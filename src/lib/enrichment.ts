@@ -1,0 +1,587 @@
+// TRD §7.7 — Multi-source enrichment pipeline
+//
+// Redesigned approval flow:
+//   1. Run ALL sources (LinkedIn discovery, ReverseContact, Claude web search, Claude extraction)
+//   2. Produce ONE unified enrichment report per contact
+//   3. Auto-apply everything that fills a NULL field (first-fill = no approval needed)
+//   4. Stage ONE approval_queue entry per contact for proposed overwrites
+//   5. Store the full report in R2 + embed into Vectorize for RAG
+
+import type { Env } from '../types/env';
+import type { EnrichmentSourceContribution, ChunkMetadata } from '../types/interfaces';
+import { chunkEmbedAndPersistAll } from './embedding';
+import {
+  checkClaudeRateLimit,
+  checkEnrichmentRateLimit,
+  recordEnrichmentRateLimit,
+  clearEnrichmentRateLimit,
+} from './rate-limit';
+import { callClaude } from './claude';
+import { emitAudit } from './audit';
+import { hashShort } from './helpers';
+import { LLM_PROMPTS } from '../prompts';
+import { buildEnrichmentUserPrompt } from '../prompts/enrichment';
+import { enrichContactFromLinkedIn } from '../integrations/reversecontact';
+import { discoverLinkedInUrl } from './linkedin-discovery';
+
+// Check for optional circuit breaker — if the module doesn't exist, skip gracefully.
+let isRcCircuitOpen: ((orgId: string, env: Env) => Promise<boolean>) | null = null;
+try {
+  // Dynamic import at module level won't work in Workers — use a try/catch around
+  // a synchronous require-style approach. If the file doesn't exist the enrichment
+  // pipeline still runs (just without the circuit breaker).
+  const mod = require('./rc-circuit-breaker');
+  isRcCircuitOpen = mod.isRcCircuitOpen;
+} catch {
+  // rc-circuit-breaker.ts doesn't exist yet — that's fine, skip it.
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Strip Claude's internal <tool_call>/<tool_response> XML blocks from web search output. */
+function stripToolArtifacts(text: string): string {
+  let t = text
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+    .replace(/<tool_response>[\s\S]*?<\/tool_response>/gi, '')
+    .replace(/<tool_result>[\s\S]*?<\/tool_result>/gi, '')
+    // Remove any other XML-ish tags like </s>, <s>, <thinking>, <search>, etc.
+    .replace(/<\/?[a-zA-Z][^>]{0,120}>/g, '');
+
+  // Strip known preamble phrases when they appear at the start of a line/paragraph,
+  // up to the next sentence end or newline.
+  const preamblePatterns = [
+    /^[\s\S]*?I'll research[^\n.]*[.!\n]\s*/i,
+    /^[\s\S]*?Let me (start|begin)[^\n.]*[.!\n]\s*/i,
+    /^[\s\S]*?I've (now )?gathered[^\n.]*[.!\n]\s*/i,
+    /^[\s\S]*?I now have (enough|sufficient)[^\n.]*[.!\n]\s*/i,
+    /^[\s\S]*?Here is the (polished |thorough |comprehensive |detailed )?(professional )?bio[^\n:]*[:\n]\s*/i,
+    /^[\s\S]*?Here it is[^\n:]*[:\n]\s*/i,
+    /^[\s\S]*?Here's (the|a) (polished |thorough |comprehensive |detailed )?(professional )?bio[^\n:]*[:\n]\s*/i,
+  ];
+  for (const pat of preamblePatterns) {
+    const m = t.match(pat);
+    // Only strip if the match is within the first 600 chars — avoid gutting the body.
+    if (m && m.index !== undefined && m.index + m[0].length < 600) {
+      t = t.slice(m.index + m[0].length);
+    }
+  }
+
+  // If the text still begins with a "---" divider (sometimes preceded by whitespace),
+  // strip everything up to and including it so the bio starts clean.
+  const dividerMatch = t.match(/^[\s\S]{0,400}?---+\s*\n/);
+  if (dividerMatch) t = t.slice(dividerMatch[0].length);
+
+  // Remove leading/trailing "---" separators.
+  t = t.replace(/^\s*-{3,}\s*\n?/, '').replace(/\n?\s*-{3,}\s*$/, '');
+
+  return t.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** Short bio for D1 (≤500 chars, sentence-boundary truncation). */
+function buildShortBio(text: string, maxChars = 500): string {
+  const cleaned = stripToolArtifacts(text)
+    .replace(/\*{2,}(.*?)\*{2,}/g, '$1')
+    .replace(/^#+\s+.+\n/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (cleaned.length <= maxChars) return cleaned;
+
+  const truncated = cleaned.slice(0, maxChars);
+  const lastSentence = Math.max(
+    truncated.lastIndexOf('. '),
+    truncated.lastIndexOf('! '),
+    truncated.lastIndexOf('? ')
+  );
+  if (lastSentence > maxChars * 0.5) return truncated.slice(0, lastSentence + 1).trim();
+  return truncated.trim() + '…';
+}
+
+function normalizeLinkedInUrl(raw: string): string | null {
+  const m = raw.match(/linkedin\.com\/in\/([a-zA-Z0-9\-_%.]+?)(?:[\/?#]|$)/i);
+  if (!m) return null;
+  return `https://www.linkedin.com/in/${m[1].replace(/\/+$/, '')}`;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Structured field extraction (single Claude call → JSON)
+// ────────────────────────────────────────────────────────────────────────────
+
+interface ExtractedFields {
+  job_title?: string | null;
+  company_name?: string | null;
+  linkedin_url?: string | null;
+  twitter_url?: string | null;
+  topics_of_interest?: string[];
+  key_facts?: string[];
+}
+
+async function extractFieldsWithClaude(
+  bioText: string,
+  orgId: string,
+  env: Env
+): Promise<ExtractedFields> {
+  const cleanBio = stripToolArtifacts(bioText);
+  if (cleanBio.length < 50) return {};
+
+  try {
+    const response = await callClaude(
+      {
+        system: `You extract structured data from professional bios. Return ONLY valid JSON, no markdown, no code fences. Use null for unknown fields. Arrays should be empty if nothing applies.`,
+        user: `Extract structured data from this bio. Return ONLY valid JSON:\n{"job_title":"...","company_name":"...","linkedin_url":"...","twitter_url":"...","topics_of_interest":["..."],"key_facts":["..."]}\n\nBio:\n${cleanBio}`,
+        max_tokens: 800,
+        orgId,
+      },
+      'low',
+      env
+    );
+
+    const cleaned = response.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    return JSON.parse(cleaned) as ExtractedFields;
+  } catch (e: any) {
+    console.error(`[enrichment] field-extraction failed: ${e?.message}`);
+    return {};
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Unified enrichment report
+// ────────────────────────────────────────────────────────────────────────────
+
+interface EnrichmentReport {
+  bio: string;
+  fields: Record<string, string | string[]>;
+  auto_applied: Record<string, string | string[]>;
+  proposed_changes: Record<string, { current: string | null; proposed: string | string[] }>;
+  sources: string[];
+  linkedin_url_discovered?: string;
+}
+
+/**
+ * Builds ONE unified enrichment report from all sources, applies NULL-fill
+ * fields directly, and stages a single approval_queue entry for overwrites.
+ */
+async function applyUnifiedEnrichment(
+  contactId: string,
+  fullBioText: string,
+  r2Key: string,
+  discoveredLinkedinUrl: string | null,
+  orgId: string,
+  sources: string[],
+  env: Env
+): Promise<void> {
+  // ── 1. Clean the bio ──
+  const cleanBio = stripToolArtifacts(fullBioText);
+  const shortBio = buildShortBio(fullBioText);
+  console.log(`[enrichment] ${contactId}: clean bio ${cleanBio.length} chars, short bio ${shortBio.length} chars`);
+
+  // ── 2. Extract structured fields via Claude ──
+  const extracted = await extractFieldsWithClaude(fullBioText, orgId, env);
+  console.log(`[enrichment] ${contactId}: extracted fields: ${JSON.stringify(extracted).slice(0, 300)}`);
+
+  // ── 3. Load existing contact row ──
+  const existing = await env.D1.prepare(
+    `SELECT bio_summary, job_title, linkedin_url, twitter_url, topics_of_interest, custom_fields
+     FROM contacts WHERE id = ?`
+  ).bind(contactId).first<{
+    bio_summary: string | null;
+    job_title: string | null;
+    linkedin_url: string | null;
+    twitter_url: string | null;
+    topics_of_interest: string | null;
+    custom_fields: string | null;
+  }>();
+
+  // ── 4. Build the unified field map from ALL sources ──
+  // LinkedIn discovery URL takes precedence over extraction-parsed URL
+  const resolvedFields: Record<string, string> = {};
+
+  if (discoveredLinkedinUrl) {
+    resolvedFields.linkedin_url = discoveredLinkedinUrl;
+  } else if (extracted.linkedin_url) {
+    const norm = normalizeLinkedInUrl(extracted.linkedin_url);
+    if (norm) resolvedFields.linkedin_url = norm;
+  }
+
+  if (extracted.job_title) {
+    // Clean common extraction artifacts
+    let title = String(extracted.job_title).trim();
+    title = title.replace(/^the\s+/i, '');
+    if (title.length >= 2 && title.length <= 120) {
+      resolvedFields.job_title = title;
+    }
+  }
+
+  if (extracted.twitter_url) resolvedFields.twitter_url = String(extracted.twitter_url).trim();
+
+  if (Array.isArray(extracted.topics_of_interest) && extracted.topics_of_interest.length > 0) {
+    const topics = extracted.topics_of_interest
+      .map(s => String(s).trim())
+      .filter(s => s.length >= 2 && s.length <= 80)
+      .slice(0, 15);
+    if (topics.length > 0) resolvedFields.topics_of_interest = JSON.stringify(topics);
+  }
+
+  // ── 5. Classify each field: auto_applied vs proposed_change ──
+  const autoApplied: Record<string, string> = {};
+  const proposedChanges: Record<string, { current: string | null; proposed: string }> = {};
+
+  const dbUpdates: string[] = ['bio_summary = ?', 'web_enrichment_r2_key = ?'];
+  const dbBinds: unknown[] = [shortBio, r2Key];
+
+  for (const [field, value] of Object.entries(resolvedFields)) {
+    const currentVal = (existing as any)?.[field] as string | null | undefined;
+    const current = currentVal == null || currentVal === '' ? null : String(currentVal).trim();
+
+    if (current === null) {
+      // NULL → first fill: auto-apply, no approval needed
+      dbUpdates.push(`${field} = ?`);
+      dbBinds.push(value);
+      autoApplied[field] = value;
+      console.log(`[enrichment] ${contactId}: auto-apply ${field} = "${String(value).slice(0, 60)}"`);
+    } else if (current.toLowerCase() === String(value).trim().toLowerCase()) {
+      // Same value: skip
+      console.log(`[enrichment] ${contactId}: ${field} already matches — skip`);
+    } else {
+      // Different value: propose overwrite
+      proposedChanges[field] = { current, proposed: value };
+      console.log(`[enrichment] ${contactId}: propose ${field}: "${current.slice(0, 40)}" → "${String(value).slice(0, 40)}"`);
+    }
+  }
+
+  // key_facts → custom_fields JSON
+  let customFields: Record<string, unknown> = {};
+  try { customFields = JSON.parse(existing?.custom_fields || '{}'); } catch { customFields = {}; }
+  if (Array.isArray(extracted.key_facts) && extracted.key_facts.length > 0) {
+    customFields.key_facts = extracted.key_facts.map(s => String(s).trim()).filter(s => s.length >= 2).slice(0, 20);
+  }
+  dbUpdates.push('custom_fields = ?');
+  dbBinds.push(JSON.stringify(customFields));
+
+  dbUpdates.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')");
+
+  // ── 6. Write auto-applied fields to D1 ──
+  await env.D1.prepare(
+    `UPDATE contacts SET ${dbUpdates.join(', ')} WHERE id = ?`
+  ).bind(...dbBinds, contactId).run();
+
+  console.log(
+    `[enrichment] ${contactId}: auto-applied ${Object.keys(autoApplied).length} fields, ` +
+    `${Object.keys(proposedChanges).length} proposed changes`
+  );
+
+  // ── 7. Build the unified enrichment report ──
+  const report: EnrichmentReport = {
+    bio: cleanBio,
+    fields: { ...autoApplied },
+    auto_applied: autoApplied,
+    proposed_changes: proposedChanges,
+    sources,
+    linkedin_url_discovered: discoveredLinkedinUrl || undefined,
+  };
+
+  // ── 8. Stage ONE approval entry if there are any proposed overwrites ──
+  if (Object.keys(proposedChanges).length > 0) {
+    const idempotencyKey = `${orgId}:${contactId}:enrichment_report:${hashShort(JSON.stringify(proposedChanges))}`;
+
+    await env.D1.prepare(
+      `INSERT OR IGNORE INTO approval_queue
+         (idempotency_key, org_id, entity_type, entity_id, change_type, field_name,
+          proposed_value, source_visibility, confidence, status)
+       VALUES (?, ?, 'contact', ?, 'enrichment_report', 'enrichment_report', ?, 'org_wide', 0.85, 'pending')`
+    ).bind(idempotencyKey, orgId, contactId, JSON.stringify(report)).run();
+
+    console.log(
+      `[enrichment] ${contactId}: staged 1 enrichment_report with ${Object.keys(proposedChanges).length} proposed overwrites`
+    );
+  } else {
+    console.log(`[enrichment] ${contactId}: no overwrites — no approval needed`);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Public API
+// ────────────────────────────────────────────────────────────────────────────
+
+export function aggregateEnrichmentResult(
+  contributions: EnrichmentSourceContribution[]
+): { text: string; visibility: 'org_wide' | 'confidential' } {
+  const text = contributions
+    .filter(c => c.text.length > 0)
+    .map(c => {
+      if (c.source === 'llm_extraction' && c.sanitized_text) {
+        return `[Source: ${c.source}]\n${c.sanitized_text}`;
+      }
+      return `[Source: ${c.source}]\n${c.text}`;
+    })
+    .join('\n\n');
+
+  const hasRestricted = contributions.some(
+    c => c.visibility === 'private' || c.visibility === 'confidential'
+  );
+  return { text, visibility: hasRestricted ? 'confidential' : 'org_wide' };
+}
+
+export async function triggerContactEnrichment(
+  contactId: string,
+  orgId: string,
+  env: Env
+): Promise<void> {
+  const contact = await env.D1.prepare(
+    `SELECT id, full_name, email, linkedin_url, company_id, job_title
+     FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(contactId, orgId).first<any>();
+  if (!contact) {
+    console.log(`[enrichment] ${contactId}: not found — skipping`);
+    return;
+  }
+
+  console.log(
+    `[enrichment] ${contactId}: starting for "${contact.full_name}" email=${contact.email || 'none'} linkedin=${contact.linkedin_url || 'none'}`
+  );
+
+  const contributions: EnrichmentSourceContribution[] = [];
+  let discoveredLinkedinUrl: string | null = null;
+
+  // ── Circuit breaker gate ──
+  const rcOpen = isRcCircuitOpen ? await isRcCircuitOpen(orgId, env) : false;
+  if (rcOpen) {
+    console.warn(`[enrichment] ${contactId}: ReverseContact circuit open — skipping RC + discovery`);
+  }
+
+  // ── Step 0: LinkedIn URL discovery ──
+  let skipReverseContact = rcOpen;
+  if (!rcOpen && !contact.linkedin_url) {
+    console.log(`[enrichment] ${contactId}: no linkedin_url → LinkedIn discovery`);
+    try {
+      const discovery = await discoverLinkedInUrl(contact, orgId, env);
+      console.log(`[enrichment] ${contactId}: discovery → ${discovery.status} url=${discovery.linkedin_url || 'none'}`);
+      if (discovery.status === 'found' && discovery.linkedin_url) {
+        contact.linkedin_url = discovery.linkedin_url;
+        discoveredLinkedinUrl = discovery.linkedin_url;
+        contributions.push({
+          source: 'claude_web_search',
+          text: `LinkedIn profile discovered: ${discovery.linkedin_url}`,
+          visibility: 'org_wide',
+        });
+      } else if (discovery.status === 'multiple') {
+        skipReverseContact = true;
+      }
+    } catch (e) {
+      console.error(`[enrichment] ${contactId}: discovery error:`, e);
+    }
+  }
+
+  // ── Source 1: ReverseContact ──
+  if (!skipReverseContact) {
+    const claudeOk = await checkClaudeRateLimit(env, orgId, 'low');
+    const rcOk = await checkEnrichmentRateLimit('reversecontact', orgId, env);
+    if (claudeOk && rcOk) {
+      try {
+        const result = await enrichContactFromLinkedIn(contact, orgId, env);
+        if (result) {
+          console.log(`[enrichment] ${contactId}: RC returned ${result.text.length} chars`);
+          contributions.push({ source: 'reversecontact', text: result.text, visibility: 'org_wide' });
+          await clearEnrichmentRateLimit('reversecontact', orgId, env);
+        }
+      } catch (e: any) {
+        console.error(`[enrichment] ${contactId}: RC failed: ${e.message}`);
+        if (String(e.message).includes('429')) await recordEnrichmentRateLimit('reversecontact', orgId, env);
+      }
+    }
+  }
+
+  // ── Source 2: Claude web search ──
+  if (await checkEnrichmentRateLimit('claude_enrichment', orgId, env)) {
+    try {
+      const company = contact.company_id
+        ? await env.D1.prepare('SELECT name, sector, website FROM companies WHERE id = ?')
+            .bind(contact.company_id).first<any>()
+        : null;
+
+      const text = await callClaude(
+        {
+          system: LLM_PROMPTS.ENRICHMENT_SEARCH,
+          user: buildEnrichmentUserPrompt({
+            entityName: contact.full_name,
+            entityType: 'contact',
+            sector: company?.sector,
+            emailDomain: contact.email ? contact.email.split('@')[1] : undefined,
+            knownContacts: company ? [company.name] : [],
+            jobTitle: contact.job_title || undefined,
+          }),
+          max_tokens: 5000,
+          orgId,
+        },
+        'low',
+        env
+      );
+
+      console.log(`[enrichment] ${contactId}: Claude web search → ${text.length} chars`);
+      contributions.push({ source: 'claude_web_search', text, visibility: 'org_wide' });
+      await clearEnrichmentRateLimit('claude_enrichment', orgId, env);
+    } catch (e: any) {
+      console.error(`[enrichment] ${contactId}: Claude failed: ${e.message}`);
+      if (String(e.message).includes('CLAUDE_RATE_LIMITED')) {
+        await recordEnrichmentRateLimit('claude_enrichment', orgId, env);
+      }
+    }
+  }
+
+  console.log(`[enrichment] ${contactId}: ${contributions.length} contributions from [${contributions.map(c => c.source).join(', ')}]`);
+  if (contributions.length === 0) return;
+
+  // ── Aggregate for Vectorize ──
+  const { text: aggText, visibility } = aggregateEnrichmentResult(contributions);
+
+  // ── Pick the best bio text (longest web search contribution) ──
+  const bestBio = contributions
+    .filter(c => c.source === 'claude_web_search' && c.text.length > 200)
+    .sort((a, b) => b.text.length - a.text.length)[0]?.text || aggText;
+
+  // ── R2: full enrichment payload ──
+  const r2Key = `${orgId}/enrichment/aggregated/${contactId}.json`;
+  await env.R2.put(r2Key, JSON.stringify({
+    full_bio: stripToolArtifacts(bestBio),
+    visibility,
+    updated_at: new Date().toISOString(),
+    contributions,
+  }));
+
+  // ── Vectorize embed ──
+  const meta: ChunkMetadata = {
+    org_id: orgId,
+    document_type: 'enrichment',
+    source_table: 'contacts',
+    source_id: contactId,
+    r2_key: r2Key,
+    visibility,
+    primary_entity_id: contactId,
+    created_at: new Date().toISOString(),
+    entity_name: contact.full_name,
+  };
+
+  const entries = await chunkEmbedAndPersistAll(aggText, meta, env);
+  if (entries.length > 0) {
+    await env.D1.batch(entries.map(e =>
+      env.D1.prepare('INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)')
+        .bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+    ));
+  }
+
+  // ── Unified enrichment report: auto-apply NULLs, stage overwrites ──
+  try {
+    await applyUnifiedEnrichment(contactId, bestBio, r2Key, discoveredLinkedinUrl, orgId, contributions.map(c => c.source), env);
+  } catch (e) {
+    console.error(`[enrichment] ${contactId}: applyUnifiedEnrichment failed:`, e);
+  }
+
+  // ── Update enrichment metadata ──
+  await env.D1.prepare(
+    `UPDATE contacts SET enrichment_confidence = ?, enrichment_last_run = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+  ).bind(Math.min(0.95, 0.4 + contributions.length * 0.25), contactId).run();
+
+  await emitAudit(env, {
+    org_id: orgId,
+    action: 'enrich',
+    entity_type: 'contact',
+    entity_id: contactId,
+    metadata: { sources: contributions.map(c => c.source), visibility },
+    created_at: new Date().toISOString(),
+  });
+}
+
+export async function triggerCompanyEnrichment(
+  companyId: string,
+  orgId: string,
+  env: Env
+): Promise<void> {
+  const company = await env.D1.prepare(
+    `SELECT id, name, sector, website FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(companyId, orgId).first<any>();
+  if (!company) return;
+
+  const contributions: EnrichmentSourceContribution[] = [];
+
+  if (await checkEnrichmentRateLimit('claude_enrichment', orgId, env)) {
+    try {
+      const contactsRow = await env.D1.prepare(
+        'SELECT full_name FROM contacts WHERE company_id = ? AND deleted_at IS NULL LIMIT 5'
+      ).bind(companyId).all<{ full_name: string }>();
+
+      const emailDomain = company.website
+        ? company.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]
+        : undefined;
+
+      const text = await callClaude(
+        {
+          system: LLM_PROMPTS.ENRICHMENT_SEARCH,
+          user: buildEnrichmentUserPrompt({
+            entityName: company.name,
+            entityType: 'company',
+            sector: company.sector,
+            emailDomain,
+            knownContacts: contactsRow.results.map(c => c.full_name),
+          }),
+          max_tokens: 2500,
+          orgId,
+        },
+        'low',
+        env
+      );
+
+      contributions.push({ source: 'claude_web_search', text, visibility: 'org_wide' });
+      await clearEnrichmentRateLimit('claude_enrichment', orgId, env);
+    } catch (e: any) {
+      if (String(e.message).includes('CLAUDE_RATE_LIMITED')) {
+        await recordEnrichmentRateLimit('claude_enrichment', orgId, env);
+      }
+      console.error('Company enrichment failed:', e);
+    }
+  }
+
+  if (contributions.length === 0) return;
+
+  const { text: aggText, visibility } = aggregateEnrichmentResult(contributions);
+  const cleanBio = stripToolArtifacts(contributions[0]?.text || aggText);
+  const r2Key = `${orgId}/enrichment/aggregated/${companyId}.json`;
+
+  await env.R2.put(r2Key, JSON.stringify({
+    full_bio: cleanBio, visibility,
+    updated_at: new Date().toISOString(), contributions,
+  }));
+
+  const meta: ChunkMetadata = {
+    org_id: orgId,
+    document_type: 'enrichment',
+    source_table: 'companies',
+    source_id: companyId,
+    r2_key: r2Key,
+    visibility,
+    primary_entity_id: companyId,
+    created_at: new Date().toISOString(),
+    entity_name: company.name,
+  };
+
+  const entries = await chunkEmbedAndPersistAll(aggText, meta, env);
+  if (entries.length > 0) {
+    await env.D1.batch(entries.map(e =>
+      env.D1.prepare('INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)')
+        .bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+    ));
+  }
+
+  await env.D1.prepare(
+    `UPDATE companies SET enrichment_confidence = ?, enrichment_last_run = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+  ).bind(0.7, companyId).run();
+
+  await emitAudit(env, {
+    org_id: orgId, action: 'enrich', entity_type: 'company', entity_id: companyId,
+    metadata: { sources: contributions.map(c => c.source), visibility },
+    created_at: new Date().toISOString(),
+  });
+}

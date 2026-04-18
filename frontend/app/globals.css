@@ -1,0 +1,137 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  background: #09090B;
+  color: #FAFAFA;
+  font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #0D0D0F;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272A;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3F3F46;
+}
+
+/* Button styles (Frontend Spec §1.4) */
+.btn-primary {
+  background: linear-gradient(135deg, #D946A8, #8B5CF6);
+  color: white;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: none;
+  transition: filter 0.15s, transform 0.15s;
+}
+.btn-primary:hover {
+  filter: brightness(1.1);
+  transform: scale(1.01);
+}
+.btn-primary:disabled {
+  filter: grayscale(0.5) brightness(0.6);
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: #FAFAFA;
+  font-size: 14px;
+  padding: 10px 20px;
+  border: 1px solid #27272A;
+  border-radius: 8px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.btn-secondary:hover {
+  background: #1A1A1F;
+  border-color: #3F3F46;
+}
+
+.btn-ghost {
+  background: transparent;
+  color: #A1A1AA;
+  font-size: 14px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 8px;
+  transition: color 0.15s, background 0.15s;
+}
+.btn-ghost:hover {
+  color: #FAFAFA;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.btn-destructive {
+  background: transparent;
+  color: #EF4444;
+  font-size: 14px;
+  padding: 10px 20px;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+}
+.btn-destructive:hover {
+  background: rgba(239, 68, 68, 0.08);
+}
+
+/* Card */
+.card {
+  background: #111114;
+  border: 1px solid #27272A;
+  border-radius: 12px;
+  padding: 16px;
+}
+
+/* Input */
+.input {
+  background: #161619;
+  color: #FAFAFA;
+  border: 1px solid #27272A;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.input:focus {
+  outline: none;
+  border-color: #D946A8;
+  box-shadow: 0 0 0 3px rgba(217, 70, 168, 0.12);
+}
+
+/* Badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 9999px;
+  background: #222228;
+  color: #FAFAFA;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* Streaming dot animation */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+.streaming-dot {
+  animation: pulse-dot 1.4s infinite;
+}

@@ -1,0 +1,28 @@
+{
+  "name": "medina-ventures-api",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n api,web -c magenta,cyan \"wrangler dev --remote\" \"npm --prefix frontend run dev\"",
+    "dev:api": "wrangler dev --remote",
+    "dev:web": "npm --prefix frontend run dev",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run",
+    "migrate:local": "wrangler d1 migrations apply medina-ventures-db --local",
+    "migrate:remote": "wrangler d1 migrations apply medina-ventures-db --remote",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@langchain/textsplitters": "^0.1.0",
+    "pdf-parse": "^1.1.1",
+    "mammoth": "^1.8.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240924.0",
+    "@types/node": "^20.14.0",
+    "concurrently": "^9.0.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.78.0"
+  }
+}

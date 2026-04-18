@@ -1,0 +1,91 @@
+name = "medina-ventures-api"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ENVIRONMENT = "production"
+CLOUDFLARE_ACCOUNT_ID = "ad54df3fe69483d2c0b69be1b72864e8"
+CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "D1"
+database_name = "medina-ventures-db"
+database_id = "4bb3705c-c471-43f7-b42f-b44ab62f5dab"
+preview_database_id = "4bb3705c-c471-43f7-b42f-b44ab62f5dab"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "medina-ventures-storage"
+preview_bucket_name = "medina-ventures-storage"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "29422591253b424d9094c37e0897d68e"
+preview_id = "59205fe013c84c548579bc2b503750f6"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "medina-ventures-main"
+
+# --- Workflows ---
+
+[[workflows]]
+name = "ingestion-workflow"
+binding = "INGESTION_WORKFLOW"
+class_name = "IngestionWorkflow"
+
+[[workflows]]
+name = "enrichment-workflow"
+binding = "ENRICHMENT_WORKFLOW"
+class_name = "EnrichmentWorkflow"
+
+[[workflows]]
+name = "campaign-send-workflow"
+binding = "CAMPAIGN_WORKFLOW"
+class_name = "CampaignSendWorkflow"
+
+# --- Cron Triggers ---
+
+[triggers]
+crons = [
+  "*/20 * * * *",
+  "5 * * * *",
+  "0 0 * * *",
+]
+
+# --- Queues ---
+
+[[queues.producers]]
+queue = "audit-log-queue"
+binding = "AUDIT_QUEUE"
+
+[[queues.consumers]]
+queue = "audit-log-queue"
+max_batch_size = 50
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "audit-log-dlq"
+
+[[queues.producers]]
+queue = "audit-log-dlq"
+binding = "AUDIT_DLQ"
+
+[[queues.producers]]
+queue = "webhook-intake-queue"
+binding = "WEBHOOK_QUEUE"
+
+[[queues.consumers]]
+queue = "webhook-intake-queue"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "webhook-dlq"
+retry_delay = 60
+
+[[queues.producers]]
+queue = "webhook-dlq"
+binding = "WEBHOOK_DLQ"
