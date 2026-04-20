@@ -50,39 +50,79 @@ export function scoreIdentity(
 ): IdentityScore {
   const details: string[] = [];
   let score = 0;
+  let penalty = 0;
 
+  // Name match
+  if (contact.full_name) {
+    const cParts = contact.full_name.toLowerCase().split(/\s+/);
+    const candFirst = (candidate.firstName || '').toLowerCase();
+    const candLast = (candidate.lastName || '').toLowerCase();
+    const firstMatch = cParts[0] === candFirst;
+    const lastMatch = cParts.length > 1 && cParts[cParts.length - 1] === candLast;
+    if (firstMatch && lastMatch) {
+      score += 0.3;
+      details.push('full_name_match (+0.3)');
+    } else if (firstMatch || lastMatch) {
+      score += 0.15;
+      details.push('partial_name_match (+0.15)');
+    }
+  }
+
+  // Email domain → company match
   if (contact.email) {
     const contactDomain = contact.email.split('@')[1]?.toLowerCase();
+    const domainBase = contactDomain?.split('.')[0];
     const candidateCompany = (candidate.currentCompany || '').toLowerCase();
-    if (contactDomain && candidateCompany.includes(contactDomain.split('.')[0])) {
-      score += 0.4;
-      details.push('email_domain_match (+0.4)');
+    if (domainBase && candidateCompany.includes(domainBase)) {
+      score += 0.35;
+      details.push('email_domain_company_match (+0.35)');
     }
   }
 
-  if (contact.full_name) {
-    const [cFirst, ...cRest] = contact.full_name.toLowerCase().split(' ');
-    const nameOverlap =
-      (candidate.firstName || '').toLowerCase() === cFirst ||
-      (candidate.lastName || '').toLowerCase() === cRest.join(' ').trim();
-    if (nameOverlap) {
-      score += 0.3;
-      details.push('name_match (+0.3)');
-    }
-  }
-
+  // Job title match — check for meaningful word overlap
   if (contact.job_title && candidate.currentTitle) {
-    const titleOverlap = contact.job_title
-      .toLowerCase()
-      .split(/\s+/)
-      .some(w => candidate.currentTitle!.toLowerCase().includes(w));
-    if (titleOverlap) {
+    const contactWords = contact.job_title.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    const candTitle = candidate.currentTitle.toLowerCase();
+    const matchCount = contactWords.filter(w => candTitle.includes(w)).length;
+    if (matchCount >= 1) {
       score += 0.2;
-      details.push('title_match (+0.2)');
+      details.push(`title_match (+0.2, ${matchCount} words)`);
+    } else {
+      // Title exists but no overlap — possible wrong person
+      penalty += 0.15;
+      details.push('title_mismatch (-0.15)');
     }
   }
 
-  return { score, details, candidate };
+  // Company name match (if we know the company)
+  if ((contact as any).company_name && candidate.currentCompany) {
+    const knownCompany = ((contact as any).company_name as string).toLowerCase();
+    const candCompany = candidate.currentCompany.toLowerCase();
+    const overlap = knownCompany.split(/\s+/).filter(w => w.length > 2).some(w => candCompany.includes(w));
+    if (overlap) {
+      score += 0.15;
+      details.push('company_name_match (+0.15)');
+    } else {
+      penalty += 0.2;
+      details.push('company_mismatch (-0.2)');
+    }
+  }
+
+  // Industry/headline sanity check — if we know the job title and their headline
+  // describes a completely unrelated field, penalize
+  if (contact.job_title && candidate.headline) {
+    const headline = candidate.headline.toLowerCase();
+    const title = contact.job_title.toLowerCase();
+    const unrelatedFields = ['director', 'filmmaker', 'actor', 'artist', 'musician', 'author', 'writer', 'photographer'];
+    const titleSuggestsUnrelated = unrelatedFields.some(f => headline.includes(f)) &&
+      !unrelatedFields.some(f => title.includes(f));
+    if (titleSuggestsUnrelated) {
+      penalty += 0.3;
+      details.push('headline_field_mismatch (-0.3)');
+    }
+  }
+
+  return { score: Math.max(0, score - penalty), details, candidate };
 }
 
 export async function enrichContactFromLinkedIn(

@@ -147,7 +147,7 @@ export async function retrieveContext(
 
   const filtered = internalMatches
     .filter(pq.postRetrievalFilter)
-    .filter(m => m.score >= 0.72);
+    .filter(m => m.score >= 0.55);
 
   const { chunks: hydrated } = await hydrateChunks(filtered.slice(0, 20), env);
   let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env);
@@ -173,7 +173,7 @@ export async function retrieveContext(
     returnMetadata: 'all',
   });
   const newsMatches = ((newsResult.matches || []) as VectorMatch[])
-    .filter(m => m.score >= 0.72)
+    .filter(m => m.score >= 0.55)
     .slice(0, 5);
   const { chunks: newsChunks } = await hydrateChunks(newsMatches, env);
 

@@ -41,7 +41,8 @@ const config: Config = {
       },
       fontFamily: {
         sans: ['DM Sans', 'system-ui', '-apple-system', 'sans-serif'],
-        display: ['Instrument Serif', 'Georgia', 'serif'],
+        display: ['Space Grotesk', 'sans-serif'],
+        accent: ['Exo 2', 'sans-serif'],
         mono: ['JetBrains Mono', 'monospace'],
       },
       backgroundImage: {

@@ -5,7 +5,7 @@ import type {
   ClassifiedItem,
   ChunkMetadata,
 } from '../types/interfaces';
-import { discoverNewContact, type DiscoveryEligibility } from './discovery';
+import { discoverNewContact, PERSONAL_DOMAINS, findOrCreateCompanyByDomain, type DiscoveryEligibility } from './discovery';
 
 export async function classifyAndDeduplicate(
   items: ClassifiableItem[],
@@ -147,9 +147,6 @@ export async function classifyAndDeduplicate(
       ).bind(orgId, email).first<{ id: string }>();
 
       if (existing) {
-        await env.D1.prepare(
-          'UPDATE contacts SET total_interactions = COALESCE(total_interactions, 0) + 1, updated_at = ? WHERE id = ?'
-        ).bind(new Date().toISOString(), existing.id).run();
         contactIds.push(existing.id);
         contactsExisting++;
         continue;
@@ -171,6 +168,22 @@ export async function classifyAndDeduplicate(
         else contactsExisting++;
       } else {
         contactsSkippedAutomated++;
+      }
+    }
+
+    // --- auto-create company stubs for new business email domains ---
+    if (item.type === 'email') {
+      const domainsSeen = new Set<string>();
+      for (const email of allEmails) {
+        if (internalEmails.has(email)) continue;
+        const domain = email.split('@')[1];
+        if (!domain || PERSONAL_DOMAINS.has(domain) || domainsSeen.has(domain)) continue;
+        domainsSeen.add(domain);
+        try {
+          await findOrCreateCompanyByDomain(domain, orgId, env);
+        } catch (e) {
+          console.error(`[classification] company stub creation failed for ${domain}:`, e);
+        }
       }
     }
 

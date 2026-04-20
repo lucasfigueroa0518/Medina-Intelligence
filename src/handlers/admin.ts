@@ -4,6 +4,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { clearEnrichmentRateLimit } from '../lib/rate-limit';
 import { emitAudit } from '../lib/audit';
+import { runHistoricalBackfill, getUserSyncConfig, setUserSyncConfig, type BackfillProgress } from '../integrations/outlook';
 
 export async function listDlq(
   request: Request,
@@ -198,4 +199,69 @@ export async function triggerSync(
     instance_id: instance.id,
     message: `${workflow} workflow dispatched. Watch /api/sync/status for progress.`,
   });
+}
+
+export async function backfillEmail(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ user_id?: string; days_back?: number }>(request);
+  const userId = body?.user_id || ctx.userId;
+  const daysBack = body?.days_back || 365;
+
+  if (daysBack < 1 || daysBack > 730) {
+    return errorResponse('VALIDATION_ERROR', 400, 'days_back must be between 1 and 730');
+  }
+
+  const user = await env.D1.prepare(
+    'SELECT id FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(userId, ctx.orgId).first();
+  if (!user) return errorResponse('USER_NOT_FOUND', 404, 'User not found in your org');
+
+  const progress = await runHistoricalBackfill(userId, ctx.orgId, daysBack, env);
+
+  return jsonResponse({ ok: true, progress });
+}
+
+export async function getBackfillProgress(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const userId = ctx.userId;
+  const progress = await env.KV.get<BackfillProgress>(
+    `backfill_progress:${userId}`,
+    'json'
+  );
+
+  return jsonResponse({ progress: progress || null });
+}
+
+export async function getSyncConfig(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const config = await getUserSyncConfig(ctx.userId, env);
+  return jsonResponse({ config });
+}
+
+export async function updateSyncConfig(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ sync_history_days?: number }>(request);
+  if (!body?.sync_history_days) {
+    return errorResponse('VALIDATION_ERROR', 400, 'sync_history_days is required');
+  }
+
+  const valid = [30, 90, 180, 365, 0];
+  if (!valid.includes(body.sync_history_days)) {
+    return errorResponse('VALIDATION_ERROR', 400, `sync_history_days must be one of: ${valid.join(', ')} (0 = all time)`);
+  }
+
+  const days = body.sync_history_days === 0 ? 3650 : body.sync_history_days;
+  await setUserSyncConfig(ctx.userId, { sync_history_days: days }, env);
+
+  return jsonResponse({ ok: true, sync_history_days: days });
 }

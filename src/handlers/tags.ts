@@ -5,15 +5,27 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 
 export async function listTags(
+  request: Request,
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const rows = await env.D1.prepare(
-    `SELECT t.*,
+  const url = new URL(request.url);
+  const entityType = url.searchParams.get('entity_type');
+
+  let sql = `SELECT t.*,
        (SELECT COUNT(*) FROM contact_tags ct WHERE ct.tag_id = t.id) as contact_count,
-       (SELECT COUNT(*) FROM company_tags ct WHERE ct.tag_id = t.id) as company_count
-     FROM tags t WHERE t.org_id = ? ORDER BY t.name ASC`
-  ).bind(ctx.orgId).all();
+       (SELECT COUNT(*) FROM company_tags cot WHERE cot.tag_id = t.id) as company_count
+     FROM tags t WHERE t.org_id = ?`;
+  const binds: unknown[] = [ctx.orgId];
+
+  if (entityType === 'contact' || entityType === 'company') {
+    sql += ' AND t.entity_type = ?';
+    binds.push(entityType);
+  }
+
+  sql += ' ORDER BY t.name ASC';
+
+  const rows = await env.D1.prepare(sql).bind(...binds).all();
   return jsonResponse({ tags: rows.results });
 }
 
@@ -22,14 +34,19 @@ export async function createTag(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const body = await parseJsonBody<{ name: string; color?: string }>(request);
+  const body = await parseJsonBody<{ name: string; color?: string; entity_type?: string }>(request);
   if (!body?.name) return errorResponse('VALIDATION_ERROR', 400);
+
+  const entityType = body.entity_type || 'contact';
+  if (entityType !== 'contact' && entityType !== 'company') {
+    return errorResponse('VALIDATION_ERROR', 400, 'entity_type must be "contact" or "company"');
+  }
 
   const id = crypto.randomUUID();
   try {
     await env.D1.prepare(
-      `INSERT INTO tags (id, org_id, name, color, created_by) VALUES (?, ?, ?, ?, ?)`
-    ).bind(id, ctx.orgId, body.name, body.color || '#888888', ctx.userId).run();
+      `INSERT INTO tags (id, org_id, name, color, entity_type, created_by) VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(id, ctx.orgId, body.name, body.color || '#888888', entityType, ctx.userId).run();
   } catch (e: any) {
     if (String(e.message).includes('UNIQUE'))
       return errorResponse('TAG_EXISTS', 409);
@@ -42,7 +59,7 @@ export async function createTag(
     action: 'create',
     entity_type: 'tag',
     entity_id: id,
-    after_data: { name: body.name },
+    after_data: { name: body.name, entity_type: entityType },
     created_at: new Date().toISOString(),
   });
 

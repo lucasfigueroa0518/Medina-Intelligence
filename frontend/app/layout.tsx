@@ -1,11 +1,14 @@
 import type { Metadata } from 'next';
 import './globals.css';
-import { Sidebar } from '@/components/sidebar';
-import { SessionExpiredBanner } from '@/components/session-expired-banner';
+import { AuthGuard } from '@/components/auth-guard';
+import { AppShell } from '@/components/app-shell';
 
 export const metadata: Metadata = {
-  title: 'Medina Ventures — Intelligence Platform',
+  title: 'Medina Intelligence Platform',
   description: 'VC CRM with God Mode AI agent, auto-sync engine, and RAG pipeline',
+  icons: {
+    icon: '/medina-logo.png',
+  },
 };
 
 export default function RootLayout({
@@ -16,13 +19,9 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className="bg-bg-root text-text-primary min-h-screen">
-        <SessionExpiredBanner />
-        <div className="flex min-h-screen">
-          <Sidebar />
-          <div className="flex-1 flex flex-col overflow-hidden">
-            {children}
-          </div>
-        </div>
+        <AuthGuard>
+          <AppShell>{children}</AppShell>
+        </AuthGuard>
       </body>
     </html>
   );

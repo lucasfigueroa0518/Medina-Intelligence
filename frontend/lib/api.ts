@@ -11,21 +11,17 @@ if (!API_ORIGIN && typeof window !== 'undefined') {
 }
 const API_BASE = `${API_ORIGIN ?? ''}/api`;
 
-// Dev token — owner JWT for lucas-admin / medina-ventures. Set in frontend/.env.local
-// as NEXT_PUBLIC_DEV_JWT. Seeded into localStorage on first load. Replace with real auth later.
-const DEV_JWT_TOKEN = process.env.NEXT_PUBLIC_DEV_JWT ?? '';
-
 const TOKEN_KEY = 'auth_token';
 const SESSION_EXPIRED_EVENT = 'auth:session-expired';
 
 export function getAuthToken(): string | null {
   if (typeof window === 'undefined') return null;
-  let token = localStorage.getItem(TOKEN_KEY);
-  if (!token && DEV_JWT_TOKEN) {
-    localStorage.setItem(TOKEN_KEY, DEV_JWT_TOKEN);
-    token = DEV_JWT_TOKEN;
-  }
-  return token;
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function setAuthToken(token: string): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(TOKEN_KEY, token);
 }
 
 export function clearAuthToken(): void {
@@ -108,12 +104,33 @@ export const api = {
     return request<{ companies: any[] }>(`/companies${q}`);
   },
   getCompany: (id: string) =>
-    request<{ company: any; contacts: any[]; deals: any[]; tags: any[] }>(`/companies/${id}`),
+    request<{ company: any; contacts: any[]; deals: any[]; tags: any[]; news_articles: any[] }>(`/companies/${id}`),
   createCompany: (data: any) =>
     request<{ company: any }>('/companies', { method: 'POST', body: JSON.stringify(data) }),
   updateCompany: (id: string, data: any) =>
     request<{ company: any }>(`/companies/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-  getCompanyNews: (id: string) => request<{ company: any; news: any[] }>(`/companies/${id}/news`),
+  getCompanyNews: (id: string) => request<{
+    company: any; articles: any[]; legacy_news: any[];
+    news_relevance_score: number | null; last_summary: string | null;
+  }>(`/companies/${id}/news`),
+  deleteCompany: (id: string) =>
+    request<{ ok: boolean }>(`/companies/${id}`, { method: 'DELETE' }),
+  enrichCompany: (id: string) =>
+    request<{ ok: boolean; message: string }>(`/companies/${id}/enrich`, { method: 'POST' }),
+  getCompanyEnrichment: (id: string) =>
+    request<{
+      company_id: string;
+      full_bio: string | null;
+      enrichment_confidence: number | null;
+      enrichment_last_run: string | null;
+      status: string;
+    }>(`/companies/${id}/enrichment`),
+  enrichContact: (id: string) =>
+    request<{ ok: boolean; message: string }>(`/contacts/${id}/enrich`, { method: 'POST' }),
+  getContactAssociations: (id: string) =>
+    request<{ associations: any[] }>(`/contacts/${id}/associations`),
+  getCompanyAssociations: (id: string) =>
+    request<{ associations: any[] }>(`/companies/${id}/associations`),
 
   // Deals
   listDeals: (params?: Record<string, string>) => {
@@ -124,11 +141,56 @@ export const api = {
     request<{ deal: any }>('/deals', { method: 'POST', body: JSON.stringify(data) }),
   updateDeal: (id: string, data: any) =>
     request<{ deal: any }>(`/deals/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  getDeal: (id: string) =>
+    request<{ deal: any; contacts: { theirs: any[]; ours: any[]; other: any[] }; action_items: any[]; notes: any[]; company: any; users: any[] }>(`/deals/${id}`),
+  deleteDeal: (id: string) =>
+    request<{ ok: boolean }>(`/deals/${id}`, { method: 'DELETE' }),
+  getDealTimeline: (id: string) =>
+    request<{ entries: any[] }>(`/deals/${id}/timeline`),
+  addDealContact: (dealId: string, data: { contact_id: string; role: string; side: string }) =>
+    request<{ ok: boolean }>(`/deals/${dealId}/contacts`, { method: 'POST', body: JSON.stringify(data) }),
+  removeDealContact: (dealId: string, contactId: string) =>
+    request<{ ok: boolean }>(`/deals/${dealId}/contacts/${contactId}`, { method: 'DELETE' }),
+  createDealActionItem: (dealId: string, data: { description: string; assignee_id: string | null; due_date: string | null }) =>
+    request<{ action_item: any }>(`/deals/${dealId}/action-items`, { method: 'POST', body: JSON.stringify(data) }),
+  updateDealActionItem: (dealId: string, itemId: string, data: any) =>
+    request<{ action_item: any }>(`/deals/${dealId}/action-items/${itemId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteDealActionItem: (dealId: string, itemId: string) =>
+    request<{ ok: boolean }>(`/deals/${dealId}/action-items/${itemId}`, { method: 'DELETE' }),
+  createDealNote: (dealId: string, data: { content: string }) =>
+    request<{ note: any }>(`/deals/${dealId}/notes`, { method: 'POST', body: JSON.stringify(data) }),
+  updateDealNote: (dealId: string, noteId: string, data: { content: string }) =>
+    request<{ note: any }>(`/deals/${dealId}/notes/${noteId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteDealNote: (dealId: string, noteId: string) =>
+    request<{ ok: boolean }>(`/deals/${dealId}/notes/${noteId}`, { method: 'DELETE' }),
 
   // Tags
-  listTags: () => request<{ tags: any[] }>('/tags'),
-  createTag: (data: any) =>
+  listTags: (entityType?: string) => {
+    const q = entityType ? `?entity_type=${entityType}` : '';
+    return request<{ tags: any[] }>(`/tags${q}`);
+  },
+  createTag: (data: { name: string; color?: string; entity_type?: string }) =>
     request<{ tag: any }>('/tags', { method: 'POST', body: JSON.stringify(data) }),
+  applyContactTags: (contactId: string, tagIds: string[]) =>
+    request<{ ok: boolean }>(`/contacts/${contactId}/tags`, {
+      method: 'POST', body: JSON.stringify({ tag_ids: tagIds }),
+    }),
+  removeContactTag: (contactId: string, tagId: string) =>
+    request<{ ok: boolean }>(`/contacts/${contactId}/tags/${tagId}`, { method: 'DELETE' }),
+  applyCompanyTags: (companyId: string, tagIds: string[]) =>
+    request<{ ok: boolean }>(`/companies/${companyId}/tags`, {
+      method: 'POST', body: JSON.stringify({ tag_ids: tagIds }),
+    }),
+  removeCompanyTag: (companyId: string, tagId: string) =>
+    request<{ ok: boolean }>(`/companies/${companyId}/tags/${tagId}`, { method: 'DELETE' }),
+  updateTag: (id: string, data: { name?: string; color?: string }) =>
+    request<{ tag: any }>(`/tags/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteTag: (id: string) =>
+    request<{ ok: boolean }>(`/tags/${id}`, { method: 'DELETE' }),
+  getContactFilterCounts: () =>
+    request<{ contact_type: Record<string, number>; tags: Record<string, number>; overdue_followups: number }>('/contacts/filter-counts'),
+  getCompanyFilterCounts: () =>
+    request<{ tags: Record<string, number> }>('/companies/filter-counts'),
 
   // Tasks
   listTasks: (params?: Record<string, string>) => {
@@ -143,10 +205,24 @@ export const api = {
   // Approval queue
   listApprovalQueue: (status = 'pending') =>
     request<{ entries: any[] }>(`/approval-queue?status=${status}`),
+  listApprovalQueueGrouped: (params?: Record<string, string>) => {
+    const q = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<{ entities: any[] }>(`/approval-queue/grouped${q}`);
+  },
   approveItem: (id: string) =>
-    request<{ ok: boolean }>(`/approval-queue/${id}/approve`, { method: 'POST' }),
+    request<{ ok: boolean; re_enrich_triggered?: boolean }>(`/approval-queue/${id}/approve`, { method: 'POST' }),
   rejectItem: (id: string) =>
     request<{ ok: boolean }>(`/approval-queue/${id}/reject`, { method: 'POST' }),
+  approveAllForEntity: (entityType: string, entityId: string) =>
+    request<{ ok: boolean; resolved_count: number }>('/approval-queue/approve-all', {
+      method: 'POST', body: JSON.stringify({ entity_type: entityType, entity_id: entityId }),
+    }),
+  rejectAllForEntity: (entityType: string, entityId: string) =>
+    request<{ ok: boolean; resolved_count: number }>('/approval-queue/reject-all', {
+      method: 'POST', body: JSON.stringify({ entity_type: entityType, entity_id: entityId }),
+    }),
+  getContactPendingUpdates: (id: string) =>
+    request<{ updates: any[] }>(`/contacts/${id}/pending-updates`),
 
   // Agent
   listSessions: () => request<{ sessions: any[] }>('/agent/sessions'),
@@ -154,6 +230,8 @@ export const api = {
     request<{ session: any; messages: any[] }>(`/agent/sessions/${id}/messages`),
   deleteSession: (id: string) =>
     request<{ ok: boolean }>(`/agent/sessions/${id}`, { method: 'DELETE' }),
+  renameSession: (id: string, title: string) =>
+    request<{ ok: boolean }>(`/agent/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
 
   // Campaigns
   listCampaigns: () => request<{ campaigns: any[] }>('/campaigns'),
@@ -162,6 +240,9 @@ export const api = {
     request<{ campaign: any }>('/campaigns', { method: 'POST', body: JSON.stringify(data) }),
   sendCampaign: (id: string) =>
     request<{ ok: boolean }>(`/campaigns/${id}/send`, { method: 'POST' }),
+
+  // Users
+  listUsers: () => request<{ users: any[] }>('/admin/users').catch(() => ({ users: [] })),
 
   // Admin
   listDlq: (status = 'unresolved') =>
@@ -174,6 +255,19 @@ export const api = {
 
   // Sync
   getSyncStatus: () => request<any>('/sync/status'),
+  getSyncConfig: () => request<{ config: { sync_history_days: number } }>('/sync/config'),
+  updateSyncConfig: (data: { sync_history_days: number }) =>
+    request<{ ok: boolean }>('/sync/config', { method: 'PATCH', body: JSON.stringify(data) }),
+
+  // Backfill
+  startBackfill: (data: { user_id?: string; days_back: number }) =>
+    request<{ ok: boolean; progress: any }>('/admin/backfill-email', { method: 'POST', body: JSON.stringify(data) }),
+  getBackfillProgress: () =>
+    request<{ progress: any }>('/admin/backfill-progress'),
+  triggerSync: (workflow: 'ingestion' | 'enrichment') =>
+    request<{ ok: boolean; instance_id: string }>('/admin/trigger-sync', {
+      method: 'POST', body: JSON.stringify({ workflow }),
+    }),
 
   // Integrations
   getIntegrationsStatus: () =>
@@ -181,6 +275,18 @@ export const api = {
 
   // Imports
   listImports: () => request<{ imports: any[] }>('/imports'),
+
+  // Auth
+  login: (email: string, password: string) =>
+    request<{ token: string; user: { id: string; email: string; full_name: string; role: string; org_id: string } }>(
+      '/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }
+    ),
+  logout: () =>
+    request<{ success: boolean }>('/auth/logout', { method: 'POST' }),
+  getMe: () =>
+    request<{ user: { id: string; email: string; full_name: string; role: string; org_id: string; avatar_url: string | null; last_login_at: string | null } }>(
+      '/auth/me'
+    ),
 };
 
 // --- Integration status types (mirrors src/handlers/integrations.ts) ---
@@ -217,7 +323,8 @@ export async function streamAgentQuery(
   file: File | null,
   onToken: (token: string) => void,
   onDone: () => void,
-  onError: (err: string) => void
+  onError: (err: string) => void,
+  onToolEvent?: (event: any) => void
 ): Promise<void> {
   const form = new FormData();
   form.append('query', query);
@@ -228,13 +335,19 @@ export async function streamAgentQuery(
 
   const token = getAuthToken();
 
-  const res = await fetch(`${API_BASE}/agent/query`, {
-    method: 'POST',
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: form,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/agent/query`, {
+      method: 'POST',
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: form,
+    });
+  } catch (e) {
+    onError(`Network error: ${(e as Error).message || 'failed to connect'}`);
+    return;
+  }
 
   if (res.status === 401) {
     clearAuthToken();
@@ -254,27 +367,47 @@ export async function streamAgentQuery(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let receivedContent = false;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const json = line.slice(6).trim();
-      if (json === '[DONE]') {
-        onDone();
-        return;
-      }
-      try {
-        const evt = JSON.parse(json);
-        if (evt.text) onToken(evt.text);
-      } catch {
-        // skip
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const json = line.slice(6).trim();
+        if (json === '[DONE]') {
+          onDone();
+          return;
+        }
+        try {
+          const evt = JSON.parse(json);
+          if (evt.type === 'session') {
+            onToolEvent?.({ type: 'session', session_id: evt.session_id });
+          } else if (evt.text) {
+            receivedContent = true;
+            onToken(evt.text);
+          }
+          if (evt.type === 'tool_call' || evt.type === 'tool_result') {
+            onToolEvent?.(evt);
+          }
+        } catch {
+          // skip malformed SSE line
+        }
       }
     }
+  } catch (e) {
+    onError(`Stream interrupted: ${(e as Error).message || 'connection lost'}`);
+    return;
   }
-  onDone();
+
+  // Stream ended without [DONE] — premature close
+  if (receivedContent) {
+    onDone();
+  } else {
+    onError('Connection lost — no response received. The request may have timed out.');
+  }
 }

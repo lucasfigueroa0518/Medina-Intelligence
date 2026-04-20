@@ -66,35 +66,69 @@ function ApprovalTab() {
 
   return (
     <div className="space-y-3">
-      {items.map(item => (
-        <div key={item.id} className="card flex items-center justify-between">
-          <div className="flex-1">
-            <div className="flex items-center gap-2">
-              <span className="badge capitalize">{item.entity_type}</span>
-              <span className="text-sm text-text-secondary">{item.field_name}</span>
-              {item.evidence_visible === false && (
-                <span className="text-xs text-text-muted italic">🔒 Private source</span>
-              )}
+      {items.map(item => {
+        const display = cleanValue(item.proposed_value);
+        const currentDisplay = item.current_value ? cleanValue(item.current_value) : null;
+        const isUrl = item.field_name?.includes('url');
+        return (
+          <div key={item.id} className="card flex items-center justify-between">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="badge capitalize">{item.entity_type}</span>
+                <span className="text-xs font-semibold text-amber-400 uppercase tracking-wider">{humanField(item.field_name)}</span>
+                {item.evidence_visible === false && (
+                  <span className="text-xs text-text-muted italic">🔒 Private source</span>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5 mt-2 text-sm flex-wrap">
+                {currentDisplay ? (
+                  <span className="text-text-muted line-through truncate max-w-[200px]">{shortUrl(currentDisplay)}</span>
+                ) : (
+                  <span className="text-text-muted/50 italic text-xs">empty</span>
+                )}
+                <span className="text-text-muted">&rarr;</span>
+                {isUrl ? (
+                  <a href={display} target="_blank" rel="noopener" className="text-accent-magenta hover:underline font-medium truncate max-w-[280px]">{shortUrl(display)}</a>
+                ) : (
+                  <span className="text-text-primary font-medium truncate max-w-[280px]">{display}</span>
+                )}
+              </div>
+              <div className="text-[11px] text-text-muted mt-1">
+                {item.source_description || item.change_type || 'Unknown source'} &middot; {Math.round((item.confidence || 0) * 100)}% confidence
+              </div>
             </div>
-            <div className="text-sm mt-2 text-text-primary">
-              Proposed: <code className="font-mono text-xs">{item.proposed_value}</code>
-            </div>
-            <div className="text-xs text-text-muted mt-1">
-              Confidence: {((item.confidence || 0) * 100).toFixed(0)}%
+            <div className="flex gap-2 shrink-0">
+              <button onClick={() => approve(item.id)} className="btn-primary">
+                Approve
+              </button>
+              <button onClick={() => reject(item.id)} className="btn-destructive">
+                Reject
+              </button>
             </div>
           </div>
-          <div className="flex gap-2">
-            <button onClick={() => approve(item.id)} className="btn-primary">
-              Approve
-            </button>
-            <button onClick={() => reject(item.id)} className="btn-destructive">
-              Reject
-            </button>
-          </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
+}
+
+function cleanValue(raw: any): string {
+  if (raw == null) return '';
+  const s = String(raw);
+  try {
+    const parsed = JSON.parse(s);
+    if (parsed && typeof parsed === 'object' && parsed.value !== undefined) return String(parsed.value);
+    if (typeof parsed === 'string') return parsed;
+  } catch { /* not JSON */ }
+  return s;
+}
+
+function shortUrl(v: string): string {
+  return v.replace(/^https?:\/\//, '').replace(/^www\./, '');
+}
+
+function humanField(f: string): string {
+  return (f || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
 function DlqTab() {

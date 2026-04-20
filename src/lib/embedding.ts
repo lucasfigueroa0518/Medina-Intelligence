@@ -19,7 +19,10 @@ export async function chunkEmbedAndPersist(
   env: Env
 ): Promise<VectorIndexEntry> {
   const prefixedChunk = prefixChunk(text, meta);
-  const vectorId = `${meta.org_id}_${meta.source_table}_${meta.source_id}_${chunkIndex}`;
+  // Vectorize max ID is 64 bytes. Compact: strip UUID dashes, truncate org_id.
+  const orgPrefix = meta.org_id.substring(0, 8);
+  const compactSourceId = meta.source_id.replace(/-/g, '');
+  const vectorId = `${orgPrefix}_${meta.source_table}_${compactSourceId}_${chunkIndex}`;
 
   const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
     text: [prefixedChunk],

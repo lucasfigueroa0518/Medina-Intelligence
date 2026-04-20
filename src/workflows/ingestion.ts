@@ -15,6 +15,10 @@ import { stageAndCommitApprovals } from '../lib/stage-approvals';
 import { invalidateRagCache } from '../lib/cache';
 import { chunkArray, getCurrentSyncJobId } from '../lib/helpers';
 import { emitAudit } from '../lib/audit';
+import { calculateAllRelationshipStatuses } from '../lib/relationship-status';
+import { calculateAllRelationshipOwners } from '../lib/relationship-owner';
+import { analyzeAllCommsPatterns } from '../lib/communication-patterns';
+import { recalculateAllAssociations } from '../lib/associations';
 
 // Module-load probe: if this never fires in `wrangler tail`, the crash is at
 // import/class-definition time, not in run().
@@ -209,7 +213,31 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         await invalidateRagCache(org_id!, this.env);
       });
 
-      // Step 7: finalize
+      // Step 7: post-ingestion calculations
+      console.log('[IngestionWorkflow] step → post-ingestion-calcs');
+      await step.do('post-ingestion-calcs', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
+        try {
+          const statusCount = await calculateAllRelationshipStatuses(org_id!, this.env);
+          console.log(`[IngestionWorkflow] relationship statuses updated: ${statusCount}`);
+        } catch (e) { console.error('[IngestionWorkflow] relationship-status calc failed:', e); }
+
+        try {
+          const ownerCount = await calculateAllRelationshipOwners(org_id!, this.env);
+          console.log(`[IngestionWorkflow] relationship owners updated: ${ownerCount}`);
+        } catch (e) { console.error('[IngestionWorkflow] relationship-owner calc failed:', e); }
+
+        try {
+          const commsCount = await analyzeAllCommsPatterns(org_id!, this.env);
+          console.log(`[IngestionWorkflow] comms patterns analyzed: ${commsCount}`);
+        } catch (e) { console.error('[IngestionWorkflow] comms-patterns calc failed:', e); }
+
+        try {
+          await recalculateAllAssociations(org_id!, this.env);
+          console.log(`[IngestionWorkflow] entity associations recalculated`);
+        } catch (e) { console.error('[IngestionWorkflow] associations calc failed:', e); }
+      });
+
+      // Step 8: finalize
       console.log('[IngestionWorkflow] step → finalize');
       await step.do('finalize', async () => {
         await this.env.D1.prepare(

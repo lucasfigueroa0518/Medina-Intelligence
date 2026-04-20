@@ -7,6 +7,8 @@ import type { AuditEvent } from './types/audit';
 import type { WebhookQueueMessage } from './types/webhooks';
 
 import { requireAuth, requireRole } from './handlers/auth';
+import { isTokenRevoked } from './handlers/auth-login';
+import * as AuthLogin from './handlers/auth-login';
 import { jsonResponse, errorResponse } from './handlers/utils';
 
 import * as Contacts from './handlers/contacts';
@@ -40,16 +42,30 @@ export { CampaignSendWorkflow } from './workflows/campaign-send';
 
 // --- CORS helpers ---
 
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-  'Access-Control-Allow-Headers': 'Authorization,Content-Type',
-  'Access-Control-Max-Age': '86400',
-};
+const DEFAULT_ORIGINS = ['http://localhost:3000'];
 
-function withCors(res: Response): Response {
+function getAllowedOrigins(env: Env): string[] {
+  if (env.ALLOWED_ORIGINS) {
+    return env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean);
+  }
+  return DEFAULT_ORIGINS;
+}
+
+function corsHeaders(origin: string, env: Env): Record<string, string> {
+  const allowed = getAllowedOrigins(env);
+  const resolved = allowed.includes(origin) ? origin : allowed[0];
+  return {
+    'Access-Control-Allow-Origin': resolved,
+    'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization,Content-Type',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Max-Age': '86400',
+  };
+}
+
+function withCors(res: Response, origin: string, env: Env): Response {
   const headers = new Headers(res.headers);
-  for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
+  for (const [k, v] of Object.entries(corsHeaders(origin, env))) headers.set(k, v);
   return new Response(res.body, { status: res.status, headers });
 }
 
@@ -60,8 +76,9 @@ async function handleRequest(
   env: Env,
   ctxExec: ExecutionContext
 ): Promise<Response> {
+  const reqOrigin = request.headers.get('Origin') || '';
   if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
+    return new Response(null, { status: 204, headers: corsHeaders(reqOrigin, env) });
   }
 
   const url = new URL(request.url);
@@ -107,6 +124,9 @@ if (path === '/webhooks/firefly' && method === 'POST') {
   if (path === '/webhooks/slack' && method === 'POST') {
     return Webhooks.receiveSlackWebhook(request, env);
   }
+  if (path === '/webhooks/outlook-mail' && (method === 'POST' || method === 'GET')) {
+    return Webhooks.receiveOutlookMailWebhook(request, env, ctxExec);
+  }
 
   if (path === '/auth/outlook/callback' && method === 'GET') {
     return AuthOAuth.outlookOAuthCallback(request, env);
@@ -118,10 +138,34 @@ if (path === '/webhooks/firefly' && method === 'POST') {
     return AuthOAuth.outlookOAuthStart(request, env);
   }
 
+  // --- Public auth endpoints ---
+  if (path === '/api/auth/login' && method === 'POST') {
+    return AuthLogin.login(request, env);
+  }
+  if (path === '/api/auth/register' && method === 'POST') {
+    return AuthLogin.register(request, env);
+  }
+  if (path === '/api/auth/set-initial-password' && method === 'POST') {
+    return AuthLogin.setInitialPassword(request, env);
+  }
+
   // --- Authenticated routes ---
   const authResult = await requireAuth(request, env);
   if (authResult instanceof Response) return authResult;
   const ctx = authResult;
+
+  // Check token revocation
+  const authHeader = request.headers.get('Authorization') || '';
+  const rawToken = authHeader.replace(/^Bearer\s+/i, '');
+  if (rawToken) {
+    const revoked = await isTokenRevoked(rawToken, env);
+    if (revoked) {
+      return new Response(
+        JSON.stringify({ error: 'AUTH_TOKEN_REVOKED' }),
+        { status: 401, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+  }
 
   return routeAuthenticated(path, method, url, request, ctx, env, ctxExec);
 }
@@ -135,10 +179,21 @@ async function routeAuthenticated(
   env: Env,
   ctxExec: ExecutionContext
 ): Promise<Response> {
+  // --- Auth (authenticated) ---
+  if (path === '/api/auth/logout' && method === 'POST') {
+    return AuthLogin.logout(request, ctx, env);
+  }
+  if (path === '/api/auth/me' && method === 'GET') {
+    return AuthLogin.me(ctx, env);
+  }
+
   // --- Contacts ---
   if (path === '/api/contacts') {
     if (method === 'GET') return Contacts.listContacts(request, ctx, env);
-    if (method === 'POST') return Contacts.createContact(request, ctx, env);
+    if (method === 'POST') return Contacts.createContact(request, ctx, env, ctxExec);
+  }
+  if (path === '/api/contacts/filter-counts' && method === 'GET') {
+    return Contacts.getContactFilterCounts(ctx, env);
   }
   if (path === '/api/contacts/merge' && method === 'POST') {
     return Contacts.postContactMerge(request, ctx, env);
@@ -158,12 +213,17 @@ async function routeAuthenticated(
   if (m && method === 'GET') return Contacts.getContactTimeline(request, m[1], ctx, env);
   m = path.match(/^\/api\/contacts\/([^/]+)\/associations$/);
   if (m && method === 'GET') return Contacts.getContactAssociations(m[1], ctx, env);
+  m = path.match(/^\/api\/contacts\/([^/]+)\/pending-updates$/);
+  if (m && method === 'GET') return Approval.getPendingUpdates('contact', m[1], ctx, env);
   m = path.match(/^\/api\/contacts\/([^/]+)\/enrich$/);
   if (m && method === 'POST') return Contacts.enrichContactEndpoint(m[1], ctx, env, ctxExec);
   m = path.match(/^\/api\/contacts\/([^/]+)\/enrichment$/);
   if (m && method === 'GET') return Contacts.getContactEnrichment(m[1], ctx, env);
 
   // --- Companies ---
+  if (path === '/api/companies/filter-counts' && method === 'GET') {
+    return Companies.getCompanyFilterCounts(ctx, env);
+  }
   if (path === '/api/companies') {
     if (method === 'GET') return Companies.listCompanies(request, ctx, env);
     if (method === 'POST') return Companies.createCompany(request, ctx, env, ctxExec);
@@ -173,6 +233,7 @@ async function routeAuthenticated(
     const id = m[1];
     if (method === 'GET') return Companies.getCompany(id, ctx, env);
     if (method === 'PATCH') return Companies.updateCompany(request, id, ctx, env);
+    if (method === 'DELETE') return Companies.deleteCompany(id, ctx, env);
   }
   m = path.match(/^\/api\/companies\/([^/]+)\/news$/);
   if (m && method === 'GET') return Companies.getCompanyNews(m[1], ctx, env);
@@ -180,13 +241,50 @@ async function routeAuthenticated(
   if (m && method === 'POST') return Companies.applyCompanyTags(request, m[1], ctx, env);
   m = path.match(/^\/api\/companies\/([^/]+)\/tags\/([^/]+)$/);
   if (m && method === 'DELETE') return Companies.removeCompanyTag(m[1], m[2], ctx, env);
+  m = path.match(/^\/api\/companies\/([^/]+)\/associations$/);
+  if (m && method === 'GET') return Companies.getCompanyAssociations(m[1], ctx, env);
   m = path.match(/^\/api\/companies\/([^/]+)\/enrich$/);
   if (m && method === 'POST') return Companies.enrichCompanyEndpoint(m[1], ctx, env, ctxExec);
+  m = path.match(/^\/api\/companies\/([^/]+)\/enrichment$/);
+  if (m && method === 'GET') return Companies.getCompanyEnrichment(m[1], ctx, env);
 
   // --- Deals ---
+  if (path === '/api/deals/metrics' && method === 'GET')
+    return Deals.getDealMetrics(ctx, env);
   if (path === '/api/deals') {
     if (method === 'GET') return Deals.listDeals(request, ctx, env);
     if (method === 'POST') return Deals.createDeal(request, ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/associations$/);
+  if (m && method === 'GET') return Deals.getDealAssociations(m[1], ctx, env);
+  m = path.match(/^\/api\/deals\/([^/]+)\/timeline$/);
+  if (m && method === 'GET') return Deals.getDealTimeline(request, m[1], ctx, env);
+  m = path.match(/^\/api\/deals\/([^/]+)\/contacts\/([^/]+)$/);
+  if (m && method === 'DELETE') return Deals.removeDealContact(m[1], m[2], ctx, env);
+  m = path.match(/^\/api\/deals\/([^/]+)\/contacts$/);
+  if (m) {
+    if (method === 'GET') return Deals.listDealContacts(m[1], ctx, env);
+    if (method === 'POST') return Deals.addDealContact(request, m[1], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/action-items\/([^/]+)$/);
+  if (m) {
+    if (method === 'PATCH') return Deals.updateDealActionItem(request, m[1], m[2], ctx, env);
+    if (method === 'DELETE') return Deals.deleteDealActionItem(m[1], m[2], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/action-items$/);
+  if (m) {
+    if (method === 'GET') return Deals.listDealActionItems(m[1], ctx, env);
+    if (method === 'POST') return Deals.createDealActionItem(request, m[1], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/notes\/([^/]+)$/);
+  if (m) {
+    if (method === 'PATCH') return Deals.updateDealNote(request, m[1], m[2], ctx, env);
+    if (method === 'DELETE') return Deals.deleteDealNote(m[1], m[2], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/notes$/);
+  if (m) {
+    if (method === 'GET') return Deals.listDealNotes(m[1], ctx, env);
+    if (method === 'POST') return Deals.createDealNote(request, m[1], ctx, env);
   }
   m = path.match(/^\/api\/deals\/([^/]+)$/);
   if (m) {
@@ -218,7 +316,7 @@ async function routeAuthenticated(
 
   // --- Tags ---
   if (path === '/api/tags') {
-    if (method === 'GET') return Tags.listTags(ctx, env);
+    if (method === 'GET') return Tags.listTags(request, ctx, env);
     if (method === 'POST') return Tags.createTag(request, ctx, env);
   }
   m = path.match(/^\/api\/tags\/([^/]+)$/);
@@ -255,6 +353,12 @@ async function routeAuthenticated(
   if (path === '/api/sync/status' && method === 'GET') {
     return Sync.getSyncStatus(ctx, env);
   }
+  if (path === '/api/sync/config' && method === 'GET') {
+    return Admin.getSyncConfig(ctx, env);
+  }
+  if (path === '/api/sync/config' && method === 'PATCH') {
+    return Admin.updateSyncConfig(request, ctx, env);
+  }
   if (path === '/api/approval-queue' && method === 'GET') {
     return Approval.listApprovalQueue(request, ctx, env);
   }
@@ -267,6 +371,15 @@ async function routeAuthenticated(
   }
   if (path === '/api/approval-queue/bulk-reject' && method === 'POST') {
     return Approval.bulkReject(request, ctx, env);
+  }
+  if (path === '/api/approval-queue/approve-all' && method === 'POST') {
+    return Approval.approveAllForEntity(request, ctx, env);
+  }
+  if (path === '/api/approval-queue/reject-all' && method === 'POST') {
+    return Approval.rejectAllForEntity(request, ctx, env);
+  }
+  if (path === '/api/approval-queue/grouped' && method === 'GET') {
+    return Approval.listApprovalQueueGrouped(request, ctx, env);
   }
 
   // --- Agent ---
@@ -282,6 +395,7 @@ async function routeAuthenticated(
   if (m && method === 'GET') return Agent.getSessionTrace(m[1], ctx, env);
   m = path.match(/^\/api\/agent\/sessions\/([^/]+)$/);
   if (m && method === 'DELETE') return Agent.deleteSession(m[1], ctx, env);
+  if (m && method === 'PATCH') return Agent.updateSessionTitle(request, m[1], ctx, env);
 
   // --- Audit log ---
   if (path === '/api/audit-log' && method === 'GET') {
@@ -306,6 +420,10 @@ async function routeAuthenticated(
       return Admin.clearRateLimit(request, ctx, env);
     if (path === '/api/admin/trigger-sync' && method === 'POST')
       return Admin.triggerSync(request, ctx, env);
+    if (path === '/api/admin/backfill-email' && method === 'POST')
+      return Admin.backfillEmail(request, ctx, env);
+    if (path === '/api/admin/backfill-progress' && method === 'GET')
+      return Admin.getBackfillProgress(ctx, env);
   }
 
   if (path === '/api/system/status' && method === 'GET') return Admin.getSystemStatus(ctx, env);
@@ -359,7 +477,7 @@ async function handleScheduled(
 
   for (const org of orgs.results) {
     try {
-      if (cron === '*/20 * * * *') {
+      if (cron === '0 * * * *') {
         // Ingestion
         await env.INGESTION_WORKFLOW.create({
           id: `ingestion-${org.id}-${Date.now()}`,
@@ -408,12 +526,13 @@ export default {
     env: Env,
     ctxExec: ExecutionContext
   ): Promise<Response> {
+    const origin = request.headers.get('Origin') || '';
     try {
       const res = await handleRequest(request, env, ctxExec);
-      return withCors(res);
+      return withCors(res, origin, env);
     } catch (e) {
       console.error('Unhandled error:', e);
-      return withCors(errorResponse('INTERNAL_ERROR', 500, (e as Error).message));
+      return withCors(errorResponse('INTERNAL_ERROR', 500, (e as Error).message), origin, env);
     }
   },
 

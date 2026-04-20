@@ -52,7 +52,7 @@ class_name = "CampaignSendWorkflow"
 
 [triggers]
 crons = [
-  "*/20 * * * *",
+  "0 * * * *",
   "5 * * * *",
   "0 0 * * *",
 ]

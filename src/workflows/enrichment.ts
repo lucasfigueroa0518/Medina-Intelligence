@@ -10,6 +10,9 @@ import {
 import { invalidateRagCache } from '../lib/cache';
 import { chunkArray, getOrgSettings } from '../lib/helpers';
 import { emitAudit } from '../lib/audit';
+import { extractTranscriptSignals, generateMeetingSummary } from '../lib/transcript-extraction';
+import { routeTranscriptSignals, distributeMeetingSummary } from '../lib/signal-router';
+import { incrementalAssociationUpdate } from '../lib/associations';
 
 interface EnrichmentParams {
   org_id: string;
@@ -206,20 +209,104 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
         }
       });
 
-      // Step 5: event reconciliation
+      // Step 5: transcript signal extraction from Firefly meetings
+      console.log('[EnrichmentWorkflow] step → transcript-extraction');
+      await step.do('transcript-extraction', { retries: { limit: 1, delay: '15 seconds' } }, async () => {
+        const unextracted = await this.env.D1.prepare(
+          `SELECT id, title, start_time, transcript_r2_key FROM events
+           WHERE org_id = ? AND transcript_r2_key IS NOT NULL
+             AND signals_extracted_at IS NULL
+             AND deleted_at IS NULL
+           ORDER BY start_time DESC LIMIT 10`
+        ).bind(org_id!).all<{
+          id: string; title: string; start_time: string; transcript_r2_key: string;
+        }>();
+
+        console.log(`[EnrichmentWorkflow] ${unextracted.results.length} transcripts to extract`);
+
+        for (const event of unextracted.results) {
+          try {
+            const obj = await this.env.R2.get(event.transcript_r2_key);
+            if (!obj) continue;
+            const transcriptText = await obj.text();
+            if (transcriptText.length < 100) continue;
+
+            const attendees = await this.env.D1.prepare(
+              `SELECT display_name as name, email FROM event_attendees WHERE event_id = ?`
+            ).bind(event.id).all<{ name: string; email: string | null }>();
+
+            const participants = attendees.results.map(a => ({
+              name: a.name,
+              email: a.email || undefined,
+            }));
+
+            const signals = await extractTranscriptSignals(
+              transcriptText, event.title, participants, org_id!, this.env
+            );
+
+            const totalSignals =
+              signals.contact_signals.length +
+              signals.company_signals.length +
+              signals.deal_signals.length +
+              signals.relationship_signals.length;
+
+            console.log(`[EnrichmentWorkflow] event=${event.id}: ${totalSignals} signals extracted`);
+
+            if (totalSignals > 0) {
+              const result = await routeTranscriptSignals(signals, event.id, org_id!, this.env);
+              console.log(`[EnrichmentWorkflow] routed: contacts=${result.contact_signals_routed} companies=${result.company_signals_routed} deals=${result.deal_signals_routed} relationships=${result.relationship_signals_routed} new_companies=${result.new_companies_flagged.length}`);
+            }
+
+            const summary = await generateMeetingSummary(
+              transcriptText, event.title, event.start_time, participants, org_id!, this.env
+            );
+
+            if (summary) {
+              const distributed = await distributeMeetingSummary(
+                summary, event.id, event.title, event.start_time, org_id!, this.env
+              );
+              console.log(`[EnrichmentWorkflow] meeting summary distributed to ${distributed} contacts`);
+
+              await this.env.D1.prepare(
+                `UPDATE events SET summary = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+              ).bind(summary.substring(0, 2000), event.id).run();
+            }
+
+            await this.env.D1.prepare(
+              `UPDATE events SET signals_extracted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+            ).bind(event.id).run();
+          } catch (e) {
+            console.error(`[EnrichmentWorkflow] transcript extraction failed event=${event.id}:`, errMessage(e));
+          }
+        }
+      });
+
+      // Step 6: event reconciliation
       console.log('[EnrichmentWorkflow] step → reconcile-events');
       await step.do('reconcile-events', async () => {
         await promoteToStandalone(org_id!, this.env);
         await flagStaleOrphanedEvents(org_id!, this.env);
       });
 
-      // Step 6: cache invalidation
+      // Step 7: update associations for enriched contacts
+      console.log('[EnrichmentWorkflow] step → update-associations');
+      await step.do('update-associations', async () => {
+        for (const cid of contacts) {
+          try {
+            await incrementalAssociationUpdate(cid, org_id!, this.env);
+          } catch (e) {
+            console.error(`[EnrichmentWorkflow] association update failed ${cid}: ${errMessage(e)}`);
+          }
+        }
+      });
+
+      // Step 8: cache invalidation
       console.log('[EnrichmentWorkflow] step → invalidate-cache');
       await step.do('invalidate-cache', async () => {
         await invalidateRagCache(org_id!, this.env);
       });
 
-      // Step 7: finalize
+      // Step 9: finalize
       console.log('[EnrichmentWorkflow] step → finalize');
       await step.do('finalize', async () => {
         await this.env.D1.prepare(

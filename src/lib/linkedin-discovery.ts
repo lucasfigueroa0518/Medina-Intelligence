@@ -11,9 +11,9 @@
 // discovery step is about recall; ReverseContact is about precision.
 
 import type { Env } from '../types/env';
-import { callClaude } from './claude';
+import { callGemini } from './gemini';
 import {
-  checkClaudeRateLimit,
+  checkGeminiRateLimit,
   checkEnrichmentRateLimit,
   recordEnrichmentRateLimit,
 } from './rate-limit';
@@ -102,12 +102,60 @@ function dedupeUrls(urls: string[]): string[] {
   return out;
 }
 
-/** Extract ALL linkedin.com/in/ URLs from any text Claude returned. */
+/** Extract ALL linkedin.com/in/ URLs from any text returned by the LLM. */
 function extractLinkedInUrls(text: string): string[] {
   const matches = text.match(
     /https?:\/\/(?:www\.)?linkedin\.com\/in\/[a-zA-Z0-9\-_%.]+\/?/gi
   );
   return matches ? dedupeUrls(matches) : [];
+}
+
+/**
+ * Detect whether a LinkedIn URL was likely fabricated by an LLM.
+ *
+ * Real LinkedIn URLs have an alphanumeric disambiguation suffix assigned by
+ * LinkedIn: linkedin.com/in/john-smith-a1b2c3d4 or linkedin.com/in/jsmith-1234567
+ *
+ * Fabricated URLs are just the person's name jammed together:
+ *   linkedin.com/in/thomaspozo, linkedin.com/in/lucas-figueroa-helios
+ */
+export function assessLinkedInUrlAuthenticity(
+  url: string,
+  personName?: string
+): { likelyFabricated: boolean; confidence: number; reason: string } {
+  const match = url.match(/linkedin\.com\/in\/([a-zA-Z0-9\-_%.]+?)(?:[\/?#]|$)/i);
+  if (!match) return { likelyFabricated: true, confidence: 0, reason: 'invalid_url' };
+
+  const slug = match[1].toLowerCase().replace(/%[0-9a-f]{2}/gi, '');
+
+  // Has LinkedIn's alphanumeric ID suffix (e.g., -b07671239, -4b7b2b137, -a1b2c3)
+  if (/[-_][a-f0-9]{6,}$/i.test(slug) || /[-_]\d{5,}$/.test(slug)) {
+    return { likelyFabricated: false, confidence: 0.9, reason: 'has_linkedin_id_suffix' };
+  }
+
+  if (personName) {
+    const nameParts = personName.toLowerCase().split(/\s+/).filter(p => p.length > 1);
+    const nameSlug = nameParts.join('-');
+    const nameCombined = nameParts.join('');
+    const slugClean = slug.replace(/[-_]/g, '');
+
+    if (slugClean === nameCombined || slug === nameSlug) {
+      return { likelyFabricated: true, confidence: 0.3, reason: 'slug_is_exact_name' };
+    }
+
+    if (slug.startsWith(nameSlug + '-') || slugClean.startsWith(nameCombined)) {
+      const suffix = slug.slice(nameSlug.length + 1);
+      if (suffix && !/[a-f0-9]{4,}/i.test(suffix) && !/\d{3,}/.test(suffix)) {
+        return { likelyFabricated: true, confidence: 0.3, reason: 'slug_is_name_plus_words' };
+      }
+    }
+  }
+
+  if (!/\d/.test(slug)) {
+    return { likelyFabricated: false, confidence: 0.5, reason: 'no_numbers_uncertain' };
+  }
+
+  return { likelyFabricated: false, confidence: 0.7, reason: 'has_numbers' };
 }
 
 async function stageDiscoveryForReview(
@@ -212,10 +260,10 @@ export async function discoverLinkedInUrl(
   }
 
   // Rate limits
-  if (!(await checkClaudeRateLimit(env, orgId, 'low'))) {
-    return { status: 'skipped', reason: 'claude_rate_limited' };
+  if (!(await checkGeminiRateLimit(env, orgId, 'low'))) {
+    return { status: 'skipped', reason: 'gemini_rate_limited' };
   }
-  if (!(await checkEnrichmentRateLimit('claude_enrichment', orgId, env))) {
+  if (!(await checkEnrichmentRateLimit('gemini_linkedin', orgId, env))) {
     return { status: 'skipped', reason: 'enrichment_backoff' };
   }
 
@@ -234,40 +282,47 @@ export async function discoverLinkedInUrl(
   // Try each strategy; stop at first URL found
   for (const strategy of strategies) {
     // Check rate limit before each call — we may exhaust RPM partway through
-    if (!(await checkClaudeRateLimit(env, orgId, 'low'))) {
+    if (!(await checkGeminiRateLimit(env, orgId, 'low'))) {
       console.log(`[linkedin-discovery] ${contact.id}: rate limited after strategy "${strategy.label}"`);
       break;
     }
 
     const prompt = `Search for: ${strategy.query}
 
-Find the LinkedIn profile URL (linkedin.com/in/...) for this person. Even if you are not 100% certain, return the best-match URL — we have a separate verification system that will confirm the identity.
+Find the LinkedIn profile URL (linkedin.com/in/...) for this person.
+
+CRITICAL RULES:
+- Return ONLY LinkedIn URLs you actually found in real search results.
+- DO NOT construct or guess URLs by combining the person's name (e.g., do NOT return linkedin.com/in/firstname-lastname just because the person's name is "Firstname Lastname").
+- A real LinkedIn URL has an alphanumeric suffix assigned by LinkedIn, like: linkedin.com/in/john-smith-a1b2c3d4 or linkedin.com/in/jdoe-1234567. If the URL you found is just the person's name without such a suffix, you likely fabricated it.
+- If you cannot find a real LinkedIn profile URL in search results, return NONE. Returning a fabricated URL is worse than returning NONE.
 
 If you find a URL, return it on its own line prefixed with URL:
 If you find multiple possible matches, return each on its own line prefixed with URL:
 If you truly find nothing, return NONE.
 
 Example response:
-URL: https://www.linkedin.com/in/johndoe`;
+URL: https://www.linkedin.com/in/johndoe-a1b2c3d4`;
 
     let response: string;
     try {
-      response = await callClaude(
+      const result = await callGemini(
         {
-          system: 'You are a LinkedIn profile finder. Search and return profile URLs. Be thorough — try multiple search approaches before giving up.',
+          system: 'You are a LinkedIn profile finder. Use Google Search to locate the correct linkedin.com/in/ URL for the person described. IMPORTANT: Only return URLs you actually found in search results. NEVER construct or guess a URL from the person\'s name — if you cannot find a real profile, say NONE.',
           user: prompt,
-          max_tokens: 300,
+          max_tokens: 400,
           orgId,
         },
         'low',
         env
       );
+      response = result.text;
     } catch (e: any) {
-      if (String(e?.message).includes('CLAUDE_RATE_LIMITED')) {
-        await recordEnrichmentRateLimit('claude_enrichment', orgId, env);
-        return { status: 'skipped', reason: 'claude_rate_limited' };
+      if (String(e?.message).includes('GEMINI_RATE_LIMITED')) {
+        await recordEnrichmentRateLimit('gemini_linkedin', orgId, env);
+        return { status: 'skipped', reason: 'gemini_rate_limited' };
       }
-      console.error(`[linkedin-discovery] ${contact.id}: Claude error on strategy "${strategy.label}":`, e);
+      console.error(`[linkedin-discovery] ${contact.id}: Gemini error on strategy "${strategy.label}":`, e);
       continue;
     }
 
@@ -281,25 +336,31 @@ URL: https://www.linkedin.com/in/johndoe`;
 
     if (urls.length === 1) {
       const url = urls[0];
-      console.log(`[linkedin-discovery] ${contact.id}: FOUND via "${strategy.label}" → ${url}`);
+      const auth = assessLinkedInUrlAuthenticity(url, contact.full_name);
 
-      await env.D1
-        .prepare(
-          `UPDATE contacts SET linkedin_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-        )
-        .bind(url, contact.id)
-        .run();
+      console.log(
+        `[linkedin-discovery] ${contact.id}: FOUND via "${strategy.label}" → ${url} ` +
+        `(fabricated=${auth.likelyFabricated}, confidence=${auth.confidence}, reason=${auth.reason})`
+      );
+
+      if (auth.likelyFabricated) {
+        console.log(
+          `[linkedin-discovery] ${contact.id}: URL appears fabricated (${auth.reason}) — ` +
+          `slug matches name pattern without LinkedIn ID suffix. Discarding.`
+        );
+        continue; // try next strategy — this one fabricated
+      }
 
       await emitAudit(env, {
         org_id: orgId,
         action: 'update',
         entity_type: 'contact',
         entity_id: contact.id,
-        metadata: { field: 'linkedin_url', value: url, source: 'claude_linkedin_discovery', strategy: strategy.label },
+        metadata: { field: 'linkedin_url', value: url, source: 'gemini_linkedin_discovery', strategy: strategy.label, authenticity: auth },
         created_at: new Date().toISOString(),
       });
 
-      return { status: 'found', linkedin_url: url, confidence: 0.8 };
+      return { status: 'found', linkedin_url: url, confidence: auth.confidence };
     }
 
     if (urls.length > 1) {

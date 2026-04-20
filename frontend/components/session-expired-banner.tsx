@@ -1,8 +1,10 @@
 'use client';
 
 import React from 'react';
+import { useRouter } from 'next/navigation';
 
 export function SessionExpiredBanner() {
+  const router = useRouter();
   const [visible, setVisible] = React.useState(false);
 
   React.useEffect(() => {
@@ -18,17 +20,17 @@ export function SessionExpiredBanner() {
       <div>
         <div className="text-sm font-medium text-text-primary">Session expired</div>
         <div className="text-xs text-text-secondary mt-0.5">
-          Your auth token is no longer valid. Reload the page to get a fresh dev token.
+          Your session has expired. Please sign in again.
         </div>
       </div>
       <button
         onClick={() => {
           setVisible(false);
-          window.location.reload();
+          router.push('/login');
         }}
         className="btn-secondary text-xs py-1.5"
       >
-        Reload
+        Sign In
       </button>
     </div>
   );

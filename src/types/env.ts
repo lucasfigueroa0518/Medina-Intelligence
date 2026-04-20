@@ -33,6 +33,8 @@ export interface Env {
   // Frontend origin the OAuth callback redirects back to after storing tokens.
   // Defaults to http://localhost:3000 when unset.
   FRONTEND_URL?: string;
+  // Comma-separated list of allowed CORS origins.
+  ALLOWED_ORIGINS?: string;
 
   // --- Secrets (via `wrangler secret put`) ---
   AZURE_CLIENT_ID: string;
@@ -41,6 +43,8 @@ export interface Env {
   AZURE_REDIRECT_URI: string;
 
   ANTHROPIC_API_KEY: string;
+  GOOGLE_GEMINI_API_KEY: string;
+  GEMINI_MAX_RPM?: string;
 
   SLACK_CLIENT_ID: string;
   SLACK_CLIENT_SECRET: string;

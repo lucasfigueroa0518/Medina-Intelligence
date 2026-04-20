@@ -201,7 +201,7 @@ export interface CompanyFilter {
 
 export interface ClassifiableItem {
   type: 'email' | 'calendar_event' | 'slack_message' | 'news';
-  source: 'outlook' | 'slack' | 'claude_search';
+  source: 'outlook' | 'slack' | 'claude_search' | 'gemini_search';
   externalId: string;
   threadId?: string;
   subject?: string;
@@ -335,7 +335,7 @@ export interface TranscriptChunk {
 // --- Enrichment ---
 
 export interface EnrichmentSourceContribution {
-  source: 'reversecontact' | 'claude_web_search' | 'llm_extraction';
+  source: 'reversecontact' | 'claude_web_search' | 'llm_extraction' | 'gemini_web_search' | 'transcript_extraction';
   text: string;
   sanitized_text?: string;
   visibility: 'private' | 'org_wide' | 'confidential';

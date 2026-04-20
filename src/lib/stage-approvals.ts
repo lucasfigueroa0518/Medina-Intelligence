@@ -3,6 +3,7 @@ import type { Env } from '../types/env';
 import type { ClassifiedItem } from '../types/interfaces';
 import { hashShort, getOrgSettings } from './helpers';
 import { autoLinkAttendees, autoLinkConversationParticipants } from './associations';
+import { processEmailSignature, processDisplayNameUpdate } from './email-signature-parser';
 
 /**
  * Stages classified items as approval queue entries (or writes them directly
@@ -74,42 +75,42 @@ export async function stageAndCommitApprovals(
         ).bind(item.sentAt, cid).run();
       }
 
-      // Stub for audit idempotency marker
+      // Email signature extraction + display name updates (progressive enrichment)
+      if (item.type === 'email' && item.direction !== 'internal' && item.contactIds.length > 0) {
+        const senderContactId = item.contactIds[0];
+        try {
+          if (item.bodyText && item.bodyText.length > 100) {
+            await processEmailSignature(
+              senderContactId, orgId, item.bodyText,
+              item.fromName || '', item.entityId, item.sentAt, env
+            );
+          }
+          if (item.fromName && item.fromName.trim().split(/\s+/).length >= 2) {
+            await processDisplayNameUpdate(
+              senderContactId, orgId, item.fromName,
+              item.entityId, item.sentAt, env
+            );
+          }
+        } catch (e) {
+          console.error(`[sig-parser] error for contact ${senderContactId}:`, e);
+        }
+      }
+
       void idempotencyKey;
       continue;
     }
 
     if (item.entityType === 'news') {
-      const idempotencyKey = `${orgId}:news:create:${item.externalId}:${syncJobId}`;
-      await env.D1.prepare(
-        `INSERT OR IGNORE INTO conversations
-           (id, org_id, source, external_message_id, subject, body_r2_key, body_preview, direction, sent_at, from_email, to_emails, participant_user_ids, created_at, updated_at)
-         VALUES (?, ?, 'manual', ?, ?, ?, ?, 'inbound', ?, 'news@claude-search', '[]', '[]', ?, ?)`
-      )
-        .bind(
-          item.entityId,
-          orgId,
-          item.externalId,
-          item.subject || '',
-          item.metadata.r2_key,
-          item.bodyPreview,
-          item.sentAt,
-          now,
-          now
-        )
-        .run();
-
+      // News articles are already persisted in news_articles by fetchNewsForActiveCompanies.
+      // Only update the company's last_news_summary — do NOT duplicate into conversations.
       if (item.relatedCompanyId) {
         await env.D1.prepare(
           `UPDATE companies SET
-             news_relevance_score = MIN(1.0, COALESCE(news_relevance_score, 0) + 0.1),
-             news_score_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
              last_news_summary = ?,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
            WHERE id = ?`
         ).bind(item.bodyPreview.slice(0, 500), item.relatedCompanyId).run();
       }
-      void idempotencyKey;
       continue;
     }
 

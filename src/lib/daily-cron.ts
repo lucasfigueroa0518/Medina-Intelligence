@@ -4,6 +4,8 @@ import { chunkArray } from './helpers';
 import { promoteToStandalone, flagStaleOrphanedEvents } from './reconciliation';
 import { triggerContactEnrichment, triggerCompanyEnrichment } from './enrichment';
 import { checkClaudeRateLimit } from './rate-limit';
+import { recalculateAllAssociations } from './associations';
+import { renewExpiringSubscriptions } from './graph-subscriptions';
 
 export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await applyNewsScoreDecay(orgId, env); } catch (e) { console.error('Score decay:', e); }
@@ -15,6 +17,8 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await checkWebhookHealth(orgId, env); } catch (e) { console.error('Webhook health:', e); }
   try { await promoteToStandalone(orgId, env); } catch (e) { console.error('Standalone promotion:', e); }
   try { await flagStaleOrphanedEvents(orgId, env); } catch (e) { console.error('Orphan flagging:', e); }
+  try { await recalculateAllAssociations(orgId, env); } catch (e) { console.error('Association recalc:', e); }
+  try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
 }
 
 export async function applyNewsScoreDecay(orgId: string, env: Env): Promise<void> {

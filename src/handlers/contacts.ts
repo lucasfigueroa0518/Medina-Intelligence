@@ -4,7 +4,7 @@ import type { AuthContext, ContactFilter } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
-import { mergeContacts, resolveMergedContact } from '../lib/merge';
+import { mergeContacts, resolveMergedContact, cleanupVectorsForEntity } from '../lib/merge';
 import { canReadEmailContent } from '../lib/helpers';
 import { triggerContactEnrichment } from '../lib/enrichment';
 
@@ -92,7 +92,27 @@ export async function listContacts(
 
   const result = await env.D1.prepare(sql).bind(...binds, limit, offset).all();
 
-  return jsonResponse({ contacts: result.results, limit, offset });
+  const contacts = result.results as any[];
+  if (contacts.length > 0) {
+    const ids = contacts.map(c => c.id);
+    const ph = ids.map(() => '?').join(',');
+    const tagRows = await env.D1.prepare(
+      `SELECT ct.contact_id, t.id, t.name, t.color
+       FROM contact_tags ct JOIN tags t ON ct.tag_id = t.id
+       WHERE ct.contact_id IN (${ph})`
+    ).bind(...ids).all();
+    const tagMap = new Map<string, any[]>();
+    for (const r of tagRows.results as any[]) {
+      const arr = tagMap.get(r.contact_id) || [];
+      arr.push({ id: r.id, name: r.name, color: r.color });
+      tagMap.set(r.contact_id, arr);
+    }
+    for (const c of contacts) {
+      c.tags = tagMap.get(c.id) || [];
+    }
+  }
+
+  return jsonResponse({ contacts, limit, offset });
 }
 
 function sanitizeSortColumn(col: string): string {
@@ -129,12 +149,54 @@ function parseContactFilter(url: URL): ContactFilter {
   return f;
 }
 
+// --- GET /api/contacts/filter-counts ---
+
+export async function getContactFilterCounts(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const [typeCounts, tagCounts, overdueCount] = await Promise.all([
+    env.D1.prepare(
+      `SELECT contact_type, COUNT(*) as cnt FROM contacts
+       WHERE org_id = ? AND deleted_at IS NULL
+       GROUP BY contact_type`
+    ).bind(ctx.orgId).all<{ contact_type: string; cnt: number }>(),
+
+    env.D1.prepare(
+      `SELECT ct.tag_id, COUNT(*) as cnt FROM contact_tags ct
+       JOIN contacts c ON c.id = ct.contact_id
+       WHERE c.org_id = ? AND c.deleted_at IS NULL
+       GROUP BY ct.tag_id`
+    ).bind(ctx.orgId).all<{ tag_id: string; cnt: number }>(),
+
+    env.D1.prepare(
+      `SELECT COUNT(*) as cnt FROM contacts
+       WHERE org_id = ? AND deleted_at IS NULL
+         AND next_followup_date IS NOT NULL
+         AND next_followup_date < strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+    ).bind(ctx.orgId).first<{ cnt: number }>(),
+  ]);
+
+  const contact_type: Record<string, number> = {};
+  for (const r of typeCounts.results) contact_type[r.contact_type] = r.cnt;
+
+  const tags: Record<string, number> = {};
+  for (const r of tagCounts.results) tags[r.tag_id] = r.cnt;
+
+  return jsonResponse({
+    contact_type,
+    tags,
+    overdue_followups: overdueCount?.cnt || 0,
+  });
+}
+
 // --- POST /api/contacts ---
 
 export async function createContact(
   request: Request,
   ctx: AuthContext,
-  env: Env
+  env: Env,
+  ctxExec: ExecutionContext
 ): Promise<Response> {
   const body = await parseJsonBody<any>(request);
   if (!body?.full_name || typeof body.full_name !== 'string' || !body.full_name.trim()) {
@@ -200,6 +262,10 @@ export async function createContact(
 
   await invalidateRagCache(ctx.orgId, env);
 
+  if (body.auto_enrich !== false) {
+    ctxExec.waitUntil(triggerContactEnrichment(id, ctx.orgId, env));
+  }
+
   const created = await env.D1.prepare('SELECT * FROM contacts WHERE id = ?').bind(id).first();
   return jsonResponse({ contact: created }, 201);
 }
@@ -212,8 +278,11 @@ export async function getContact(
   env: Env
 ): Promise<Response> {
   const contact = await env.D1.prepare(
-    `SELECT c.*, co.name as company_name
-     FROM contacts c LEFT JOIN companies co ON c.company_id = co.id
+    `SELECT c.*, co.name as company_name,
+            u.full_name as owner_name, u.avatar_url as owner_avatar, u.email as owner_email
+     FROM contacts c
+     LEFT JOIN companies co ON c.company_id = co.id
+     LEFT JOIN users u ON c.relationship_owner_id = u.id
      WHERE c.id = ? AND c.org_id = ? AND c.deleted_at IS NULL`
   ).bind(id, ctx.orgId).first();
 
@@ -225,13 +294,49 @@ export async function getContact(
      WHERE ct.contact_id = ?`
   ).bind(id).all();
 
-  const associations = await env.D1.prepare(
-    `SELECT ca.contact_id_a, ca.contact_id_b, ca.relationship, ca.confidence
+  const assocRows = await env.D1.prepare(
+    `SELECT ca.contact_id_a, ca.contact_id_b, ca.relationship, ca.confidence,
+            c2.full_name as other_name, c2.job_title as other_title, c2.company_id as other_company_id
      FROM contact_associations ca
-     WHERE ca.contact_id_a = ? OR ca.contact_id_b = ?`
-  ).bind(id, id).all();
+     LEFT JOIN contacts c2 ON c2.id = CASE WHEN ca.contact_id_a = ? THEN ca.contact_id_b ELSE ca.contact_id_a END
+     WHERE (ca.contact_id_a = ? OR ca.contact_id_b = ?)
+     ORDER BY ca.confidence DESC
+     LIMIT 20`
+  ).bind(id, id, id).all();
 
-  return jsonResponse({ contact, tags: tags.results, associations: associations.results });
+  const signals = await env.D1.prepare(
+    `SELECT field_name, proposed_value, confidence, status, change_type, source_communication_id, created_at
+     FROM approval_queue
+     WHERE org_id = ? AND entity_type = 'contact' AND entity_id = ?
+       AND change_type NOT IN ('enrichment_report', 'progressive_update')
+     ORDER BY created_at DESC LIMIT 10`
+  ).bind(ctx.orgId, id).all();
+
+  const weeklyInteractions = await env.D1.prepare(
+    `SELECT strftime('%Y-%W', conv.sent_at) as week,
+            MIN(conv.sent_at) as week_start,
+            COUNT(*) as cnt
+     FROM conversation_contacts cc
+     JOIN conversations conv ON cc.conversation_id = conv.id
+     WHERE cc.contact_id = ? AND conv.sent_at >= date('now', '-56 days')
+     GROUP BY week ORDER BY week`
+  ).bind(id).all();
+
+  const firstInteraction = await env.D1.prepare(
+    `SELECT MIN(conv.sent_at) as first_date
+     FROM conversation_contacts cc
+     JOIN conversations conv ON cc.conversation_id = conv.id
+     WHERE cc.contact_id = ?`
+  ).bind(id).first<{ first_date: string | null }>();
+
+  return jsonResponse({
+    contact,
+    tags: tags.results,
+    associations: assocRows.results,
+    signals: signals.results,
+    weekly_interactions: weeklyInteractions.results,
+    first_interaction_date: firstInteraction?.first_date || null,
+  });
 }
 
 // --- PATCH /api/contacts/:id ---
@@ -269,6 +374,14 @@ export async function updateContact(
     'pain_points',
     'investment_thesis_tags',
     'custom_fields',
+    'location',
+    'introduced_via',
+    'investment_focus',
+    'check_size_range',
+    'fund_name',
+    'commitment_status',
+    'engagement_status',
+    'relationship_owner_id',
   ];
 
   const updates: string[] = [];
@@ -279,6 +392,16 @@ export async function updateContact(
       binds.push(body[k]);
     }
   }
+
+  if ('engagement_status' in body) {
+    updates.push('engagement_status_manual = ?');
+    binds.push(1);
+  }
+  if ('relationship_owner_id' in body) {
+    updates.push('relationship_owner_manual = ?');
+    binds.push(1);
+  }
+
   if (updates.length === 0) return jsonResponse({ contact: before });
 
   updates.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
@@ -320,6 +443,11 @@ export async function deleteContact(
     `UPDATE contacts SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
   ).bind(id).run();
 
+  await env.D1.batch([
+    env.D1.prepare('DELETE FROM deal_contacts WHERE contact_id = ?').bind(id),
+    env.D1.prepare('DELETE FROM entity_associations WHERE (entity_a_type = ? AND entity_a_id = ?) OR (entity_b_type = ? AND entity_b_id = ?)').bind('contact', id, 'contact', id),
+  ]);
+
   await emitAudit(env, {
     org_id: ctx.orgId,
     user_id: ctx.userId,
@@ -330,6 +458,7 @@ export async function deleteContact(
     created_at: new Date().toISOString(),
   });
 
+  try { await cleanupVectorsForEntity(id, 'contacts', env); } catch { /* best-effort */ }
   await invalidateRagCache(ctx.orgId, env);
   return jsonResponse({ ok: true });
 }
@@ -497,13 +626,90 @@ export async function getContactAssociations(
   env: Env
 ): Promise<Response> {
   const rows = await env.D1.prepare(
-    `SELECT ca.*, c.id as other_id, c.full_name, c.avatar_url, c.company_id
-     FROM contact_associations ca
-     JOIN contacts c ON (ca.contact_id_a = c.id OR ca.contact_id_b = c.id) AND c.id != ?
-     WHERE (ca.contact_id_a = ? OR ca.contact_id_b = ?) AND ca.org_id = ?`
-  ).bind(id, id, id, ctx.orgId).all();
+    `SELECT ea.id, ea.entity_a_type, ea.entity_a_id, ea.entity_b_type, ea.entity_b_id,
+            ea.association_type, ea.strength, ea.reason, ea.evidence_count,
+            ea.first_seen_at, ea.last_seen_at,
+            CASE
+              WHEN ea.entity_a_type = 'contact' AND ea.entity_a_id = ? THEN ea.entity_b_type
+              ELSE ea.entity_a_type
+            END as other_type,
+            CASE
+              WHEN ea.entity_a_type = 'contact' AND ea.entity_a_id = ? THEN ea.entity_b_id
+              ELSE ea.entity_a_id
+            END as other_id
+     FROM entity_associations ea
+     WHERE ea.org_id = ?
+       AND ((ea.entity_a_type = 'contact' AND ea.entity_a_id = ?)
+         OR (ea.entity_b_type = 'contact' AND ea.entity_b_id = ?))
+     ORDER BY ea.strength DESC
+     LIMIT 100`
+  ).bind(id, id, ctx.orgId, id, id).all();
 
-  return jsonResponse({ associations: rows.results });
+  const hydrated = [];
+  for (const row of rows.results as any[]) {
+    let entityName: string | null = null;
+    let entityTitle: string | null = null;
+    let entityAvatar: string | null = null;
+
+    if (row.other_type === 'contact') {
+      const c = await env.D1.prepare(
+        'SELECT full_name, job_title, avatar_url FROM contacts WHERE id = ? AND deleted_at IS NULL'
+      ).bind(row.other_id).first<{ full_name: string; job_title: string | null; avatar_url: string | null }>();
+      if (c) {
+        entityName = c.full_name;
+        entityTitle = c.job_title;
+        entityAvatar = c.avatar_url;
+      }
+    } else if (row.other_type === 'company') {
+      const c = await env.D1.prepare(
+        'SELECT name, sector FROM companies WHERE id = ? AND deleted_at IS NULL'
+      ).bind(row.other_id).first<{ name: string; sector: string | null }>();
+      if (c) {
+        entityName = c.name;
+        entityTitle = c.sector;
+      }
+    } else if (row.other_type === 'deal') {
+      const d = await env.D1.prepare(
+        'SELECT title, stage FROM deals WHERE id = ? AND deleted_at IS NULL'
+      ).bind(row.other_id).first<{ title: string; stage: string | null }>();
+      if (d) {
+        entityName = d.title;
+        entityTitle = d.stage;
+      }
+    }
+
+    if (entityName) {
+      hydrated.push({
+        ...row,
+        entity_name: entityName,
+        entity_title: entityTitle,
+        entity_avatar: entityAvatar,
+      });
+    }
+  }
+
+  const grouped = new Map<string, any>();
+  for (const h of hydrated) {
+    const key = `${h.other_type}:${h.other_id}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      if (!existing.association_types.includes(h.association_type)) {
+        existing.association_types.push(h.association_type);
+      }
+      if (h.strength > existing.strength) existing.strength = h.strength;
+      if (h.reason && !existing.reason.includes(h.reason)) {
+        existing.reason = `${existing.reason} · ${h.reason}`;
+      }
+      existing.evidence_count = (existing.evidence_count || 0) + (h.evidence_count || 0);
+    } else {
+      grouped.set(key, {
+        ...h,
+        association_types: [h.association_type],
+      });
+    }
+  }
+
+  return jsonResponse({ associations: Array.from(grouped.values()) });
 }
 
 // --- POST /api/contacts/:id/enrich ---

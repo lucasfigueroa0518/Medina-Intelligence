@@ -3,8 +3,8 @@
 import React from 'react';
 import { X } from 'lucide-react';
 import { api } from '@/lib/api';
+import { CompanySearchField } from './company-search-field';
 
-// Matches TRD §3.4 contact_type enum.
 const CONTACT_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'individual', label: 'Individual' },
   { value: 'family', label: 'Family' },
@@ -21,6 +21,9 @@ interface ContactFormState {
   contact_type: string;
   linkedin_url: string;
   notes: string;
+  company_id: string | null;
+  company_name: string;
+  auto_enrich: boolean;
 }
 
 const EMPTY_FORM: ContactFormState = {
@@ -31,6 +34,9 @@ const EMPTY_FORM: ContactFormState = {
   contact_type: 'individual',
   linkedin_url: '',
   notes: '',
+  company_id: null,
+  company_name: '',
+  auto_enrich: true,
 };
 
 interface ContactCreateModalProps {
@@ -47,6 +53,7 @@ export function ContactCreateModal({
   const [form, setForm] = React.useState<ContactFormState>(EMPTY_FORM);
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [toast, setToast] = React.useState<string | null>(null);
   const firstFieldRef = React.useRef<HTMLInputElement>(null);
 
   // Reset state whenever the modal is (re)opened.
@@ -55,11 +62,18 @@ export function ContactCreateModal({
       setForm(EMPTY_FORM);
       setError(null);
       setSubmitting(false);
+      setToast(null);
       // Focus the name field on the next tick (after the element mounts).
       const t = setTimeout(() => firstFieldRef.current?.focus(), 0);
       return () => clearTimeout(t);
     }
   }, [open]);
+
+  React.useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3500);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   // Escape to dismiss.
   React.useEffect(() => {
@@ -91,15 +105,17 @@ export function ContactCreateModal({
 
     setSubmitting(true);
     try {
-      const payload: Record<string, string> = {
+      const payload: Record<string, string | boolean | null> = {
         full_name: form.full_name.trim(),
         contact_type: form.contact_type,
+        auto_enrich: form.auto_enrich,
       };
       if (form.email.trim()) payload.email = form.email.trim();
       if (form.phone.trim()) payload.phone = form.phone.trim();
       if (form.job_title.trim()) payload.job_title = form.job_title.trim();
       if (form.linkedin_url.trim()) payload.linkedin_url = form.linkedin_url.trim();
       if (form.notes.trim()) payload.notes = form.notes.trim();
+      if (form.company_id) payload.company_id = form.company_id;
 
       const res = await api.createContact(payload);
       onCreated(res.contact);
@@ -203,6 +219,16 @@ export function ContactCreateModal({
             </Field>
           </div>
 
+          <Field label="Company">
+            <CompanySearchField
+              companyId={form.company_id}
+              companyName={form.company_name}
+              onChange={(id, name) => setForm(f => ({ ...f, company_id: id, company_name: name }))}
+              onCompanyCreated={name => setToast(`\u2713 ${name} has been added to Companies`)}
+              disabled={submitting}
+            />
+          </Field>
+
           <Field label="LinkedIn URL">
             <input
               type="url"
@@ -235,25 +261,43 @@ export function ContactCreateModal({
         </form>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-border">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={submitting}
-            className="btn-ghost"
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={submitting || !form.full_name.trim()}
-            onClick={handleSubmit}
-            className="btn-primary"
-          >
-            {submitting ? 'Creating…' : 'Create Contact'}
-          </button>
+        <div className="flex items-center justify-between px-6 py-4 border-t border-border">
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={form.auto_enrich}
+              onChange={e => update('auto_enrich', e.target.checked)}
+              disabled={submitting}
+              className="w-3.5 h-3.5 rounded border-border accent-accent-magenta"
+            />
+            <span className="text-xs text-text-muted">Auto-enrich after creation</span>
+          </label>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={submitting}
+              className="btn-ghost"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={submitting || !form.full_name.trim()}
+              onClick={handleSubmit}
+              className="btn-primary"
+            >
+              {submitting ? 'Creating…' : 'Create Contact'}
+            </button>
+          </div>
         </div>
       </div>
+
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-[60] bg-bg-elevated border-l-4 border-semantic-success rounded-xl shadow-2xl px-5 py-3">
+          <div className="text-sm text-text-primary">{toast}</div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,7 +1,8 @@
-// TRD §7.3 — New contact discovery
+// TRD §7.3 — New contact discovery with company auto-association
 import type { Env } from '../types/env';
 import type { ClassifiableItem } from '../types/interfaces';
 import { emitAudit } from './audit';
+import { triggerContactEnrichment } from './enrichment';
 
 // Domains whose mail is always automated/transactional — never discover as contacts.
 export const AUTOMATED_DOMAINS = new Set<string>([
@@ -48,13 +49,36 @@ export const AUTOMATED_LOCAL_KEYWORDS: string[] = [
   'hello',
 ];
 
-const PERSONAL_DOMAINS = new Set([
+export const PERSONAL_DOMAINS = new Set([
   'gmail.com',
   'yahoo.com',
   'hotmail.com',
   'outlook.com',
   'icloud.com',
   'aol.com',
+  'protonmail.com',
+  'mail.com',
+  'live.com',
+  'msn.com',
+  'comcast.net',
+  'verizon.net',
+  'att.net',
+  'sbcglobal.net',
+  'cox.net',
+  'charter.net',
+  'earthlink.net',
+  'optonline.net',
+  'me.com',
+  'mac.com',
+  'ymail.com',
+  'rocketmail.com',
+  'fastmail.com',
+  'zoho.com',
+  'tutanota.com',
+  'hey.com',
+  'pm.me',
+  'proton.me',
+  'googlemail.com',
 ]);
 
 export type DiscoveryEligibility =
@@ -71,14 +95,8 @@ export function isAutomatedEmail(email: string): { blocked: boolean; reason?: st
   const local = lower.slice(0, atIdx);
   const domain = lower.slice(atIdx + 1);
 
-  if (AUTOMATED_DOMAINS.has(domain)) {
+  if (isAutomatedDomain(domain)) {
     return { blocked: true, reason: `automated_domain:${domain}` };
-  }
-  // Match subdomains of blocked roots (e.g. email.godaddy.com)
-  for (const d of AUTOMATED_DOMAINS) {
-    if (domain.endsWith(`.${d}`)) {
-      return { blocked: true, reason: `automated_domain:${d}` };
-    }
   }
 
   for (const kw of AUTOMATED_LOCAL_KEYWORDS) {
@@ -87,6 +105,163 @@ export function isAutomatedEmail(email: string): { blocked: boolean; reason?: st
     }
   }
   return { blocked: false };
+}
+
+function domainToCompanyName(domain: string): string {
+  const base = domain.split('.')[0];
+  return base
+    .replace(/[-_]/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function normalizeDomain(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .split('/')[0]
+    .trim();
+}
+
+export async function findDuplicateCompany(
+  name: string,
+  domain: string | null,
+  orgId: string,
+  env: Env
+): Promise<string | null> {
+  // 1. Exact domain match
+  if (domain) {
+    const byDomain = await env.D1.prepare(
+      'SELECT id FROM companies WHERE org_id = ? AND LOWER(domain) = ? AND deleted_at IS NULL LIMIT 1'
+    ).bind(orgId, domain.toLowerCase()).first<{ id: string }>();
+    if (byDomain) return byDomain.id;
+  }
+
+  // 2. Exact name match (case-insensitive)
+  const byName = await env.D1.prepare(
+    'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) = ? AND deleted_at IS NULL LIMIT 1'
+  ).bind(orgId, name.toLowerCase()).first<{ id: string }>();
+  if (byName) return byName.id;
+
+  // 3. Contains match for common suffixes (e.g. "Helios Marketing" matches "Helios Marketing Inc")
+  const baseName = name.toLowerCase().replace(/\s+(inc|llc|ltd|corp|co|company|group|holdings)\.?$/i, '').trim();
+  if (baseName.length >= 3 && baseName !== name.toLowerCase()) {
+    const byFuzzy = await env.D1.prepare(
+      'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) LIKE ? AND deleted_at IS NULL LIMIT 1'
+    ).bind(orgId, `%${baseName}%`).first<{ id: string }>();
+    if (byFuzzy) return byFuzzy.id;
+  }
+
+  return null;
+}
+
+export async function findCompanyByDomain(
+  emailDomain: string,
+  orgId: string,
+  env: Env
+): Promise<string | null> {
+  const domain = emailDomain.toLowerCase();
+
+  // 1. Match by domain column
+  const byDomain = await env.D1.prepare(
+    'SELECT id FROM companies WHERE org_id = ? AND LOWER(domain) = ? AND deleted_at IS NULL LIMIT 1'
+  ).bind(orgId, domain).first<{ id: string }>();
+  if (byDomain) return byDomain.id;
+
+  // 2. Match by website containing the domain
+  const byWebsite = await env.D1.prepare(
+    'SELECT id FROM companies WHERE org_id = ? AND LOWER(website) LIKE ? AND deleted_at IS NULL LIMIT 1'
+  ).bind(orgId, `%${domain}%`).first<{ id: string }>();
+  if (byWebsite) return byWebsite.id;
+
+  // 3. Match by derived company name (fuzzy)
+  const derivedName = domainToCompanyName(domain).toLowerCase();
+  if (derivedName.length >= 3) {
+    const byName = await env.D1.prepare(
+      'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) LIKE ? AND deleted_at IS NULL LIMIT 1'
+    ).bind(orgId, `%${derivedName}%`).first<{ id: string }>();
+    if (byName) return byName.id;
+  }
+
+  return null;
+}
+
+export function isAutomatedDomain(domain: string): boolean {
+  const d = domain.toLowerCase();
+  if (AUTOMATED_DOMAINS.has(d)) return true;
+  for (const blocked of AUTOMATED_DOMAINS) {
+    if (d.endsWith(`.${blocked}`)) return true;
+  }
+  return false;
+}
+
+export async function findOrCreateCompanyByDomain(
+  emailDomain: string,
+  orgId: string,
+  env: Env
+): Promise<string | null> {
+  const domainLower = emailDomain.toLowerCase();
+  if (PERSONAL_DOMAINS.has(domainLower)) return null;
+  if (isAutomatedDomain(domainLower)) return null;
+
+  const existing = await findCompanyByDomain(emailDomain, orgId, env);
+  if (existing) return existing;
+
+  const companyName = domainToCompanyName(emailDomain);
+  if (companyName.length < 2) return null;
+
+  // Dedup: check for existing company with similar name before creating
+  const dupCheck = await findDuplicateCompany(companyName, emailDomain.toLowerCase(), orgId, env);
+  if (dupCheck) return dupCheck;
+
+  const companyId = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  await env.D1.prepare(
+    `INSERT INTO companies
+       (id, org_id, name, domain, website, company_type, investment_status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'other', 'tracking', ?, ?)`
+  ).bind(
+    companyId, orgId, companyName,
+    emailDomain.toLowerCase(),
+    `https://${emailDomain.toLowerCase()}`,
+    now, now
+  ).run();
+
+  console.log(`[discovery] auto-created company "${companyName}" (domain: ${emailDomain}) id=${companyId}`);
+
+  await emitAudit(env, {
+    org_id: orgId,
+    action: 'create',
+    entity_type: 'company',
+    entity_id: companyId,
+    metadata: { auto_created: true, domain: emailDomain, derived_name: companyName },
+    created_at: now,
+  });
+
+  return companyId;
+}
+
+export async function linkContactToCompanyByEmail(
+  contactId: string,
+  email: string,
+  orgId: string,
+  env: Env
+): Promise<string | null> {
+  const domain = email.toLowerCase().split('@')[1];
+  if (!domain || PERSONAL_DOMAINS.has(domain)) return null;
+
+  const companyId = await findCompanyByDomain(domain, orgId, env);
+  if (!companyId) return null;
+
+  await env.D1.prepare(
+    `UPDATE contacts SET company_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id = ? AND company_id IS NULL`
+  ).bind(companyId, contactId).run();
+
+  console.log(`[discovery] linked contact ${contactId} to company ${companyId} via domain ${domain}`);
+  return companyId;
 }
 
 export async function discoverNewContact(
@@ -109,14 +284,18 @@ export async function discoverNewContact(
 
   const normalizedEmail = email.toLowerCase().trim();
 
-  // Dedup by email (unique within org).
   const existing = await env.D1.prepare(
     'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
   ).bind(orgId, normalizedEmail).first<{ id: string }>();
   if (existing) {
-    await env.D1.prepare(
-      'UPDATE contacts SET total_interactions = COALESCE(total_interactions, 0) + 1, updated_at = ? WHERE id = ?'
-    ).bind(new Date().toISOString(), existing.id).run();
+    // Backfill: if existing contact has no company, try to link now
+    const hasCompany = await env.D1.prepare(
+      'SELECT company_id FROM contacts WHERE id = ? AND company_id IS NOT NULL'
+    ).bind(existing.id).first();
+    if (!hasCompany) {
+      await linkContactToCompanyByEmail(existing.id, normalizedEmail, orgId, env);
+    }
+
     return { id: existing.id, created: false };
   }
 
@@ -132,32 +311,24 @@ export async function discoverNewContact(
   let companyId: string | null = null;
 
   if (domain && !PERSONAL_DOMAINS.has(domain)) {
-    const company = await env.D1.prepare(
-      'SELECT id FROM companies WHERE org_id = ? AND website LIKE ? AND deleted_at IS NULL'
-    ).bind(orgId, `%${domain}%`).first<{ id: string }>();
-    if (company) companyId = company.id;
+    companyId = await findCompanyByDomain(domain, orgId, env);
   }
 
-  // Dedup by full_name + company when email-match missed (different address, same person).
+  // Dedup by full_name + company when email-match missed
   if (companyId) {
     const nameCompanyDup = await env.D1.prepare(
       'SELECT id FROM contacts WHERE org_id = ? AND LOWER(full_name) = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1'
     ).bind(orgId, displayName.toLowerCase(), companyId).first<{ id: string }>();
     if (nameCompanyDup) {
-      await env.D1.prepare(
-        'UPDATE contacts SET total_interactions = COALESCE(total_interactions, 0) + 1, updated_at = ? WHERE id = ?'
-      ).bind(new Date().toISOString(), nameCompanyDup.id).run();
       return { id: nameCompanyDup.id, created: false };
     }
   }
 
   const contactId = crypto.randomUUID();
 
-  // INSERT OR IGNORE relies on the UNIQUE(org_id, email) partial index added in migration 0031.
-  // It is a no-op when the index is absent, so we re-check by SELECT below to handle races.
   const result = await env.D1.prepare(
     `INSERT OR IGNORE INTO contacts (id, org_id, full_name, email, company_id, source, source_confidence, contact_type, total_interactions)
-     VALUES (?, ?, ?, ?, ?, ?, 0.6, 'individual', 1)`
+     VALUES (?, ?, ?, ?, ?, ?, 0.6, 'individual', 0)`
   ).bind(contactId, orgId, displayName, normalizedEmail, companyId, sourceItem.source).run();
 
   if (!result.meta?.changes) {
@@ -165,12 +336,13 @@ export async function discoverNewContact(
       'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
     ).bind(orgId, normalizedEmail).first<{ id: string }>();
     if (raced) {
-      await env.D1.prepare(
-        'UPDATE contacts SET total_interactions = COALESCE(total_interactions, 0) + 1, updated_at = ? WHERE id = ?'
-      ).bind(new Date().toISOString(), raced.id).run();
       return { id: raced.id, created: false };
     }
     return null;
+  }
+
+  if (companyId) {
+    console.log(`[discovery] created contact ${contactId} (${displayName}) auto-linked to company ${companyId}`);
   }
 
   await emitAudit(env, {
@@ -182,9 +354,14 @@ export async function discoverNewContact(
       discovered_from: sourceItem.source,
       email: normalizedEmail,
       eligibility: eligibility.kind,
+      auto_linked_company: companyId || undefined,
     },
     created_at: new Date().toISOString(),
   });
+
+  triggerContactEnrichment(contactId, orgId, env).catch(e =>
+    console.error(`[discovery] auto-enrich failed for ${contactId}:`, e)
+  );
 
   return { id: contactId, created: true };
 }

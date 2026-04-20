@@ -30,9 +30,18 @@ export async function fetchSlackMessages(
   let botToken: string;
   try {
     botToken = await getDecryptedSlackBotToken(orgId, env);
-  } catch {
+    console.log(`[slack] token resolved for org ${orgId} (${botToken.slice(0, 8)}...)`);
+  } catch (e) {
+    console.error(`[slack] token resolution failed for org ${orgId}:`, e);
     return [];
   }
+
+  const authResp = await fetch('https://slack.com/api/auth.test', {
+    headers: { Authorization: `Bearer ${botToken}` },
+  });
+  const authData = (await authResp.json()) as { ok: boolean; error?: string; team?: string; user?: string };
+  console.log(`[slack] auth.test: ok=${authData.ok} team=${authData.team || 'n/a'} user=${authData.user || 'n/a'} error=${authData.error || 'none'}`);
+  if (!authData.ok) return [];
 
   const channelsResp = await fetch(
     'https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200',
@@ -41,7 +50,9 @@ export async function fetchSlackMessages(
   const channelsData = (await channelsResp.json()) as {
     ok: boolean;
     channels?: SlackChannel[];
+    error?: string;
   };
+  console.log(`[slack] conversations.list: ok=${channelsData.ok} channels=${channelsData.channels?.length ?? 0} error=${channelsData.error || 'none'}`);
   if (!channelsData.ok) return [];
 
   const channels = channelsData.channels || [];
@@ -64,7 +75,10 @@ export async function fetchSlackMessages(
         messages?: SlackMessage[];
         response_metadata?: { next_cursor?: string };
       };
-      if (!data.ok) break;
+      if (!data.ok) {
+        console.warn(`[slack] conversations.history failed for #${channel.name}: ${(data as any).error || 'unknown'}`);
+        break;
+      }
 
       for (const msg of data.messages || []) {
         if (msg.subtype) continue;
@@ -96,6 +110,7 @@ export async function fetchSlackMessages(
     } while (cursor);
   }
 
+  console.log(`[slack] fetch complete: ${allItems.length} messages from ${channels.length} channels`);
   await env.KV.put(`slack_last_sync:${orgId}`, (Date.now() / 1000).toString());
   return allItems;
 }

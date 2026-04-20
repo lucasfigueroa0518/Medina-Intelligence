@@ -64,29 +64,46 @@ export async function getEntityFieldValue(
   field: string,
   env: Env
 ): Promise<unknown> {
-  // Safe field whitelist
-  const allowed = new Set([
-    'job_title',
-    'company_id',
-    'stage',
-    'current_valuation',
-    'topics_of_interest',
-    'pain_points',
-    'investment_thesis_tags',
-    'sector',
-  ]);
-  if (!allowed.has(field)) return null;
+  const CONTACT_QUERIES: Record<string, string> = {
+    job_title: 'SELECT job_title as v FROM contacts WHERE id = ?',
+    company_id: 'SELECT company_id as v FROM contacts WHERE id = ?',
+    topics_of_interest: 'SELECT topics_of_interest as v FROM contacts WHERE id = ?',
+    pain_points: 'SELECT pain_points as v FROM contacts WHERE id = ?',
+    investment_thesis_tags: 'SELECT investment_thesis_tags as v FROM contacts WHERE id = ?',
+    location: 'SELECT location as v FROM contacts WHERE id = ?',
+    investment_focus: 'SELECT investment_focus as v FROM contacts WHERE id = ?',
+    check_size_range: 'SELECT check_size_range as v FROM contacts WHERE id = ?',
+    communication_channel_preference: 'SELECT communication_channel_preference as v FROM contacts WHERE id = ?',
+    full_name: 'SELECT full_name as v FROM contacts WHERE id = ?',
+    linkedin_url: 'SELECT linkedin_url as v FROM contacts WHERE id = ?',
+    phone: 'SELECT phone as v FROM contacts WHERE id = ?',
+    email: 'SELECT email as v FROM contacts WHERE id = ?',
+    bio_summary: 'SELECT bio_summary as v FROM contacts WHERE id = ?',
+    twitter_url: 'SELECT twitter_url as v FROM contacts WHERE id = ?',
+  };
 
-  // Try contacts first
-  const contact = await env.D1.prepare(
-    `SELECT ${field} as v FROM contacts WHERE id = ?`
-  ).bind(entityId).first<{ v: unknown }>().catch(() => null);
-  if (contact?.v !== undefined && contact.v !== null) return contact.v;
+  const COMPANY_QUERIES: Record<string, string> = {
+    stage: 'SELECT stage as v FROM companies WHERE id = ?',
+    current_valuation: 'SELECT current_valuation as v FROM companies WHERE id = ?',
+    sector: 'SELECT sector as v FROM companies WHERE id = ?',
+    location: 'SELECT location as v FROM companies WHERE id = ?',
+    description: 'SELECT description as v FROM companies WHERE id = ?',
+    name: 'SELECT name as v FROM companies WHERE id = ?',
+  };
 
-  const company = await env.D1.prepare(
-    `SELECT ${field} as v FROM companies WHERE id = ?`
-  ).bind(entityId).first<{ v: unknown }>().catch(() => null);
-  return company?.v ?? null;
+  const contactQuery = CONTACT_QUERIES[field];
+  if (contactQuery) {
+    const row = await env.D1.prepare(contactQuery).bind(entityId).first<{ v: unknown }>().catch(() => null);
+    if (row?.v !== undefined && row.v !== null) return row.v;
+  }
+
+  const companyQuery = COMPANY_QUERIES[field];
+  if (companyQuery) {
+    const row = await env.D1.prepare(companyQuery).bind(entityId).first<{ v: unknown }>().catch(() => null);
+    if (row?.v !== undefined && row.v !== null) return row.v;
+  }
+
+  return null;
 }
 
 export async function extractEnrichmentSignals(

@@ -1,193 +1,1005 @@
 'use client';
 
 import React from 'react';
-import { TopBar } from '@/components/top-bar';
+import { MarkdownMessage } from '@/components/markdown-message';
 import { api, streamAgentQuery } from '@/lib/api';
-import { ArrowUp, Paperclip, Plus, Sparkles } from 'lucide-react';
+import {
+  ArrowUp, Paperclip, Plus, Trash2,
+  X as XIcon, Pencil, Check, Copy, RefreshCw,
+  Search, Database, Globe, FileText,
+  CheckCircle2, AlertCircle, ChevronDown, ChevronRight,
+  BarChart3, Users, Newspaper, PenLine, List,
+} from 'lucide-react';
+import { MartyEmblem } from '@/components/marty-emblem';
+
+// ---------------------------------------------------------------------------
+// Thinking verbs (crossfade)
+// ---------------------------------------------------------------------------
+
+const THINKING_VERBS = [
+  "Sourcing deals", "Running the numbers", "Sizing the opportunity",
+  "Stress-testing the thesis", "Modeling the upside", "Underwriting the risk",
+  "Benchmarking comps", "Digging into the cap table", "Working the network",
+  "Cross-referencing connections", "Mapping the landscape", "Tracing the money trail",
+  "Pulling the thread", "Connecting the dots", "Doing the due diligence",
+  "Combing through the data room", "Scanning the market", "Checking the pulse",
+  "Reading the tea leaves", "Crunching alpha", "Triangulating signals",
+  "Heating things up", "Making moves", "Building bridges",
+  "Turning over stones", "Riding the wave", "Cutting through the noise",
+  "Sharpening the brief", "Assembling the picture", "Locking in the signal",
+];
+
+function useThinkingVerb(active: boolean) {
+  const [display, setDisplay] = React.useState({ text: '', phase: 'enter' as 'enter' | 'exit' });
+
+  React.useEffect(() => {
+    if (!active) return;
+    const pick = () => THINKING_VERBS[Math.floor(Math.random() * THINKING_VERBS.length)];
+    setDisplay({ text: pick(), phase: 'enter' });
+
+    const interval = setInterval(() => {
+      setDisplay(d => ({ text: d.text, phase: 'exit' }));
+      setTimeout(() => setDisplay({ text: pick(), phase: 'enter' }), 400);
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [active]);
+
+  return display;
+}
+
+// ---------------------------------------------------------------------------
+// Sparkles (logo entrance)
+// ---------------------------------------------------------------------------
+
+function Sparkles({ active }: { active: boolean }) {
+  if (!active) return null;
+  const positions = [
+    { '--sx': '-12px', '--sy': '-14px' },
+    { '--sx': '14px', '--sy': '-10px' },
+    { '--sx': '-10px', '--sy': '12px' },
+    { '--sx': '12px', '--sy': '14px' },
+  ] as any[];
+  return (
+    <>
+      {positions.map((style, i) => (
+        <span key={i} className="sparkle-dot" style={{ ...style, animationDelay: `${i * 80}ms`, top: '50%', left: '50%' }} />
+      ))}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Thinking indicator
+// ---------------------------------------------------------------------------
+
+function ThinkingIndicator() {
+  const verb = useThinkingVerb(true);
+
+  return (
+    <div className="flex items-center gap-3 py-3">
+      <MartyEmblem size={28} animate />
+      <div className="flex items-center gap-0">
+        <span
+          key={verb.text}
+          className={`thinking-text text-sm ${verb.phase === 'enter' ? 'verb-crossfade-enter' : 'verb-crossfade-exit'}`}
+        >
+          {verb.text}
+        </span>
+        <span className="flex ml-0.5 gap-[2px]">
+          {[0, 0.2, 0.4].map((delay, i) => (
+            <span key={i} className="thinking-dot text-sm" style={{ fontFamily: "'Exo 2', sans-serif", fontWeight: 600, color: '#EC4899', animationDelay: `${delay}s` }}>.</span>
+          ))}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface ToolCall {
+  id: string;
+  tool: string;
+  input?: any;
+  result?: any;
+  status: 'started' | 'executing' | 'done' | 'error';
+  collapsed: boolean;
+}
 
 interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   streaming?: boolean;
+  justFinished?: boolean;
+  toolCalls?: ToolCall[];
+  timestamp?: string;
+  error?: boolean;
 }
 
-const PROMPT_SUGGESTIONS = [
-  'Summarize my meetings from this week',
-  'Which portfolio companies raised concerns last quarter?',
-  'Who haven\'t I spoken to in 30+ days?',
-  'What\'s the latest on our Series B pipeline?',
+// ---------------------------------------------------------------------------
+// Suggestion cards
+// ---------------------------------------------------------------------------
+
+const SUGGESTION_CARDS = [
+  {
+    icon: BarChart3,
+    title: 'Pipeline briefing',
+    subtitle: 'Deal status, action items, and next steps',
+    prompt: 'Give me a pipeline briefing — deal statuses, open action items, and what needs attention',
+  },
+  {
+    icon: Users,
+    title: 'Contact catch-up',
+    subtitle: 'Who needs attention and follow-ups',
+    prompt: "Who haven't I been in touch with recently? Any overdue follow-ups or contacts that need attention?",
+  },
+  {
+    icon: Newspaper,
+    title: 'Market pulse',
+    subtitle: 'News and trends in your sectors',
+    prompt: 'Search the web for the latest news in AI marketing, MarTech, and venture capital. Also check for any recent news about companies in our pipeline. Give me a market intelligence briefing.',
+  },
+  {
+    icon: PenLine,
+    title: 'Draft something',
+    subtitle: 'Emails, memos, or meeting prep',
+    prompt: '__focus_input__',
+  },
 ];
+
+// ---------------------------------------------------------------------------
+// Greeting
+// ---------------------------------------------------------------------------
+
+function getGreeting(): string {
+  const h = new Date().getHours();
+  if (h < 12) return 'Good morning. What are we working on?';
+  if (h < 17) return 'Good afternoon. What do you need?';
+  return 'Good evening. How can I help?';
+}
+
+// ---------------------------------------------------------------------------
+// Time grouping
+// ---------------------------------------------------------------------------
+
+function groupSessionsByTime(sessions: any[]) {
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfYesterday = startOfDay - 86400000;
+  const startOfWeek = startOfDay - now.getDay() * 86400000;
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+
+  const groups: { label: string; sessions: any[] }[] = [
+    { label: 'Today', sessions: [] },
+    { label: 'Yesterday', sessions: [] },
+    { label: 'This Week', sessions: [] },
+    { label: 'This Month', sessions: [] },
+    { label: 'Older', sessions: [] },
+  ];
+
+  for (const s of sessions) {
+    const t = new Date(s.last_activity_at).getTime();
+    if (t >= startOfDay) groups[0].sessions.push(s);
+    else if (t >= startOfYesterday) groups[1].sessions.push(s);
+    else if (t >= startOfWeek) groups[2].sessions.push(s);
+    else if (t >= startOfMonth) groups[3].sessions.push(s);
+    else groups[4].sessions.push(s);
+  }
+
+  return groups.filter(g => g.sessions.length > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Header extraction + TOC
+// ---------------------------------------------------------------------------
+
+function extractHeaders(content: string): { level: number; text: string; id: string }[] {
+  const headers: { level: number; text: string; id: string }[] = [];
+  for (const line of content.split('\n')) {
+    const match = line.match(/^(#{1,4})\s+(.+)/);
+    if (match) {
+      const text = match[2].replace(/\*\*/g, '').replace(/\*/g, '').replace(/`/g, '');
+      headers.push({
+        level: match[1].length,
+        text,
+        id: text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
+      });
+    }
+  }
+  return headers;
+}
+
+function TableOfContents({ content }: { content: string }) {
+  const headers = extractHeaders(content);
+  if (headers.length < 3) return null;
+
+  return (
+    <div className="toc-container sticky top-0 z-10 bg-bg-root/80 backdrop-blur-sm border-b border-border/30 py-2.5 px-4 mb-3 rounded-t-lg">
+      <div className="flex items-center gap-1.5 mb-1.5">
+        <List size={10} className="text-text-muted" />
+        <span className="text-[10px] text-text-muted uppercase tracking-wider font-semibold" style={{ fontFamily: "'Exo 2', sans-serif" }}>Contents</span>
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
+        {headers.map((h, i) => (
+          <a
+            key={i}
+            href={`#${h.id}`}
+            className="text-xs text-text-secondary hover:text-accent-magenta transition-colors"
+            style={{ paddingLeft: h.level > 1 ? `${(h.level - 1) * 8}px` : undefined }}
+            onClick={e => {
+              e.preventDefault();
+              document.getElementById(h.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }}
+          >
+            {h.text}
+          </a>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tool helpers
+// ---------------------------------------------------------------------------
+
+const TOOL_ICONS: Record<string, typeof Search> = {
+  search_contacts: Search, search_companies: Search, search_deals: Search,
+  search_conversations: Search,
+  get_contact_detail: Database, get_company_detail: Database, get_deal_detail: Database,
+  web_search: Globe, read_url: Globe,
+  create_contact: FileText, update_contact: FileText,
+  create_company: FileText, update_company: FileText,
+  create_deal: FileText, update_deal: FileText,
+  add_note: FileText, add_deal_action_item: FileText, apply_tag: FileText,
+  delete_entity: AlertCircle,
+};
+
+function toolLabel(name: string): string {
+  return name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function toolStatusText(tool: ToolCall): string {
+  if (tool.status === 'started' || tool.status === 'executing') {
+    const action = tool.tool.startsWith('search') ? 'Searching' :
+      tool.tool.startsWith('get') ? 'Loading' :
+      tool.tool === 'web_search' ? 'Searching the web' :
+      tool.tool === 'read_url' ? 'Reading page' :
+      tool.tool.startsWith('create') ? 'Creating' :
+      tool.tool.startsWith('update') ? 'Updating' :
+      tool.tool.startsWith('add') ? 'Adding' :
+      tool.tool === 'apply_tag' ? 'Tagging' : 'Processing';
+    return `${action}...`;
+  }
+  if (tool.status === 'error') return 'Failed';
+  if (tool.result?.count !== undefined) return `Found ${tool.result.count} results`;
+  if (tool.result?.success) return tool.result.message || 'Done';
+  if (tool.result?.summary) return 'Results ready';
+  if (tool.result?.contact) return `Loaded ${tool.result.contact.full_name || 'contact'}`;
+  if (tool.result?.company) return `Loaded ${tool.result.company.name || 'company'}`;
+  if (tool.result?.deal) return `Loaded ${tool.result.deal.title || 'deal'}`;
+  if (tool.result?.requires_confirmation) return 'Needs confirmation';
+  return 'Done';
+}
+
+// ---------------------------------------------------------------------------
+// ToolCallCard
+// ---------------------------------------------------------------------------
+
+function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void }) {
+  const Icon = TOOL_ICONS[tool.tool] || FileText;
+  const isRunning = tool.status === 'started' || tool.status === 'executing';
+  const isError = tool.status === 'error';
+  const isDone = tool.status === 'done';
+
+  return (
+    <div className={`tool-slide-in rounded-lg border my-2 overflow-hidden transition-all ${
+      isError ? 'border-semantic-error/30 bg-semantic-error/5' :
+      isRunning ? 'border-[#8B5CF6]/30 tool-shimmer' :
+      'border-border bg-[#111114]/80 backdrop-blur-sm'
+    }`}>
+      <button onClick={onToggle} className="flex items-center gap-2 w-full px-3 py-2 text-left">
+        {isRunning ? (
+          <MartyEmblem size={16} animate />
+        ) : isError ? (
+          <AlertCircle size={14} className="text-semantic-error shrink-0" />
+        ) : (
+          <CheckCircle2 size={14} className="text-semantic-success shrink-0 check-pop" />
+        )}
+        <Icon size={14} className={isRunning ? 'text-[#8B5CF6]' : 'text-text-muted'} style={{ flexShrink: 0 }} />
+        <span className="text-xs text-text-secondary flex-1 truncate" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
+          {toolLabel(tool.tool)}
+        </span>
+        <span className={`text-[10px] ${
+          isError ? 'text-semantic-error' : isDone ? 'text-semantic-success' : 'text-text-muted'
+        }`} style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
+          {isDone && '\u2713 '}{toolStatusText(tool)}
+        </span>
+        {tool.collapsed ? <ChevronRight size={12} className="text-text-muted" /> : <ChevronDown size={12} className="text-text-muted" />}
+      </button>
+      {!tool.collapsed && (
+        <div className="border-t border-border/50 px-3 py-2 space-y-1.5">
+          {tool.input && (
+            <div>
+              <div className="text-[9px] uppercase text-text-muted font-semibold tracking-wider mb-0.5">Input</div>
+              <pre className="text-[11px] text-text-secondary bg-bg-root rounded p-2 overflow-x-auto max-h-32">
+                {JSON.stringify(tool.input, null, 2)}
+              </pre>
+            </div>
+          )}
+          {tool.result && (
+            <div>
+              <div className="text-[9px] uppercase text-text-muted font-semibold tracking-wider mb-0.5">Result</div>
+              <pre className="text-[11px] text-text-secondary bg-bg-root rounded p-2 overflow-x-auto max-h-48">
+                {JSON.stringify(tool.result, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Error card
+// ---------------------------------------------------------------------------
+
+function ErrorCard({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="error-card rounded-xl border border-semantic-error/20 bg-semantic-error/5 backdrop-blur-sm p-4 max-w-md">
+      <div className="flex items-center gap-2 mb-2">
+        <AlertCircle size={16} className="text-semantic-error shrink-0" />
+        <span className="text-sm font-medium text-semantic-error" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+          Something went wrong
+        </span>
+      </div>
+      <p className="text-xs text-text-secondary mb-3" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+        {message.replace(/^Error:\s*/i, '')}
+      </p>
+      <button
+        onClick={onRetry}
+        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-semantic-error/30 text-semantic-error text-xs hover:bg-semantic-error/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
+      >
+        <RefreshCw size={12} /> Try again
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Session item component
+// ---------------------------------------------------------------------------
+
+function SessionItem({
+  session,
+  isActive,
+  index,
+  onSelect,
+  onDelete,
+  onRename,
+  deleteConfirmId,
+  setDeleteConfirmId,
+  deletingId,
+  editingTitleId,
+  setEditingTitleId,
+  editTitleValue,
+  setEditTitleValue,
+}: {
+  session: any;
+  isActive: boolean;
+  index: number;
+  onSelect: () => void;
+  onDelete: () => void;
+  onRename: () => void;
+  deleteConfirmId: string | null;
+  setDeleteConfirmId: (id: string | null) => void;
+  deletingId: string | null;
+  editingTitleId: string | null;
+  setEditingTitleId: (id: string | null) => void;
+  editTitleValue: string;
+  setEditTitleValue: (v: string) => void;
+}) {
+  return (
+    <div
+      className={`session-stagger relative group transition-colors ${
+        isActive
+          ? 'bg-white/[0.04] border-l-2 border-l-[#8B5CF6]'
+          : 'hover:bg-white/[0.02]'
+      }`}
+      style={{ animationDelay: `${index * 30}ms` }}
+    >
+      {deleteConfirmId === session.id && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center px-3"
+          style={{ background: 'rgba(9,9,11,0.92)', backdropFilter: 'blur(4px)' }}>
+          <div className="text-center">
+            <div className="text-xs text-text-secondary mb-2">Delete this conversation?</div>
+            <div className="flex gap-2 justify-center">
+              <button onClick={() => setDeleteConfirmId(null)}
+                className="px-2.5 py-1 rounded text-[10px] text-text-muted hover:text-text-primary transition-colors"
+                disabled={deletingId === session.id}>Cancel</button>
+              <button onClick={onDelete}
+                className="px-2.5 py-1 rounded text-[10px] font-medium text-semantic-error hover:bg-semantic-error/10 transition-colors"
+                disabled={deletingId === session.id}>
+                {deletingId === session.id ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-center gap-2 px-4 py-2.5">
+        <button onClick={onSelect} className="flex-1 text-left min-w-0">
+          {editingTitleId === session.id ? (
+            <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
+              <input
+                className="bg-bg-input border border-border rounded px-2 py-0.5 text-sm text-text-primary w-full outline-none focus:border-accent-magenta"
+                value={editTitleValue}
+                onChange={e => setEditTitleValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') onRename(); if (e.key === 'Escape') setEditingTitleId(null); }}
+                autoFocus
+              />
+              <button onClick={onRename} className="text-semantic-success hover:text-semantic-success/80 shrink-0">
+                <Check size={14} />
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="text-sm text-text-primary truncate" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
+                {session.title || 'New Session'}
+              </div>
+              <div className="text-[10px] text-text-muted mt-0.5" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
+                {formatRelative(session.last_activity_at)}
+              </div>
+            </>
+          )}
+        </button>
+
+        {editingTitleId !== session.id && (
+          <div className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button onClick={e => { e.stopPropagation(); setEditingTitleId(session.id); setEditTitleValue(session.title || ''); }}
+              className="p-1 rounded text-text-muted hover:text-text-primary hover:bg-white/[0.04] transition-colors" title="Rename">
+              <Pencil size={12} />
+            </button>
+            <button onClick={e => { e.stopPropagation(); setDeleteConfirmId(session.id); }}
+              className="p-1 rounded text-text-muted hover:text-semantic-error hover:bg-semantic-error/10 transition-colors" title="Delete">
+              <Trash2 size={12} />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
 
 export default function GodModePage() {
   const [sessions, setSessions] = React.useState<any[]>([]);
+  const [sessionsLoading, setSessionsLoading] = React.useState(true);
   const [activeSessionId, setActiveSessionId] = React.useState<string | null>(null);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [input, setInput] = React.useState('');
   const [streaming, setStreaming] = React.useState(false);
   const [attachedFile, setAttachedFile] = React.useState<File | null>(null);
   const messagesRef = React.useRef<HTMLDivElement>(null);
+  const inputRef = React.useRef<HTMLTextAreaElement>(null);
+  const lastSentQueryRef = React.useRef('');
+
+  const [deleteConfirmId, setDeleteConfirmId] = React.useState<string | null>(null);
+  const [deletingId, setDeletingId] = React.useState<string | null>(null);
+  const [editingTitleId, setEditingTitleId] = React.useState<string | null>(null);
+  const [editTitleValue, setEditTitleValue] = React.useState('');
+
+  const [sendPulse, setSendPulse] = React.useState(false);
+  const [showSparkles, setShowSparkles] = React.useState(true);
+  const [emptyMounted, setEmptyMounted] = React.useState(false);
+  const liveSessionIdRef = React.useRef<string | null>(null);
+  const pendingSessionIdRef = React.useRef<string | null>(null);
+  const streamingRef = React.useRef(false);
+  const skipNextFetchRef = React.useRef(false);
+
+  const [sidebarSearch, setSidebarSearch] = React.useState('');
+  const [copiedMsgId, setCopiedMsgId] = React.useState<string | null>(null);
+
+  // Fix 4: Explicit isThinking state — only cleared on first text token
+  const [isThinking, setIsThinking] = React.useState(false);
+
+  // Fix 1: Smart auto-scroll — respect user's scroll position
+  const userScrolledUpRef = React.useRef(false);
 
   React.useEffect(() => {
-    api.listSessions().then(d => setSessions(d.sessions));
+    document.title = 'MARTy \u2014 Medina Intelligence';
+    setSessionsLoading(true);
+    api.listSessions().then(d => { setSessions(d.sessions); setSessionsLoading(false); });
+    const t = setTimeout(() => setShowSparkles(false), 1200);
+
+    try {
+      const pending = localStorage.getItem('marty_pending');
+      if (pending) {
+        const { sessionId } = JSON.parse(pending);
+        if (sessionId) {
+          setActiveSessionId(sessionId);
+          api.getSessionMessages(sessionId).then(d => {
+            setMessages(d.messages.map((m: any) => ({
+              id: m.id, role: m.role, content: m.content, timestamp: m.created_at,
+            })));
+            localStorage.removeItem('marty_pending');
+            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          }).catch(() => {
+            localStorage.removeItem('marty_pending');
+          });
+        }
+      }
+    } catch { /* ignore corrupt localStorage */ }
+
+    return () => clearTimeout(t);
   }, []);
 
   React.useEffect(() => {
-    if (activeSessionId) {
-      api.getSessionMessages(activeSessionId).then(d =>
-        setMessages(
-          d.messages.map((m: any) => ({
-            id: m.id,
-            role: m.role,
-            content: m.content,
-          }))
-        )
-      );
-    } else {
+    if (!activeSessionId && messages.length === 0) {
+      setEmptyMounted(false);
+      requestAnimationFrame(() => setEmptyMounted(true));
+    }
+  }, [activeSessionId, messages.length]);
+
+  streamingRef.current = streaming;
+
+  React.useEffect(() => {
+    if (skipNextFetchRef.current) {
+      skipNextFetchRef.current = false;
+      return;
+    }
+    if (activeSessionId && !streamingRef.current) {
+      api.getSessionMessages(activeSessionId).then(d => {
+        if (!streamingRef.current) {
+          setMessages(d.messages.map((m: any) => ({
+            id: m.id, role: m.role, content: m.content, timestamp: m.created_at,
+          })));
+        }
+      });
+    } else if (!activeSessionId) {
       setMessages([]);
     }
   }, [activeSessionId]);
 
+  // Fix 1: Auto-scroll only when user hasn't scrolled up
   React.useEffect(() => {
-    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight });
+    if (!userScrolledUpRef.current) {
+      messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: 'smooth' });
+    }
   }, [messages]);
+
+  function handleMessagesScroll() {
+    const el = messagesRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    userScrolledUpRef.current = !atBottom;
+  }
+
+  const filteredSessions = React.useMemo(() => {
+    if (!sidebarSearch.trim()) return sessions;
+    const q = sidebarSearch.toLowerCase();
+    return sessions.filter(s => (s.title || '').toLowerCase().includes(q));
+  }, [sessions, sidebarSearch]);
+
+  const sessionGroups = React.useMemo(() => groupSessionsByTime(filteredSessions), [filteredSessions]);
+
+  async function handleDeleteSession(sessionId: string) {
+    setDeletingId(sessionId);
+    try {
+      await api.deleteSession(sessionId);
+      setSessions(prev => prev.filter(s => s.id !== sessionId));
+      if (activeSessionId === sessionId) { setActiveSessionId(null); setMessages([]); }
+    } catch { /* ignore */ }
+    finally { setDeletingId(null); setDeleteConfirmId(null); }
+  }
+
+  async function handleRenameSession(sessionId: string) {
+    const trimmed = editTitleValue.trim();
+    if (!trimmed) { setEditingTitleId(null); return; }
+    try {
+      await api.renameSession(sessionId, trimmed);
+      setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: trimmed } : s));
+    } catch { /* ignore */ }
+    finally { setEditingTitleId(null); }
+  }
+
+  function handleCopyMessage(msgId: string, content: string) {
+    navigator.clipboard.writeText(content);
+    setCopiedMsgId(msgId);
+    setTimeout(() => setCopiedMsgId(null), 2000);
+  }
+
+  function retryFrom(assistantMsgId: string) {
+    if (streaming) return;
+    const idx = messages.findIndex(m => m.id === assistantMsgId);
+    if (idx < 1) return;
+    const userMsg = messages[idx - 1];
+    if (userMsg?.role !== 'user') return;
+    setMessages(m => m.slice(0, idx));
+    sendMessage(userMsg.content);
+  }
+
+  // Fix 2: Auto-resize textarea
+  function handleInputChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    setInput(e.target.value);
+    e.target.style.height = 'auto';
+    e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
+  }
 
   const sendMessage = async (queryText: string) => {
     if (!queryText || streaming) return;
     setStreaming(true);
+    lastSentQueryRef.current = queryText;
+
+    // Fix 4: Set isThinking immediately on send
+    setIsThinking(true);
+
+    setSendPulse(true);
+    setTimeout(() => setSendPulse(false), 300);
+
+    // Reset scroll lock on new message
+    userScrolledUpRef.current = false;
 
     const userMsgId = crypto.randomUUID();
     const assistantMsgId = crypto.randomUUID();
+    const now = new Date().toISOString();
 
     setMessages(m => [
       ...m,
-      { id: userMsgId, role: 'user', content: queryText },
-      { id: assistantMsgId, role: 'assistant', content: '', streaming: true },
+      { id: userMsgId, role: 'user', content: queryText, timestamp: now },
+      { id: assistantMsgId, role: 'assistant', content: '', streaming: true, toolCalls: [], timestamp: now },
     ]);
     setInput('');
+
+    // Reset textarea height
+    if (inputRef.current) {
+      inputRef.current.style.height = 'auto';
+    }
 
     const file = attachedFile;
     setAttachedFile(null);
 
-    await streamAgentQuery(
-      queryText,
-      activeSessionId,
-      null,
-      null,
-      file,
-      token => {
-        setMessages(m =>
-          m.map(msg =>
-            msg.id === assistantMsgId ? { ...msg, content: msg.content + token } : msg
-          )
-        );
-      },
-      () => {
-        setMessages(m =>
-          m.map(msg => (msg.id === assistantMsgId ? { ...msg, streaming: false } : msg))
-        );
-        setStreaming(false);
-        api.listSessions().then(d => setSessions(d.sessions));
-      },
-      err => {
-        setMessages(m =>
-          m.map(msg =>
-            msg.id === assistantMsgId
-              ? { ...msg, content: `Error: ${err}`, streaming: false }
-              : msg
-          )
-        );
-        setStreaming(false);
+    try {
+      await streamAgentQuery(
+        queryText, activeSessionId, null, null, file,
+        token => {
+          if (typeof token === 'string') {
+            setIsThinking(false);
+            setMessages(m => m.map(msg =>
+              msg.id === assistantMsgId ? { ...msg, content: msg.content + token } : msg
+            ));
+          }
+        },
+        () => {
+          setIsThinking(false);
+          setMessages(m => m.map(msg => {
+            if (msg.id !== assistantMsgId) return msg;
+            if (!msg.content && (!msg.toolCalls || msg.toolCalls.length === 0)) {
+              return { ...msg, content: 'Something went wrong — no response was received. Please try again.', streaming: false, error: true };
+            }
+            return { ...msg, streaming: false, justFinished: true };
+          }));
+          setStreaming(false);
+          if (pendingSessionIdRef.current) {
+            skipNextFetchRef.current = true;
+            setActiveSessionId(pendingSessionIdRef.current);
+            pendingSessionIdRef.current = null;
+          }
+          liveSessionIdRef.current = null;
+          localStorage.removeItem('marty_pending');
+          window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          api.listSessions().then(d => setSessions(d.sessions));
+          setTimeout(() => {
+            setMessages(m => m.map(msg =>
+              msg.id === assistantMsgId ? { ...msg, justFinished: false } : msg
+            ));
+          }, 1000);
+        },
+        err => {
+          setIsThinking(false);
+          setMessages(m => m.map(msg =>
+            msg.id === assistantMsgId ? { ...msg, content: msg.content || `Error: ${err}`, streaming: false, error: !msg.content } : msg
+          ));
+          setStreaming(false);
+          if (pendingSessionIdRef.current) {
+            setActiveSessionId(pendingSessionIdRef.current);
+            pendingSessionIdRef.current = null;
+          }
+          liveSessionIdRef.current = null;
+          localStorage.removeItem('marty_pending');
+          window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+        },
+        (event: any) => {
+          if (event.type === 'session' && event.session_id) {
+            liveSessionIdRef.current = event.session_id;
+            if (!activeSessionId) {
+              pendingSessionIdRef.current = event.session_id;
+            }
+            localStorage.setItem('marty_pending', JSON.stringify({ sessionId: event.session_id }));
+            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+            return;
+          }
+          setMessages(m => m.map(msg => {
+            if (msg.id !== assistantMsgId) return msg;
+            const toolCalls = [...(msg.toolCalls || [])];
+            if (event.status === 'started') {
+              toolCalls.push({ id: crypto.randomUUID(), tool: event.tool, status: 'started', collapsed: true });
+            } else if (event.status === 'executing') {
+              const last = toolCalls.findLast(tc => tc.tool === event.tool);
+              if (last) { last.status = 'executing'; last.input = event.input; }
+            } else if (event.status === 'done' || event.status === 'error') {
+              const last = toolCalls.findLast(tc => tc.tool === event.tool && tc.status !== 'done' && tc.status !== 'error');
+              if (last) { last.status = event.status; last.result = event.result; }
+            }
+            return { ...msg, toolCalls };
+          }));
+        }
+      );
+    } catch (e) {
+      setIsThinking(false);
+      setMessages(m => m.map(msg =>
+        msg.id === assistantMsgId ? { ...msg, content: msg.content || `Error: ${(e as Error).message || 'Unexpected error'}`, streaming: false, error: true } : msg
+      ));
+      setStreaming(false);
+      if (pendingSessionIdRef.current) {
+        setActiveSessionId(pendingSessionIdRef.current);
+        pendingSessionIdRef.current = null;
       }
-    );
+      liveSessionIdRef.current = null;
+      localStorage.removeItem('marty_pending');
+      window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+    }
   };
 
+  function handleSuggestionClick(card: typeof SUGGESTION_CARDS[0]) {
+    if (card.prompt === '__focus_input__') {
+      inputRef.current?.focus();
+      setInput('');
+      inputRef.current?.setAttribute('placeholder', 'What would you like me to draft?');
+    } else {
+      sendMessage(card.prompt);
+    }
+  }
+
+  const isEmptyState = messages.length === 0;
+  const hasInput = input.trim().length > 0;
+
   return (
-    <div className="flex-1 flex">
+    <div className="h-full flex overflow-hidden">
       {/* Sessions sidebar */}
-      <aside className="w-[300px] bg-bg-inset border-r border-border flex flex-col">
-        <div className="p-4">
+      <aside className="w-[280px] bg-bg-inset border-r border-border flex flex-col shrink-0">
+        {/* Fix 3: MARTy's own identity in sessions sidebar */}
+        <div className="px-4 pt-4 pb-2 flex items-center gap-2.5">
+          <MartyEmblem size={22} />
+          <span className="text-sm text-text-primary" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
+            MARTy
+          </span>
+        </div>
+
+        <div className="px-4 pb-3">
           <button
-            onClick={() => {
-              setActiveSessionId(null);
-              setMessages([]);
-            }}
-            className="btn-secondary w-full flex items-center justify-center gap-2"
+            onClick={() => { setActiveSessionId(null); setMessages([]); setShowSparkles(true); setTimeout(() => setShowSparkles(false), 1200); }}
+            className="new-session-btn btn-secondary w-full flex items-center justify-center gap-2"
           >
             <Plus size={16} /> New Session
           </button>
         </div>
+
+        <div className="px-4 pb-3">
+          <div className="relative">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted" />
+            <input
+              type="text"
+              value={sidebarSearch}
+              onChange={e => setSidebarSearch(e.target.value)}
+              placeholder="Search sessions..."
+              className="w-full bg-bg-surface border border-border rounded-lg pl-9 pr-3 py-1.5 text-xs text-text-primary placeholder-text-muted outline-none focus:border-[#8B5CF6]/50 transition-colors"
+              style={{ fontFamily: "'DM Sans', sans-serif" }}
+            />
+            {sidebarSearch && (
+              <button onClick={() => setSidebarSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-primary">
+                <XIcon size={12} />
+              </button>
+            )}
+          </div>
+        </div>
+
         <div className="flex-1 overflow-y-auto">
-          {sessions.map(s => (
-            <button
-              key={s.id}
-              onClick={() => setActiveSessionId(s.id)}
-              className={`w-full text-left px-4 py-3 border-b border-border/50 hover:bg-bg-surface transition-colors ${
-                activeSessionId === s.id
-                  ? 'bg-bg-surface border-l-2 border-l-accent-magenta pl-[14px]'
-                  : ''
-              }`}
-            >
-              <div className="text-sm text-text-primary truncate">
-                {s.title || 'New Session'}
-              </div>
-              <div className="text-xs text-text-muted mt-1">
-                {s.turn_count || 0} turns · {formatRelative(s.last_activity_at)}
-              </div>
-            </button>
-          ))}
+          {sessionsLoading ? (
+            <div className="space-y-2 px-4">
+              {[1, 2, 3].map(i => (
+                <div key={i} className="animate-pulse">
+                  <div className="h-4 bg-bg-surface rounded w-3/4 mb-1.5" />
+                  <div className="h-3 bg-bg-surface rounded w-1/2" />
+                </div>
+              ))}
+            </div>
+          ) : filteredSessions.length === 0 ? (
+            <div className="px-4 py-8 text-center text-xs text-text-muted">
+              {sidebarSearch ? 'No matching sessions' : 'No conversations yet'}
+            </div>
+          ) : (
+            sessionGroups.map(group => {
+              let runningIndex = 0;
+              return (
+                <div key={group.label}>
+                  <div className="px-4 pt-3 pb-1">
+                    <span className="sidebar-group-label">{group.label}</span>
+                  </div>
+                  {group.sessions.map(s => {
+                    const idx = runningIndex++;
+                    return (
+                      <SessionItem
+                        key={s.id}
+                        session={s}
+                        isActive={activeSessionId === s.id}
+                        index={idx}
+                        onSelect={() => setActiveSessionId(s.id)}
+                        onDelete={() => handleDeleteSession(s.id)}
+                        onRename={() => handleRenameSession(s.id)}
+                        deleteConfirmId={deleteConfirmId}
+                        setDeleteConfirmId={setDeleteConfirmId}
+                        deletingId={deletingId}
+                        editingTitleId={editingTitleId}
+                        setEditingTitleId={setEditingTitleId}
+                        editTitleValue={editTitleValue}
+                        setEditTitleValue={setEditTitleValue}
+                      />
+                    );
+                  })}
+                </div>
+              );
+            })
+          )}
         </div>
       </aside>
 
-      {/* Chat area */}
-      <main className="flex-1 flex flex-col">
-        <TopBar title="God Mode" />
-
-        <div ref={messagesRef} className="flex-1 overflow-y-auto px-8 py-6">
-          {messages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center gap-6">
-              <Sparkles size={64} className="text-text-muted opacity-30" />
-              <div className="text-lg text-text-secondary">
-                Ask anything about your firm's data
+      {/* Fix 1: Chat area — relative container, never scrolls, only messages-container scrolls */}
+      <main className="flex-1 flex flex-col relative overflow-hidden">
+        {/* Messages — the ONLY scrollable element */}
+        <div
+          ref={messagesRef}
+          onScroll={handleMessagesScroll}
+          className="flex-1 overflow-y-auto px-8 py-6"
+          style={{ paddingBottom: 140 }}
+        >
+          {isEmptyState ? (
+            <div className="h-full flex flex-col items-center justify-center">
+              {/* Fix 3: MARTy's own emblem */}
+              <div className="relative logo-entrance mb-6">
+                <MartyEmblem size={56} animate />
+                <div className="absolute inset-0 bg-[#8B5CF6]/10 blur-2xl rounded-full -z-10" />
+                <Sparkles active={showSparkles} />
               </div>
-              <div className="grid grid-cols-2 gap-3 max-w-2xl w-full">
-                {PROMPT_SUGGESTIONS.map(s => (
-                  <button
-                    key={s}
-                    onClick={() => sendMessage(s)}
-                    className="card text-left text-sm text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover transition-all"
-                  >
-                    {s}
-                  </button>
-                ))}
+
+              <div className="text-[48px] text-text-primary text-center mb-2 leading-tight" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700 }}>
+                MARTy
+              </div>
+
+              <div className="greet-fade text-sm text-text-muted text-center mb-10" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400, animationDelay: '300ms' }}>
+                {getGreeting()}
+              </div>
+
+              <div className="grid grid-cols-3 gap-3 max-w-2xl w-full mb-10">
+                {SUGGESTION_CARDS.map((card, i) => {
+                  const CardIcon = card.icon;
+                  const isWide = i === 0 || i === 3;
+                  return (
+                    <button
+                      key={card.title}
+                      onClick={() => handleSuggestionClick(card)}
+                      className={`suggestion-card-glass card-stagger group/card flex items-start gap-3 p-4 rounded-xl text-left ${
+                        isWide ? 'col-span-2' : 'col-span-1'
+                      }`}
+                      style={{ animationDelay: emptyMounted ? `${i * 100}ms` : '0ms' }}
+                    >
+                      <div className="w-9 h-9 rounded-lg bg-[#8B5CF6]/10 flex items-center justify-center shrink-0 mt-0.5">
+                        <CardIcon size={17} className="text-[#A855F7]" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-sm text-text-primary mb-0.5" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
+                          {card.title}
+                        </div>
+                        <div className="text-xs text-text-muted" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
+                          {card.subtitle}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="text-[12px] text-text-muted/50 text-center" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+                MARTy can search your CRM &middot; read emails &amp; Slack &middot; update contacts &amp; deals &middot; research the web
               </div>
             </div>
           ) : (
-            <div className="max-w-4xl mx-auto space-y-4">
+            <div className="max-w-4xl mx-auto space-y-5">
               {messages.map(m =>
                 m.role === 'user' ? (
-                  <div key={m.id} className="flex justify-end">
-                    <div className="bg-bg-surface rounded-xl rounded-br-none px-5 py-3 max-w-[75%]">
-                      <div className="text-sm text-text-primary whitespace-pre-wrap">
-                        {m.content}
+                  <div key={m.id} className="flex justify-end group/msg msg-slide-in">
+                    <div className="relative max-w-[75%]">
+                      <div className="bg-bg-surface rounded-2xl rounded-br-sm px-5 py-3">
+                        <div className="text-sm text-text-primary whitespace-pre-wrap" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
+                          {m.content}
+                        </div>
+                        {m.timestamp && (
+                          <div className="text-[10px] text-text-muted/60 mt-1.5 text-right">{formatTimestamp(m.timestamp)}</div>
+                        )}
+                      </div>
+                      <div className="absolute -bottom-2 right-2 flex items-center gap-1 opacity-0 group-hover/msg:opacity-100 transition-opacity duration-150 z-10"
+                        style={{ background: 'rgba(17,17,20,0.85)', backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8, padding: '3px 6px' }}>
+                        <button
+                          onClick={() => handleCopyMessage(m.id, m.content)}
+                          className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-text-muted hover:text-text-primary transition-all ${copiedMsgId === m.id ? 'action-pop' : ''}`}
+                        >
+                          {copiedMsgId === m.id ? <><Check size={11} className="text-semantic-success" /> Copied</> : <><Copy size={11} /> Copy</>}
+                        </button>
                       </div>
                     </div>
                   </div>
                 ) : (
-                  <div key={m.id} className="max-w-[85%]">
-                    <div className="text-sm text-text-primary whitespace-pre-wrap leading-relaxed">
-                      {m.content || (
-                        <span className="flex gap-1">
-                          <span className="streaming-dot">●</span>
-                          <span className="streaming-dot" style={{ animationDelay: '0.2s' }}>
-                            ●
-                          </span>
-                          <span className="streaming-dot" style={{ animationDelay: '0.4s' }}>
-                            ●
-                          </span>
-                        </span>
-                      )}
-                    </div>
+                  <div key={m.id} className="max-w-[85%] group/msg msg-slide-in-left">
+                    {m.toolCalls && m.toolCalls.length > 0 && (
+                      <div className="mb-2">
+                        {m.toolCalls.map((tc, idx) => (
+                          <ToolCallCard key={tc.id} tool={tc}
+                            onToggle={() => {
+                              setMessages(msgs => msgs.map(msg => {
+                                if (msg.id !== m.id) return msg;
+                                const toolCalls = [...(msg.toolCalls || [])];
+                                toolCalls[idx] = { ...toolCalls[idx], collapsed: !toolCalls[idx].collapsed };
+                                return { ...msg, toolCalls };
+                              }));
+                            }}
+                          />
+                        ))}
+                      </div>
+                    )}
+
+                    {m.streaming && isThinking && (
+                      <ThinkingIndicator />
+                    )}
+
+                    {m.content && m.error ? (
+                      <ErrorCard message={m.content} onRetry={() => retryFrom(m.id)} />
+                    ) : m.content ? (
+                      <div className="relative">
+                        <div className="border-l-2 border-[#8B5CF6]/30 pl-4">
+                          {!m.streaming && <TableOfContents content={m.content} />}
+                          <MarkdownMessage content={m.content} />
+                        </div>
+                        {m.justFinished && <div className="response-done-line mt-2 ml-4" />}
+
+                        {!m.streaming && (
+                          <div className="absolute -bottom-2 right-2 flex items-center gap-1 opacity-0 group-hover/msg:opacity-100 transition-opacity duration-150 z-10"
+                            style={{ background: 'rgba(17,17,20,0.85)', backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8, padding: '3px 6px' }}>
+                            {m.timestamp && (
+                              <span className="text-[10px] text-text-muted/40 px-1">{formatTimestamp(m.timestamp)}</span>
+                            )}
+                            <button
+                              onClick={() => handleCopyMessage(m.id, m.content)}
+                              className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-text-muted hover:text-text-primary transition-all ${copiedMsgId === m.id ? 'action-pop' : ''}`}
+                            >
+                              {copiedMsgId === m.id ? <><Check size={11} className="text-semantic-success" /> Copied</> : <><Copy size={11} /> Copy</>}
+                            </button>
+                            <button
+                              onClick={() => retryFrom(m.id)}
+                              className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-text-muted hover:text-text-primary transition-colors"
+                            >
+                              <RefreshCw size={11} /> Retry
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    ) : null}
                   </div>
                 )
               )}
@@ -195,51 +1007,71 @@ export default function GodModePage() {
           )}
         </div>
 
-        {/* Input */}
-        <div className="border-t border-border bg-bg-root p-6">
-          {attachedFile && (
-            <div className="max-w-4xl mx-auto mb-2 flex items-center gap-2">
-              <div className="badge">
-                {attachedFile.name} ({Math.round(attachedFile.size / 1024)}KB)
+        {/* Fix 1+2: Floating prompt bar — absolutely positioned, doesn't take layout space */}
+        <div className="absolute bottom-8 left-10 right-10 z-10">
+          <div className="floating-input-bar" style={{ padding: '12px 16px' }}>
+            {attachedFile && (
+              <div className="mb-2 flex items-center gap-2">
+                <div className="badge">{attachedFile.name} ({Math.round(attachedFile.size / 1024)}KB)</div>
+                <button onClick={() => setAttachedFile(null)} className="text-text-muted hover:text-text-primary text-xs">
+                  <XIcon size={12} />
+                </button>
               </div>
+            )}
+            <div className="flex items-center gap-3">
+              {/* Paperclip — fixed 36x36 */}
+              <label className="w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer shrink-0 transition-colors"
+                style={{ color: 'rgba(255,255,255,0.5)' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.9)'; (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.05)'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.5)'; (e.currentTarget as HTMLElement).style.background = 'transparent'; }}>
+                <Paperclip size={18} />
+                <input type="file" className="hidden" accept=".pdf,.docx,.csv,.txt,.md,.xlsx"
+                  onChange={e => setAttachedFile(e.target.files?.[0] || null)} />
+              </label>
+
+              {/* Textarea — flex-1, auto-resizes */}
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={handleInputChange}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); }
+                }}
+                placeholder="Ask MARTy anything..."
+                rows={1}
+                className="flex-1 resize-none bg-transparent border-none outline-none"
+                style={{
+                  fontFamily: "'DM Sans', sans-serif",
+                  fontWeight: 400,
+                  fontSize: 15,
+                  lineHeight: 1.5,
+                  color: '#ffffff',
+                  minHeight: 24,
+                  maxHeight: 200,
+                  padding: '6px 0',
+                  overflowY: 'auto',
+                }}
+              />
+
+              {/* Send button — fixed 36x36 */}
               <button
-                onClick={() => setAttachedFile(null)}
-                className="text-text-muted hover:text-text-primary text-xs"
+                onClick={() => sendMessage(input)}
+                disabled={!hasInput || streaming}
+                className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
+                style={{
+                  borderRadius: 10,
+                  background: hasInput && !streaming
+                    ? 'linear-gradient(135deg, #A855F7 0%, #EC4899 100%)'
+                    : 'rgba(255,255,255,0.08)',
+                  cursor: hasInput && !streaming ? 'pointer' : 'not-allowed',
+                  transform: sendPulse ? 'scale(0.95)' : 'scale(1)',
+                }}
+                onMouseEnter={e => { if (hasInput && !streaming) { (e.currentTarget as HTMLElement).style.filter = 'brightness(1.15)'; (e.currentTarget as HTMLElement).style.transform = 'scale(1.05)'; } }}
+                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.filter = ''; (e.currentTarget as HTMLElement).style.transform = ''; }}
               >
-                ✕
+                <ArrowUp size={18} color="#ffffff" />
               </button>
             </div>
-          )}
-          <div className="max-w-4xl mx-auto flex items-end gap-3">
-            <label className="btn-ghost cursor-pointer p-2">
-              <Paperclip size={18} />
-              <input
-                type="file"
-                className="hidden"
-                accept=".pdf,.docx,.csv,.txt,.md,.xlsx"
-                onChange={e => setAttachedFile(e.target.files?.[0] || null)}
-              />
-            </label>
-            <textarea
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  sendMessage(input);
-                }
-              }}
-              placeholder="Ask anything about your data..."
-              rows={1}
-              className="input flex-1 resize-none max-h-32"
-            />
-            <button
-              onClick={() => sendMessage(input)}
-              disabled={!input || streaming}
-              className="btn-primary p-2.5 rounded-lg"
-            >
-              <ArrowUp size={18} />
-            </button>
           </div>
         </div>
       </main>
@@ -250,8 +1082,24 @@ export default function GodModePage() {
 function formatRelative(iso: string): string {
   if (!iso) return '';
   const diff = Date.now() - new Date(iso).getTime();
+  const min = 60000;
+  const hour = 3600000;
   const day = 86400000;
-  if (diff < 3600000) return 'Just now';
-  if (diff < day) return `${Math.floor(diff / 3600000)}h ago`;
-  return `${Math.floor(diff / day)}d ago`;
+  if (diff < min) return 'Just now';
+  if (diff < hour) return `${Math.floor(diff / min)}m ago`;
+  if (diff < day) return `${Math.floor(diff / hour)}h ago`;
+  if (diff < day * 7) return `${Math.floor(diff / day)}d ago`;
+  return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+function formatTimestamp(iso: string): string {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    if (sameDay) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
+      ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
 }

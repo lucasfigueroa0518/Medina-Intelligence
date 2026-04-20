@@ -17,12 +17,14 @@ import {
   clearEnrichmentRateLimit,
 } from './rate-limit';
 import { callClaude } from './claude';
+import { callGemini } from './gemini';
 import { emitAudit } from './audit';
 import { hashShort } from './helpers';
-import { LLM_PROMPTS } from '../prompts';
-import { buildEnrichmentUserPrompt } from '../prompts/enrichment';
+import { GEMINI_ENRICHMENT_PROMPT, buildGeminiEnrichmentUserPrompt } from '../prompts/gemini-enrichment';
 import { enrichContactFromLinkedIn } from '../integrations/reversecontact';
-import { discoverLinkedInUrl } from './linkedin-discovery';
+import { discoverLinkedInUrl, assessLinkedInUrlAuthenticity } from './linkedin-discovery';
+import { findCompanyByDomain, findOrCreateCompanyByDomain, PERSONAL_DOMAINS } from './discovery';
+import { proposeEntityUpdate } from './progressive-enrichment';
 
 // Check for optional circuit breaker — if the module doesn't exist, skip gracefully.
 let isRcCircuitOpen: ((orgId: string, env: Env) => Promise<boolean>) | null = null;
@@ -75,6 +77,10 @@ function stripToolArtifacts(text: string): string {
 
   // Remove leading/trailing "---" separators.
   t = t.replace(/^\s*-{3,}\s*\n?/, '').replace(/\n?\s*-{3,}\s*$/, '');
+
+  // Strip any trailing "Grounded sources:" bibliography block.
+  t = t.replace(/\n*-{3,}\s*\n\s*Grounded sources:[\s\S]*$/i, '');
+  t = t.replace(/\n*Grounded sources:\s*\n[\s\S]*$/i, '');
 
   return t.replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -183,9 +189,10 @@ async function applyUnifiedEnrichment(
 
   // ── 3. Load existing contact row ──
   const existing = await env.D1.prepare(
-    `SELECT bio_summary, job_title, linkedin_url, twitter_url, topics_of_interest, custom_fields
+    `SELECT full_name, bio_summary, job_title, linkedin_url, twitter_url, topics_of_interest, custom_fields
      FROM contacts WHERE id = ?`
   ).bind(contactId).first<{
+    full_name: string | null;
     bio_summary: string | null;
     job_title: string | null;
     linkedin_url: string | null;
@@ -202,11 +209,17 @@ async function applyUnifiedEnrichment(
     resolvedFields.linkedin_url = discoveredLinkedinUrl;
   } else if (extracted.linkedin_url) {
     const norm = normalizeLinkedInUrl(extracted.linkedin_url);
-    if (norm) resolvedFields.linkedin_url = norm;
+    if (norm) {
+      const auth = assessLinkedInUrlAuthenticity(norm, existing?.full_name || undefined);
+      if (auth.likelyFabricated) {
+        console.log(`[enrichment] ${contactId}: Claude-extracted LinkedIn URL "${norm}" looks fabricated (${auth.reason}) — skipping`);
+      } else {
+        resolvedFields.linkedin_url = norm;
+      }
+    }
   }
 
   if (extracted.job_title) {
-    // Clean common extraction artifacts
     let title = String(extracted.job_title).trim();
     title = title.replace(/^the\s+/i, '');
     if (title.length >= 2 && title.length <= 120) {
@@ -251,6 +264,29 @@ async function applyUnifiedEnrichment(
     }
   }
 
+  // Auto-link to company by extracted company_name
+  if (extracted.company_name && typeof extracted.company_name === 'string') {
+    const existingCompanyId = await env.D1.prepare(
+      'SELECT company_id FROM contacts WHERE id = ?'
+    ).bind(contactId).first<{ company_id: string | null }>();
+
+    if (!existingCompanyId?.company_id) {
+      const companyName = String(extracted.company_name).trim();
+      if (companyName.length >= 2) {
+        const matchedCompany = await env.D1.prepare(
+          'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) = LOWER(?) AND deleted_at IS NULL LIMIT 1'
+        ).bind(orgId, companyName).first<{ id: string }>();
+
+        if (matchedCompany) {
+          dbUpdates.push('company_id = ?');
+          dbBinds.push(matchedCompany.id);
+          autoApplied['company_id'] = matchedCompany.id;
+          console.log(`[enrichment] ${contactId}: auto-link to company "${companyName}" id=${matchedCompany.id}`);
+        }
+      }
+    }
+  }
+
   // key_facts → custom_fields JSON
   let customFields: Record<string, unknown> = {};
   try { customFields = JSON.parse(existing?.custom_fields || '{}'); } catch { customFields = {}; }
@@ -282,19 +318,17 @@ async function applyUnifiedEnrichment(
     linkedin_url_discovered: discoveredLinkedinUrl || undefined,
   };
 
-  // ── 8. Stage ONE approval entry if there are any proposed overwrites ──
+  // ── 8. Stage individual progressive_update entries for proposed overwrites ──
   if (Object.keys(proposedChanges).length > 0) {
-    const idempotencyKey = `${orgId}:${contactId}:enrichment_report:${hashShort(JSON.stringify(proposedChanges))}`;
-
-    await env.D1.prepare(
-      `INSERT OR IGNORE INTO approval_queue
-         (idempotency_key, org_id, entity_type, entity_id, change_type, field_name,
-          proposed_value, source_visibility, confidence, status)
-       VALUES (?, ?, 'contact', ?, 'enrichment_report', 'enrichment_report', ?, 'org_wide', 0.85, 'pending')`
-    ).bind(idempotencyKey, orgId, contactId, JSON.stringify(report)).run();
-
+    for (const [field, change] of Object.entries(proposedChanges)) {
+      await proposeEntityUpdate(
+        orgId, 'contact', contactId, field, change.proposed,
+        'enrichment', 0.85, env,
+        { source_description: `Enrichment re-run (sources: ${sources.join(', ')})` }
+      );
+    }
     console.log(
-      `[enrichment] ${contactId}: staged 1 enrichment_report with ${Object.keys(proposedChanges).length} proposed overwrites`
+      `[enrichment] ${contactId}: staged ${Object.keys(proposedChanges).length} progressive updates`
     );
   } else {
     console.log(`[enrichment] ${contactId}: no overwrites — no approval needed`);
@@ -344,6 +378,7 @@ export async function triggerContactEnrichment(
 
   const contributions: EnrichmentSourceContribution[] = [];
   let discoveredLinkedinUrl: string | null = null;
+  let rcVerifiedUrl = false;
 
   // ── Circuit breaker gate ──
   const rcOpen = isRcCircuitOpen ? await isRcCircuitOpen(orgId, env) : false;
@@ -352,6 +387,7 @@ export async function triggerContactEnrichment(
   }
 
   // ── Step 0: LinkedIn URL discovery ──
+  // Discovery no longer writes directly to DB — we verify with RC first.
   let skipReverseContact = rcOpen;
   if (!rcOpen && !contact.linkedin_url) {
     console.log(`[enrichment] ${contactId}: no linkedin_url → LinkedIn discovery`);
@@ -382,35 +418,68 @@ export async function triggerContactEnrichment(
       try {
         const result = await enrichContactFromLinkedIn(contact, orgId, env);
         if (result) {
-          console.log(`[enrichment] ${contactId}: RC returned ${result.text.length} chars`);
+          rcVerifiedUrl = true;
+          console.log(`[enrichment] ${contactId}: RC returned ${result.text.length} chars (identity verified)`);
           contributions.push({ source: 'reversecontact', text: result.text, visibility: 'org_wide' });
           await clearEnrichmentRateLimit('reversecontact', orgId, env);
         }
       } catch (e: any) {
         console.error(`[enrichment] ${contactId}: RC failed: ${e.message}`);
         if (String(e.message).includes('429')) await recordEnrichmentRateLimit('reversecontact', orgId, env);
+        if (String(e.message).includes('LINKEDIN_IDENTITY_UNVERIFIED') && discoveredLinkedinUrl) {
+          console.log(`[enrichment] ${contactId}: RC identity unverified — discarding discovered URL "${discoveredLinkedinUrl}"`);
+          contact.linkedin_url = null;
+          discoveredLinkedinUrl = null;
+        }
       }
     }
   }
 
-  // ── Source 2: Claude web search ──
-  if (await checkEnrichmentRateLimit('claude_enrichment', orgId, env)) {
+  // ── Persist discovered URL based on verification ──
+  if (discoveredLinkedinUrl) {
+    if (rcVerifiedUrl) {
+      await env.D1.prepare(
+        `UPDATE contacts SET linkedin_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+      ).bind(discoveredLinkedinUrl, contactId).run();
+      console.log(`[enrichment] ${contactId}: discovered URL verified by RC — persisted to DB`);
+    } else {
+      const auth = assessLinkedInUrlAuthenticity(discoveredLinkedinUrl, contact.full_name);
+      if (auth.likelyFabricated) {
+        console.log(`[enrichment] ${contactId}: discovered URL not RC-verified AND looks fabricated (${auth.reason}) — discarding`);
+        contact.linkedin_url = null;
+        discoveredLinkedinUrl = null;
+      } else {
+        await env.D1.prepare(
+          `UPDATE contacts SET linkedin_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+        ).bind(discoveredLinkedinUrl, contactId).run();
+        console.log(`[enrichment] ${contactId}: discovered URL not RC-verified but passes authenticity check (${auth.reason}) — persisted`);
+      }
+    }
+  }
+
+  // ── Source 2: Gemini web search (grounded) ──
+  if (await checkEnrichmentRateLimit('gemini_enrichment', orgId, env)) {
     try {
       const company = contact.company_id
         ? await env.D1.prepare('SELECT name, sector, website FROM companies WHERE id = ?')
             .bind(contact.company_id).first<any>()
         : null;
 
-      const text = await callClaude(
+      // Feed any RC payload we gathered above into Gemini so it can merge
+      // verified LinkedIn data with live web findings in a single dossier.
+      const rcContrib = contributions.find(c => c.source === 'reversecontact');
+
+      const { text, sources } = await callGemini(
         {
-          system: LLM_PROMPTS.ENRICHMENT_SEARCH,
-          user: buildEnrichmentUserPrompt({
+          system: GEMINI_ENRICHMENT_PROMPT,
+          user: buildGeminiEnrichmentUserPrompt({
             entityName: contact.full_name,
             entityType: 'contact',
             sector: company?.sector,
             emailDomain: contact.email ? contact.email.split('@')[1] : undefined,
             knownContacts: company ? [company.name] : [],
             jobTitle: contact.job_title || undefined,
+            reverseContactPayload: rcContrib?.text,
           }),
           max_tokens: 5000,
           orgId,
@@ -419,13 +488,17 @@ export async function triggerContactEnrichment(
         env
       );
 
-      console.log(`[enrichment] ${contactId}: Claude web search → ${text.length} chars`);
-      contributions.push({ source: 'claude_web_search', text, visibility: 'org_wide' });
-      await clearEnrichmentRateLimit('claude_enrichment', orgId, env);
+      console.log(`[enrichment] ${contactId}: Gemini web search → ${text.length} chars, ${sources.length} sources`);
+      contributions.push({
+        source: 'gemini_web_search',
+        text: text,
+        visibility: 'org_wide',
+      });
+      await clearEnrichmentRateLimit('gemini_enrichment', orgId, env);
     } catch (e: any) {
-      console.error(`[enrichment] ${contactId}: Claude failed: ${e.message}`);
-      if (String(e.message).includes('CLAUDE_RATE_LIMITED')) {
-        await recordEnrichmentRateLimit('claude_enrichment', orgId, env);
+      console.error(`[enrichment] ${contactId}: Gemini failed: ${e.message}`);
+      if (String(e.message).includes('GEMINI_RATE_LIMITED')) {
+        await recordEnrichmentRateLimit('gemini_enrichment', orgId, env);
       }
     }
   }
@@ -438,7 +511,7 @@ export async function triggerContactEnrichment(
 
   // ── Pick the best bio text (longest web search contribution) ──
   const bestBio = contributions
-    .filter(c => c.source === 'claude_web_search' && c.text.length > 200)
+    .filter(c => (c.source === 'gemini_web_search' || c.source === 'claude_web_search') && c.text.length > 200)
     .sort((a, b) => b.text.length - a.text.length)[0]?.text || aggText;
 
   // ── R2: full enrichment payload ──
@@ -478,6 +551,25 @@ export async function triggerContactEnrichment(
     console.error(`[enrichment] ${contactId}: applyUnifiedEnrichment failed:`, e);
   }
 
+  // ── Auto-link contact to company if not already linked ──
+  if (!contact.company_id && contact.email) {
+    try {
+      const emailDomain = contact.email.split('@')[1]?.toLowerCase();
+      if (emailDomain && !PERSONAL_DOMAINS.has(emailDomain)) {
+        const companyId = await findOrCreateCompanyByDomain(emailDomain, orgId, env);
+        if (companyId) {
+          await env.D1.prepare(
+            `UPDATE contacts SET company_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ? AND company_id IS NULL`
+          ).bind(companyId, contactId).run();
+          console.log(`[enrichment] ${contactId}: auto-linked to company ${companyId} via email domain ${emailDomain}`);
+        }
+      }
+    } catch (e) {
+      console.error(`[enrichment] ${contactId}: company auto-link failed:`, e);
+    }
+  }
+
   // ── Update enrichment metadata ──
   await env.D1.prepare(
     `UPDATE contacts SET enrichment_confidence = ?, enrichment_last_run = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
@@ -506,38 +598,69 @@ export async function triggerCompanyEnrichment(
 
   const contributions: EnrichmentSourceContribution[] = [];
 
-  if (await checkEnrichmentRateLimit('claude_enrichment', orgId, env)) {
+  // Fetch recent news for context in enrichment prompt
+  let recentNewsContext = '';
+  try {
+    const recentNews = await env.D1.prepare(
+      `SELECT title, summary, relevance_tag, published_at FROM news_articles
+       WHERE company_id = ? AND org_id = ?
+       ORDER BY published_at DESC LIMIT 5`
+    ).bind(companyId, orgId).all<{
+      title: string; summary: string | null; relevance_tag: string; published_at: string | null;
+    }>();
+
+    if (recentNews.results.length > 0) {
+      recentNewsContext = '\n\nRecent news in this company\'s space:\n' +
+        recentNews.results.map(n =>
+          `- [${n.relevance_tag}] ${n.title} (${n.published_at || 'recent'}): ${n.summary || ''}`
+        ).join('\n');
+    }
+  } catch { /* news fetch is optional */ }
+
+  if (await checkEnrichmentRateLimit('gemini_enrichment', orgId, env)) {
     try {
       const contactsRow = await env.D1.prepare(
-        'SELECT full_name FROM contacts WHERE company_id = ? AND deleted_at IS NULL LIMIT 5'
-      ).bind(companyId).all<{ full_name: string }>();
+        'SELECT full_name, job_title, email FROM contacts WHERE company_id = ? AND deleted_at IS NULL LIMIT 5'
+      ).bind(companyId).all<{ full_name: string; job_title: string | null; email: string | null }>();
 
       const emailDomain = company.website
         ? company.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]
-        : undefined;
+        : contactsRow.results[0]?.email?.split('@')[1] || undefined;
 
-      const text = await callClaude(
+      const contactAnchors = contactsRow.results.map(c => {
+        let s = c.full_name;
+        if (c.job_title) s += ` (${c.job_title})`;
+        return s;
+      });
+
+      const enrichmentPromptText = buildGeminiEnrichmentUserPrompt({
+        entityName: company.name,
+        entityType: 'company',
+        sector: company.sector,
+        emailDomain,
+        knownContacts: contactAnchors,
+      }) + recentNewsContext;
+
+      const { text, sources } = await callGemini(
         {
-          system: LLM_PROMPTS.ENRICHMENT_SEARCH,
-          user: buildEnrichmentUserPrompt({
-            entityName: company.name,
-            entityType: 'company',
-            sector: company.sector,
-            emailDomain,
-            knownContacts: contactsRow.results.map(c => c.full_name),
-          }),
-          max_tokens: 2500,
+          system: GEMINI_ENRICHMENT_PROMPT,
+          user: enrichmentPromptText,
+          max_tokens: 5000,
           orgId,
         },
         'low',
         env
       );
 
-      contributions.push({ source: 'claude_web_search', text, visibility: 'org_wide' });
-      await clearEnrichmentRateLimit('claude_enrichment', orgId, env);
+      contributions.push({
+        source: 'gemini_web_search',
+        text: text,
+        visibility: 'org_wide',
+      });
+      await clearEnrichmentRateLimit('gemini_enrichment', orgId, env);
     } catch (e: any) {
-      if (String(e.message).includes('CLAUDE_RATE_LIMITED')) {
-        await recordEnrichmentRateLimit('claude_enrichment', orgId, env);
+      if (String(e.message).includes('GEMINI_RATE_LIMITED')) {
+        await recordEnrichmentRateLimit('gemini_enrichment', orgId, env);
       }
       console.error('Company enrichment failed:', e);
     }
@@ -574,10 +697,13 @@ export async function triggerCompanyEnrichment(
     ));
   }
 
+  const descriptionSnippet = cleanBio.length > 500 ? cleanBio.slice(0, 497) + '...' : cleanBio;
+
   await env.D1.prepare(
     `UPDATE companies SET enrichment_confidence = ?, enrichment_last_run = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+       description = COALESCE(description, ?),
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-  ).bind(0.7, companyId).run();
+  ).bind(0.7, descriptionSnippet, companyId).run();
 
   await emitAudit(env, {
     org_id: orgId, action: 'enrich', entity_type: 'company', entity_id: companyId,

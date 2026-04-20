@@ -22,6 +22,7 @@ import { errorResponse } from './utils';
 import { encryptToken } from '../lib/encryption';
 import { verifyJwt } from './auth';
 import { emitAudit } from '../lib/audit';
+import { ensureSubscriptionsForUser } from '../lib/graph-subscriptions';
 
 interface OAuthStateRecord {
   user_id: string;
@@ -408,6 +409,18 @@ export async function outlookOAuthCallback(
 
   // Reset any prior token-refresh failure counter.
   await env.KV.delete(`token_failed:${record.user_id}:outlook`);
+
+  // Read per-user sync window for first delta fetch logging
+  const syncConfigRaw = await env.KV.get(`sync_config:${record.user_id}`, 'json') as { sync_history_days?: number } | null;
+  const syncDays = syncConfigRaw?.sync_history_days ?? 30;
+  console.log(`[outlook] First sync for user ${record.user_id}, fetching last ${syncDays} days`);
+
+  // Create Graph push notification subscriptions for near-instant email/calendar ingestion
+  try {
+    await ensureSubscriptionsForUser(record.user_id, record.org_id, env);
+  } catch (e) {
+    console.error('[auth-oauth] Graph subscription creation failed (non-fatal):', e);
+  }
 
   await emitAudit(env, {
     org_id: record.org_id,
