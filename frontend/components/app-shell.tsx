@@ -17,7 +17,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <SessionExpiredBanner />
       <div className="flex h-screen overflow-hidden">
         <Sidebar />
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 flex flex-col overflow-y-auto">
           {children}
         </div>
       </div>
