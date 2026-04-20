@@ -429,6 +429,7 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
 }
 .entrance-content {
   display: flex;
@@ -438,11 +439,14 @@ html, body {
 }
 .entrance-logo-wrap {
   position: relative;
-  overflow: hidden;
-  border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+.entrance-logo-img {
+  width: 450px;
+  height: auto;
+  display: block;
 }
 .entrance-text {
   font-family: 'Space Grotesk', sans-serif;
@@ -451,28 +455,44 @@ html, body {
   letter-spacing: 4px;
   text-transform: uppercase;
   color: rgba(255, 255, 255, 0.9);
-}
-@keyframes shineWipe {
-  0% { transform: translateX(-150%) translateY(-150%) rotate(45deg); opacity: 1; }
-  100% { transform: translateX(150%) translateY(150%) rotate(45deg); opacity: 1; }
+  position: relative;
+  z-index: 2;
 }
 .entrance-shine {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  -webkit-mask-image: url(/medina-logo.png);
+  mask-image: url(/medina-logo.png);
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  pointer-events: none;
+}
+.entrance-shine::after {
+  content: '';
   position: absolute;
   top: -50%;
   left: -50%;
   width: 200%;
   height: 200%;
   background: linear-gradient(
-    90deg,
+    45deg,
     transparent 0%,
-    transparent 40%,
-    rgba(255, 255, 255, 0.15) 45%,
-    rgba(255, 255, 255, 0.4) 50%,
-    rgba(255, 255, 255, 0.15) 55%,
-    transparent 60%,
+    transparent 38%,
+    rgba(255, 255, 255, 0.2) 42%,
+    rgba(255, 255, 255, 0.6) 50%,
+    rgba(255, 255, 255, 0.2) 58%,
+    transparent 62%,
     transparent 100%
   );
-  opacity: 0;
-  animation: shineWipe 600ms cubic-bezier(0.4, 0, 0.2, 1) 600ms forwards;
-  pointer-events: none;
+  transform: translateX(-150%) translateY(-150%) rotate(45deg);
+  animation: shineWipe 700ms cubic-bezier(0.4, 0, 0.2, 1) 700ms forwards;
+}
+@keyframes shineWipe {
+  0% { transform: translateX(-150%) translateY(-150%) rotate(45deg); }
+  100% { transform: translateX(150%) translateY(150%) rotate(45deg); }
 }

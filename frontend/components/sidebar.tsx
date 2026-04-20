@@ -7,7 +7,6 @@ import {
   Users,
   Building2,
   Handshake,
-  Sparkles,
   Mail,
   Shield,
   Upload,
@@ -18,16 +17,17 @@ import {
 import { useRouter } from 'next/navigation';
 import { api, clearAuthToken } from '@/lib/api';
 import { MedinaLogo } from './medina-logo';
+import { MartyEmblem } from './marty-emblem';
 
 interface NavLink {
   label: string;
-  icon: LucideIcon;
+  icon?: LucideIcon;
   route: string;
   requireAdmin?: boolean;
 }
 
 const NAV_LINKS: NavLink[] = [
-  { label: 'MARTy', icon: Sparkles, route: '/god-mode' },
+  { label: 'MARTy', route: '/god-mode' },
   { label: 'Contacts', icon: Users, route: '/contacts' },
   { label: 'Companies', icon: Building2, route: '/companies' },
   { label: 'Deals', icon: Handshake, route: '/deals' },
@@ -72,8 +72,8 @@ export function Sidebar() {
       {/* Nav links */}
       <nav className="flex-1 p-3 space-y-1">
         {NAV_LINKS.map(link => {
-          const Icon = link.icon;
           const active = pathname === link.route || pathname.startsWith(link.route + '/');
+          const isMarty = link.route === '/god-mode';
           return (
             <Link
               key={link.route}
@@ -85,8 +85,12 @@ export function Sidebar() {
               }`}
             >
               <span className="relative">
-                <Icon size={20} className={active ? 'text-accent-magenta' : ''} />
-                {link.route === '/god-mode' && martyPending && !active && (
+                {isMarty ? (
+                  <MartyEmblem size={20} animate={martyPending && !active} />
+                ) : link.icon ? (
+                  <link.icon size={20} className={active ? 'text-accent-magenta' : ''} />
+                ) : null}
+                {isMarty && martyPending && !active && (
                   <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-[#8B5CF6] streaming-dot" />
                 )}
               </span>

@@ -506,6 +506,7 @@ export default function GodModePage() {
 
   const [sidebarSearch, setSidebarSearch] = React.useState('');
   const [copiedMsgId, setCopiedMsgId] = React.useState<string | null>(null);
+  const [placeholderText, setPlaceholderText] = React.useState('Ask MARTy anything...');
 
   // Fix 4: Explicit isThinking state — only cleared on first text token
   const [isThinking, setIsThinking] = React.useState(false);
@@ -657,6 +658,7 @@ export default function GodModePage() {
       { id: assistantMsgId, role: 'assistant', content: '', streaming: true, toolCalls: [], timestamp: now },
     ]);
     setInput('');
+    setPlaceholderText('Ask MARTy anything...');
 
     // Reset textarea height
     if (inputRef.current) {
@@ -760,9 +762,9 @@ export default function GodModePage() {
 
   function handleSuggestionClick(card: typeof SUGGESTION_CARDS[0]) {
     if (card.prompt === '__focus_input__') {
-      inputRef.current?.focus();
+      setPlaceholderText('What would you like me to draft?');
       setInput('');
-      inputRef.current?.setAttribute('placeholder', 'What would you like me to draft?');
+      setTimeout(() => inputRef.current?.focus(), 50);
     } else {
       sendMessage(card.prompt);
     }
@@ -1037,7 +1039,14 @@ export default function GodModePage() {
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); }
                 }}
-                placeholder="Ask MARTy anything..."
+                placeholder={placeholderText}
+                onBlur={() => {
+                  setTimeout(() => {
+                    if (document.activeElement !== inputRef.current) {
+                      setPlaceholderText('Ask MARTy anything...');
+                    }
+                  }, 150);
+                }}
                 rows={1}
                 className="flex-1 resize-none bg-transparent border-none outline-none"
                 style={{
