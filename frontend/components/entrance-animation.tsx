@@ -74,8 +74,11 @@ export function EntranceAnimation({ onComplete }: EntranceAnimationProps) {
           className="entrance-text"
           style={{
             opacity: showText ? 1 : 0,
-            transform: showText ? 'translateY(0)' : 'translateY(10px)',
-            transition: showText ? 'opacity 400ms ease-out, transform 400ms ease-out' : 'none',
+            letterSpacing: showText ? '14px' : '8px',
+            transform: showText ? 'scale(1.05)' : 'scale(0.95)',
+            transition: showText
+              ? 'opacity 800ms cubic-bezier(0.16, 1, 0.3, 1), letter-spacing 800ms cubic-bezier(0.16, 1, 0.3, 1), transform 800ms cubic-bezier(0.16, 1, 0.3, 1)'
+              : 'none',
           }}
         >
           MEDINA INTELLIGENCE

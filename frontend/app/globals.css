@@ -449,14 +449,17 @@ html, body {
   display: block;
 }
 .entrance-text {
-  font-family: 'Space Grotesk', sans-serif;
-  font-weight: 700;
-  font-size: 16px;
-  letter-spacing: 4px;
-  text-transform: uppercase;
-  color: rgba(255, 255, 255, 0.9);
-  position: relative;
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  translate: -50% -50%;
   z-index: 2;
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 800;
+  font-size: 24px;
+  text-transform: uppercase;
+  color: #ffffff;
+  white-space: nowrap;
 }
 .entrance-shine {
   position: absolute;
