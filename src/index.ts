@@ -428,6 +428,8 @@ async function routeAuthenticated(
       return Admin.getBackfillProgress(ctx, env);
     if (path === '/api/admin/repair-vectorize-participants' && method === 'POST')
       return Admin.repairVectorizeParticipantIds(request, ctx, env);
+    if (path === '/api/admin/run-daily-cron' && method === 'POST')
+      return Admin.runDailyCronManually(ctx, env);
   }
 
   if (path === '/api/system/status' && method === 'GET') return Admin.getSystemStatus(ctx, env);

@@ -5,6 +5,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { clearEnrichmentRateLimit } from '../lib/rate-limit';
 import { emitAudit } from '../lib/audit';
 import { runHistoricalBackfill, getUserSyncConfig, setUserSyncConfig, type BackfillProgress } from '../integrations/outlook';
+import { runDailyCron } from '../lib/daily-cron';
 
 export async function listDlq(
   request: Request,
@@ -85,6 +86,21 @@ export async function clearRateLimit(
   if (!source) return errorResponse('VALIDATION_ERROR', 400);
   await clearEnrichmentRateLimit(source, ctx.orgId, env);
   return jsonResponse({ ok: true });
+}
+
+// Manual trigger for the daily cron handler (matches the 0 0 * * * cron).
+// Same logic the scheduled handler runs — useful for end-to-end pipeline
+// testing without waiting for midnight UTC.
+export async function runDailyCronManually(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  try {
+    await runDailyCron(ctx.orgId, env);
+    return jsonResponse({ ok: true });
+  } catch (e: any) {
+    return errorResponse('DAILY_CRON_FAILED', 500, e?.message || String(e));
+  }
 }
 
 // One-time repair: rewrite participant_user_ids in Vectorize chunk metadata
