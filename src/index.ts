@@ -32,7 +32,7 @@ import * as Integrations from './handlers/integrations';
 
 import { handleAuditBatch } from './workers/audit-consumer';
 import { handleWebhookBatch } from './workers/webhook-consumer';
-import { handleDlqBatch } from './workers/dlq-consumer';
+import { handleDlqBatch, handleAuditDlqBatch } from './workers/dlq-consumer';
 
 import { runDailyCron } from './lib/daily-cron';
 
@@ -424,6 +424,8 @@ async function routeAuthenticated(
       return Admin.backfillEmail(request, ctx, env);
     if (path === '/api/admin/backfill-progress' && method === 'GET')
       return Admin.getBackfillProgress(ctx, env);
+    if (path === '/api/admin/repair-vectorize-participants' && method === 'POST')
+      return Admin.repairVectorizeParticipantIds(request, ctx, env);
   }
 
   if (path === '/api/system/status' && method === 'GET') return Admin.getSystemStatus(ctx, env);
@@ -513,6 +515,8 @@ async function handleQueue(
     await handleWebhookBatch(batch as MessageBatch<WebhookQueueMessage>, env);
   } else if (queueName === 'webhook-dlq') {
     await handleDlqBatch(batch as MessageBatch<WebhookQueueMessage>, env);
+  } else if (queueName === 'audit-log-dlq') {
+    await handleAuditDlqBatch(batch as MessageBatch<AuditEvent>, env);
   } else {
     for (const m of batch.messages) m.ack();
   }

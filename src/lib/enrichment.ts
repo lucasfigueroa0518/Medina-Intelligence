@@ -592,7 +592,7 @@ export async function triggerCompanyEnrichment(
   env: Env
 ): Promise<void> {
   const company = await env.D1.prepare(
-    `SELECT id, name, sector, website FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    `SELECT id, name, sector, website, domain FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL AND merged_into IS NULL`
   ).bind(companyId, orgId).first<any>();
   if (!company) return;
 
@@ -705,9 +705,123 @@ export async function triggerCompanyEnrichment(
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
   ).bind(0.7, descriptionSnippet, companyId).run();
 
+  // Resolve placeholder domain-name into a canonical human-readable name and
+  // dedupe against any existing company that already has that name.
+  if (isDomainShapedName(company.name, company.domain, company.website)) {
+    const canonical = await extractCanonicalCompanyName(cleanBio, env, orgId);
+    if (canonical) {
+      await resolveCompanyName(companyId, orgId, canonical, env);
+    }
+  }
+
   await emitAudit(env, {
     org_id: orgId, action: 'enrich', entity_type: 'company', entity_id: companyId,
     metadata: { sources: contributions.map(c => c.source), visibility },
     created_at: new Date().toISOString(),
   });
+}
+
+function isDomainShapedName(
+  name: string | null,
+  domain: string | null,
+  website: string | null
+): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase().trim();
+  if (domain && lower === domain.toLowerCase()) return true;
+  if (website) {
+    const stripped = website.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+    if (lower === stripped) return true;
+  }
+  if (/\.[a-z]{2,}(\/|$)/i.test(lower)) return true;
+  return false;
+}
+
+async function extractCanonicalCompanyName(
+  briefing: string,
+  env: Env,
+  orgId: string
+): Promise<string | null> {
+  const system = `You extract the official, human-readable company name from an investor briefing. Return ONLY raw JSON, no markdown, no commentary. Schema:
+{"canonical_name": string | null, "confidence": "high" | "medium" | "low"}
+
+Rules:
+- canonical_name is the company's branded/legal name as written by the company itself (e.g. "Bain Capital Ventures", not "bain.com").
+- If the briefing does not clearly identify the company (bare stub, no real content, only describes people without naming the firm), return {"canonical_name": null, "confidence": "low"}.
+- Never return a domain, URL, or hostname as the canonical_name.
+- Never invent a name.`;
+  const user = `Briefing:\n${briefing.slice(0, 4000)}`;
+
+  let raw: string;
+  try {
+    raw = await callClaude(
+      { system, user, max_tokens: 200, orgId, model: 'claude-haiku-4-5-20251001' },
+      'low',
+      env
+    );
+  } catch (e) {
+    console.error('[enrichment] canonical name extraction failed:', e);
+    return null;
+  }
+
+  try {
+    const cleaned = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    const parsed = JSON.parse(cleaned);
+    if (parsed.confidence === 'low') return null;
+    if (typeof parsed.canonical_name !== 'string') return null;
+    const name = parsed.canonical_name.trim();
+    if (name.length < 2) return null;
+    if (/^https?:\/\//i.test(name)) return null;
+    if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(name)) return null;
+    return name;
+  } catch {
+    console.error('[enrichment] canonical name parse failed:', raw);
+    return null;
+  }
+}
+
+async function resolveCompanyName(
+  companyId: string,
+  orgId: string,
+  canonicalName: string,
+  env: Env
+): Promise<void> {
+  const dup = await env.D1.prepare(
+    `SELECT id FROM companies
+       WHERE org_id = ? AND LOWER(name) = LOWER(?) AND id != ?
+         AND deleted_at IS NULL AND merged_into IS NULL
+       LIMIT 1`
+  ).bind(orgId, canonicalName, companyId).first<{ id: string }>();
+
+  if (dup) {
+    const survivor = dup.id;
+    await env.D1.batch([
+      env.D1.prepare(`UPDATE contacts SET company_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE company_id = ?`).bind(survivor, companyId),
+      env.D1.prepare(`UPDATE deals SET company_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE company_id = ?`).bind(survivor, companyId),
+      env.D1.prepare(`UPDATE documents SET company_id = ? WHERE company_id = ?`).bind(survivor, companyId),
+      env.D1.prepare(`UPDATE tasks SET company_id = ? WHERE company_id = ?`).bind(survivor, companyId),
+      env.D1.prepare(`UPDATE news_articles SET company_id = ? WHERE company_id = ?`).bind(survivor, companyId),
+      env.D1.prepare(`DELETE FROM company_tags WHERE company_id = ?`).bind(companyId),
+      env.D1.prepare(`UPDATE companies SET merged_into = ?, deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`).bind(survivor, companyId),
+    ]);
+
+    await emitAudit(env, {
+      org_id: orgId, action: 'merge', entity_type: 'company', entity_id: companyId,
+      metadata: { merged_into: survivor, canonical_name: canonicalName, reason: 'enrichment_resolved_existing_name' },
+      created_at: new Date().toISOString(),
+    });
+    console.log(`[enrichment] merged company ${companyId} → ${survivor} (canonical "${canonicalName}")`);
+    return;
+  }
+
+  await env.D1.prepare(
+    `UPDATE companies SET name = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+  ).bind(canonicalName, companyId).run();
+
+  await emitAudit(env, {
+    org_id: orgId, action: 'update', entity_type: 'company', entity_id: companyId,
+    metadata: { field: 'name', new_name: canonicalName, reason: 'enrichment_canonical_name' },
+    created_at: new Date().toISOString(),
+  });
+  console.log(`[enrichment] resolved company name: ${companyId} → "${canonicalName}"`);
 }

@@ -36,69 +36,89 @@ export async function classifyAndDeduplicate(
 
   for (const item of items) {
     // --- dedup: external_message_id uniqueness ---
+    // When a message we've already stored arrives again (cross-user inbox view,
+    // re-delivery, etc.) we still want to (a) merge the new viewer into
+    // participant_user_ids and (b) revisit contact linking — earlier passes
+    // may have rejected a participant whose name we now have.
+    let existingConversationId: string | null = null;
     if (item.externalId) {
       if (item.type === 'email' || item.type === 'slack_message' || item.type === 'news') {
         const existing = await env.D1.prepare(
           'SELECT id FROM conversations WHERE external_message_id = ?'
-        ).bind(item.externalId).first();
-        if (existing) continue;
+        ).bind(item.externalId).first<{ id: string }>();
+        if (existing) existingConversationId = existing.id;
       }
     }
 
     // --- cross-user email dedup (v3.0) ---
-    if (item.type === 'email' && item.threadId && item.fromEmail) {
+    if (!existingConversationId && item.type === 'email' && item.threadId && item.fromEmail) {
       const crossUserDup = await env.D1.prepare(
-        'SELECT id, participant_user_ids FROM conversations WHERE external_thread_id = ? AND sent_at = ? AND from_email = ? AND org_id = ?'
-      ).bind(item.threadId, item.sentAt, item.fromEmail, orgId).first<{
-        id: string;
-        participant_user_ids: string;
-      }>();
+        'SELECT id FROM conversations WHERE external_thread_id = ? AND sent_at = ? AND from_email = ? AND org_id = ?'
+      ).bind(item.threadId, item.sentAt, item.fromEmail, orgId).first<{ id: string }>();
+      if (crossUserDup) existingConversationId = crossUserDup.id;
+    }
 
-      if (crossUserDup) {
-        if (item.userId) {
-          const existingParticipants: string[] = JSON.parse(
-            crossUserDup.participant_user_ids || '[]'
-          );
-          if (!existingParticipants.includes(item.userId)) {
-            existingParticipants.push(item.userId);
-            await env.D1.prepare(
-              'UPDATE conversations SET participant_user_ids = ? WHERE id = ?'
-            ).bind(JSON.stringify(existingParticipants), crossUserDup.id).run();
+    if (existingConversationId) {
+      // Merge new viewer into participant_user_ids if applicable
+      if (item.userId) {
+        const row = await env.D1.prepare(
+          'SELECT participant_user_ids FROM conversations WHERE id = ?'
+        ).bind(existingConversationId).first<{ participant_user_ids: string }>();
+        const existingParticipants: string[] = row?.participant_user_ids
+          ? JSON.parse(row.participant_user_ids)
+          : [];
 
-            // Re-upsert Vectorize chunks with new participant string (P-1 fix)
-            const updatedParticipantStr = existingParticipants.join(',');
-            const vectors = await env.D1.prepare(
-              'SELECT vector_id FROM vector_entity_index WHERE entity_id = ? AND source_table = ?'
-            ).bind(crossUserDup.id, 'conversations').all<{ vector_id: string }>();
+        if (!existingParticipants.includes(item.userId)) {
+          existingParticipants.push(item.userId);
+          await env.D1.prepare(
+            'UPDATE conversations SET participant_user_ids = ? WHERE id = ?'
+          ).bind(JSON.stringify(existingParticipants), existingConversationId).run();
 
-            for (const v of vectors.results) {
-              const vectorId = v.vector_id;
-              const chunkText = await env.KV.get(`chunk:${vectorId}`);
-              if (chunkText) {
-                const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-                  text: [chunkText],
-                  pooling: 'cls',
-                } as any);
-                const values = Array.isArray((embedding as any).data)
-                  ? (embedding as any).data[0]
-                  : (embedding as any).data;
+          // Re-upsert Vectorize chunks with new participant string (P-1 fix)
+          const updatedParticipantStr = existingParticipants.join(',');
+          const vectors = await env.D1.prepare(
+            'SELECT vector_id FROM vector_entity_index WHERE entity_id = ? AND source_table = ?'
+          ).bind(existingConversationId, 'conversations').all<{ vector_id: string }>();
 
-                const existing = await env.VECTORIZE.getByIds([vectorId]);
-                if (existing.length > 0) {
-                  const meta = {
-                    ...existing[0].metadata,
-                    participant_user_ids: updatedParticipantStr,
-                  };
-                  await env.VECTORIZE.upsert([
-                    { id: vectorId, values, metadata: meta },
-                  ]);
-                }
+          for (const v of vectors.results) {
+            const vectorId = v.vector_id;
+            const chunkText = await env.KV.get(`chunk:${vectorId}`);
+            if (chunkText) {
+              const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+                text: [chunkText],
+                pooling: 'cls',
+              } as any);
+              const values = Array.isArray((embedding as any).data)
+                ? (embedding as any).data[0]
+                : (embedding as any).data;
+
+              const existingVec = await env.VECTORIZE.getByIds([vectorId]);
+              if (existingVec.length > 0) {
+                const meta = {
+                  ...existingVec[0].metadata,
+                  participant_user_ids: updatedParticipantStr,
+                };
+                await env.VECTORIZE.upsert([
+                  { id: vectorId, values, metadata: meta },
+                ]);
               }
             }
           }
         }
-        continue;
       }
+
+      // Re-run contact resolution against the existing conversation so that
+      // recipients who were rejected on a prior pass (e.g. unknown display name)
+      // can now be linked, and total_interactions stays accurate.
+      await reconcileExistingConversation(
+        existingConversationId,
+        item,
+        orgId,
+        internalEmails,
+        env
+      );
+
+      continue;
     }
 
     // --- contact resolution ---
@@ -108,33 +128,40 @@ export async function classifyAndDeduplicate(
     for (const e of item.toEmails || []) recipientEmails.add(e.toLowerCase());
     for (const e of item.ccEmails || []) recipientEmails.add(e.toLowerCase());
 
-    // For an inbound email, the sender only becomes a contact once we have replied.
-    // That means another conversation in the same thread is outbound (direction='outbound').
-    let weRepliedToSender = false;
-    if (item.type === 'email' && item.direction === 'inbound' && item.threadId) {
-      const prior = await env.D1.prepare(
-        "SELECT 1 FROM conversations WHERE org_id = ? AND external_thread_id = ? AND direction = 'outbound' LIMIT 1"
-      ).bind(orgId, item.threadId).first();
-      weRepliedToSender = !!prior;
-    }
-
     const eligibilityFor = (email: string): DiscoveryEligibility | null => {
       if (item.type === 'calendar_event') return { kind: 'meeting_attendee' };
       if (item.type !== 'email') return null;
       if (item.direction === 'internal') return null;
 
+      // Outbound: recipients become contacts (we initiated).
       if (item.direction === 'outbound') {
-        // We sent this message; recipients become contacts.
         if (recipientEmails.has(email)) return { kind: 'outbound' };
         return null;
       }
-      // Inbound: only the sender is eligible, and only if we have already replied in-thread.
-      if (email === fromEmailLower && weRepliedToSender) return { kind: 'reply' };
+      // Inbound: sender is eligible immediately. The "have we replied yet"
+      // gate (Finding 3) was over-restrictive — a real inbound is a real signal.
+      if (email === fromEmailLower) return { kind: 'reply' };
       return null;
     };
 
     const allEmails = new Set<string>(recipientEmails);
     if (fromEmailLower) allEmails.add(fromEmailLower);
+
+    // --- auto-create company stubs FIRST so contact discovery can attach them ---
+    if (item.type === 'email') {
+      const domainsSeen = new Set<string>();
+      for (const email of allEmails) {
+        if (internalEmails.has(email)) continue;
+        const domain = email.split('@')[1];
+        if (!domain || PERSONAL_DOMAINS.has(domain) || domainsSeen.has(domain)) continue;
+        domainsSeen.add(domain);
+        try {
+          await findOrCreateCompanyByDomain(domain, orgId, env);
+        } catch (e) {
+          console.error(`[classification] company stub creation failed for ${domain}:`, e);
+        }
+      }
+    }
 
     for (const email of allEmails) {
       if (internalEmails.has(email)) {
@@ -153,9 +180,6 @@ export async function classifyAndDeduplicate(
       }
 
       // Eligibility + automated-email filtering happen inside discoverNewContact.
-      // It returns null when:
-      //   - eligibility is null (inbound-only sender we haven't replied to)
-      //   - isAutomatedEmail() blocks the address (automated domain or keyword)
       const eligibility = eligibilityFor(email);
       if (!eligibility) {
         contactsSkippedNoEligibility++;
@@ -168,22 +192,6 @@ export async function classifyAndDeduplicate(
         else contactsExisting++;
       } else {
         contactsSkippedAutomated++;
-      }
-    }
-
-    // --- auto-create company stubs for new business email domains ---
-    if (item.type === 'email') {
-      const domainsSeen = new Set<string>();
-      for (const email of allEmails) {
-        if (internalEmails.has(email)) continue;
-        const domain = email.split('@')[1];
-        if (!domain || PERSONAL_DOMAINS.has(domain) || domainsSeen.has(domain)) continue;
-        domainsSeen.add(domain);
-        try {
-          await findOrCreateCompanyByDomain(domain, orgId, env);
-        } catch (e) {
-          console.error(`[classification] company stub creation failed for ${domain}:`, e);
-        }
       }
     }
 
@@ -276,4 +284,69 @@ export async function classifyAndDeduplicate(
   );
 
   return classified;
+}
+
+// When an inbound message turns out to be a duplicate of one we've already
+// stored, we still need to (a) try to link any participants that were rejected
+// on the first pass and (b) bump total_interactions for newly added links.
+async function reconcileExistingConversation(
+  conversationId: string,
+  item: ClassifiableItem,
+  orgId: string,
+  internalEmails: Set<string>,
+  env: Env
+): Promise<void> {
+  if (item.type !== 'email') return;
+
+  const fromEmailLower = item.fromEmail?.toLowerCase();
+  const recipientEmails = new Set<string>();
+  for (const e of item.toEmails || []) recipientEmails.add(e.toLowerCase());
+  for (const e of item.ccEmails || []) recipientEmails.add(e.toLowerCase());
+  const allEmails = new Set<string>(recipientEmails);
+  if (fromEmailLower) allEmails.add(fromEmailLower);
+
+  const eligibilityFor = (email: string): DiscoveryEligibility | null => {
+    if (item.direction === 'internal') return null;
+    if (item.direction === 'outbound') {
+      if (recipientEmails.has(email)) return { kind: 'outbound' };
+      return null;
+    }
+    if (email === fromEmailLower) return { kind: 'reply' };
+    return null;
+  };
+
+  for (const email of allEmails) {
+    if (internalEmails.has(email)) continue;
+
+    let contactId: string | null = null;
+    const existing = await env.D1.prepare(
+      'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL'
+    ).bind(orgId, email).first<{ id: string }>();
+
+    if (existing) {
+      contactId = existing.id;
+    } else {
+      const eligibility = eligibilityFor(email);
+      if (!eligibility) continue;
+      const discovered = await discoverNewContact(email, item, orgId, env, eligibility);
+      if (discovered) contactId = discovered.id;
+    }
+
+    if (!contactId) continue;
+
+    const result = await env.D1.prepare(
+      `INSERT OR IGNORE INTO conversation_contacts (conversation_id, contact_id, role)
+       VALUES (?, ?, 'participant')`
+    ).bind(conversationId, contactId).run();
+
+    if (result.meta?.changes) {
+      await env.D1.prepare(
+        `UPDATE contacts
+           SET last_contact_date = ?,
+               total_interactions = total_interactions + 1,
+               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ?`
+      ).bind(item.sentAt, contactId).run();
+    }
+  }
 }

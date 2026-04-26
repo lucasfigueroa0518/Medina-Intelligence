@@ -74,6 +74,12 @@ dead_letter_queue = "audit-log-dlq"
 queue = "audit-log-dlq"
 binding = "AUDIT_DLQ"
 
+[[queues.consumers]]
+queue = "audit-log-dlq"
+max_batch_size = 25
+max_batch_timeout = 30
+max_retries = 1
+
 [[queues.producers]]
 queue = "webhook-intake-queue"
 binding = "WEBHOOK_QUEUE"
@@ -89,3 +95,9 @@ retry_delay = 60
 [[queues.producers]]
 queue = "webhook-dlq"
 binding = "WEBHOOK_DLQ"
+
+[[queues.consumers]]
+queue = "webhook-dlq"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 1

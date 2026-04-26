@@ -425,77 +425,182 @@ html, body {
   position: fixed;
   inset: 0;
   z-index: 9999;
-  background: #000000;
+  background: radial-gradient(ellipse at center, #0a0612 0%, #050308 60%, #000000 100%);
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
 }
-.entrance-content {
+.entrance-orb {
+  position: relative;
+  width: 90px;
+  height: 90px;
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 28px;
+  justify-content: center;
 }
 .entrance-logo-wrap {
   position: relative;
+  z-index: 5;
+  width: 100%;
+  height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
+  opacity: 0;
+  transform: scale(0.6);
+  animation:
+    entranceLogoIgnite 1500ms cubic-bezier(0.16, 1, 0.3, 1) forwards,
+    entranceLogoBreathe 1000ms cubic-bezier(0.4, 0, 0.6, 1) 1500ms forwards;
 }
 .entrance-logo-img {
-  width: 450px;
+  width: 100%;
   height: auto;
   display: block;
+  filter: drop-shadow(0 0 14px rgba(139, 92, 246, 0.55))
+          drop-shadow(0 0 28px rgba(124, 58, 237, 0.35));
 }
-.entrance-text {
-  position: fixed;
+.entrance-glow {
+  position: absolute;
   left: 50%;
   top: 50%;
-  translate: -50% -50%;
-  z-index: 2;
-  font-family: 'Space Grotesk', sans-serif;
-  font-weight: 800;
-  font-size: 24px;
-  text-transform: uppercase;
-  color: #ffffff;
-  white-space: nowrap;
-}
-.entrance-shine {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  -webkit-mask-image: url(/medina-logo.png);
-  mask-image: url(/medina-logo.png);
-  -webkit-mask-size: contain;
-  mask-size: contain;
-  -webkit-mask-repeat: no-repeat;
-  mask-repeat: no-repeat;
-  -webkit-mask-position: center;
-  mask-position: center;
+  border-radius: 50%;
   pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.4);
+  mix-blend-mode: screen;
+  will-change: transform, opacity, filter;
 }
-.entrance-shine::after {
-  content: '';
-  position: absolute;
-  top: -50%;
-  left: -50%;
-  width: 200%;
-  height: 200%;
-  background: linear-gradient(
-    45deg,
-    transparent 0%,
-    transparent 38%,
-    rgba(255, 255, 255, 0.2) 42%,
-    rgba(255, 255, 255, 0.6) 50%,
-    rgba(255, 255, 255, 0.2) 58%,
-    transparent 62%,
-    transparent 100%
+.entrance-glow-halo {
+  width: 1100px;
+  height: 1100px;
+  background: radial-gradient(
+    circle at center,
+    rgba(124, 58, 237, 0.22) 0%,
+    rgba(109, 40, 217, 0.15) 25%,
+    rgba(79, 70, 229, 0.08) 50%,
+    rgba(0, 0, 0, 0) 72%
   );
-  transform: translateX(-150%) translateY(-150%) rotate(45deg);
-  animation: shineWipe 700ms cubic-bezier(0.4, 0, 0.2, 1) 700ms forwards;
+  filter: blur(80px);
+  animation:
+    entranceGlowIgniteSlow 2400ms cubic-bezier(0.16, 1, 0.3, 1) 350ms forwards,
+    entranceGlowHaloDrift 9000ms ease-in-out 2400ms infinite;
 }
-@keyframes shineWipe {
-  0% { transform: translateX(-150%) translateY(-150%) rotate(45deg); }
-  100% { transform: translateX(150%) translateY(150%) rotate(45deg); }
+.entrance-glow-core {
+  width: 220px;
+  height: 220px;
+  background: radial-gradient(
+    circle at center,
+    rgba(167, 139, 250, 0.95) 0%,
+    rgba(139, 92, 246, 0.75) 22%,
+    rgba(124, 58, 237, 0.45) 45%,
+    rgba(109, 40, 217, 0.18) 65%,
+    rgba(0, 0, 0, 0) 80%
+  );
+  filter: blur(14px);
+  animation:
+    entranceGlowIgnite 1500ms cubic-bezier(0.16, 1, 0.3, 1) forwards,
+    entranceGlowPulseCore 3200ms ease-in-out 1500ms infinite;
+}
+.entrance-glow-mid {
+  width: 380px;
+  height: 380px;
+  background: radial-gradient(
+    circle at center,
+    rgba(139, 92, 246, 0.6) 0%,
+    rgba(124, 58, 237, 0.4) 30%,
+    rgba(109, 40, 217, 0.18) 55%,
+    rgba(0, 0, 0, 0) 75%
+  );
+  filter: blur(28px);
+  animation:
+    entranceGlowIgniteSlow 1700ms cubic-bezier(0.16, 1, 0.3, 1) 100ms forwards,
+    entranceGlowPulseMid 4500ms ease-in-out 1700ms infinite;
+}
+.entrance-glow-outer {
+  width: 620px;
+  height: 620px;
+  background: radial-gradient(
+    circle at center,
+    rgba(124, 58, 237, 0.45) 0%,
+    rgba(109, 40, 217, 0.28) 30%,
+    rgba(79, 70, 229, 0.14) 55%,
+    rgba(0, 0, 0, 0) 75%
+  );
+  filter: blur(48px);
+  animation:
+    entranceGlowIgniteSlow 2000ms cubic-bezier(0.16, 1, 0.3, 1) 200ms forwards,
+    entranceGlowDrift 6500ms ease-in-out 2000ms infinite;
+}
+.entrance-glow-shimmer {
+  width: 300px;
+  height: 300px;
+  background: radial-gradient(
+    circle at 30% 35%,
+    rgba(196, 181, 253, 0.55) 0%,
+    rgba(139, 92, 246, 0.25) 40%,
+    rgba(0, 0, 0, 0) 70%
+  );
+  filter: blur(22px);
+  animation:
+    entranceGlowIgnite 1600ms cubic-bezier(0.16, 1, 0.3, 1) 150ms forwards,
+    entranceGlowShimmer 5200ms ease-in-out 1600ms infinite;
+}
+.entrance-glow-cool {
+  width: 480px;
+  height: 480px;
+  background: radial-gradient(
+    circle at 65% 60%,
+    rgba(79, 70, 229, 0.4) 0%,
+    rgba(67, 56, 202, 0.22) 35%,
+    rgba(0, 0, 0, 0) 70%
+  );
+  filter: blur(36px);
+  animation:
+    entranceGlowIgniteSlow 1900ms cubic-bezier(0.16, 1, 0.3, 1) 250ms forwards,
+    entranceGlowCoolDrift 7200ms ease-in-out 1900ms infinite;
+}
+
+@keyframes entranceLogoIgnite {
+  0%   { opacity: 0; transform: scale(0.6); }
+  60%  { opacity: 1; }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes entranceLogoBreathe {
+  0%   { transform: scale(1); }
+  100% { transform: scale(1.13); }
+}
+@keyframes entranceGlowIgnite {
+  0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.4); }
+  100% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+@keyframes entranceGlowIgniteSlow {
+  0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+  100% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+@keyframes entranceGlowPulseCore {
+  0%, 100% { opacity: 0.95; transform: translate(-50%, -50%) scale(1); }
+  50%      { opacity: 1;    transform: translate(-50%, -50%) scale(1.15); }
+}
+@keyframes entranceGlowPulseMid {
+  0%, 100% { opacity: 0.85; transform: translate(-50%, -50%) scale(1); }
+  50%      { opacity: 1;    transform: translate(-50%, -50%) scale(1.12); }
+}
+@keyframes entranceGlowDrift {
+  0%, 100% { opacity: 0.85; transform: translate(-50%, -50%) scale(1) rotate(0deg); }
+  50%      { opacity: 1;    transform: translate(-50%, -50%) scale(1.08) rotate(180deg); }
+}
+@keyframes entranceGlowShimmer {
+  0%   { opacity: 0.9; transform: translate(-50%, -50%) scale(1) rotate(0deg); }
+  50%  { opacity: 1;   transform: translate(-50%, -50%) scale(1.18) rotate(140deg); }
+  100% { opacity: 0.9; transform: translate(-50%, -50%) scale(1) rotate(360deg); }
+}
+@keyframes entranceGlowHaloDrift {
+  0%, 100% { opacity: 0.7; transform: translate(-50%, -50%) scale(1); }
+  50%      { opacity: 0.95; transform: translate(-50%, -50%) scale(1.08); }
+}
+@keyframes entranceGlowCoolDrift {
+  0%   { opacity: 0.8; transform: translate(-50%, -50%) scale(1) rotate(0deg); }
+  50%  { opacity: 0.95; transform: translate(-50%, -50%) scale(1.1) rotate(-160deg); }
+  100% { opacity: 0.8; transform: translate(-50%, -50%) scale(1) rotate(-360deg); }
 }

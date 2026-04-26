@@ -4,6 +4,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
+import { canReadEmailContent } from '../lib/helpers';
 
 // ---------------------------------------------------------------------------
 // GET /api/deals
@@ -445,7 +446,8 @@ export async function getDealTimeline(
     // Conversations involving deal contacts
     env.D1.prepare(
       `SELECT DISTINCT conv.id, conv.subject AS title, conv.sent_at AS timestamp,
-              'conversation' AS type, conv.source AS subtype, conv.body_preview
+              'conversation' AS type, conv.source AS subtype, conv.body_preview,
+              conv.source AS conv_source, conv.participant_user_ids, conv.is_campaign_email
        FROM deal_contacts dc
        JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
        JOIN conversations conv ON cc.conversation_id = conv.id
@@ -523,8 +525,25 @@ export async function getDealTimeline(
     };
   });
 
+  const conversationsWithAccess = (conversations.results as any[]).map((c: any) => {
+    const canRead = canReadEmailContent(
+      {
+        source: c.conv_source,
+        participant_user_ids: c.participant_user_ids,
+        is_campaign_email: c.is_campaign_email,
+      } as any,
+      ctx.userId,
+      ctx.userRole
+    );
+    return {
+      ...c,
+      canReadContent: canRead,
+      body_preview: canRead ? c.body_preview : null,
+    };
+  });
+
   const entries = [
-    ...conversations.results,
+    ...conversationsWithAccess,
     ...events.results,
     ...notes.results,
     ...parsedAudit,

@@ -211,6 +211,10 @@ export interface ClassifiableItem {
   fromName?: string;
   toEmails?: string[];
   ccEmails?: string[];
+  // Display names keyed by lowercased recipient email (from + to + cc).
+  // Plain Record so the value survives JSON serialization through the
+  // Workflow checkpoint boundary.
+  recipientNames?: Record<string, string>;
   sentAt: string;
   direction?: 'inbound' | 'outbound' | 'internal';
   importance?: string;

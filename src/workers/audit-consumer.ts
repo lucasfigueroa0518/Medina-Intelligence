@@ -8,6 +8,7 @@ export async function handleAuditBatch(
   env: Env
 ): Promise<void> {
   const statements: D1PreparedStatement[] = [];
+  const validMessages: Message<AuditEvent>[] = [];
 
   for (const msg of batch.messages) {
     if (!isValidAuditEvent(msg.body)) {
@@ -41,16 +42,17 @@ export async function handleAuditBatch(
       )
     );
 
-    msg.ack();
+    validMessages.push(msg);
   }
 
-  if (statements.length > 0) {
-    try {
-      await env.D1.batch(statements);
-    } catch (err) {
-      console.error('Audit batch write failed:', err);
-      // Don't throw — messages already ack'd. Durable retry handled via queue retries.
-    }
+  if (statements.length === 0) return;
+
+  try {
+    await env.D1.batch(statements);
+    for (const m of validMessages) m.ack();
+  } catch (err) {
+    console.error('Audit batch write failed — messages will retry then DLQ:', err);
+    for (const m of validMessages) m.retry();
   }
 }
 

@@ -129,12 +129,9 @@ export async function calculateRelationshipOwner(
       ownerId = validUser ? creator.user_id : null;
     }
 
-    if (!ownerId) {
-      const fallback = await env.D1.prepare(
-        'SELECT id FROM users WHERE org_id = ? LIMIT 1'
-      ).bind(orgId).first<{ id: string }>();
-      ownerId = fallback?.id ?? null;
-    }
+    // No interactions and no audit-recorded creator → leave NULL.
+    // Never default to "first user in the org" — that quietly assigns every
+    // ownerless contact to whoever signed up first.
   } else if (ranked.length === 1) {
     ownerId = ranked[0].userId;
   } else {

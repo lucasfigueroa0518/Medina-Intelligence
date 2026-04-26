@@ -7,7 +7,7 @@ import {
   Mail, Calendar, FileText, Activity, Clock, Users, Building2,
   Check, X as XIcon, Plus, ChevronDown, ChevronUp, Trash2,
   DollarSign, Target, AlertCircle, CheckCircle2, MoreHorizontal,
-  Sparkles, ArrowRight,
+  Sparkles, ArrowRight, Lock,
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { api } from '@/lib/api';
@@ -1287,9 +1287,13 @@ function GlassCard({ children }: { children: React.ReactNode }) {
 function TimelineRow({ entry }: { entry: any }) {
   const meta = parseEntryMeta(entry);
   const isStageChange = entry.type === 'audit' && meta.old_stage && meta.new_stage;
+  const isRestrictedEmail =
+    entry.type === 'conversation' && entry.canReadContent === false;
 
   const iconMap: Record<string, React.ReactNode> = {
-    conversation: <Mail size={14} className="text-blue-400" />,
+    conversation: isRestrictedEmail
+      ? <Lock size={14} className="text-text-muted" />
+      : <Mail size={14} className="text-blue-400" />,
     event:        <Calendar size={14} className="text-cyan-400" />,
     note:         <FileText size={14} className="text-purple-400" />,
     audit:        <Activity size={14} className="text-zinc-400" />,
@@ -1330,9 +1334,11 @@ function TimelineRow({ entry }: { entry: any }) {
             </span>
           </div>
         )}
-        {entry.body_preview && (
+        {isRestrictedEmail ? (
+          <div className="text-xs text-text-muted italic mt-0.5">You are not a participant in this email</div>
+        ) : entry.body_preview ? (
           <div className="text-xs text-text-muted mt-0.5 truncate">{entry.body_preview}</div>
-        )}
+        ) : null}
         {entry.attendees && (
           <div className="text-xs text-text-muted mt-0.5 truncate">{entry.attendees}</div>
         )}

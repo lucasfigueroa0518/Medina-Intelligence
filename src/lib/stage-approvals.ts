@@ -52,12 +52,15 @@ export async function stageAndCommitApprovals(
         )
         .run();
 
-      // Junction rows for conversation_contacts
+      // Junction rows for conversation_contacts. Only bump total_interactions
+      // for links that were newly inserted — replays/dedup must not double-count.
+      const newlyLinked: string[] = [];
       for (const cid of item.contactIds) {
-        await env.D1.prepare(
+        const result = await env.D1.prepare(
           `INSERT OR IGNORE INTO conversation_contacts (conversation_id, contact_id, role)
            VALUES (?, ?, 'participant')`
         ).bind(item.entityId, cid).run();
+        if (result.meta?.changes) newlyLinked.push(cid);
       }
 
       // Auto-link pairs
@@ -65,14 +68,20 @@ export async function stageAndCommitApprovals(
         await autoLinkConversationParticipants(item.entityId, item.contactIds, orgId, env);
       }
 
-      // Update last_contact_date on linked contacts
+      // Update last_contact_date on every linked contact (it's monotonic),
+      // but only increment total_interactions for newly inserted links.
       for (const cid of item.contactIds) {
         await env.D1.prepare(
           `UPDATE contacts SET last_contact_date = ?,
-             total_interactions = total_interactions + 1,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE id = ? AND (last_contact_date IS NULL OR last_contact_date < ?)`
+        ).bind(item.sentAt, cid, item.sentAt).run();
+      }
+      for (const cid of newlyLinked) {
+        await env.D1.prepare(
+          `UPDATE contacts SET total_interactions = total_interactions + 1
            WHERE id = ?`
-        ).bind(item.sentAt, cid).run();
+        ).bind(cid).run();
       }
 
       // Email signature extraction + display name updates (progressive enrichment)
@@ -85,11 +94,29 @@ export async function stageAndCommitApprovals(
               item.fromName || '', item.entityId, item.sentAt, env
             );
           }
-          if (item.fromName && item.fromName.trim().split(/\s+/).length >= 2) {
-            await processDisplayNameUpdate(
-              senderContactId, orgId, item.fromName,
-              item.entityId, item.sentAt, env
-            );
+          // Apply display-name updates to every linked contact for which we have
+          // a real display name (either fromName matching sender or recipientNames).
+          const recipientNames = item.recipientNames || {};
+          for (const cid of item.contactIds) {
+            const row = await env.D1.prepare(
+              'SELECT email FROM contacts WHERE id = ?'
+            ).bind(cid).first<{ email: string | null }>();
+            const emailLower = row?.email?.toLowerCase();
+            if (!emailLower) continue;
+
+            let nameCandidate: string | null = null;
+            if (item.fromEmail && item.fromEmail.toLowerCase() === emailLower && item.fromName) {
+              nameCandidate = item.fromName;
+            } else if (recipientNames[emailLower]) {
+              nameCandidate = recipientNames[emailLower];
+            }
+
+            if (nameCandidate && nameCandidate.trim().split(/\s+/).length >= 2) {
+              await processDisplayNameUpdate(
+                cid, orgId, nameCandidate,
+                item.entityId, item.sentAt, env
+              );
+            }
           }
         } catch (e) {
           console.error(`[sig-parser] error for contact ${senderContactId}:`, e);

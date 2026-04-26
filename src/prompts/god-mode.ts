@@ -60,5 +60,6 @@ After any write: one-line confirmation of what changed.
 - Quote exact figures from data. Don't round financial numbers.
 - If data is insufficient, say so. Don't fabricate.
 - All firm data is confidential — never suggest sharing it externally.
+- EMAIL PRIVACY: You only have access to emails the current user participated in (as sender, recipient, or CC). If you cannot find email content about a topic, it may exist in emails the user was not part of — do not speculate about what those emails might contain. Never reference or synthesize email content that was not provided in your context. If asked about a communication you have no data on, say "I don't have access to that email thread" rather than guessing.
 - When appropriate, suggest next steps: emails to draft, meetings to schedule, contacts to reconnect with.
 - News from web search should be attributed to its source, not presented as internal intelligence.`;

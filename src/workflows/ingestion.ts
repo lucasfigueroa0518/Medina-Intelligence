@@ -19,6 +19,7 @@ import { calculateAllRelationshipStatuses } from '../lib/relationship-status';
 import { calculateAllRelationshipOwners } from '../lib/relationship-owner';
 import { analyzeAllCommsPatterns } from '../lib/communication-patterns';
 import { recalculateAllAssociations } from '../lib/associations';
+import { reconcileOrphanContacts } from '../lib/contact-reconciliation';
 
 // Module-load probe: if this never fires in `wrangler tail`, the crash is at
 // import/class-definition time, not in run().
@@ -153,7 +154,11 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       ];
 
       const classifiedItems: ClassifiedItem[] = [];
-      const classifyBatches = chunkArray(allItems, 50);
+      // Batch size 10 to stay under the 1000-subrequest-per-Worker cap. High-
+      // fanout emails (calendar invites with many attendees) can trigger 80+
+      // subrequests per item via per-recipient discover/dedup queries, so even
+      // 20/batch overflows on certain shapes. 10/batch is the safe ceiling.
+      const classifyBatches = chunkArray(allItems, 10);
       for (let i = 0; i < classifyBatches.length; i++) {
         console.log(`[IngestionWorkflow] step → classify-batch-${i} (${classifyBatches[i].length} items)`);
         const batch = await step.do(`classify-batch-${i}`, async () =>
@@ -213,6 +218,23 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         await invalidateRagCache(org_id!, this.env);
       });
 
+      // Step 6b: reconcile orphan contacts. Heals any contact whose
+      // discovery committed under a previous failed run but whose
+      // conversation_contacts link never got written (workflow died between
+      // classify-batch and stage-approvals). Recomputes total_interactions
+      // from the junction table so the counter is always the source of truth.
+      console.log('[IngestionWorkflow] step → reconcile-orphan-contacts');
+      await step.do('reconcile-orphan-contacts', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
+        try {
+          const r = await reconcileOrphanContacts(org_id!, this.env);
+          console.log(
+            `[IngestionWorkflow] reconciliation: orphans=${r.orphan_contacts_scanned} links_inserted=${r.links_inserted} counter_updates=${r.contacts_with_counter_change}`
+          );
+        } catch (e) {
+          console.error('[IngestionWorkflow] reconciliation failed:', e);
+        }
+      });
+
       // Step 7: post-ingestion calculations
       console.log('[IngestionWorkflow] step → post-ingestion-calcs');
       await step.do('post-ingestion-calcs', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
@@ -237,14 +259,85 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         } catch (e) { console.error('[IngestionWorkflow] associations calc failed:', e); }
       });
 
-      // Step 8: finalize
+      // Step 7b: deal detection from this batch (Finding 5)
+      console.log('[IngestionWorkflow] step → detect-deals');
+      const dealsStaged = await step.do('detect-deals', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
+        try {
+          const { detectAndStageDealSignals } = await import('../lib/deal-detection');
+          const stagedCount = await detectAndStageDealSignals(classifiedItems, org_id!, this.env);
+          console.log(`[IngestionWorkflow] deal signals staged: ${stagedCount}`);
+          return stagedCount;
+        } catch (e) {
+          console.error('[IngestionWorkflow] deal detection failed:', e);
+          return 0;
+        }
+      });
+
+      // Step 7c: kick off enrichment now so newly-discovered contacts/companies
+      // don't wait the full hour. Skip if an enrichment run is already in flight.
+      console.log('[IngestionWorkflow] step → trigger-post-ingest-enrichment');
+      await step.do('trigger-post-ingest-enrichment', async () => {
+        const running = await this.env.D1.prepare(
+          `SELECT id FROM sync_jobs
+           WHERE org_id = ? AND workflow_type = 'enrichment' AND status = 'running'
+             AND timeout_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+        ).bind(org_id!).first();
+
+        if (running) {
+          console.log('[IngestionWorkflow] enrichment already in flight — skipping post-ingest trigger');
+          return;
+        }
+
+        try {
+          await this.env.ENRICHMENT_WORKFLOW.create({
+            params: { org_id: org_id! },
+          });
+          console.log('[IngestionWorkflow] post-ingest enrichment workflow triggered');
+        } catch (e) {
+          console.error('[IngestionWorkflow] failed to trigger post-ingest enrichment:', e);
+        }
+      });
+
+      // Step 8: finalize — record a structured metadata summary on the job row
       console.log('[IngestionWorkflow] step → finalize');
       await step.do('finalize', async () => {
+        // Quality gates: log a warning when this run looks suspicious so it's
+        // findable in `wrangler tail` without rooting through every log line.
+        const fetched = sourceData.outlook.length + sourceData.slack.length + sourceData.news.length + sourceData.calendar.length;
+        const classifiedCount = classifiedItems.length;
+        const dropRate = fetched > 0 ? 1 - classifiedCount / fetched : 0;
+
+        const warnings: string[] = [];
+        if (sourceData.failures.length > 0) {
+          warnings.push(`source_failures:${sourceData.failures.map(f => f.source).join(',')}`);
+        }
+        if (fetched > 50 && classifiedCount === 0) {
+          warnings.push('all_items_dropped');
+        }
+        if (fetched > 100 && dropRate > 0.9) {
+          warnings.push(`high_drop_rate:${dropRate.toFixed(2)}`);
+        }
+        if (warnings.length > 0) {
+          console.warn(`[IngestionWorkflow] QUALITY GATES TRIPPED: ${warnings.join(' | ')}`);
+        }
+
+        const metadata = {
+          fetched_outlook: sourceData.outlook.length,
+          fetched_slack: sourceData.slack.length,
+          fetched_news: sourceData.news.length,
+          fetched_calendar: sourceData.calendar.length,
+          source_failures: sourceData.failures,
+          classified: classifiedCount,
+          drop_rate: Number(dropRate.toFixed(4)),
+          deals_staged: dealsStaged,
+          warnings,
+        };
+
         await this.env.D1.prepare(
           `UPDATE sync_jobs SET status = 'completed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-             items_processed = ?
+             items_processed = ?, metadata = ?
            WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'running'`
-        ).bind(classifiedItems.length, org_id!).run();
+        ).bind(classifiedCount, JSON.stringify(metadata), org_id!).run();
       });
 
       console.log('[IngestionWorkflow] run completed successfully');

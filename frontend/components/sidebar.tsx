@@ -37,11 +37,22 @@ const NAV_LINKS: NavLink[] = [
   { label: 'Settings', icon: SettingsIcon, route: '/settings' },
 ];
 
+interface MeUser {
+  id: string;
+  email: string;
+  full_name: string;
+  role: string;
+  org_id: string;
+  avatar_url: string | null;
+}
+
 export function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
   const [martyPending, setMartyPending] = React.useState(false);
   const [loggingOut, setLoggingOut] = React.useState(false);
+  const [me, setMe] = React.useState<MeUser | null>(null);
+  const [isAdmin, setIsAdmin] = React.useState(false);
 
   React.useEffect(() => {
     // Check initial state
@@ -57,6 +68,22 @@ export function Sidebar() {
     return () => window.removeEventListener('marty-pending-change', handler);
   }, []);
 
+  React.useEffect(() => {
+    let cancelled = false;
+    api.getMe()
+      .then(res => {
+        if (cancelled) return;
+        setMe(res.user);
+        setIsAdmin(res.user.role === 'owner' || res.user.role === 'admin');
+      })
+      .catch(() => { /* unauthenticated — leave defaults */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const initial = me?.full_name?.trim()?.charAt(0)?.toUpperCase() || me?.email?.charAt(0)?.toUpperCase() || '?';
+  const displayName = me?.full_name?.trim() || me?.email || 'Loading…';
+  const roleLabel = me?.role || '';
+
   return (
     <aside className="w-[240px] bg-bg-inset border-r border-border flex-shrink-0 flex flex-col">
       {/* Logo */}
@@ -71,7 +98,7 @@ export function Sidebar() {
 
       {/* Nav links */}
       <nav className="flex-1 p-3 space-y-1">
-        {NAV_LINKS.map(link => {
+        {NAV_LINKS.filter(link => !link.requireAdmin || isAdmin).map(link => {
           const active = pathname === link.route || pathname.startsWith(link.route + '/');
           const isMarty = link.route === '/god-mode';
           return (
@@ -103,12 +130,17 @@ export function Sidebar() {
       {/* User menu */}
       <div className="p-4 border-t border-border">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-full bg-brand-gradient flex items-center justify-center text-white text-sm font-medium">
-            M
-          </div>
+          {me?.avatar_url ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={me.avatar_url} alt="" className="w-8 h-8 rounded-full object-cover" />
+          ) : (
+            <div className="w-8 h-8 rounded-full bg-brand-gradient flex items-center justify-center text-white text-sm font-medium">
+              {initial}
+            </div>
+          )}
           <div className="flex-1 min-w-0">
-            <div className="text-sm text-text-primary truncate">Managing Partner</div>
-            <div className="text-xs text-text-muted">owner</div>
+            <div className="text-sm text-text-primary truncate">{displayName}</div>
+            <div className="text-xs text-text-muted">{roleLabel}</div>
           </div>
           <button
             title="Sign out"

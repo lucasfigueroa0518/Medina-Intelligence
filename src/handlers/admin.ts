@@ -87,6 +87,91 @@ export async function clearRateLimit(
   return jsonResponse({ ok: true });
 }
 
+// One-time repair: rewrite participant_user_ids in Vectorize chunk metadata
+// after a user-id migration. Vectorize metadata is immutable; we re-upsert
+// with the same vector_id to overwrite. Idempotent — vectors whose metadata
+// is already correct are skipped without re-embedding. Batched via `limit`
+// to stay under the Worker CPU ceiling; call repeatedly until updated === 0.
+export async function repairVectorizeParticipantIds(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ old_user_id: string; new_user_id: string; limit?: number }>(request);
+  if (!body?.old_user_id || !body?.new_user_id) {
+    return errorResponse('VALIDATION_ERROR', 400, 'old_user_id and new_user_id required');
+  }
+  const limit = Math.min(Math.max(body.limit ?? 25, 1), 100);
+
+  const conversations = await env.D1.prepare(
+    `SELECT id FROM conversations WHERE participant_user_ids LIKE ? AND org_id = ?`
+  ).bind(`%${body.new_user_id}%`, ctx.orgId).all<{ id: string }>();
+
+  if (conversations.results.length === 0) {
+    return jsonResponse({ updated: 0, skipped: 0, errors: [], total_candidate_vectors: 0, message: 'No conversations match new_user_id' });
+  }
+
+  const placeholders = conversations.results.map(() => '?').join(',');
+  const vectors = await env.D1.prepare(
+    `SELECT vector_id FROM vector_entity_index WHERE source_table = 'conversations' AND entity_id IN (${placeholders})`
+  ).bind(...conversations.results.map(c => c.id)).all<{ vector_id: string }>();
+
+  const totalCandidates = vectors.results.length;
+  let updated = 0;
+  let skipped = 0;
+  const errors: string[] = [];
+
+  for (const v of vectors.results) {
+    if (updated >= limit) break;
+    const vectorId = v.vector_id;
+    try {
+      const existing = await env.VECTORIZE.getByIds([vectorId]);
+      if (existing.length === 0) {
+        errors.push(`${vectorId}: not in Vectorize`);
+        continue;
+      }
+      const meta = existing[0].metadata || {};
+      const csv = String(meta.participant_user_ids || '');
+      if (!csv.includes(body.old_user_id)) {
+        skipped++;
+        continue;
+      }
+      const chunkText = await env.KV.get(`chunk:${vectorId}`);
+      if (!chunkText) {
+        errors.push(`${vectorId}: chunk text missing from KV`);
+        continue;
+      }
+      const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+        text: [chunkText],
+        pooling: 'cls',
+      } as any);
+      const values = Array.isArray((embedding as any).data)
+        ? (embedding as any).data[0]
+        : (embedding as any).data;
+
+      const newCsv = csv.split(',').map(s => s === body.old_user_id ? body.new_user_id : s).join(',');
+      await env.VECTORIZE.upsert([
+        { id: vectorId, values, metadata: { ...meta, participant_user_ids: newCsv } },
+      ]);
+      updated++;
+    } catch (err: any) {
+      errors.push(`${vectorId}: ${err?.message || String(err)}`);
+    }
+  }
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'update',
+    entity_type: 'integration',
+    entity_id: `vectorize_repair:${body.old_user_id}->${body.new_user_id}`,
+    metadata: { updated, skipped, errors_count: errors.length, total_candidates: totalCandidates },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ updated, skipped, errors, total_candidate_vectors: totalCandidates });
+}
+
 export async function getSystemStatus(
   ctx: AuthContext,
   env: Env

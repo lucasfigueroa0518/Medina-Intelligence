@@ -140,12 +140,27 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
 
       console.log('[EnrichmentWorkflow] step → identify-pending-companies');
       const companies = await step.do('identify-pending-companies', async () => {
+        // Order by enrichment_last_run NULLS FIRST (never-enriched first) and
+        // bump the cap to 0.6 so the first cycle clears the auto-discovered
+        // backlog instead of leaving 60% of companies un-enriched forever.
+        // Prioritize:
+        //   1. Never enriched (enrichment_last_run IS NULL).
+        //   2. Companies whose name still equals their domain — discovery
+        //      stores the domain as a placeholder; enrichment should resolve
+        //      it to a real name (when that pipeline starts writing names back).
+        //   3. Highest news relevance, then oldest.
         const rows = await this.env.D1.prepare(
           `SELECT id FROM companies WHERE org_id = ? AND deleted_at IS NULL
+             AND merged_into IS NULL
              AND (enrichment_last_run IS NULL OR enrichment_last_run < strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days'))
              AND investment_status NOT IN ('passed','exited')
-           ORDER BY news_relevance_score DESC LIMIT ?`
-        ).bind(org_id!, Math.floor(maxPerCycle * 0.4)).all<{ id: string }>();
+           ORDER BY
+             CASE WHEN enrichment_last_run IS NULL THEN 0 ELSE 1 END,
+             CASE WHEN LOWER(name) = LOWER(domain) OR LOWER(name) = LOWER(REPLACE(REPLACE(website,'https://',''),'http://','')) THEN 0 ELSE 1 END,
+             COALESCE(news_relevance_score, 0) DESC,
+             created_at ASC
+           LIMIT ?`
+        ).bind(org_id!, Math.floor(maxPerCycle * 0.6)).all<{ id: string }>();
         return rows.results.map(r => r.id);
       });
       console.log(`[EnrichmentWorkflow] pending companies: ${companies.length}`);

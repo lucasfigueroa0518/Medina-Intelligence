@@ -120,6 +120,27 @@ function messageToClassifiableItem(
   userId: string,
   orgId: string
 ): ClassifiableItem {
+  const recipientNames: Record<string, string> = {};
+  const fromAddr = msg.from?.emailAddress?.address;
+  const fromName = msg.from?.emailAddress?.name;
+  if (fromAddr && fromName) {
+    recipientNames[fromAddr.toLowerCase()] = fromName;
+  }
+  for (const r of msg.toRecipients || []) {
+    const addr = r.emailAddress?.address;
+    const name = r.emailAddress?.name;
+    if (addr && name && name.trim()) {
+      recipientNames[addr.toLowerCase()] = name;
+    }
+  }
+  for (const r of msg.ccRecipients || []) {
+    const addr = r.emailAddress?.address;
+    const name = r.emailAddress?.name;
+    if (addr && name && name.trim()) {
+      recipientNames[addr.toLowerCase()] = name;
+    }
+  }
+
   return {
     type: 'email',
     source: 'outlook',
@@ -133,6 +154,7 @@ function messageToClassifiableItem(
     fromName: msg.from.emailAddress.name,
     toEmails: msg.toRecipients.map(r => r.emailAddress.address),
     ccEmails: msg.ccRecipients.map(r => r.emailAddress.address),
+    recipientNames,
     sentAt: msg.sentDateTime,
     direction,
     importance: msg.importance,

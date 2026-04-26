@@ -40,6 +40,9 @@ export default function AdminPage() {
 function ApprovalTab() {
   const [items, setItems] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
+  const [confirmingAll, setConfirmingAll] = React.useState(false);
+  const [bulkInFlight, setBulkInFlight] = React.useState(false);
+  const [statusMsg, setStatusMsg] = React.useState<string | null>(null);
 
   const load = () => {
     setLoading(true);
@@ -51,6 +54,12 @@ function ApprovalTab() {
 
   React.useEffect(load, []);
 
+  React.useEffect(() => {
+    if (!statusMsg) return;
+    const t = setTimeout(() => setStatusMsg(null), 5000);
+    return () => clearTimeout(t);
+  }, [statusMsg]);
+
   const approve = async (id: string) => {
     await api.approveItem(id);
     load();
@@ -60,12 +69,75 @@ function ApprovalTab() {
     load();
   };
 
+  const approveAll = async () => {
+    const ids = items.map(i => i.id);
+    setBulkInFlight(true);
+    try {
+      const res = await api.bulkApprove(ids);
+      const resolved = res.resolved.length;
+      const conflicts = res.conflicts.length;
+      setStatusMsg(
+        conflicts > 0
+          ? `Approved ${resolved} item${resolved === 1 ? '' : 's'}, ${conflicts} already resolved`
+          : `Approved ${resolved} item${resolved === 1 ? '' : 's'}`
+      );
+    } finally {
+      setBulkInFlight(false);
+      setConfirmingAll(false);
+      load();
+    }
+  };
+
   if (loading) return <div className="text-text-secondary">Loading approvals...</div>;
   if (items.length === 0)
-    return <div className="card text-center py-12 text-text-secondary">No pending approvals</div>;
+    return (
+      <>
+        {statusMsg && (
+          <div className="card mb-3 text-sm text-semantic-success">{statusMsg}</div>
+        )}
+        <div className="card text-center py-12 text-text-secondary">No pending approvals</div>
+      </>
+    );
 
   return (
     <div className="space-y-3">
+      {statusMsg && (
+        <div className="card text-sm text-semantic-success">{statusMsg}</div>
+      )}
+      <div className="flex items-center justify-between">
+        <div className="text-sm text-text-secondary">
+          {items.length} pending item{items.length === 1 ? '' : 's'}
+        </div>
+        {!confirmingAll ? (
+          <button
+            onClick={() => setConfirmingAll(true)}
+            disabled={bulkInFlight}
+            className="btn-primary"
+          >
+            Approve All
+          </button>
+        ) : (
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-text-primary">
+              Approve all {items.length} pending item{items.length === 1 ? '' : 's'}?
+            </span>
+            <button
+              onClick={approveAll}
+              disabled={bulkInFlight}
+              className="btn-primary"
+            >
+              {bulkInFlight ? 'Approving...' : 'Confirm'}
+            </button>
+            <button
+              onClick={() => setConfirmingAll(false)}
+              disabled={bulkInFlight}
+              className="btn-secondary"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
       {items.map(item => {
         const display = cleanValue(item.proposed_value);
         const currentDisplay = item.current_value ? cleanValue(item.current_value) : null;

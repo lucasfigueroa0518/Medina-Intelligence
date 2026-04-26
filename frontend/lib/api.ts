@@ -213,6 +213,10 @@ export const api = {
     request<{ ok: boolean; re_enrich_triggered?: boolean }>(`/approval-queue/${id}/approve`, { method: 'POST' }),
   rejectItem: (id: string) =>
     request<{ ok: boolean }>(`/approval-queue/${id}/reject`, { method: 'POST' }),
+  bulkApprove: (ids: string[]) =>
+    request<{ resolved: string[]; conflicts: string[] }>('/approval-queue/bulk-approve', {
+      method: 'POST', body: JSON.stringify({ ids }),
+    }),
   approveAllForEntity: (entityType: string, entityId: string) =>
     request<{ ok: boolean; resolved_count: number }>('/approval-queue/approve-all', {
       method: 'POST', body: JSON.stringify({ entity_type: entityType, entity_id: entityId }),
