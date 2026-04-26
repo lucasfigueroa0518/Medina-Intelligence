@@ -2,7 +2,6 @@
 import type { Env } from '../types/env';
 import type { ClassifiableItem } from '../types/interfaces';
 import { emitAudit } from './audit';
-import { triggerContactEnrichment } from './enrichment';
 import { isValidContactName, resolveContactName } from './name-quality';
 
 // Domains whose mail is always automated/transactional — never discover as contacts.
@@ -520,9 +519,11 @@ export async function discoverNewContact(
     created_at: new Date().toISOString(),
   });
 
-  triggerContactEnrichment(contactId, orgId, env).catch(e =>
-    console.error(`[discovery] auto-enrich failed for ${contactId}:`, e)
-  );
+  // No inline enrichment trigger here — every WORKFLOW.create is a subrequest,
+  // and high-fanout items would blow the per-invocation cap. The enrichment
+  // workflow's pickup loop already grabs `enrichment_last_run IS NULL` rows on
+  // its own cadence (and ingestion now also kicks a one-shot enrichment run at
+  // the end via `trigger-post-ingest-enrichment`).
 
   return { id: contactId, created: true };
 }

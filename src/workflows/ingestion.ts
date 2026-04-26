@@ -154,11 +154,12 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       ];
 
       const classifiedItems: ClassifiedItem[] = [];
-      // Batch size 10 to stay under the 1000-subrequest-per-Worker cap. High-
-      // fanout emails (calendar invites with many attendees) can trigger 80+
-      // subrequests per item via per-recipient discover/dedup queries, so even
-      // 20/batch overflows on certain shapes. 10/batch is the safe ceiling.
-      const classifyBatches = chunkArray(allItems, 10);
+      // Batch size 5 to stay under the 1000-subrequest-per-Worker cap. High-
+      // fanout items (calendar invites, threads cc'd to long lists) can spend
+      // ~10-15 subrequests per recipient via discover/dedup/audit, and 10/batch
+      // has been observed to overflow on real Outlook batches. 5/batch is the
+      // ceiling that's actually held under load.
+      const classifyBatches = chunkArray(allItems, 5);
       for (let i = 0; i < classifyBatches.length; i++) {
         console.log(`[IngestionWorkflow] step → classify-batch-${i} (${classifyBatches[i].length} items)`);
         const batch = await step.do(`classify-batch-${i}`, async () =>
@@ -168,7 +169,7 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       }
 
       // Step 4: embed + cache (batched 20/step)
-      const embedBatches = chunkArray(classifiedItems, 20);
+      const embedBatches = chunkArray(classifiedItems, 5);
       for (let i = 0; i < embedBatches.length; i++) {
         console.log(`[IngestionWorkflow] step → embed-batch-${i} (${embedBatches[i].length} items)`);
         await step.do(
