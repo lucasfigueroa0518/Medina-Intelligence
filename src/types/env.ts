@@ -19,6 +19,8 @@ export interface Env {
 
   // --- Workflows ---
   INGESTION_WORKFLOW: Workflow;
+  INGESTION_CHUNK_WORKFLOW: Workflow;
+  INGESTION_FINALIZER_WORKFLOW: Workflow;
   ENRICHMENT_WORKFLOW: Workflow;
   CAMPAIGN_WORKFLOW: Workflow;
 

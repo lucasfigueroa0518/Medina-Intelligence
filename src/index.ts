@@ -37,6 +37,8 @@ import { handleDlqBatch, handleAuditDlqBatch } from './workers/dlq-consumer';
 import { runDailyCron } from './lib/daily-cron';
 
 export { IngestionWorkflow } from './workflows/ingestion';
+export { IngestionChunkWorkflow } from './workflows/ingestion-chunk';
+export { IngestionFinalizerWorkflow } from './workflows/ingestion-finalizer';
 export { EnrichmentWorkflow } from './workflows/enrichment';
 export { CampaignSendWorkflow } from './workflows/campaign-send';
 

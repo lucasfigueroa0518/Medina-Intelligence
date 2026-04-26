@@ -39,6 +39,16 @@ binding = "INGESTION_WORKFLOW"
 class_name = "IngestionWorkflow"
 
 [[workflows]]
+name = "ingestion-chunk-workflow"
+binding = "INGESTION_CHUNK_WORKFLOW"
+class_name = "IngestionChunkWorkflow"
+
+[[workflows]]
+name = "ingestion-finalizer-workflow"
+binding = "INGESTION_FINALIZER_WORKFLOW"
+class_name = "IngestionFinalizerWorkflow"
+
+[[workflows]]
 name = "enrichment-workflow"
 binding = "ENRICHMENT_WORKFLOW"
 class_name = "EnrichmentWorkflow"

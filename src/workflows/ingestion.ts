@@ -1,29 +1,28 @@
-// TRD §7.1 Workflow A — Ingestion (every 20 min)
+// TRD §7.1 Workflow A — Ingestion master.
+//
+// Architecture: this workflow only fetches sources, writes per-chunk
+// item slices to R2, and fans out child IngestionChunkWorkflow runs.
+// Each child gets a fresh Worker invocation (fresh 1000-subrequest
+// budget). The last child to finish triggers IngestionFinalizerWorkflow
+// for bulk post-processing. The master itself stays well under the
+// subrequest cap because it only does fetch + R2 puts + N create() calls.
 import type { Env } from '../types/env';
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
-import type {
-  ClassifiableItem,
-  ClassifiedItem,
-  VectorIndexEntry,
-} from '../types/interfaces';
+import type { ClassifiableItem } from '../types/interfaces';
 import { fetchOutlookDelta, fetchOutlookCalendarDelta } from '../integrations/outlook';
 import { fetchSlackMessages } from '../integrations/slack';
 import { fetchNewsForActiveCompanies } from '../integrations/news-search';
-import { classifyAndDeduplicate } from '../lib/classification';
-import { chunkEmbedAndPersistAll } from '../lib/embedding';
-import { stageAndCommitApprovals } from '../lib/stage-approvals';
-import { invalidateRagCache } from '../lib/cache';
 import { chunkArray, getCurrentSyncJobId } from '../lib/helpers';
 import { emitAudit } from '../lib/audit';
-import { calculateAllRelationshipStatuses } from '../lib/relationship-status';
-import { calculateAllRelationshipOwners } from '../lib/relationship-owner';
-import { analyzeAllCommsPatterns } from '../lib/communication-patterns';
-import { recalculateAllAssociations } from '../lib/associations';
-import { reconcileOrphanContacts } from '../lib/contact-reconciliation';
 
-// Module-load probe: if this never fires in `wrangler tail`, the crash is at
-// import/class-definition time, not in run().
 console.log('[IngestionWorkflow] module loaded');
+
+// Items per child workflow. Each child has a fresh 1000-subrequest budget,
+// so we can be a touch more generous than the previous in-process batch
+// size (5) — but not too generous, because high-fanout items (large CC
+// lists, calendar invites) can spend ~100 subrequests each on contact
+// discovery alone. 8 keeps a comfortable margin for the worst case.
+const CHILDREN_CHUNK_SIZE = 8;
 
 interface IngestionParams {
   org_id: string;
@@ -41,8 +40,6 @@ function errMessage(e: unknown): string {
 
 export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> {
   async run(event: WorkflowEvent<IngestionParams>, step: WorkflowStep): Promise<void> {
-    // First log — proves run() was entered. If module-loaded fires but this
-    // does not, the crash is in entrypoint construction, not in the body.
     console.log(
       '[IngestionWorkflow] run started',
       (() => {
@@ -58,8 +55,6 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
     let jobCreated = false;
 
     try {
-      // Defensive payload unpack — a bad trigger payload used to crash the
-      // workflow silently before any step ran.
       if (!event || !event.payload) {
         throw new Error('IngestionWorkflow invoked with no event.payload');
       }
@@ -146,205 +141,110 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         }
       );
 
-      // Step 3: classify + deduplicate (batched 50/step)
-      const allItems: ClassifiableItem[] = [
-        ...sourceData.outlook,
-        ...sourceData.slack,
-        ...sourceData.news,
-      ];
-
-      const classifiedItems: ClassifiedItem[] = [];
-      // Batch size 5 to stay under the 1000-subrequest-per-Worker cap. High-
-      // fanout items (calendar invites, threads cc'd to long lists) can spend
-      // ~10-15 subrequests per recipient via discover/dedup/audit, and 10/batch
-      // has been observed to overflow on real Outlook batches. 5/batch is the
-      // ceiling that's actually held under load.
-      const classifyBatches = chunkArray(allItems, 5);
-      for (let i = 0; i < classifyBatches.length; i++) {
-        console.log(`[IngestionWorkflow] step → classify-batch-${i} (${classifyBatches[i].length} items)`);
-        const batch = await step.do(`classify-batch-${i}`, async () =>
-          classifyAndDeduplicate(classifyBatches[i], org_id!, this.env)
-        );
-        classifiedItems.push(...batch);
-      }
-
-      // Step 4: embed + cache (batched 20/step)
-      const embedBatches = chunkArray(classifiedItems, 5);
-      for (let i = 0; i < embedBatches.length; i++) {
-        console.log(`[IngestionWorkflow] step → embed-batch-${i} (${embedBatches[i].length} items)`);
-        await step.do(
-          `embed-batch-${i}`,
-          { retries: { limit: 3, delay: '10 seconds' } },
-          async () => {
-            const indexEntries: VectorIndexEntry[] = [];
-
-            for (const item of embedBatches[i]) {
-              try {
-                const entries = await chunkEmbedAndPersistAll(
-                  item.text,
-                  item.metadata,
-                  this.env
-                );
-                indexEntries.push(...entries);
-              } catch (e) {
-                console.error('embed failed for item', item.entityId, e);
-              }
-            }
-
-            if (indexEntries.length > 0) {
-              await this.env.D1.batch(
-                indexEntries.map(e =>
-                  this.env.D1
-                    .prepare(
-                      'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-                    )
-                    .bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
-                )
-              );
-            }
-          }
-        );
-      }
-
-      // Step 5: stage approvals + commit auto-approved
-      console.log('[IngestionWorkflow] step → stage-approvals');
-      await step.do('stage-approvals', async () => {
+      // Step 3: write chunks to R2 + fan out children
+      console.log('[IngestionWorkflow] step → write-chunks-and-fanout');
+      await step.do('write-chunks-and-fanout', async () => {
+        const allItems: ClassifiableItem[] = [
+          ...sourceData.outlook,
+          ...sourceData.slack,
+          ...sourceData.news,
+        ];
         const syncJobId = await getCurrentSyncJobId(org_id!, 'ingestion', this.env);
-        await stageAndCommitApprovals(classifiedItems, org_id!, syncJobId, this.env);
-      });
+        const chunks = chunkArray(allItems, CHILDREN_CHUNK_SIZE);
 
-      // Step 6: invalidate cache
-      console.log('[IngestionWorkflow] step → invalidate-cache');
-      await step.do('invalidate-cache', async () => {
-        await invalidateRagCache(org_id!, this.env);
-      });
-
-      // Step 6b: reconcile orphan contacts. Heals any contact whose
-      // discovery committed under a previous failed run but whose
-      // conversation_contacts link never got written (workflow died between
-      // classify-batch and stage-approvals). Recomputes total_interactions
-      // from the junction table so the counter is always the source of truth.
-      console.log('[IngestionWorkflow] step → reconcile-orphan-contacts');
-      await step.do('reconcile-orphan-contacts', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
-        try {
-          const r = await reconcileOrphanContacts(org_id!, this.env);
-          console.log(
-            `[IngestionWorkflow] reconciliation: orphans=${r.orphan_contacts_scanned} links_inserted=${r.links_inserted} counter_updates=${r.contacts_with_counter_change}`
-          );
-        } catch (e) {
-          console.error('[IngestionWorkflow] reconciliation failed:', e);
-        }
-      });
-
-      // Step 7: post-ingestion calculations
-      console.log('[IngestionWorkflow] step → post-ingestion-calcs');
-      await step.do('post-ingestion-calcs', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
-        try {
-          const statusCount = await calculateAllRelationshipStatuses(org_id!, this.env);
-          console.log(`[IngestionWorkflow] relationship statuses updated: ${statusCount}`);
-        } catch (e) { console.error('[IngestionWorkflow] relationship-status calc failed:', e); }
-
-        try {
-          const ownerCount = await calculateAllRelationshipOwners(org_id!, this.env);
-          console.log(`[IngestionWorkflow] relationship owners updated: ${ownerCount}`);
-        } catch (e) { console.error('[IngestionWorkflow] relationship-owner calc failed:', e); }
-
-        try {
-          const commsCount = await analyzeAllCommsPatterns(org_id!, this.env);
-          console.log(`[IngestionWorkflow] comms patterns analyzed: ${commsCount}`);
-        } catch (e) { console.error('[IngestionWorkflow] comms-patterns calc failed:', e); }
-
-        try {
-          await recalculateAllAssociations(org_id!, this.env);
-          console.log(`[IngestionWorkflow] entity associations recalculated`);
-        } catch (e) { console.error('[IngestionWorkflow] associations calc failed:', e); }
-      });
-
-      // Step 7b: deal detection from this batch (Finding 5)
-      console.log('[IngestionWorkflow] step → detect-deals');
-      const dealsStaged = await step.do('detect-deals', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
-        try {
-          const { detectAndStageDealSignals } = await import('../lib/deal-detection');
-          const stagedCount = await detectAndStageDealSignals(classifiedItems, org_id!, this.env);
-          console.log(`[IngestionWorkflow] deal signals staged: ${stagedCount}`);
-          return stagedCount;
-        } catch (e) {
-          console.error('[IngestionWorkflow] deal detection failed:', e);
-          return 0;
-        }
-      });
-
-      // Step 7c: kick off enrichment now so newly-discovered contacts/companies
-      // don't wait the full hour. Skip if an enrichment run is already in flight.
-      console.log('[IngestionWorkflow] step → trigger-post-ingest-enrichment');
-      await step.do('trigger-post-ingest-enrichment', async () => {
-        const running = await this.env.D1.prepare(
-          `SELECT id FROM sync_jobs
-           WHERE org_id = ? AND workflow_type = 'enrichment' AND status = 'running'
-             AND timeout_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`
-        ).bind(org_id!).first();
-
-        if (running) {
-          console.log('[IngestionWorkflow] enrichment already in flight — skipping post-ingest trigger');
-          return;
-        }
-
-        try {
-          await this.env.ENRICHMENT_WORKFLOW.create({
-            params: { org_id: org_id! },
-          });
-          console.log('[IngestionWorkflow] post-ingest enrichment workflow triggered');
-        } catch (e) {
-          console.error('[IngestionWorkflow] failed to trigger post-ingest enrichment:', e);
-        }
-      });
-
-      // Step 8: finalize — record a structured metadata summary on the job row
-      console.log('[IngestionWorkflow] step → finalize');
-      await step.do('finalize', async () => {
-        // Quality gates: log a warning when this run looks suspicious so it's
-        // findable in `wrangler tail` without rooting through every log line.
-        const fetched = sourceData.outlook.length + sourceData.slack.length + sourceData.news.length + sourceData.calendar.length;
-        const classifiedCount = classifiedItems.length;
-        const dropRate = fetched > 0 ? 1 - classifiedCount / fetched : 0;
-
-        const warnings: string[] = [];
-        if (sourceData.failures.length > 0) {
-          warnings.push(`source_failures:${sourceData.failures.map(f => f.source).join(',')}`);
-        }
-        if (fetched > 50 && classifiedCount === 0) {
-          warnings.push('all_items_dropped');
-        }
-        if (fetched > 100 && dropRate > 0.9) {
-          warnings.push(`high_drop_rate:${dropRate.toFixed(2)}`);
-        }
-        if (warnings.length > 0) {
-          console.warn(`[IngestionWorkflow] QUALITY GATES TRIPPED: ${warnings.join(' | ')}`);
-        }
-
-        const metadata = {
+        const baseSummary = {
           fetched_outlook: sourceData.outlook.length,
           fetched_slack: sourceData.slack.length,
           fetched_news: sourceData.news.length,
           fetched_calendar: sourceData.calendar.length,
           source_failures: sourceData.failures,
-          classified: classifiedCount,
-          drop_rate: Number(dropRate.toFixed(4)),
-          deals_staged: dealsStaged,
-          warnings,
         };
 
+        // No items → finalize immediately (no children, no finalizer needed).
+        if (chunks.length === 0) {
+          const warnings: string[] = [];
+          if (sourceData.failures.length > 0) {
+            warnings.push(`source_failures:${sourceData.failures.map(f => f.source).join(',')}`);
+          }
+          const metadata = {
+            ...baseSummary,
+            chunk_count: 0,
+            pending_chunks: 0,
+            classified: 0,
+            warnings,
+          };
+          await this.env.D1.prepare(
+            `UPDATE sync_jobs
+               SET status = 'completed',
+                   completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                   items_processed = 0,
+                   metadata = ?
+             WHERE id = ?`
+          ).bind(JSON.stringify(metadata), syncJobId).run();
+          console.log('[IngestionWorkflow] no items fetched — job marked completed');
+          return;
+        }
+
+        // Write per-chunk slices to R2 in parallel.
+        const manifestPrefix = `ingestion/${org_id}/${syncJobId}`;
+        const chunkKeys = chunks.map((_, i) => `${manifestPrefix}/chunks/${i}.json`);
+        await Promise.all(
+          chunks.map((chunk, i) => this.env.R2.put(chunkKeys[i], JSON.stringify(chunk)))
+        );
+
+        // Manifest is for observability only — children read their own chunk file.
+        await this.env.R2.put(
+          `${manifestPrefix}/manifest.json`,
+          JSON.stringify({
+            org_id,
+            sync_job_id: syncJobId,
+            chunk_count: chunks.length,
+            chunk_size: CHILDREN_CHUNK_SIZE,
+            total_items: allItems.length,
+            fetched_at: new Date().toISOString(),
+            source_summary: baseSummary,
+            chunk_keys: chunkKeys,
+          })
+        );
+
+        // Set the counter BEFORE spawning children so the first child to
+        // finish doesn't observe a missing pending_chunks key.
+        const initialMetadata = {
+          ...baseSummary,
+          manifest_key: `${manifestPrefix}/manifest.json`,
+          chunk_count: chunks.length,
+          pending_chunks: chunks.length,
+          fanout_started_at: new Date().toISOString(),
+        };
         await this.env.D1.prepare(
-          `UPDATE sync_jobs SET status = 'completed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-             items_processed = ?, metadata = ?
-           WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'running'`
-        ).bind(classifiedCount, JSON.stringify(metadata), org_id!).run();
+          `UPDATE sync_jobs SET metadata = ? WHERE id = ?`
+        ).bind(JSON.stringify(initialMetadata), syncJobId).run();
+
+        // Fan out. Each create() queues a fresh Worker invocation.
+        await Promise.all(
+          chunks.map((_, i) =>
+            this.env.INGESTION_CHUNK_WORKFLOW.create({
+              id: `chunk-${syncJobId}-${i}`,
+              params: {
+                org_id: org_id!,
+                sync_job_id: syncJobId,
+                chunk_index: i,
+                chunk_r2_key: chunkKeys[i],
+              },
+            })
+          )
+        );
+
+        console.log(
+          `[IngestionWorkflow] fanned out ${chunks.length} children for job=${syncJobId} (chunk_size=${CHILDREN_CHUNK_SIZE}, total_items=${allItems.length})`
+        );
       });
 
-      console.log('[IngestionWorkflow] run completed successfully');
+      // Master ends here. Children continue independently. The last child
+      // to decrement the counter triggers IngestionFinalizerWorkflow which
+      // marks the sync_job as 'completed'.
+      console.log('[IngestionWorkflow] master finished — children running async');
     } catch (e) {
-      // Mirror EnrichmentWorkflow: nothing in this catch block may throw —
-      // we wrap every side-effect so the original error always re-throws.
       console.error(`[IngestionWorkflow] FATAL: ${errMessage(e)}`,
         e instanceof Error && e.stack ? e.stack : '');
 
