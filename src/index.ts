@@ -41,6 +41,7 @@ export { IngestionChunkWorkflow } from './workflows/ingestion-chunk';
 export { IngestionFinalizerWorkflow } from './workflows/ingestion-finalizer';
 export { EnrichmentWorkflow } from './workflows/enrichment';
 export { CampaignSendWorkflow } from './workflows/campaign-send';
+export { DailyCronWorkflow } from './workflows/daily-cron';
 
 // --- CORS helpers ---
 

@@ -58,6 +58,11 @@ name = "campaign-send-workflow"
 binding = "CAMPAIGN_WORKFLOW"
 class_name = "CampaignSendWorkflow"
 
+[[workflows]]
+name = "daily-cron-workflow"
+binding = "DAILY_CRON_WORKFLOW"
+class_name = "DailyCronWorkflow"
+
 # --- Cron Triggers ---
 
 [triggers]

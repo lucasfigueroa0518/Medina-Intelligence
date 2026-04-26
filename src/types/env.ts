@@ -23,6 +23,7 @@ export interface Env {
   INGESTION_FINALIZER_WORKFLOW: Workflow;
   ENRICHMENT_WORKFLOW: Workflow;
   CAMPAIGN_WORKFLOW: Workflow;
+  DAILY_CRON_WORKFLOW: Workflow;
 
   // --- Vars (from wrangler.toml [vars]) ---
   ENVIRONMENT: string;
