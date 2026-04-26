@@ -28,6 +28,7 @@ import * as Campaigns from './handlers/campaigns';
 import * as Agent from './handlers/agent';
 import * as Webhooks from './handlers/webhooks';
 import * as AuthOAuth from './handlers/auth-oauth';
+import * as Users from './handlers/users';
 import * as Integrations from './handlers/integrations';
 
 import { handleAuditBatch } from './workers/audit-consumer';
@@ -157,9 +158,11 @@ if (path === '/webhooks/firefly' && method === 'POST') {
   if (authResult instanceof Response) return authResult;
   const ctx = authResult;
 
-  // Check token revocation
+  // Check token revocation. Mirrors requireAuth: header preferred, ?token= fallback
+  // so the revocation check applies to browser-initiated GETs (e.g. <img> avatars) too.
   const authHeader = request.headers.get('Authorization') || '';
-  const rawToken = authHeader.replace(/^Bearer\s+/i, '');
+  let rawToken = authHeader.replace(/^Bearer\s+/i, '');
+  if (!rawToken) rawToken = url.searchParams.get('token') || '';
   if (rawToken) {
     const revoked = await isTokenRevoked(rawToken, env);
     if (revoked) {
@@ -189,6 +192,28 @@ async function routeAuthenticated(
   if (path === '/api/auth/me' && method === 'GET') {
     return AuthLogin.me(ctx, env);
   }
+
+  // --- Users (self-service profile) ---
+  if (path === '/api/users/me' && method === 'PATCH') {
+    return Users.updateMyProfile(request, ctx, env);
+  }
+  if (path === '/api/users/me/avatar' && method === 'POST') {
+    return Users.uploadMyAvatar(request, ctx, env);
+  }
+  if (path === '/api/users/me/avatar' && method === 'GET') {
+    return Users.getAvatar(request, ctx, env);
+  }
+  if (path === '/api/users/me/change-password' && method === 'POST') {
+    return AuthLogin.changePassword(request, ctx, env);
+  }
+  if (path === '/api/users/me/sessions' && method === 'GET') {
+    return AuthLogin.listMySessions(request, ctx, env);
+  }
+  if (path === '/api/users/me/sessions/logout-all' && method === 'POST') {
+    return AuthLogin.revokeAllOtherSessions(request, ctx, env);
+  }
+  const sessionMatch = path.match(/^\/api\/users\/me\/sessions\/([^/]+)$/);
+  if (sessionMatch && method === 'DELETE') return AuthLogin.revokeMySession(sessionMatch[1], ctx, env);
 
   // --- Contacts ---
   if (path === '/api/contacts') {

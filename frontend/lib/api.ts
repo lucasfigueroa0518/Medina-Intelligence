@@ -288,10 +288,53 @@ export const api = {
   logout: () =>
     request<{ success: boolean }>('/auth/logout', { method: 'POST' }),
   getMe: () =>
-    request<{ user: { id: string; email: string; full_name: string; role: string; org_id: string; avatar_url: string | null; last_login_at: string | null } }>(
-      '/auth/me'
-    ),
+    request<{ user: UserProfile }>('/auth/me'),
+
+  // Self-service profile
+  updateMyProfile: (data: Partial<Pick<UserProfile, 'full_name' | 'phone' | 'job_title' | 'linkedin_url' | 'bio' | 'avatar_url'>>) =>
+    request<{ user: UserProfile }>('/users/me', { method: 'PATCH', body: JSON.stringify(data) }),
+  uploadMyAvatar: (file: File) => {
+    const fd = new FormData();
+    fd.append('avatar', file);
+    return request<{ ok: boolean; avatar_url: string }>('/users/me/avatar', { method: 'POST', body: fd });
+  },
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ ok: boolean }>('/users/me/change-password', {
+      method: 'POST', body: JSON.stringify({ current_password, new_password }),
+    }),
+  listMySessions: () =>
+    request<{ sessions: Array<{ id: string; created_at: string; expires_at: string; current: boolean }> }>('/users/me/sessions'),
+  revokeMySession: (id: string) =>
+    request<{ ok: boolean }>(`/users/me/sessions/${id}`, { method: 'DELETE' }),
+  revokeAllOtherSessions: () =>
+    request<{ ok: boolean; revoked: number }>('/users/me/sessions/logout-all', { method: 'POST' }),
 };
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  full_name: string;
+  role: string;
+  org_id: string;
+  avatar_url: string | null;
+  phone: string | null;
+  job_title: string | null;
+  linkedin_url: string | null;
+  bio: string | null;
+  last_login_at: string | null;
+}
+
+// Resolve avatar_url for display. The backend stores R2-backed avatars as `r2:<key>`
+// — we route those through the authenticated /users/me/avatar?key=... endpoint so
+// the browser sends the bearer token. External http(s) URLs pass through unchanged.
+export function resolveAvatarUrl(avatarUrl: string | null | undefined): string | null {
+  if (!avatarUrl) return null;
+  if (avatarUrl.startsWith('r2:')) {
+    const key = avatarUrl.slice(3);
+    return `${API_BASE}/users/me/avatar?key=${encodeURIComponent(key)}`;
+  }
+  return avatarUrl;
+}
 
 // --- Integration status types (mirrors src/handlers/integrations.ts) ---
 

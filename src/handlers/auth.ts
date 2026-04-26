@@ -109,7 +109,15 @@ export async function requireAuth(
   env: Env
 ): Promise<AuthContext | Response> {
   const authHeader = request.headers.get('Authorization') || '';
-  const token = authHeader.replace(/^Bearer\s+/i, '');
+  let token = authHeader.replace(/^Bearer\s+/i, '');
+  // Fallback for browser-initiated GETs that can't set Authorization headers
+  // (e.g. <img src> for avatars). Header is preferred when present.
+  if (!token) {
+    try {
+      const url = new URL(request.url);
+      token = url.searchParams.get('token') || '';
+    } catch { /* ignore */ }
+  }
   if (!token) {
     return new Response(
       JSON.stringify({ error: 'AUTH_TOKEN_INVALID' }),

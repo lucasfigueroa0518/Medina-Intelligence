@@ -3,13 +3,15 @@
 import React from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2 } from 'lucide-react';
+import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import {
   api,
   getAuthToken,
+  resolveAvatarUrl,
   type IntegrationRow,
   type IntegrationsStatusResponse,
+  type UserProfile,
 } from '@/lib/api';
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
@@ -110,6 +112,10 @@ function SettingsPageInner() {
             <div className="text-sm text-text-primary">{banner.message}</div>
           </div>
         )}
+
+        <ProfileSection />
+
+        <SecuritySection />
 
         <div className="card">
           <div className="font-medium mb-4">Sync Behavior</div>
@@ -719,6 +725,477 @@ function ApprovalQueueSection() {
           <div className="text-sm text-text-primary">{toast}</div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ProfileSection() {
+  const [user, setUser] = React.useState<UserProfile | null>(null);
+  const [draft, setDraft] = React.useState<Partial<UserProfile>>({});
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+  const [uploading, setUploading] = React.useState(false);
+  const [toast, setToast] = React.useState<{ tone: 'success' | 'error'; msg: string } | null>(null);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const { user: u } = await api.getMe();
+      setUser(u);
+      setDraft({});
+    } catch (e: any) {
+      setToast({ tone: 'error', msg: e?.message || 'Failed to load profile' });
+    }
+    setLoading(false);
+  }, []);
+
+  React.useEffect(() => { load(); }, [load]);
+
+  React.useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // Detect changes against the loaded user
+  const hasChanges = React.useMemo(() => {
+    if (!user) return false;
+    const fields: Array<keyof UserProfile> = ['full_name', 'phone', 'job_title', 'linkedin_url', 'bio'];
+    return fields.some(f => f in draft && (draft[f] ?? null) !== (user[f] ?? null));
+  }, [user, draft]);
+
+  const update = (field: keyof UserProfile, value: string) => {
+    setDraft(prev => ({ ...prev, [field]: value }));
+  };
+
+  const valueOf = (field: keyof UserProfile): string => {
+    if (field in draft) return (draft[field] as string | null) ?? '';
+    return (user?.[field] as string | null) ?? '';
+  };
+
+  async function handleSave() {
+    if (!user || !hasChanges) return;
+    if ('full_name' in draft && (!draft.full_name || draft.full_name.trim().length === 0)) {
+      setToast({ tone: 'error', msg: 'Full name cannot be empty' });
+      return;
+    }
+    setSaving(true);
+    try {
+      // Send only changed fields. Empty strings → null for nullable fields.
+      const payload: Record<string, string | null> = {};
+      const fields: Array<keyof UserProfile> = ['full_name', 'phone', 'job_title', 'linkedin_url', 'bio'];
+      for (const f of fields) {
+        if (!(f in draft)) continue;
+        const v = (draft[f] as string | null) ?? null;
+        if (f === 'full_name') {
+          payload[f] = (v as string).trim();
+        } else {
+          const trimmed = (v ?? '').trim();
+          payload[f] = trimmed.length === 0 ? null : trimmed;
+        }
+      }
+      const { user: updated } = await api.updateMyProfile(payload as any);
+      setUser(updated);
+      setDraft({});
+      setToast({ tone: 'success', msg: 'Profile saved' });
+    } catch (e: any) {
+      setToast({ tone: 'error', msg: e?.message || 'Failed to save profile' });
+    }
+    setSaving(false);
+  }
+
+  async function handleAvatarChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setToast({ tone: 'error', msg: 'Avatar must be 5MB or smaller' });
+      return;
+    }
+    setUploading(true);
+    try {
+      const { avatar_url } = await api.uploadMyAvatar(file);
+      setUser(u => u ? { ...u, avatar_url } : u);
+      setToast({ tone: 'success', msg: 'Avatar updated' });
+    } catch (err: any) {
+      setToast({ tone: 'error', msg: err?.message || 'Failed to upload avatar' });
+    }
+    setUploading(false);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }
+
+  if (loading || !user) {
+    return (
+      <div className="card">
+        <div className="flex items-center gap-2 mb-4">
+          <UserIcon size={16} className="text-accent-magenta" />
+          <div className="font-medium">My Profile</div>
+        </div>
+        <div className="h-32 bg-bg-surface-hover rounded-lg animate-pulse" />
+      </div>
+    );
+  }
+
+  const token = getAuthToken();
+  const avatarBase = resolveAvatarUrl(user.avatar_url);
+  const avatarSrc = avatarBase
+    ? (avatarBase.includes('?') ? `${avatarBase}&token=${encodeURIComponent(token || '')}` : `${avatarBase}?token=${encodeURIComponent(token || '')}`)
+    : null;
+  const initials = (user.full_name || user.email)
+    .split(/\s+/)
+    .map(p => p.charAt(0).toUpperCase())
+    .slice(0, 2)
+    .join('');
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-2 mb-4">
+        <UserIcon size={16} className="text-accent-magenta" />
+        <div className="font-medium">My Profile</div>
+      </div>
+
+      <div className="flex items-start gap-6 mb-6">
+        <div className="relative shrink-0">
+          <div className="w-20 h-20 rounded-full overflow-hidden bg-brand-gradient flex items-center justify-center text-white text-2xl font-medium">
+            {avatarSrc ? (
+              <img src={avatarSrc} alt="" className="w-full h-full object-cover" />
+            ) : (
+              <span>{initials}</span>
+            )}
+          </div>
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full flex items-center justify-center transition-colors"
+            style={{
+              background: 'rgba(26,26,31,0.95)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              cursor: uploading ? 'wait' : 'pointer',
+            }}
+            title="Change avatar"
+          >
+            {uploading ? <Loader2 size={12} className="animate-spin text-text-secondary" /> : <Camera size={12} className="text-text-secondary" />}
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            onChange={handleAvatarChange}
+            className="hidden"
+          />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-base font-medium text-text-primary truncate">{user.full_name}</div>
+          <div className="text-xs text-text-muted">{user.email}</div>
+          <div className="text-[10px] text-text-muted uppercase tracking-wider mt-1">{user.role}</div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-x-4 gap-y-4">
+        <ProfileField label="Full name" required>
+          <input
+            type="text"
+            value={valueOf('full_name')}
+            onChange={e => update('full_name', e.target.value)}
+            className="input text-sm w-full"
+          />
+        </ProfileField>
+
+        <ProfileField label="Email" helper="Cannot be changed">
+          <input
+            type="email"
+            value={user.email}
+            disabled
+            className="input text-sm w-full"
+            style={{ opacity: 0.6, cursor: 'not-allowed' }}
+          />
+        </ProfileField>
+
+        <ProfileField label="Job title">
+          <input
+            type="text"
+            value={valueOf('job_title')}
+            onChange={e => update('job_title', e.target.value)}
+            placeholder="e.g. Managing Partner"
+            className="input text-sm w-full"
+          />
+        </ProfileField>
+
+        <ProfileField label="Phone">
+          <input
+            type="tel"
+            value={valueOf('phone')}
+            onChange={e => update('phone', e.target.value)}
+            placeholder="+1 (555) 555-5555"
+            className="input text-sm w-full"
+          />
+        </ProfileField>
+
+        <div className="col-span-2">
+          <ProfileField label="LinkedIn URL">
+            <input
+              type="url"
+              value={valueOf('linkedin_url')}
+              onChange={e => update('linkedin_url', e.target.value)}
+              placeholder="https://linkedin.com/in/..."
+              className="input text-sm w-full"
+            />
+          </ProfileField>
+        </div>
+
+        <div className="col-span-2">
+          <ProfileField label="Bio">
+            <textarea
+              value={valueOf('bio')}
+              onChange={e => update('bio', e.target.value)}
+              rows={3}
+              placeholder="A short bio for teammates"
+              className="input text-sm w-full resize-y"
+            />
+          </ProfileField>
+        </div>
+      </div>
+
+      <div className="flex justify-end mt-6">
+        <button
+          onClick={handleSave}
+          disabled={!hasChanges || saving}
+          className="btn-primary text-sm"
+          style={{ opacity: hasChanges && !saving ? 1 : 0.5, cursor: hasChanges && !saving ? 'pointer' : 'not-allowed' }}
+        >
+          {saving ? 'Saving...' : 'Save Changes'}
+        </button>
+      </div>
+
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-[60] rounded-xl shadow-2xl px-5 py-3"
+          style={{
+            background: '#1A1A1F',
+            border: `1px solid ${toast.tone === 'success' ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
+            borderLeft: `3px solid ${toast.tone === 'success' ? '#22C55E' : '#EF4444'}`,
+          }}>
+          <div className="text-sm text-text-primary">{toast.msg}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProfileField({ label, required, helper, children }: { label: string; required?: boolean; helper?: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <label className="block text-xs text-text-muted mb-1.5">
+        {label}
+        {required && <span className="text-semantic-error ml-0.5">*</span>}
+      </label>
+      {children}
+      {helper && <div className="text-[10px] text-text-muted mt-1">{helper}</div>}
+    </div>
+  );
+}
+
+function SecuritySection() {
+  return (
+    <div className="card">
+      <div className="flex items-center gap-2 mb-4">
+        <Shield size={16} className="text-accent-magenta" />
+        <div className="font-medium">Security</div>
+      </div>
+      <ChangePasswordPanel />
+      <div className="border-t border-border/50 mt-6 pt-6">
+        <ActiveSessionsPanel />
+      </div>
+    </div>
+  );
+}
+
+function ChangePasswordPanel() {
+  const [current, setCurrent] = React.useState('');
+  const [next, setNext] = React.useState('');
+  const [confirm, setConfirm] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [msg, setMsg] = React.useState<{ tone: 'success' | 'error'; text: string } | null>(null);
+
+  React.useEffect(() => {
+    if (!msg) return;
+    const t = setTimeout(() => setMsg(null), 4000);
+    return () => clearTimeout(t);
+  }, [msg]);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (next.length < 8) {
+      setMsg({ tone: 'error', text: 'New password must be at least 8 characters' });
+      return;
+    }
+    if (next !== confirm) {
+      setMsg({ tone: 'error', text: 'New password and confirmation do not match' });
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.changePassword(current, next);
+      setMsg({ tone: 'success', text: 'Password changed' });
+      setCurrent(''); setNext(''); setConfirm('');
+    } catch (e: any) {
+      const text = e?.message?.includes('401') || /INVALID_CREDENTIALS/i.test(e?.message || '')
+        ? 'Current password is incorrect'
+        : (e?.message || 'Failed to change password');
+      setMsg({ tone: 'error', text });
+    }
+    setSaving(false);
+  }
+
+  const canSubmit = current.length > 0 && next.length >= 8 && confirm.length > 0 && !saving;
+
+  return (
+    <div>
+      <div className="text-sm text-text-secondary mb-3">Change password</div>
+      <form onSubmit={handleSubmit} className="grid grid-cols-2 gap-x-4 gap-y-3 max-w-xl">
+        <div className="col-span-2">
+          <ProfileField label="Current password">
+            <input type="password" value={current} onChange={e => setCurrent(e.target.value)} autoComplete="current-password" className="input text-sm w-full" />
+          </ProfileField>
+        </div>
+        <ProfileField label="New password" helper="Min 8 characters">
+          <input type="password" value={next} onChange={e => setNext(e.target.value)} autoComplete="new-password" className="input text-sm w-full" />
+        </ProfileField>
+        <ProfileField label="Confirm new password">
+          <input type="password" value={confirm} onChange={e => setConfirm(e.target.value)} autoComplete="new-password" className="input text-sm w-full" />
+        </ProfileField>
+        <div className="col-span-2 flex items-center gap-3">
+          <button
+            type="submit"
+            disabled={!canSubmit}
+            className="btn-secondary text-sm py-1.5"
+            style={{ opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
+          >
+            {saving ? 'Updating...' : 'Update Password'}
+          </button>
+          {msg && (
+            <span className={`text-xs ${msg.tone === 'success' ? 'text-semantic-success' : 'text-semantic-error'}`}>
+              {msg.text}
+            </span>
+          )}
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ActiveSessionsPanel() {
+  const [sessions, setSessions] = React.useState<Array<{ id: string; created_at: string; expires_at: string; current: boolean }> | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [busy, setBusy] = React.useState<string | null>(null);
+  const [msg, setMsg] = React.useState<string | null>(null);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const { sessions } = await api.listMySessions();
+      setSessions(sessions);
+    } catch { setSessions([]); }
+    setLoading(false);
+  }, []);
+
+  React.useEffect(() => { load(); }, [load]);
+
+  React.useEffect(() => {
+    if (!msg) return;
+    const t = setTimeout(() => setMsg(null), 3000);
+    return () => clearTimeout(t);
+  }, [msg]);
+
+  async function revokeOne(id: string) {
+    setBusy(id);
+    try {
+      await api.revokeMySession(id);
+      setMsg('Session revoked');
+      load();
+    } catch { setMsg('Failed to revoke session'); }
+    setBusy(null);
+  }
+
+  async function logoutAllOthers() {
+    setBusy('all');
+    try {
+      const { revoked } = await api.revokeAllOtherSessions();
+      setMsg(`Logged out of ${revoked} other ${revoked === 1 ? 'device' : 'devices'}`);
+      load();
+    } catch { setMsg('Failed to log out other sessions'); }
+    setBusy(null);
+  }
+
+  const otherSessions = sessions?.filter(s => !s.current) ?? [];
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-sm text-text-secondary">Active sessions</div>
+        {otherSessions.length > 0 && (
+          <button
+            onClick={logoutAllOthers}
+            disabled={busy === 'all'}
+            className="text-xs text-text-muted hover:text-semantic-error transition-colors flex items-center gap-1.5"
+          >
+            <LogOut size={12} />
+            {busy === 'all' ? 'Logging out...' : `Log out other ${otherSessions.length} device${otherSessions.length === 1 ? '' : 's'}`}
+          </button>
+        )}
+      </div>
+
+      {loading ? (
+        <div className="space-y-2">
+          {[0, 1].map(i => <div key={i} className="h-12 bg-bg-surface-hover rounded-lg animate-pulse" />)}
+        </div>
+      ) : !sessions || sessions.length === 0 ? (
+        <div className="text-xs text-text-muted py-3">No active sessions found.</div>
+      ) : (
+        <div className="space-y-2">
+          {sessions.map(s => (
+            <div key={s.id}
+              className="flex items-center justify-between px-3 py-2.5 rounded-lg"
+              style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}>
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-7 h-7 rounded-full flex items-center justify-center shrink-0"
+                  style={{ background: s.current ? 'rgba(139,92,246,0.15)' : 'rgba(255,255,255,0.04)' }}>
+                  <Shield size={13} className={s.current ? 'text-accent-purple' : 'text-text-muted'} />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm text-text-primary flex items-center gap-2">
+                    <span>Session</span>
+                    {s.current && (
+                      <span className="text-[9px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider"
+                        style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>
+                        Current
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-text-muted">
+                    Started {formatRelative(s.created_at)} · expires {formatRelative(s.expires_at)}
+                  </div>
+                </div>
+              </div>
+              {!s.current && (
+                <button
+                  onClick={() => revokeOne(s.id)}
+                  disabled={busy === s.id}
+                  className="text-text-muted hover:text-semantic-error transition-colors p-1.5"
+                  title="Revoke session"
+                >
+                  <Trash2 size={14} />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {msg && <div className="text-xs text-text-muted mt-3">{msg}</div>}
+
+      <div className="text-[10px] text-text-muted mt-3">
+        Sessions don&apos;t track device or IP yet — you only see start/expiry times. We&apos;ll add device info in a future release.
+      </div>
     </div>
   );
 }

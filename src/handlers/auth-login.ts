@@ -230,7 +230,7 @@ export async function logout(request: Request, ctx: AuthContext, env: Env): Prom
  */
 export async function me(ctx: AuthContext, env: Env): Promise<Response> {
   const user = await env.D1.prepare(
-    `SELECT id, email, full_name, role, org_id, avatar_url, last_login_at
+    `SELECT id, email, full_name, role, org_id, avatar_url, phone, job_title, linkedin_url, bio, last_login_at
      FROM users WHERE id = ? AND deleted_at IS NULL`
   ).bind(ctx.userId).first();
 
@@ -239,6 +239,128 @@ export async function me(ctx: AuthContext, env: Env): Promise<Response> {
   }
 
   return jsonResponse({ user });
+}
+
+/**
+ * POST /api/users/me/change-password
+ */
+export async function changePassword(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  let body: { current_password?: string; new_password?: string };
+  try { body = await request.json(); } catch { return errorResponse('INVALID_BODY', 400); }
+
+  const { current_password, new_password } = body;
+  if (!current_password || !new_password) {
+    return errorResponse('MISSING_FIELDS', 400, 'current_password and new_password are required');
+  }
+  if (new_password.length < 8) {
+    return errorResponse('WEAK_PASSWORD', 400, 'New password must be at least 8 characters');
+  }
+
+  const user = await env.D1.prepare(
+    `SELECT password_hash FROM users WHERE id = ? AND deleted_at IS NULL`
+  ).bind(ctx.userId).first<{ password_hash: string | null }>();
+
+  if (!user || !user.password_hash) {
+    return errorResponse('NO_PASSWORD_SET', 400, 'No password is set for this account');
+  }
+
+  const valid = await verifyPassword(current_password, user.password_hash);
+  if (!valid) {
+    return errorResponse('INVALID_CREDENTIALS', 401, 'Current password is incorrect');
+  }
+
+  const newHash = await hashPassword(new_password);
+  await env.D1.prepare(
+    `UPDATE users SET password_hash = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+  ).bind(newHash, ctx.userId).run();
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'update',
+    entity_type: 'user',
+    entity_id: ctx.userId,
+    metadata: { fields: ['password_hash'] },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ ok: true });
+}
+
+/**
+ * GET /api/users/me/sessions
+ * Returns active (non-revoked, non-expired) sessions for the current user.
+ * Marks the session belonging to the current request as `current: true`.
+ */
+export async function listMySessions(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const authHeader = request.headers.get('Authorization') || '';
+  const currentToken = authHeader.replace(/^Bearer\s+/i, '');
+  const currentTokenHash = currentToken ? await hashTokenForStorage(currentToken) : '';
+
+  const rows = await env.D1.prepare(
+    `SELECT id, token_hash, expires_at, created_at, revoked_at
+     FROM auth_tokens
+     WHERE user_id = ? AND revoked_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     ORDER BY created_at DESC`
+  ).bind(ctx.userId).all<{ id: string; token_hash: string; expires_at: string; created_at: string; revoked_at: string | null }>();
+
+  const sessions = rows.results.map(r => ({
+    id: r.id,
+    created_at: r.created_at,
+    expires_at: r.expires_at,
+    current: r.token_hash === currentTokenHash,
+  }));
+
+  return jsonResponse({ sessions });
+}
+
+/**
+ * DELETE /api/users/me/sessions/:id
+ * Revokes a specific session. A user can only revoke their own.
+ */
+export async function revokeMySession(
+  id: string,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const result = await env.D1.prepare(
+    `UPDATE auth_tokens SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id = ? AND user_id = ? AND revoked_at IS NULL`
+  ).bind(id, ctx.userId).run();
+
+  if ((result.meta?.changes ?? 0) === 0) {
+    return errorResponse('SESSION_NOT_FOUND', 404);
+  }
+  return jsonResponse({ ok: true });
+}
+
+/**
+ * POST /api/users/me/sessions/logout-all
+ * Revokes every active session for this user EXCEPT the one making the request.
+ */
+export async function revokeAllOtherSessions(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const authHeader = request.headers.get('Authorization') || '';
+  const currentToken = authHeader.replace(/^Bearer\s+/i, '');
+  const currentTokenHash = currentToken ? await hashTokenForStorage(currentToken) : '';
+
+  const result = await env.D1.prepare(
+    `UPDATE auth_tokens SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE user_id = ? AND revoked_at IS NULL AND token_hash != ?`
+  ).bind(ctx.userId, currentTokenHash).run();
+
+  return jsonResponse({ ok: true, revoked: result.meta?.changes ?? 0 });
 }
 
 /**
