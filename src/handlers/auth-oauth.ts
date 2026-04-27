@@ -40,6 +40,9 @@ const SCOPES = [
 ].join(' ');
 
 function frontendUrl(env: Env): string {
+  if (!env.FRONTEND_URL) {
+    console.error('[auth-oauth] FRONTEND_URL is not set — OAuth redirects will fail');
+  }
   return env.FRONTEND_URL || 'http://localhost:3000';
 }
 
@@ -141,59 +144,6 @@ function tenantAuthorizeUrl(env: Env): string {
 function tenantTokenUrl(env: Env): string {
   const tenant = encodeURIComponent(env.AZURE_TENANT_ID);
   return `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
-}
-
-/**
- * GET /auth/outlook/debug
- *
- * Sanitized snapshot of the Azure env var state for the deployed Worker.
- * Returns format-only diagnostics — NEVER raw secret values.
- */
-export async function outlookOAuthDebug(
-  _request: Request,
-  env: Env
-): Promise<Response> {
-  const tenantValid = isValidTenantId(env.AZURE_TENANT_ID);
-  const clientIdValid = isValidGuid(env.AZURE_CLIENT_ID);
-  const redirectValid = isValidHttpUrl(env.AZURE_REDIRECT_URI);
-  const clientSecretPresent = Boolean(env.AZURE_CLIENT_SECRET && env.AZURE_CLIENT_SECRET.length > 0);
-
-  const diag = {
-    AZURE_CLIENT_ID: {
-      present: Boolean(env.AZURE_CLIENT_ID),
-      length: (env.AZURE_CLIENT_ID || '').length,
-      format_valid_guid: clientIdValid,
-      looks_like_url: isValidHttpUrl(env.AZURE_CLIENT_ID),
-    },
-    AZURE_CLIENT_SECRET: {
-      present: clientSecretPresent,
-      length: (env.AZURE_CLIENT_SECRET || '').length,
-    },
-    AZURE_TENANT_ID: {
-      present: Boolean(env.AZURE_TENANT_ID),
-      length: (env.AZURE_TENANT_ID || '').length,
-      format_valid: tenantValid,
-      looks_like_url: isValidHttpUrl(env.AZURE_TENANT_ID),
-      looks_like_guid: isValidGuid(env.AZURE_TENANT_ID),
-    },
-    AZURE_REDIRECT_URI: {
-      present: Boolean(env.AZURE_REDIRECT_URI),
-      length: (env.AZURE_REDIRECT_URI || '').length,
-      format_valid_http: redirectValid,
-      looks_like_guid: isValidGuid(env.AZURE_REDIRECT_URI),
-    },
-    FRONTEND_URL: {
-      present: Boolean(env.FRONTEND_URL),
-      value: env.FRONTEND_URL || '(falling back to http://localhost:3000)',
-    },
-    detected_swap: describeSwap(env),
-    would_build_authorize_url: tenantValid ? tenantAuthorizeUrl(env) : '(not built — tenant invalid)',
-  };
-
-  return new Response(JSON.stringify(diag, null, 2), {
-    status: 200,
-    headers: { 'Content-Type': 'application/json' },
-  });
 }
 
 function settingsRedirect(env: Env, params: Record<string, string>): Response {

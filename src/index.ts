@@ -136,9 +136,6 @@ if (path === '/webhooks/firefly' && method === 'POST') {
   if (path === '/auth/outlook/callback' && method === 'GET') {
     return AuthOAuth.outlookOAuthCallback(request, env);
   }
-  if (path === '/auth/outlook/debug' && method === 'GET') {
-    return AuthOAuth.outlookOAuthDebug(request, env);
-  }
   if (path === '/auth/outlook' && method === 'GET') {
     return AuthOAuth.outlookOAuthStart(request, env);
   }
