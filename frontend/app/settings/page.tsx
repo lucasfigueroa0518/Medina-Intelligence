@@ -14,6 +14,7 @@ import {
   type UserProfile,
   type FireflyBackfillResult,
 } from '@/lib/api';
+import { useBackgroundTasks } from '@/components/background-task-indicator';
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
 
@@ -1451,12 +1452,14 @@ function IntegrationRowView({
   row,
   primaryLabel,
   onPrimaryClick,
+  primaryDisabled,
 }: {
   name: string;
   description: string;
   row: IntegrationRow;
   primaryLabel: string | null;
   onPrimaryClick?: () => void;
+  primaryDisabled?: boolean;
 }) {
   const [copied, setCopied] = React.useState(false);
 
@@ -1516,7 +1519,7 @@ function IntegrationRowView({
           {row.status === 'connected' && (
             <span className="badge bg-semantic-success/10 text-semantic-success text-xs">Manage</span>
           )}
-          <button onClick={onPrimaryClick} className={row.status === 'connected' ? 'btn-ghost text-xs' : 'btn-secondary text-xs py-1.5'}>
+          <button onClick={onPrimaryClick} disabled={primaryDisabled} className={`${row.status === 'connected' ? 'btn-ghost text-xs' : 'btn-secondary text-xs py-1.5'} ${primaryDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}>
             {primaryLabel}
           </button>
         </div>
@@ -1548,13 +1551,24 @@ const FIREFLY_TROUBLESHOOTING: Array<{ q: string; a: React.ReactNode }> = [
   { q: 'How to import past meeting transcripts', a: <>Use the "Import Transcripts" button on the Firefly card to pull historical transcripts from Firefly's API. You'll need your Firefly API key from Settings → Developer settings.</> },
 ];
 
+const FIREFLY_TASK_NAME = 'Firefly transcript import';
+
 function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
   const [showImport, setShowImport] = React.useState(false);
   const [guideOpen, setGuideOpen] = React.useState(false);
+  const { isRunning } = useBackgroundTasks();
+  const importRunning = isRunning(FIREFLY_TASK_NAME);
 
   return (
     <div>
-      <IntegrationRowView name="Firefly AI" description="Meeting transcription + action items via webhook." row={row} primaryLabel="Import Transcripts" onPrimaryClick={() => setShowImport(true)} />
+      <IntegrationRowView
+        name="Firefly AI"
+        description="Meeting transcription + action items via webhook."
+        row={row}
+        primaryLabel={importRunning ? 'Import in progress...' : 'Import Transcripts'}
+        onPrimaryClick={() => setShowImport(true)}
+        primaryDisabled={importRunning}
+      />
       <button onClick={() => setGuideOpen(o => !o)} className="mt-2 flex items-center gap-1 text-xs text-text-muted hover:text-text-primary transition-colors">
         {guideOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
         Setup guide &amp; troubleshooting
@@ -1674,15 +1688,20 @@ function FireflyTroubleshooting() {
 function FireflyImportModal({ onClose }: { onClose: () => void }) {
   const [apiKey, setApiKey] = React.useState('');
   const [days, setDays] = React.useState(30);
-  const [loading, setLoading] = React.useState(false);
-  const [result, setResult] = React.useState<FireflyBackfillResult | null>(null);
   const [error, setError] = React.useState<string | null>(null);
-  const [showErrorList, setShowErrorList] = React.useState(false);
+  const { startTask } = useBackgroundTasks();
 
-  const submit = async () => {
+  const submit = () => {
     if (!apiKey.trim()) { setError('Enter your Firefly API key.'); return; }
-    setError(null); setLoading(true); setResult(null);
-    try { const r = await api.fireflyBackfill(apiKey.trim(), days); setResult(r); } catch (e: any) { setError(e?.message || 'Backfill failed'); } finally { setLoading(false); }
+    const promise = api.fireflyBackfill(apiKey.trim(), days);
+    startTask(FIREFLY_TASK_NAME, promise, (r: FireflyBackfillResult) => {
+      const parts: string[] = [];
+      if (r.ingested > 0) parts.push(`Imported ${r.ingested} transcript${r.ingested === 1 ? '' : 's'}`);
+      if (r.skipped_duplicates > 0) parts.push(`${r.skipped_duplicates} skipped`);
+      if (r.failed > 0) parts.push(`${r.failed} failed`);
+      return parts.length > 0 ? parts.join(', ') : 'No new transcripts found';
+    });
+    onClose();
   };
 
   return (
@@ -1695,76 +1714,27 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
           </div>
           <button onClick={onClose} className="text-text-muted hover:text-text-primary"><XIcon className="w-4 h-4" /></button>
         </div>
-
-        {!result && (
-          <>
-            <div>
-              <label className="text-xs text-text-secondary block mb-1">Firefly API key</label>
-              <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Paste your API key" className="input w-full text-sm" disabled={loading} autoFocus />
-              <div className="text-xs text-text-muted mt-1">From <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span></div>
-            </div>
-            <div>
-              <label className="text-xs text-text-secondary block mb-1">Backfill window</label>
-              <select value={days} onChange={e => setDays(Number(e.target.value))} className="input w-full text-sm" disabled={loading}>
-                <option value={7}>Last 7 days</option>
-                <option value={14}>Last 14 days</option>
-                <option value={30}>Last 30 days</option>
-                <option value={60}>Last 60 days</option>
-                <option value={90}>Last 90 days</option>
-              </select>
-            </div>
-            {error && <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">{error}</div>}
-            <div className="flex justify-end gap-2 pt-2">
-              <button onClick={onClose} className="btn-ghost text-xs" disabled={loading}>Cancel</button>
-              <button onClick={submit} className="btn-primary text-xs" disabled={loading || !apiKey.trim()}>
-                {loading ? <span className="flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" /> Importing…</span> : 'Import'}
-              </button>
-            </div>
-            {loading && <div className="text-xs text-text-muted">This can take a few minutes — Firefly's API is paced at one transcript per second.</div>}
-          </>
-        )}
-
-        {result && (
-          <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <Stat label="Found" value={result.total_found} />
-              <Stat label="Ingested" value={result.ingested} tone="success" />
-              <Stat label="Skipped duplicates" value={result.skipped_duplicates} />
-              <Stat label="Failed" value={result.failed} tone={result.failed > 0 ? 'error' : 'muted'} />
-            </div>
-            {result.partial && <div className="text-xs text-semantic-warning bg-semantic-warning/10 border-l-2 border-semantic-warning px-2 py-1 rounded">Partial result — {result.partial_reason}</div>}
-            {result.errors.length > 0 && (
-              <div>
-                <button onClick={() => setShowErrorList(o => !o)} className="flex items-center gap-1 text-xs text-text-muted hover:text-text-primary">
-                  {showErrorList ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                  {result.errors.length} error{result.errors.length === 1 ? '' : 's'}
-                </button>
-                {showErrorList && (
-                  <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
-                    {result.errors.map((e, i) => (
-                      <div key={i} className="text-xs bg-bg-input rounded px-2 py-1">
-                        <div className="text-text-primary truncate">{e.title}</div>
-                        <div className="text-text-muted text-[10px] truncate">{e.error}</div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-            <div className="flex justify-end pt-2"><button onClick={onClose} className="btn-secondary text-xs">Done</button></div>
-          </div>
-        )}
+        <div>
+          <label className="text-xs text-text-secondary block mb-1">Firefly API key</label>
+          <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Paste your API key" className="input w-full text-sm" autoFocus />
+          <div className="text-xs text-text-muted mt-1">From <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span></div>
+        </div>
+        <div>
+          <label className="text-xs text-text-secondary block mb-1">Backfill window</label>
+          <select value={days} onChange={e => setDays(Number(e.target.value))} className="input w-full text-sm">
+            <option value={7}>Last 7 days</option>
+            <option value={14}>Last 14 days</option>
+            <option value={30}>Last 30 days</option>
+            <option value={60}>Last 60 days</option>
+            <option value={90}>Last 90 days</option>
+          </select>
+        </div>
+        {error && <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">{error}</div>}
+        <div className="flex justify-end gap-2 pt-2">
+          <button onClick={onClose} className="btn-ghost text-xs">Cancel</button>
+          <button onClick={submit} className="btn-primary text-xs" disabled={!apiKey.trim()}>Import</button>
+        </div>
       </div>
-    </div>
-  );
-}
-
-function Stat({ label, value, tone }: { label: string; value: number; tone?: 'success' | 'error' | 'muted' }) {
-  const color = tone === 'success' ? 'text-semantic-success' : tone === 'error' ? 'text-semantic-error' : 'text-text-primary';
-  return (
-    <div className="bg-bg-input rounded px-2 py-1.5">
-      <div className="text-[10px] text-text-muted uppercase tracking-wide">{label}</div>
-      <div className={`text-sm font-medium ${color}`}>{value.toLocaleString()}</div>
     </div>
   );
 }
