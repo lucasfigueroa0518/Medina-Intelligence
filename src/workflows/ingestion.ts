@@ -66,17 +66,25 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       }
       console.log(`[IngestionWorkflow] org_id=${org_id}`);
 
-      // Step 1: concurrency guard with timeout recovery
+      // Step 1: concurrency guard with timeout recovery.
+      // Deploy-killed workflows leave orphan "running" rows. We use timeout_at
+      // as the authority: once past, the job is considered abandoned. We also
+      // treat any job running for >15 minutes as stale (healthy runs complete
+      // the master in <2 min; children run independently).
       console.log('[IngestionWorkflow] step → check-concurrency');
       const canProceed = await step.do('check-concurrency', async () => {
+        await this.env.D1.prepare(
+          `UPDATE sync_jobs SET status = 'failed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                 error_message = COALESCE(error_message, 'Timed out or interrupted by deploy')
+           WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'running'
+             AND (timeout_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                  OR started_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-15 minutes'))`
+        ).bind(org_id!).run();
+
         const running = await this.env.D1.prepare(
-          `SELECT id FROM sync_jobs WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'running' AND timeout_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+          `SELECT id FROM sync_jobs WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'running'`
         ).bind(org_id!).first();
         if (running) return false;
-
-        await this.env.D1.prepare(
-          `UPDATE sync_jobs SET status = 'failed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'running' AND (timeout_at IS NULL OR timeout_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-        ).bind(org_id!).run();
 
         await this.env.D1.prepare(
           `INSERT INTO sync_jobs (org_id, workflow_type, status, started_at, timeout_at)
@@ -91,47 +99,42 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       }
       jobCreated = true;
 
-      // Step 2: parallel source fetch
-      interface SourceBundle {
+      // Step 2a: fetch email + slack + calendar (fast sources)
+      interface CoreSourceBundle {
         outlook: ClassifiableItem[];
         slack: ClassifiableItem[];
-        news: ClassifiableItem[];
         calendar: ClassifiableItem[];
         failures: Array<{ source: string; error: string }>;
       }
 
-      console.log('[IngestionWorkflow] step → fetch-all-sources');
-      const sourceData: SourceBundle = await step.do(
-        'fetch-all-sources',
+      console.log('[IngestionWorkflow] step → fetch-core-sources');
+      const coreData: CoreSourceBundle = await step.do(
+        'fetch-core-sources',
         {
           retries: { limit: 2, delay: '10 seconds' },
-          timeout: '120 seconds',
+          timeout: '300 seconds',
         },
-        async (): Promise<SourceBundle> => {
+        async (): Promise<CoreSourceBundle> => {
           const results = await Promise.allSettled([
             fetchOutlookDelta(org_id!, this.env),
             fetchSlackMessages(org_id!, this.env),
-            fetchNewsForActiveCompanies(org_id!, this.env),
             fetchOutlookCalendarDelta(org_id!, this.env).then(() => [] as ClassifiableItem[]),
           ]);
 
           const failures: Array<{ source: string; error: string }> = [];
-          const data: SourceBundle = {
+          const data: CoreSourceBundle = {
             outlook: [] as ClassifiableItem[],
             slack: [] as ClassifiableItem[],
-            news: [] as ClassifiableItem[],
             calendar: [] as ClassifiableItem[],
             failures,
           };
 
-          // Outlook
           if (results[0].status === 'fulfilled') {
             data.outlook = (results[0] as PromiseFulfilledResult<ClassifiableItem[]>).value;
           } else {
             failures.push({ source: 'outlook', error: (results[0] as PromiseRejectedResult).reason?.message || 'unknown' });
           }
 
-          // Slack — new shape: { messages, errors, channels_visible }
           if (results[1].status === 'fulfilled') {
             const slackResult = (results[1] as PromiseFulfilledResult<{
               messages: ClassifiableItem[];
@@ -145,28 +148,47 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
             failures.push({ source: 'slack', error: (results[1] as PromiseRejectedResult).reason?.message || 'unknown' });
           }
 
-          // News
-          if (results[2].status === 'fulfilled') {
-            data.news = (results[2] as PromiseFulfilledResult<ClassifiableItem[]>).value;
-          } else {
-            failures.push({ source: 'news', error: (results[2] as PromiseRejectedResult).reason?.message || 'unknown' });
+          if (results[2].status === 'rejected') {
+            failures.push({ source: 'calendar', error: (results[2] as PromiseRejectedResult).reason?.message || 'unknown' });
           }
 
-          // Calendar (always returns [] — runs for side effects)
-          if (results[3].status === 'rejected') {
-            failures.push({ source: 'calendar', error: (results[3] as PromiseRejectedResult).reason?.message || 'unknown' });
-          }
-
-          // Bail only when every source actually failed (channel-level slack
-          // errors don't count — they're informational, not fetch failures).
-          const hardFailures = new Set(failures.map(f => f.source.split(':')[0]));
-          if (hardFailures.size === 4 && hardFailures.has('outlook') && hardFailures.has('slack')
-              && hardFailures.has('news') && hardFailures.has('calendar')) {
-            throw new Error('All source fetches failed');
-          }
           return data;
         }
       );
+
+      // Step 2b: fetch news (slow — separate step so it doesn't block core ingestion)
+      console.log('[IngestionWorkflow] step → fetch-news');
+      const newsData = await step.do(
+        'fetch-news',
+        {
+          retries: { limit: 1, delay: '10 seconds' },
+          timeout: '300 seconds',
+        },
+        async (): Promise<{ news: ClassifiableItem[]; failures: Array<{ source: string; error: string }> }> => {
+          try {
+            const news = await fetchNewsForActiveCompanies(org_id!, this.env);
+            return { news, failures: [] };
+          } catch (e: any) {
+            return { news: [], failures: [{ source: 'news', error: e?.message || 'unknown' }] };
+          }
+        }
+      );
+
+      // Combine into unified shape
+      interface SourceBundle {
+        outlook: ClassifiableItem[];
+        slack: ClassifiableItem[];
+        news: ClassifiableItem[];
+        calendar: ClassifiableItem[];
+        failures: Array<{ source: string; error: string }>;
+      }
+      const sourceData: SourceBundle = {
+        outlook: coreData.outlook,
+        slack: coreData.slack,
+        news: newsData.news,
+        calendar: coreData.calendar,
+        failures: [...coreData.failures, ...newsData.failures],
+      };
 
       // Step 3: write chunks to R2 + fan out children
       console.log('[IngestionWorkflow] step → write-chunks-and-fanout');

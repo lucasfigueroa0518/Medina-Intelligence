@@ -287,15 +287,14 @@ export async function triggerIngestion(
       end_date: body.end_date || now,
     });
     await env.D1.prepare(
-      `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, timeout_at, metadata, created_at, updated_at)
-       VALUES (?, ?, 'ingestion', 'running', ?, datetime(?, '+30 minutes'), ?, ?, ?)`
-    ).bind(jobId, ctx.orgId, now, now, metadata, now, now).run();
+      `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, timeout_at, metadata)
+       VALUES (?, ?, 'ingestion', 'running', ?, datetime(?, '+30 minutes'), ?)`
+    ).bind(jobId, ctx.orgId, now, now, metadata).run();
 
-    // Mark completed immediately since runHistoricalBackfill may return with in_progress (paginated)
     if (progress.status === 'completed') {
       await env.D1.prepare(
-        `UPDATE sync_jobs SET status = 'completed', completed_at = ?, items_processed = ?, updated_at = ? WHERE id = ?`
-      ).bind(now, progress.total_fetched, now, jobId).run();
+        `UPDATE sync_jobs SET status = 'completed', completed_at = ?, items_processed = ? WHERE id = ?`
+      ).bind(now, progress.total_fetched, jobId).run();
     }
 
     return jsonResponse({ ok: true, instance_id: jobId, progress });
