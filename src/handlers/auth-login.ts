@@ -252,7 +252,21 @@ export async function me(ctx: AuthContext, env: Env): Promise<Response> {
     return errorResponse('USER_NOT_FOUND', 404);
   }
 
-  return jsonResponse({ user });
+  const warnings: Array<{ type: string; message: string; consecutive_failures?: number }> = [];
+
+  const tokenFailState = await env.KV.get<{ count: number; last_failed?: string }>(
+    `token_failed:${ctx.userId}:outlook`,
+    'json'
+  );
+  if (tokenFailState && tokenFailState.count >= 3) {
+    warnings.push({
+      type: 'outlook_token_expired',
+      message: 'Your Outlook connection has stopped syncing. Go to Settings → Integrations to reconnect.',
+      consecutive_failures: tokenFailState.count,
+    });
+  }
+
+  return jsonResponse({ user, warnings });
 }
 
 /**

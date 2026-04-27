@@ -271,6 +271,8 @@ function EnrichmentTab() {
 
 function SyncTab() {
   const [status, setStatus] = React.useState<any>(null);
+  const [userHealth, setUserHealth] = React.useState<{ users: any[]; tokenHealth: Record<string, any> } | null>(null);
+
   React.useEffect(() => {
     const load = () => api.getSyncStatus().then(setStatus);
     load();
@@ -278,37 +280,90 @@ function SyncTab() {
     return () => clearInterval(t);
   }, []);
 
+  React.useEffect(() => {
+    api.getAdminIntegrationStatus().then(setUserHealth).catch(() => {});
+  }, []);
+
   if (!status) return <div className="text-text-secondary">Loading sync status...</div>;
 
   const types = ['ingestion', 'enrichment', 'daily'];
 
   return (
-    <div className="grid grid-cols-3 gap-4">
-      {types.map(t => {
-        const job = status[t];
-        return (
-          <div key={t} className="card">
-            <div className="font-medium capitalize mb-2">{t}</div>
-            {job ? (
-              <>
-                <div className="text-sm">
-                  Status: <span className="badge capitalize">{job.status}</span>
-                </div>
-                {job.started_at && (
-                  <div className="text-xs text-text-muted mt-2">
-                    Last run: {new Date(job.started_at).toLocaleString()}
+    <div className="space-y-6">
+      <div className="grid grid-cols-3 gap-4">
+        {types.map(t => {
+          const job = status[t];
+          return (
+            <div key={t} className="card">
+              <div className="font-medium capitalize mb-2">{t}</div>
+              {job ? (
+                <>
+                  <div className="text-sm">
+                    Status: <span className="badge capitalize">{job.status}</span>
                   </div>
-                )}
-                <div className="text-xs text-text-muted mt-1">
-                  Processed: {job.items_processed || 0} · Failed: {job.items_failed || 0}
-                </div>
-              </>
-            ) : (
-              <div className="text-text-muted text-sm">Never run</div>
-            )}
-          </div>
-        );
-      })}
+                  {job.started_at && (
+                    <div className="text-xs text-text-muted mt-2">
+                      Last run: {new Date(job.started_at).toLocaleString()}
+                    </div>
+                  )}
+                  <div className="text-xs text-text-muted mt-1">
+                    Processed: {job.items_processed || 0} · Failed: {job.items_failed || 0}
+                  </div>
+                </>
+              ) : (
+                <div className="text-text-muted text-sm">Never run</div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {userHealth && (
+        <div className="card">
+          <div className="font-medium mb-3">User Token Health</div>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs text-text-muted border-b border-border">
+                <th className="pb-2">Name</th>
+                <th className="pb-2">Email</th>
+                <th className="pb-2">Outlook</th>
+                <th className="pb-2">Failures</th>
+              </tr>
+            </thead>
+            <tbody>
+              {userHealth.users.map((u: any) => {
+                const health = userHealth.tokenHealth[u.id];
+                const failures = health?.count || 0;
+                const rowColor = failures >= 3
+                  ? 'bg-semantic-error/5'
+                  : failures >= 1
+                    ? 'bg-semantic-warning/5'
+                    : '';
+                return (
+                  <tr key={u.id} className={`border-b border-border/30 ${rowColor}`}>
+                    <td className="py-2 text-text-primary">{u.full_name || '—'}</td>
+                    <td className="py-2 text-text-secondary">{u.email}</td>
+                    <td className="py-2">
+                      {!u.has_outlook ? (
+                        <span className="text-text-muted">Not connected</span>
+                      ) : failures >= 3 ? (
+                        <span className="text-semantic-error">Failing</span>
+                      ) : failures >= 1 ? (
+                        <span className="text-semantic-warning">Degraded ({failures})</span>
+                      ) : (
+                        <span className="text-semantic-success">Healthy</span>
+                      )}
+                    </td>
+                    <td className="py-2 text-text-muted">
+                      {failures > 0 ? failures : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

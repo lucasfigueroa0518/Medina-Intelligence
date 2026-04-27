@@ -33,6 +33,7 @@ interface FolderDeltaConfig {
   folder: 'inbox' | 'sentitems';
   getDeltaToken: () => Promise<string | null>;
   setDeltaToken: (token: string) => Promise<void>;
+  clearDeltaToken: () => Promise<void>;
   backfillFilter: string;
 }
 
@@ -68,7 +69,10 @@ async function fetchFolderDelta(
     if (!resp.ok) {
       const errBody = await resp.text().catch(() => '');
       console.error(`[outlook] Delta fetch failed for ${config.folder} user ${userId}: ${resp.status} ${errBody.slice(0, 300)}`);
-      if (resp.status === 401) {
+      if (resp.status === 410) {
+        await config.clearDeltaToken();
+        console.warn(`[outlook] Delta token expired (410) for ${config.folder} user ${userId}, cleared for full re-sync`);
+      } else if (resp.status === 401) {
         await recordTokenFailure(userId, 'outlook', env);
       }
       break;
@@ -225,6 +229,11 @@ export async function fetchOutlookDelta(
             'UPDATE users SET outlook_delta_token = ? WHERE id = ?'
           ).bind(dt, user.id).run();
         },
+        clearDeltaToken: async () => {
+          await env.D1.prepare(
+            'UPDATE users SET outlook_delta_token = NULL WHERE id = ?'
+          ).bind(user.id).run();
+        },
         backfillFilter: `$filter=receivedDateTime ge ${since}`,
       }, orgId, env);
     } catch (e) {
@@ -240,6 +249,9 @@ export async function fetchOutlookDelta(
         getDeltaToken: async () => await env.KV.get(sentDeltaKey),
         setDeltaToken: async (dt) => {
           await env.KV.put(sentDeltaKey, dt, { expirationTtl: 2592000 });
+        },
+        clearDeltaToken: async () => {
+          await env.KV.delete(sentDeltaKey);
         },
         backfillFilter: `$filter=receivedDateTime ge ${since}`,
       }, orgId, env);
@@ -488,7 +500,12 @@ export async function fetchOutlookCalendarDelta(
         await recordGraphApiCall(orgId, env);
 
         if (!resp.ok) {
-          if (resp.status === 401) await recordTokenFailure(user.id, 'outlook', env);
+          if (resp.status === 410) {
+            await env.KV.delete(deltaKey);
+            console.warn(`[outlook] Calendar delta token expired (410) for user ${user.id}, cleared for full re-sync`);
+          } else if (resp.status === 401) {
+            await recordTokenFailure(user.id, 'outlook', env);
+          }
           break;
         }
 

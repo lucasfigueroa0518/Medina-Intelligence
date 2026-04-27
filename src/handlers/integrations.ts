@@ -267,7 +267,7 @@ async function buildSlackIntegrationRow(orgId: string, env: Env): Promise<Integr
   const [msgRow, lastSync] = await Promise.all([
     env.D1.prepare(
       `SELECT COUNT(*) as n FROM conversations
-        WHERE org_id = ? AND source = 'slack' AND deleted_at IS NULL`
+        WHERE org_id = ? AND source = 'slack'`
     ).bind(orgId).first<{ n: number }>(),
     env.KV.get(`slack_last_sync:${orgId}`),
   ]);

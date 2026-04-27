@@ -52,9 +52,7 @@ export async function preprocessQuery(
 
   const postRetrievalFilter = (chunk: VectorMatch): boolean => {
     if (chunk.metadata.visibility === 'private') {
-      if (userRole === 'owner') {
-        // bypass — fiduciary access
-      } else if (chunk.metadata.participant_user_ids) {
+      if (chunk.metadata.participant_user_ids) {
         const participants = String(chunk.metadata.participant_user_ids).split(',');
         if (!participants.includes(userId)) return false;
       } else if (

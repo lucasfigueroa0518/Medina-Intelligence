@@ -3,6 +3,7 @@
 import { usePathname } from 'next/navigation';
 import { Sidebar } from '@/components/sidebar';
 import { SessionExpiredBanner } from '@/components/session-expired-banner';
+import { IntegrationWarningBanner } from '@/components/integration-warning-banner';
 
 const NO_SHELL_PATHS = ['/login', '/signup', '/mfa'];
 
@@ -18,6 +19,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <div className="flex h-screen overflow-hidden">
         <Sidebar />
         <div className="flex-1 flex flex-col overflow-y-auto">
+          <IntegrationWarningBanner />
           {children}
         </div>
       </div>

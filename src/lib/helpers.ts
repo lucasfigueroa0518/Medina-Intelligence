@@ -123,11 +123,10 @@ export async function getDecryptedSlackBotToken(orgId: string, env: Env): Promis
 export function canReadEmailContent(
   conversation: Pick<Conversation, 'source' | 'participant_user_ids' | 'is_campaign_email'>,
   requestingUserId: string,
-  userRole: string
+  _userRole: string
 ): boolean {
   if (conversation.source === 'slack') return true;
   if ((conversation as any).is_campaign_email) return true;
-  if (userRole === 'owner') return true;
 
   try {
     const participants: string[] = JSON.parse(conversation.participant_user_ids || '[]');
