@@ -144,24 +144,23 @@ export async function enrichContactFromLinkedIn(
   const trimmedKey = apiKey.trim();
   const keyPrefix = trimmedKey.slice(0, 8);
 
-  // ReverseContact API is GET with query params — NOT POST with JSON body.
-  // POST /enrichment returns 404 "Endpoint not found".
-  // GET /enrichment?linkedin_url=... or ?email=... with Authorization: Bearer header.
+  // ReverseContact V1 API is GET with query params — NOT POST with JSON body,
+  // and the API key is passed as ?apikey=… NOT as Authorization: Bearer.
+  // Bearer auth returns {"code":"V1_API_KEY_MISSING"} because their auth
+  // middleware only inspects the apikey query param (or X-API-Key header).
   const lookupParam = contact.linkedin_url
     ? `linkedin_url=${encodeURIComponent(contact.linkedin_url)}`
     : `email=${encodeURIComponent(contact.email!)}`;
-  const url = `${API_BASE}${ENDPOINT}?${lookupParam}`;
+  const url = `${API_BASE}${ENDPOINT}?${lookupParam}&apikey=${encodeURIComponent(trimmedKey)}`;
 
   console.log(
-    `[reversecontact] ${contact.id}: GET ${ENDPOINT}?${contact.linkedin_url ? 'linkedin_url' : 'email'}=... key=${keyPrefix}…`
+    `[reversecontact] ${contact.id}: GET ${ENDPOINT}?${contact.linkedin_url ? 'linkedin_url' : 'email'}=...&apikey=… key=${keyPrefix}…`
   );
 
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${trimmedKey}`,
-    Accept: 'application/json',
-  };
-
-  const resp = await fetch(url, { method: 'GET', headers });
+  const resp = await fetch(url, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
 
   if (!resp.ok) {
     const respBody = await resp.text().catch(() => '(unreadable)');
