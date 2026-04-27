@@ -204,12 +204,18 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
         );
       }
 
-      // Step 4: LLM extraction from recent communications
+      // Step 4: LLM extraction from recent communications.
+      // Each conversation is extracted at most once — gated by signals_extracted_at
+      // (mirrors events.signals_extracted_at and news_articles.facts_extracted_at).
+      // The cron runs twice an hour over a 24h window; without this marker the
+      // same email gets re-sent to Claude up to 48× and stages a fresh approval
+      // row each time.
       console.log('[EnrichmentWorkflow] step → llm-extraction');
       await step.do('llm-extraction', async () => {
         const recent = await this.env.D1.prepare(
           `SELECT * FROM conversations WHERE org_id = ?
              AND sent_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')
+             AND signals_extracted_at IS NULL
            LIMIT 100`
         ).bind(org_id!).all<any>();
 
@@ -220,6 +226,12 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
             console.error(
               `[EnrichmentWorkflow] extraction failed conv=${conv.id}: ${errMessage(e)}`
             );
+          } finally {
+            // Stamp regardless of outcome — a transient failure shouldn't make
+            // us re-charge Claude for the same email on the next cron tick.
+            await this.env.D1.prepare(
+              `UPDATE conversations SET signals_extracted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+            ).bind(conv.id).run().catch(() => undefined);
           }
         }
       });

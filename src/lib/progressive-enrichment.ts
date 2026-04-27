@@ -33,6 +33,9 @@ const CONTACT_FIELDS = new Set([
   'full_name', 'job_title', 'phone', 'email', 'linkedin_url', 'twitter_url',
   'location', 'company_id', 'bio_summary', 'investment_focus', 'check_size_range',
   'communication_channel_preference', 'introduced_via', 'fund_name',
+  // LLM extraction emits these (see prompts/extraction.ts); they map to real
+  // contact columns and need to flow through the same dedup/skip-if-equal path.
+  'topics_of_interest', 'pain_points', 'investment_thesis_tags',
 ]);
 
 const COMPANY_FIELDS = new Set([

@@ -6,7 +6,7 @@ import type { Env } from '../types/env';
 import type { ClassifiedItem } from '../types/interfaces';
 import { callClaude } from './claude';
 import { truncateToTokens } from './tokens';
-import { hashShort, getCurrentSyncJobId } from './helpers';
+import { hashShort } from './helpers';
 import { LLM_PROMPTS } from '../prompts';
 
 interface DealSignal {
@@ -67,7 +67,6 @@ export async function detectAndStageDealSignals(
   const MAX_LLM_CALLS = 20;
   const budget = candidates.slice(0, MAX_LLM_CALLS);
 
-  const syncJobId = await getCurrentSyncJobId(orgId, 'ingestion', env);
   let staged = 0;
 
   for (const item of budget) {
@@ -113,7 +112,8 @@ export async function detectAndStageDealSignals(
       source_sent_at: item.sentAt,
     });
 
-    const idempotencyKey = `${orgId}:deal:${item.companyId}:${hashShort(item.entityId)}:${syncJobId}`;
+    // No per-cycle component — same source email must collapse across cycles.
+    const idempotencyKey = `${orgId}:deal:${item.companyId}:${hashShort(item.entityId)}`;
 
     const result = await env.D1.prepare(
       `INSERT OR IGNORE INTO approval_queue

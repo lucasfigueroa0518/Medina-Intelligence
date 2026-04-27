@@ -6,8 +6,31 @@ import type {
 } from '../types/interfaces';
 import { callClaude } from './claude';
 import { truncateToTokens } from './tokens';
-import { hashShort, getOrgSettings, getCurrentSyncJobId } from './helpers';
+import { hashShort } from './helpers';
+import { proposeEntityUpdate, type SourceType } from './progressive-enrichment';
 import { LLM_PROMPTS } from '../prompts';
+
+// Fields that proposeEntityUpdate knows how to route. Anything outside this
+// set is a synthetic LLM output (e.g. "company_name" on a contact, which has
+// no matching column) — we still stage it for human review but via a manual
+// INSERT keyed without any per-cycle component.
+const PROGRESSIVE_CONTACT_FIELDS = new Set([
+  'full_name', 'job_title', 'phone', 'email', 'linkedin_url', 'twitter_url',
+  'location', 'company_id', 'bio_summary', 'investment_focus', 'check_size_range',
+  'communication_channel_preference', 'introduced_via', 'fund_name',
+  'topics_of_interest', 'pain_points', 'investment_thesis_tags',
+]);
+const PROGRESSIVE_COMPANY_FIELDS = new Set([
+  'name', 'sector', 'website', 'domain', 'description', 'hq_location',
+  'employee_count', 'investment_status', 'stage', 'current_valuation',
+  'linkedin_url', 'last_funding_amount', 'last_funding_round', 'last_funding_date',
+]);
+
+function isProgressiveField(entityType: 'contact' | 'company', field: string): boolean {
+  return entityType === 'contact'
+    ? PROGRESSIVE_CONTACT_FIELDS.has(field)
+    : PROGRESSIVE_COMPANY_FIELDS.has(field);
+}
 
 export interface ExtractionSignal {
   entity_type: 'contact' | 'company';
@@ -148,37 +171,53 @@ export async function extractEnrichmentSignals(
     const entityId = signal.entity_id || (await resolveEntityId(signal, orgId, env));
     if (!entityId) continue;
 
-    const existing = await getEntityFieldValue(entityId, signal.field, env);
-    const isOverwrite = existing !== null && existing !== undefined;
+    // Route through progressive enrichment so we get skip-if-equal-to-current,
+    // update-existing-pending-row, NULL auto-fill, and the human-edit lockout
+    // for free. Falls back to a manual no-syncJobId INSERT only for synthetic
+    // LLM fields that don't map to a real column.
+    const proposed =
+      typeof signal.value === 'string'
+        ? signal.value
+        : JSON.stringify(signal.value);
 
-    const settings = await getOrgSettings(orgId, env);
-    const autoApprove = !isOverwrite && !isStructured && settings.auto_approve_sync;
-
-    const syncJobId = await getCurrentSyncJobId(orgId, 'enrichment', env);
-    const idempotencyKey = `${orgId}:${entityId}:${signal.field}:${hashShort(
-      JSON.stringify(signal.value)
-    )}:${syncJobId}`;
-
-    await env.D1.prepare(
-      `INSERT OR IGNORE INTO approval_queue (idempotency_key, org_id, entity_type, entity_id, change_type, field_name, proposed_value, source_communication_id, source_visibility, confidence, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        idempotencyKey,
+    if (isProgressiveField(signal.entity_type, signal.field)) {
+      await proposeEntityUpdate(
         orgId,
         signal.entity_type,
         entityId,
-        isOverwrite ? 'update_contact' : 'new_association',
         signal.field,
-        JSON.stringify(signal.value),
-        conversation.id,
-        conversation.source === 'outlook'
-          ? 'private'
-          : conversation.visibility || 'org_wide',
+        proposed,
+        'llm_extraction' as SourceType,
         signal.confidence,
-        autoApprove ? 'auto_approved' : 'pending'
+        env,
+        {
+          source_communication_id: conversation.id,
+          source_description: 'llm_extraction',
+        }
+      );
+    } else {
+      const idempotencyKey = `${orgId}:${entityId}:${signal.field}:${hashShort(
+        JSON.stringify(signal.value)
+      )}`;
+      await env.D1.prepare(
+        `INSERT OR IGNORE INTO approval_queue (idempotency_key, org_id, entity_type, entity_id, change_type, field_name, proposed_value, source_communication_id, source_visibility, confidence, status)
+         VALUES (?, ?, ?, ?, 'new_association', ?, ?, ?, ?, ?, 'pending')`
       )
-      .run();
+        .bind(
+          idempotencyKey,
+          orgId,
+          signal.entity_type,
+          entityId,
+          signal.field,
+          JSON.stringify(signal.value),
+          conversation.id,
+          conversation.source === 'outlook'
+            ? 'private'
+            : conversation.visibility || 'org_wide',
+          signal.confidence
+        )
+        .run();
+    }
 
     const dateStr = conversation.sent_at
       ? new Date(conversation.sent_at).toISOString().slice(0, 7)

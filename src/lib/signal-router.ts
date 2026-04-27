@@ -1,6 +1,6 @@
 import type { Env } from '../types/env';
 import type { TranscriptSignals, ContactSignal, CompanySignal, DealSignal, RelationshipSignal } from './transcript-extraction';
-import { hashShort, getCurrentSyncJobId } from './helpers';
+import { hashShort } from './helpers';
 
 interface RoutedSignalResult {
   contact_signals_routed: number;
@@ -69,8 +69,9 @@ async function stageSignalInApprovalQueue(
   sourceEventId: string,
   env: Env
 ): Promise<void> {
-  const syncJobId = await getCurrentSyncJobId(orgId, 'enrichment', env).catch(() => 'transcript');
-  const idempotencyKey = `${orgId}:${entityId}:${field}:${hashShort(JSON.stringify(value))}:${syncJobId}`;
+  // Idempotency key intentionally omits any per-cycle component (sync_job id,
+  // timestamp). Same proposal across cycles must collapse, not pile up.
+  const idempotencyKey = `${orgId}:${entityId}:${field}:${hashShort(JSON.stringify(value))}`;
 
   await env.D1.prepare(
     `INSERT OR IGNORE INTO approval_queue
