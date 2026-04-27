@@ -7,6 +7,7 @@ import type {
   VectorMatch,
 } from '../types/interfaces';
 import { hydrateChunks } from './hydration';
+import { runEmbedding } from './embedding';
 import { estimateTokens, truncateToTokens } from './tokens';
 import { callClaude } from './claude';
 import { checkClaudeRateLimit } from './rate-limit';
@@ -38,14 +39,7 @@ export async function preprocessQuery(
     }
   }
 
-  const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-    text: [query],
-    pooling: 'cls',
-  } as any);
-
-  const values = Array.isArray((embedding as any).data)
-    ? (embedding as any).data[0]
-    : (embedding as any).data;
+  const values = await runEmbedding(env, query);
 
   const userId = session.user_id;
   const userRole = session.user_role || 'member';

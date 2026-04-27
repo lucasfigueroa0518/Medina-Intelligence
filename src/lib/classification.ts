@@ -6,6 +6,7 @@ import type {
   ChunkMetadata,
 } from '../types/interfaces';
 import { discoverNewContact, PERSONAL_DOMAINS, findOrCreateCompanyByDomain, type DiscoveryEligibility } from './discovery';
+import { runEmbedding } from './embedding';
 
 export async function classifyAndDeduplicate(
   items: ClassifiableItem[],
@@ -84,13 +85,7 @@ export async function classifyAndDeduplicate(
             const vectorId = v.vector_id;
             const chunkText = await env.KV.get(`chunk:${vectorId}`);
             if (chunkText) {
-              const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-                text: [chunkText],
-                pooling: 'cls',
-              } as any);
-              const values = Array.isArray((embedding as any).data)
-                ? (embedding as any).data[0]
-                : (embedding as any).data;
+              const values = await runEmbedding(env, chunkText);
 
               const existingVec = await env.VECTORIZE.getByIds([vectorId]);
               if (existingVec.length > 0) {

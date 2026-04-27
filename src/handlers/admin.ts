@@ -3,6 +3,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { clearEnrichmentRateLimit } from '../lib/rate-limit';
+import { runEmbedding } from '../lib/embedding';
 import { emitAudit } from '../lib/audit';
 import { runHistoricalBackfill, getUserSyncConfig, setUserSyncConfig, type BackfillProgress } from '../integrations/outlook';
 import { runDailyCron } from '../lib/daily-cron';
@@ -210,13 +211,7 @@ export async function repairVectorizeParticipantIds(
         errors.push(`${vectorId}: chunk text missing from KV`);
         continue;
       }
-      const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-        text: [chunkText],
-        pooling: 'cls',
-      } as any);
-      const values = Array.isArray((embedding as any).data)
-        ? (embedding as any).data[0]
-        : (embedding as any).data;
+      const values = await runEmbedding(env, chunkText);
 
       const newCsv = csv.split(',').map(s => s === body.old_user_id ? body.new_user_id : s).join(',');
       await env.VECTORIZE.upsert([

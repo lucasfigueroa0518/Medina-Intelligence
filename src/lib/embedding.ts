@@ -11,6 +11,25 @@ export function prefixChunk(text: string, meta: ChunkMetadata): string {
   return `${parts.join(' ')}\n${text}`;
 }
 
+export async function runEmbedding(env: Env, text: string): Promise<number[]> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+        text: [text],
+        pooling: 'cls',
+      } as any);
+      return Array.isArray((result as any).data)
+        ? (result as any).data[0]
+        : (result as any).data;
+    } catch (e) {
+      lastErr = e;
+      if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  throw lastErr;
+}
+
 export async function chunkEmbedAndPersist(
   text: string,
   meta: ChunkMetadata,
@@ -24,14 +43,7 @@ export async function chunkEmbedAndPersist(
   const compactSourceId = meta.source_id.replace(/-/g, '');
   const vectorId = `${orgPrefix}_${meta.source_table}_${compactSourceId}_${chunkIndex}`;
 
-  const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-    text: [prefixedChunk],
-    pooling: 'cls',
-  } as any);
-
-  const values = Array.isArray((embedding as any).data)
-    ? (embedding as any).data[0]
-    : (embedding as any).data;
+  const values = await runEmbedding(env, prefixedChunk);
 
   await Promise.all([
     env.VECTORIZE.upsert([

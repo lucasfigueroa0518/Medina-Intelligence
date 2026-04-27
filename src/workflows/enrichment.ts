@@ -173,11 +173,15 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
           `enrich-contacts-${i}`,
           { retries: { limit: 2, delay: '30 seconds' } },
           async () => {
-            for (const cid of contactBatches[i]) {
+            for (let j = 0; j < contactBatches[i].length; j++) {
+              const cid = contactBatches[i][j];
               try {
                 await triggerContactEnrichment(cid, org_id!, this.env);
               } catch (e) {
                 console.error(`[EnrichmentWorkflow] contact enrich failed ${cid}: ${errMessage(e)}`);
+              }
+              if (j < contactBatches[i].length - 1) {
+                await new Promise(r => setTimeout(r, 2000));
               }
             }
             return { status: 'completed', count: contactBatches[i].length };
@@ -192,11 +196,15 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
           `enrich-companies-${i}`,
           { retries: { limit: 2, delay: '30 seconds' } },
           async () => {
-            for (const cid of companyBatches[i]) {
+            for (let j = 0; j < companyBatches[i].length; j++) {
+              const cid = companyBatches[i][j];
               try {
                 await triggerCompanyEnrichment(cid, org_id!, this.env);
               } catch (e) {
                 console.error(`[EnrichmentWorkflow] company enrich failed ${cid}: ${errMessage(e)}`);
+              }
+              if (j < companyBatches[i].length - 1) {
+                await new Promise(r => setTimeout(r, 2000));
               }
             }
             return { status: 'completed', count: companyBatches[i].length };

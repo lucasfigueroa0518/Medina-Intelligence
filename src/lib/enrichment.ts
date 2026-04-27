@@ -843,6 +843,30 @@ export function isDomainShapedName(
   return false;
 }
 
+const MARKETING_PHRASES = /\b(the best|leading|professional|premier|top rated|#1|number one|your |we are|welcome to|solutions for|platform for)\b/i;
+
+function validateCompanyName(raw: string): string | null {
+  let name = raw.trim();
+  if (name.length < 2) return null;
+  if (/^https?:\/\//i.test(name)) return null;
+  if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(name)) return null;
+  if (name.length > 60) {
+    const sepIdx = name.search(/\s+[–—|\-:]\s+/);
+    if (sepIdx > 1) name = name.slice(0, sepIdx).trim();
+    if (name.length > 60) return null;
+  }
+  const sepIdx = name.search(/\s+[–—|\-:]\s+/);
+  if (sepIdx > 1) {
+    const after = name.slice(sepIdx).replace(/^\s+[–—|\-:]\s+/, '');
+    if (after.split(/\s+/).length > 3 || MARKETING_PHRASES.test(after)) {
+      name = name.slice(0, sepIdx).trim();
+    }
+  }
+  if (MARKETING_PHRASES.test(name)) return null;
+  if (name.length < 2) return null;
+  return name;
+}
+
 async function extractCanonicalCompanyName(
   briefing: string,
   env: Env,
@@ -855,6 +879,7 @@ Rules:
 - canonical_name is the company's branded/legal name as written by the company itself (e.g. "Bain Capital Ventures", not "bain.com").
 - If the briefing does not clearly identify the company (bare stub, no real content, only describes people without naming the firm), return {"canonical_name": null, "confidence": "low"}.
 - Never return a domain, URL, or hostname as the canonical_name.
+- Never return a tagline or marketing slogan as the canonical_name.
 - Never invent a name.`;
   const user = `Briefing:\n${briefing.slice(0, 4000)}`;
 
@@ -875,11 +900,7 @@ Rules:
     const parsed = JSON.parse(cleaned);
     if (parsed.confidence === 'low') return null;
     if (typeof parsed.canonical_name !== 'string') return null;
-    const name = parsed.canonical_name.trim();
-    if (name.length < 2) return null;
-    if (/^https?:\/\//i.test(name)) return null;
-    if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(name)) return null;
-    return name;
+    return validateCompanyName(parsed.canonical_name);
   } catch {
     console.error('[enrichment] canonical name parse failed:', raw);
     return null;
@@ -926,16 +947,12 @@ async function extractNameFromWebsite(domain: string): Promise<string | null> {
       .replace(/&#8211;/g, '–').replace(/&#8212;/g, '—').replace(/&#x2013;/g, '–').replace(/&#x2014;/g, '—')
       .replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&nbsp;/g, ' ');
     name = name.replace(TITLE_SUFFIXES, '').trim();
-    const sepIdx = name.search(/\s+[|\-–—:]\s+/);
-    if (sepIdx > 1) name = name.slice(0, sepIdx).trim();
     name = name.replace(/\s*[|\-–—]\s*$/, '').trim();
 
-    if (name.length < 2 || name.length > 80) continue;
     if (GENERIC_TITLES.has(name.toLowerCase())) continue;
-    if (/^https?:\/\//i.test(name)) continue;
-    if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(name)) continue;
     if (/^(the|a|an)\s/i.test(name) && name.split(/\s+/).length > 4) continue;
-    return name;
+    const valid = validateCompanyName(name);
+    if (valid) return valid;
   }
   return null;
 }

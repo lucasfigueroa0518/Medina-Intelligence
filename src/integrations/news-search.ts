@@ -79,6 +79,10 @@ async function runSearchQuery(
   orgId: string,
   env: Env
 ): Promise<NewsArticle[]> {
+  const cacheKey = `news_cache:${hashShort(orgId + searchQuery.query)}`;
+  const cached = await env.KV.get<NewsArticle[]>(cacheKey, 'json');
+  if (cached) return cached;
+
   const newsPrompt = `Use Google Search to find recent news about: ${searchQuery.query}
 
 Find 3-5 relevant articles from the past 30 days. For each article include:
@@ -116,11 +120,13 @@ If no recent news found, return: []`;
     const match = cleaned.match(/\[[\s\S]*\]/);
     const articles: NewsArticle[] = JSON.parse(match ? match[0] : cleaned);
     if (!Array.isArray(articles)) return [];
-    return articles.map(a => ({
+    const result = articles.map(a => ({
       ...a,
       url: a.url && !a.url.includes('vertexaisearch.cloud.google.com') ? a.url : undefined,
       relevance_tag: searchQuery.tag,
     }));
+    await env.KV.put(cacheKey, JSON.stringify(result), { expirationTtl: 21600 });
+    return result;
   } catch {
     return [];
   }

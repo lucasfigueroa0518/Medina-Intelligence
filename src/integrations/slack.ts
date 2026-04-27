@@ -38,6 +38,31 @@ const SKIP_SUBTYPES = new Set([
   'channel_name', 'bot_message', 'tombstone', 'ekm_access_denied',
 ]);
 
+const SLACK_MAX_RETRIES = 2;
+
+async function slackFetchWithRetry(
+  url: string,
+  headers: Record<string, string>,
+  label: string,
+): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const resp = await fetch(url, { headers });
+    const retryAfter = resp.headers.get('Retry-After');
+    const body = (await resp.json()) as { ok: boolean; error?: string; [k: string]: unknown };
+
+    if (body.ok || body.error !== 'ratelimited' || attempt >= SLACK_MAX_RETRIES) {
+      return new Response(JSON.stringify(body), {
+        status: resp.status,
+        headers: resp.headers,
+      });
+    }
+
+    const delaySec = parseInt(retryAfter || '5', 10);
+    console.warn(`[slack] ${label} rate-limited, retry ${attempt + 1}/${SLACK_MAX_RETRIES} after ${delaySec}s`);
+    await new Promise(r => setTimeout(r, delaySec * 1000));
+  }
+}
+
 export async function fetchSlackMessages(
   orgId: string,
   env: Env
@@ -54,16 +79,18 @@ export async function fetchSlackMessages(
     return { messages, errors, channels_visible: 0 };
   }
 
-  const authResp = await fetch('https://slack.com/api/auth.test', {
-    headers: { Authorization: `Bearer ${botToken}` },
-  });
+  const authHeaders = { Authorization: `Bearer ${botToken}` };
+
+  const authResp = await slackFetchWithRetry(
+    'https://slack.com/api/auth.test', authHeaders, 'auth.test',
+  );
   const authData = (await authResp.json()) as { ok: boolean; error?: string; team?: string; user?: string };
   console.log(`[slack] auth.test: ok=${authData.ok} team=${authData.team || 'n/a'} user=${authData.user || 'n/a'} error=${authData.error || 'none'}`);
   if (!authData.ok) return { messages, errors, channels_visible: 0 };
 
-  const channelsResp = await fetch(
+  const channelsResp = await slackFetchWithRetry(
     'https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200',
-    { headers: { Authorization: `Bearer ${botToken}` } }
+    authHeaders, 'conversations.list',
   );
   const channelsData = (await channelsResp.json()) as {
     ok: boolean;
@@ -71,7 +98,12 @@ export async function fetchSlackMessages(
     error?: string;
   };
   console.log(`[slack] conversations.list: ok=${channelsData.ok} channels=${channelsData.channels?.length ?? 0} error=${channelsData.error || 'none'}`);
-  if (!channelsData.ok) return { messages, errors, channels_visible: 0 };
+  if (!channelsData.ok) {
+    if (channelsData.error === 'ratelimited') {
+      errors.push({ channel_id: '*', channel_name: '*', error: 'ratelimited:conversations.list' });
+    }
+    return { messages, errors, channels_visible: 0 };
+  }
 
   const channels = channelsData.channels || [];
   let anyChannelReturnedMessages = false;
@@ -93,9 +125,9 @@ export async function fetchSlackMessages(
         limit: '200',
         ...(cursor ? { cursor } : {}),
       });
-      const resp = await fetch(
+      const resp = await slackFetchWithRetry(
         `https://slack.com/api/conversations.history?${params}`,
-        { headers: { Authorization: `Bearer ${botToken}` } }
+        authHeaders, `conversations.history #${channel.name}`,
       );
       const data = (await resp.json()) as {
         ok: boolean;
@@ -178,14 +210,20 @@ export async function resolveSlackUserEmail(
   const cached = await env.KV.get(cacheKey);
   if (cached) return cached;
 
-  const resp = await fetch(
+  const resp = await slackFetchWithRetry(
     `https://slack.com/api/users.info?user=${slackUserId}`,
-    { headers: { Authorization: `Bearer ${botToken}` } }
+    { Authorization: `Bearer ${botToken}` },
+    `users.info ${slackUserId}`,
   );
   const data = (await resp.json()) as {
     ok: boolean;
     user?: { profile?: { email?: string } };
+    error?: string;
   };
+  if (!data.ok && data.error === 'ratelimited') {
+    console.warn(`[slack] users.info rate-limited for ${slackUserId} after retries`);
+    return null;
+  }
   const email = data.user?.profile?.email;
   if (email) await env.KV.put(cacheKey, email, { expirationTtl: 86400 });
   return email || null;
