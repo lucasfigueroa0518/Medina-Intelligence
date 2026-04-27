@@ -482,17 +482,33 @@ export async function queryAgent(
   const tRetrieve = Date.now() - t0;
 
   // --- Load session history ---
+  // Fetch recent turns. We guarantee the last 3 complete exchanges (6 messages)
+  // are always included so MARTy can resolve pronouns and references, then
+  // fill remaining token budget with older context.
+  const MIN_RECENT_MESSAGES = 6;
   const historyMsgs = await env.D1.prepare(
     'SELECT role, content, turn_index FROM agent_messages WHERE session_id = ? ORDER BY turn_index DESC LIMIT 20'
   ).bind(session.id).all<{ role: string; content: string; turn_index: number }>();
 
+  const allHistory = historyMsgs.results.reverse();
+  const recentCount = Math.min(MIN_RECENT_MESSAGES, allHistory.length);
+  const olderMessages = allHistory.slice(0, allHistory.length - recentCount);
+  const recentMessages = allHistory.slice(allHistory.length - recentCount);
+
+  let recentTokens = 0;
+  for (const m of recentMessages) recentTokens += estimateTokens(m.content);
+
   const messages: Array<{ role: 'user' | 'assistant'; content: any }> = [];
   let historyTokens = 0;
-  for (const m of historyMsgs.results.reverse()) {
+  const olderBudget = TOKEN_BUDGET.session_history - recentTokens;
+  for (const m of olderMessages) {
     const t = estimateTokens(m.content);
-    if (historyTokens + t > TOKEN_BUDGET.session_history) break;
+    if (historyTokens + t > olderBudget) break;
     messages.push({ role: m.role as 'user' | 'assistant', content: m.content });
     historyTokens += t;
+  }
+  for (const m of recentMessages) {
+    messages.push({ role: m.role as 'user' | 'assistant', content: m.content });
   }
 
   // --- Assemble context ---

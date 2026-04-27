@@ -14,6 +14,26 @@ import { checkClaudeRateLimit } from './rate-limit';
 import { getOrgSettings } from './helpers';
 import { RERANKER_SYSTEM_PROMPT } from '../prompts/reranker';
 
+function isAggregationQuery(query: string): boolean {
+  return /\b(how many|count|total|tally|all the|every|list all|summarize all|aggregate|across all|compile|gather all)\b/i.test(query);
+}
+
+const DOC_TYPE_KEYWORDS: Record<string, string[]> = {
+  pitch_deck: ['pitch deck', 'pitch decks', 'deck', 'decks', 'presentation'],
+  email: ['email', 'emails', 'message', 'thread'],
+  transcript: ['meeting', 'meetings', 'call', 'calls', 'transcript', 'discussion'],
+  document: ['document', 'file', 'attachment', 'pdf', 'doc'],
+};
+
+function detectDocTypes(query: string): string[] {
+  const lower = query.toLowerCase();
+  const matched: string[] = [];
+  for (const [docType, keywords] of Object.entries(DOC_TYPE_KEYWORDS)) {
+    if (keywords.some(kw => lower.includes(kw))) matched.push(docType);
+  }
+  return matched;
+}
+
 export async function preprocessQuery(
   query: string,
   session: AgentSession,
@@ -89,6 +109,10 @@ export async function retrieveContext(
     document_type: { $nin: ['news'] },
   };
 
+  const aggregation = isAggregationQuery(pq.originalQuery);
+  const broadTopK = aggregation ? 50 : 30;
+  const hydrateLimit = aggregation ? 30 : 20;
+
   let internalMatches: VectorMatch[];
 
   if (pq.entityIds.length > 0) {
@@ -104,7 +128,7 @@ export async function retrieveContext(
         )
       ),
       env.VECTORIZE.query(pq.embeddedQuery, {
-        topK: 20,
+        topK: broadTopK,
         filter,
         returnValues: false,
         returnMetadata: 'all',
@@ -129,7 +153,7 @@ export async function retrieveContext(
     }
   } else {
     const result = await env.VECTORIZE.query(pq.embeddedQuery, {
-      topK: 30,
+      topK: broadTopK,
       filter,
       returnValues: false,
       returnMetadata: 'all',
@@ -137,11 +161,36 @@ export async function retrieveContext(
     internalMatches = (result.matches || []) as VectorMatch[];
   }
 
+  // Doc-type-aware secondary queries: if the query mentions specific
+  // document types, run targeted filtered queries and merge results.
+  const docTypes = detectDocTypes(pq.originalQuery);
+  if (docTypes.length > 0) {
+    const seen = new Set(internalMatches.map(m => m.id));
+    const docResults = await Promise.all(
+      docTypes.map(dt =>
+        env.VECTORIZE.query(pq.embeddedQuery, {
+          topK: 20,
+          filter: { org_id: pq.orgId, document_type: dt },
+          returnValues: false,
+          returnMetadata: 'all',
+        })
+      )
+    );
+    for (const r of docResults) {
+      for (const m of (r.matches || []) as VectorMatch[]) {
+        if (!seen.has(m.id)) {
+          seen.add(m.id);
+          internalMatches.push(m);
+        }
+      }
+    }
+  }
+
   const filtered = internalMatches
     .filter(pq.postRetrievalFilter)
     .filter(m => m.score >= 0.55);
 
-  const { chunks: hydrated } = await hydrateChunks(filtered.slice(0, 20), env);
+  const { chunks: hydrated } = await hydrateChunks(filtered.slice(0, hydrateLimit), env);
   let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env);
 
   if (pq.entityIds.length > 0) {
