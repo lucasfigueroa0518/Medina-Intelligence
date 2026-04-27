@@ -7,7 +7,7 @@ import {
   Mail, Phone, MapPin, Linkedin, Twitter, Calendar,
   ChevronDown, ChevronUp, ExternalLink, TrendingUp, TrendingDown, Minus,
   Users, Briefcase, Target, DollarSign, Hash, Info, ArrowRight,
-  Check, X as XIcon, Sparkles, RefreshCw,
+  Check, X as XIcon, Sparkles, RefreshCw, Upload, FileText, Paperclip, Trash2,
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { Timeline, TimelineEntry } from '@/components/timeline';
@@ -78,6 +78,10 @@ export default function ContactDetailPage() {
   const [pendingUpdates, setPendingUpdates] = React.useState<any[]>([]);
   const [approvingIds, setApprovingIds] = React.useState<Set<string>>(new Set());
   const [approvedFields, setApprovedFields] = React.useState<Set<string>>(new Set());
+  const [documents, setDocuments] = React.useState<any[]>([]);
+  const [docsLoading, setDocsLoading] = React.useState(false);
+  const [uploading, setUploading] = React.useState(false);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   React.useEffect(() => {
     setLoading(true);
@@ -108,6 +112,38 @@ export default function ContactDetailPage() {
     const t = setTimeout(() => setToast(null), 3500);
     return () => clearTimeout(t);
   }, [toast]);
+
+  React.useEffect(() => {
+    if (activeTab !== 'documents') return;
+    setDocsLoading(true);
+    api.listDocuments({ contact_id: id }).then(r => setDocuments(r.documents || []))
+      .catch(() => setDocuments([]))
+      .finally(() => setDocsLoading(false));
+  }, [activeTab, id, refreshKey]);
+
+  async function handleDocUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const res = await api.uploadDocument(file, { contact_id: id });
+      if (res.duplicate) {
+        setToast('Duplicate document — already exists');
+      } else {
+        setToast('Document uploaded');
+      }
+      setRefreshKey(k => k + 1);
+    } catch (err: any) { setToast(`Upload failed: ${err.message}`); }
+    finally { setUploading(false); if (fileInputRef.current) fileInputRef.current.value = ''; }
+  }
+
+  async function handleDocDelete(docId: string) {
+    try {
+      await api.deleteDocument(docId);
+      setDocuments(prev => prev.filter(d => d.id !== docId));
+      setToast('Document deleted');
+    } catch { setToast('Delete failed'); }
+  }
 
   const hasInvestorTag = tags.some(t => t.name === 'Investor' || t.name === 'LP');
 
@@ -791,7 +827,89 @@ export default function ContactDetailPage() {
             }
           </div>
         )}
-        {activeTab === 'documents' && <div className="text-center text-text-muted py-12">No documents linked</div>}
+        {activeTab === 'documents' && (
+          <div>
+            <div className="flex items-center justify-between mb-5">
+              <div className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
+                Documents ({documents.length})
+              </div>
+              <label className={`btn-secondary flex items-center gap-2 cursor-pointer ${uploading ? 'opacity-50 pointer-events-none' : ''}`}>
+                <Upload size={14} />
+                {uploading ? 'Uploading...' : 'Upload'}
+                <input ref={fileInputRef} type="file" className="hidden" onChange={handleDocUpload} disabled={uploading} />
+              </label>
+            </div>
+            {docsLoading ? (
+              <div className="space-y-3">
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <div key={i} className="h-16 bg-bg-surface animate-pulse rounded-xl" />
+                ))}
+              </div>
+            ) : documents.length === 0 ? (
+              <div className="text-center py-12">
+                <FileText size={32} className="mx-auto text-text-muted/30 mb-3" />
+                <div className="text-text-muted text-sm">No documents linked to this contact</div>
+                <div className="text-text-muted/60 text-xs mt-1">Upload a document or email attachments will appear here automatically</div>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {documents.map((doc: any) => (
+                  <div key={doc.id} className="flex items-center gap-4 rounded-xl p-4 transition-all hover:bg-white/[0.03]"
+                    style={{ background: 'rgba(17,17,20,0.5)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                    <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
+                      style={{ background: doc.source === 'email_attachment' ? 'rgba(59,130,246,0.12)' : 'rgba(139,92,246,0.12)' }}>
+                      {doc.source === 'email_attachment'
+                        ? <Paperclip size={16} className="text-blue-400" />
+                        : <FileText size={16} className="text-purple-400" />}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-text-primary truncate">{doc.title || doc.file_name}</span>
+                        {doc.version_number > 1 && (
+                          <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
+                            style={{ background: 'rgba(245,158,11,0.12)', color: '#FBBF24' }}>
+                            v{doc.version_number}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+                          style={{ background: 'rgba(255,255,255,0.05)', color: '#A1A1AA' }}>
+                          {(doc.document_type || 'other').replace(/_/g, ' ')}
+                        </span>
+                        <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+                          style={{
+                            background: doc.source === 'email_attachment' ? 'rgba(59,130,246,0.08)' : 'rgba(139,92,246,0.08)',
+                            color: doc.source === 'email_attachment' ? '#93C5FD' : '#C084FC',
+                          }}>
+                          {doc.source === 'email_attachment' ? 'email' : doc.source}
+                        </span>
+                        {doc.file_size && (
+                          <span className="text-[10px] text-text-muted">{fmtSize(doc.file_size)}</span>
+                        )}
+                        <span className="text-[10px] text-text-muted">{fmtRel(doc.created_at)}</span>
+                        {doc.processing_status && doc.processing_status !== 'completed' && (
+                          <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
+                            style={{
+                              background: doc.processing_status === 'failed' ? 'rgba(239,68,68,0.12)' : 'rgba(245,158,11,0.12)',
+                              color: doc.processing_status === 'failed' ? '#F87171' : '#FBBF24',
+                            }}>
+                            {doc.processing_status}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <button onClick={() => handleDocDelete(doc.id)}
+                      className="p-2 rounded-lg text-text-muted hover:text-semantic-error hover:bg-semantic-error/10 transition-colors shrink-0"
+                      title="Delete document">
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         {activeTab === 'deals' && <div className="text-center text-text-muted py-12">No deals linked</div>}
       </div>
 
@@ -1096,6 +1214,12 @@ function cleanValue(raw: any): string {
 
 function shortUrl(v: string): string {
   return v.replace(/^https?:\/\//, '').replace(/^www\./, '');
+}
+
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function sigVal(raw: string): string {

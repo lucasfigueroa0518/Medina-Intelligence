@@ -26,11 +26,13 @@ export async function stageAndCommitApprovals(
       // Commit the conversation record directly (org-wide creation — gated by participant_user_ids)
       const idempotencyKey = `${orgId}:conversation:create:${item.externalId}:${syncJobId}`;
 
+      const attCount = item.attachments?.length || 0;
       await env.D1.prepare(
         `INSERT OR IGNORE INTO conversations
            (id, org_id, source, external_thread_id, external_message_id, subject, body_r2_key, body_preview, direction, sent_at,
-            from_email, to_emails, cc_emails, participant_user_ids, is_campaign_email, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+            from_email, to_emails, cc_emails, participant_user_ids, is_campaign_email,
+            has_attachments, attachment_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`
       )
         .bind(
           item.entityId,
@@ -47,6 +49,8 @@ export async function stageAndCommitApprovals(
           JSON.stringify(item.toEmails || []),
           JSON.stringify(item.ccEmails || []),
           JSON.stringify(item.participantUserIds || []),
+          attCount > 0 ? 1 : 0,
+          attCount,
           now,
           now
         )

@@ -266,7 +266,7 @@ export const api = {
     request<{ ok: boolean }>('/sync/config', { method: 'PATCH', body: JSON.stringify(data) }),
 
   // Backfill
-  startBackfill: (data: { user_id?: string; days_back: number }) =>
+  startBackfill: (data: { user_id?: string; days_back?: number; start_date?: string; end_date?: string }) =>
     request<{ ok: boolean; progress: any }>('/admin/backfill-email', { method: 'POST', body: JSON.stringify(data) }),
   getBackfillProgress: () =>
     request<{ progress: any }>('/admin/backfill-progress'),
@@ -274,17 +274,39 @@ export const api = {
     request<{ ok: boolean; instance_id: string }>('/admin/trigger-sync', {
       method: 'POST', body: JSON.stringify({ workflow }),
     }),
+  triggerIngestion: (data: { user_id?: string; start_date?: string; end_date?: string }) =>
+    request<{ ok: boolean; instance_id: string; progress?: any }>('/admin/trigger-ingestion', {
+      method: 'POST', body: JSON.stringify(data),
+    }),
 
   // Integrations
   getIntegrationsStatus: () =>
     request<IntegrationsStatusResponse>('/integrations/status'),
   getFireflyWebhookSecret: () =>
     request<{ secret: string }>('/integrations/firefly/webhook-secret'),
-  fireflyBackfill: (apiKey: string, days: number) =>
+  fireflyBackfill: (apiKey: string, days?: number, opts?: { start_date?: string; end_date?: string }) =>
     request<FireflyBackfillResult>('/admin/firefly-backfill', {
       method: 'POST',
-      body: JSON.stringify({ api_key: apiKey, days }),
+      body: JSON.stringify({ api_key: apiKey, ...(opts?.start_date ? opts : { days: days ?? 30 }) }),
     }),
+
+  // Documents
+  listDocuments: (params?: Record<string, string>) => {
+    const q = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<{ documents: any[] }>(`/documents${q}`);
+  },
+  uploadDocument: (file: File, data: { title?: string; contact_id?: string; company_id?: string; deal_id?: string; document_type?: string }) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    if (data.title) fd.append('title', data.title);
+    if (data.contact_id) fd.append('contact_id', data.contact_id);
+    if (data.company_id) fd.append('company_id', data.company_id);
+    if (data.deal_id) fd.append('deal_id', data.deal_id);
+    if (data.document_type) fd.append('document_type', data.document_type);
+    return request<{ document: any; duplicate?: boolean }>('/documents', { method: 'POST', body: fd });
+  },
+  deleteDocument: (id: string) =>
+    request<{ ok: boolean }>(`/documents/${id}`, { method: 'DELETE' }),
 
   // Imports
   listImports: () => request<{ imports: any[] }>('/imports'),

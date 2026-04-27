@@ -72,6 +72,27 @@ export class IngestionChunkWorkflow extends WorkflowEntrypoint<Env, ChunkParams>
         }
       });
 
+      await step.do('process-attachments', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
+        const { processEmailAttachments } = await import('../lib/attachment-processor');
+        let totalDocs = 0;
+        let totalSkipped = 0;
+        for (const item of classified) {
+          if (item.attachments?.length) {
+            try {
+              const r = await processEmailAttachments(item, org_id, this.env);
+              totalDocs += r.documents_created;
+              totalSkipped += r.documents_skipped;
+              if (r.errors.length) console.warn(`[IngestionChunkWorkflow] attachment errors:`, r.errors);
+            } catch (e) {
+              console.error(`[IngestionChunkWorkflow] attachment processing failed for ${item.entityId}:`, errMessage(e));
+            }
+          }
+        }
+        if (totalDocs + totalSkipped > 0) {
+          console.log(`[IngestionChunkWorkflow] chunk=${chunk_index} attachments: created=${totalDocs} skipped=${totalSkipped}`);
+        }
+      });
+
       await step.do('detect-deals', { retries: { limit: 1, delay: '5 seconds' } }, async () => {
         try {
           const { detectAndStageDealSignals } = await import('../lib/deal-detection');

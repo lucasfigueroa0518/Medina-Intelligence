@@ -9,6 +9,7 @@ import {
   Hash,
   CheckSquare,
   FileText,
+  Paperclip,
 } from 'lucide-react';
 
 export interface TimelineEntry {
@@ -21,6 +22,9 @@ export interface TimelineEntry {
   canReadContent?: boolean;
   from_email?: string;
   participant_user_ids?: string;
+  has_attachments?: number;
+  attachment_count?: number;
+  attachment_names?: string[];
 }
 
 interface TimelineProps {
@@ -119,6 +123,20 @@ function TimelineEntryRow({ entry }: { entry: TimelineEntry }) {
           ) : entry.body_preview ? (
             <div className="text-sm text-text-secondary mt-1 line-clamp-2">
               {entry.body_preview}
+            </div>
+          ) : null}
+          {entry.has_attachments && entry.attachment_count ? (
+            <div className="flex items-center gap-1.5 mt-1.5">
+              <Paperclip size={11} className="text-text-muted" />
+              <span className="text-[11px] text-text-muted">
+                {entry.attachment_count} attachment{entry.attachment_count !== 1 ? 's' : ''}
+              </span>
+              {entry.attachment_names && entry.attachment_names.length > 0 && (
+                <span className="text-[10px] text-text-muted/60 truncate max-w-[300px]">
+                  — {entry.attachment_names.slice(0, 3).join(', ')}
+                  {entry.attachment_names.length > 3 ? ` +${entry.attachment_names.length - 3}` : ''}
+                </span>
+              )}
             </div>
           ) : null}
         </div>

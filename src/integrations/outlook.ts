@@ -1,6 +1,6 @@
 // TRD §6.1 — Microsoft Graph email + calendar delta sync
 import type { Env } from '../types/env';
-import type { ClassifiableItem } from '../types/interfaces';
+import type { ClassifiableItem, AttachmentMeta } from '../types/interfaces';
 import {
   getActiveUsersForOrg,
   getOrgDomains,
@@ -11,6 +11,14 @@ import { stripHtml } from '../lib/helpers';
 import { refreshOutlookToken, recordTokenFailure } from './oauth';
 import { upsertOutlookEvent } from '../lib/reconciliation';
 import { checkGraphRateLimit, recordGraphApiCall } from '../lib/rate-limit';
+
+interface OutlookAttachment {
+  id: string;
+  name: string;
+  size: number;
+  contentType: string;
+  isInline?: boolean;
+}
 
 interface OutlookMessage {
   id: string;
@@ -25,9 +33,10 @@ interface OutlookMessage {
   conversationId: string;
   importance?: 'low' | 'normal' | 'high';
   hasAttachments?: boolean;
+  attachments?: OutlookAttachment[];
 }
 
-const MSG_SELECT = '$select=id,subject,bodyPreview,body,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,conversationId,importance,hasAttachments';
+const MSG_SELECT = '$select=id,subject,bodyPreview,body,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,conversationId,importance,hasAttachments&$expand=attachments($select=id,name,size,contentType,isInline)';
 
 interface FolderDeltaConfig {
   folder: 'inbox' | 'sentitems';
@@ -145,6 +154,13 @@ function messageToClassifiableItem(
     }
   }
 
+  const attachments: AttachmentMeta[] | undefined = msg.hasAttachments && msg.attachments?.length
+    ? msg.attachments
+        .filter(a => !(a.isInline && a.size < 51200))
+        .slice(0, 5)
+        .map(a => ({ id: a.id, name: a.name, size: a.size, contentType: a.contentType, isInline: a.isInline }))
+    : undefined;
+
   return {
     type: 'email',
     source: 'outlook',
@@ -165,6 +181,7 @@ function messageToClassifiableItem(
     userId,
     orgId,
     visibility: 'org_wide',
+    attachments,
   };
 }
 
@@ -293,14 +310,24 @@ export async function runHistoricalBackfill(
   userId: string,
   orgId: string,
   daysBack: number,
-  env: Env
+  env: Env,
+  opts?: { start_date?: string; end_date?: string }
 ): Promise<BackfillProgress> {
   const progressKey = `backfill_progress:${userId}`;
   const existing = await env.KV.get<BackfillProgress>(progressKey, 'json');
 
-  const syncConfig = await getUserSyncConfig(userId, env);
-  const initialSyncCutoff = new Date(Date.now() - syncConfig.sync_history_days * 86400000);
-  const backfillStart = new Date(Date.now() - daysBack * 86400000);
+  let backfillStart: Date;
+  let backfillEnd: Date;
+
+  if (opts?.start_date) {
+    backfillStart = new Date(opts.start_date);
+    backfillEnd = opts.end_date ? new Date(opts.end_date) : new Date();
+  } else {
+    const syncConfig = await getUserSyncConfig(userId, env);
+    const initialSyncCutoff = new Date(Date.now() - syncConfig.sync_history_days * 86400000);
+    backfillStart = new Date(Date.now() - daysBack * 86400000);
+    backfillEnd = initialSyncCutoff;
+  }
 
   let progress: BackfillProgress;
   if (existing && existing.status === 'in_progress') {
@@ -313,7 +340,7 @@ export async function runHistoricalBackfill(
       started_at: existing?.started_at || new Date().toISOString(),
       updated_at: new Date().toISOString(),
       target_start_date: backfillStart.toISOString(),
-      target_end_date: initialSyncCutoff.toISOString(),
+      target_end_date: backfillEnd.toISOString(),
     };
   }
 

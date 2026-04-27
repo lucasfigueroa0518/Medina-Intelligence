@@ -583,7 +583,8 @@ export async function getContactTimeline(
     env.D1.prepare(
       `SELECT c.id, c.subject as title, c.sent_at as timestamp, 'conversation' as type,
               c.source as subtype, c.body_preview, c.participant_user_ids,
-              c.source as conv_source, c.is_campaign_email, c.from_email
+              c.source as conv_source, c.is_campaign_email, c.from_email,
+              c.has_attachments, c.attachment_count
        FROM conversations c JOIN conversation_contacts cc ON c.id = cc.conversation_id
        WHERE cc.contact_id = ? AND c.org_id = ?
        ORDER BY c.sent_at DESC LIMIT ?`
@@ -600,6 +601,24 @@ export async function getContactTimeline(
     ).bind(id, ctx.orgId, limit).all(),
   ]);
 
+  const conversationIds = conversations.results
+    .filter((c: any) => c.has_attachments)
+    .map((c: any) => c.id);
+
+  let attachmentsByConv: Record<string, string[]> = {};
+  if (conversationIds.length > 0) {
+    const placeholders = conversationIds.map(() => '?').join(',');
+    const attRows = await env.D1.prepare(
+      `SELECT conversation_id, file_name FROM documents
+       WHERE conversation_id IN (${placeholders}) AND org_id = ? AND deleted_at IS NULL
+       ORDER BY created_at`
+    ).bind(...conversationIds, ctx.orgId).all<{ conversation_id: string; file_name: string }>();
+    for (const row of attRows.results) {
+      if (!attachmentsByConv[row.conversation_id]) attachmentsByConv[row.conversation_id] = [];
+      attachmentsByConv[row.conversation_id].push(row.file_name);
+    }
+  }
+
   const conversationsWithAccess = conversations.results.map((c: any) => {
     const canRead = canReadEmailContent(
       {
@@ -614,6 +633,7 @@ export async function getContactTimeline(
       ...c,
       canReadContent: canRead,
       body_preview: canRead ? c.body_preview : null,
+      attachment_names: attachmentsByConv[c.id] || [],
     };
   });
 

@@ -199,6 +199,14 @@ export interface CompanyFilter {
 
 // --- Ingestion / Classification ---
 
+export interface AttachmentMeta {
+  id: string;
+  name: string;
+  size: number;
+  contentType: string;
+  isInline?: boolean;
+}
+
 export interface ClassifiableItem {
   type: 'email' | 'calendar_event' | 'slack_message' | 'news';
   source: 'outlook' | 'slack' | 'claude_search' | 'gemini_search';
@@ -225,6 +233,7 @@ export interface ClassifiableItem {
   relatedCompanyName?: string;
   metadata?: ChunkMetadata;
   text?: string;
+  attachments?: AttachmentMeta[];
 }
 
 export interface ClassifiedItem extends ClassifiableItem {

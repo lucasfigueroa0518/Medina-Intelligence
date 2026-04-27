@@ -5,6 +5,61 @@ import { jsonResponse, errorResponse } from './utils';
 import { emitAudit } from '../lib/audit';
 import { extractTextFromFile } from '../lib/file-extraction';
 import { chunkEmbedAndPersistAll } from '../lib/embedding';
+import { classifyDocument } from '../lib/document-intelligence';
+
+async function computeContentHash(buffer: ArrayBuffer): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function stripVersionSuffix(name: string): string {
+  return name
+    .replace(/\.[^.]+$/, '')
+    .replace(/[\s_-]*(v\d+|draft|final|rev\d*|copy|revised|updated)$/i, '')
+    .trim()
+    .toLowerCase();
+}
+
+async function findExistingVersion(
+  contentHash: string,
+  fileName: string,
+  orgId: string,
+  contactId: string | null,
+  companyId: string | null,
+  env: Env
+): Promise<{ type: 'exact_dup'; id: string } | { type: 'version'; parentId: string; nextVersion: number } | null> {
+  const byHash = await env.D1.prepare(
+    'SELECT id FROM documents WHERE org_id = ? AND content_hash = ? AND deleted_at IS NULL LIMIT 1'
+  ).bind(orgId, contentHash).first<{ id: string }>();
+  if (byHash) return { type: 'exact_dup', id: byHash.id };
+
+  const baseName = stripVersionSuffix(fileName);
+  if (!baseName) return null;
+
+  const where: string[] = ['org_id = ?', 'deleted_at IS NULL'];
+  const binds: unknown[] = [orgId];
+  if (contactId) { where.push('contact_id = ?'); binds.push(contactId); }
+  else if (companyId) { where.push('company_id = ?'); binds.push(companyId); }
+
+  const candidates = await env.D1.prepare(
+    `SELECT id, file_name, version_number, parent_document_id
+     FROM documents WHERE ${where.join(' AND ')}
+     ORDER BY created_at DESC LIMIT 100`
+  ).bind(...binds).all<{ id: string; file_name: string | null; version_number: number | null; parent_document_id: string | null }>();
+
+  for (const c of candidates.results) {
+    if (!c.file_name) continue;
+    if (stripVersionSuffix(c.file_name) === baseName) {
+      const parentId = c.parent_document_id || c.id;
+      const currentVersion = c.version_number || 1;
+      return { type: 'version', parentId, nextVersion: currentVersion + 1 };
+    }
+  }
+
+  return null;
+}
 
 export async function listDocuments(
   request: Request,
@@ -49,13 +104,26 @@ export async function uploadDocument(
   const r2Key = `${ctx.orgId}/document/${now.slice(0, 7)}/${id}_${file.name}`;
 
   const buffer = await file.arrayBuffer();
+  const contentHash = await computeContentHash(buffer);
+
+  const existing = await findExistingVersion(contentHash, file.name, ctx.orgId, contactId, companyId, env);
+  if (existing?.type === 'exact_dup') {
+    const dup = await env.D1.prepare('SELECT * FROM documents WHERE id = ?').bind(existing.id).first();
+    return jsonResponse({ document: dup, duplicate: true, message: 'Exact duplicate already exists' }, 200);
+  }
+
+  const parentId = existing?.type === 'version' ? existing.parentId : null;
+  const versionNum = existing?.type === 'version' ? existing.nextVersion : 1;
+
   await env.R2.put(r2Key, buffer);
 
   await env.D1.prepare(
     `INSERT INTO documents
        (id, org_id, title, document_type, source, r2_key, file_name, file_size, mime_type,
-        contact_id, company_id, deal_id, uploaded_by, processing_status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'upload', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+        contact_id, company_id, deal_id, uploaded_by, processing_status,
+        content_hash, parent_document_id, version_number,
+        created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'upload', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`
   )
     .bind(
       id,
@@ -70,12 +138,14 @@ export async function uploadDocument(
       companyId,
       dealId,
       ctx.userId,
+      contentHash,
+      parentId,
+      versionNum,
       now,
       now
     )
     .run();
 
-  // Async processing: extract text, embed, update status
   ctxExec.waitUntil(
     (async () => {
       try {
@@ -86,9 +156,17 @@ export async function uploadDocument(
         const text = await extractTextFromFile(file);
         const preview = text.slice(0, 500);
 
+        let classifiedType = docType;
+        if (text.length > 20) {
+          try {
+            const cls = await classifyDocument(text, file.name, env, ctx.orgId);
+            classifiedType = cls.category;
+          } catch { /* keep user-provided type */ }
+        }
+
         const meta: ChunkMetadata = {
           org_id: ctx.orgId,
-          document_type: 'document',
+          document_type: classifiedType,
           source_table: 'documents',
           source_id: id,
           r2_key: r2Key,
@@ -114,8 +192,8 @@ export async function uploadDocument(
         }
 
         await env.D1.prepare(
-          `UPDATE documents SET processing_status = 'completed', extracted_text_preview = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-        ).bind(preview, id).run();
+          `UPDATE documents SET processing_status = 'completed', document_type = ?, extracted_text_preview = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+        ).bind(classifiedType, preview, id).run();
       } catch (e) {
         await env.D1.prepare(
           `UPDATE documents SET processing_status = 'failed' WHERE id = ?`
