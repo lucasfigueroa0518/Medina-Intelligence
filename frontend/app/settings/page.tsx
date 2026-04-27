@@ -12,6 +12,7 @@ import {
   type IntegrationRow,
   type IntegrationsStatusResponse,
   type UserProfile,
+  type FireflyBackfillResult,
 } from '@/lib/api';
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
@@ -175,12 +176,7 @@ function SettingsPageInner() {
                 row={status.reversecontact}
                 primaryLabel={null}
               />
-              <IntegrationRowView
-                name="Firefly AI"
-                description="Meeting transcription + action items via webhook."
-                row={status.firefly}
-                primaryLabel={null}
-              />
+              <FireflyIntegrationCard row={status.firefly} />
             </div>
           ) : null}
         </div>
@@ -1522,4 +1518,352 @@ function formatRelative(iso: string): string {
   if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24);
   return `${d}d ago`;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Firefly card — adds setup/troubleshooting accordion + Import button + modal
+// ────────────────────────────────────────────────────────────────────────────
+
+const FIREFLY_WEBHOOK_URL =
+  'https://medina-ventures-api.intel-ad5.workers.dev/webhooks/firefly';
+
+const FIREFLY_TROUBLESHOOTING: Array<{ q: string; a: React.ReactNode }> = [
+  {
+    q: '"Webhook ready" but no transcripts appearing',
+    a: (
+      <>
+        Verify the webhook URL is correct in Firefly's Integrations → Webhooks settings.
+        Check the History tab in Firefly's webhook config for delivery attempts.
+        Make sure Firefly is set to auto-join your meetings (Settings → Recording &amp; Privacy).
+      </>
+    ),
+  },
+  {
+    q: 'Test event returns 401 Unauthorized',
+    a: (
+      <>
+        The signing secret doesn't match. Make sure the exact same secret string
+        is set in both Firefly's webhook configuration AND your platform's
+        <code className="text-xs bg-bg-input px-1 mx-1 rounded">FIREFLY_WEBHOOK_SECRET</code>.
+        Try setting a new simple secret in both places.
+      </>
+    ),
+  },
+  {
+    q: 'Test event returns 200 but real meetings don\'t appear',
+    a: (
+      <>
+        Check that "Meeting Transcribed" is selected as a webhook event.
+        Firefly only sends webhooks after the transcript is fully processed,
+        which can take 5–15 minutes after a meeting ends.
+      </>
+    ),
+  },
+  {
+    q: 'Meetings are being recorded but Firefly bot doesn\'t join',
+    a: (
+      <>
+        Go to Firefly Settings → Recording &amp; Privacy. Make sure "Auto-join" is
+        enabled for your calendar. The Firefly bot needs calendar access to
+        detect and join meetings.
+      </>
+    ),
+  },
+  {
+    q: 'How to import past meeting transcripts',
+    a: (
+      <>
+        Use the "Import Transcripts" button on the Firefly card to pull historical
+        transcripts from Firefly's API. You'll need your Firefly API key from
+        Settings → Developer settings.
+      </>
+    ),
+  },
+];
+
+function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
+  const [showImport, setShowImport] = React.useState(false);
+  const [guideOpen, setGuideOpen] = React.useState(false);
+
+  return (
+    <div>
+      <IntegrationRowView
+        name="Firefly AI"
+        description="Meeting transcription + action items via webhook."
+        row={row}
+        primaryLabel="Import Transcripts"
+        onPrimaryClick={() => setShowImport(true)}
+      />
+
+      <button
+        onClick={() => setGuideOpen(o => !o)}
+        className="mt-2 flex items-center gap-1 text-xs text-text-muted hover:text-text-primary transition-colors"
+      >
+        {guideOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+        Setup guide &amp; troubleshooting
+      </button>
+
+      <div
+        className={`overflow-hidden transition-all duration-200 ${
+          guideOpen ? 'max-h-[2000px] opacity-100 mt-3' : 'max-h-0 opacity-0'
+        }`}
+      >
+        <div className="border border-border/50 rounded-lg p-4 space-y-5 bg-bg-elevated/40">
+          <FireflySetupGuide />
+          <div className="border-t border-border/50 pt-4">
+            <FireflyTroubleshooting />
+          </div>
+        </div>
+      </div>
+
+      {showImport && (
+        <FireflyImportModal onClose={() => setShowImport(false)} />
+      )}
+    </div>
+  );
+}
+
+function FireflySetupGuide() {
+  const [copied, setCopied] = React.useState(false);
+  const copyUrl = () => {
+    navigator.clipboard.writeText(FIREFLY_WEBHOOK_URL);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div>
+      <div className="text-sm font-medium text-text-primary mb-2">How to connect Firefly</div>
+      <ol className="space-y-1.5 text-xs text-text-secondary list-decimal list-inside">
+        <li>Log in to your Firefly account at <span className="text-text-primary">app.fireflies.ai</span></li>
+        <li>Go to <span className="text-text-primary">Settings → Developer settings</span> (left sidebar)</li>
+        <li>Copy your <span className="text-text-primary">API Key</span> (you'll need this for transcript backfill)</li>
+        <li>Go to <span className="text-text-primary">Integrations</span> (left sidebar)</li>
+        <li>Click the <span className="text-text-primary">"API"</span> filter tab, then find <span className="text-text-primary">"Webhooks"</span></li>
+        <li>Click on the Webhooks card, then <span className="text-text-primary">"+ Add Config"</span> or edit the Default Configuration</li>
+        <li>
+          Set the Webhook URL to:
+          <div className="mt-1 flex items-center gap-2">
+            <code className="text-xs bg-bg-input px-2 py-1 rounded font-mono text-text-primary truncate flex-1">
+              {FIREFLY_WEBHOOK_URL}
+            </code>
+            <button onClick={copyUrl} className="btn-ghost text-xs shrink-0">
+              {copied ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+        </li>
+        <li>Set the Signing Secret to match the value configured in your platform (contact your admin if you don't know the signing secret)</li>
+        <li>Select these events: <span className="text-text-primary">"Meeting Transcribed"</span> and <span className="text-text-primary">"Meeting Summarized"</span></li>
+        <li>Click <span className="text-text-primary">Continue</span>, then <span className="text-text-primary">"Send Test Event"</span> to verify</li>
+        <li>You should see <span className="text-semantic-success">"Test event delivered successfully (HTTP 200)"</span></li>
+        <li>Click <span className="text-text-primary">Continue → Update</span> to save</li>
+      </ol>
+      <div className="text-xs text-text-muted mt-3">
+        Firefly will now automatically send meeting transcripts to your CRM when meetings are recorded.
+      </div>
+    </div>
+  );
+}
+
+function FireflyTroubleshooting() {
+  const [openIdx, setOpenIdx] = React.useState<number | null>(null);
+  return (
+    <div>
+      <div className="text-sm font-medium text-text-primary mb-2">Troubleshooting</div>
+      <div className="space-y-1">
+        {FIREFLY_TROUBLESHOOTING.map((item, i) => {
+          const open = openIdx === i;
+          return (
+            <div key={i} className="border-b border-border/30 last:border-0">
+              <button
+                onClick={() => setOpenIdx(open ? null : i)}
+                className="w-full flex items-center justify-between gap-2 py-2 text-left text-xs text-text-primary hover:text-accent-magenta transition-colors"
+              >
+                <span>{item.q}</span>
+                {open ? <ChevronUp className="w-3 h-3 shrink-0" /> : <ChevronDown className="w-3 h-3 shrink-0" />}
+              </button>
+              <div
+                className={`overflow-hidden transition-all duration-200 ${
+                  open ? 'max-h-96 pb-2 opacity-100' : 'max-h-0 opacity-0'
+                }`}
+              >
+                <div className="text-xs text-text-secondary leading-relaxed pl-2">→ {item.a}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function FireflyImportModal({ onClose }: { onClose: () => void }) {
+  const [apiKey, setApiKey] = React.useState('');
+  const [days, setDays] = React.useState(30);
+  const [loading, setLoading] = React.useState(false);
+  const [result, setResult] = React.useState<FireflyBackfillResult | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [showErrorList, setShowErrorList] = React.useState(false);
+
+  const submit = async () => {
+    if (!apiKey.trim()) {
+      setError('Enter your Firefly API key.');
+      return;
+    }
+    setError(null);
+    setLoading(true);
+    setResult(null);
+    try {
+      const r = await api.fireflyBackfill(apiKey.trim(), days);
+      setResult(r);
+    } catch (e: any) {
+      setError(e?.message || 'Backfill failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="card w-full max-w-md mx-4 p-6 space-y-4"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="text-sm font-medium text-text-primary">Import Firefly transcripts</div>
+            <div className="text-xs text-text-secondary mt-0.5">
+              Pull historical meeting transcripts from your Firefly account.
+            </div>
+          </div>
+          <button onClick={onClose} className="text-text-muted hover:text-text-primary">
+            <XIcon className="w-4 h-4" />
+          </button>
+        </div>
+
+        {!result && (
+          <>
+            <div>
+              <label className="text-xs text-text-secondary block mb-1">Firefly API key</label>
+              <input
+                type="password"
+                value={apiKey}
+                onChange={e => setApiKey(e.target.value)}
+                placeholder="Paste your API key"
+                className="input w-full text-sm"
+                disabled={loading}
+                autoFocus
+              />
+              <div className="text-xs text-text-muted mt-1">
+                From <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span>
+              </div>
+            </div>
+
+            <div>
+              <label className="text-xs text-text-secondary block mb-1">Backfill window</label>
+              <select
+                value={days}
+                onChange={e => setDays(Number(e.target.value))}
+                className="input w-full text-sm"
+                disabled={loading}
+              >
+                <option value={7}>Last 7 days</option>
+                <option value={14}>Last 14 days</option>
+                <option value={30}>Last 30 days</option>
+                <option value={60}>Last 60 days</option>
+                <option value={90}>Last 90 days</option>
+              </select>
+            </div>
+
+            {error && (
+              <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">
+                {error}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button onClick={onClose} className="btn-ghost text-xs" disabled={loading}>
+                Cancel
+              </button>
+              <button onClick={submit} className="btn-primary text-xs" disabled={loading || !apiKey.trim()}>
+                {loading ? (
+                  <span className="flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin" /> Importing…
+                  </span>
+                ) : (
+                  'Import'
+                )}
+              </button>
+            </div>
+            {loading && (
+              <div className="text-xs text-text-muted">
+                This can take a few minutes — Firefly's API is paced at one transcript per second.
+              </div>
+            )}
+          </>
+        )}
+
+        {result && (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <Stat label="Found" value={result.total_found} />
+              <Stat label="Ingested" value={result.ingested} tone="success" />
+              <Stat label="Skipped duplicates" value={result.skipped_duplicates} />
+              <Stat label="Failed" value={result.failed} tone={result.failed > 0 ? 'error' : 'muted'} />
+            </div>
+
+            {result.partial && (
+              <div className="text-xs text-semantic-warning bg-semantic-warning/10 border-l-2 border-semantic-warning px-2 py-1 rounded">
+                ⚠️ Partial result — {result.partial_reason}
+              </div>
+            )}
+
+            {result.errors.length > 0 && (
+              <div>
+                <button
+                  onClick={() => setShowErrorList(o => !o)}
+                  className="flex items-center gap-1 text-xs text-text-muted hover:text-text-primary"
+                >
+                  {showErrorList ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                  {result.errors.length} error{result.errors.length === 1 ? '' : 's'}
+                </button>
+                {showErrorList && (
+                  <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
+                    {result.errors.map((e, i) => (
+                      <div key={i} className="text-xs bg-bg-input rounded px-2 py-1">
+                        <div className="text-text-primary truncate">{e.title}</div>
+                        <div className="text-text-muted text-[10px] truncate">{e.error}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex justify-end pt-2">
+              <button onClick={onClose} className="btn-secondary text-xs">Done</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, tone }: { label: string; value: number; tone?: 'success' | 'error' | 'muted' }) {
+  const color =
+    tone === 'success'
+      ? 'text-semantic-success'
+      : tone === 'error'
+        ? 'text-semantic-error'
+        : 'text-text-primary';
+  return (
+    <div className="bg-bg-input rounded px-2 py-1.5">
+      <div className="text-[10px] text-text-muted uppercase tracking-wide">{label}</div>
+      <div className={`text-sm font-medium ${color}`}>{value.toLocaleString()}</div>
+    </div>
+  );
 }

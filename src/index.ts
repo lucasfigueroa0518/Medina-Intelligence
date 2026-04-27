@@ -451,6 +451,15 @@ async function routeAuthenticated(
   m = path.match(/^\/api\/audit-log\/([^/]+)\/([^/]+)$/);
   if (m && method === 'GET') return AuditLog.getEntityHistory(m[1], m[2], ctx, env);
 
+  // --- Firefly transcript backfill — auth-only, no role gate (each user
+  // brings their own Firefly API key, transcripts ingest as org-wide data).
+  // Registered above the /api/admin role check so the path is reachable for
+  // any authenticated team member.
+  if (path === '/api/admin/firefly-backfill' && method === 'POST') {
+    const { handleFireflyBackfill } = await import('./handlers/firefly-backfill');
+    return handleFireflyBackfill(request, ctx, env);
+  }
+
   // --- Admin (owner/admin only) ---
   if (path.startsWith('/api/admin')) {
     const forbidden = requireRole(ctx, ['owner', 'admin']);

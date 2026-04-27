@@ -278,6 +278,11 @@ export const api = {
   // Integrations
   getIntegrationsStatus: () =>
     request<IntegrationsStatusResponse>('/integrations/status'),
+  fireflyBackfill: (apiKey: string, days: number) =>
+    request<FireflyBackfillResult>('/admin/firefly-backfill', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: apiKey, days }),
+    }),
 
   // Imports
   listImports: () => request<{ imports: any[] }>('/imports'),
@@ -385,6 +390,16 @@ export interface IntegrationsStatusResponse {
   slack: IntegrationRow;
   reversecontact: IntegrationRow;
   firefly: IntegrationRow;
+}
+
+export interface FireflyBackfillResult {
+  total_found: number;
+  ingested: number;
+  skipped_duplicates: number;
+  failed: number;
+  errors: Array<{ transcript_id: string; title: string; error: string }>;
+  partial?: boolean;
+  partial_reason?: string;
 }
 
 export async function streamAgentQuery(
