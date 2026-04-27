@@ -15,8 +15,12 @@
   },
   "dependencies": {
     "@langchain/textsplitters": "^0.1.0",
+    "@types/papaparse": "^5.5.2",
+    "jszip": "^3.10.1",
     "mammoth": "^1.8.0",
-    "pdf-parse": "^1.1.1"
+    "papaparse": "^5.5.3",
+    "pdf-parse": "^1.1.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240924.0",

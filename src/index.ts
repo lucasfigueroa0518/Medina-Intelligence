@@ -24,6 +24,7 @@ import * as Sync from './handlers/sync';
 import * as AuditLog from './handlers/audit-log';
 import * as Admin from './handlers/admin';
 import * as Imports from './handlers/imports';
+import * as IntelligentImport from './handlers/intelligent-import';
 import * as Campaigns from './handlers/campaigns';
 import * as Agent from './handlers/agent';
 import * as Webhooks from './handlers/webhooks';
@@ -498,6 +499,9 @@ async function routeAuthenticated(
     return Integrations.getIntegrationsStatus(request, ctx, env);
 
   // --- Imports ---
+  if (path === '/api/imports/intelligent' && method === 'POST') {
+    return IntelligentImport.intelligentImport(request, ctx, env, ctxExec);
+  }
   if (path === '/api/imports' && method === 'POST') {
     return Imports.uploadImport(request, ctx, env);
   }
