@@ -3,7 +3,8 @@ export type AuditAction =
   | 'merge' | 'enrich'
   | 'tag_apply' | 'tag_remove' | 'tag_delete'
   | 'approve' | 'reject' | 'auto_approve'
-  | 'campaign_send' | 'import' | 'login' | 'token_refresh_failed';
+  | 'campaign_send' | 'import' | 'login' | 'token_refresh_failed'
+  | 'set_initial_password' | 'admin_reset_password';
 
 export type AuditEntityType =
   | 'contact' | 'company' | 'deal' | 'event' | 'conversation'
@@ -28,6 +29,7 @@ const VALID_ACTIONS: ReadonlySet<string> = new Set([
   'tag_apply', 'tag_remove', 'tag_delete',
   'approve', 'reject', 'auto_approve',
   'campaign_send', 'import', 'login', 'token_refresh_failed',
+  'set_initial_password', 'admin_reset_password',
 ]);
 
 const VALID_ENTITY_TYPES: ReadonlySet<string> = new Set([

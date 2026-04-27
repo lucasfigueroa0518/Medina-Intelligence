@@ -7,6 +7,7 @@ import { invalidateRagCache } from '../lib/cache';
 import { cleanupVectorsForEntity } from '../lib/merge';
 import { triggerCompanyEnrichment } from '../lib/enrichment';
 import { findDuplicateCompany } from '../lib/discovery';
+import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 
 export async function listCompanies(
   request: Request,
@@ -256,10 +257,16 @@ export async function updateCompany(
 
   const updates: string[] = [];
   const binds: unknown[] = [];
+  const changedFields: string[] = [];
   for (const k of allowed) {
     if (k in body) {
       updates.push(`${k} = ?`);
       binds.push(body[k]);
+      // Only treat as a real edit if the value actually changed.
+      const beforeVal = (before as any)[k];
+      const beforeNorm = beforeVal == null ? '' : String(beforeVal).trim();
+      const afterNorm = body[k] == null ? '' : String(body[k]).trim();
+      if (beforeNorm !== afterNorm) changedFields.push(k);
     }
   }
   if (updates.length === 0) return jsonResponse({ company: before });
@@ -268,6 +275,11 @@ export async function updateCompany(
   await env.D1.prepare(
     `UPDATE companies SET ${updates.join(', ')} WHERE id = ?`
   ).bind(...binds, id).run();
+
+  if (changedFields.length > 0) {
+    await markFieldsHumanEdited(ctx.orgId, 'company', id, changedFields, ctx.userId, env)
+      .catch(e => console.error('[companies] markFieldsHumanEdited failed:', e));
+  }
 
   const after = await env.D1.prepare('SELECT * FROM companies WHERE id = ?').bind(id).first();
 

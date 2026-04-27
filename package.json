@@ -15,14 +15,14 @@
   },
   "dependencies": {
     "@langchain/textsplitters": "^0.1.0",
-    "pdf-parse": "^1.1.1",
-    "mammoth": "^1.8.0"
+    "mammoth": "^1.8.0",
+    "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240924.0",
     "@types/node": "^20.14.0",
     "concurrently": "^9.0.1",
     "typescript": "^5.6.0",
-    "wrangler": "^3.78.0"
+    "wrangler": "^4.85.0"
   }
 }

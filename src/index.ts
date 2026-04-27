@@ -144,13 +144,20 @@ if (path === '/webhooks/firefly' && method === 'POST') {
 
   // --- Public auth endpoints ---
   if (path === '/api/auth/login' && method === 'POST') {
-    return AuthLogin.login(request, env);
+    return withCors(await AuthLogin.login(request, env), reqOrigin, env);
   }
   if (path === '/api/auth/register' && method === 'POST') {
-    return AuthLogin.register(request, env);
+    return withCors(await AuthLogin.register(request, env), reqOrigin, env);
+  }
+  if (path === '/api/auth/signup' && method === 'POST') {
+    return withCors(await AuthLogin.signup(request, env), reqOrigin, env);
+  }
+  if (path === '/api/auth/mfa/verify' && method === 'POST') {
+    // Authenticated by short-lived purpose='mfa_challenge' JWT, not the session JWT.
+    return withCors(await AuthLogin.mfaVerify(request, env), reqOrigin, env);
   }
   if (path === '/api/auth/set-initial-password' && method === 'POST') {
-    return AuthLogin.setInitialPassword(request, env);
+    return withCors(await AuthLogin.setInitialPassword(request, env), reqOrigin, env);
   }
 
   // --- Authenticated routes ---
@@ -205,6 +212,18 @@ async function routeAuthenticated(
   }
   if (path === '/api/users/me/change-password' && method === 'POST') {
     return AuthLogin.changePassword(request, ctx, env);
+  }
+  if (path === '/api/auth/mfa/status' && method === 'GET') {
+    return AuthLogin.mfaStatus(ctx, env);
+  }
+  if (path === '/api/auth/mfa/enroll/start' && method === 'POST') {
+    return AuthLogin.mfaEnrollStart(ctx, env);
+  }
+  if (path === '/api/auth/mfa/enroll/confirm' && method === 'POST') {
+    return AuthLogin.mfaEnrollConfirm(request, ctx, env);
+  }
+  if (path === '/api/auth/mfa/disable' && method === 'POST') {
+    return AuthLogin.mfaDisable(request, ctx, env);
   }
   if (path === '/api/users/me/sessions' && method === 'GET') {
     return AuthLogin.listMySessions(request, ctx, env);
@@ -456,6 +475,11 @@ async function routeAuthenticated(
       return Admin.repairVectorizeParticipantIds(request, ctx, env);
     if (path === '/api/admin/run-daily-cron' && method === 'POST')
       return Admin.runDailyCronManually(ctx, env);
+    if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
+      return Admin.renamePlaceholderCompanies(request, ctx, env);
+    m = path.match(/^\/api\/admin\/users\/([^/]+)\/reset-password$/);
+    if (m && method === 'POST')
+      return AuthLogin.adminResetPassword(m[1], request, ctx, env);
   }
 
   if (path === '/api/system/status' && method === 'GET') return Admin.getSystemStatus(ctx, env);

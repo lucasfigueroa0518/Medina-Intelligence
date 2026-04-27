@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(npx tsc *)",
-      "Bash(npx wrangler@3.114.17 deploy)"
+      "Bash(npx wrangler@3.114.17 deploy)",
+      "Bash(npm install *)",
+      "Bash(npm --prefix frontend install)",
+      "Bash(npm run *)",
+      "Bash(npx wrangler *)",
+      "Bash(python3 -c \"import sys, json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d[0]['results'], indent=2\\)\\)\")"
     ]
   }
 }

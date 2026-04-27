@@ -6,6 +6,7 @@ import { clearEnrichmentRateLimit } from '../lib/rate-limit';
 import { emitAudit } from '../lib/audit';
 import { runHistoricalBackfill, getUserSyncConfig, setUserSyncConfig, type BackfillProgress } from '../integrations/outlook';
 import { runDailyCron } from '../lib/daily-cron';
+import { triggerCompanyEnrichment, isDomainShapedName } from '../lib/enrichment';
 
 export async function listDlq(
   request: Request,
@@ -101,6 +102,58 @@ export async function runDailyCronManually(
   } catch (e: any) {
     return errorResponse('DAILY_CRON_FAILED', 500, e?.message || String(e));
   }
+}
+
+// One-shot sweep: re-enrich every company whose name still looks like an
+// auto-generated email-domain placeholder ("Bluepeakllc", "4degrees", ...).
+// Re-enrichment runs the canonical-name resolver in enrichment.ts, which
+// renames the row (and merges into an existing canonical row if one exists).
+// Body: { limit?: number, dry_run?: boolean }
+export async function renamePlaceholderCompanies(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = (await parseJsonBody<{ limit?: number; dry_run?: boolean }>(request)) || {};
+  const limit = Math.max(1, Math.min(500, body.limit ?? 100));
+  const dryRun = body.dry_run === true;
+
+  const rows = await env.D1.prepare(
+    `SELECT id, name, domain, website FROM companies
+       WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL
+       ORDER BY created_at ASC`
+  ).bind(ctx.orgId).all<{ id: string; name: string; domain: string | null; website: string | null }>();
+
+  const candidates = rows.results
+    .filter(r => isDomainShapedName(r.name, r.domain, r.website))
+    .slice(0, limit);
+
+  if (dryRun) {
+    return jsonResponse({
+      ok: true,
+      dry_run: true,
+      candidate_count: candidates.length,
+      candidates: candidates.map(c => ({ id: c.id, name: c.name, domain: c.domain })),
+    });
+  }
+
+  const results: Array<{ id: string; name: string; ok: boolean; error?: string }> = [];
+  for (const c of candidates) {
+    try {
+      await triggerCompanyEnrichment(c.id, ctx.orgId, env);
+      results.push({ id: c.id, name: c.name, ok: true });
+    } catch (e: any) {
+      results.push({ id: c.id, name: c.name, ok: false, error: e?.message || String(e) });
+    }
+  }
+
+  return jsonResponse({
+    ok: true,
+    processed: results.length,
+    succeeded: results.filter(r => r.ok).length,
+    failed: results.filter(r => !r.ok).length,
+    results,
+  });
 }
 
 // One-time repair: rewrite participant_user_ids in Vectorize chunk metadata

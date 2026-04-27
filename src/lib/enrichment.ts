@@ -24,7 +24,25 @@ import { GEMINI_ENRICHMENT_PROMPT, buildGeminiEnrichmentUserPrompt } from '../pr
 import { enrichContactFromLinkedIn } from '../integrations/reversecontact';
 import { discoverLinkedInUrl, assessLinkedInUrlAuthenticity } from './linkedin-discovery';
 import { findCompanyByDomain, findOrCreateCompanyByDomain, PERSONAL_DOMAINS } from './discovery';
-import { proposeEntityUpdate } from './progressive-enrichment';
+import { proposeEntityUpdate, proposeMultipleUpdates } from './progressive-enrichment';
+import { jaroWinkler } from './dedup';
+
+// Returns true if two company names plausibly refer to the same entity:
+// exact match, high Jaro-Winkler similarity (catches typos/spellings), or
+// any non-trivial token in common (catches "Pagsa" vs "Grupo Pagsa").
+function isSameCompany(a: string, b: string): boolean {
+  const x = a.toLowerCase().trim();
+  const y = b.toLowerCase().trim();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (jaroWinkler(x, y) >= 0.75) return true;
+  const tokenize = (s: string) =>
+    new Set(s.split(/[\s,.\-_/]+/).filter(w => w.length >= 4));
+  const tx = tokenize(x);
+  const ty = tokenize(y);
+  for (const t of tx) if (ty.has(t)) return true;
+  return false;
+}
 
 // Check for optional circuit breaker — if the module doesn't exist, skip gracefully.
 let isRcCircuitOpen: ((orgId: string, env: Env) => Promise<boolean>) | null = null;
@@ -264,24 +282,72 @@ async function applyUnifiedEnrichment(
     }
   }
 
-  // Auto-link to company by extracted company_name
+  // Reconcile the contact's company assignment with the bio.
+  // Email-domain auto-linking (the default) can attach a contact to the wrong
+  // real-world employer (side domains, family business, vendor, personal mailbox
+  // at a related entity). When the bio names a different company, queue a
+  // human approval rather than silently keeping the wrong link.
   if (extracted.company_name && typeof extracted.company_name === 'string') {
-    const existingCompanyId = await env.D1.prepare(
-      'SELECT company_id FROM contacts WHERE id = ?'
-    ).bind(contactId).first<{ company_id: string | null }>();
+    const proposedName = String(extracted.company_name).trim();
+    if (proposedName.length >= 2) {
+      const link = await env.D1.prepare(
+        'SELECT company_id FROM contacts WHERE id = ?'
+      ).bind(contactId).first<{ company_id: string | null }>();
 
-    if (!existingCompanyId?.company_id) {
-      const companyName = String(extracted.company_name).trim();
-      if (companyName.length >= 2) {
+      if (!link?.company_id) {
         const matchedCompany = await env.D1.prepare(
           'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) = LOWER(?) AND deleted_at IS NULL LIMIT 1'
-        ).bind(orgId, companyName).first<{ id: string }>();
-
+        ).bind(orgId, proposedName).first<{ id: string }>();
         if (matchedCompany) {
           dbUpdates.push('company_id = ?');
           dbBinds.push(matchedCompany.id);
           autoApplied['company_id'] = matchedCompany.id;
-          console.log(`[enrichment] ${contactId}: auto-link to company "${companyName}" id=${matchedCompany.id}`);
+          console.log(`[enrichment] ${contactId}: auto-link to company "${proposedName}" id=${matchedCompany.id}`);
+        }
+      } else {
+        const current = await env.D1.prepare(
+          'SELECT name, domain FROM companies WHERE id = ?'
+        ).bind(link.company_id).first<{ name: string; domain: string | null }>();
+
+        const matchesName = current && isSameCompany(current.name, proposedName);
+        const matchesDomain = current?.domain && isSameCompany(current.domain, proposedName);
+        if (current && !matchesName && !matchesDomain) {
+          let proposedCompanyId: string | null = null;
+          const matched = await env.D1.prepare(
+            'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) = LOWER(?) AND deleted_at IS NULL LIMIT 1'
+          ).bind(orgId, proposedName).first<{ id: string }>();
+
+          if (matched) {
+            proposedCompanyId = matched.id;
+          } else {
+            proposedCompanyId = crypto.randomUUID();
+            await env.D1.prepare(
+              `INSERT INTO companies (id, org_id, name, company_type, created_at, updated_at)
+               VALUES (?, ?, ?, 'other', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+            ).bind(proposedCompanyId, orgId, proposedName).run();
+            console.log(`[enrichment] ${contactId}: created placeholder company "${proposedName}" id=${proposedCompanyId} for approval`);
+          }
+
+          const slug = proposedName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+          const idempotencyKey = `${orgId}:${contactId}:company_mismatch:${slug}`;
+          const proposedValue = JSON.stringify({
+            value: proposedCompanyId,
+            context: {
+              current_company_id: link.company_id,
+              current_company_name: current.name,
+              proposed_company_name: proposedName,
+              reason: 'email_domain_disagrees_with_bio',
+            },
+          });
+
+          await env.D1.prepare(
+            `INSERT OR IGNORE INTO approval_queue
+               (org_id, idempotency_key, entity_type, entity_id, change_type, field_name,
+                proposed_value, confidence, status)
+             VALUES (?, ?, 'contact', ?, 'update_contact', 'company_id', ?, 0.6, 'pending')`
+          ).bind(orgId, idempotencyKey, contactId, proposedValue).run();
+
+          console.log(`[enrichment] ${contactId}: queued company-mismatch approval — current="${current.name}" proposed="${proposedName}"`);
         }
       }
     }
@@ -697,13 +763,28 @@ export async function triggerCompanyEnrichment(
     ));
   }
 
-  const descriptionSnippet = cleanBio.length > 500 ? cleanBio.slice(0, 497) + '...' : cleanBio;
-
+  // Always update enrichment metadata; structured fact updates flow through
+  // progressive enrichment so they get NULL-fill / auto-apply / queue policy.
   await env.D1.prepare(
     `UPDATE companies SET enrichment_confidence = ?, enrichment_last_run = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-       description = COALESCE(description, ?),
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-  ).bind(0.7, descriptionSnippet, companyId).run();
+  ).bind(0.7, companyId).run();
+
+  const facts = await extractCompanyStructuredFacts(cleanBio, env, orgId, contributions.length);
+  if (facts.length > 0) {
+    await proposeMultipleUpdates(
+      orgId, 'company', companyId,
+      facts.map(f => ({
+        field: f.field,
+        value: f.value,
+        source: 'web_enrichment_company',
+        confidence: f.confidence,
+        source_description: `web enrichment (${contributions.length} source(s))`,
+      })),
+      env,
+      { policy: 'auto_if_confident' }
+    );
+  }
 
   // Resolve placeholder domain-name into a canonical human-readable name and
   // dedupe against any existing company that already has that name.
@@ -721,17 +802,26 @@ export async function triggerCompanyEnrichment(
   });
 }
 
-function isDomainShapedName(
+export function isDomainShapedName(
   name: string | null,
   domain: string | null,
   website: string | null
 ): boolean {
   if (!name) return false;
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
   const lower = name.toLowerCase().trim();
-  if (domain && lower === domain.toLowerCase()) return true;
+  const namePacked = norm(name);
+
+  if (domain) {
+    if (lower === domain.toLowerCase()) return true;
+    const stem = domain.toLowerCase().split('.')[0];
+    if (stem && namePacked === norm(stem)) return true;
+  }
   if (website) {
-    const stripped = website.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
-    if (lower === stripped) return true;
+    const host = website.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+    if (lower === host) return true;
+    const stem = host.split('.')[0];
+    if (stem && namePacked === norm(stem)) return true;
   }
   if (/\.[a-z]{2,}(\/|$)/i.test(lower)) return true;
   return false;
@@ -778,6 +868,97 @@ Rules:
     console.error('[enrichment] canonical name parse failed:', raw);
     return null;
   }
+}
+
+// Pulls structured field values out of an enrichment briefing so progressive
+// enrichment can propose them. Per-field self-reported confidence is mapped
+// onto the [0..1] scale; corroboration across multiple contributions bumps to
+// 0.95 so the auto-apply path can fire.
+export interface ExtractedCompanyFact {
+  field: string;
+  value: string;
+  confidence: number;
+}
+
+const COMPANY_FACT_FIELDS = [
+  'sector', 'stage', 'website', 'hq_location', 'employee_count',
+  'investment_status', 'linkedin_url', 'current_valuation',
+  'last_funding_amount', 'last_funding_round', 'last_funding_date',
+  'description',
+] as const;
+
+export async function extractCompanyStructuredFacts(
+  briefing: string,
+  env: Env,
+  orgId: string,
+  contributionCount: number
+): Promise<ExtractedCompanyFact[]> {
+  const system = `You extract structured company facts from an investor briefing. Return ONLY raw JSON, no markdown, no commentary. Schema:
+{
+  "sector": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "stage": {"value": "pre_seed"|"seed"|"series_a"|"series_b"|"series_c"|"growth"|"public"|"acquired"|"other", "confidence": "high"|"medium"|"low"} | null,
+  "website": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "hq_location": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "employee_count": {"value": number, "confidence": "high"|"medium"|"low"} | null,
+  "investment_status": {"value": "tracking"|"prospect"|"due_diligence"|"term_sheet"|"invested"|"passed"|"exited", "confidence": "high"|"medium"|"low"} | null,
+  "linkedin_url": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "current_valuation": {"value": number, "confidence": "high"|"medium"|"low"} | null,
+  "last_funding_amount": {"value": number, "confidence": "high"|"medium"|"low"} | null,
+  "last_funding_round": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "last_funding_date": {"value": "YYYY-MM-DD", "confidence": "high"|"medium"|"low"} | null,
+  "description": {"value": string, "confidence": "high"|"medium"|"low"} | null
+}
+
+Rules:
+- Omit (null) any field not clearly stated in the briefing. Never guess.
+- "high" = the briefing states the fact directly, with corroborating context.
+- "medium" = single source / mild inference.
+- "low" = weak inference. Prefer to return null over "low".
+- description is a 1-2 sentence company summary, not a full bio.
+- Numeric fields must be raw numbers (no currency symbols, no commas, no "$1.2M" — convert to 1200000).
+- investment_status reflects only what the briefing implies about *our* relationship; default to omitting.`;
+  const user = `Briefing:\n${briefing.slice(0, 6000)}`;
+
+  let raw: string;
+  try {
+    raw = await callClaude(
+      { system, user, max_tokens: 800, orgId, model: 'claude-haiku-4-5-20251001' },
+      'low',
+      env
+    );
+  } catch (e) {
+    console.error('[enrichment] structured fact extraction failed:', e);
+    return [];
+  }
+
+  let parsed: Record<string, { value: unknown; confidence: string } | null>;
+  try {
+    const cleaned = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    parsed = JSON.parse(cleaned);
+  } catch {
+    console.error('[enrichment] structured fact parse failed:', raw.slice(0, 200));
+    return [];
+  }
+
+  const corroborationBoost = contributionCount >= 2 ? 0.1 : 0;
+  const confMap: Record<string, number> = { high: 0.85, medium: 0.6, low: 0.4 };
+
+  const facts: ExtractedCompanyFact[] = [];
+  for (const field of COMPANY_FACT_FIELDS) {
+    const f = parsed[field];
+    if (!f || f.value === null || f.value === undefined) continue;
+    const baseConf = confMap[String(f.confidence).toLowerCase()] ?? 0.4;
+    if (baseConf < 0.5) continue;
+    const value = typeof f.value === 'number' ? String(f.value) : String(f.value).trim();
+    if (!value || value.toLowerCase() === 'null' || value.toLowerCase() === 'unknown') continue;
+    facts.push({
+      field,
+      value,
+      confidence: Math.min(0.95, baseConf + corroborationBoost),
+    });
+  }
+
+  return facts;
 }
 
 async function resolveCompanyName(

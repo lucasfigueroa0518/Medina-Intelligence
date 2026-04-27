@@ -5,7 +5,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { canReadEmailContent } from '../lib/helpers';
-import { commitProgressiveApproval } from '../lib/progressive-enrichment';
+import { commitProgressiveApproval, markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { triggerContactEnrichment } from '../lib/enrichment';
 
 export async function listApprovalQueue(
@@ -97,6 +97,13 @@ export async function approveItem(
 
   // Commit the proposed change
   const { reEnrich } = await commitApproval(item, env);
+
+  // Approving a queued change is human intent — record it so future enrichment
+  // defers to the queue for this field instead of auto-overwriting.
+  if (item.field_name && (item.entity_type === 'company' || item.entity_type === 'contact' || item.entity_type === 'deal')) {
+    await markFieldsHumanEdited(ctx.orgId, item.entity_type, item.entity_id, [item.field_name], ctx.userId, env)
+      .catch(e => console.error('[approval] markFieldsHumanEdited failed:', e));
+  }
 
   await emitAudit(env, {
     org_id: ctx.orgId,

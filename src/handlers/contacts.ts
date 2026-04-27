@@ -7,6 +7,7 @@ import { invalidateRagCache } from '../lib/cache';
 import { mergeContacts, resolveMergedContact, cleanupVectorsForEntity } from '../lib/merge';
 import { canReadEmailContent } from '../lib/helpers';
 import { triggerContactEnrichment } from '../lib/enrichment';
+import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 
 // --- GET /api/contacts ---
 
@@ -386,10 +387,15 @@ export async function updateContact(
 
   const updates: string[] = [];
   const binds: unknown[] = [];
+  const changedFields: string[] = [];
   for (const k of allowed) {
     if (k in body) {
       updates.push(`${k} = ?`);
       binds.push(body[k]);
+      const beforeVal = (before as any)[k];
+      const beforeNorm = beforeVal == null ? '' : String(beforeVal).trim();
+      const afterNorm = body[k] == null ? '' : String(body[k]).trim();
+      if (beforeNorm !== afterNorm) changedFields.push(k);
     }
   }
 
@@ -409,6 +415,11 @@ export async function updateContact(
   await env.D1.prepare(
     `UPDATE contacts SET ${updates.join(', ')} WHERE id = ?`
   ).bind(...binds, id).run();
+
+  if (changedFields.length > 0) {
+    await markFieldsHumanEdited(ctx.orgId, 'contact', id, changedFields, ctx.userId, env)
+      .catch(e => console.error('[contacts] markFieldsHumanEdited failed:', e));
+  }
 
   const after = await env.D1.prepare('SELECT * FROM contacts WHERE id = ?').bind(id).first();
 

@@ -60,6 +60,12 @@ export interface Env {
 
   TOKEN_ENCRYPTION_KEY: string;
   JWT_SECRET: string;
+
+  // --- Signup ---
+  // Comma-separated list of email domains permitted for self-signup, e.g. "medinavc.com".
+  ALLOWED_SIGNUP_DOMAINS?: string;
+  // Org assigned to self-signups.
+  DEFAULT_SIGNUP_ORG_ID?: string;
 }
 
 // Cloudflare Workflows types.

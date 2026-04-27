@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { MedinaLogo } from '@/components/medina-logo';
 import { EntranceAnimation } from '@/components/entrance-animation';
@@ -20,12 +21,17 @@ export default function LoginPage() {
     setError('');
     setLoading(true);
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
     try {
       const res = await fetch(`${API_ORIGIN}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -35,6 +41,13 @@ export default function LoginPage() {
       }
 
       const data = await res.json();
+
+      if (data.mfa_required === 'verify' && data.mfa_token) {
+        sessionStorage.setItem('mfa_pending_token', data.mfa_token);
+        router.push('/mfa/challenge');
+        return;
+      }
+
       localStorage.setItem('auth_token', data.token);
 
       const alreadyPlayed = sessionStorage.getItem('entrance_played');
@@ -44,8 +57,9 @@ export default function LoginPage() {
         sessionStorage.setItem('entrance_played', 'true');
         setShowEntrance(true);
       }
-    } catch {
-      setError('Unable to connect to the server');
+    } catch (err: any) {
+      clearTimeout(timeout);
+      setError(err?.name === 'AbortError' ? 'Request timed out. Is the server running?' : 'Unable to connect to the server');
       setLoading(false);
     }
   }
@@ -112,6 +126,11 @@ export default function LoginPage() {
           >
             {loading ? 'Signing in...' : 'Sign In'}
           </button>
+
+          <p className="text-center text-sm text-text-muted">
+            Don&apos;t have an account?{' '}
+            <Link href="/signup" className="text-accent-purple hover:underline">Sign up</Link>
+          </p>
         </form>
       </div>
     </div>

@@ -1,8 +1,9 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
-import { signJwt, verifyJwt } from './auth';
+import { signJwt, verifyJwt, verifyPurposeJwt } from './auth';
 import { jsonResponse, errorResponse } from './utils';
 import { emitAudit } from '../lib/audit';
+import { generateSecret, otpauthUrl, verifyTotp, generateRecoveryCodes, hashRecoveryCode } from '../lib/totp';
 
 const PBKDF2_ITERATIONS = 100_000;
 const SALT_BYTES = 32;
@@ -164,11 +165,13 @@ export async function login(request: Request, env: Env): Promise<Response> {
   }
 
   const user = await env.D1.prepare(
-    `SELECT id, org_id, email, full_name, role, password_hash, is_active
+    `SELECT id, org_id, email, full_name, role, password_hash, is_active,
+            email_verified, mfa_enabled
      FROM users WHERE email = ? AND deleted_at IS NULL`
   ).bind(email.toLowerCase()).first<{
     id: string; org_id: string; email: string; full_name: string;
     role: string; password_hash: string | null; is_active: number;
+    email_verified: number | null; mfa_enabled: number | null;
   }>();
 
   if (!user || !user.password_hash) {
@@ -182,6 +185,17 @@ export async function login(request: Request, env: Env): Promise<Response> {
   const valid = await verifyPassword(password, user.password_hash);
   if (!valid) {
     return errorResponse('INVALID_CREDENTIALS', 401, 'Invalid email or password');
+  }
+
+  // If 2FA is enabled, return a short-lived purpose-scoped token instead of a session.
+  if (user.mfa_enabled) {
+    const challengeExp = Math.floor(Date.now() / 1000) + 5 * 60;
+    const challengeToken = await signJwt(
+      { sub: user.id, org_id: user.org_id, role: user.role, email: user.email,
+        exp: challengeExp, purpose: 'mfa_challenge' },
+      env
+    );
+    return jsonResponse({ mfa_required: 'verify', mfa_token: challengeToken });
   }
 
   const expiresAt = new Date(Date.now() + 7 * 86400 * 1000).toISOString();
@@ -292,6 +306,45 @@ export async function changePassword(
 }
 
 /**
+ * POST /api/admin/users/:id/reset-password
+ * Owner/admin-only password reset for another user. Always emits an audit entry
+ * (action='admin_reset_password') so password rewrites are observable.
+ */
+export async function adminResetPassword(
+  targetUserId: string,
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  let body: { password?: string };
+  try { body = await request.json(); } catch { return errorResponse('INVALID_BODY', 400); }
+  const password = body.password;
+  if (!password) return errorResponse('MISSING_FIELDS', 400, 'password is required');
+  if (password.length < 8) return errorResponse('WEAK_PASSWORD', 400, 'Password must be at least 8 characters');
+
+  const target = await env.D1.prepare(
+    'SELECT id, org_id FROM users WHERE id = ? AND deleted_at IS NULL'
+  ).bind(targetUserId).first<{ id: string; org_id: string }>();
+  if (!target) return errorResponse('USER_NOT_FOUND', 404);
+  if (target.org_id !== ctx.orgId) return errorResponse('FORBIDDEN', 403, 'Cannot reset users in other organizations');
+
+  const passwordHash = await hashPassword(password);
+  await env.D1.prepare('UPDATE users SET password_hash = ? WHERE id = ?').bind(passwordHash, targetUserId).run();
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'admin_reset_password',
+    entity_type: 'user',
+    entity_id: targetUserId,
+    metadata: { reset_by: ctx.userId },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ ok: true, user_id: targetUserId });
+}
+
+/**
  * GET /api/users/me/sessions
  * Returns active (non-revoked, non-expired) sessions for the current user.
  * Marks the session belonging to the current request as `current: true`.
@@ -365,7 +418,10 @@ export async function revokeAllOtherSessions(
 
 /**
  * POST /api/auth/set-initial-password
- * Temporary bootstrap endpoint — set password for existing users without one.
+ * Bootstrap endpoint — sets a password for a user that doesn't have one yet.
+ * Refuses to overwrite an existing password (use /api/users/me/change-password
+ * or the admin reset endpoint for that). Emits an audit event so silent
+ * password rewrites can never happen unobserved again.
  */
 export async function setInitialPassword(request: Request, env: Env): Promise<Response> {
   let body: { user_id?: string; password?: string };
@@ -385,11 +441,19 @@ export async function setInitialPassword(request: Request, env: Env): Promise<Re
   }
 
   const user = await env.D1.prepare(
-    'SELECT id, password_hash FROM users WHERE id = ? AND deleted_at IS NULL'
-  ).bind(user_id).first<{ id: string; password_hash: string | null }>();
+    'SELECT id, org_id, password_hash FROM users WHERE id = ? AND deleted_at IS NULL'
+  ).bind(user_id).first<{ id: string; org_id: string; password_hash: string | null }>();
 
   if (!user) {
     return errorResponse('USER_NOT_FOUND', 404);
+  }
+
+  if (user.password_hash) {
+    return errorResponse(
+      'PASSWORD_ALREADY_SET',
+      409,
+      'This user already has a password. Use change-password (with current password) or admin reset.'
+    );
   }
 
   const passwordHash = await hashPassword(password);
@@ -397,5 +461,323 @@ export async function setInitialPassword(request: Request, env: Env): Promise<Re
     'UPDATE users SET password_hash = ? WHERE id = ?'
   ).bind(passwordHash, user_id).run();
 
+  await emitAudit(env, {
+    org_id: user.org_id,
+    user_id,
+    action: 'set_initial_password',
+    entity_type: 'user',
+    entity_id: user_id,
+    metadata: { method: 'set_initial_password' },
+    created_at: new Date().toISOString(),
+  });
+
   return jsonResponse({ ok: true, user_id });
+}
+
+// =====================================================================
+// Self-signup (domain-restricted, no email verification)
+// =====================================================================
+
+function isAllowedSignupDomain(email: string, env: Env): boolean {
+  const domains = (env.ALLOWED_SIGNUP_DOMAINS || 'medinavc.com')
+    .split(',').map(d => d.trim().toLowerCase()).filter(Boolean);
+  const lower = email.toLowerCase();
+  const at = lower.lastIndexOf('@');
+  if (at === -1) return false;
+  const domain = lower.slice(at + 1);
+  return domains.includes(domain);
+}
+
+/**
+ * POST /api/auth/signup
+ * Body: { email, password, full_name }. Creates an active user and returns a session token.
+ */
+export async function signup(request: Request, env: Env): Promise<Response> {
+  let body: { email?: string; password?: string; full_name?: string };
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('INVALID_BODY', 400);
+  }
+
+  const { email, password, full_name } = body;
+  if (!email || !password || !full_name) {
+    return errorResponse('MISSING_FIELDS', 400, 'email, password, and full_name are required');
+  }
+  if (password.length < 8) {
+    return errorResponse('WEAK_PASSWORD', 400, 'Password must be at least 8 characters');
+  }
+  if (!isAllowedSignupDomain(email, env)) {
+    return errorResponse('DOMAIN_NOT_ALLOWED', 400, 'Signup is restricted to approved email domains');
+  }
+
+  const orgId = env.DEFAULT_SIGNUP_ORG_ID;
+  if (!orgId) {
+    return errorResponse('SIGNUP_DISABLED', 500, 'Signup is not configured');
+  }
+  const org = await env.D1.prepare(
+    'SELECT id FROM organizations WHERE id = ? AND deleted_at IS NULL'
+  ).bind(orgId).first();
+  if (!org) {
+    return errorResponse('SIGNUP_DISABLED', 500, 'Default signup organization missing');
+  }
+
+  const lowerEmail = email.toLowerCase();
+  const existing = await env.D1.prepare(
+    'SELECT id FROM users WHERE email = ? AND deleted_at IS NULL'
+  ).bind(lowerEmail).first();
+  if (existing) {
+    return errorResponse('EMAIL_EXISTS', 409, 'An account with this email already exists');
+  }
+
+  const userId = crypto.randomUUID();
+  const passwordHash = await hashPassword(password);
+  await env.D1.prepare(
+    `INSERT INTO users (id, org_id, email, full_name, role, password_hash, is_active, email_verified)
+     VALUES (?, ?, ?, ?, 'member', ?, 1, 1)`
+  ).bind(userId, orgId, lowerEmail, full_name, passwordHash).run();
+
+  const expiresAt = new Date(Date.now() + 7 * 86400 * 1000).toISOString();
+  const token = await signJwt(
+    { sub: userId, org_id: orgId, role: 'member', email: lowerEmail },
+    env
+  );
+  await recordToken(userId, token, expiresAt, env);
+
+  await emitAudit(env, {
+    org_id: orgId,
+    user_id: userId,
+    action: 'create',
+    entity_type: 'user',
+    entity_id: userId,
+    metadata: { method: 'signup' },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({
+    token,
+    user: { id: userId, email: lowerEmail, full_name, role: 'member', org_id: orgId },
+  }, 201);
+}
+
+// =====================================================================
+// Optional TOTP 2FA
+// =====================================================================
+
+const MFA_PENDING_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * POST /api/auth/mfa/enroll/start
+ * Auth: full session JWT. Generates pending secret + recovery codes.
+ */
+export async function mfaEnrollStart(ctx: AuthContext, env: Env): Promise<Response> {
+  const user = await env.D1.prepare(
+    `SELECT email, mfa_enabled FROM users WHERE id = ? AND deleted_at IS NULL`
+  ).bind(ctx.userId).first<{ email: string; mfa_enabled: number | null }>();
+  if (!user) return errorResponse('USER_NOT_FOUND', 404);
+  if (user.mfa_enabled) return errorResponse('MFA_ALREADY_ENABLED', 400);
+
+  const secret = generateSecret();
+  const { plain } = generateRecoveryCodes(10);
+  const hashes = await Promise.all(plain.map(hashRecoveryCode));
+  const expiresAt = new Date(Date.now() + MFA_PENDING_TTL_MS).toISOString();
+
+  await env.D1.prepare(
+    `INSERT INTO auth_mfa_pending (user_id, secret, recovery_hashes, expires_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET secret = excluded.secret,
+       recovery_hashes = excluded.recovery_hashes, expires_at = excluded.expires_at,
+       created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(ctx.userId, secret, JSON.stringify(hashes), expiresAt).run();
+
+  return jsonResponse({
+    secret,
+    otpauth_url: otpauthUrl(secret, user.email),
+    recovery_codes: plain,
+  });
+}
+
+/**
+ * POST /api/auth/mfa/enroll/confirm
+ * Auth: full session JWT. Body: { code }. Persists and enables 2FA.
+ */
+export async function mfaEnrollConfirm(request: Request, ctx: AuthContext, env: Env): Promise<Response> {
+  let body: { code?: string };
+  try { body = await request.json(); } catch { return errorResponse('INVALID_BODY', 400); }
+  const code = (body.code || '').trim();
+  if (!/^\d{6}$/.test(code)) return errorResponse('INVALID_CODE', 400);
+
+  const pending = await env.D1.prepare(
+    `SELECT secret, recovery_hashes, expires_at FROM auth_mfa_pending WHERE user_id = ?`
+  ).bind(ctx.userId).first<{ secret: string; recovery_hashes: string; expires_at: string }>();
+  if (!pending) return errorResponse('NO_PENDING_ENROLLMENT', 400);
+  if (new Date(pending.expires_at).getTime() < Date.now()) {
+    await env.D1.prepare('DELETE FROM auth_mfa_pending WHERE user_id = ?').bind(ctx.userId).run();
+    return errorResponse('ENROLLMENT_EXPIRED', 400);
+  }
+
+  const ok = await verifyTotp(pending.secret, code);
+  if (!ok) return errorResponse('INVALID_CODE', 400);
+
+  await env.D1.prepare(
+    `UPDATE users SET mfa_secret = ?, mfa_enabled = 1, mfa_recovery_codes = ?,
+       mfa_enrolled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+       mfa_failed_attempts = 0, mfa_locked_until = NULL
+     WHERE id = ?`
+  ).bind(pending.secret, pending.recovery_hashes, ctx.userId).run();
+  await env.D1.prepare('DELETE FROM auth_mfa_pending WHERE user_id = ?').bind(ctx.userId).run();
+
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId,
+    action: 'update', entity_type: 'user', entity_id: ctx.userId,
+    metadata: { fields: ['mfa_enabled'], value: true },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ ok: true });
+}
+
+/**
+ * POST /api/auth/mfa/disable
+ * Auth: full session JWT. Body: { code } — current TOTP code required.
+ */
+export async function mfaDisable(request: Request, ctx: AuthContext, env: Env): Promise<Response> {
+  let body: { code?: string };
+  try { body = await request.json(); } catch { return errorResponse('INVALID_BODY', 400); }
+  const code = (body.code || '').trim();
+
+  const user = await env.D1.prepare(
+    `SELECT mfa_secret, mfa_enabled FROM users WHERE id = ? AND deleted_at IS NULL`
+  ).bind(ctx.userId).first<{ mfa_secret: string | null; mfa_enabled: number | null }>();
+  if (!user || !user.mfa_enabled || !user.mfa_secret) {
+    return errorResponse('MFA_NOT_ENABLED', 400);
+  }
+  const ok = await verifyTotp(user.mfa_secret, code);
+  if (!ok) return errorResponse('INVALID_CODE', 400);
+
+  await env.D1.prepare(
+    `UPDATE users SET mfa_secret = NULL, mfa_enabled = 0,
+       mfa_recovery_codes = NULL, mfa_enrolled_at = NULL,
+       mfa_failed_attempts = 0, mfa_locked_until = NULL
+     WHERE id = ?`
+  ).bind(ctx.userId).run();
+
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId,
+    action: 'update', entity_type: 'user', entity_id: ctx.userId,
+    metadata: { fields: ['mfa_enabled'], value: false },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ ok: true });
+}
+
+/**
+ * POST /api/auth/mfa/verify
+ * Auth: short-lived purpose='mfa_challenge' JWT in Authorization header.
+ * Body: { code } OR { recovery_code }.
+ * Issues real session JWT on success.
+ */
+export async function mfaVerify(request: Request, env: Env): Promise<Response> {
+  const authHeader = request.headers.get('Authorization') || '';
+  const challengeToken = authHeader.replace(/^Bearer\s+/i, '');
+  if (!challengeToken) return errorResponse('MFA_TOKEN_INVALID', 401);
+
+  const payload = await verifyPurposeJwt(challengeToken, env, 'mfa_challenge');
+  if (!payload) return errorResponse('MFA_TOKEN_INVALID', 401);
+
+  let body: { code?: string; recovery_code?: string };
+  try { body = await request.json(); } catch { return errorResponse('INVALID_BODY', 400); }
+
+  const user = await env.D1.prepare(
+    `SELECT id, org_id, email, full_name, role, mfa_secret, mfa_enabled,
+            mfa_recovery_codes, mfa_failed_attempts, mfa_locked_until
+     FROM users WHERE id = ? AND deleted_at IS NULL`
+  ).bind(payload.sub).first<{
+    id: string; org_id: string; email: string; full_name: string; role: string;
+    mfa_secret: string | null; mfa_enabled: number | null;
+    mfa_recovery_codes: string | null; mfa_failed_attempts: number | null;
+    mfa_locked_until: string | null;
+  }>();
+  if (!user || !user.mfa_enabled || !user.mfa_secret) {
+    return errorResponse('MFA_NOT_ENABLED', 400);
+  }
+
+  if (user.mfa_locked_until && new Date(user.mfa_locked_until).getTime() > Date.now()) {
+    return errorResponse('MFA_LOCKED', 423, 'Too many failed attempts. Try again later.');
+  }
+
+  let success = false;
+  let updatedRecovery: string | null = null;
+
+  if (body.code) {
+    success = await verifyTotp(user.mfa_secret, body.code.trim());
+  } else if (body.recovery_code) {
+    const incomingHash = await hashRecoveryCode(body.recovery_code);
+    const stored: string[] = user.mfa_recovery_codes ? JSON.parse(user.mfa_recovery_codes) : [];
+    const idx = stored.indexOf(incomingHash);
+    if (idx >= 0) {
+      stored.splice(idx, 1);
+      updatedRecovery = JSON.stringify(stored);
+      success = true;
+    }
+  } else {
+    return errorResponse('MISSING_CODE', 400);
+  }
+
+  if (!success) {
+    const attempts = (user.mfa_failed_attempts ?? 0) + 1;
+    const lockUntil = attempts >= 5 ? new Date(Date.now() + 15 * 60 * 1000).toISOString() : null;
+    await env.D1.prepare(
+      `UPDATE users SET mfa_failed_attempts = ?, mfa_locked_until = ? WHERE id = ?`
+    ).bind(attempts, lockUntil, user.id).run();
+    return errorResponse('INVALID_CODE', 401);
+  }
+
+  // Reset counters and consume recovery code if used
+  if (updatedRecovery !== null) {
+    await env.D1.prepare(
+      `UPDATE users SET mfa_recovery_codes = ?, mfa_failed_attempts = 0, mfa_locked_until = NULL WHERE id = ?`
+    ).bind(updatedRecovery, user.id).run();
+  } else {
+    await env.D1.prepare(
+      `UPDATE users SET mfa_failed_attempts = 0, mfa_locked_until = NULL WHERE id = ?`
+    ).bind(user.id).run();
+  }
+
+  const expiresAt = new Date(Date.now() + 7 * 86400 * 1000).toISOString();
+  const sessionToken = await signJwt(
+    { sub: user.id, org_id: user.org_id, role: user.role, email: user.email },
+    env
+  );
+  await recordToken(user.id, sessionToken, expiresAt, env);
+  await env.D1.prepare(
+    `UPDATE users SET last_login_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+  ).bind(user.id).run();
+
+  await emitAudit(env, {
+    org_id: user.org_id, user_id: user.id,
+    action: 'login', entity_type: 'user', entity_id: user.id,
+    metadata: { mfa: true, recovery: updatedRecovery !== null },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({
+    token: sessionToken,
+    user: { id: user.id, email: user.email, full_name: user.full_name, role: user.role, org_id: user.org_id },
+  });
+}
+
+/**
+ * GET /api/auth/mfa/status
+ * Auth: full session JWT. Returns whether the current user has 2FA enabled.
+ */
+export async function mfaStatus(ctx: AuthContext, env: Env): Promise<Response> {
+  const row = await env.D1.prepare(
+    `SELECT mfa_enabled, mfa_enrolled_at FROM users WHERE id = ? AND deleted_at IS NULL`
+  ).bind(ctx.userId).first<{ mfa_enabled: number | null; mfa_enrolled_at: string | null }>();
+  return jsonResponse({
+    enabled: !!row?.mfa_enabled,
+    enrolled_at: row?.mfa_enrolled_at ?? null,
+  });
 }
