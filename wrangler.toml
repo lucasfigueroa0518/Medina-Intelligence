@@ -8,6 +8,7 @@ ENVIRONMENT = "production"
 CLOUDFLARE_ACCOUNT_ID = "ad54df3fe69483d2c0b69be1b72864e8"
 CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
 GEMINI_MAX_RPM = "500"
+ALLOWED_ORIGINS = "https://medinaventures.ai,https://www.medinaventures.ai,http://localhost:3000"
 
 [ai]
 binding = "AI"
