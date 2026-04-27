@@ -789,7 +789,11 @@ export async function triggerCompanyEnrichment(
   // Resolve placeholder domain-name into a canonical human-readable name and
   // dedupe against any existing company that already has that name.
   if (isDomainShapedName(company.name, company.domain, company.website)) {
-    const canonical = await extractCanonicalCompanyName(cleanBio, env, orgId);
+    let canonical = await extractCanonicalCompanyName(cleanBio, env, orgId);
+    if (!canonical && company.domain) {
+      canonical = await extractNameFromWebsite(company.domain);
+      if (canonical) console.log(`[enrichment] website title fallback: "${canonical}" for ${company.domain}`);
+    }
     if (canonical) {
       await resolveCompanyName(companyId, orgId, canonical, env);
     }
@@ -868,6 +872,55 @@ Rules:
     console.error('[enrichment] canonical name parse failed:', raw);
     return null;
   }
+}
+
+const TITLE_SUFFIXES = /\s*[|\-–—:]\s*(home|homepage|official\s*site|official\s*website|welcome|main|index|landing|default|404|page\s*not\s*found).*$/i;
+const GENERIC_TITLES = new Set([
+  'home', 'homepage', 'welcome', 'index', 'untitled', '404', 'not found',
+  'page not found', 'coming soon', 'under construction', 'website',
+]);
+
+async function extractNameFromWebsite(domain: string): Promise<string | null> {
+  let html: string;
+  try {
+    const res = await fetch(`https://${domain}`, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(5000),
+      headers: { 'User-Agent': 'MedinaBot/1.0 (company-enrichment)' },
+    });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('text/html')) return null;
+    html = await res.text();
+  } catch {
+    return null;
+  }
+
+  const candidates: string[] = [];
+
+  const ogMatch = html.match(/<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i)
+    || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:site_name["']/i);
+  if (ogMatch) candidates.push(ogMatch[1]);
+
+  const appMatch = html.match(/<meta[^>]+name=["']application-name["'][^>]+content=["']([^"']+)["']/i)
+    || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']application-name["']/i);
+  if (appMatch) candidates.push(appMatch[1]);
+
+  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  if (titleMatch) candidates.push(titleMatch[1]);
+
+  for (const raw of candidates) {
+    let name = raw.trim().replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+    name = name.replace(TITLE_SUFFIXES, '').trim();
+    name = name.replace(/\s*[|\-–—]\s*$/, '').trim();
+
+    if (name.length < 2 || name.length > 80) continue;
+    if (GENERIC_TITLES.has(name.toLowerCase())) continue;
+    if (/^https?:\/\//i.test(name)) continue;
+    if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(name)) continue;
+    return name;
+  }
+  return null;
 }
 
 // Pulls structured field values out of an enrichment briefing so progressive

@@ -3,6 +3,7 @@ import type { Env } from '../types/env';
 import type { ClassifiableItem } from '../types/interfaces';
 import { emitAudit } from './audit';
 import { isValidContactName, resolveContactName } from './name-quality';
+import { jaroWinkler } from './dedup';
 
 // Domains whose mail is always automated/transactional — never discover as contacts.
 // Includes platform-noreply senders (slack.com, github.com), SaaS billing/notice
@@ -261,6 +262,11 @@ function normalizeDomain(raw: string): string {
     .trim();
 }
 
+function domainStem(domain: string): string {
+  const reg = registrableDomain(domain);
+  return reg.split('.')[0].replace(/[-_]/g, '').toLowerCase();
+}
+
 export async function findDuplicateCompany(
   name: string,
   domain: string | null,
@@ -321,6 +327,20 @@ export async function findCompanyByDomain(
     if (byName) return byName.id;
   }
 
+  // 4. Fuzzy domain-prefix match (catches acme-corp.com vs acmecorp.com)
+  const incomingStem = domainStem(domain);
+  if (incomingStem.length >= 4) {
+    const candidates = await env.D1.prepare(
+      'SELECT id, domain FROM companies WHERE org_id = ? AND domain IS NOT NULL AND deleted_at IS NULL'
+    ).bind(orgId).all<{ id: string; domain: string }>();
+    for (const c of candidates.results) {
+      const existingStem = domainStem(c.domain);
+      if (existingStem.length >= 4 && jaroWinkler(incomingStem, existingStem) >= 0.92) {
+        return c.id;
+      }
+    }
+  }
+
   return null;
 }
 
@@ -363,16 +383,26 @@ export async function findOrCreateCompanyByDomain(
   const companyId = crypto.randomUUID();
   const now = new Date().toISOString();
 
-  await env.D1.prepare(
-    `INSERT INTO companies
-       (id, org_id, name, domain, website, company_type, investment_status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'other', 'tracking', ?, ?)`
-  ).bind(
-    companyId, orgId, placeholderName,
-    regDomain,
-    `https://${regDomain}`,
-    now, now
-  ).run();
+  try {
+    await env.D1.prepare(
+      `INSERT INTO companies
+         (id, org_id, name, domain, website, company_type, investment_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'other', 'tracking', ?, ?)`
+    ).bind(
+      companyId, orgId, placeholderName,
+      regDomain,
+      `https://${regDomain}`,
+      now, now
+    ).run();
+  } catch (e: any) {
+    if (String(e.message).includes('UNIQUE constraint failed')) {
+      const raced = await env.D1.prepare(
+        'SELECT id FROM companies WHERE org_id = ? AND LOWER(domain) = ? AND deleted_at IS NULL LIMIT 1'
+      ).bind(orgId, regDomain).first<{ id: string }>();
+      if (raced) return raced.id;
+    }
+    throw e;
+  }
 
   console.log(`[discovery] auto-created company "${placeholderName}" (domain: ${emailDomain}) id=${companyId}`);
 
@@ -384,7 +414,6 @@ export async function findOrCreateCompanyByDomain(
     metadata: { auto_created: true, domain: regDomain, placeholder_name: placeholderName },
     created_at: now,
   });
-  // Note: company auto-discovery is org-level, no specific user attribution.
 
   return companyId;
 }
