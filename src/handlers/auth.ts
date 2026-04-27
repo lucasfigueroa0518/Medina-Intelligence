@@ -44,6 +44,9 @@ export async function verifyJwt(
 
   if (payload.exp && payload.exp * 1000 < Date.now()) return null;
   if (!payload.sub || !payload.org_id) return null;
+  // Reject purpose-scoped tokens (e.g. mfa_challenge) — only session tokens
+  // (no purpose claim, or purpose === 'session') unlock authenticated routes.
+  if (payload.purpose && payload.purpose !== 'session') return null;
 
   return {
     userId: payload.sub,
@@ -53,6 +56,41 @@ export async function verifyJwt(
   };
 }
 
+/**
+ * Verify a JWT minted for a specific non-session purpose (e.g. 'mfa_challenge').
+ * Returns the raw payload on success, null on failure.
+ */
+export async function verifyPurposeJwt(
+  token: string,
+  env: Env,
+  purpose: string
+): Promise<{ sub: string; org_id: string; email: string; purpose: string; exp: number } | null> {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [headerB64, payloadB64, sigB64] = parts;
+  const data = `${headerB64}.${payloadB64}`;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(env.JWT_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['verify']
+  );
+  const sigBytes = base64UrlDecode(sigB64);
+  const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(data));
+  if (!valid) return null;
+  let payload: any;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(payloadB64)));
+  } catch {
+    return null;
+  }
+  if (payload.exp && payload.exp * 1000 < Date.now()) return null;
+  if (payload.purpose !== purpose) return null;
+  if (!payload.sub || !payload.org_id) return null;
+  return payload;
+}
+
 export async function signJwt(
   claims: {
     sub: string;
@@ -60,6 +98,7 @@ export async function signJwt(
     role: string;
     email: string;
     exp?: number;
+    purpose?: string;
   },
   env: Env
 ): Promise<string> {

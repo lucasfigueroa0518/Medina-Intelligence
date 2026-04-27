@@ -4,7 +4,7 @@ import React, { useEffect, useState } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 
 const TOKEN_KEY = 'auth_token';
-const PUBLIC_PATHS = ['/login'];
+const PUBLIC_PATHS = ['/login', '/signup', '/mfa'];
 
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();

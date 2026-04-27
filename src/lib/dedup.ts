@@ -43,7 +43,7 @@ export const SIMILARITY_WEIGHTS = {
   same_company: 0.2,
 };
 
-function jaroWinkler(a: string, b: string): number {
+export function jaroWinkler(a: string, b: string): number {
   if (a === b) return 1;
   const m1 = a.length;
   const m2 = b.length;

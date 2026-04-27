@@ -1003,8 +1003,174 @@ function SecuritySection() {
       </div>
       <ChangePasswordPanel />
       <div className="border-t border-border/50 mt-6 pt-6">
+        <TwoFactorPanel />
+      </div>
+      <div className="border-t border-border/50 mt-6 pt-6">
         <ActiveSessionsPanel />
       </div>
+    </div>
+  );
+}
+
+function TwoFactorPanel() {
+  const [enabled, setEnabled] = React.useState<boolean | null>(null);
+  const [enrollment, setEnrollment] = React.useState<{ secret: string; otpauth_url: string; recovery_codes: string[]; qr: string } | null>(null);
+  const [savedRecovery, setSavedRecovery] = React.useState(false);
+  const [code, setCode] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [msg, setMsg] = React.useState<{ tone: 'success' | 'error'; text: string } | null>(null);
+  const [showDisable, setShowDisable] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    try {
+      const { enabled } = await api.mfaStatus();
+      setEnabled(enabled);
+    } catch { setEnabled(false); }
+  }, []);
+  React.useEffect(() => { load(); }, [load]);
+
+  React.useEffect(() => {
+    if (!msg) return;
+    const t = setTimeout(() => setMsg(null), 4000);
+    return () => clearTimeout(t);
+  }, [msg]);
+
+  async function startEnrollment() {
+    setBusy(true);
+    try {
+      const data = await api.mfaEnrollStart();
+      // Lazy-load qrcode to keep initial bundle small
+      const QR = (await import('qrcode')).default;
+      const qr = await QR.toDataURL(data.otpauth_url, { margin: 1, width: 200 });
+      setEnrollment({ ...data, qr });
+      setSavedRecovery(false);
+      setCode('');
+    } catch (e: any) {
+      setMsg({ tone: 'error', text: e?.message || 'Could not start enrollment' });
+    }
+    setBusy(false);
+  }
+
+  async function confirmEnrollment() {
+    if (!/^\d{6}$/.test(code.trim())) { setMsg({ tone: 'error', text: 'Enter the 6-digit code' }); return; }
+    setBusy(true);
+    try {
+      await api.mfaEnrollConfirm(code.trim());
+      setMsg({ tone: 'success', text: 'Two-factor authentication enabled' });
+      setEnrollment(null);
+      setEnabled(true);
+    } catch (e: any) {
+      setMsg({ tone: 'error', text: /INVALID_CODE/.test(e?.message || '') ? 'Invalid code' : (e?.message || 'Failed') });
+    }
+    setBusy(false);
+  }
+
+  async function disable() {
+    if (!/^\d{6}$/.test(code.trim())) { setMsg({ tone: 'error', text: 'Enter the 6-digit code' }); return; }
+    setBusy(true);
+    try {
+      await api.mfaDisable(code.trim());
+      setMsg({ tone: 'success', text: 'Two-factor authentication disabled' });
+      setEnabled(false);
+      setShowDisable(false);
+      setCode('');
+    } catch (e: any) {
+      setMsg({ tone: 'error', text: /INVALID_CODE/.test(e?.message || '') ? 'Invalid code' : (e?.message || 'Failed') });
+    }
+    setBusy(false);
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <div className="text-sm text-text-secondary">Two-factor authentication</div>
+          <div className="text-[11px] text-text-muted mt-0.5">
+            Use an authenticator app (Microsoft Authenticator, Google Authenticator, 1Password, etc.) to add a second step at sign-in.
+          </div>
+        </div>
+        {enabled !== null && (
+          <span className={`text-[11px] px-2 py-0.5 rounded-full ${enabled ? 'bg-semantic-success/15 text-semantic-success' : 'bg-bg-input text-text-muted'}`}>
+            {enabled ? 'Enabled' : 'Disabled'}
+          </span>
+        )}
+      </div>
+
+      {enabled === false && !enrollment && (
+        <button onClick={startEnrollment} disabled={busy} className="btn-secondary text-sm py-1.5">
+          {busy ? 'Loading...' : 'Enable 2FA'}
+        </button>
+      )}
+
+      {enrollment && (
+        <div className="mt-4 grid gap-4 max-w-xl">
+          <div className="flex gap-4">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={enrollment.qr} alt="2FA QR code" width={160} height={160} className="rounded-lg bg-white p-2" />
+            <div className="text-xs text-text-muted">
+              <div className="mb-2">Scan this QR with your authenticator app, or enter the secret manually:</div>
+              <code className="block break-all text-text-secondary bg-bg-input rounded px-2 py-1">{enrollment.secret}</code>
+            </div>
+          </div>
+
+          <div>
+            <div className="text-xs text-text-secondary mb-1">Recovery codes — save these somewhere safe. Each can be used once if you lose your device.</div>
+            <div className="grid grid-cols-2 gap-1 font-mono text-xs bg-bg-input rounded-lg p-3">
+              {enrollment.recovery_codes.map(c => <div key={c}>{c}</div>)}
+            </div>
+            <label className="flex items-center gap-2 mt-2 text-xs text-text-secondary">
+              <input type="checkbox" checked={savedRecovery} onChange={e => setSavedRecovery(e.target.checked)} />
+              I&apos;ve saved my recovery codes
+            </label>
+          </div>
+
+          <div>
+            <ProfileField label="Code from your authenticator app">
+              <input value={code} onChange={e => setCode(e.target.value)} maxLength={6} inputMode="numeric"
+                className="input text-sm w-32 font-mono tracking-widest" placeholder="000000" />
+            </ProfileField>
+            <div className="flex items-center gap-3 mt-3">
+              <button onClick={confirmEnrollment} disabled={busy || !savedRecovery || code.length !== 6} className="btn-secondary text-sm py-1.5"
+                style={{ opacity: (!savedRecovery || code.length !== 6 || busy) ? 0.5 : 1 }}>
+                {busy ? 'Confirming...' : 'Confirm'}
+              </button>
+              <button onClick={() => { setEnrollment(null); setCode(''); }} className="text-xs text-text-muted hover:text-text-primary">
+                Cancel
+              </button>
+              {msg && <span className={`text-xs ${msg.tone === 'success' ? 'text-semantic-success' : 'text-semantic-error'}`}>{msg.text}</span>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {enabled && !showDisable && (
+        <button onClick={() => { setShowDisable(true); setCode(''); }} className="btn-secondary text-sm py-1.5">
+          Disable 2FA
+        </button>
+      )}
+
+      {enabled && showDisable && (
+        <div className="mt-3 max-w-xl">
+          <ProfileField label="Enter your current 6-digit code to disable" >
+            <input value={code} onChange={e => setCode(e.target.value)} maxLength={6} inputMode="numeric"
+              className="input text-sm w-32 font-mono tracking-widest" placeholder="000000" />
+          </ProfileField>
+          <div className="flex items-center gap-3 mt-3">
+            <button onClick={disable} disabled={busy || code.length !== 6} className="btn-secondary text-sm py-1.5"
+              style={{ opacity: (code.length !== 6 || busy) ? 0.5 : 1 }}>
+              {busy ? 'Disabling...' : 'Disable 2FA'}
+            </button>
+            <button onClick={() => { setShowDisable(false); setCode(''); }} className="text-xs text-text-muted hover:text-text-primary">
+              Cancel
+            </button>
+            {msg && <span className={`text-xs ${msg.tone === 'success' ? 'text-semantic-success' : 'text-semantic-error'}`}>{msg.text}</span>}
+          </div>
+        </div>
+      )}
+
+      {!enrollment && !showDisable && msg && (
+        <div className={`mt-2 text-xs ${msg.tone === 'success' ? 'text-semantic-success' : 'text-semantic-error'}`}>{msg.text}</div>
+      )}
     </div>
   );
 }

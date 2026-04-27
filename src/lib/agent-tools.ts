@@ -1,6 +1,7 @@
 import type { Env } from '../types/env';
 import { emitAudit } from './audit';
 import { invalidateRagCache } from './cache';
+import { findDuplicateCompany } from './discovery';
 
 // ---------------------------------------------------------------------------
 // READ TOOLS
@@ -365,11 +366,9 @@ export async function createContactTool(
 ): Promise<any> {
   let companyId: string | null = null;
   if (input.company_name) {
-    const existing = await env.D1.prepare(
-      'SELECT id FROM companies WHERE org_id = ? AND name LIKE ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(orgId, input.company_name).first<{ id: string }>();
-    if (existing) {
-      companyId = existing.id;
+    const existingCompany = await findDuplicateCompany(input.company_name, null, orgId, env);
+    if (existingCompany) {
+      companyId = existingCompany;
     } else {
       companyId = crypto.randomUUID();
       const now = new Date().toISOString();
@@ -383,19 +382,48 @@ export async function createContactTool(
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const contactType = input.contact_type || 'individual';
+  const normalizedEmail = input.email?.toLowerCase().trim() || null;
 
-  await env.D1.prepare(
-    `INSERT INTO contacts
+  // Dedup by email
+  if (normalizedEmail) {
+    const byEmail = await env.D1.prepare(
+      'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
+    ).bind(orgId, normalizedEmail).first<{ id: string }>();
+    if (byEmail) {
+      return { success: true, contact_id: byEmail.id, message: `Contact "${input.full_name}" already exists`, deduplicated: true };
+    }
+  }
+
+  // Dedup by name + company when no email provided
+  if (!normalizedEmail && companyId) {
+    const byNameCompany = await env.D1.prepare(
+      'SELECT id FROM contacts WHERE org_id = ? AND LOWER(full_name) = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1'
+    ).bind(orgId, input.full_name.trim().toLowerCase(), companyId).first<{ id: string }>();
+    if (byNameCompany) {
+      return { success: true, contact_id: byNameCompany.id, message: `Contact "${input.full_name}" already exists`, deduplicated: true };
+    }
+  }
+
+  const result = await env.D1.prepare(
+    `INSERT OR IGNORE INTO contacts
        (id, org_id, full_name, email, phone, linkedin_url, contact_type,
         company_id, job_title, bio_summary, source, source_confidence, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', 1.0, ?, ?)`
   ).bind(
     id, orgId, input.full_name.trim(),
-    input.email?.toLowerCase().trim() || null,
+    normalizedEmail,
     input.phone || null, input.linkedin_url || null,
     contactType, companyId, input.job_title || null,
     input.notes || null, now, now
   ).run();
+
+  if (!result.meta?.changes) {
+    const raced = await env.D1.prepare(
+      'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
+    ).bind(orgId, normalizedEmail || '').first<{ id: string }>();
+    if (raced) return { success: true, contact_id: raced.id, message: `Contact "${input.full_name}" already exists`, deduplicated: true };
+    return { error: 'Failed to create contact' };
+  }
 
   await emitAudit(env, {
     org_id: orgId, user_id: userId, action: 'create',
@@ -463,6 +491,15 @@ export async function createCompanyTool(
   input: { name: string; domain?: string; website?: string; sector?: string; company_type?: string; location?: string; description?: string },
   env: Env
 ): Promise<any> {
+  const domain = input.domain || (input.website
+    ? input.website.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].trim()
+    : null);
+
+  const existing = await findDuplicateCompany(input.name, domain, orgId, env);
+  if (existing) {
+    return { success: true, company_id: existing, message: `Company "${input.name}" already exists`, deduplicated: true };
+  }
+
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
 
@@ -471,7 +508,7 @@ export async function createCompanyTool(
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     id, orgId, input.name.trim(),
-    input.domain || null, input.website || null,
+    domain || null, input.website || null,
     input.sector || null, input.company_type || 'other',
     input.description || null, now, now
   ).run();

@@ -308,6 +308,16 @@ export const api = {
     request<{ ok: boolean }>(`/users/me/sessions/${id}`, { method: 'DELETE' }),
   revokeAllOtherSessions: () =>
     request<{ ok: boolean; revoked: number }>('/users/me/sessions/logout-all', { method: 'POST' }),
+
+  // 2FA
+  mfaStatus: () =>
+    request<{ enabled: boolean; enrolled_at: string | null }>('/auth/mfa/status'),
+  mfaEnrollStart: () =>
+    request<{ secret: string; otpauth_url: string; recovery_codes: string[] }>('/auth/mfa/enroll/start', { method: 'POST' }),
+  mfaEnrollConfirm: (code: string) =>
+    request<{ ok: boolean }>('/auth/mfa/enroll/confirm', { method: 'POST', body: JSON.stringify({ code }) }),
+  mfaDisable: (code: string) =>
+    request<{ ok: boolean }>('/auth/mfa/disable', { method: 'POST', body: JSON.stringify({ code }) }),
 };
 
 export interface UserProfile {

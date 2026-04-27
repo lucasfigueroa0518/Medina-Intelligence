@@ -517,7 +517,7 @@ export default function GodModePage() {
   React.useEffect(() => {
     document.title = 'MARTy \u2014 Medina Intelligence';
     setSessionsLoading(true);
-    api.listSessions().then(d => { setSessions(d.sessions); setSessionsLoading(false); });
+    api.listSessions().then(d => { setSessions(d.sessions); setSessionsLoading(false); }).catch(() => setSessionsLoading(false));
     const t = setTimeout(() => setShowSparkles(false), 1200);
 
     try {

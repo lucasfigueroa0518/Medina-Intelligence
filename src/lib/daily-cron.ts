@@ -2,14 +2,18 @@
 import type { Env } from '../types/env';
 import { chunkArray } from './helpers';
 import { promoteToStandalone, flagStaleOrphanedEvents } from './reconciliation';
-import { triggerContactEnrichment, triggerCompanyEnrichment } from './enrichment';
+import { triggerContactEnrichment, triggerCompanyEnrichment, isDomainShapedName } from './enrichment';
 import { checkClaudeRateLimit } from './rate-limit';
 import { recalculateAllAssociations } from './associations';
 import { renewExpiringSubscriptions } from './graph-subscriptions';
+import { proposeMultipleUpdates } from './progressive-enrichment';
+import { callClaude } from './claude';
 
 export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await applyNewsScoreDecay(orgId, env); } catch (e) { console.error('Score decay:', e); }
   try { await scheduleReEnrichment(orgId, env); } catch (e) { console.error('Re-enrichment:', e); }
+  try { await backfillDomainShapedCompanyNames(orgId, env); } catch (e) { console.error('Domain-shaped name backfill:', e); }
+  try { await extractFactsFromRecentNews(orgId, env); } catch (e) { console.error('News fact extraction:', e); }
   try { await reconcileVectorIndex(orgId, env); } catch (e) { console.error('Vector reconciliation:', e); }
   try { await archiveOldAuditLogs(orgId, env); } catch (e) { console.error('Audit archival:', e); }
   try { await cleanupExpiredMergeLocks(env); } catch (e) { console.error('Lock cleanup:', e); }
@@ -45,18 +49,96 @@ export async function scheduleReEnrichment(orgId: string, env: Env): Promise<voi
      ORDER BY total_interactions DESC LIMIT 100`
   ).bind(orgId, thirtyDaysAgo).all<{ id: string }>();
 
+  // Signal-driven cadence for companies. Hot companies (active deals or news
+  // velocity) get re-enriched faster; cold passed/exited get re-enriched
+  // rarely. The CASE expression computes a per-row "stale-by" cutoff that
+  // enrichment_last_run must precede to be picked up.
+  const now = Date.now();
+  const sevenDaysAgo = new Date(now - 7 * 86400000).toISOString();
+  const fourteenDaysAgo = new Date(now - 14 * 86400000).toISOString();
+  const ninetyDaysAgo = new Date(now - 90 * 86400000).toISOString();
+
   const companies = await env.D1.prepare(
-    `SELECT id FROM companies WHERE org_id = ? AND deleted_at IS NULL
-       AND (enrichment_last_run IS NULL OR enrichment_last_run < ?)
-       AND investment_status NOT IN ('passed','exited')
-     ORDER BY news_relevance_score DESC LIMIT 50`
-  ).bind(orgId, thirtyDaysAgo).all<{ id: string }>();
+    `SELECT c.id FROM companies c
+       LEFT JOIN (
+         SELECT company_id, COUNT(*) AS recent_news
+         FROM news_articles
+         WHERE org_id = ? AND published_at > ?
+         GROUP BY company_id
+       ) n ON n.company_id = c.id
+       LEFT JOIN (
+         SELECT company_id, MAX(updated_at) AS last_deal_activity
+         FROM deals
+         WHERE org_id = ? AND deleted_at IS NULL
+         GROUP BY company_id
+       ) d ON d.company_id = c.id
+       LEFT JOIN (
+         SELECT company_id, MAX(last_contact_date) AS last_interaction
+         FROM contacts
+         WHERE org_id = ? AND deleted_at IS NULL AND last_contact_date > ?
+         GROUP BY company_id
+       ) e ON e.company_id = c.id
+       WHERE c.org_id = ? AND c.deleted_at IS NULL AND c.merged_into IS NULL
+         AND (
+           c.enrichment_last_run IS NULL
+           OR (
+             c.investment_status IN ('passed','exited')
+               AND c.enrichment_last_run < ?
+           )
+           OR (
+             (d.last_deal_activity IS NOT NULL AND d.last_deal_activity > ?
+               OR COALESCE(n.recent_news, 0) >= 3)
+             AND c.enrichment_last_run < ?
+           )
+           OR (
+             (e.last_interaction IS NOT NULL OR c.news_relevance_score >= 5)
+             AND c.enrichment_last_run < ?
+           )
+           OR c.enrichment_last_run < ?
+         )
+       ORDER BY c.news_relevance_score DESC, c.updated_at DESC
+       LIMIT 50`
+  ).bind(
+    // recent_news join
+    orgId, sevenDaysAgo,
+    // recent deals join
+    orgId,
+    // recent interactions join
+    orgId, fourteenDaysAgo,
+    // outer WHERE
+    orgId,
+    /* passed/exited cutoff */ ninetyDaysAgo,
+    /* hot deal-activity cutoff (30d) */ new Date(now - 30 * 86400000).toISOString(),
+    /* hot 7-day stale cutoff */ sevenDaysAgo,
+    /* warm 14-day stale cutoff */ fourteenDaysAgo,
+    /* default 30-day stale cutoff */ thirtyDaysAgo,
+  ).all<{ id: string }>();
 
   for (const c of contacts.results) {
     if (!(await checkClaudeRateLimit(env, orgId, 'low'))) break;
     await triggerContactEnrichment(c.id, orgId, env);
   }
   for (const c of companies.results) {
+    if (!(await checkClaudeRateLimit(env, orgId, 'low'))) break;
+    await triggerCompanyEnrichment(c.id, orgId, env);
+  }
+}
+
+// Find companies still carrying their auto-discovery placeholder name (e.g.
+// "emergeamericas.com") and run them through enrichment so resolveCompanyName
+// can replace the name with the canonical form ("Emerge Americas") and merge
+// any duplicate that already has the canonical name.
+export async function backfillDomainShapedCompanyNames(orgId: string, env: Env): Promise<void> {
+  const candidates = await env.D1.prepare(
+    `SELECT id, name, domain, website FROM companies
+       WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL
+         AND name LIKE '%.%' AND name NOT LIKE '% %'
+       ORDER BY news_relevance_score DESC, updated_at DESC
+       LIMIT 25`
+  ).bind(orgId).all<{ id: string; name: string; domain: string | null; website: string | null }>();
+
+  for (const c of candidates.results) {
+    if (!isDomainShapedName(c.name, c.domain, c.website)) continue;
     if (!(await checkClaudeRateLimit(env, orgId, 'low'))) break;
     await triggerCompanyEnrichment(c.id, orgId, env);
   }
@@ -173,6 +255,119 @@ export async function warmCrmCache(orgId: string, env: Env): Promise<void> {
     });
     throw e;
   }
+}
+
+// Pull structured facts (funding round, valuation, leadership, location, etc.)
+// out of recent news articles and feed them through progressive enrichment so
+// the company row stays current. Each article is processed at most once.
+export async function extractFactsFromRecentNews(orgId: string, env: Env): Promise<void> {
+  const articles = await env.D1.prepare(
+    `SELECT id, company_id, title, summary, source_url, published_at
+       FROM news_articles
+       WHERE org_id = ? AND company_id IS NOT NULL
+         AND facts_extracted_at IS NULL
+         AND summary IS NOT NULL AND LENGTH(summary) > 60
+       ORDER BY published_at DESC
+       LIMIT 25`
+  ).bind(orgId).all<{
+    id: string; company_id: string; title: string; summary: string | null;
+    source_url: string | null; published_at: string | null;
+  }>();
+
+  if (articles.results.length === 0) return;
+
+  for (const a of articles.results) {
+    if (!(await checkClaudeRateLimit(env, orgId, 'low'))) break;
+    try {
+      const facts = await extractFactsFromArticle(a, env, orgId);
+      if (facts.length > 0) {
+        await proposeMultipleUpdates(
+          orgId, 'company', a.company_id,
+          facts.map(f => ({
+            field: f.field,
+            value: f.value,
+            source: 'news_article',
+            confidence: f.confidence,
+            source_description: a.source_url || a.title,
+            source_communication_id: a.id,
+          })),
+          env,
+          { policy: 'auto_if_confident' }
+        );
+      }
+    } catch (e) {
+      console.error(`[news-facts] extraction failed for article ${a.id}:`, e);
+    } finally {
+      // Mark processed regardless of outcome to avoid re-charging the LLM for
+      // the same article on every cron run. A future re-extraction would need
+      // to clear this column intentionally.
+      await env.D1.prepare(
+        `UPDATE news_articles SET facts_extracted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+      ).bind(a.id).run().catch(() => undefined);
+    }
+  }
+}
+
+interface ArticleFact { field: string; value: string; confidence: number }
+
+async function extractFactsFromArticle(
+  article: { id: string; title: string; summary: string | null; published_at: string | null },
+  env: Env,
+  orgId: string
+): Promise<ArticleFact[]> {
+  const system = `You extract verifiable company facts from a single news article. Return ONLY raw JSON, no markdown. Schema:
+{
+  "stage": {"value": "pre_seed"|"seed"|"series_a"|"series_b"|"series_c"|"growth"|"public"|"acquired"|"other", "confidence": "high"|"medium"|"low"} | null,
+  "current_valuation": {"value": number, "confidence": "high"|"medium"|"low"} | null,
+  "last_funding_amount": {"value": number, "confidence": "high"|"medium"|"low"} | null,
+  "last_funding_round": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "last_funding_date": {"value": "YYYY-MM-DD", "confidence": "high"|"medium"|"low"} | null,
+  "hq_location": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "employee_count": {"value": number, "confidence": "high"|"medium"|"low"} | null
+}
+
+Rules:
+- Omit (null) any field not stated in the article. Never guess.
+- Numeric fields must be raw numbers. "$50M" → 50000000. "1.2 billion" → 1200000000.
+- last_funding_date defaults to the article's published_at if a recent round is announced without an explicit date.
+- "high" confidence = direct quote / press release / explicit announcement.`;
+
+  const user = `Title: ${article.title}
+Published: ${article.published_at || 'unknown'}
+Summary: ${article.summary?.slice(0, 2500) || ''}`;
+
+  let raw: string;
+  try {
+    raw = await callClaude(
+      { system, user, max_tokens: 500, orgId, model: 'claude-haiku-4-5-20251001' },
+      'low',
+      env
+    );
+  } catch {
+    return [];
+  }
+
+  let parsed: Record<string, { value: unknown; confidence: string } | null>;
+  try {
+    const cleaned = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return [];
+  }
+
+  const confMap: Record<string, number> = { high: 0.9, medium: 0.65, low: 0.4 };
+  const fields = ['stage','current_valuation','last_funding_amount','last_funding_round','last_funding_date','hq_location','employee_count'];
+  const out: ArticleFact[] = [];
+  for (const field of fields) {
+    const f = parsed[field];
+    if (!f || f.value === null || f.value === undefined) continue;
+    const conf = confMap[String(f.confidence).toLowerCase()] ?? 0.4;
+    if (conf < 0.5) continue;
+    const value = typeof f.value === 'number' ? String(f.value) : String(f.value).trim();
+    if (!value || value.toLowerCase() === 'null' || value.toLowerCase() === 'unknown') continue;
+    out.push({ field, value, confidence: conf });
+  }
+  return out;
 }
 
 export async function checkWebhookHealth(orgId: string, env: Env): Promise<void> {
