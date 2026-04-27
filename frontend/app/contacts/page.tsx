@@ -60,7 +60,10 @@ export default function ContactsPage() {
   }, [loadTags]);
 
   const loadContacts = React.useCallback(() => {
-    const params: Record<string, string> = {};
+    // Backend defaults to LIMIT 50 (max 500). The list view shows everything
+    // in one scroll, so request the upper bound. If the dataset ever grows
+    // past 500, swap this for proper pagination.
+    const params: Record<string, string> = { limit: '500' };
     if (search) params.keyword = search;
     if (filters.has_followup_overdue) params.has_followup_overdue = 'true';
 

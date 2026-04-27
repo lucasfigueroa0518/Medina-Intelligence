@@ -45,8 +45,10 @@ export default function CompaniesPage() {
   }, [toast]);
 
   const loadCompanies = React.useCallback(() => {
+    // Backend defaults to LIMIT 50 (max 500). Request the upper bound so the
+    // list shows everything; swap for paging when dataset crosses 500.
     setLoading(true);
-    api.listCompanies().then(d => setCompanies(d.companies)).finally(() => setLoading(false));
+    api.listCompanies({ limit: '500' }).then(d => setCompanies(d.companies)).finally(() => setLoading(false));
   }, []);
 
   async function handleCreateCompany() {
