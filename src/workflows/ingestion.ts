@@ -115,29 +115,56 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
             fetchOutlookCalendarDelta(org_id!, this.env).then(() => [] as ClassifiableItem[]),
           ]);
 
-          const names = ['outlook', 'slack', 'news', 'calendar'] as const;
           const failures: Array<{ source: string; error: string }> = [];
-          const data = {
+          const data: SourceBundle = {
             outlook: [] as ClassifiableItem[],
             slack: [] as ClassifiableItem[],
             news: [] as ClassifiableItem[],
             calendar: [] as ClassifiableItem[],
+            failures,
           };
 
-          for (let i = 0; i < results.length; i++) {
-            const key = names[i];
-            if (results[i].status === 'fulfilled') {
-              data[key] = (results[i] as PromiseFulfilledResult<ClassifiableItem[]>).value;
-            } else {
-              failures.push({
-                source: key,
-                error: (results[i] as PromiseRejectedResult).reason?.message || 'unknown',
-              });
-            }
+          // Outlook
+          if (results[0].status === 'fulfilled') {
+            data.outlook = (results[0] as PromiseFulfilledResult<ClassifiableItem[]>).value;
+          } else {
+            failures.push({ source: 'outlook', error: (results[0] as PromiseRejectedResult).reason?.message || 'unknown' });
           }
 
-          if (failures.length === 4) throw new Error('All source fetches failed');
-          return { ...data, failures };
+          // Slack — new shape: { messages, errors, channels_visible }
+          if (results[1].status === 'fulfilled') {
+            const slackResult = (results[1] as PromiseFulfilledResult<{
+              messages: ClassifiableItem[];
+              errors: Array<{ channel_id: string; channel_name: string; error: string }>;
+            }>).value;
+            data.slack = slackResult.messages;
+            for (const e of slackResult.errors) {
+              failures.push({ source: `slack:#${e.channel_name}`, error: e.error });
+            }
+          } else {
+            failures.push({ source: 'slack', error: (results[1] as PromiseRejectedResult).reason?.message || 'unknown' });
+          }
+
+          // News
+          if (results[2].status === 'fulfilled') {
+            data.news = (results[2] as PromiseFulfilledResult<ClassifiableItem[]>).value;
+          } else {
+            failures.push({ source: 'news', error: (results[2] as PromiseRejectedResult).reason?.message || 'unknown' });
+          }
+
+          // Calendar (always returns [] — runs for side effects)
+          if (results[3].status === 'rejected') {
+            failures.push({ source: 'calendar', error: (results[3] as PromiseRejectedResult).reason?.message || 'unknown' });
+          }
+
+          // Bail only when every source actually failed (channel-level slack
+          // errors don't count — they're informational, not fetch failures).
+          const hardFailures = new Set(failures.map(f => f.source.split(':')[0]));
+          if (hardFailures.size === 4 && hardFailures.has('outlook') && hardFailures.has('slack')
+              && hardFailures.has('news') && hardFailures.has('calendar')) {
+            throw new Error('All source fetches failed');
+          }
+          return data;
         }
       );
 

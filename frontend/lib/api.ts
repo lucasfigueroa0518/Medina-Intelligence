@@ -255,6 +255,8 @@ export const api = {
     request<{ ok: boolean }>(`/admin/dlq/${id}/replay`, { method: 'POST' }),
   getEnrichmentStatus: () =>
     request<{ status: Record<string, unknown> }>('/admin/enrichment-status'),
+  getAdminIntegrationStatus: () =>
+    request<{ users: any[]; tokenHealth: Record<string, any> }>('/me/integration-status'),
   getSystemStatus: () => request<{ mode: string; cache_stale: boolean }>('/system/status'),
 
   // Sync
@@ -353,6 +355,8 @@ export type IntegrationStatus =
   | 'not_connected'
   | 'configured'
   | 'not_configured'
+  | 'configured_no_channels'
+  | 'auth_failed'
   | 'webhook_ready';
 
 export interface IntegrationRow {
@@ -363,6 +367,17 @@ export interface IntegrationRow {
   connected_email?: string | null;
   token_healthy?: boolean;
   webhook_url?: string;
+  items_processed?: number;
+  items_failed?: number;
+  enriched_count?: number;
+  rate_limit_status?: 'active' | 'rate_limited' | 'auth_failed';
+  rate_limit_until?: string | null;
+  // Slack-specific
+  team_name?: string | null;
+  bot_user_id?: string | null;
+  channels_visible?: number;
+  messages_synced?: number;
+  warnings?: string[];
 }
 
 export interface IntegrationsStatusResponse {

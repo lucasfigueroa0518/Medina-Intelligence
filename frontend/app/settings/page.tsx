@@ -1393,6 +1393,10 @@ function statusColor(s: IntegrationRow['status']): string {
     case 'configured':
     case 'webhook_ready':
       return 'text-semantic-success';
+    case 'configured_no_channels':
+      return 'text-semantic-warning';
+    case 'auth_failed':
+      return 'text-semantic-error';
     case 'not_connected':
     case 'not_configured':
     default:
@@ -1415,6 +1419,13 @@ function IntegrationRowView({
 }) {
   const [copied, setCopied] = React.useState(false);
 
+  const rateLimitColor =
+    row.rate_limit_status === 'auth_failed'
+      ? 'text-semantic-error'
+      : row.rate_limit_status === 'rate_limited'
+        ? 'text-semantic-warning'
+        : '';
+
   return (
     <div className="flex items-start justify-between py-4 border-b border-border/50 last:border-0 gap-4">
       <div className="min-w-0 flex-1">
@@ -1422,11 +1433,44 @@ function IntegrationRowView({
         <div className="text-xs text-text-secondary mt-0.5">{description}</div>
         <div className={`text-xs mt-2 ${statusColor(row.status)}`}>● {row.label}</div>
         {row.detail && (
-          <div className="text-xs text-text-muted mt-1">{row.detail}</div>
+          <div className={`text-xs mt-1 ${rateLimitColor || 'text-text-muted'}`}>
+            {row.detail}
+          </div>
         )}
         {row.last_sync && (
           <div className="text-xs text-text-muted mt-1">
             Last sync: {formatRelative(row.last_sync)}
+          </div>
+        )}
+        {row.items_processed != null && row.items_processed > 0 && (
+          <div className="text-xs text-text-muted mt-0.5">
+            {row.items_processed.toLocaleString()} items synced
+            {row.items_failed ? `, ${row.items_failed} failed` : ''}
+          </div>
+        )}
+        {row.team_name && (
+          <div className="text-xs text-text-muted mt-1">
+            Team: {row.team_name}
+          </div>
+        )}
+        {row.channels_visible != null && (row.channels_visible > 0 || row.status === 'configured_no_channels') && (
+          <div className="text-xs text-text-muted mt-0.5">
+            {row.channels_visible} channel{row.channels_visible === 1 ? '' : 's'} visible
+            {row.messages_synced != null && (
+              <> • {row.messages_synced.toLocaleString()} message{row.messages_synced === 1 ? '' : 's'} synced</>
+            )}
+          </div>
+        )}
+        {row.warnings && row.warnings.length > 0 && (
+          <div className="mt-2 space-y-1">
+            {row.warnings.map((w, i) => (
+              <div
+                key={i}
+                className="text-xs text-semantic-warning bg-semantic-warning/10 border-l-2 border-semantic-warning px-2 py-1 rounded"
+              >
+                ⚠️ {w}
+              </div>
+            ))}
           </div>
         )}
         {row.webhook_url && (

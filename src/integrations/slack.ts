@@ -19,13 +19,31 @@ interface SlackMessage {
   channel?: string;
 }
 
+export interface SlackChannelError {
+  channel_id: string;
+  channel_name: string;
+  error: string;
+}
+
+export interface SlackFetchResult {
+  messages: ClassifiableItem[];
+  errors: SlackChannelError[];
+  channels_visible: number;
+}
+
+// Subtypes that carry no human content. Anything else (file_share,
+// thread_broadcast, me_message, etc.) is a real user post and gets ingested.
+const SKIP_SUBTYPES = new Set([
+  'channel_join', 'channel_leave', 'channel_topic', 'channel_purpose',
+  'channel_name', 'bot_message', 'tombstone', 'ekm_access_denied',
+]);
+
 export async function fetchSlackMessages(
   orgId: string,
   env: Env
-): Promise<ClassifiableItem[]> {
-  const allItems: ClassifiableItem[] = [];
-
-  const lastSync = (await env.KV.get(`slack_last_sync:${orgId}`)) || '0';
+): Promise<SlackFetchResult> {
+  const messages: ClassifiableItem[] = [];
+  const errors: SlackChannelError[] = [];
 
   let botToken: string;
   try {
@@ -33,7 +51,7 @@ export async function fetchSlackMessages(
     console.log(`[slack] token resolved for org ${orgId} (${botToken.slice(0, 8)}...)`);
   } catch (e) {
     console.error(`[slack] token resolution failed for org ${orgId}:`, e);
-    return [];
+    return { messages, errors, channels_visible: 0 };
   }
 
   const authResp = await fetch('https://slack.com/api/auth.test', {
@@ -41,7 +59,7 @@ export async function fetchSlackMessages(
   });
   const authData = (await authResp.json()) as { ok: boolean; error?: string; team?: string; user?: string };
   console.log(`[slack] auth.test: ok=${authData.ok} team=${authData.team || 'n/a'} user=${authData.user || 'n/a'} error=${authData.error || 'none'}`);
-  if (!authData.ok) return [];
+  if (!authData.ok) return { messages, errors, channels_visible: 0 };
 
   const channelsResp = await fetch(
     'https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200',
@@ -53,16 +71,25 @@ export async function fetchSlackMessages(
     error?: string;
   };
   console.log(`[slack] conversations.list: ok=${channelsData.ok} channels=${channelsData.channels?.length ?? 0} error=${channelsData.error || 'none'}`);
-  if (!channelsData.ok) return [];
+  if (!channelsData.ok) return { messages, errors, channels_visible: 0 };
 
   const channels = channelsData.channels || [];
+  let anyChannelReturnedMessages = false;
 
   for (const channel of channels) {
+    // Per-channel marker so a newly-invited channel backfills from oldest=0
+    // instead of inheriting the org-wide "last sync = now" and missing every
+    // message that pre-dates the invite.
+    const channelMarkerKey = `slack_last_sync:${orgId}:${channel.id}`;
+    const channelLastSync = (await env.KV.get(channelMarkerKey)) || '0';
+    let latestTsThisChannel = channelLastSync;
     let cursor: string | undefined;
+    let channelHadError = false;
+
     do {
       const params = new URLSearchParams({
         channel: channel.id,
-        oldest: lastSync,
+        oldest: channelLastSync,
         limit: '200',
         ...(cursor ? { cursor } : {}),
       });
@@ -74,20 +101,24 @@ export async function fetchSlackMessages(
         ok: boolean;
         messages?: SlackMessage[];
         response_metadata?: { next_cursor?: string };
+        error?: string;
       };
       if (!data.ok) {
-        console.warn(`[slack] conversations.history failed for #${channel.name}: ${(data as any).error || 'unknown'}`);
+        const code = data.error || 'unknown';
+        console.warn(`[slack] conversations.history failed for #${channel.name}: ${code}`);
+        errors.push({ channel_id: channel.id, channel_name: channel.name, error: code });
+        channelHadError = true;
         break;
       }
 
       for (const msg of data.messages || []) {
-        if (msg.subtype) continue;
+        if (msg.subtype && SKIP_SUBTYPES.has(msg.subtype)) continue;
         if (!msg.user) continue;
 
         const userEmail = await resolveSlackUserEmail(msg.user, botToken, env);
         if (!userEmail) continue;
 
-        allItems.push({
+        messages.push({
           type: 'slack_message',
           source: 'slack',
           externalId: `${channel.id}:${msg.ts}`,
@@ -105,14 +136,37 @@ export async function fetchSlackMessages(
           orgId,
           visibility: channel.is_private ? 'confidential' : 'org_wide',
         });
+
+        // Track the latest message ts in this channel so we can advance the
+        // per-channel marker only past messages we actually persisted.
+        if (parseFloat(msg.ts) > parseFloat(latestTsThisChannel)) {
+          latestTsThisChannel = msg.ts;
+        }
+        anyChannelReturnedMessages = true;
       }
       cursor = data.response_metadata?.next_cursor;
     } while (cursor);
+
+    // Only advance the per-channel marker on a clean pass with at least one
+    // message. A 0-message clean pass leaves the marker untouched so the next
+    // cycle re-checks the same window — cheap and avoids advancing past
+    // messages that arrive between API call and our response.
+    if (!channelHadError && latestTsThisChannel !== channelLastSync) {
+      await env.KV.put(channelMarkerKey, latestTsThisChannel);
+    }
   }
 
-  console.log(`[slack] fetch complete: ${allItems.length} messages from ${channels.length} channels`);
-  await env.KV.put(`slack_last_sync:${orgId}`, (Date.now() / 1000).toString());
-  return allItems;
+  // Org-level marker is for the Settings card "Last sync" display only — it
+  // advances only when the cycle actually pulled at least one message, so a
+  // user staring at the UI can tell when something was last ingested.
+  if (anyChannelReturnedMessages) {
+    await env.KV.put(`slack_last_sync:${orgId}`, new Date().toISOString());
+  }
+
+  console.log(
+    `[slack] fetch complete: ${messages.length} messages from ${channels.length} channels, ${errors.length} channel errors`
+  );
+  return { messages, errors, channels_visible: channels.length };
 }
 
 export async function resolveSlackUserEmail(
