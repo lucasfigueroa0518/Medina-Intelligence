@@ -732,6 +732,20 @@ export async function triggerCompanyEnrichment(
     }
   }
 
+  // Website title fallback runs even when Gemini is rate-limited (no contributions).
+  if (contributions.length === 0 && isDomainShapedName(company.name, company.domain, company.website) && company.domain) {
+    const canonical = await extractNameFromWebsite(company.domain);
+    if (canonical) {
+      console.log(`[enrichment] website title fallback (no briefing): "${canonical}" for ${company.domain}`);
+      await resolveCompanyName(companyId, orgId, canonical, env);
+    }
+    await env.D1.prepare(
+      `UPDATE companies SET enrichment_last_run = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+    ).bind(companyId).run();
+    return;
+  }
+
   if (contributions.length === 0) return;
 
   const { text: aggText, visibility } = aggregateEnrichmentResult(contributions);
@@ -763,8 +777,6 @@ export async function triggerCompanyEnrichment(
     ));
   }
 
-  // Always update enrichment metadata; structured fact updates flow through
-  // progressive enrichment so they get NULL-fill / auto-apply / queue policy.
   await env.D1.prepare(
     `UPDATE companies SET enrichment_confidence = ?, enrichment_last_run = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
