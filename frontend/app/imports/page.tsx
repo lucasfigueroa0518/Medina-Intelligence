@@ -197,6 +197,43 @@ export default function ImportsPage() {
     return () => clearTimeout(t);
   }, [toast]);
 
+  // Background polling — watches `history` for any job with status='processing'
+  // and refreshes its row every 4s until the server flips it to a terminal
+  // state. This makes navigation work trivially: the import keeps running
+  // server-side, and whenever the user lands back on /imports, polling
+  // resumes automatically. No 3-min cap, no full-screen blocker.
+  const polling = React.useRef<Set<string>>(new Set());
+  React.useEffect(() => {
+    const inProgress = history.filter(j => j.status === 'processing').map(j => j.id);
+    if (inProgress.length === 0) return;
+    const intervals: number[] = [];
+    for (const jobId of inProgress) {
+      if (polling.current.has(jobId)) continue;
+      polling.current.add(jobId);
+      const id = window.setInterval(async () => {
+        try {
+          const data = await api.getImportJob(jobId);
+          const job = data.job;
+          if (!job) return;
+          if (job.status === 'completed' || job.status === 'failed' || job.status === 'reverted') {
+            window.clearInterval(id);
+            polling.current.delete(jobId);
+            setHistory(prev => prev.map(j => j.id === jobId ? { ...j, ...job } : j));
+            if (job.status === 'completed') {
+              setToast(`Analysis complete: ${(job as any).total_rows ?? 0} entities. Click the row to view the report.`);
+            } else if (job.status === 'failed') {
+              setToast('Import failed. Check the row in your history.');
+            }
+          }
+        } catch {
+          // keep trying — transient network errors shouldn't kill the poll
+        }
+      }, 4000);
+      intervals.push(id);
+    }
+    return () => { for (const id of intervals) window.clearInterval(id); };
+  }, [history]);
+
   // Animated analysis steps
   React.useEffect(() => {
     if (phase !== 'analyzing') return;
@@ -208,29 +245,46 @@ export default function ImportsPage() {
 
   async function handleAnalyze() {
     if (!file) return;
-    setPhase('analyzing');
-    setAnalyzeStep(0);
     setError(null);
-
+    const fileName = file.name;
     try {
-      // Always async — server returns immediately with a job_id, processing
-      // happens in the background. User can leave the page; the job keeps
-      // running and shows up in history when they return.
+      // Fire-and-forget. Server returns a job_id within a second; processing
+      // runs server-side via waitUntil. We add the job to history and let the
+      // background-polling effect drive status updates. The user is freed
+      // immediately — no full-screen blocker, navigate-away works, and
+      // returning to /imports just resumes polling for any 'processing'
+      // rows in the list.
       const data = await api.intelligentImport(file);
-      const jobId = data.job_id;
-      // Surface the in-progress job in history right away.
       setHistory(prev => [
-        { id: jobId, source_type: 'intelligent', status: 'processing',
+        { id: data.job_id, source_type: 'intelligent', status: 'processing',
           created_at: new Date().toISOString(),
           total_rows: 0, created_rows: 0, updated_rows: 0,
           source_r2_key: data.file_name },
         ...prev,
       ]);
-      await pollJob(jobId);
+      setFile(null);
+      setToast(`"${fileName}" uploaded — analyzing in the background. You can navigate away; the result will show in your import history.`);
     } catch (e: any) {
-      setError(e.message || 'Import failed');
-      setPhase('upload');
+      setError(e.message || 'Upload failed');
     }
+  }
+
+  function openReportFromJob(job: ImportJob) {
+    setResult({
+      document_id: job.id,
+      category: 'reference',
+      summary: `Processed ${job.total_rows || 0} entities from "${(job as any).source_r2_key?.split('/').pop() || 'uploaded file'}".`,
+      contacts_created: job.created_rows || 0,
+      contacts_updated: job.updated_rows || 0,
+      companies_created: 0,
+      companies_updated: 0,
+      deals_created: 0,
+      relationships_found: 0,
+      signals_found: 0,
+      entities_routed: (job as any).processed_rows || job.created_rows || 0,
+      errors: (job as any).failed_rows ? [`${(job as any).failed_rows} rows failed`] : [],
+    });
+    setPhase('report');
   }
 
   async function handleUndo(jobId: string) {
@@ -417,36 +471,46 @@ export default function ImportsPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {history.slice(0, 20).map(job => (
-                        <tr key={job.id} className="border-b border-border/50">
-                          <td className="px-4 py-3 text-text-secondary">{formatRelative(job.created_at)}</td>
-                          <td className="px-4 py-3">
-                            <span className="badge capitalize">{job.source_type}</span>
-                          </td>
-                          <td className="px-4 py-3 text-text-primary tabular-nums">{job.created_rows ?? '—'}</td>
-                          <td className="px-4 py-3 text-text-primary tabular-nums">{job.updated_rows ?? '—'}</td>
-                          <td className="px-4 py-3">
-                            <StatusBadge status={job.status} />
-                          </td>
-                          <td className="px-4 py-3 text-right">
-                            {job.status === 'completed' && (
-                              <button
-                                onClick={() => handleUndo(job.id)}
-                                className="text-xs text-text-muted hover:text-semantic-error transition-colors"
-                                title="Soft-delete created entities and remove the document"
-                              >
-                                Undo
-                              </button>
-                            )}
-                            {job.status === 'reverted' && (
-                              <span className="text-xs text-text-muted italic">reverted</span>
-                            )}
-                            {job.status === 'processing' && (
-                              <span className="text-xs text-accent-magenta">in progress…</span>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
+                      {history.slice(0, 20).map(job => {
+                        const clickable = job.status === 'completed';
+                        return (
+                          <tr
+                            key={job.id}
+                            className={`border-b border-border/50 ${clickable ? 'cursor-pointer hover:bg-bg-surface-hover' : ''}`}
+                            onClick={clickable ? () => openReportFromJob(job) : undefined}
+                          >
+                            <td className="px-4 py-3 text-text-secondary">{formatRelative(job.created_at)}</td>
+                            <td className="px-4 py-3">
+                              <span className="badge capitalize">{job.source_type}</span>
+                            </td>
+                            <td className="px-4 py-3 text-text-primary tabular-nums">{job.created_rows ?? '—'}</td>
+                            <td className="px-4 py-3 text-text-primary tabular-nums">{job.updated_rows ?? '—'}</td>
+                            <td className="px-4 py-3">
+                              <StatusBadge status={job.status} />
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              {job.status === 'completed' && (
+                                <button
+                                  onClick={e => { e.stopPropagation(); handleUndo(job.id); }}
+                                  className="text-xs text-text-muted hover:text-semantic-error transition-colors"
+                                  title="Soft-delete created entities and remove the document"
+                                >
+                                  Undo
+                                </button>
+                              )}
+                              {job.status === 'reverted' && (
+                                <span className="text-xs text-text-muted italic">reverted</span>
+                              )}
+                              {job.status === 'processing' && (
+                                <span className="text-xs text-accent-magenta">in progress…</span>
+                              )}
+                              {job.status === 'failed' && (
+                                <span className="text-xs text-semantic-error">failed</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
