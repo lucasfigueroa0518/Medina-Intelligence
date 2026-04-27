@@ -97,22 +97,27 @@ interface ImportJob {
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-const ACCEPTED_EXTENSIONS = '.csv,.xlsx,.xls,.json,.vcf,.pdf,.docx,.pptx,.txt,.md';
-
+// MECE category palette — mirrors src/lib/document-intelligence.ts.
 const CATEGORY_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
-  contact_list:     { label: 'Contact List',     color: '#22C55E', bg: 'rgba(34,197,94,0.12)' },
-  pitch_deck:       { label: 'Pitch Deck',       color: '#8B5CF6', bg: 'rgba(139,92,246,0.12)' },
-  financial_report: { label: 'Financial Report',  color: '#F59E0B', bg: 'rgba(245,158,11,0.12)' },
-  meeting_notes:    { label: 'Meeting Notes',     color: '#3B82F6', bg: 'rgba(59,130,246,0.12)' },
-  deal_memo:        { label: 'Deal Memo',         color: '#D946A8', bg: 'rgba(217,70,168,0.12)' },
-  email_thread:     { label: 'Email Thread',      color: '#06B6D4', bg: 'rgba(6,182,212,0.12)' },
-  news_article:     { label: 'News Article',      color: '#EF4444', bg: 'rgba(239,68,68,0.12)' },
-  legal_document:   { label: 'Legal Document',    color: '#64748B', bg: 'rgba(100,116,139,0.12)' },
-  investor_update:  { label: 'Investor Update',   color: '#10B981', bg: 'rgba(16,185,129,0.12)' },
-  market_research:  { label: 'Market Research',   color: '#F97316', bg: 'rgba(249,115,22,0.12)' },
-  portfolio_report: { label: 'Portfolio Report',   color: '#6366F1', bg: 'rgba(99,102,241,0.12)' },
-  resume_cv:        { label: 'Resume / CV',       color: '#14B8A6', bg: 'rgba(20,184,166,0.12)' },
-  other:            { label: 'Document',          color: '#94A3B8', bg: 'rgba(148,163,184,0.12)' },
+  // Deal flow — magenta family
+  deal_pitch:       { label: 'Deal — Pitch',       color: '#8B5CF6', bg: 'rgba(139,92,246,0.12)' },
+  deal_diligence:   { label: 'Deal — Diligence',   color: '#A855F7', bg: 'rgba(168,85,247,0.12)' },
+  deal_terms:       { label: 'Deal — Terms',       color: '#D946A8', bg: 'rgba(217,70,168,0.12)' },
+  deal_financials:  { label: 'Deal — Financials',  color: '#EC4899', bg: 'rgba(236,72,153,0.12)' },
+  // Fund operations — amber/orange family
+  fund_reporting:   { label: 'Fund — Reporting',   color: '#F59E0B', bg: 'rgba(245,158,11,0.12)' },
+  fund_legal:       { label: 'Fund — Legal',       color: '#F97316', bg: 'rgba(249,115,22,0.12)' },
+  fund_admin:       { label: 'Fund — Admin',       color: '#EAB308', bg: 'rgba(234,179,8,0.12)' },
+  // Relationships — green/cyan family
+  contact_data:     { label: 'Contact Data',       color: '#22C55E', bg: 'rgba(34,197,94,0.12)' },
+  correspondence:   { label: 'Correspondence',     color: '#06B6D4', bg: 'rgba(6,182,212,0.12)' },
+  meeting_material: { label: 'Meeting Material',   color: '#3B82F6', bg: 'rgba(59,130,246,0.12)' },
+  // Market intelligence — teal/indigo
+  research:         { label: 'Research',           color: '#14B8A6', bg: 'rgba(20,184,166,0.12)' },
+  portfolio_update: { label: 'Portfolio Update',   color: '#6366F1', bg: 'rgba(99,102,241,0.12)' },
+  // General — neutral
+  internal_ops:     { label: 'Internal Ops',       color: '#64748B', bg: 'rgba(100,116,139,0.12)' },
+  reference:        { label: 'Reference',          color: '#94A3B8', bg: 'rgba(148,163,184,0.12)' },
 };
 
 function fileIcon(name: string) {
@@ -340,14 +345,14 @@ export default function ImportsPage() {
                     Drop your file here or click to browse
                   </div>
                   <div className="text-xs text-text-muted">
-                    CSV, Excel, PDF, Word, PowerPoint, JSON, Text, Markdown
+                    Any file type — documents, spreadsheets, presentations, data exports, and more.
                   </div>
                 </>
               )}
               <input
                 type="file"
                 className="hidden"
-                accept={ACCEPTED_EXTENSIONS}
+                accept="*/*"
                 onChange={e => { setFile(e.target.files?.[0] || null); e.target.value = ''; }}
               />
             </label>

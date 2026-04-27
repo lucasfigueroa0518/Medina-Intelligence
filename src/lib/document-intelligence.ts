@@ -12,20 +12,29 @@ import { emitAudit } from './audit';
 // Types
 // ────────────────────────────────────────────────────────────────────────────
 
+// MECE category set — every document the firm touches fits one of these.
+// `reference` is the safety net: anything the classifier can't confidently
+// place lands here so it's still ingested, embedded, and discoverable by MARTy.
 export type DocumentCategory =
-  | 'contact_list'
-  | 'pitch_deck'
-  | 'financial_report'
-  | 'meeting_notes'
-  | 'deal_memo'
-  | 'email_thread'
-  | 'news_article'
-  | 'legal_document'
-  | 'investor_update'
-  | 'market_research'
-  | 'portfolio_report'
-  | 'resume_cv'
-  | 'other';
+  // DEAL FLOW
+  | 'deal_pitch'              // Pitch decks, executive summaries, one-pagers, company overviews
+  | 'deal_diligence'          // DD reports, background checks, technical assessments, market analyses
+  | 'deal_terms'              // Term sheets, LOIs, side letters, investment agreements, cap tables
+  | 'deal_financials'         // Financial models, projections, P&L, balance sheets, revenue reports
+  // FUND OPERATIONS
+  | 'fund_reporting'          // LP reports, quarterly updates, fund performance, distributions, K-1s
+  | 'fund_legal'              // LPAs, subscription docs, compliance filings, regulatory docs, NDAs
+  | 'fund_admin'              // Bank statements, wire confirmations, tax docs, EIN letters, formation docs
+  // RELATIONSHIPS
+  | 'contact_data'            // Contact lists, CRM exports, vCards, LinkedIn exports, attendee lists
+  | 'correspondence'          // Email threads, letters, memos, thank-you notes, introductions
+  | 'meeting_material'        // Meeting agendas, board decks, IC memos, presentation materials, minutes
+  // MARKET INTELLIGENCE
+  | 'research'                // Industry reports, market maps, competitive analyses, white papers, news
+  | 'portfolio_update'        // Portfolio company updates, board packages, milestone reports, KPI dashboards
+  // GENERAL
+  | 'internal_ops'            // HR docs, policies, procedures, org charts, team docs, contracts, invoices
+  | 'reference';              // Anything else — guides, templates, miscellaneous files (the safety net)
 
 export interface ExtractedContact {
   full_name: string;
@@ -117,23 +126,37 @@ export interface ImportResult {
 // 1. Document Classifier
 // ────────────────────────────────────────────────────────────────────────────
 
-const CLASSIFIER_SYSTEM = `You are a document classifier for a venture capital CRM.
-Given the first portion of a document, classify it into exactly one category.
+const CLASSIFIER_SYSTEM = `You are a document classifier for a venture capital CRM. You always pick the BEST fit from these 14 categories. There is no "none of these" option — pick the closest match. \`reference\` is a safety net for genuinely unclassifiable files; try harder before defaulting to it.
 
-Categories:
-- contact_list: spreadsheet/list of people with names, emails, phones, titles
-- pitch_deck: startup pitch deck or investor presentation
-- financial_report: financial statements, balance sheets, P&L
-- meeting_notes: notes from meetings, calls, or conversations
-- deal_memo: investment memo, deal analysis, due diligence
-- email_thread: email correspondence
-- news_article: news, press release, blog post
-- legal_document: contracts, terms, NDAs, agreements
-- investor_update: portfolio company updates, quarterly letters
-- market_research: industry analysis, market reports
-- portfolio_report: fund performance, portfolio summary
-- resume_cv: resume, CV, professional profile
-- other: doesn't fit the above categories
+DEAL FLOW
+- deal_pitch         Pitch decks, executive summaries, one-pagers, company overviews
+- deal_diligence     DD reports, background checks, technical assessments, market analyses on a target
+- deal_terms         Term sheets, LOIs, side letters, investment agreements, cap tables, SAFEs, convertibles
+- deal_financials    Financial models, projections, P&L, balance sheets, revenue/burn/runway reports
+
+FUND OPERATIONS
+- fund_reporting     LP reports, quarterly updates, fund performance (TVPI/DPI/IRR), distributions, K-1s
+- fund_legal         LPAs, subscription docs, compliance filings, regulatory docs, NDAs
+- fund_admin         Bank statements, wire confirmations, tax docs, EIN letters, formation docs
+
+RELATIONSHIPS
+- contact_data       Contact lists, CRM exports, vCards, LinkedIn exports, event attendee lists
+- correspondence     Email threads, letters, memos, thank-you notes, introductions
+- meeting_material   Meeting agendas, board decks, IC memos, presentation materials, minutes
+
+MARKET INTELLIGENCE
+- research           Industry reports, market maps, competitive analyses, white papers, news articles
+- portfolio_update   Portfolio company updates, board packages, milestone reports, KPI dashboards
+
+GENERAL
+- internal_ops       HR docs, policies, procedures, org charts, team docs, vendor contracts, invoices
+- reference          Anything else — guides, templates, training material, miscellaneous files
+
+Rules:
+1. Always return a category. Even when confidence is low, pick the closest fit.
+2. If genuinely ambiguous (e.g. a memo discussing multiple topics), pick the one most central to its purpose.
+3. \`reference\` is the safety net but should never be your first choice. Try every other category first.
+4. Confidence: 0.9+ for unambiguous, 0.7–0.9 for clear-but-not-certain, 0.5–0.7 for best guess, 0.3–0.5 for low-confidence fallback to \`reference\`.
 
 Respond with ONLY a JSON object: {"category": "<category>", "confidence": <0.0-1.0>}`;
 
@@ -144,7 +167,7 @@ export async function classifyDocument(
   orgId: string
 ): Promise<{ category: DocumentCategory; confidence: number }> {
   const preview = text.slice(0, 3000);
-  const userPrompt = `File name: ${fileName}\n\nContent preview:\n${preview}`;
+  const userPrompt = `File name: ${fileName}\n\nContent preview:\n${preview || '(no extractable text — classify based on filename and extension alone)'}`;
 
   try {
     const response = await callClaude(
@@ -154,13 +177,22 @@ export async function classifyDocument(
     );
     const cleaned = response.trim().replace(/```json\s*/g, '').replace(/```/g, '').trim();
     const parsed = JSON.parse(cleaned);
+    const cat = parsed.category as DocumentCategory;
+    // Validate against the allow-list — never return an unknown string as a category.
+    const valid: Set<DocumentCategory> = new Set([
+      'deal_pitch','deal_diligence','deal_terms','deal_financials',
+      'fund_reporting','fund_legal','fund_admin',
+      'contact_data','correspondence','meeting_material',
+      'research','portfolio_update',
+      'internal_ops','reference',
+    ]);
     return {
-      category: parsed.category as DocumentCategory,
+      category: valid.has(cat) ? cat : 'reference',
       confidence: Math.min(1, Math.max(0, parsed.confidence || 0.5)),
     };
   } catch (e) {
-    console.error('[doc-intel] classification failed:', e);
-    return { category: 'other', confidence: 0.3 };
+    console.error('[doc-intel] classification failed — defaulting to reference:', e);
+    return { category: 'reference', confidence: 0.3 };
   }
 }
 
@@ -168,51 +200,55 @@ export async function classifyDocument(
 // 2. Entity Extractor
 // ────────────────────────────────────────────────────────────────────────────
 
-const EXTRACTION_SYSTEM_TABULAR = `You are an entity extractor for a venture capital CRM.
-The document is a tabular/list format (CSV, spreadsheet, contact list).
-Extract ALL people, companies, and deals mentioned.
+// Base extraction always runs — every document gets entity discovery, even
+// `internal_ops` and `reference`. Category-specific hints are appended when
+// applicable so the model gets richer context, never less.
+const BASE_EXTRACTION_SYSTEM = `You are an entity extractor for a venture capital CRM. Extract any people, companies, financial figures, dates, or actionable intelligence from this document, regardless of document type. Even mundane operational documents often mention vendors, signatories, dates, or amounts worth capturing.
 
 Respond with ONLY a JSON object matching this schema:
 {
-  "contacts": [{"full_name":"...","email":"...","phone":"...","job_title":"...","company_name":"...","location":"...","linkedin_url":"...","confidence":0.9}],
-  "companies": [{"name":"...","domain":"...","website":"...","sector":"...","company_type":"...","location":"...","description":"...","confidence":0.8}],
-  "deals": [],
-  "relationships": [],
-  "signals": [],
-  "summary": "Brief 1-2 sentence summary of what this document contains"
-}
-
-Rules:
-- Extract every person you can find. Include partial data — a name alone is valid.
-- Infer company names from email domains when no explicit company is listed.
-- Confidence 0.9+ for explicitly stated data, 0.7-0.9 for inferred data.
-- Do NOT invent data. If a field is missing, omit it from the object.
-- For phone numbers, preserve the original format.`;
-
-const EXTRACTION_SYSTEM_COMPLEX = `You are an entity extractor for a venture capital CRM.
-The document is a complex document (pitch deck, memo, meeting notes, report, etc.).
-Extract ALL people, companies, deals, relationships, and investment signals.
-
-Respond with ONLY a JSON object matching this schema:
-{
-  "contacts": [{"full_name":"...","email":"...","phone":"...","job_title":"...","company_name":"...","location":"...","confidence":0.8}],
+  "contacts": [{"full_name":"...","email":"...","phone":"...","job_title":"...","company_name":"...","location":"...","linkedin_url":"...","confidence":0.8}],
   "companies": [{"name":"...","domain":"...","website":"...","sector":"...","company_type":"...","location":"...","description":"...","stage":"...","valuation":null,"confidence":0.8}],
   "deals": [{"name":"...","company_name":"...","stage":"...","amount":null,"description":"...","confidence":0.7}],
   "relationships": [{"from_name":"...","to_name":"...","relationship_type":"investor|advisor|board_member|employee|partner","context":"..."}],
   "signals": [{"entity_name":"...","signal_type":"funding|hiring|product_launch|partnership|leadership_change|other","summary":"...","date":"..."}],
-  "summary": "Brief 2-3 sentence summary of the document's key intelligence"
+  "summary": "Brief 2-3 sentence summary of the document"
 }
 
 Rules:
-- Extract every entity mentioned, even if only partially described.
-- For deals, extract funding rounds, investment amounts, and valuations.
-- For relationships, capture who is connected to whom and how.
-- For signals, capture any notable business events or changes.
-- Confidence: 0.9+ for explicitly stated, 0.7-0.9 for strongly inferred, 0.5-0.7 for weakly inferred.
-- Do NOT invent data. Omit fields you cannot determine.
-- Valuation and amount should be numbers (in USD) or null.`;
+- Extract every entity mentioned, even with partial data — a name alone is valid.
+- Infer company names from email domains when no explicit company is listed.
+- For amounts/valuations, normalize to USD numbers ($1.2M → 1200000). Never invent numbers.
+- Confidence: 0.9+ for explicitly stated, 0.7–0.9 for strongly inferred, 0.5–0.7 for weakly inferred.
+- Omit fields you cannot determine. Do NOT invent data.
+- If the document has no extractable entities, return empty arrays and a brief summary.`;
 
-const TABULAR_CATEGORIES = new Set<DocumentCategory>(['contact_list', 'portfolio_report']);
+// Category-specific add-ons appended after BASE_EXTRACTION_SYSTEM. Each fires
+// only when the document was classified into that category.
+const CATEGORY_HINTS: Partial<Record<DocumentCategory, string>> = {
+  contact_data: `\n\nThis document is tabular (contact list / CRM export / attendee list). Treat every row as a separate \`contacts\` entry. Be exhaustive — extract every person, even with partial data. Preserve phone number formatting as-is.`,
+  portfolio_update: `\n\nThis document is a portfolio company update or board package. Extract company KPIs (revenue, ARR, headcount, growth rate) into the \`signals\` array (signal_type: \`product_launch\` for product news, \`hiring\` for headcount, \`funding\` for financing events). Capture the reporting period in the summary.`,
+  fund_reporting: `\n\nThis document is LP-facing fund reporting. Extract fund-level metrics (TVPI, DPI, IRR, distributions, capital calls) into \`signals\` with the fund name as \`entity_name\`. Extract every portfolio company mentioned with valuation/stage data.`,
+  deal_terms: `\n\nThis document is a term sheet / LOI / investment agreement. Extract: investment amount (\`deals[].amount\`), pre-money/post-money valuation (\`companies[].valuation\`), security type (SAFE / preferred / convertible) into \`deals[].description\`, lead investor and co-investors as \`relationships\` (\`relationship_type: 'investor'\`), founders and signatories as \`contacts\`, key dates in the summary.`,
+  deal_financials: `\n\nThis document is a financial model or report. Extract revenue, gross margin, burn, runway, headcount, and growth rates as \`signals\`. Capture forecast period and any funding amounts already raised.`,
+  deal_pitch: `\n\nThis document is a pitch deck / one-pager. Extract: company name + sector + stage + valuation, founders + key team as \`contacts\`, raise amount as \`deals[].amount\`, market size mentions, traction metrics into \`signals\`, listed customers/partners as \`relationships\`.`,
+  deal_diligence: `\n\nThis document is due-diligence material on a target company. Extract: the target company (rich detail), customer references and partners as \`relationships\`, any concerning findings as \`signals\` (signal_type: \`other\`), key personnel as \`contacts\`.`,
+  fund_legal: `\n\nThis document is a legal/compliance document (LPA, NDA, subscription, regulatory). Extract: every legal entity name as \`companies\`, every signatory as \`contacts\` (job_title from their signature block), governing law and effective dates in the summary.`,
+  fund_admin: `\n\nThis document is administrative (banking, tax, formation). Extract: counterparty entity names as \`companies\`, amounts and dates as \`signals\` (signal_type: \`other\`), any people referenced as \`contacts\`.`,
+  correspondence: `\n\nThis document is correspondence (email thread, letter, memo). Extract every sender + recipient as \`contacts\`, follow-up commitments and dates as \`signals\`, introductions or referrals as \`relationships\`.`,
+  meeting_material: `\n\nThis document is meeting material (agenda, board deck, IC memo, minutes). Extract attendees as \`contacts\`, decisions and action items as \`signals\` (signal_type: \`other\`), companies under discussion with stage/valuation context.`,
+  research: `\n\nThis document is market research. Extract every company mentioned in the competitive landscape with sector tagging, market sizes (TAM/SAM/SOM) and trends in the summary, cited authors as \`contacts\`.`,
+  internal_ops: `\n\nThis document is internal operational material. Extract people referenced (HR docs, org charts, vendor contracts) as \`contacts\` and any vendor/counterparty as \`companies\`. Even when sparse, surface what's there.`,
+  // reference: no add-on — base prompt covers it.
+};
+
+// Tabular categories use the cheaper Haiku model and a larger char budget
+// since they're typically long lists with low-density text per row.
+const TABULAR_CATEGORIES = new Set<DocumentCategory>([
+  'contact_data',
+  'portfolio_update',
+  'fund_reporting',
+]);
 
 export async function extractEntities(
   text: string,
@@ -220,10 +256,15 @@ export async function extractEntities(
   env: Env,
   orgId: string
 ): Promise<ExtractionResult> {
-  const isTabular = TABULAR_CATEGORIES.has(category);
-  const system = isTabular ? EXTRACTION_SYSTEM_TABULAR : EXTRACTION_SYSTEM_COMPLEX;
-  const model = isTabular ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-6';
+  // No text? Still return a valid empty result — extraction "ran" but found
+  // nothing. The document is still ingested upstream.
+  if (!text || text.trim().length < 20) {
+    return { category, contacts: [], companies: [], deals: [], relationships: [], signals: [], summary: '' };
+  }
 
+  const system = BASE_EXTRACTION_SYSTEM + (CATEGORY_HINTS[category] || '');
+  const isTabular = TABULAR_CATEGORIES.has(category);
+  const model = isTabular ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-6';
   const maxChars = isTabular ? 30000 : 20000;
   const truncated = text.length > maxChars ? text.slice(0, maxChars) + '\n[... truncated]' : text;
 
@@ -246,7 +287,7 @@ export async function extractEntities(
       summary: parsed.summary || '',
     };
   } catch (e) {
-    console.error('[doc-intel] extraction failed:', e);
+    console.error('[doc-intel] extraction failed — returning empty result:', e);
     return { category, contacts: [], companies: [], deals: [], relationships: [], signals: [], summary: '' };
   }
 }
@@ -484,32 +525,42 @@ export async function processIntelligentImport(
   const now = new Date().toISOString();
   const r2Key = `${orgId}/document/${now.slice(0, 7)}/${documentId}_${file.name}`;
 
-  // Store file in R2
+  // Always store the raw file in R2 first — this is the durable artifact and
+  // happens before any extraction so a download link is guaranteed regardless
+  // of what comes next.
   const buffer = await file.arrayBuffer();
   await env.R2.put(r2Key, buffer);
 
-  // Extract text
-  const text = await extractTextFromFile(file);
-  if (!text || text.trim().length < 20) {
-    return {
-      document_id: documentId,
-      category: 'other',
-      summary: 'Could not extract meaningful text from file',
-      contacts_created: 0, contacts_updated: 0,
-      companies_created: 0, companies_updated: 0,
-      deals_created: 0, relationships_found: 0, signals_found: 0,
-      entities_routed: 0, errors: ['Text extraction returned insufficient content'],
-      extraction: { contacts: [], companies: [], deals: [], relationships: [], signals: [] },
-    };
+  // Try to extract text. If extraction fails or yields nothing, we still
+  // ingest the file — it just lands as `reference` with no entity payload.
+  let text = '';
+  let extractionFailed = false;
+  try {
+    text = await extractTextFromFile(file);
+  } catch (e: any) {
+    extractionFailed = true;
+    errors.push(`Text extraction: ${e?.message || e}`);
   }
+  const hasUsableText = !!text && text.trim().length >= 20;
+  if (!hasUsableText) extractionFailed = true;
 
-  // Classify
-  const { category, confidence: classConfidence } = await classifyDocument(text, file.name, env, orgId);
-  console.log(`[doc-intel] classified "${file.name}" as ${category} (confidence: ${classConfidence})`);
+  // Classify — even when text is empty, the classifier sees the filename and
+  // returns a category (or `reference` on hard failure). Never throws.
+  const { category, confidence: classConfidence } = await classifyDocument(
+    text,
+    file.name,
+    env,
+    orgId
+  );
+  console.log(
+    `[doc-intel] classified "${file.name}" as ${category} (confidence: ${classConfidence}, text_extracted: ${hasUsableText})`
+  );
 
-  // Extract entities
+  // Run base + category-specific extraction. Empty text → empty result, no Claude call wasted.
   const extraction = await extractEntities(text, category, env, orgId);
-  console.log(`[doc-intel] extracted: ${extraction.contacts.length} contacts, ${extraction.companies.length} companies, ${extraction.deals.length} deals`);
+  console.log(
+    `[doc-intel] extracted: ${extraction.contacts.length} contacts, ${extraction.companies.length} companies, ${extraction.deals.length} deals`
+  );
 
   // Store document record in D1
   await env.D1.prepare(
@@ -625,6 +676,7 @@ export async function processIntelligentImport(
     metadata: {
       category,
       file_name: file.name,
+      extraction_failed: extractionFailed,
       contacts_created: contactsCreated,
       contacts_updated: contactsUpdated,
       companies_created: companiesCreated,

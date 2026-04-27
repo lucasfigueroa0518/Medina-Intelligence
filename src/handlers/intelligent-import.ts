@@ -3,22 +3,6 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
 import { processIntelligentImport, type ImportResult } from '../lib/document-intelligence';
 
-const SUPPORTED_TYPES = new Set([
-  'text/csv',
-  'application/pdf',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  'text/plain',
-  'text/markdown',
-  'application/json',
-]);
-
-const SUPPORTED_EXTENSIONS = new Set([
-  '.csv', '.pdf', '.docx', '.xlsx', '.xls', '.pptx', '.txt', '.md', '.json',
-]);
-
 export async function intelligentImport(
   request: Request,
   ctx: AuthContext,
@@ -29,11 +13,9 @@ export async function intelligentImport(
   const file = form.get('file') as File | null;
   if (!file) return errorResponse('VALIDATION_ERROR', 400, 'file required');
 
-  const ext = '.' + file.name.split('.').pop()?.toLowerCase();
-  if (!SUPPORTED_TYPES.has(file.type) && !SUPPORTED_EXTENSIONS.has(ext)) {
-    return errorResponse('UNSUPPORTED_FILE_TYPE', 400, `Unsupported file type: ${file.type || ext}`);
-  }
-
+  // No file-type filter — every file is accepted. Text-extractable formats
+  // (PDF/DOCX/XLSX/CSV/TXT/MD/JSON) get LLM extraction; everything else is
+  // still stored in R2, classified as `reference`, and made downloadable.
   if (file.size > 25 * 1024 * 1024) {
     return errorResponse('FILE_TOO_LARGE', 400, 'Maximum file size is 25MB');
   }
