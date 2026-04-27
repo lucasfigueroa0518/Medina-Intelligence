@@ -912,6 +912,9 @@ async function extractNameFromWebsite(domain: string): Promise<string | null> {
   for (const raw of candidates) {
     let name = raw.trim().replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"');
     name = name.replace(TITLE_SUFFIXES, '').trim();
+    // Strip taglines after a separator: "Acme - Build the future" → "Acme"
+    const sepIdx = name.search(/\s+[|\-–—:]\s+/);
+    if (sepIdx > 1) name = name.slice(0, sepIdx).trim();
     name = name.replace(/\s*[|\-–—]\s*$/, '').trim();
 
     if (name.length < 2 || name.length > 80) continue;
