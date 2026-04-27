@@ -3,7 +3,7 @@
 import React from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2 } from 'lucide-react';
+import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2, Calendar } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import {
   api,
@@ -379,6 +379,7 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
   const [backfillProgress, setBackfillProgress] = React.useState<any>(null);
   const [backfillLoading, setBackfillLoading] = React.useState(false);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
+  const [dateRangeOpen, setDateRangeOpen] = React.useState(false);
   const [backfillDays, setBackfillDays] = React.useState(365);
   const [toast, setToast] = React.useState<string | null>(null);
 
@@ -529,10 +530,16 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
                 <div className="text-xs text-text-secondary mb-3">
                   Import older emails that were sent before your initial sync window. This runs in the background.
                 </div>
-                <button onClick={() => setConfirmOpen(true)} className="btn-secondary text-xs py-1.5 flex items-center gap-2">
-                  <Clock size={13} />
-                  Import Older Emails
-                </button>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setConfirmOpen(true)} className="btn-secondary text-xs py-1.5 flex items-center gap-2">
+                    <Clock size={13} />
+                    Import Older Emails
+                  </button>
+                  <button onClick={() => setDateRangeOpen(true)} className="btn-secondary text-xs py-1.5 flex items-center gap-2">
+                    <Calendar size={13} />
+                    Import by Date Range
+                  </button>
+                </div>
               </div>
             )}
 
@@ -584,6 +591,17 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
             </div>
           </div>
         </div>
+      )}
+
+      {dateRangeOpen && (
+        <EmailDateRangeModal
+          onClose={() => setDateRangeOpen(false)}
+          onStarted={(progress) => {
+            setDateRangeOpen(false);
+            setBackfillProgress(progress);
+            setToast('Date range import started');
+          }}
+        />
       )}
 
       {toast && (
@@ -1539,6 +1557,124 @@ function formatRelative(iso: string): string {
   return `${d}d ago`;
 }
 
+// ─── Date Range Helpers ─────────────────────────────────────────────────────
+
+const EMAIL_DATE_PRESETS: Array<{ label: string; start: string; end: string }> = (() => {
+  const now = new Date();
+  const y = now.getFullYear();
+  return [
+    { label: 'Last 90 days', start: new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) },
+    { label: 'Last 6 months', start: new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) },
+    { label: 'Last year', start: new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) },
+    { label: `Q1 ${y}`, start: `${y}-01-01`, end: `${y}-03-31` },
+    { label: `Q2 ${y}`, start: `${y}-04-01`, end: `${y}-06-30` },
+    { label: `Q3 ${y - 1}`, start: `${y - 1}-07-01`, end: `${y - 1}-09-30` },
+    { label: `Q4 ${y - 1}`, start: `${y - 1}-10-01`, end: `${y - 1}-12-31` },
+  ];
+})();
+
+function EmailDateRangeModal({ onClose, onStarted }: { onClose: () => void; onStarted: (progress: any) => void }) {
+  const [startDate, setStartDate] = React.useState('');
+  const [endDate, setEndDate] = React.useState('');
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const { startTask } = useBackgroundTasks();
+
+  const applyPreset = (p: { start: string; end: string }) => {
+    setStartDate(p.start);
+    setEndDate(p.end);
+  };
+
+  const submit = async () => {
+    if (!startDate) { setError('Start date is required'); return; }
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await api.triggerIngestion({
+        start_date: new Date(startDate).toISOString(),
+        end_date: endDate ? new Date(endDate + 'T23:59:59Z').toISOString() : undefined,
+      });
+      if (res.progress) {
+        onStarted(res.progress);
+      } else {
+        onStarted({ status: 'in_progress', total_fetched: 0 });
+      }
+    } catch (e: any) {
+      if (e?.status === 409) {
+        setError('An ingestion is already in progress. Wait for it to complete.');
+      } else {
+        setError(e?.message || 'Failed to start import');
+      }
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+      onClick={onClose}>
+      <div className="rounded-2xl w-full max-w-md shadow-2xl p-6"
+        style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-full bg-brand-gradient flex items-center justify-center">
+            <Calendar size={20} className="text-white" />
+          </div>
+          <div>
+            <div className="text-lg font-medium text-text-primary">Import by Date Range</div>
+            <div className="text-xs text-text-muted">Pull emails from a specific time period</div>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-text-muted block mb-1">Start date</label>
+              <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
+                className="input text-sm w-full" />
+            </div>
+            <div>
+              <label className="text-xs text-text-muted block mb-1">End date</label>
+              <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
+                className="input text-sm w-full" />
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[10px] text-text-muted uppercase tracking-wider mb-2">Quick select</div>
+            <div className="flex flex-wrap gap-1.5">
+              {EMAIL_DATE_PRESETS.map(p => (
+                <button key={p.label} onClick={() => applyPreset(p)}
+                  className="px-2.5 py-1 rounded-lg text-[11px] transition-colors"
+                  style={{
+                    background: startDate === p.start && endDate === p.end ? 'rgba(139,92,246,0.15)' : 'rgba(255,255,255,0.04)',
+                    border: `1px solid ${startDate === p.start && endDate === p.end ? 'rgba(139,92,246,0.3)' : 'rgba(255,255,255,0.06)'}`,
+                    color: startDate === p.start && endDate === p.end ? '#A78BFA' : undefined,
+                  }}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="text-xs text-text-muted bg-bg-input/50 rounded-lg px-3 py-2">
+            Large date ranges may take several minutes. You can continue using the platform while the import runs in the background.
+          </div>
+
+          {error && <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">{error}</div>}
+        </div>
+
+        <div className="flex justify-end gap-3 mt-5">
+          <button className="btn-ghost text-sm" onClick={onClose}>Cancel</button>
+          <button className="btn-primary text-sm" onClick={submit} disabled={loading || !startDate}>
+            {loading ? 'Starting...' : 'Start Import'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 // ─── Firefly Card ─────────���───────────────────────────────────���──────────────
 
 const FIREFLY_WEBHOOK_URL = 'https://medina-ventures-api.intel-ad5.workers.dev/webhooks/firefly';
@@ -1685,15 +1821,37 @@ function FireflyTroubleshooting() {
   );
 }
 
+const FIREFLY_DATE_PRESETS: Array<{ label: string; days: number }> = [
+  { label: 'Last 7 days', days: 7 },
+  { label: 'Last 14 days', days: 14 },
+  { label: 'Last 30 days', days: 30 },
+  { label: 'Last 60 days', days: 60 },
+  { label: 'Last 90 days', days: 90 },
+];
+
 function FireflyImportModal({ onClose }: { onClose: () => void }) {
   const [apiKey, setApiKey] = React.useState('');
-  const [days, setDays] = React.useState(30);
+  const [startDate, setStartDate] = React.useState('');
+  const [endDate, setEndDate] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
   const { startTask } = useBackgroundTasks();
 
+  const applyPreset = (days: number) => {
+    const end = new Date();
+    const start = new Date(Date.now() - days * 86400000);
+    setStartDate(start.toISOString().slice(0, 10));
+    setEndDate(end.toISOString().slice(0, 10));
+  };
+
+  // Default to last 30 days on mount
+  React.useEffect(() => { applyPreset(30); }, []);
+
   const submit = () => {
     if (!apiKey.trim()) { setError('Enter your Firefly API key.'); return; }
-    const promise = api.fireflyBackfill(apiKey.trim(), days);
+    if (!startDate) { setError('Start date is required.'); return; }
+
+    const opts = startDate ? { start_date: new Date(startDate).toISOString(), end_date: endDate ? new Date(endDate + 'T23:59:59Z').toISOString() : undefined } : undefined;
+    const promise = api.fireflyBackfill(apiKey.trim(), undefined, opts);
     startTask(FIREFLY_TASK_NAME, promise, (r: FireflyBackfillResult) => {
       const parts: string[] = [];
       if (r.ingested > 0) parts.push(`Imported ${r.ingested} transcript${r.ingested === 1 ? '' : 's'}`);
@@ -1703,6 +1861,11 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
     });
     onClose();
   };
+
+  const matchedPreset = FIREFLY_DATE_PRESETS.find(p => {
+    const expectedStart = new Date(Date.now() - p.days * 86400000).toISOString().slice(0, 10);
+    return startDate === expectedStart;
+  });
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
@@ -1720,19 +1883,29 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
           <div className="text-xs text-text-muted mt-1">From <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span></div>
         </div>
         <div>
-          <label className="text-xs text-text-secondary block mb-1">Backfill window</label>
-          <select value={days} onChange={e => setDays(Number(e.target.value))} className="input w-full text-sm">
-            <option value={7}>Last 7 days</option>
-            <option value={14}>Last 14 days</option>
-            <option value={30}>Last 30 days</option>
-            <option value={60}>Last 60 days</option>
-            <option value={90}>Last 90 days</option>
-          </select>
+          <label className="text-xs text-text-secondary block mb-1">Date range</label>
+          <div className="grid grid-cols-2 gap-3 mb-2">
+            <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} className="input text-sm w-full" />
+            <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} className="input text-sm w-full" />
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {FIREFLY_DATE_PRESETS.map(p => (
+              <button key={p.days} onClick={() => applyPreset(p.days)}
+                className="px-2 py-0.5 rounded text-[11px] transition-colors"
+                style={{
+                  background: matchedPreset?.days === p.days ? 'rgba(139,92,246,0.15)' : 'rgba(255,255,255,0.04)',
+                  border: `1px solid ${matchedPreset?.days === p.days ? 'rgba(139,92,246,0.3)' : 'rgba(255,255,255,0.06)'}`,
+                  color: matchedPreset?.days === p.days ? '#A78BFA' : undefined,
+                }}>
+                {p.label}
+              </button>
+            ))}
+          </div>
         </div>
         {error && <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">{error}</div>}
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={onClose} className="btn-ghost text-xs">Cancel</button>
-          <button onClick={submit} className="btn-primary text-xs" disabled={!apiKey.trim()}>Import</button>
+          <button onClick={submit} className="btn-primary text-xs" disabled={!apiKey.trim() || !startDate}>Import</button>
         </div>
       </div>
     </div>

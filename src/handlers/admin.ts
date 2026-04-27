@@ -236,6 +236,86 @@ export async function repairVectorizeParticipantIds(
   return jsonResponse({ updated, skipped, errors, total_candidate_vectors: totalCandidates });
 }
 
+export async function triggerIngestion(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    user_id?: string;
+    start_date?: string;
+    end_date?: string;
+  }>(request);
+
+  if (body?.start_date && isNaN(Date.parse(body.start_date))) {
+    return errorResponse('VALIDATION_ERROR', 400, 'start_date must be a valid ISO 8601 date');
+  }
+  if (body?.end_date && isNaN(Date.parse(body.end_date))) {
+    return errorResponse('VALIDATION_ERROR', 400, 'end_date must be a valid ISO 8601 date');
+  }
+
+  const userId = body?.user_id || ctx.userId;
+
+  const user = await env.D1.prepare(
+    'SELECT id FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(userId, ctx.orgId).first();
+  if (!user) return errorResponse('USER_NOT_FOUND', 404, 'User not found in your org');
+
+  // Overlap prevention
+  const existing = await env.KV.get<BackfillProgress>(
+    `backfill_progress:${userId}`,
+    'json'
+  );
+  if (existing && existing.status === 'in_progress') {
+    return errorResponse('INGESTION_IN_PROGRESS', 409, 'An ingestion is already in progress. Wait for it to complete or let it timeout.');
+  }
+
+  // If date range supplied, run as historical backfill (direct date-filtered query, no delta token)
+  if (body?.start_date) {
+    const progress = await runHistoricalBackfill(userId, ctx.orgId, 365, env, {
+      start_date: body.start_date,
+      end_date: body.end_date,
+    });
+
+    // Store date range metadata in a sync_jobs row for progress visibility
+    const jobId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const metadata = JSON.stringify({
+      trigger: 'manual_date_range',
+      user_id: userId,
+      start_date: body.start_date,
+      end_date: body.end_date || now,
+    });
+    await env.D1.prepare(
+      `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, timeout_at, metadata, created_at, updated_at)
+       VALUES (?, ?, 'ingestion', 'running', ?, datetime(?, '+30 minutes'), ?, ?, ?)`
+    ).bind(jobId, ctx.orgId, now, now, metadata, now, now).run();
+
+    // Mark completed immediately since runHistoricalBackfill may return with in_progress (paginated)
+    if (progress.status === 'completed') {
+      await env.D1.prepare(
+        `UPDATE sync_jobs SET status = 'completed', completed_at = ?, items_processed = ?, updated_at = ? WHERE id = ?`
+      ).bind(now, progress.total_fetched, now, jobId).run();
+    }
+
+    return jsonResponse({ ok: true, instance_id: jobId, progress });
+  }
+
+  // No date range: trigger the standard ingestion workflow
+  const binding = env.INGESTION_WORKFLOW;
+  if (!binding) {
+    return errorResponse('WORKFLOW_BINDING_MISSING', 500, 'Ingestion workflow binding is not available.');
+  }
+
+  const instanceId = `ingestion-manual-${ctx.orgId}-${Date.now()}`;
+  const instance = await binding.create({
+    id: instanceId,
+    params: { org_id: ctx.orgId },
+  });
+
+  return jsonResponse({ ok: true, instance_id: instance.id });
+}
+
 export async function getSystemStatus(
   ctx: AuthContext,
   env: Env
@@ -355,12 +435,24 @@ export async function backfillEmail(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const body = await parseJsonBody<{ user_id?: string; days_back?: number }>(request);
+  const body = await parseJsonBody<{
+    user_id?: string;
+    days_back?: number;
+    start_date?: string;
+    end_date?: string;
+  }>(request);
   const userId = body?.user_id || ctx.userId;
   const daysBack = body?.days_back || 365;
 
-  if (daysBack < 1 || daysBack > 730) {
+  if (!body?.start_date && (daysBack < 1 || daysBack > 730)) {
     return errorResponse('VALIDATION_ERROR', 400, 'days_back must be between 1 and 730');
+  }
+
+  if (body?.start_date && isNaN(Date.parse(body.start_date))) {
+    return errorResponse('VALIDATION_ERROR', 400, 'start_date must be a valid ISO 8601 date');
+  }
+  if (body?.end_date && isNaN(Date.parse(body.end_date))) {
+    return errorResponse('VALIDATION_ERROR', 400, 'end_date must be a valid ISO 8601 date');
   }
 
   const user = await env.D1.prepare(
@@ -368,7 +460,19 @@ export async function backfillEmail(
   ).bind(userId, ctx.orgId).first();
   if (!user) return errorResponse('USER_NOT_FOUND', 404, 'User not found in your org');
 
-  const progress = await runHistoricalBackfill(userId, ctx.orgId, daysBack, env);
+  // Overlap prevention: check if a backfill is already running for this user
+  const existing = await env.KV.get<BackfillProgress>(
+    `backfill_progress:${userId}`,
+    'json'
+  );
+  if (existing && existing.status === 'in_progress') {
+    return errorResponse('INGESTION_IN_PROGRESS', 409, 'An ingestion is already in progress. Wait for it to complete or let it timeout.');
+  }
+
+  const progress = await runHistoricalBackfill(userId, ctx.orgId, daysBack, env, {
+    start_date: body?.start_date,
+    end_date: body?.end_date,
+  });
 
   return jsonResponse({ ok: true, progress });
 }

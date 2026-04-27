@@ -38,6 +38,8 @@ interface FireflyTranscript {
 interface BackfillBody {
   api_key?: string;
   days?: number;
+  start_date?: string;
+  end_date?: string;
 }
 
 interface BackfillResult {
@@ -64,8 +66,21 @@ export async function handleFireflyBackfill(
   const daysRaw = body?.days ?? 30;
   const days = Math.min(Math.max(Math.floor(daysRaw), 1), 90);
   const now = Date.now();
-  const fromDate = new Date(now - days * 86400000).toISOString();
-  const toDate = new Date(now).toISOString();
+
+  let fromDate: string;
+  let toDate: string;
+
+  if (body?.start_date) {
+    const parsed = Date.parse(body.start_date);
+    if (isNaN(parsed)) {
+      return errorResponse('VALIDATION_ERROR', 400, 'start_date must be a valid ISO 8601 date');
+    }
+    fromDate = new Date(parsed).toISOString();
+    toDate = body.end_date ? new Date(Date.parse(body.end_date)).toISOString() : new Date(now).toISOString();
+  } else {
+    fromDate = new Date(now - days * 86400000).toISOString();
+    toDate = new Date(now).toISOString();
+  }
 
   const result: BackfillResult = {
     total_found: 0,

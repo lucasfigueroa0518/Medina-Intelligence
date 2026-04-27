@@ -458,6 +458,11 @@ async function routeAuthenticated(
     return handleFireflyBackfill(request, ctx, env);
   }
 
+  // Custom date-range ingestion trigger — any authenticated user
+  if (path === '/api/admin/trigger-ingestion' && method === 'POST') {
+    return Admin.triggerIngestion(request, ctx, env);
+  }
+
   // --- Admin (owner/admin only) ---
   if (path.startsWith('/api/admin')) {
     const forbidden = requireRole(ctx, ['owner', 'admin']);
