@@ -518,10 +518,24 @@ export async function processIntelligentImport(
   file: File,
   orgId: string,
   userId: string,
-  env: Env
+  env: Env,
+  importJobId?: string
 ): Promise<ImportResult> {
   const errors: string[] = [];
   const documentId = crypto.randomUUID();
+  // Helper to log lineage so the undo endpoint can revert exactly what was
+  // created. Only CREATEs are tracked; updates to pre-existing entities are
+  // intentionally not undoable (they entangle with downstream enrichment).
+  const logCreated = async (entityType: 'contact' | 'company' | 'deal' | 'document', entityId: string) => {
+    if (!importJobId) return;
+    try {
+      await env.D1.prepare(
+        `INSERT OR IGNORE INTO import_lineage (import_job_id, entity_type, entity_id) VALUES (?, ?, ?)`
+      ).bind(importJobId, entityType, entityId).run();
+    } catch (e) {
+      console.error(`[doc-intel] lineage log failed for ${entityType}/${entityId}:`, e);
+    }
+  };
   const now = new Date().toISOString();
   const r2Key = `${orgId}/document/${now.slice(0, 7)}/${documentId}_${file.name}`;
 
@@ -580,6 +594,7 @@ export async function processIntelligentImport(
     text.slice(0, 500),
     now, now
   ).run();
+  await logCreated('document', documentId);
 
   // Match + Route companies first (contacts may reference them)
   const companyLookup = new Map<string, string>();
@@ -591,7 +606,7 @@ export async function processIntelligentImport(
       const match = await matchCompany(company, orgId, env);
       const result = await routeCompany(company, match, orgId, documentId, env);
       companyLookup.set(company.name.toLowerCase(), result.id);
-      if (result.created) companiesCreated++;
+      if (result.created) { companiesCreated++; await logCreated('company', result.id); }
       if (result.updated) companiesUpdated++;
     } catch (e: any) {
       errors.push(`Company "${company.name}": ${e.message}`);
@@ -606,7 +621,7 @@ export async function processIntelligentImport(
     try {
       const match = await matchContact(contact, orgId, env);
       const result = await routeContact(contact, match, orgId, documentId, env);
-      if (result.created) contactsCreated++;
+      if (result.created) { contactsCreated++; await logCreated('contact', result.id); }
       if (result.updated) contactsUpdated++;
 
       if (contact.company_name && result.id) {
@@ -627,7 +642,7 @@ export async function processIntelligentImport(
   for (const deal of extraction.deals) {
     try {
       const result = await routeDeal(deal, companyLookup, orgId, env);
-      if (result.created) dealsCreated++;
+      if (result.created) { dealsCreated++; await logCreated('deal', result.id); }
     } catch (e: any) {
       errors.push(`Deal "${deal.name}": ${e.message}`);
     }

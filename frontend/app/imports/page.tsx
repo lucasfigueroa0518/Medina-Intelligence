@@ -212,22 +212,39 @@ export default function ImportsPage() {
     setAnalyzeStep(0);
     setError(null);
 
-    const isSmall = file.size < 5 * 1024 * 1024;
-
     try {
-      if (isSmall) {
-        const data = await api.intelligentImport(file, true);
-        setResult(data.result);
-        setPhase('report');
-        setHistory(prev => [{ id: data.result.document_id, source_type: 'intelligent', status: 'completed', created_at: new Date().toISOString(), total_rows: data.result.entities_routed, created_rows: data.result.contacts_created + data.result.companies_created + data.result.deals_created, updated_rows: data.result.contacts_updated + data.result.companies_updated }, ...prev]);
-      } else {
-        const data = await api.intelligentImport(file, false);
-        const jobId = data.job_id;
-        await pollJob(jobId);
-      }
+      // Always async — server returns immediately with a job_id, processing
+      // happens in the background. User can leave the page; the job keeps
+      // running and shows up in history when they return.
+      const data = await api.intelligentImport(file);
+      const jobId = data.job_id;
+      // Surface the in-progress job in history right away.
+      setHistory(prev => [
+        { id: jobId, source_type: 'intelligent', status: 'processing',
+          created_at: new Date().toISOString(),
+          total_rows: 0, created_rows: 0, updated_rows: 0,
+          source_r2_key: data.file_name },
+        ...prev,
+      ]);
+      await pollJob(jobId);
     } catch (e: any) {
       setError(e.message || 'Import failed');
       setPhase('upload');
+    }
+  }
+
+  async function handleUndo(jobId: string) {
+    if (!confirm('Undo this import? Created contacts, companies, deals, and the document will be soft-deleted. Updates to pre-existing entities are not reverted.')) return;
+    try {
+      const r = await api.undoImport(jobId);
+      setHistory(prev => prev.map(j => j.id === jobId ? { ...j, status: 'reverted' } : j));
+      if (result?.document_id === jobId) {
+        setResult(null);
+        setPhase('upload');
+      }
+      alert(`Reverted: ${r.reverted.contact} contacts, ${r.reverted.company} companies, ${r.reverted.deal} deals, ${r.reverted.document} document, ${r.reverted.vectors} embeddings.`);
+    } catch (e: any) {
+      alert(`Undo failed: ${e?.message || e}`);
     }
   }
 
@@ -241,7 +258,7 @@ export default function ImportsPage() {
         if (job.status === 'completed') {
           setResult({
             document_id: job.id,
-            category: 'other',
+            category: 'reference',
             summary: `Processed ${job.total_rows || 0} entities from uploaded file.`,
             contacts_created: job.created_rows || 0,
             contacts_updated: job.updated_rows || 0,
@@ -253,6 +270,7 @@ export default function ImportsPage() {
             entities_routed: job.processed_rows || 0,
             errors: job.failed_rows ? [`${job.failed_rows} rows failed`] : [],
           });
+          setHistory(prev => prev.map(j => j.id === jobId ? { ...j, ...job } : j));
           setPhase('report');
           return;
         }
@@ -390,6 +408,7 @@ export default function ImportsPage() {
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Created</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Updated</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Status</th>
+                        <th className="text-right px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted"></th>
                       </tr>
                     </thead>
                     <tbody>
@@ -403,6 +422,23 @@ export default function ImportsPage() {
                           <td className="px-4 py-3 text-text-primary tabular-nums">{job.updated_rows ?? '—'}</td>
                           <td className="px-4 py-3">
                             <StatusBadge status={job.status} />
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            {job.status === 'completed' && (
+                              <button
+                                onClick={() => handleUndo(job.id)}
+                                className="text-xs text-text-muted hover:text-semantic-error transition-colors"
+                                title="Soft-delete created entities and remove the document"
+                              >
+                                Undo
+                              </button>
+                            )}
+                            {job.status === 'reverted' && (
+                              <span className="text-xs text-text-muted italic">reverted</span>
+                            )}
+                            {job.status === 'processing' && (
+                              <span className="text-xs text-accent-magenta">in progress…</span>
+                            )}
                           </td>
                         </tr>
                       ))}
@@ -473,7 +509,7 @@ export default function ImportsPage() {
 
   if (!result) return null;
 
-  const catConfig = CATEGORY_CONFIG[result.category] || CATEGORY_CONFIG.other;
+  const catConfig = CATEGORY_CONFIG[result.category] || CATEGORY_CONFIG.reference;
   const totalContacts = result.contacts_created + result.contacts_updated;
   const totalCompanies = result.companies_created + result.companies_updated;
 
@@ -482,9 +518,18 @@ export default function ImportsPage() {
       <TopBar
         title="Intelligence Report"
         actions={
-          <button className="btn-ghost flex items-center gap-2 text-sm" onClick={resetToUpload}>
-            <ArrowLeft size={14} /> New Import
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => handleUndo(result.document_id)}
+              className="btn-ghost text-sm text-semantic-error hover:bg-semantic-error/10"
+              title="Soft-delete created entities and remove the document"
+            >
+              Undo Import
+            </button>
+            <button className="btn-ghost flex items-center gap-2 text-sm" onClick={resetToUpload}>
+              <ArrowLeft size={14} /> New Import
+            </button>
+          </div>
         }
       />
       <div className="flex-1 p-6 overflow-auto">

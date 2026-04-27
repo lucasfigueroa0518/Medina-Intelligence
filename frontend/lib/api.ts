@@ -311,12 +311,19 @@ export const api = {
   // Imports
   listImports: () => request<{ imports: any[] }>('/imports'),
   getImportJob: (id: string) => request<{ job: any }>(`/imports/${id}`),
-  intelligentImport: (file: File, sync = false) => {
+  intelligentImport: (file: File) => {
     const fd = new FormData();
     fd.append('file', file);
-    if (sync) fd.append('sync', 'true');
-    return request<any>('/imports/intelligent', { method: 'POST', body: fd });
+    // Always async — server returns { job_id, status: 'processing' } and the
+    // import runs in waitUntil so the user can navigate away.
+    return request<{ job_id: string; status: string; file_name: string; message: string }>(
+      '/imports/intelligent', { method: 'POST', body: fd }
+    );
   },
+  undoImport: (jobId: string) =>
+    request<{ ok: boolean; job_id: string; reverted: { document: number; contact: number; company: number; deal: number; vectors: number }; note: string }>(
+      `/imports/${jobId}/undo`, { method: 'POST' }
+    ),
 
   // Auth
   login: (email: string, password: string) =>

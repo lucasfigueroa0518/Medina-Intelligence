@@ -509,6 +509,8 @@ async function routeAuthenticated(
   if (path === '/api/imports' && method === 'POST') {
     return Imports.uploadImport(request, ctx, env);
   }
+  m = path.match(/^\/api\/imports\/([^/]+)\/undo$/);
+  if (m && method === 'POST') return IntelligentImport.undoImport(m[1], ctx, env);
   m = path.match(/^\/api\/imports\/([^/]+)$/);
   if (m && method === 'GET') return Imports.getImportJob(m[1], ctx, env);
   m = path.match(/^\/api\/imports\/([^/]+)\/mapping$/);
