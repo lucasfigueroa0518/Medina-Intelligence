@@ -15,7 +15,10 @@ export async function receiveFireflyWebhook(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const signature = request.headers.get('X-Firefly-Signature') || '';
+  // Firefly sends HMAC-SHA256 in `x-hub-signature` (GitHub-style), formatted
+  // as `sha256=<hex>`. Despite some docs naming it X-Firefly-Signature, the
+  // actual production header is x-hub-signature.
+  const signature = request.headers.get('x-hub-signature') || '';
   const rawBody = await request.text();
 
   if (env.FIREFLY_WEBHOOK_SECRET) {
