@@ -286,6 +286,13 @@ export const api = {
 
   // Imports
   listImports: () => request<{ imports: any[] }>('/imports'),
+  getImportJob: (id: string) => request<{ job: any }>(`/imports/${id}`),
+  intelligentImport: (file: File, sync = false) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    if (sync) fd.append('sync', 'true');
+    return request<any>('/imports/intelligent', { method: 'POST', body: fd });
+  },
 
   // Auth
   login: (email: string, password: string) =>

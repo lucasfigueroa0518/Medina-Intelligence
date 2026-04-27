@@ -104,6 +104,13 @@ export interface ImportResult {
   signals_found: number;
   entities_routed: number;
   errors: string[];
+  extraction: {
+    contacts: ExtractedContact[];
+    companies: ExtractedCompany[];
+    deals: ExtractedDeal[];
+    relationships: ExtractedRelationship[];
+    signals: ExtractedSignal[];
+  };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -492,6 +499,7 @@ export async function processIntelligentImport(
       companies_created: 0, companies_updated: 0,
       deals_created: 0, relationships_found: 0, signals_found: 0,
       entities_routed: 0, errors: ['Text extraction returned insufficient content'],
+      extraction: { contacts: [], companies: [], deals: [], relationships: [], signals: [] },
     };
   }
 
@@ -643,5 +651,12 @@ export async function processIntelligentImport(
     signals_found: extraction.signals.length,
     entities_routed: totalRouted,
     errors,
+    extraction: {
+      contacts: extraction.contacts,
+      companies: extraction.companies,
+      deals: extraction.deals,
+      relationships: extraction.relationships,
+      signals: extraction.signals,
+    },
   };
 }
