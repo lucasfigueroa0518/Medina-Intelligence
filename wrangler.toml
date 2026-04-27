@@ -31,6 +31,17 @@ preview_id = "59205fe013c84c548579bc2b503750f6"
 [[vectorize]]
 binding = "VECTORIZE"
 index_name = "medina-ventures-main"
+# Metadata indexes (declared out-of-band via `wrangler vectorize
+# create-metadata-index`; not configurable via wrangler.toml). Filtered
+# queries against any of these fields require the index to exist BEFORE the
+# vector is upserted — vectors written before the index won't filter until
+# they're re-upserted. Current indexes:
+#   - org_id          (string)
+#   - document_type   (string)
+#   - primary_entity_id (string)
+# If the index is ever rebuilt or these are dropped, recreate with:
+#   npx wrangler vectorize create-metadata-index medina-ventures-main \
+#     --property-name=<field> --type=string
 
 # --- Workflows ---
 
