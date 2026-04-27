@@ -27,6 +27,8 @@ const THINKING_VERBS = [
   "Heating things up", "Making moves", "Building bridges",
   "Turning over stones", "Riding the wave", "Cutting through the noise",
   "Sharpening the brief", "Assembling the picture", "Locking in the signal",
+  "Shining Manny's shoes", "Helping Raul pick his outfit", "Ordering lunch for Tony",
+  "Helping Alvaro with Due Diligence", "Building firewalls for Adam",
 ];
 
 function useThinkingVerb(active: boolean) {
