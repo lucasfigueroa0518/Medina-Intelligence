@@ -21,12 +21,10 @@ export async function receiveFireflyWebhook(
   const signature = request.headers.get('x-hub-signature') || '';
   const rawBody = await request.text();
 
-  if (env.FIREFLY_WEBHOOK_SECRET) {
-    const valid = await verifyFireflySignature(
-      env.FIREFLY_WEBHOOK_SECRET,
-      rawBody,
-      signature
-    );
+  const kvSecret = await env.KV.get('firefly_webhook_secret');
+  const secret = kvSecret || env.FIREFLY_WEBHOOK_SECRET;
+  if (secret) {
+    const valid = await verifyFireflySignature(secret, rawBody, signature);
     if (!valid) {
       return jsonResponse({ error: 'INVALID_SIGNATURE' }, 401);
     }

@@ -278,6 +278,8 @@ export const api = {
   // Integrations
   getIntegrationsStatus: () =>
     request<IntegrationsStatusResponse>('/integrations/status'),
+  getFireflyWebhookSecret: () =>
+    request<{ secret: string }>('/integrations/firefly/webhook-secret'),
   fireflyBackfill: (apiKey: string, days: number) =>
     request<FireflyBackfillResult>('/admin/firefly-backfill', {
       method: 'POST',

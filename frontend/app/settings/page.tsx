@@ -1542,7 +1542,7 @@ const FIREFLY_WEBHOOK_URL = 'https://medina-ventures-api.intel-ad5.workers.dev/w
 
 const FIREFLY_TROUBLESHOOTING: Array<{ q: string; a: React.ReactNode }> = [
   { q: '"Webhook ready" but no transcripts appearing', a: <>Verify the webhook URL is correct in Firefly's Integrations → Webhooks settings. Check the History tab in Firefly's webhook config for delivery attempts. Make sure Firefly is set to auto-join your meetings (Settings → Recording &amp; Privacy).</> },
-  { q: 'Test event returns 401 Unauthorized', a: <>The signing secret doesn't match. Make sure the exact same secret string is set in both Firefly's webhook configuration AND your platform's <code className="text-xs bg-bg-input px-1 mx-1 rounded">FIREFLY_WEBHOOK_SECRET</code>. Try setting a new simple secret in both places.</> },
+  { q: 'Test event returns 401 Unauthorized', a: <>The signing secret doesn't match. Copy the secret from the setup guide above and paste it into Firefly's webhook Signing Secret field. Both values must be identical.</> },
   { q: 'Test event returns 200 but real meetings don\'t appear', a: <>Check that "Meeting Transcribed" is selected as a webhook event. Firefly only sends webhooks after the transcript is fully processed, which can take 5–15 minutes after a meeting ends.</> },
   { q: 'Meetings are being recorded but Firefly bot doesn\'t join', a: <>Go to Firefly Settings → Recording &amp; Privacy. Make sure "Auto-join" is enabled for your calendar. The Firefly bot needs calendar access to detect and join meetings.</> },
   { q: 'How to import past meeting transcripts', a: <>Use the "Import Transcripts" button on the Firefly card to pull historical transcripts from Firefly's API. You'll need your Firefly API key from Settings → Developer settings.</> },
@@ -1571,7 +1571,30 @@ function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
 }
 
 function FireflySetupGuide() {
-  const [copied, setCopied] = React.useState(false);
+  const [copiedUrl, setCopiedUrl] = React.useState(false);
+  const [copiedSecret, setCopiedSecret] = React.useState(false);
+  const [secret, setSecret] = React.useState<string | null>(null);
+  const [showSecret, setShowSecret] = React.useState(false);
+  const [loadingSecret, setLoadingSecret] = React.useState(false);
+
+  const loadSecret = React.useCallback(() => {
+    if (secret) return;
+    setLoadingSecret(true);
+    api.getFireflyWebhookSecret()
+      .then(d => setSecret(d.secret))
+      .catch(() => setSecret(null))
+      .finally(() => setLoadingSecret(false));
+  }, [secret]);
+
+  React.useEffect(() => { loadSecret(); }, [loadSecret]);
+
+  const copySecret = () => {
+    if (!secret) return;
+    navigator.clipboard.writeText(secret);
+    setCopiedSecret(true);
+    setTimeout(() => setCopiedSecret(false), 1500);
+  };
+
   return (
     <div>
       <div className="text-sm font-medium text-text-primary mb-2">How to connect Firefly</div>
@@ -1586,12 +1609,33 @@ function FireflySetupGuide() {
           Set the Webhook URL to:
           <div className="mt-1 flex items-center gap-2">
             <code className="text-xs bg-bg-input px-2 py-1 rounded font-mono text-text-primary truncate flex-1">{FIREFLY_WEBHOOK_URL}</code>
-            <button onClick={() => { navigator.clipboard.writeText(FIREFLY_WEBHOOK_URL); setCopied(true); setTimeout(() => setCopied(false), 1500); }} className="btn-ghost text-xs shrink-0">
-              {copied ? 'Copied' : 'Copy'}
+            <button onClick={() => { navigator.clipboard.writeText(FIREFLY_WEBHOOK_URL); setCopiedUrl(true); setTimeout(() => setCopiedUrl(false), 1500); }} className="btn-ghost text-xs shrink-0">
+              {copiedUrl ? 'Copied' : 'Copy'}
             </button>
           </div>
         </li>
-        <li>Set the Signing Secret to match the value configured in your platform (contact your admin if you don't know the signing secret)</li>
+        <li>
+          Set the Signing Secret to:
+          <div className="mt-1 flex items-center gap-2">
+            {loadingSecret ? (
+              <span className="text-xs text-text-muted">Loading...</span>
+            ) : secret ? (
+              <>
+                <code className="text-xs bg-bg-input px-2 py-1 rounded font-mono text-text-primary truncate flex-1 select-all">
+                  {showSecret ? secret : '••••••••••••••••••••••••••••••••'}
+                </code>
+                <button onClick={() => setShowSecret(s => !s)} className="btn-ghost text-xs shrink-0">
+                  {showSecret ? 'Hide' : 'Reveal'}
+                </button>
+                <button onClick={copySecret} className="btn-ghost text-xs shrink-0">
+                  {copiedSecret ? 'Copied' : 'Copy'}
+                </button>
+              </>
+            ) : (
+              <span className="text-xs text-semantic-error">Failed to load secret</span>
+            )}
+          </div>
+        </li>
         <li>Select these events: <span className="text-text-primary">"Meeting Transcribed"</span> and <span className="text-text-primary">"Meeting Summarized"</span></li>
         <li>Click <span className="text-text-primary">Continue</span>, then <span className="text-text-primary">"Send Test Event"</span> to verify</li>
         <li>You should see <span className="text-semantic-success">"Test event delivered successfully (HTTP 200)"</span></li>

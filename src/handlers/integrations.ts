@@ -47,6 +47,22 @@ export interface IntegrationsStatusResponse {
   firefly: IntegrationRow;
 }
 
+const WEBHOOK_SECRET_KV_KEY = 'firefly_webhook_secret';
+
+export async function getFireflyWebhookSecret(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  let secret = await env.KV.get(WEBHOOK_SECRET_KV_KEY);
+  if (!secret) {
+    const buf = new Uint8Array(32);
+    crypto.getRandomValues(buf);
+    secret = [...buf].map(b => b.toString(16).padStart(2, '0')).join('');
+    await env.KV.put(WEBHOOK_SECRET_KV_KEY, secret);
+  }
+  return jsonResponse({ secret });
+}
+
 export async function getIntegrationsStatus(
   request: Request,
   ctx: AuthContext,

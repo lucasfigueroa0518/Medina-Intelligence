@@ -494,6 +494,8 @@ async function routeAuthenticated(
     return Admin.getIntegrationStatus(ctx, env);
   if (path === '/api/integrations/status' && method === 'GET')
     return Integrations.getIntegrationsStatus(request, ctx, env);
+  if (path === '/api/integrations/firefly/webhook-secret' && method === 'GET')
+    return Integrations.getFireflyWebhookSecret(ctx, env);
 
   // --- Imports ---
   if (path === '/api/imports/intelligent' && method === 'POST') {
