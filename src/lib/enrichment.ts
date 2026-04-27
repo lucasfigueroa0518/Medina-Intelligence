@@ -922,9 +922,10 @@ async function extractNameFromWebsite(domain: string): Promise<string | null> {
   if (titleMatch) candidates.push(titleMatch[1]);
 
   for (const raw of candidates) {
-    let name = raw.trim().replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+    let name = raw.trim()
+      .replace(/&#8211;/g, '–').replace(/&#8212;/g, '—').replace(/&#x2013;/g, '–').replace(/&#x2014;/g, '—')
+      .replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&nbsp;/g, ' ');
     name = name.replace(TITLE_SUFFIXES, '').trim();
-    // Strip taglines after a separator: "Acme - Build the future" → "Acme"
     const sepIdx = name.search(/\s+[|\-–—:]\s+/);
     if (sepIdx > 1) name = name.slice(0, sepIdx).trim();
     name = name.replace(/\s*[|\-–—]\s*$/, '').trim();
@@ -933,6 +934,7 @@ async function extractNameFromWebsite(domain: string): Promise<string | null> {
     if (GENERIC_TITLES.has(name.toLowerCase())) continue;
     if (/^https?:\/\//i.test(name)) continue;
     if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(name)) continue;
+    if (/^(the|a|an)\s/i.test(name) && name.split(/\s+/).length > 4) continue;
     return name;
   }
   return null;
