@@ -108,11 +108,11 @@ export default function CompaniesPage() {
       header: 'Name',
       width: '220px',
       accessor: row => (
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-brand-gradient flex items-center justify-center text-white text-xs font-medium">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-8 h-8 shrink-0 rounded-lg bg-brand-gradient flex items-center justify-center text-white text-xs font-medium">
             {row.name?.charAt(0)}
           </div>
-          <span className="font-medium">{row.name}</span>
+          <span className="font-medium truncate" title={row.name}>{row.name}</span>
         </div>
       ),
     },

@@ -105,11 +105,11 @@ export default function ContactsPage() {
       header: 'Name',
       width: '220px',
       accessor: row => (
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-full bg-brand-gradient flex items-center justify-center text-white text-xs font-medium">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-8 h-8 shrink-0 rounded-full bg-brand-gradient flex items-center justify-center text-white text-xs font-medium">
             {row.full_name.charAt(0)}
           </div>
-          <span className="font-medium">{row.full_name}</span>
+          <span className="font-medium truncate" title={row.full_name}>{row.full_name}</span>
         </div>
       ),
       sortable: true,
@@ -118,7 +118,11 @@ export default function ContactsPage() {
       key: 'company',
       header: 'Company',
       width: '180px',
-      accessor: row => row.company_name || '\u2014',
+      accessor: row => (
+        <span className="truncate block" title={row.company_name || undefined}>
+          {row.company_name || '\u2014'}
+        </span>
+      ),
       sortable: true,
     },
     {

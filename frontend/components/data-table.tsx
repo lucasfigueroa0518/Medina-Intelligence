@@ -105,7 +105,7 @@ export function DataTable<T>({
                   </td>
                 )}
                 {columns.map(col => (
-                  <td key={col.key} className="px-4 py-3 text-text-primary">
+                  <td key={col.key} className="px-4 py-3 text-text-primary overflow-hidden" style={col.width ? { maxWidth: col.width } : undefined}>
                     {col.accessor(row)}
                   </td>
                 ))}
