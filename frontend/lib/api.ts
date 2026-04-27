@@ -71,7 +71,7 @@ export const api = {
   // Contacts
   listContacts: (params?: Record<string, string>) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ contacts: any[]; limit: number; offset: number }>(`/contacts${q}`);
+    return request<{ contacts: any[]; limit: number; offset: number; total: number }>(`/contacts${q}`);
   },
   getContact: (id: string) =>
     request<{ contact: any; tags: any[]; associations: any[] }>(`/contacts/${id}`),
@@ -101,7 +101,7 @@ export const api = {
   // Companies
   listCompanies: (params?: Record<string, string>) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ companies: any[] }>(`/companies${q}`);
+    return request<{ companies: any[]; limit: number; offset: number; total: number }>(`/companies${q}`);
   },
   getCompany: (id: string) =>
     request<{ company: any; contacts: any[]; deals: any[]; tags: any[]; news_articles: any[] }>(`/companies/${id}`),

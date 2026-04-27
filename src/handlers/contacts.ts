@@ -71,7 +71,9 @@ export async function listContacts(
 
   const sortBy = filter.sort_by || 'last_contact_date';
   const sortDir = filter.sort_dir === 'asc' ? 'ASC' : 'DESC';
-  const limit = Math.min(filter.limit || 50, 500);
+  // Default to 100/page, ceiling 500. Frontend uses cumulative "load more"
+  // pagination so initial load stays fast even at 10k+ records.
+  const limit = Math.min(filter.limit || 100, 500);
   const offset = filter.offset || 0;
 
   const havingClause =
@@ -91,7 +93,21 @@ export async function listContacts(
     LIMIT ? OFFSET ?
   `;
 
-  const result = await env.D1.prepare(sql).bind(...binds, limit, offset).all();
+  // Count query — same WHERE + same JOINs but bare COUNT, no GROUP BY/HAVING
+  // unless we're tag-filtering (which can change cardinality).
+  const countSql = `
+    SELECT COUNT(DISTINCT c.id) as n
+    FROM contacts c
+    LEFT JOIN companies co ON c.company_id = co.id
+    ${tagJoin}
+    WHERE ${where.join(' AND ')}
+  `;
+
+  const [result, countResult] = await Promise.all([
+    env.D1.prepare(sql).bind(...binds, limit, offset).all(),
+    env.D1.prepare(countSql).bind(...binds).first<{ n: number }>(),
+  ]);
+  const total = countResult?.n ?? 0;
 
   const contacts = result.results as any[];
   if (contacts.length > 0) {
@@ -113,7 +129,7 @@ export async function listContacts(
     }
   }
 
-  return jsonResponse({ contacts, limit, offset });
+  return jsonResponse({ contacts, limit, offset, total });
 }
 
 function sanitizeSortColumn(col: string): string {

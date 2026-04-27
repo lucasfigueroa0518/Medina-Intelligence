@@ -59,20 +59,41 @@ export default function ContactsPage() {
     api.getContactFilterCounts().then(setFilterCounts).catch(() => {});
   }, [loadTags]);
 
-  const loadContacts = React.useCallback(() => {
-    // Backend defaults to LIMIT 50 (max 500). The list view shows everything
-    // in one scroll, so request the upper bound. If the dataset ever grows
-    // past 500, swap this for proper pagination.
-    const params: Record<string, string> = { limit: '500' };
-    if (search) params.keyword = search;
-    if (filters.has_followup_overdue) params.has_followup_overdue = 'true';
+  // Cumulative pagination — initial load gets the first page; "Load more"
+  // appends the next page. Total comes from the server so the UI can show
+  // "X of Y". 100/page keeps initial render fast at any data scale.
+  const PAGE_SIZE = 100;
+  const [total, setTotal] = React.useState(0);
+  const [loadingMore, setLoadingMore] = React.useState(false);
 
+  const buildParams = React.useCallback((offset: number): Record<string, string> => {
+    const p: Record<string, string> = { limit: String(PAGE_SIZE), offset: String(offset) };
+    if (search) p.keyword = search;
+    if (filters.has_followup_overdue) p.has_followup_overdue = 'true';
+    return p;
+  }, [search, filters.has_followup_overdue]);
+
+  const loadContacts = React.useCallback(() => {
     setLoading(true);
     return api
-      .listContacts(params)
-      .then(data => setContacts(data.contacts as Contact[]))
+      .listContacts(buildParams(0))
+      .then(data => {
+        setContacts(data.contacts as Contact[]);
+        setTotal(data.total ?? data.contacts.length);
+      })
       .finally(() => setLoading(false));
-  }, [search, filters.has_followup_overdue]);
+  }, [buildParams]);
+
+  const loadMore = React.useCallback(() => {
+    if (loadingMore || contacts.length >= total) return;
+    setLoadingMore(true);
+    api.listContacts(buildParams(contacts.length))
+      .then(data => {
+        setContacts(prev => [...prev, ...(data.contacts as Contact[])]);
+        if (typeof data.total === 'number') setTotal(data.total);
+      })
+      .finally(() => setLoadingMore(false));
+  }, [buildParams, contacts.length, total, loadingMore]);
 
   React.useEffect(() => {
     loadContacts();
@@ -307,8 +328,8 @@ export default function ContactsPage() {
 
           <div className="text-sm text-text-secondary mb-4">
             {loading ? 'Loading...' : isFiltered
-              ? `Showing ${filteredContacts.length} of ${contacts.length} contacts`
-              : `${contacts.length} contacts`
+              ? `Showing ${filteredContacts.length} of ${contacts.length} loaded (${total} total)`
+              : `Showing ${contacts.length} of ${total} contacts`
             }
           </div>
           <DataTable
@@ -319,6 +340,17 @@ export default function ContactsPage() {
             getRowId={c => c.id}
             onRowClick={c => router.push(`/contacts/${c.id}`)}
           />
+          {!loading && contacts.length < total && (
+            <div className="flex justify-center mt-4">
+              <button
+                onClick={loadMore}
+                disabled={loadingMore}
+                className="btn-secondary text-sm"
+              >
+                {loadingMore ? 'Loading...' : `Load more (${total - contacts.length} remaining)`}
+              </button>
+            </div>
+          )}
         </div>
       </main>
 

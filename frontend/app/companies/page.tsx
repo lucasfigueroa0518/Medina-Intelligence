@@ -44,12 +44,33 @@ export default function CompaniesPage() {
     return () => clearTimeout(t);
   }, [toast]);
 
+  // Cumulative pagination — same shape as the contacts page: 100/page, total
+  // from server, "Load more" button below the list. Scales cleanly to ~10k
+  // records; if the dataset crosses 100k swap to cursor-based.
+  const PAGE_SIZE = 100;
+  const [total, setTotal] = React.useState(0);
+  const [loadingMore, setLoadingMore] = React.useState(false);
+
   const loadCompanies = React.useCallback(() => {
-    // Backend defaults to LIMIT 50 (max 500). Request the upper bound so the
-    // list shows everything; swap for paging when dataset crosses 500.
     setLoading(true);
-    api.listCompanies({ limit: '500' }).then(d => setCompanies(d.companies)).finally(() => setLoading(false));
+    api.listCompanies({ limit: String(PAGE_SIZE), offset: '0' })
+      .then(d => {
+        setCompanies(d.companies);
+        setTotal(d.total ?? d.companies.length);
+      })
+      .finally(() => setLoading(false));
   }, []);
+
+  const loadMore = React.useCallback(() => {
+    if (loadingMore || companies.length >= total) return;
+    setLoadingMore(true);
+    api.listCompanies({ limit: String(PAGE_SIZE), offset: String(companies.length) })
+      .then(d => {
+        setCompanies(prev => [...prev, ...d.companies]);
+        if (typeof d.total === 'number') setTotal(d.total);
+      })
+      .finally(() => setLoadingMore(false));
+  }, [companies.length, total, loadingMore]);
 
   async function handleCreateCompany() {
     if (!createForm.name.trim()) return;
@@ -264,8 +285,8 @@ export default function CompaniesPage() {
 
           <div className="text-sm text-text-secondary mb-4">
             {loading ? 'Loading...' : isFiltered
-              ? `Showing ${filtered.length} of ${companies.length} companies`
-              : `${companies.length} companies`
+              ? `Showing ${filtered.length} of ${companies.length} loaded (${total} total)`
+              : `Showing ${companies.length} of ${total} companies`
             }
           </div>
           <DataTable
@@ -276,6 +297,17 @@ export default function CompaniesPage() {
             getRowId={c => c.id}
             onRowClick={c => router.push(`/companies/${c.id}`)}
           />
+          {!loading && companies.length < total && (
+            <div className="flex justify-center mt-4">
+              <button
+                onClick={loadMore}
+                disabled={loadingMore}
+                className="btn-secondary text-sm"
+              >
+                {loadingMore ? 'Loading...' : `Load more (${total - companies.length} remaining)`}
+              </button>
+            </div>
+          )}
         </div>
       </main>
 

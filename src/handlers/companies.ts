@@ -54,12 +54,19 @@ export async function listCompanies(
   ]);
   const sortCol = allowedSort.has(sortBy) ? sortBy : 'name';
 
-  const limit = Math.min(f.limit || 50, 500);
+  // Default 100/page, ceiling 500. Frontend cumulative-paginates.
+  const limit = Math.min(f.limit || 100, 500);
   const offset = f.offset || 0;
 
-  const result = await env.D1.prepare(
-    `SELECT * FROM companies WHERE ${where.join(' AND ')} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`
-  ).bind(...binds, limit, offset).all();
+  const [result, countResult] = await Promise.all([
+    env.D1.prepare(
+      `SELECT * FROM companies WHERE ${where.join(' AND ')} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as n FROM companies WHERE ${where.join(' AND ')}`
+    ).bind(...binds).first<{ n: number }>(),
+  ]);
+  const total = countResult?.n ?? 0;
 
   const companies = result.results as any[];
   if (companies.length > 0) {
@@ -81,7 +88,7 @@ export async function listCompanies(
     }
   }
 
-  return jsonResponse({ companies, limit, offset });
+  return jsonResponse({ companies, limit, offset, total });
 }
 
 function parseCompanyFilter(url: URL): CompanyFilter {
