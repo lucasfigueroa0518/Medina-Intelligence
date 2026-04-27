@@ -347,6 +347,11 @@ export default function ImportsPage() {
                   </div>
                   <div className="text-sm font-medium text-text-primary">{file.name}</div>
                   <div className="text-xs text-text-muted">{formatFileSize(file.size)}</div>
+                  {file.size > 1024 * 1024 && (
+                    <div className="text-[11px] text-semantic-warning bg-semantic-warning/10 border-l-2 border-semantic-warning px-2 py-1 rounded text-left max-w-xs">
+                      Large file — analysis runs in the background. You can navigate away and come back; it'll show in your import history when done.
+                    </div>
+                  )}
                   <button
                     onClick={e => { e.preventDefault(); setFile(null); }}
                     className="text-[11px] text-text-muted hover:text-semantic-error transition-colors flex items-center gap-1 mt-1"

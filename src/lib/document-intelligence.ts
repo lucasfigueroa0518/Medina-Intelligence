@@ -250,6 +250,13 @@ const TABULAR_CATEGORIES = new Set<DocumentCategory>([
   'fund_reporting',
 ]);
 
+// Tabular text larger than this gets line-chunked across multiple Claude
+// calls so a 500-row XLSX doesn't get silently truncated at the 30k limit.
+const TABULAR_CHUNK_THRESHOLD = 15000;
+const TABULAR_LINES_PER_CHUNK = 80;
+const TABULAR_HEADER_LINES = 5;
+const TABULAR_MAX_CHUNKS = 12; // hard cap so a pathological file can't blow the LLM budget
+
 export async function extractEntities(
   text: string,
   category: DocumentCategory,
@@ -262,8 +269,17 @@ export async function extractEntities(
     return { category, contacts: [], companies: [], deals: [], relationships: [], signals: [], summary: '' };
   }
 
-  const system = BASE_EXTRACTION_SYSTEM + (CATEGORY_HINTS[category] || '');
   const isTabular = TABULAR_CATEGORIES.has(category);
+
+  // Line-chunked path for large tabular text. Keeps the first few lines as
+  // header context in every chunk so column meaning isn't lost. Results are
+  // merged + deduped by (name, email/domain) so the same row appearing in two
+  // chunks isn't double-routed.
+  if (isTabular && text.length > TABULAR_CHUNK_THRESHOLD) {
+    return extractTabularChunked(text, category, env, orgId);
+  }
+
+  const system = BASE_EXTRACTION_SYSTEM + (CATEGORY_HINTS[category] || '');
   const model = isTabular ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-6';
   const maxChars = isTabular ? 30000 : 20000;
   const truncated = text.length > maxChars ? text.slice(0, maxChars) + '\n[... truncated]' : text;
@@ -290,6 +306,78 @@ export async function extractEntities(
     console.error('[doc-intel] extraction failed — returning empty result:', e);
     return { category, contacts: [], companies: [], deals: [], relationships: [], signals: [], summary: '' };
   }
+}
+
+// Splits long tabular text into header-prefixed chunks, runs the same
+// extractor on each, and merges. Header (first ~5 lines) is repeated in every
+// chunk so column meaning isn't lost. Output is deduped within the merge so
+// the same row appearing in two adjacent chunks doesn't get double-routed.
+async function extractTabularChunked(
+  text: string,
+  category: DocumentCategory,
+  env: Env,
+  orgId: string
+): Promise<ExtractionResult> {
+  const lines = text.split('\n');
+  const headerEnd = Math.min(TABULAR_HEADER_LINES, lines.length);
+  const header = lines.slice(0, headerEnd).join('\n');
+  const dataLines = lines.slice(headerEnd);
+
+  const chunks: string[] = [];
+  for (let i = 0; i < dataLines.length && chunks.length < TABULAR_MAX_CHUNKS; i += TABULAR_LINES_PER_CHUNK) {
+    chunks.push(header + '\n' + dataLines.slice(i, i + TABULAR_LINES_PER_CHUNK).join('\n'));
+  }
+
+  console.log(`[doc-intel] tabular chunked extraction: ${chunks.length} chunks (${text.length} chars total, capped at ${TABULAR_MAX_CHUNKS})`);
+
+  const system = BASE_EXTRACTION_SYSTEM + (CATEGORY_HINTS[category] || '');
+  const merged: ExtractionResult = {
+    category,
+    contacts: [], companies: [], deals: [], relationships: [], signals: [],
+    summary: '',
+  };
+
+  for (let i = 0; i < chunks.length; i++) {
+    try {
+      const response = await callClaude(
+        { system, user: chunks[i], max_tokens: 4000, orgId, model: 'claude-haiku-4-5-20251001' },
+        'high',
+        env
+      );
+      const cleaned = response.trim().replace(/```json\s*/g, '').replace(/```/g, '').trim();
+      const parsed = JSON.parse(cleaned);
+      merged.contacts.push(...(parsed.contacts || []).filter((c: any) => c.full_name));
+      merged.companies.push(...(parsed.companies || []).filter((c: any) => c.name));
+      merged.deals.push(...(parsed.deals || []));
+      merged.relationships.push(...(parsed.relationships || []));
+      merged.signals.push(...(parsed.signals || []));
+      if (!merged.summary && parsed.summary) merged.summary = parsed.summary;
+    } catch (e) {
+      console.error(`[doc-intel] chunk ${i + 1}/${chunks.length} failed:`, e);
+      // Continue — partial extraction beats none.
+    }
+  }
+
+  // Dedupe within the merge so the same row spanning two chunks doesn't
+  // double-route. Cross-chunk dedup only — matchContact/matchCompany handle
+  // pre-existing CRM entities downstream.
+  const seenContacts = new Set<string>();
+  merged.contacts = merged.contacts.filter(c => {
+    const key = `${(c.full_name || '').toLowerCase()}|${(c.email || '').toLowerCase()}`;
+    if (seenContacts.has(key)) return false;
+    seenContacts.add(key);
+    return true;
+  });
+  const seenCompanies = new Set<string>();
+  merged.companies = merged.companies.filter(c => {
+    const key = `${(c.name || '').toLowerCase()}|${(c.domain || '').toLowerCase()}`;
+    if (seenCompanies.has(key)) return false;
+    seenCompanies.add(key);
+    return true;
+  });
+
+  console.log(`[doc-intel] tabular chunked merged: ${merged.contacts.length} contacts, ${merged.companies.length} companies`);
+  return merged;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
