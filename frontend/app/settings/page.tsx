@@ -17,6 +17,15 @@ import {
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
 
+type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals';
+
+const TABS: { id: SettingsTab; label: string }[] = [
+  { id: 'profile', label: 'Profile' },
+  { id: 'security', label: 'Security' },
+  { id: 'integrations', label: 'Sync & Integrations' },
+  { id: 'approvals', label: 'Approval Queue' },
+];
+
 export default function SettingsPageWrapper() {
   return (
     <React.Suspense fallback={<div className="flex-1 flex items-center justify-center text-text-secondary">Loading settings...</div>}>
@@ -28,6 +37,11 @@ export default function SettingsPageWrapper() {
 function SettingsPageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
+
+  const tabParam = searchParams.get('tab') as SettingsTab | null;
+  const [activeTab, setActiveTab] = React.useState<SettingsTab>(
+    tabParam && TABS.some(t => t.id === tabParam) ? tabParam : 'profile'
+  );
 
   const [banner, setBanner] = React.useState<{
     tone: 'success' | 'error';
@@ -52,7 +66,6 @@ function SettingsPageInner() {
     }
   }, []);
 
-  // Fetch on mount
   React.useEffect(() => {
     loadStatus();
   }, [loadStatus]);
@@ -65,17 +78,24 @@ function SettingsPageInner() {
 
     if (connected === 'outlook') {
       setShowFirstConnect(true);
-      router.replace('/settings');
+      setActiveTab('integrations');
+      router.replace('/settings?tab=integrations');
       loadStatus();
     } else if (err) {
       setBanner({
         tone: 'error',
         message: message || `Outlook connection failed: ${err}`,
       });
-      router.replace('/settings');
+      setActiveTab('integrations');
+      router.replace('/settings?tab=integrations');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams]);
+  }, []);
+
+  const switchTab = (tab: SettingsTab) => {
+    setActiveTab(tab);
+    router.replace(`/settings?tab=${tab}`, { scroll: false });
+  };
 
   const connectOutlook = () => {
     if (!API_ORIGIN) {
@@ -101,10 +121,32 @@ function SettingsPageInner() {
   return (
     <div className="flex-1 flex flex-col">
       <TopBar title="Settings" />
-      <div className="p-8 space-y-6 max-w-4xl">
+
+      {/* Tab bar */}
+      <div className="sticky top-0 z-10 bg-bg-primary border-b border-border">
+        <div className="max-w-4xl px-8 overflow-x-auto scrollbar-hide">
+          <div className="flex gap-0 min-w-max">
+            {TABS.map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => switchTab(tab.id)}
+                className={`px-5 py-3 text-sm whitespace-nowrap transition-colors ${
+                  activeTab === tab.id
+                    ? 'text-text-primary border-b-2 border-accent-magenta'
+                    : 'text-text-secondary hover:text-text-primary'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="p-8 max-w-4xl">
         {banner && (
           <div
-            className={`card border-l-4 ${
+            className={`card border-l-4 mb-6 ${
               banner.tone === 'success'
                 ? 'border-semantic-success'
                 : 'border-semantic-error'
@@ -114,74 +156,18 @@ function SettingsPageInner() {
           </div>
         )}
 
-        <ProfileSection />
-
-        <SecuritySection />
-
-        <div className="card">
-          <div className="font-medium mb-4">Sync Behavior</div>
-          <div className="space-y-3 text-sm">
-            <Toggle label="Auto-approve sync" />
-            <Toggle label="Re-ranker enabled" checked />
-            <Toggle label="News feed enabled" checked />
-            <Toggle label="LinkedIn enrichment enabled" checked />
-          </div>
-        </div>
-
-        <EmailSyncSection isOutlookConnected={status?.outlook?.status === 'connected'} />
-
-        <div className="card">
-          <div className="flex items-center justify-between mb-4">
-            <div className="font-medium">Integrations</div>
-            <button
-              onClick={loadStatus}
-              className="btn-ghost text-xs"
-              disabled={loading}
-            >
-              {loading ? 'Refreshing...' : 'Refresh'}
-            </button>
-          </div>
-
-          {error ? (
-            <div className="text-sm text-semantic-error py-6">{error}</div>
-          ) : loading && !status ? (
-            <div className="space-y-3">
-              {[0, 1, 2, 3].map(i => (
-                <div
-                  key={i}
-                  className="h-16 bg-bg-surface-hover rounded-lg animate-pulse"
-                />
-              ))}
-            </div>
-          ) : status ? (
-            <div className="space-y-3">
-              <IntegrationRowView
-                name="Microsoft Outlook 365"
-                description="Email, calendar, and contacts via Microsoft Graph. Also used for campaign sends."
-                row={status.outlook}
-                onPrimaryClick={connectOutlook}
-                primaryLabel={
-                  status.outlook.status === 'connected' ? 'Reconnect' : 'Connect'
-                }
-              />
-              <IntegrationRowView
-                name="Slack"
-                description="Public + private channel messages via the bot token."
-                row={status.slack}
-                primaryLabel={null}
-              />
-              <IntegrationRowView
-                name="ReverseContact (LinkedIn)"
-                description="LinkedIn contact + company enrichment."
-                row={status.reversecontact}
-                primaryLabel={null}
-              />
-              <FireflyIntegrationCard row={status.firefly} />
-            </div>
-          ) : null}
-        </div>
-
-        <ApprovalQueueSection />
+        {activeTab === 'profile' && <ProfileSection />}
+        {activeTab === 'security' && <SecuritySection />}
+        {activeTab === 'integrations' && (
+          <SyncIntegrationsTab
+            status={status}
+            loading={loading}
+            error={error}
+            loadStatus={loadStatus}
+            connectOutlook={connectOutlook}
+          />
+        )}
+        {activeTab === 'approvals' && <ApprovalQueueSection />}
       </div>
 
       {showFirstConnect && (
@@ -200,6 +186,91 @@ function SettingsPageInner() {
     </div>
   );
 }
+
+// ─── Sync & Integrations Tab ─────��───────────────────────────────────────────
+
+function SyncIntegrationsTab({
+  status,
+  loading,
+  error,
+  loadStatus,
+  connectOutlook,
+}: {
+  status: IntegrationsStatusResponse | null;
+  loading: boolean;
+  error: string | null;
+  loadStatus: () => void;
+  connectOutlook: () => void;
+}) {
+  return (
+    <div className="space-y-6">
+      <div className="card">
+        <div className="font-medium mb-4">Sync Behavior</div>
+        <div className="space-y-3 text-sm">
+          <Toggle label="Auto-approve sync" />
+          <Toggle label="Re-ranker enabled" checked />
+          <Toggle label="News feed enabled" checked />
+          <Toggle label="LinkedIn enrichment enabled" checked />
+        </div>
+      </div>
+
+      <EmailSyncSection isOutlookConnected={status?.outlook?.status === 'connected'} />
+
+      <div className="card">
+        <div className="flex items-center justify-between mb-4">
+          <div className="font-medium">Integrations</div>
+          <button
+            onClick={loadStatus}
+            className="btn-ghost text-xs"
+            disabled={loading}
+          >
+            {loading ? 'Refreshing...' : 'Refresh'}
+          </button>
+        </div>
+
+        {error ? (
+          <div className="text-sm text-semantic-error py-6">{error}</div>
+        ) : loading && !status ? (
+          <div className="space-y-3">
+            {[0, 1, 2, 3].map(i => (
+              <div
+                key={i}
+                className="h-16 bg-bg-surface-hover rounded-lg animate-pulse"
+              />
+            ))}
+          </div>
+        ) : status ? (
+          <div className="space-y-3">
+            <IntegrationRowView
+              name="Microsoft Outlook 365"
+              description="Email, calendar, and contacts via Microsoft Graph. Also used for campaign sends."
+              row={status.outlook}
+              onPrimaryClick={connectOutlook}
+              primaryLabel={
+                status.outlook.status === 'connected' ? 'Reconnect' : 'Connect'
+              }
+            />
+            <IntegrationRowView
+              name="Slack"
+              description="Public + private channel messages via the bot token."
+              row={status.slack}
+              primaryLabel={null}
+            />
+            <IntegrationRowView
+              name="ReverseContact (LinkedIn)"
+              description="LinkedIn contact + company enrichment."
+              row={status.reversecontact}
+              primaryLabel={null}
+            />
+            <FireflyIntegrationCard row={status.firefly} />
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+// ─── Helpers ──────────────���──────────────────────────────────────────────────
 
 function humanField(f: string): string {
   return (f || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
@@ -524,12 +595,16 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
   );
 }
 
+// ─── Approval Queue ─────────────────────���────────────────────────────────────
+
 function ApprovalQueueSection() {
   const [entities, setEntities] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [expandedIds, setExpandedIds] = React.useState<Set<string>>(new Set());
   const [entityTypeFilter, setEntityTypeFilter] = React.useState<string>('');
   const [toast, setToast] = React.useState<string | null>(null);
+  const [showBulkConfirm, setShowBulkConfirm] = React.useState(false);
+  const [bulkApproving, setBulkApproving] = React.useState(false);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -571,6 +646,26 @@ function ApprovalQueueSection() {
     try { await api.rejectAllForEntity(entityType, entityId); load(); setToast('All dismissed'); } catch { setToast('Failed'); }
   }
 
+  async function handleBulkApproveAll() {
+    setBulkApproving(true);
+    try {
+      const allIds = entities.flatMap(e => e.updates.map((u: any) => u.id));
+      const result = await api.bulkApprove(allIds);
+      const resolved = result.resolved?.length || 0;
+      const conflicts = result.conflicts?.length || 0;
+      setToast(
+        conflicts > 0
+          ? `Approved ${resolved} items. ${conflicts} conflicts.`
+          : `Approved ${resolved} items.`
+      );
+      load();
+    } catch {
+      setToast('Bulk approve failed');
+    }
+    setBulkApproving(false);
+    setShowBulkConfirm(false);
+  }
+
   const totalPending = entities.reduce((s, e) => s + e.updates.length, 0);
 
   return (
@@ -598,6 +693,14 @@ function ApprovalQueueSection() {
           </select>
           <button onClick={load} disabled={loading} className="btn-ghost text-xs">
             {loading ? 'Loading...' : 'Refresh'}
+          </button>
+          <button
+            onClick={() => setShowBulkConfirm(true)}
+            disabled={totalPending === 0 || loading}
+            className="btn-primary text-xs py-1.5 px-3"
+            style={{ opacity: totalPending === 0 ? 0.5 : 1, cursor: totalPending === 0 ? 'not-allowed' : 'pointer' }}
+          >
+            Approve All
           </button>
         </div>
       </div>
@@ -716,6 +819,34 @@ function ApprovalQueueSection() {
         </div>
       )}
 
+      {/* Bulk Approve Confirmation Modal */}
+      {showBulkConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+          onClick={() => setShowBulkConfirm(false)}>
+          <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+            onClick={e => e.stopPropagation()}>
+            <div className="text-lg font-medium text-text-primary mb-2">Approve All Updates</div>
+            <div className="text-sm text-text-secondary mb-5">
+              Approve all {totalPending} pending update{totalPending !== 1 ? 's' : ''} across {entities.length} {entities.length === 1 ? 'entity' : 'entities'}?
+            </div>
+            <div className="flex justify-end gap-3">
+              <button className="btn-ghost text-sm" onClick={() => setShowBulkConfirm(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary text-sm"
+                onClick={handleBulkApproveAll}
+                disabled={bulkApproving}
+              >
+                {bulkApproving ? 'Approving...' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {toast && (
         <div className="fixed bottom-6 right-6 z-[60] bg-bg-elevated border-l-4 border-semantic-success rounded-xl shadow-2xl px-5 py-3">
           <div className="text-sm text-text-primary">{toast}</div>
@@ -724,6 +855,8 @@ function ApprovalQueueSection() {
     </div>
   );
 }
+
+// ─── Profile Section ─────────────────────────────────────────────────────────
 
 function ProfileSection() {
   const [user, setUser] = React.useState<UserProfile | null>(null);
@@ -754,7 +887,6 @@ function ProfileSection() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // Detect changes against the loaded user
   const hasChanges = React.useMemo(() => {
     if (!user) return false;
     const fields: Array<keyof UserProfile> = ['full_name', 'phone', 'job_title', 'linkedin_url', 'bio'];
@@ -778,7 +910,6 @@ function ProfileSection() {
     }
     setSaving(true);
     try {
-      // Send only changed fields. Empty strings → null for nullable fields.
       const payload: Record<string, string | null> = {};
       const fields: Array<keyof UserProfile> = ['full_name', 'phone', 'job_title', 'linkedin_url', 'bio'];
       for (const f of fields) {
@@ -889,65 +1020,25 @@ function ProfileSection() {
 
       <div className="grid grid-cols-2 gap-x-4 gap-y-4">
         <ProfileField label="Full name" required>
-          <input
-            type="text"
-            value={valueOf('full_name')}
-            onChange={e => update('full_name', e.target.value)}
-            className="input text-sm w-full"
-          />
+          <input type="text" value={valueOf('full_name')} onChange={e => update('full_name', e.target.value)} className="input text-sm w-full" />
         </ProfileField>
-
         <ProfileField label="Email" helper="Cannot be changed">
-          <input
-            type="email"
-            value={user.email}
-            disabled
-            className="input text-sm w-full"
-            style={{ opacity: 0.6, cursor: 'not-allowed' }}
-          />
+          <input type="email" value={user.email} disabled className="input text-sm w-full" style={{ opacity: 0.6, cursor: 'not-allowed' }} />
         </ProfileField>
-
         <ProfileField label="Job title">
-          <input
-            type="text"
-            value={valueOf('job_title')}
-            onChange={e => update('job_title', e.target.value)}
-            placeholder="e.g. Managing Partner"
-            className="input text-sm w-full"
-          />
+          <input type="text" value={valueOf('job_title')} onChange={e => update('job_title', e.target.value)} placeholder="e.g. Managing Partner" className="input text-sm w-full" />
         </ProfileField>
-
         <ProfileField label="Phone">
-          <input
-            type="tel"
-            value={valueOf('phone')}
-            onChange={e => update('phone', e.target.value)}
-            placeholder="+1 (555) 555-5555"
-            className="input text-sm w-full"
-          />
+          <input type="tel" value={valueOf('phone')} onChange={e => update('phone', e.target.value)} placeholder="+1 (555) 555-5555" className="input text-sm w-full" />
         </ProfileField>
-
         <div className="col-span-2">
           <ProfileField label="LinkedIn URL">
-            <input
-              type="url"
-              value={valueOf('linkedin_url')}
-              onChange={e => update('linkedin_url', e.target.value)}
-              placeholder="https://linkedin.com/in/..."
-              className="input text-sm w-full"
-            />
+            <input type="url" value={valueOf('linkedin_url')} onChange={e => update('linkedin_url', e.target.value)} placeholder="https://linkedin.com/in/..." className="input text-sm w-full" />
           </ProfileField>
         </div>
-
         <div className="col-span-2">
           <ProfileField label="Bio">
-            <textarea
-              value={valueOf('bio')}
-              onChange={e => update('bio', e.target.value)}
-              rows={3}
-              placeholder="A short bio for teammates"
-              className="input text-sm w-full resize-y"
-            />
+            <textarea value={valueOf('bio')} onChange={e => update('bio', e.target.value)} rows={3} placeholder="A short bio for teammates" className="input text-sm w-full resize-y" />
           </ProfileField>
         </div>
       </div>
@@ -989,6 +1080,8 @@ function ProfileField({ label, required, helper, children }: { label: string; re
     </div>
   );
 }
+
+// ─── Security Section ────────────────────────────────────────────────────────
 
 function SecuritySection() {
   return (
@@ -1035,7 +1128,6 @@ function TwoFactorPanel() {
     setBusy(true);
     try {
       const data = await api.mfaEnrollStart();
-      // Lazy-load qrcode to keep initial bundle small
       const QR = (await import('qrcode')).default;
       const qr = await QR.toDataURL(data.otpauth_url, { margin: 1, width: 200 });
       setEnrollment({ ...data, qr });
@@ -1186,14 +1278,8 @@ function ChangePasswordPanel() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (next.length < 8) {
-      setMsg({ tone: 'error', text: 'New password must be at least 8 characters' });
-      return;
-    }
-    if (next !== confirm) {
-      setMsg({ tone: 'error', text: 'New password and confirmation do not match' });
-      return;
-    }
+    if (next.length < 8) { setMsg({ tone: 'error', text: 'New password must be at least 8 characters' }); return; }
+    if (next !== confirm) { setMsg({ tone: 'error', text: 'New password and confirmation do not match' }); return; }
     setSaving(true);
     try {
       await api.changePassword(current, next);
@@ -1226,19 +1312,11 @@ function ChangePasswordPanel() {
           <input type="password" value={confirm} onChange={e => setConfirm(e.target.value)} autoComplete="new-password" className="input text-sm w-full" />
         </ProfileField>
         <div className="col-span-2 flex items-center gap-3">
-          <button
-            type="submit"
-            disabled={!canSubmit}
-            className="btn-secondary text-sm py-1.5"
-            style={{ opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}
-          >
+          <button type="submit" disabled={!canSubmit} className="btn-secondary text-sm py-1.5"
+            style={{ opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'not-allowed' }}>
             {saving ? 'Updating...' : 'Update Password'}
           </button>
-          {msg && (
-            <span className={`text-xs ${msg.tone === 'success' ? 'text-semantic-success' : 'text-semantic-error'}`}>
-              {msg.text}
-            </span>
-          )}
+          {msg && <span className={`text-xs ${msg.tone === 'success' ? 'text-semantic-success' : 'text-semantic-error'}`}>{msg.text}</span>}
         </div>
       </form>
     </div>
@@ -1253,38 +1331,22 @@ function ActiveSessionsPanel() {
 
   const load = React.useCallback(async () => {
     setLoading(true);
-    try {
-      const { sessions } = await api.listMySessions();
-      setSessions(sessions);
-    } catch { setSessions([]); }
+    try { const { sessions } = await api.listMySessions(); setSessions(sessions); } catch { setSessions([]); }
     setLoading(false);
   }, []);
 
   React.useEffect(() => { load(); }, [load]);
-
-  React.useEffect(() => {
-    if (!msg) return;
-    const t = setTimeout(() => setMsg(null), 3000);
-    return () => clearTimeout(t);
-  }, [msg]);
+  React.useEffect(() => { if (!msg) return; const t = setTimeout(() => setMsg(null), 3000); return () => clearTimeout(t); }, [msg]);
 
   async function revokeOne(id: string) {
     setBusy(id);
-    try {
-      await api.revokeMySession(id);
-      setMsg('Session revoked');
-      load();
-    } catch { setMsg('Failed to revoke session'); }
+    try { await api.revokeMySession(id); setMsg('Session revoked'); load(); } catch { setMsg('Failed to revoke session'); }
     setBusy(null);
   }
 
   async function logoutAllOthers() {
     setBusy('all');
-    try {
-      const { revoked } = await api.revokeAllOtherSessions();
-      setMsg(`Logged out of ${revoked} other ${revoked === 1 ? 'device' : 'devices'}`);
-      load();
-    } catch { setMsg('Failed to log out other sessions'); }
+    try { const { revoked } = await api.revokeAllOtherSessions(); setMsg(`Logged out of ${revoked} other ${revoked === 1 ? 'device' : 'devices'}`); load(); } catch { setMsg('Failed to log out other sessions'); }
     setBusy(null);
   }
 
@@ -1295,11 +1357,8 @@ function ActiveSessionsPanel() {
       <div className="flex items-center justify-between mb-3">
         <div className="text-sm text-text-secondary">Active sessions</div>
         {otherSessions.length > 0 && (
-          <button
-            onClick={logoutAllOthers}
-            disabled={busy === 'all'}
-            className="text-xs text-text-muted hover:text-semantic-error transition-colors flex items-center gap-1.5"
-          >
+          <button onClick={logoutAllOthers} disabled={busy === 'all'}
+            className="text-xs text-text-muted hover:text-semantic-error transition-colors flex items-center gap-1.5">
             <LogOut size={12} />
             {busy === 'all' ? 'Logging out...' : `Log out other ${otherSessions.length} device${otherSessions.length === 1 ? '' : 's'}`}
           </button>
@@ -1307,16 +1366,13 @@ function ActiveSessionsPanel() {
       </div>
 
       {loading ? (
-        <div className="space-y-2">
-          {[0, 1].map(i => <div key={i} className="h-12 bg-bg-surface-hover rounded-lg animate-pulse" />)}
-        </div>
+        <div className="space-y-2">{[0, 1].map(i => <div key={i} className="h-12 bg-bg-surface-hover rounded-lg animate-pulse" />)}</div>
       ) : !sessions || sessions.length === 0 ? (
         <div className="text-xs text-text-muted py-3">No active sessions found.</div>
       ) : (
         <div className="space-y-2">
           {sessions.map(s => (
-            <div key={s.id}
-              className="flex items-center justify-between px-3 py-2.5 rounded-lg"
+            <div key={s.id} className="flex items-center justify-between px-3 py-2.5 rounded-lg"
               style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}>
               <div className="flex items-center gap-3 min-w-0">
                 <div className="w-7 h-7 rounded-full flex items-center justify-center shrink-0"
@@ -1328,9 +1384,7 @@ function ActiveSessionsPanel() {
                     <span>Session</span>
                     {s.current && (
                       <span className="text-[9px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider"
-                        style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>
-                        Current
-                      </span>
+                        style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>Current</span>
                     )}
                   </div>
                   <div className="text-[11px] text-text-muted">
@@ -1339,12 +1393,8 @@ function ActiveSessionsPanel() {
                 </div>
               </div>
               {!s.current && (
-                <button
-                  onClick={() => revokeOne(s.id)}
-                  disabled={busy === s.id}
-                  className="text-text-muted hover:text-semantic-error transition-colors p-1.5"
-                  title="Revoke session"
-                >
+                <button onClick={() => revokeOne(s.id)} disabled={busy === s.id}
+                  className="text-text-muted hover:text-semantic-error transition-colors p-1.5" title="Revoke session">
                   <Trash2 size={14} />
                 </button>
               )}
@@ -1354,13 +1404,14 @@ function ActiveSessionsPanel() {
       )}
 
       {msg && <div className="text-xs text-text-muted mt-3">{msg}</div>}
-
       <div className="text-[10px] text-text-muted mt-3">
         Sessions don&apos;t track device or IP yet — you only see start/expiry times. We&apos;ll add device info in a future release.
       </div>
     </div>
   );
 }
+
+// ─── Shared UI Components ────────────────────────────────────────────────────
 
 function Toggle({ label, checked = false }: { label: string; checked?: boolean }) {
   const [on, setOn] = React.useState(checked);
@@ -1369,15 +1420,9 @@ function Toggle({ label, checked = false }: { label: string; checked?: boolean }
       <span className="text-text-secondary">{label}</span>
       <button
         onClick={() => setOn(!on)}
-        className={`w-10 h-6 rounded-full transition-colors ${
-          on ? 'bg-brand-gradient' : 'bg-bg-surface-hover'
-        }`}
+        className={`w-10 h-6 rounded-full transition-colors ${on ? 'bg-brand-gradient' : 'bg-bg-surface-hover'}`}
       >
-        <span
-          className={`block w-4 h-4 rounded-full bg-white transform transition-transform ${
-            on ? 'translate-x-5' : 'translate-x-1'
-          }`}
-        />
+        <span className={`block w-4 h-4 rounded-full bg-white transform transition-transform ${on ? 'translate-x-5' : 'translate-x-1'}`} />
       </button>
     </label>
   );
@@ -1429,14 +1474,10 @@ function IntegrationRowView({
         <div className="text-xs text-text-secondary mt-0.5">{description}</div>
         <div className={`text-xs mt-2 ${statusColor(row.status)}`}>● {row.label}</div>
         {row.detail && (
-          <div className={`text-xs mt-1 ${rateLimitColor || 'text-text-muted'}`}>
-            {row.detail}
-          </div>
+          <div className={`text-xs mt-1 ${rateLimitColor || 'text-text-muted'}`}>{row.detail}</div>
         )}
         {row.last_sync && (
-          <div className="text-xs text-text-muted mt-1">
-            Last sync: {formatRelative(row.last_sync)}
-          </div>
+          <div className="text-xs text-text-muted mt-1">Last sync: {formatRelative(row.last_sync)}</div>
         )}
         {row.items_processed != null && row.items_processed > 0 && (
           <div className="text-xs text-text-muted mt-0.5">
@@ -1444,44 +1485,26 @@ function IntegrationRowView({
             {row.items_failed ? `, ${row.items_failed} failed` : ''}
           </div>
         )}
-        {row.team_name && (
-          <div className="text-xs text-text-muted mt-1">
-            Team: {row.team_name}
-          </div>
-        )}
+        {row.team_name && <div className="text-xs text-text-muted mt-1">Team: {row.team_name}</div>}
         {row.channels_visible != null && (row.channels_visible > 0 || row.status === 'configured_no_channels') && (
           <div className="text-xs text-text-muted mt-0.5">
             {row.channels_visible} channel{row.channels_visible === 1 ? '' : 's'} visible
-            {row.messages_synced != null && (
-              <> • {row.messages_synced.toLocaleString()} message{row.messages_synced === 1 ? '' : 's'} synced</>
-            )}
+            {row.messages_synced != null && <> • {row.messages_synced.toLocaleString()} message{row.messages_synced === 1 ? '' : 's'} synced</>}
           </div>
         )}
         {row.warnings && row.warnings.length > 0 && (
           <div className="mt-2 space-y-1">
             {row.warnings.map((w, i) => (
-              <div
-                key={i}
-                className="text-xs text-semantic-warning bg-semantic-warning/10 border-l-2 border-semantic-warning px-2 py-1 rounded"
-              >
-                ⚠️ {w}
+              <div key={i} className="text-xs text-semantic-warning bg-semantic-warning/10 border-l-2 border-semantic-warning px-2 py-1 rounded">
+                {w}
               </div>
             ))}
           </div>
         )}
         {row.webhook_url && (
           <div className="mt-2 flex items-center gap-2">
-            <code className="text-xs bg-bg-input px-2 py-1 rounded font-mono text-text-primary truncate max-w-md">
-              {row.webhook_url}
-            </code>
-            <button
-              onClick={() => {
-                navigator.clipboard.writeText(row.webhook_url!);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1500);
-              }}
-              className="btn-ghost text-xs"
-            >
+            <code className="text-xs bg-bg-input px-2 py-1 rounded font-mono text-text-primary truncate max-w-md">{row.webhook_url}</code>
+            <button onClick={() => { navigator.clipboard.writeText(row.webhook_url!); setCopied(true); setTimeout(() => setCopied(false), 1500); }} className="btn-ghost text-xs">
               {copied ? 'Copied' : 'Copy'}
             </button>
           </div>
@@ -1491,16 +1514,9 @@ function IntegrationRowView({
       {primaryLabel && (
         <div className="shrink-0 flex items-center gap-2">
           {row.status === 'connected' && (
-            <span className="badge bg-semantic-success/10 text-semantic-success text-xs">
-              Manage
-            </span>
+            <span className="badge bg-semantic-success/10 text-semantic-success text-xs">Manage</span>
           )}
-          <button
-            onClick={onPrimaryClick}
-            className={
-              row.status === 'connected' ? 'btn-ghost text-xs' : 'btn-secondary text-xs py-1.5'
-            }
-          >
+          <button onClick={onPrimaryClick} className={row.status === 'connected' ? 'btn-ghost text-xs' : 'btn-secondary text-xs py-1.5'}>
             {primaryLabel}
           </button>
         </div>
@@ -1520,65 +1536,16 @@ function formatRelative(iso: string): string {
   return `${d}d ago`;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Firefly card — adds setup/troubleshooting accordion + Import button + modal
-// ────────────────────────────────────────────────────────────────────────────
+// ─── Firefly Card ─────────���───────────────────────────────────���──────────────
 
-const FIREFLY_WEBHOOK_URL =
-  'https://medina-ventures-api.intel-ad5.workers.dev/webhooks/firefly';
+const FIREFLY_WEBHOOK_URL = 'https://medina-ventures-api.intel-ad5.workers.dev/webhooks/firefly';
 
 const FIREFLY_TROUBLESHOOTING: Array<{ q: string; a: React.ReactNode }> = [
-  {
-    q: '"Webhook ready" but no transcripts appearing',
-    a: (
-      <>
-        Verify the webhook URL is correct in Firefly's Integrations → Webhooks settings.
-        Check the History tab in Firefly's webhook config for delivery attempts.
-        Make sure Firefly is set to auto-join your meetings (Settings → Recording &amp; Privacy).
-      </>
-    ),
-  },
-  {
-    q: 'Test event returns 401 Unauthorized',
-    a: (
-      <>
-        The signing secret doesn't match. Make sure the exact same secret string
-        is set in both Firefly's webhook configuration AND your platform's
-        <code className="text-xs bg-bg-input px-1 mx-1 rounded">FIREFLY_WEBHOOK_SECRET</code>.
-        Try setting a new simple secret in both places.
-      </>
-    ),
-  },
-  {
-    q: 'Test event returns 200 but real meetings don\'t appear',
-    a: (
-      <>
-        Check that "Meeting Transcribed" is selected as a webhook event.
-        Firefly only sends webhooks after the transcript is fully processed,
-        which can take 5–15 minutes after a meeting ends.
-      </>
-    ),
-  },
-  {
-    q: 'Meetings are being recorded but Firefly bot doesn\'t join',
-    a: (
-      <>
-        Go to Firefly Settings → Recording &amp; Privacy. Make sure "Auto-join" is
-        enabled for your calendar. The Firefly bot needs calendar access to
-        detect and join meetings.
-      </>
-    ),
-  },
-  {
-    q: 'How to import past meeting transcripts',
-    a: (
-      <>
-        Use the "Import Transcripts" button on the Firefly card to pull historical
-        transcripts from Firefly's API. You'll need your Firefly API key from
-        Settings → Developer settings.
-      </>
-    ),
-  },
+  { q: '"Webhook ready" but no transcripts appearing', a: <>Verify the webhook URL is correct in Firefly's Integrations → Webhooks settings. Check the History tab in Firefly's webhook config for delivery attempts. Make sure Firefly is set to auto-join your meetings (Settings → Recording &amp; Privacy).</> },
+  { q: 'Test event returns 401 Unauthorized', a: <>The signing secret doesn't match. Make sure the exact same secret string is set in both Firefly's webhook configuration AND your platform's <code className="text-xs bg-bg-input px-1 mx-1 rounded">FIREFLY_WEBHOOK_SECRET</code>. Try setting a new simple secret in both places.</> },
+  { q: 'Test event returns 200 but real meetings don\'t appear', a: <>Check that "Meeting Transcribed" is selected as a webhook event. Firefly only sends webhooks after the transcript is fully processed, which can take 5–15 minutes after a meeting ends.</> },
+  { q: 'Meetings are being recorded but Firefly bot doesn\'t join', a: <>Go to Firefly Settings → Recording &amp; Privacy. Make sure "Auto-join" is enabled for your calendar. The Firefly bot needs calendar access to detect and join meetings.</> },
+  { q: 'How to import past meeting transcripts', a: <>Use the "Import Transcripts" button on the Firefly card to pull historical transcripts from Firefly's API. You'll need your Firefly API key from Settings → Developer settings.</> },
 ];
 
 function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
@@ -1587,50 +1554,24 @@ function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
 
   return (
     <div>
-      <IntegrationRowView
-        name="Firefly AI"
-        description="Meeting transcription + action items via webhook."
-        row={row}
-        primaryLabel="Import Transcripts"
-        onPrimaryClick={() => setShowImport(true)}
-      />
-
-      <button
-        onClick={() => setGuideOpen(o => !o)}
-        className="mt-2 flex items-center gap-1 text-xs text-text-muted hover:text-text-primary transition-colors"
-      >
+      <IntegrationRowView name="Firefly AI" description="Meeting transcription + action items via webhook." row={row} primaryLabel="Import Transcripts" onPrimaryClick={() => setShowImport(true)} />
+      <button onClick={() => setGuideOpen(o => !o)} className="mt-2 flex items-center gap-1 text-xs text-text-muted hover:text-text-primary transition-colors">
         {guideOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
         Setup guide &amp; troubleshooting
       </button>
-
-      <div
-        className={`overflow-hidden transition-all duration-200 ${
-          guideOpen ? 'max-h-[2000px] opacity-100 mt-3' : 'max-h-0 opacity-0'
-        }`}
-      >
+      <div className={`overflow-hidden transition-all duration-200 ${guideOpen ? 'max-h-[2000px] opacity-100 mt-3' : 'max-h-0 opacity-0'}`}>
         <div className="border border-border/50 rounded-lg p-4 space-y-5 bg-bg-elevated/40">
           <FireflySetupGuide />
-          <div className="border-t border-border/50 pt-4">
-            <FireflyTroubleshooting />
-          </div>
+          <div className="border-t border-border/50 pt-4"><FireflyTroubleshooting /></div>
         </div>
       </div>
-
-      {showImport && (
-        <FireflyImportModal onClose={() => setShowImport(false)} />
-      )}
+      {showImport && <FireflyImportModal onClose={() => setShowImport(false)} />}
     </div>
   );
 }
 
 function FireflySetupGuide() {
   const [copied, setCopied] = React.useState(false);
-  const copyUrl = () => {
-    navigator.clipboard.writeText(FIREFLY_WEBHOOK_URL);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-
   return (
     <div>
       <div className="text-sm font-medium text-text-primary mb-2">How to connect Firefly</div>
@@ -1644,10 +1585,8 @@ function FireflySetupGuide() {
         <li>
           Set the Webhook URL to:
           <div className="mt-1 flex items-center gap-2">
-            <code className="text-xs bg-bg-input px-2 py-1 rounded font-mono text-text-primary truncate flex-1">
-              {FIREFLY_WEBHOOK_URL}
-            </code>
-            <button onClick={copyUrl} className="btn-ghost text-xs shrink-0">
+            <code className="text-xs bg-bg-input px-2 py-1 rounded font-mono text-text-primary truncate flex-1">{FIREFLY_WEBHOOK_URL}</code>
+            <button onClick={() => { navigator.clipboard.writeText(FIREFLY_WEBHOOK_URL); setCopied(true); setTimeout(() => setCopied(false), 1500); }} className="btn-ghost text-xs shrink-0">
               {copied ? 'Copied' : 'Copy'}
             </button>
           </div>
@@ -1658,9 +1597,7 @@ function FireflySetupGuide() {
         <li>You should see <span className="text-semantic-success">"Test event delivered successfully (HTTP 200)"</span></li>
         <li>Click <span className="text-text-primary">Continue → Update</span> to save</li>
       </ol>
-      <div className="text-xs text-text-muted mt-3">
-        Firefly will now automatically send meeting transcripts to your CRM when meetings are recorded.
-      </div>
+      <div className="text-xs text-text-muted mt-3">Firefly will now automatically send meeting transcripts to your CRM when meetings are recorded.</div>
     </div>
   );
 }
@@ -1675,18 +1612,11 @@ function FireflyTroubleshooting() {
           const open = openIdx === i;
           return (
             <div key={i} className="border-b border-border/30 last:border-0">
-              <button
-                onClick={() => setOpenIdx(open ? null : i)}
-                className="w-full flex items-center justify-between gap-2 py-2 text-left text-xs text-text-primary hover:text-accent-magenta transition-colors"
-              >
+              <button onClick={() => setOpenIdx(open ? null : i)} className="w-full flex items-center justify-between gap-2 py-2 text-left text-xs text-text-primary hover:text-accent-magenta transition-colors">
                 <span>{item.q}</span>
                 {open ? <ChevronUp className="w-3 h-3 shrink-0" /> : <ChevronDown className="w-3 h-3 shrink-0" />}
               </button>
-              <div
-                className={`overflow-hidden transition-all duration-200 ${
-                  open ? 'max-h-96 pb-2 opacity-100' : 'max-h-0 opacity-0'
-                }`}
-              >
+              <div className={`overflow-hidden transition-all duration-200 ${open ? 'max-h-96 pb-2 opacity-100' : 'max-h-0 opacity-0'}`}>
                 <div className="text-xs text-text-secondary leading-relaxed pl-2">→ {item.a}</div>
               </div>
             </div>
@@ -1706,70 +1636,32 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
   const [showErrorList, setShowErrorList] = React.useState(false);
 
   const submit = async () => {
-    if (!apiKey.trim()) {
-      setError('Enter your Firefly API key.');
-      return;
-    }
-    setError(null);
-    setLoading(true);
-    setResult(null);
-    try {
-      const r = await api.fireflyBackfill(apiKey.trim(), days);
-      setResult(r);
-    } catch (e: any) {
-      setError(e?.message || 'Backfill failed');
-    } finally {
-      setLoading(false);
-    }
+    if (!apiKey.trim()) { setError('Enter your Firefly API key.'); return; }
+    setError(null); setLoading(true); setResult(null);
+    try { const r = await api.fireflyBackfill(apiKey.trim(), days); setResult(r); } catch (e: any) { setError(e?.message || 'Backfill failed'); } finally { setLoading(false); }
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-      onClick={onClose}
-    >
-      <div
-        className="card w-full max-w-md mx-4 p-6 space-y-4"
-        onClick={e => e.stopPropagation()}
-      >
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div className="card w-full max-w-md mx-4 p-6 space-y-4" onClick={e => e.stopPropagation()}>
         <div className="flex items-start justify-between">
           <div>
             <div className="text-sm font-medium text-text-primary">Import Firefly transcripts</div>
-            <div className="text-xs text-text-secondary mt-0.5">
-              Pull historical meeting transcripts from your Firefly account.
-            </div>
+            <div className="text-xs text-text-secondary mt-0.5">Pull historical meeting transcripts from your Firefly account.</div>
           </div>
-          <button onClick={onClose} className="text-text-muted hover:text-text-primary">
-            <XIcon className="w-4 h-4" />
-          </button>
+          <button onClick={onClose} className="text-text-muted hover:text-text-primary"><XIcon className="w-4 h-4" /></button>
         </div>
 
         {!result && (
           <>
             <div>
               <label className="text-xs text-text-secondary block mb-1">Firefly API key</label>
-              <input
-                type="password"
-                value={apiKey}
-                onChange={e => setApiKey(e.target.value)}
-                placeholder="Paste your API key"
-                className="input w-full text-sm"
-                disabled={loading}
-                autoFocus
-              />
-              <div className="text-xs text-text-muted mt-1">
-                From <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span>
-              </div>
+              <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Paste your API key" className="input w-full text-sm" disabled={loading} autoFocus />
+              <div className="text-xs text-text-muted mt-1">From <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span></div>
             </div>
-
             <div>
               <label className="text-xs text-text-secondary block mb-1">Backfill window</label>
-              <select
-                value={days}
-                onChange={e => setDays(Number(e.target.value))}
-                className="input w-full text-sm"
-                disabled={loading}
-              >
+              <select value={days} onChange={e => setDays(Number(e.target.value))} className="input w-full text-sm" disabled={loading}>
                 <option value={7}>Last 7 days</option>
                 <option value={14}>Last 14 days</option>
                 <option value={30}>Last 30 days</option>
@@ -1777,32 +1669,14 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
                 <option value={90}>Last 90 days</option>
               </select>
             </div>
-
-            {error && (
-              <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">
-                {error}
-              </div>
-            )}
-
+            {error && <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">{error}</div>}
             <div className="flex justify-end gap-2 pt-2">
-              <button onClick={onClose} className="btn-ghost text-xs" disabled={loading}>
-                Cancel
-              </button>
+              <button onClick={onClose} className="btn-ghost text-xs" disabled={loading}>Cancel</button>
               <button onClick={submit} className="btn-primary text-xs" disabled={loading || !apiKey.trim()}>
-                {loading ? (
-                  <span className="flex items-center gap-1.5">
-                    <Loader2 className="w-3 h-3 animate-spin" /> Importing…
-                  </span>
-                ) : (
-                  'Import'
-                )}
+                {loading ? <span className="flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" /> Importing…</span> : 'Import'}
               </button>
             </div>
-            {loading && (
-              <div className="text-xs text-text-muted">
-                This can take a few minutes — Firefly's API is paced at one transcript per second.
-              </div>
-            )}
+            {loading && <div className="text-xs text-text-muted">This can take a few minutes — Firefly's API is paced at one transcript per second.</div>}
           </>
         )}
 
@@ -1814,19 +1688,10 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
               <Stat label="Skipped duplicates" value={result.skipped_duplicates} />
               <Stat label="Failed" value={result.failed} tone={result.failed > 0 ? 'error' : 'muted'} />
             </div>
-
-            {result.partial && (
-              <div className="text-xs text-semantic-warning bg-semantic-warning/10 border-l-2 border-semantic-warning px-2 py-1 rounded">
-                ⚠️ Partial result — {result.partial_reason}
-              </div>
-            )}
-
+            {result.partial && <div className="text-xs text-semantic-warning bg-semantic-warning/10 border-l-2 border-semantic-warning px-2 py-1 rounded">Partial result — {result.partial_reason}</div>}
             {result.errors.length > 0 && (
               <div>
-                <button
-                  onClick={() => setShowErrorList(o => !o)}
-                  className="flex items-center gap-1 text-xs text-text-muted hover:text-text-primary"
-                >
+                <button onClick={() => setShowErrorList(o => !o)} className="flex items-center gap-1 text-xs text-text-muted hover:text-text-primary">
                   {showErrorList ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                   {result.errors.length} error{result.errors.length === 1 ? '' : 's'}
                 </button>
@@ -1842,10 +1707,7 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
                 )}
               </div>
             )}
-
-            <div className="flex justify-end pt-2">
-              <button onClick={onClose} className="btn-secondary text-xs">Done</button>
-            </div>
+            <div className="flex justify-end pt-2"><button onClick={onClose} className="btn-secondary text-xs">Done</button></div>
           </div>
         )}
       </div>
@@ -1854,12 +1716,7 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
 }
 
 function Stat({ label, value, tone }: { label: string; value: number; tone?: 'success' | 'error' | 'muted' }) {
-  const color =
-    tone === 'success'
-      ? 'text-semantic-success'
-      : tone === 'error'
-        ? 'text-semantic-error'
-        : 'text-text-primary';
+  const color = tone === 'success' ? 'text-semantic-success' : tone === 'error' ? 'text-semantic-error' : 'text-text-primary';
   return (
     <div className="bg-bg-input rounded px-2 py-1.5">
       <div className="text-[10px] text-text-muted uppercase tracking-wide">{label}</div>
