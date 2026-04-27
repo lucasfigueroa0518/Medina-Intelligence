@@ -282,11 +282,15 @@ export async function distributeMeetingSummary(
     const convId = crypto.randomUUID();
     const now = new Date().toISOString();
 
+    // conversations.source CHECK accepts outlook/slack/manual (not firefly);
+    // tag as 'manual' and rely on from_email='meeting-summary@firefly' for
+    // origin attribution. The conversations table also has no `visibility`
+    // column despite earlier code referencing one — leave it out.
     await env.D1.prepare(
       `INSERT OR IGNORE INTO conversations
          (id, org_id, source, subject, body_r2_key, body_preview, direction, sent_at,
-          from_email, to_emails, participant_user_ids, is_campaign_email, visibility, created_at, updated_at)
-       VALUES (?, ?, 'firefly', ?, ?, ?, 'internal', ?, 'meeting-summary@firefly', '', '[]', 0, 'org_wide', ?, ?)`
+          from_email, to_emails, participant_user_ids, is_campaign_email, created_at, updated_at)
+       VALUES (?, ?, 'manual', ?, ?, ?, 'internal', ?, 'meeting-summary@firefly', '', '[]', 0, ?, ?)`
     ).bind(
       convId, orgId,
       `Meeting Summary: ${meetingTitle}`,

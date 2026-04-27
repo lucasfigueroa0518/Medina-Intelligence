@@ -11,6 +11,8 @@ import { chunkTranscriptBySpeakerTurns, determineOverlapTurns } from '../lib/chu
 import { chunkEmbedAndPersist } from '../lib/embedding';
 import { reconcileFireflyWithoutId } from '../lib/reconciliation';
 import { emitAudit } from '../lib/audit';
+import { autoCreateContactFromAttendee, extractAndRouteSignals } from '../lib/firefly-intelligence';
+import { autoLinkAttendees } from '../lib/associations';
 
 const FIREFLY_GRAPHQL = 'https://api.fireflies.ai/graphql';
 const PAGE_SIZE = 50;
@@ -284,26 +286,35 @@ async function ingestTranscript(
   if (!ours) return 'duplicate';
 
   // ── Attendees ──
+  // Three-step linkage:
+  //   1. Existing org user → user_id link, is_internal=1
+  //   2. Existing contact → contact_id link
+  //   3. Neither → auto-create contact from attendee (skips automated emails,
+  //      requires a usable display name) so the meeting graph isn't full of
+  //      orphan rows.
   for (const p of t.meeting_attendees || []) {
     const email = (p.email || '').toLowerCase().trim();
     if (!email) continue;
     const displayName = p.displayName || p.name || email.split('@')[0];
 
-    const [contact, user] = await Promise.all([
-      env.D1.prepare(
-        'SELECT id FROM contacts WHERE LOWER(email) = ? AND org_id = ? AND deleted_at IS NULL LIMIT 1'
-      ).bind(email, orgId).first<{ id: string }>(),
-      env.D1.prepare(
-        'SELECT id FROM users WHERE LOWER(email) = ? AND org_id = ? AND deleted_at IS NULL LIMIT 1'
-      ).bind(email, orgId).first<{ id: string }>(),
-    ]);
+    const user = await env.D1.prepare(
+      'SELECT id FROM users WHERE LOWER(email) = ? AND org_id = ? AND deleted_at IS NULL LIMIT 1'
+    ).bind(email, orgId).first<{ id: string }>();
+
+    let contactId: string | null = null;
+    if (!user) {
+      const auto = await autoCreateContactFromAttendee({
+        email, displayName, orgId, env,
+      });
+      if (auto) contactId = auto.contactId;
+    }
 
     await env.D1.prepare(
       `INSERT OR IGNORE INTO event_attendees
          (event_id, contact_id, user_id, email, display_name, role, is_internal)
        VALUES (?, ?, ?, ?, ?, 'attendee', ?)`
     )
-      .bind(eventId, contact?.id || null, user?.id || null, email, displayName, user ? 1 : 0)
+      .bind(eventId, contactId, user?.id || null, email, displayName, user ? 1 : 0)
       .run();
   }
 
@@ -348,6 +359,25 @@ async function ingestTranscript(
     );
   } catch (e) {
     console.error('[firefly-backfill] reconciliation failed:', e);
+  }
+
+  // ── Co-meeting graph: link every pair of contact-bearing attendees ──
+  try {
+    await autoLinkAttendees(eventId, orgId, env);
+  } catch (e) {
+    console.error('[firefly-backfill] autoLinkAttendees failed:', e);
+  }
+
+  // ── Transcript intelligence: signals + summary distribution ──
+  // Wrapped so a Claude failure doesn't lose the transcript we already
+  // persisted. The enrichment cron's Step 5 will retry next cycle if this
+  // fails (signals_extracted_at stays NULL).
+  if (transcriptText.length > 0) {
+    try {
+      await extractAndRouteSignals(eventId, orgId, env);
+    } catch (e) {
+      console.error('[firefly-backfill] signal extraction failed:', e);
+    }
   }
 
   return 'ingested';

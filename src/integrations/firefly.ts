@@ -5,6 +5,8 @@ import type { ChunkMetadata, SpeakerTurn } from '../types/interfaces';
 import { chunkEmbedAndPersist } from '../lib/embedding';
 import { reconcileFireflyWithoutId } from '../lib/reconciliation';
 import { emitAudit } from '../lib/audit';
+import { autoCreateContactFromAttendee } from '../lib/firefly-intelligence';
+import { autoLinkAttendees } from '../lib/associations';
 
 interface FireflyWebhookPayload {
   event_type: 'meeting_completed' | 'meeting_started' | 'transcript_ready';
@@ -128,31 +130,30 @@ export async function processFireflyWebhook(
     console.error('Firefly reconciliation failed:', e);
   }
 
-  // Add attendees
+  // Add attendees — auto-create contact from email when none exists, so the
+  // co-meeting graph and downstream relationship signals have real entities
+  // to point at instead of orphan rows.
   for (const p of payload.participants) {
     const email = p.email || '';
     if (!email) continue;
 
-    const contact = await env.D1.prepare(
-      'SELECT id FROM contacts WHERE email = ? AND org_id = ? AND deleted_at IS NULL'
+    const user = await env.D1.prepare(
+      'SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND org_id = ? AND deleted_at IS NULL LIMIT 1'
     ).bind(email, orgId).first<{ id: string }>();
 
-    const user = await env.D1.prepare(
-      'SELECT id FROM users WHERE email = ? AND org_id = ?'
-    ).bind(email, orgId).first<{ id: string }>();
+    let contactId: string | null = null;
+    if (!user) {
+      const auto = await autoCreateContactFromAttendee({
+        email, displayName: p.name, orgId, env,
+      });
+      if (auto) contactId = auto.contactId;
+    }
 
     await env.D1.prepare(
       `INSERT OR IGNORE INTO event_attendees (event_id, contact_id, user_id, email, display_name, role, is_internal)
        VALUES (?, ?, ?, ?, ?, 'attendee', ?)`
     )
-      .bind(
-        eventId,
-        contact?.id || null,
-        user?.id || null,
-        email,
-        p.name,
-        user ? 1 : 0
-      )
+      .bind(eventId, contactId, user?.id || null, email, p.name, user ? 1 : 0)
       .run();
   }
 
@@ -195,6 +196,14 @@ export async function processFireflyWebhook(
         ).bind(entry.vectorId, entry.entityId, entry.sourceTable, entry.orgId).run();
       }
     }
+  }
+
+  // Co-meeting graph — needs autoCreateContactFromAttendee above to have run
+  // first so attendees actually have contact_ids to pair up.
+  try {
+    await autoLinkAttendees(eventId, orgId, env);
+  } catch (e) {
+    console.error('[firefly] autoLinkAttendees failed:', e);
   }
 
   await emitAudit(env, {
