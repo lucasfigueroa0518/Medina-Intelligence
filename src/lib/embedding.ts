@@ -65,7 +65,7 @@ export async function chunkEmbedAndPersist(
 
   return {
     vectorId,
-    entityId: meta.primary_entity_id,
+    entityId: meta.source_id,
     sourceTable: meta.source_table,
     orgId: meta.org_id,
   };

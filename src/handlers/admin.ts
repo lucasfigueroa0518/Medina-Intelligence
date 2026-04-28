@@ -3,7 +3,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { clearEnrichmentRateLimit } from '../lib/rate-limit';
-import { runEmbedding } from '../lib/embedding';
+import { runEmbedding, chunkEmbedAndPersistAll } from '../lib/embedding';
 import { emitAudit } from '../lib/audit';
 import { runHistoricalBackfill, getUserSyncConfig, setUserSyncConfig, type BackfillProgress } from '../integrations/outlook';
 import { runDailyCron } from '../lib/daily-cron';
@@ -516,4 +516,86 @@ export async function updateSyncConfig(
   await setUserSyncConfig(ctx.userId, { sync_history_days: days }, env);
 
   return jsonResponse({ ok: true, sync_history_days: days });
+}
+
+export async function backfillUnembedded(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const orgId = ctx.orgId;
+
+  const unembedded = await env.D1.prepare(
+    `SELECT c.id, c.body_r2_key, c.source, c.subject, c.from_email, c.sent_at,
+            c.participant_user_ids
+       FROM conversations c
+       WHERE c.org_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM vector_entity_index vei
+            WHERE vei.source_table = 'conversations'
+              AND vei.entity_id = c.id
+         )
+       ORDER BY c.sent_at DESC
+       LIMIT 500`
+  ).bind(orgId).all<{
+    id: string; body_r2_key: string | null; source: string; subject: string | null;
+    from_email: string | null; sent_at: string | null; participant_user_ids: string | null;
+  }>();
+
+  let embedded = 0;
+  let skipped = 0;
+  let failed = 0;
+  const errors: string[] = [];
+
+  const BATCH_SIZE = 10;
+  for (let b = 0; b < unembedded.results.length; b += BATCH_SIZE) {
+    const batch = unembedded.results.slice(b, b + BATCH_SIZE);
+    for (const row of batch) {
+      if (!row.body_r2_key) { skipped++; continue; }
+      try {
+        const obj = await env.R2.get(row.body_r2_key);
+        if (!obj) { skipped++; continue; }
+        const body = await obj.text();
+
+        const meta = {
+          org_id: orgId,
+          visibility: 'org_wide' as const,
+          participant_user_ids: row.participant_user_ids || undefined,
+          document_type: row.source === 'manual' ? 'transcript' : 'email',
+          source_table: 'conversations',
+          source_id: row.id,
+          r2_key: row.body_r2_key,
+          created_at: row.sent_at || new Date().toISOString(),
+          primary_entity_id: row.id,
+          entity_name: row.subject || undefined,
+          date: row.sent_at || undefined,
+        };
+
+        const entries = await chunkEmbedAndPersistAll(body, meta, env);
+        if (entries.length > 0) {
+          await env.D1.batch(
+            entries.map(e =>
+              env.D1.prepare(
+                'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+              ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+            )
+          );
+          embedded++;
+        } else {
+          skipped++;
+        }
+      } catch (e) {
+        failed++;
+        errors.push(`${row.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
+  return jsonResponse({
+    ok: true,
+    total_unembedded: unembedded.results.length,
+    embedded,
+    skipped,
+    failed,
+    errors: errors.slice(0, 20),
+  });
 }

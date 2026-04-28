@@ -1,6 +1,8 @@
 import type { Env } from '../types/env';
+import type { ChunkMetadata } from '../types/interfaces';
 import type { TranscriptSignals, ContactSignal, CompanySignal, DealSignal, RelationshipSignal } from './transcript-extraction';
 import { hashShort } from './helpers';
+import { chunkEmbedAndPersistAll } from './embedding';
 
 interface RoutedSignalResult {
   contact_signals_routed: number;
@@ -303,6 +305,33 @@ export async function distributeMeetingSummary(
     await env.D1.prepare(
       `INSERT OR IGNORE INTO conversation_contacts (conversation_id, contact_id) VALUES (?, ?)`
     ).bind(convId, att.contact_id).run();
+
+    try {
+      const meta: ChunkMetadata = {
+        org_id: orgId,
+        visibility: 'org_wide',
+        document_type: 'transcript',
+        source_table: 'conversations',
+        source_id: convId,
+        r2_key: r2Key,
+        created_at: now,
+        primary_entity_id: att.contact_id,
+        entity_name: meetingTitle,
+        date: startTime,
+      };
+      const entries = await chunkEmbedAndPersistAll(summary, meta, env);
+      if (entries.length > 0) {
+        await env.D1.batch(
+          entries.map(e =>
+            env.D1.prepare(
+              'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+            ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+          )
+        );
+      }
+    } catch (e) {
+      console.error(`[signal-router] embed failed for meeting summary conv=${convId}:`, e);
+    }
 
     distributed++;
   }

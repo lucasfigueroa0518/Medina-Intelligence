@@ -23,6 +23,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await flagStaleOrphanedEvents(orgId, env); } catch (e) { console.error('Orphan flagging:', e); }
   try { await recalculateAllAssociations(orgId, env); } catch (e) { console.error('Association recalc:', e); }
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
+  try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
 }
 
 export async function applyNewsScoreDecay(orgId: string, env: Env): Promise<void> {
@@ -380,4 +381,69 @@ export async function checkWebhookHealth(orgId: string, env: Env): Promise<void>
     // No Firefly events in last 24h — non-fatal warning
     console.warn(`[webhook-health] No Firefly webhooks received in 24h for org ${orgId}`);
   }
+}
+
+export async function backfillUnembeddedConversations(orgId: string, env: Env): Promise<number> {
+  const { chunkEmbedAndPersistAll } = await import('./embedding');
+
+  const rows = await env.D1.prepare(
+    `SELECT c.id, c.body_r2_key, c.source, c.subject, c.from_email, c.sent_at, c.participant_user_ids
+       FROM conversations c
+       WHERE c.org_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM vector_entity_index vei
+            WHERE vei.source_table = 'conversations'
+              AND vei.entity_id = c.id
+         )
+       ORDER BY c.sent_at DESC
+       LIMIT 20`
+  ).bind(orgId).all<{
+    id: string; body_r2_key: string | null; source: string; subject: string | null;
+    from_email: string | null; sent_at: string | null; participant_user_ids: string | null;
+  }>();
+
+  if (rows.results.length === 0) return 0;
+
+  let embedded = 0;
+  for (const row of rows.results) {
+    if (!row.body_r2_key) continue;
+    try {
+      const obj = await env.R2.get(row.body_r2_key);
+      if (!obj) continue;
+      const body = await obj.text();
+
+      const meta = {
+        org_id: orgId,
+        visibility: 'org_wide' as const,
+        participant_user_ids: row.participant_user_ids || undefined,
+        document_type: row.source === 'manual' ? 'transcript' : 'email',
+        source_table: 'conversations',
+        source_id: row.id,
+        r2_key: row.body_r2_key,
+        created_at: row.sent_at || new Date().toISOString(),
+        primary_entity_id: row.id,
+        entity_name: row.subject || undefined,
+        date: row.sent_at || undefined,
+      };
+
+      const entries = await chunkEmbedAndPersistAll(body, meta, env);
+      if (entries.length > 0) {
+        await env.D1.batch(
+          entries.map(e =>
+            env.D1.prepare(
+              'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+            ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+          )
+        );
+        embedded++;
+      }
+    } catch (e) {
+      console.error(`[daily-cron] embed backfill failed for conv ${row.id}:`, e);
+    }
+  }
+
+  if (embedded > 0) {
+    console.log(`[daily-cron] backfilled ${embedded} unembedded conversations for org ${orgId}`);
+  }
+  return embedded;
 }

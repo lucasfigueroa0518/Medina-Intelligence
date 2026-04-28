@@ -439,6 +439,27 @@ export async function runHistoricalBackfill(
       const { stageAndCommitApprovals } = await import('../lib/stage-approvals');
       const classified = await classifyAndDeduplicate(items, orgId, env);
       await stageAndCommitApprovals(classified, orgId, `backfill-${userId}`, env);
+
+      const { chunkEmbedAndPersistAll } = await import('../lib/embedding');
+      for (let b = 0; b < classified.length; b += 5) {
+        const batch = classified.slice(b, b + 5);
+        for (const item of batch) {
+          try {
+            const entries = await chunkEmbedAndPersistAll(item.text, item.metadata, env);
+            if (entries.length > 0) {
+              await env.D1.batch(
+                entries.map(e =>
+                  env.D1.prepare(
+                    'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+                  ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+                )
+              );
+            }
+          } catch (e) {
+            console.error(`[backfill] embed failed for ${item.entityId}:`, e);
+          }
+        }
+      }
     }
 
     progress.total_fetched += data.value.length;
@@ -475,10 +496,16 @@ interface OutlookCalendarEvent {
   organizer: { emailAddress: { name?: string; address: string } };
 }
 
+export interface CalendarSyncResult {
+  events_upserted: number;
+  errors: Array<{ user_id: string; error: string; http_status?: number }>;
+}
+
 export async function fetchOutlookCalendarDelta(
   orgId: string,
   env: Env
-): Promise<void> {
+): Promise<CalendarSyncResult> {
+  const result: CalendarSyncResult = { events_upserted: 0, errors: [] };
   const users = await getActiveUsersForOrg(orgId, env);
 
   for (const user of users) {
@@ -486,15 +513,22 @@ export async function fetchOutlookCalendarDelta(
       `token_failed:${user.id}:outlook`,
       'json'
     );
-    if (failState && failState.count >= 3) continue;
+    if (failState && failState.count >= 3) {
+      result.errors.push({ user_id: user.id, error: 'token_failed_threshold_exceeded' });
+      continue;
+    }
 
     const refreshResult = await refreshOutlookToken(user.id, orgId, env);
-    if (!refreshResult.success) continue;
+    if (!refreshResult.success) {
+      result.errors.push({ user_id: user.id, error: 'token_refresh_failed' });
+      continue;
+    }
 
     let token: string;
     try {
       token = await getDecryptedAccessToken(user.id, env);
     } catch {
+      result.errors.push({ user_id: user.id, error: 'token_decrypt_failed' });
       continue;
     }
 
@@ -527,12 +561,14 @@ export async function fetchOutlookCalendarDelta(
         await recordGraphApiCall(orgId, env);
 
         if (!resp.ok) {
-          if (resp.status === 410) {
+          const status = resp.status;
+          if (status === 410) {
             await env.KV.delete(deltaKey);
             console.warn(`[outlook] Calendar delta token expired (410) for user ${user.id}, cleared for full re-sync`);
-          } else if (resp.status === 401) {
+          } else if (status === 401) {
             await recordTokenFailure(user.id, 'outlook', env);
           }
+          result.errors.push({ user_id: user.id, error: `graph_api_error`, http_status: status });
           break;
         }
 
@@ -556,15 +592,20 @@ export async function fetchOutlookCalendarDelta(
       }
     } catch (e) {
       console.error(`Outlook calendar sync error for user ${user.id}:`, e);
+      result.errors.push({ user_id: user.id, error: e instanceof Error ? e.message : String(e) });
       continue;
     }
 
     for (const event of events) {
       try {
         await upsertOutlookEvent(event, orgId, env);
+        result.events_upserted++;
       } catch (e) {
         console.error(`Upsert event failed for ${event.id}:`, e);
+        result.errors.push({ user_id: user.id, error: `upsert_failed:${event.id}` });
       }
     }
   }
+
+  return result;
 }

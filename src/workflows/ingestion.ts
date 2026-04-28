@@ -103,7 +103,7 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       interface CoreSourceBundle {
         outlook: ClassifiableItem[];
         slack: ClassifiableItem[];
-        calendar: ClassifiableItem[];
+        calendar_events_upserted: number;
         failures: Array<{ source: string; error: string }>;
       }
 
@@ -118,14 +118,14 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
           const results = await Promise.allSettled([
             fetchOutlookDelta(org_id!, this.env),
             fetchSlackMessages(org_id!, this.env),
-            fetchOutlookCalendarDelta(org_id!, this.env).then(() => [] as ClassifiableItem[]),
+            fetchOutlookCalendarDelta(org_id!, this.env),
           ]);
 
           const failures: Array<{ source: string; error: string }> = [];
           const data: CoreSourceBundle = {
             outlook: [] as ClassifiableItem[],
             slack: [] as ClassifiableItem[],
-            calendar: [] as ClassifiableItem[],
+            calendar_events_upserted: 0,
             failures,
           };
 
@@ -148,7 +148,13 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
             failures.push({ source: 'slack', error: (results[1] as PromiseRejectedResult).reason?.message || 'unknown' });
           }
 
-          if (results[2].status === 'rejected') {
+          if (results[2].status === 'fulfilled') {
+            const calResult = results[2].value;
+            data.calendar_events_upserted = calResult.events_upserted;
+            for (const e of calResult.errors) {
+              failures.push({ source: `calendar:${e.user_id}`, error: `${e.error}${e.http_status ? ` (HTTP ${e.http_status})` : ''}` });
+            }
+          } else {
             failures.push({ source: 'calendar', error: (results[2] as PromiseRejectedResult).reason?.message || 'unknown' });
           }
 
@@ -179,14 +185,14 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         outlook: ClassifiableItem[];
         slack: ClassifiableItem[];
         news: ClassifiableItem[];
-        calendar: ClassifiableItem[];
+        calendar_events_upserted: number;
         failures: Array<{ source: string; error: string }>;
       }
       const sourceData: SourceBundle = {
         outlook: coreData.outlook,
         slack: coreData.slack,
         news: newsData.news,
-        calendar: coreData.calendar,
+        calendar_events_upserted: coreData.calendar_events_upserted,
         failures: [...coreData.failures, ...newsData.failures],
       };
 
@@ -205,7 +211,7 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
           fetched_outlook: sourceData.outlook.length,
           fetched_slack: sourceData.slack.length,
           fetched_news: sourceData.news.length,
-          fetched_calendar: sourceData.calendar.length,
+          fetched_calendar: sourceData.calendar_events_upserted,
           source_failures: sourceData.failures,
         };
 
