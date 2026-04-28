@@ -65,6 +65,11 @@ export async function callClaude(
     }),
   });
 
+  // Track every Claude call for the Command Center sparklines.
+  // Hourly bucket counter; failure here never blocks the API call.
+  const { recordApiCall } = await import('./api-metrics');
+  await recordApiCall(env, 'claude', orgId);
+
   if (!response.ok) {
     const errorBody = await response.text();
     if (response.status === 429) throw new Error('CLAUDE_RATE_LIMITED');

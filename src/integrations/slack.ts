@@ -198,6 +198,15 @@ export async function fetchSlackMessages(
   console.log(
     `[slack] fetch complete: ${messages.length} messages from ${channels.length} channels, ${errors.length} channel errors`
   );
+
+  // Track API calls for the Command Center sparklines. Each fetch cycle
+  // does: 1 auth.test + 1 conversations.list + N×conversations.history
+  // (one per channel, more if any paginate) + M×users.info (one per
+  // unique sender, mostly cached). Approximate at 2 + channels + senders.
+  const apiCallEstimate = 2 + channels.length + Math.min(messages.length, 20);
+  const { recordApiCall } = await import('../lib/api-metrics');
+  await recordApiCall(env, 'slack', orgId, apiCallEstimate);
+
   return { messages, errors, channels_visible: channels.length };
 }
 

@@ -7,6 +7,10 @@ compatibility_flags = ["nodejs_compat"]
 ENVIRONMENT = "production"
 CLOUDFLARE_ACCOUNT_ID = "ad54df3fe69483d2c0b69be1b72864e8"
 CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
+# Self-imposed Gemini rate limit. Google Tier 1 (pay-as-you-go) actually
+# allows 1000 RPM for Gemini 2.5 Flash; we throttle to 500 as a safety
+# buffer so a runaway loop can't burn the day's quota. The rate-limit.ts
+# checker uses this value; the Command Center capacity gauge displays it.
 GEMINI_MAX_RPM = "500"
 ALLOWED_ORIGINS = "https://medinaventures.ai,https://www.medinaventures.ai,http://localhost:3000"
 FRONTEND_URL = "https://medinaventures.ai"

@@ -7,6 +7,7 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse } from './utils';
+import { readHourlyCalls, readCurrentHourCalls } from '../lib/api-metrics';
 
 // ────────────────────────────────────────────────────────────────────────────
 // /api/dashboard/pulse — every 5s while the dashboard is open.
@@ -41,19 +42,18 @@ export interface PulseResponse {
   status_message: string;
   active_processes: ActiveProcess[];
   capacity: {
-    claude: CapacityGauge & { last_call_at?: string | null };
-    gemini: CapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null };
-    graph: CapacityGauge & { window_resets_at?: string | null };
-    slack: ServiceStatus & { last_sync_at?: string | null; messages_today?: number };
-    reversecontact: ServiceStatus & { last_enrichment_at?: string | null; enriched_today?: number };
+    claude: CapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null; calls_this_hour?: number; rate_limited?: boolean };
+    gemini: CapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null; calls_this_hour?: number; rate_limited?: boolean };
+    graph: CapacityGauge & { window_resets_at?: string | null; calls_this_hour?: number };
+    slack: ServiceStatus & { last_sync_at?: string | null; messages_today?: number; calls_this_hour?: number };
+    reversecontact: ServiceStatus & { last_enrichment_at?: string | null; enriched_today?: number; calls_this_hour?: number };
   };
   alerts: Array<{ type: 'warning' | 'error'; message: string; timestamp: string }>;
-  // Idle-state context: next scheduled cron fires (ISO).
-  next_runs: {
-    ingestion: string;
-    enrichment: string;
-    daily: string;
-  };
+  next_runs: { ingestion: string; enrichment: string; daily: string };
+  // Server-side timestamp the response was generated. The frontend uses this
+  // (vs. its own clock) to compute "data is X seconds old" and surface a
+  // "stale data" amber warning if polling stops working.
+  generated_at: string;
 }
 
 const WORKFLOW_LABEL: Record<string, { type: ActiveProcess['type']; label: string }> = {
@@ -175,20 +175,29 @@ export async function getDashboardPulse(
 
   const todayStart = startOfTodayUtc();
 
+  // Read REAL per-minute counters (claude_rate / gemini_rate) — these track
+  // actual API call volume in a 60s rolling window. Previous version misread
+  // the BACKOFF keys (rate_limit:claude:*, rate_limit:gemini_*) as if they
+  // represented usage, which caused the gauge to swing 0 ↔ 100% with no
+  // middle ground. The backoff keys are still checked separately for the
+  // "rate limited" override below.
+  type RateState = { count: number; resets_at: string };
   const [
-    claudeBackoff, geminiBackoff, geminiNewsBackoff, graphState,
+    claudeRate, geminiRate, geminiBackoff, geminiNewsBackoff, claudeBackoff,
+    graphState,
     rcCircuitRaw, rcRateRaw, slackLastSyncRaw,
     lastEnrichmentRow, slackTodayRow, rcEnrichedTodayRow,
+    claudeHourCalls, geminiHourCalls, graphHourCalls, slackHourCalls, rcHourCalls,
   ] = await Promise.all([
-    env.KV.get(`rate_limit:claude:${orgId}`),
+    env.KV.get<RateState>(`claude_rate:${orgId}`, 'json'),
+    env.KV.get<RateState>(`gemini_rate:${orgId}`, 'json'),
     env.KV.get(`rate_limit:gemini_enrichment:${orgId}`),
     env.KV.get(`rate_limit:gemini_news:${orgId}`),
+    env.KV.get(`rate_limit:claude_enrichment:${orgId}`),
     env.KV.get<{ count?: number; window_start?: string }>(`graph_rpm:${orgId}`, 'json'),
     env.KV.get(`rc_failures:${orgId}`),
     env.KV.get<{ blocked_until?: string }>(`rate_limit:reversecontact:${orgId}`, 'json'),
     env.KV.get(`slack_last_sync:${orgId}`),
-    // Last enrichment cycle is our best proxy for "last Claude/Gemini call"
-    // since we don't write per-call timestamps. Cheap single row read.
     env.D1.prepare(
       `SELECT MAX(completed_at) as t FROM sync_jobs WHERE org_id = ? AND workflow_type = 'enrichment' AND status = 'completed'`
     ).bind(orgId).first<{ t: string | null }>(),
@@ -198,34 +207,57 @@ export async function getDashboardPulse(
     env.D1.prepare(
       `SELECT COUNT(*) as n FROM contacts WHERE org_id = ? AND linkedin_data_r2_key IS NOT NULL AND updated_at >= ? AND deleted_at IS NULL`
     ).bind(orgId, todayStart).first<{ n: number }>(),
+    readCurrentHourCalls(env, 'claude', orgId),
+    readCurrentHourCalls(env, 'gemini', orgId),
+    readCurrentHourCalls(env, 'graph', orgId),
+    readCurrentHourCalls(env, 'slack', orgId),
+    readCurrentHourCalls(env, 'reversecontact', orgId),
   ]);
 
   const lastEnrichmentAt = lastEnrichmentRow?.t || null;
   const slackLastSyncAt = slackLastSyncRaw || null;
+  const nowMs = Date.now();
+
+  // Honest read of the per-minute counter: if resets_at is in the past, the
+  // window has expired and current usage is 0, regardless of what `count`
+  // says (KV may not have GC'd the key yet).
+  function rateUsage(state: RateState | null): { count: number; resetsAt: string | null } {
+    if (!state || !state.resets_at) return { count: 0, resetsAt: null };
+    if (new Date(state.resets_at).getTime() < nowMs) return { count: 0, resetsAt: null };
+    return { count: Number.isFinite(state.count) ? state.count : 0, resetsAt: state.resets_at };
+  }
+  const claudeUsage = rateUsage(claudeRate);
+  const geminiUsage = rateUsage(geminiRate);
+
+  const claudeLimited = !!claudeBackoff;
+  const geminiLimited = !!(geminiBackoff || geminiNewsBackoff);
 
   const claude = {
-    ...(claudeBackoff
-      ? gaugeFor(claudeMax, claudeMax, 'Claude')
-      : gaugeFor(0, claudeMax, 'Claude')),
+    ...gaugeFor(claudeLimited ? claudeMax : claudeUsage.count, claudeMax, 'Claude'),
     last_call_at: lastEnrichmentAt,
+    window_resets_at: claudeUsage.resetsAt,
+    calls_this_hour: claudeHourCalls,
+    rate_limited: claudeLimited,
   };
-  const geminiLimited = !!(geminiBackoff || geminiNewsBackoff);
   const gemini = {
-    ...(geminiLimited
-      ? gaugeFor(geminiMax, geminiMax, 'Gemini')
-      : gaugeFor(0, geminiMax, 'Gemini')),
+    ...gaugeFor(geminiLimited ? geminiMax : geminiUsage.count, geminiMax, 'Gemini'),
     last_call_at: lastEnrichmentAt,
-    // Rate-limit windows reset 60s after the backoff was set; we don't
-    // store the exact timestamp, so estimate "soon" as 60s from now when
-    // limited.
-    window_resets_at: geminiLimited ? new Date(Date.now() + 60_000).toISOString() : null,
+    window_resets_at: geminiUsage.resetsAt
+      || (geminiLimited ? new Date(nowMs + 60_000).toISOString() : null),
+    calls_this_hour: geminiHourCalls,
+    rate_limited: geminiLimited,
   };
-  const graphUsed = graphState?.count || 0;
-  // Graph soft limit is 10k per 10min — window resets 10min after start.
-  const graphWindowStart = graphState?.window_start ? new Date(graphState.window_start).getTime() : 0;
+
+  // Graph: real count + window age check. If the 10-min window has elapsed,
+  // the counter is stale; treat as 0 until the next call refreshes it.
+  const graphWindowStartMs = graphState?.window_start ? new Date(graphState.window_start).getTime() : 0;
+  const graphWindowExpired = graphWindowStartMs === 0 || (nowMs - graphWindowStartMs) >= 10 * 60_000;
+  const graphUsed = graphWindowExpired ? 0 : (graphState?.count || 0);
   const graph = {
     ...gaugeFor(graphUsed, graphMax, 'Microsoft Graph'),
-    window_resets_at: graphWindowStart > 0 ? new Date(graphWindowStart + 10 * 60_000).toISOString() : null,
+    window_resets_at: graphWindowStartMs > 0 && !graphWindowExpired
+      ? new Date(graphWindowStartMs + 10 * 60_000).toISOString() : null,
+    calls_this_hour: graphHourCalls,
   };
 
   const slack = {
@@ -233,6 +265,7 @@ export async function getDashboardPulse(
     label: 'Active',
     last_sync_at: slackLastSyncAt,
     messages_today: slackTodayRow?.n || 0,
+    calls_this_hour: slackHourCalls,
   };
 
   const rcFailures = rcCircuitRaw ? parseInt(rcCircuitRaw, 10) : 0;
@@ -244,6 +277,7 @@ export async function getDashboardPulse(
       label: 'Paused — auth issue, needs operator reset',
       enriched_today: rcEnrichedToday,
       last_enrichment_at: lastEnrichmentAt,
+      calls_this_hour: rcHourCalls,
     };
   } else if (rcRateRaw?.blocked_until && new Date(rcRateRaw.blocked_until) > new Date()) {
     reversecontact = {
@@ -252,6 +286,7 @@ export async function getDashboardPulse(
       blocked_until: rcRateRaw.blocked_until,
       enriched_today: rcEnrichedToday,
       last_enrichment_at: lastEnrichmentAt,
+      calls_this_hour: rcHourCalls,
     };
   } else {
     reversecontact = {
@@ -259,6 +294,7 @@ export async function getDashboardPulse(
       label: 'Active',
       enriched_today: rcEnrichedToday,
       last_enrichment_at: lastEnrichmentAt,
+      calls_this_hour: rcHourCalls,
     };
   }
 
@@ -319,6 +355,7 @@ export async function getDashboardPulse(
     capacity: { claude, gemini, graph, slack, reversecontact },
     alerts,
     next_runs,
+    generated_at: nowIso,
   } satisfies PulseResponse);
 }
 
@@ -363,6 +400,7 @@ export interface ActivityResponse {
   // to tell the user "Last X was Y ago" instead of leaving them with a
   // blank "no activity" panel.
   last_of_type: Partial<Record<ActivityEntry['icon'], { timestamp: string; description: string }>>;
+  generated_at: string;
 }
 
 function describeCompletedJob(workflowType: string, metadata: any, itemsProcessed: number, status: string): {
@@ -512,13 +550,16 @@ export async function getDashboardActivity(
       documents_processed: docsTodayRow?.n || 0,
     },
     last_of_type,
+    generated_at: new Date().toISOString(),
   } satisfies ActivityResponse);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // /api/dashboard/sparklines — every 5min. Hourly buckets over the last 24h.
-// No per-call telemetry → estimate from sync_jobs activity. Each enrichment
-// cycle ≈ N Claude/Gemini calls; each ingestion cycle ≈ M Graph calls.
+// REAL DATA: reads `api_calls:{service}:{org}:{hour}` KV buckets that are
+// incremented on every API call by recordApiCall(). Replaces the previous
+// estimation from sync_jobs metadata which under-counted ad-hoc calls and
+// over-counted bulk operations.
 // ────────────────────────────────────────────────────────────────────────────
 
 export interface SparklinesResponse {
@@ -527,7 +568,8 @@ export interface SparklinesResponse {
   graph: number[];
   slack: number[];
   hours: string[];          // ISO hour starts, 24 entries
-  total_24h: number;        // sum across all four series — shown as a header line
+  total_24h: number;        // sum across all four series
+  generated_at: string;     // server-side timestamp for staleness detection
 }
 
 export async function getDashboardSparklines(
@@ -535,72 +577,29 @@ export async function getDashboardSparklines(
   env: Env
 ): Promise<Response> {
   const orgId = ctx.orgId;
-
-  const rows = await env.D1.prepare(
-    `SELECT workflow_type, status, items_processed, started_at, completed_at, metadata
-       FROM sync_jobs
-      WHERE org_id = ?
-        AND started_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')`
-  ).bind(orgId).all<{
-    workflow_type: string; status: string; items_processed: number;
-    started_at: string; completed_at: string | null; metadata: string | null;
-  }>();
-
-  // 24 buckets keyed by hour-of-completion (or hour-of-start if not completed)
   const now = Date.now();
-  const buckets = Array.from({ length: 24 }, (_, i) => ({
-    hourStart: new Date(now - (23 - i) * 3600_000).toISOString().slice(0, 13) + ':00:00.000Z',
-    claude: 0, gemini: 0, graph: 0, slack: 0,
-  }));
 
-  function hourIndex(iso: string): number {
-    const t = new Date(iso).getTime();
-    const idx = 23 - Math.floor((now - t) / 3600_000);
-    return idx >= 0 && idx < 24 ? idx : -1;
-  }
+  // Real per-service hourly counts from KV buckets written by recordApiCall().
+  // Each request reads 24 KV keys per service × 4 services = 96 reads.
+  // Cheap; KV reads are cached per worker isolate after the first hit.
+  const [claude, gemini, graph, slack] = await Promise.all([
+    readHourlyCalls(env, 'claude', orgId, 24),
+    readHourlyCalls(env, 'gemini', orgId, 24),
+    readHourlyCalls(env, 'graph', orgId, 24),
+    readHourlyCalls(env, 'slack', orgId, 24),
+  ]);
 
-  for (const r of rows.results) {
-    const ts = r.completed_at || r.started_at;
-    const idx = hourIndex(ts);
-    if (idx < 0) continue;
-    let metadata: any = {};
-    try { metadata = r.metadata ? JSON.parse(r.metadata) : {}; } catch { /* ignore */ }
-    const items = r.items_processed || 0;
-    if (r.workflow_type === 'enrichment') {
-      // ~3 Claude calls + 1 Gemini per enriched entity
-      buckets[idx].claude += items * 3;
-      buckets[idx].gemini += items * 1;
-    } else if (r.workflow_type === 'ingestion') {
-      const slackFetched = metadata.fetched_slack || 0;
-      const outlookFetched = metadata.fetched_outlook || 0;
-      const totalFetched = outlookFetched + slackFetched;
-      buckets[idx].graph += outlookFetched;
-      buckets[idx].claude += totalFetched; // classification + extraction
-      // Slack API estimate: each ingestion that fetched Slack does
-      // ~3 calls (auth.test + conversations.list + N×conversations.history).
-      // With per-channel paging we approximate at slackFetched/200 + 2.
-      if (slackFetched > 0) {
-        buckets[idx].slack += Math.max(2, Math.ceil(slackFetched / 50));
-      } else {
-        // Even a no-message poll calls auth.test + conversations.list.
-        buckets[idx].slack += 2;
-      }
-    } else if (r.workflow_type === 'daily') {
-      buckets[idx].claude += 5;
-    }
-  }
-
-  const total_24h = buckets.reduce(
-    (s, b) => s + b.claude + b.gemini + b.graph + b.slack,
-    0
+  const hours = Array.from({ length: 24 }, (_, i) =>
+    new Date(now - (23 - i) * 3600_000).toISOString().slice(0, 13) + ':00:00.000Z'
   );
+  const total_24h =
+    claude.reduce((a, b) => a + b, 0) +
+    gemini.reduce((a, b) => a + b, 0) +
+    graph.reduce((a, b) => a + b, 0) +
+    slack.reduce((a, b) => a + b, 0);
 
   return jsonResponse({
-    claude: buckets.map(b => b.claude),
-    gemini: buckets.map(b => b.gemini),
-    graph: buckets.map(b => b.graph),
-    slack: buckets.map(b => b.slack),
-    hours: buckets.map(b => b.hourStart),
-    total_24h,
+    claude, gemini, graph, slack, hours, total_24h,
+    generated_at: new Date().toISOString(),
   } satisfies SparklinesResponse);
 }

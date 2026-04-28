@@ -162,6 +162,10 @@ export async function enrichContactFromLinkedIn(
     headers: { Accept: 'application/json' },
   });
 
+  // Track for Command Center sparklines (hourly bucket, race-tolerant).
+  const { recordApiCall } = await import('../lib/api-metrics');
+  await recordApiCall(env, 'reversecontact', orgId);
+
   if (!resp.ok) {
     const respBody = await resp.text().catch(() => '(unreadable)');
     console.error(
