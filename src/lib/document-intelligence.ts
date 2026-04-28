@@ -8,6 +8,7 @@ import { updateEntityInIndex } from './entity-index';
 import { chunkEmbedAndPersistAll } from './embedding';
 import { extractTextFromFile } from './file-extraction';
 import { emitAudit } from './audit';
+import { persistDocument } from './persist-document';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types
@@ -613,7 +614,6 @@ export async function processIntelligentImport(
   importJobId?: string
 ): Promise<ImportResult> {
   const errors: string[] = [];
-  const documentId = crypto.randomUUID();
   // Helper to log lineage so the undo endpoint can revert exactly what was
   // created. Only CREATEs are tracked; updates to pre-existing entities are
   // intentionally not undoable (they entangle with downstream enrichment).
@@ -627,23 +627,6 @@ export async function processIntelligentImport(
       console.error(`[doc-intel] lineage log failed for ${entityType}/${entityId}:`, e);
     }
   };
-  const now = new Date().toISOString();
-  const r2Key = `${orgId}/document/${now.slice(0, 7)}/${documentId}_${file.name}`;
-
-  // Always store the raw file in R2 first — this is the durable artifact and
-  // happens before any extraction so a download link is guaranteed regardless
-  // of what comes next.
-  const buffer = await file.arrayBuffer();
-  await env.R2.put(r2Key, buffer);
-
-  // Compute content hash so cross-pipeline dedup works. Without this, the
-  // same file uploaded via /api/documents and via /api/imports/intelligent
-  // both land — findExistingVersion in the upload paths queries content_hash
-  // and silently skips this column when it's NULL.
-  const hashBuf = await crypto.subtle.digest('SHA-256', buffer);
-  const contentHash = Array.from(new Uint8Array(hashBuf))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
 
   // Try to extract text. If extraction fails or yields nothing, we still
   // ingest the file — it just lands as `reference` with no entity payload.
@@ -676,25 +659,22 @@ export async function processIntelligentImport(
     `[doc-intel] extracted: ${extraction.contacts.length} contacts, ${extraction.companies.length} companies, ${extraction.deals.length} deals`
   );
 
-  // Store document record in D1
-  await env.D1.prepare(
-    `INSERT INTO documents
-       (id, org_id, title, document_type, source, r2_key, file_name, file_size, mime_type,
-        uploaded_by, processing_status, extracted_text_preview, content_hash, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'intelligent_import', ?, ?, ?, ?, ?, 'processing', ?, ?, ?, ?)`
-  ).bind(
-    documentId, orgId,
-    file.name,
-    category,
-    r2Key,
-    file.name,
-    file.size,
-    file.type || null,
-    userId,
-    text.slice(0, 500),
-    contentHash,
-    now, now
-  ).run();
+  // Persist via the unified writer. Pre-extracted text + pre-classified
+  // category short-circuit finalize()'s extract/classify steps so we don't
+  // waste a second LLM call on the classifier.
+  const persisted = await persistDocument({
+    file,
+    orgId,
+    source: 'intelligent_import',
+    visibility: 'org_wide',
+    participantUserIds: null,
+    uploadedBy: userId,
+    links: [],  // intelligent_import creates entities; back-linking is a future feature
+    documentType: category,
+    preExtractedText: text,
+    embed: true,
+  }, env);
+  const documentId = persisted.documentId;
   await logCreated('document', documentId);
 
   // Match + Route companies first (contacts may reference them)
@@ -749,38 +729,14 @@ export async function processIntelligentImport(
     }
   }
 
-  // Embed document text for RAG
+  // Embed + status='completed' via the helper's finalize step. preExtractedText
+  // and documentType were passed to persistDocument, so finalize skips the
+  // re-extract / re-classify and goes straight to chunking.
   try {
-    const meta: ChunkMetadata = {
-      org_id: orgId,
-      document_type: category,
-      source_table: 'documents',
-      source_id: documentId,
-      r2_key: r2Key,
-      visibility: 'org_wide',
-      primary_entity_id: documentId,
-      created_at: now,
-      entity_name: file.name,
-    };
-
-    const entries = await chunkEmbedAndPersistAll(text, meta, env);
-    if (entries.length > 0) {
-      await env.D1.batch(
-        entries.map(e =>
-          env.D1.prepare(
-            'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-          ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
-        )
-      );
-    }
+    await persisted.finalize();
   } catch (e: any) {
-    errors.push(`Embedding: ${e.message}`);
+    errors.push(`Finalize: ${e?.message || e}`);
   }
-
-  // Update document status
-  await env.D1.prepare(
-    `UPDATE documents SET processing_status = 'completed', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-  ).bind(documentId).run();
 
   // Audit
   await emitAudit(env, {
@@ -801,7 +757,7 @@ export async function processIntelligentImport(
       relationships: extraction.relationships.length,
       signals: extraction.signals.length,
     },
-    created_at: now,
+    created_at: new Date().toISOString(),
   });
 
   const totalRouted = contactsCreated + contactsUpdated + companiesCreated + companiesUpdated + dealsCreated;

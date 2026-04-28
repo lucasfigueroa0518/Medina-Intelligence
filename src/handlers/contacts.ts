@@ -6,6 +6,7 @@ import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { mergeContacts, resolveMergedContact, cleanupVectorsForEntity } from '../lib/merge';
 import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
+import { isDocumentAccessibleToUser } from '../lib/document-acl';
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 
@@ -631,9 +632,16 @@ export async function getContactTimeline(
        ORDER BY due_date DESC LIMIT ?`
     ).bind(id, ctx.orgId, limit).all(),
     env.D1.prepare(
-      `SELECT id, title, created_at as timestamp, 'document' as type, document_type as subtype
-       FROM documents WHERE contact_id = ? AND org_id = ? AND deleted_at IS NULL
-       ORDER BY created_at DESC LIMIT ?`
+      // Documents linked to this contact through the junction table. Includes
+      // ACL columns so the post-query filter can apply isDocumentAccessibleToUser.
+      `SELECT d.id, d.title, d.created_at as timestamp, 'document' as type, d.document_type as subtype,
+              d.visibility, d.participant_user_ids, d.uploaded_by
+         FROM documents d
+         JOIN document_links dl ON dl.document_id = d.id
+        WHERE dl.entity_type = 'contact' AND dl.entity_id = ?
+          AND dl.deleted_at IS NULL AND d.deleted_at IS NULL
+          AND d.org_id = ?
+        ORDER BY d.created_at DESC LIMIT ?`
     ).bind(id, ctx.orgId, limit).all(),
     getSharingFlags(ctx.orgId, env),
   ]);
@@ -645,12 +653,25 @@ export async function getContactTimeline(
   let attachmentsByConv: Record<string, string[]> = {};
   if (conversationIds.length > 0) {
     const placeholders = conversationIds.map(() => '?').join(',');
+    // Junction-based lookup: find every document linked to any of these
+    // conversations. ACL fields included so we can hide rows the requester
+    // shouldn't see.
     const attRows = await env.D1.prepare(
-      `SELECT conversation_id, file_name FROM documents
-       WHERE conversation_id IN (${placeholders}) AND org_id = ? AND deleted_at IS NULL
-       ORDER BY created_at`
-    ).bind(...conversationIds, ctx.orgId).all<{ conversation_id: string; file_name: string }>();
+      `SELECT dl.entity_id as conversation_id, d.file_name,
+              d.visibility, d.participant_user_ids, d.uploaded_by
+         FROM documents d
+         JOIN document_links dl ON dl.document_id = d.id
+        WHERE dl.entity_type = 'conversation' AND dl.entity_id IN (${placeholders})
+          AND dl.deleted_at IS NULL AND d.deleted_at IS NULL
+          AND d.org_id = ?
+        ORDER BY d.created_at`
+    ).bind(...conversationIds, ctx.orgId).all<{
+      conversation_id: string; file_name: string;
+      visibility: string | null; participant_user_ids: string | null; uploaded_by: string | null;
+    }>();
+    const sharingSet = new Set(Object.keys(sharingFlags));
     for (const row of attRows.results) {
+      if (!isDocumentAccessibleToUser(row, ctx.userId, ctx.userRole, sharingSet)) continue;
       if (!attachmentsByConv[row.conversation_id]) attachmentsByConv[row.conversation_id] = [];
       attachmentsByConv[row.conversation_id].push(row.file_name);
     }
@@ -675,11 +696,20 @@ export async function getContactTimeline(
     };
   });
 
+  // ACL-filter the contact-linked documents before they hit the timeline.
+  // Same gate as RAG / /api/documents — owner bypass, default-deny on missing
+  // visibility, participant-or-uploader for private. Strip the ACL fields
+  // from the response shape so the timeline sees only display columns.
+  const docSharingSet = new Set(Object.keys(sharingFlags));
+  const accessibleDocs = (documents.results as any[])
+    .filter(d => isDocumentAccessibleToUser(d, ctx.userId, ctx.userRole, docSharingSet))
+    .map(({ visibility: _v, participant_user_ids: _p, uploaded_by: _u, ...rest }) => rest);
+
   const entries = [
     ...events.results,
     ...conversationsWithAccess,
     ...tasks.results,
-    ...documents.results,
+    ...accessibleDocs,
   ]
     .sort((a: any, b: any) => String(b.timestamp).localeCompare(String(a.timestamp)))
     .slice(0, limit);

@@ -59,6 +59,41 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await processEmbedRetryQueue(orgId, env); } catch (e) { console.error('Embed retry queue:', e); }
   try { await rebuildEntityIndex(orgId, env); } catch (e) { console.error('Entity index rebuild:', e); }
   try { await cleanupExpiredResetTokens(env); } catch (e) { console.error('Reset token cleanup:', e); }
+  try { await detectIngestionDivergence(orgId, env); } catch (e) { console.error('Ingestion divergence:', e); }
+}
+
+// Wave 2 self-heal: detect when conversations claim attachments but no
+// email_attachment documents exist for them. Pre-Wave-2 this gap could open
+// silently (the inline-backfill path skipped processEmailAttachments). After
+// Wave 2 both ingestion paths run the same helper, so this query should
+// trend to zero. If it stays nonzero for a sustained window, a future
+// regression has reopened the divergence — surface it loud.
+export async function detectIngestionDivergence(
+  orgId: string,
+  env: Env
+): Promise<{ orphan_attachment_conversations: number }> {
+  const row = await env.D1.prepare(
+    `SELECT COUNT(*) as n FROM conversations c
+       WHERE c.org_id = ?
+         AND c.has_attachments = 1
+         AND c.deleted_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM documents d
+            WHERE d.conversation_id = c.id
+              AND d.source = 'email_attachment'
+              AND d.deleted_at IS NULL
+         )`
+  ).bind(orgId).first<{ n: number }>();
+
+  const count = row?.n || 0;
+  if (count > 0) {
+    console.warn(
+      `[cron:divergence-detect] org=${orgId} ${count} conversations declare attachments but have no email_attachment documents — ingestion divergence (or pending Wave 3 backfill)`
+    );
+  } else {
+    console.log(`[cron:divergence-detect] org=${orgId} clean — no orphan attachment conversations`);
+  }
+  return { orphan_attachment_conversations: count };
 }
 
 export async function applyNewsScoreDecay(orgId: string, env: Env): Promise<void> {

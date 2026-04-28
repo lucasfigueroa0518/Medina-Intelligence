@@ -6,10 +6,9 @@
 
 import type { Env } from '../types/env';
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
-import type { ClassifiableItem, ClassifiedItem, VectorIndexEntry } from '../types/interfaces';
+import type { ClassifiableItem, ClassifiedItem } from '../types/interfaces';
 import { classifyAndDeduplicate } from '../lib/classification';
-import { chunkEmbedAndPersistAll } from '../lib/embedding';
-import { stageAndCommitApprovals } from '../lib/stage-approvals';
+import { processClassifiedItems, persistClassifiedStats } from '../lib/ingestion-shared';
 import { trackedStep } from '../lib/workflow-telemetry';
 
 console.log('[IngestionChunkWorkflow] module loaded');
@@ -54,108 +53,34 @@ export class IngestionChunkWorkflow extends WorkflowEntrypoint<Env, ChunkParams>
       );
       classifiedCount = classified.length;
 
-      await trackedStep(this.env, step, sync_job_id, `stage-approvals:${chunk_index}`, async () => {
-        await stageAndCommitApprovals(classified, org_id, sync_job_id, this.env);
-      });
-
-      await trackedStep(
+      // Wave 2 convergence: the four post-classify phases (stage-and-commit,
+      // chunk-and-embed, process-attachments, detect-deals) collapse into one
+      // step.do() that delegates to the shared helper. Inline-backfill calls
+      // the same helper so neither path can drift again.
+      //
+      // Trade-off: per-phase step.do() retry granularity is gone. The helper
+      // catches per-item failures internally and surfaces them via stats.errors;
+      // the outer step still gets one retry attempt for systemic failures.
+      const stats = await trackedStep(
         this.env,
         step,
         sync_job_id,
-        `embed:${chunk_index}`,
-        { retries: { limit: 3, delay: '10 seconds' } },
-        async () => {
-        const indexEntries: VectorIndexEntry[] = [];
-        for (const item of classified) {
-          try {
-            const entries = await chunkEmbedAndPersistAll(item.text, item.metadata, this.env);
-            indexEntries.push(...entries);
-          } catch (e) {
-            console.error(`[IngestionChunkWorkflow] embed failed for ${item.entityId}:`, errMessage(e));
-          }
-        }
-        if (indexEntries.length > 0) {
-          await this.env.D1.batch(
-            indexEntries.map(e =>
-              this.env.D1.prepare(
-                'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-              ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
-            )
-          );
-        }
-      });
+        `process-classified-items:${chunk_index}`,
+        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
+        async () => processClassifiedItems(classified, { orgId: org_id, syncJobId: sync_job_id }, this.env)
+      );
 
-      await trackedStep(
-        this.env,
-        step,
-        sync_job_id,
-        `process-attachments:${chunk_index}`,
-        { retries: { limit: 1, delay: '5 seconds' } },
-        async () => {
-        const { processEmailAttachments } = await import('../lib/attachment-processor');
-        // Counters track every attachment we observe vs. what landed in
-        // documents. Persisted into sync_jobs.metadata at the end of the step
-        // so a single SQL query (`SELECT json_extract(metadata, '$.attachments_*')
-        // FROM sync_jobs ...`) can detect divergence between conversations
-        // declaring attachments and documents actually written. Without this,
-        // the email-attachment pipeline silently dropping rows was invisible.
-        let attempted = 0;
-        let totalDocs = 0;
-        let totalSkipped = 0;
-        let totalFailed = 0;
-        for (const item of classified) {
-          if (item.attachments?.length) {
-            attempted += item.attachments.length;
-            try {
-              const r = await processEmailAttachments(item, org_id, this.env);
-              totalDocs += r.documents_created;
-              totalSkipped += r.documents_skipped;
-              totalFailed += r.errors.length;
-              if (r.errors.length) console.warn(`[IngestionChunkWorkflow] attachment errors:`, r.errors);
-            } catch (e) {
-              totalFailed += item.attachments.length;
-              console.error(`[IngestionChunkWorkflow] attachment processing failed for ${item.entityId}:`, errMessage(e));
-            }
-          }
-        }
-        if (attempted > 0) {
-          console.log(`[IngestionChunkWorkflow] chunk=${chunk_index} attachments: attempted=${attempted} created=${totalDocs} skipped=${totalSkipped} failed=${totalFailed}`);
-          // Accumulate across chunks via json_set + COALESCE: each chunk
-          // increments the running total without clobbering siblings'
-          // contributions. NULL metadata bootstraps to '{}'.
-          try {
-            await this.env.D1.prepare(
-              `UPDATE sync_jobs
-                  SET metadata = json_set(
-                    COALESCE(metadata, '{}'),
-                    '$.attachments_attempted', COALESCE(json_extract(metadata, '$.attachments_attempted'), 0) + ?,
-                    '$.attachments_processed', COALESCE(json_extract(metadata, '$.attachments_processed'), 0) + ?,
-                    '$.attachments_skipped',   COALESCE(json_extract(metadata, '$.attachments_skipped'),   0) + ?,
-                    '$.attachments_failed',    COALESCE(json_extract(metadata, '$.attachments_failed'),    0) + ?
-                  )
-                WHERE id = ?`
-            ).bind(attempted, totalDocs, totalSkipped, totalFailed, sync_job_id).run();
-          } catch (e) {
-            console.error(`[IngestionChunkWorkflow] sync_jobs metadata update failed:`, errMessage(e));
-          }
-        }
-      });
-
-      await trackedStep(
-        this.env,
-        step,
-        sync_job_id,
-        `detect-deals:${chunk_index}`,
-        { retries: { limit: 1, delay: '5 seconds' } },
-        async () => {
-        try {
-          const { detectAndStageDealSignals } = await import('../lib/deal-detection');
-          const stagedCount = await detectAndStageDealSignals(classified, org_id, this.env);
-          console.log(`[IngestionChunkWorkflow] chunk=${chunk_index} deals_staged=${stagedCount}`);
-        } catch (e) {
-          console.error('[IngestionChunkWorkflow] deal detection failed:', errMessage(e));
-        }
-      });
+      console.log(
+        `[IngestionChunkWorkflow] chunk=${chunk_index} ` +
+        `staged=${stats.items_staged}/${stats.items_total} ` +
+        `embedded=${stats.items_embedded} embed_fail=${stats.embed_failures} ` +
+        `attachments(att/proc/skip/fail)=${stats.attachments_attempted}/${stats.attachments_processed}/${stats.attachments_skipped}/${stats.attachments_failed} ` +
+        `deals_staged=${stats.deal_signals_staged} errors=${stats.errors.length}`
+      );
+      if (stats.errors.length > 0) {
+        console.warn(`[IngestionChunkWorkflow] chunk=${chunk_index} errors:`, stats.errors.slice(0, 10));
+      }
+      await persistClassifiedStats(stats, sync_job_id, this.env);
     } catch (e) {
       // Capture but don't rethrow yet — we always want to decrement so the
       // finalizer still runs and the sync_job doesn't dangle until timeout.

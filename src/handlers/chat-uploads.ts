@@ -1,12 +1,12 @@
 // MARTy chat upload endpoints — multi-file ephemeral uploads, optional save
 // to permanent Documents, and a content fetch endpoint for in-chat preview.
 import type { Env } from '../types/env';
-import type { AuthContext, ChunkMetadata } from '../types/interfaces';
+import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
 import { extractTextFromFile } from '../lib/file-extraction';
-import { chunkEmbedAndPersistAll } from '../lib/embedding';
 import { classifyDocument } from '../lib/document-intelligence';
 import { emitAudit } from '../lib/audit';
+import { persistDocument } from '../lib/persist-document';
 import {
   type ChatUploadRow,
   type UploadSummary,
@@ -178,22 +178,15 @@ async function processUpload(args: ProcessArgs): Promise<void> {
 
   if (!saveToDocuments) return;
 
-  // Save-to-Documents flow: mirror the upload into the permanent `documents`
-  // table and run the standard ingestion (classify + embed + index). Mirrors
-  // src/handlers/documents.ts:uploadDocument's async block.
+  // Save-to-Documents flow: re-fetch the bytes from the chat-uploads R2 prefix
+  // and hand them to the unified persistDocument writer. The chat copy stays
+  // until the TTL cron sweeps it; persistDocument writes a separate copy under
+  // {org}/document/... so cleanup doesn't break the saved doc.
   try {
-    const documentId = crypto.randomUUID();
-    const now = new Date().toISOString();
-    const docR2Key = `${ctx.orgId}/document/${now.slice(0, 7)}/${documentId}_${filename}`;
-
-    // Copy the bytes into the Documents R2 prefix so the chat-uploads cleanup
-    // can later delete the chat copy without touching the documents copy.
     const obj = await env.R2.get(r2Key);
     if (!obj) throw new Error('chat upload R2 object missing');
     const buffer = await obj.arrayBuffer();
-    await env.R2.put(docR2Key, buffer);
-
-    const contentHash = await sha256(buffer);
+    const docFile = new File([buffer], filename, { type: file.type });
 
     let classifiedType = 'other';
     if (extractedText.length > 20) {
@@ -203,63 +196,36 @@ async function processUpload(args: ProcessArgs): Promise<void> {
       } catch { /* keep default */ }
     }
 
-    await env.D1.prepare(
-      `INSERT INTO documents
-         (id, org_id, title, document_type, source, r2_key, file_name, file_size, mime_type,
-          uploaded_by, processing_status, content_hash, version_number,
-          extracted_text_preview, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'upload', ?, ?, ?, ?, ?, 'completed', ?, 1, ?, ?, ?)`
-    ).bind(
-      documentId, ctx.orgId, filename, classifiedType,
-      docR2Key, filename, file.size, file.type || null,
-      ctx.userId, contentHash, preview || null, now, now,
-    ).run();
-
-    if (extractedText.length > 10) {
-      const meta: ChunkMetadata = {
-        org_id: ctx.orgId,
-        document_type: classifiedType,
-        source_table: 'documents',
-        source_id: documentId,
-        r2_key: docR2Key,
-        visibility: 'org_wide',
-        primary_entity_id: documentId,
-        created_at: now,
-        entity_name: filename,
-      };
-      const entries = await chunkEmbedAndPersistAll(extractedText, meta, env);
-      if (entries.length > 0) {
-        await env.D1.batch(
-          entries.map(e =>
-            env.D1.prepare(
-              'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-            ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
-          )
-        );
-      }
-    }
+    const persisted = await persistDocument({
+      file: docFile,
+      orgId: ctx.orgId,
+      source: 'chat_upload',
+      visibility: 'org_wide',
+      participantUserIds: null,
+      uploadedBy: ctx.userId,
+      links: [],
+      documentType: classifiedType,
+      preExtractedText: extractedText,
+      embed: true,
+    }, env);
+    await persisted.finalize();
 
     await env.D1.prepare(
       `UPDATE chat_uploads SET saved_to_documents = 1, saved_document_id = ? WHERE id = ?`
-    ).bind(documentId, id).run();
+    ).bind(persisted.documentId, id).run();
 
     await emitAudit(env, {
       org_id: ctx.orgId,
       user_id: ctx.userId,
       action: 'create',
       entity_type: 'document',
-      entity_id: documentId,
+      entity_id: persisted.documentId,
       after_data: { title: filename, file_name: filename, source: 'chat_upload' },
-      created_at: now,
+      created_at: new Date().toISOString(),
     });
   } catch (e) {
     console.error(`[chat-uploads] save-to-documents failed for ${id}:`, e);
   }
-}
-
-async function sha256(buf: ArrayBuffer): Promise<string> {
-  const h = await crypto.subtle.digest('SHA-256', buf);
-  return Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 // --- Preview / content fetch ---------------------------------------------

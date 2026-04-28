@@ -472,12 +472,11 @@ export async function runHistoricalBackfill(
       items.push(messageToClassifiableItem(msg, direction, userId, orgId));
     }
 
-    // Store each message as a conversation via the same ingestion path.
-    // Wrap each stage so a single batch failure (e.g. transient FK error
-    // inside contact-association inserts when a contact race-condition
-    // happens) doesn't fail the whole window — the affected items are
-    // retryable via the hourly backfillUnembeddedConversations sweep and
-    // the embed_retry_queue, so it's safe to swallow + log + continue.
+    // Wave 2 convergence: route through the same helper the chunk workflow
+    // uses (classify → stage → embed → process-attachments → detect-deals).
+    // Pre-Wave-2 this path inlined classify/stage/embed only and silently
+    // skipped process-attachments + detect-deals — see Diagnostic 1, the bug
+    // that caused 85 declared email attachments to produce 0 documents rows.
     let classified: any[] = [];
     if (items.length > 0) {
       try {
@@ -490,37 +489,21 @@ export async function runHistoricalBackfill(
     }
 
     if (classified.length > 0) {
-      try {
-        const { stageAndCommitApprovals } = await import('../lib/stage-approvals');
-        await stageAndCommitApprovals(classified, orgId, `backfill-${userId}`, env);
-      } catch (e) {
-        console.error(`[backfill] stageAndCommitApprovals failed for batch (page ${pagesThisBatch}):`, e);
-        // Conversations may still be partially inserted. The embed step
-        // below skips items that have no conversation row (their
-        // chunkEmbedAndPersistAll dedup guard would still let them through
-        // since vector_entity_index is empty for them), but that's caught
-        // by the hourly self-heal anyway.
-      }
-
-      const { chunkEmbedAndPersistAll } = await import('../lib/embedding');
-      for (let b = 0; b < classified.length; b += 5) {
-        const batch = classified.slice(b, b + 5);
-        for (const item of batch) {
-          try {
-            const entries = await chunkEmbedAndPersistAll(item.text, item.metadata, env);
-            if (entries.length > 0) {
-              await env.D1.batch(
-                entries.map(e =>
-                  env.D1.prepare(
-                    'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-                  ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
-                )
-              );
-            }
-          } catch (e) {
-            console.error(`[backfill] embed failed for ${item.entityId}:`, e);
-          }
-        }
+      const { processClassifiedItems } = await import('../lib/ingestion-shared');
+      const stats = await processClassifiedItems(
+        classified,
+        { orgId, syncJobId: `backfill-${userId}` },
+        env
+      );
+      console.log(
+        `[backfill] page=${pagesThisBatch} ` +
+        `staged=${stats.items_staged}/${stats.items_total} ` +
+        `embedded=${stats.items_embedded} embed_fail=${stats.embed_failures} ` +
+        `attachments(att/proc/skip/fail)=${stats.attachments_attempted}/${stats.attachments_processed}/${stats.attachments_skipped}/${stats.attachments_failed} ` +
+        `deals_staged=${stats.deal_signals_staged} errors=${stats.errors.length}`
+      );
+      if (stats.errors.length > 0) {
+        console.warn(`[backfill] page=${pagesThisBatch} errors:`, stats.errors.slice(0, 5));
       }
     }
 

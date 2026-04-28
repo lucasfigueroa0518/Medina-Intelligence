@@ -1,11 +1,11 @@
 import type { Env } from '../types/env';
-import type { ClassifiedItem, ChunkMetadata, AttachmentMeta } from '../types/interfaces';
+import type { ClassifiedItem } from '../types/interfaces';
 import { getDecryptedAccessToken } from './helpers';
 import { refreshOutlookToken } from '../integrations/oauth';
 import { extractTextFromFile } from './file-extraction';
 import { classifyDocument } from './document-intelligence';
-import { chunkEmbedAndPersistAll } from './embedding';
 import { emitAudit } from './audit';
+import { persistDocument, type DocumentLink } from './persist-document';
 
 const MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024;
 
@@ -15,59 +15,34 @@ interface AttachmentProcessResult {
   errors: string[];
 }
 
-async function computeHash(buffer: ArrayBuffer): Promise<string> {
-  const hash = await crypto.subtle.digest('SHA-256', buffer);
-  return Array.from(new Uint8Array(hash))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
+// Build the link set for an email attachment. The conversation is always
+// 'attached' (the attachment lives inside the email). The contact (if any) is
+// the 'primary' anchor for versioning + per-entity retrieval boost. The
+// company and any additional contacts are 'mentioned' so they show up in their
+// respective entity views without being mistaken for the version anchor.
+function buildAttachmentLinks(item: ClassifiedItem): DocumentLink[] {
+  const links: DocumentLink[] = [];
+  const contactId = item.contactIds[0] || null;
+  const companyId = item.companyId || null;
+  const conversationId = item.entityId;
 
-function stripVersionSuffix(name: string): string {
-  return name
-    .replace(/\.[^.]+$/, '')
-    .replace(/[\s_-]*(v\d+|draft|final|rev\d*|copy|revised|updated)$/i, '')
-    .trim()
-    .toLowerCase();
-}
-
-async function findExistingVersion(
-  contentHash: string,
-  fileName: string,
-  orgId: string,
-  contactId: string | null,
-  companyId: string | null,
-  env: Env
-): Promise<{ type: 'exact_dup'; id: string } | { type: 'version'; parentId: string; nextVersion: number } | null> {
-  const byHash = await env.D1.prepare(
-    'SELECT id FROM documents WHERE org_id = ? AND content_hash = ? AND deleted_at IS NULL LIMIT 1'
-  ).bind(orgId, contentHash).first<{ id: string }>();
-  if (byHash) return { type: 'exact_dup', id: byHash.id };
-
-  const baseName = stripVersionSuffix(fileName);
-  if (!baseName) return null;
-
-  const where: string[] = ['org_id = ?', 'deleted_at IS NULL'];
-  const binds: unknown[] = [orgId];
-  if (contactId) { where.push('contact_id = ?'); binds.push(contactId); }
-  else if (companyId) { where.push('company_id = ?'); binds.push(companyId); }
-
-  const candidates = await env.D1.prepare(
-    `SELECT id, file_name, version_number, parent_document_id
-     FROM documents WHERE ${where.join(' AND ')}
-     ORDER BY created_at DESC LIMIT 100`
-  ).bind(...binds).all<{ id: string; file_name: string | null; version_number: number | null; parent_document_id: string | null }>();
-
-  for (const c of candidates.results) {
-    if (!c.file_name) continue;
-    const candidateBase = stripVersionSuffix(c.file_name);
-    if (candidateBase === baseName) {
-      const parentId = c.parent_document_id || c.id;
-      const currentVersion = c.version_number || 1;
-      return { type: 'version', parentId, nextVersion: currentVersion + 1 };
-    }
+  if (contactId) {
+    links.push({ entityType: 'contact', entityId: contactId, linkKind: 'primary', linkSource: 'pipeline' });
+  } else if (companyId) {
+    // Without a contact to anchor versioning, fall back to the company.
+    links.push({ entityType: 'company', entityId: companyId, linkKind: 'primary', linkSource: 'pipeline' });
   }
-
-  return null;
+  if (companyId && contactId) {
+    links.push({ entityType: 'company', entityId: companyId, linkKind: 'mentioned', linkSource: 'pipeline' });
+  }
+  if (conversationId) {
+    links.push({ entityType: 'conversation', entityId: conversationId, linkKind: 'attached', linkSource: 'pipeline' });
+  }
+  // Additional contacts beyond the first land as 'mentioned'.
+  for (const cid of item.contactIds.slice(1)) {
+    links.push({ entityType: 'contact', entityId: cid, linkKind: 'mentioned', linkSource: 'pipeline' });
+  }
+  return links;
 }
 
 export async function processEmailAttachments(
@@ -90,14 +65,20 @@ export async function processEmailAttachments(
   const contactId = item.contactIds[0] || null;
   const companyId = item.companyId || null;
   const conversationId = item.entityId;
-  const now = new Date().toISOString();
-  const monthStr = now.slice(0, 7);
+  const links = buildAttachmentLinks(item);
+  const participantUserIds = item.participantUserIds && item.participantUserIds.length > 0
+    ? item.participantUserIds
+    : null;
 
   let attachmentCount = 0;
 
   for (const att of item.attachments) {
     if (att.size > MAX_ATTACHMENT_SIZE) {
+      // Oversize path: we never fetched the bytes, so persistDocument can't
+      // be used. Open-code the skipped row + matching document_links so the
+      // attachment still surfaces in entity views as a skipped placeholder.
       const docId = crypto.randomUUID();
+      const now = new Date().toISOString();
       await env.D1.prepare(
         `INSERT INTO documents
            (id, org_id, title, document_type, source, r2_key, file_name, file_size, mime_type,
@@ -109,9 +90,20 @@ export async function processEmailAttachments(
         docId, orgId, att.name, att.name, att.size, att.contentType,
         contactId, companyId, conversationId,
         'File too large (>25MB)',
-        item.participantUserIds ? JSON.stringify(item.participantUserIds) : null,
+        participantUserIds ? JSON.stringify(participantUserIds) : null,
         now, now
       ).run();
+      if (links.length > 0) {
+        await env.D1.batch(
+          links.map(link =>
+            env.D1.prepare(
+              `INSERT OR IGNORE INTO document_links
+                 (id, document_id, org_id, entity_type, entity_id, link_kind, link_source, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(crypto.randomUUID(), docId, orgId, link.entityType, link.entityId, link.linkKind, link.linkSource, now)
+          )
+        );
+      }
       result.documents_skipped++;
       attachmentCount++;
       continue;
@@ -126,26 +118,12 @@ export async function processEmailAttachments(
       }
 
       const buffer = await resp.arrayBuffer();
-      const contentHash = await computeHash(buffer);
-
-      const existing = await findExistingVersion(contentHash, att.name, orgId, contactId, companyId, env);
-      if (existing?.type === 'exact_dup') {
-        result.documents_skipped++;
-        attachmentCount++;
-        continue;
-      }
-
-      const r2Key = `${orgId}/attachments/email/${monthStr}/${conversationId}/${att.name}`;
-      await env.R2.put(r2Key, buffer);
-
-      const docId = crypto.randomUUID();
-      const parentId = existing?.type === 'version' ? existing.parentId : null;
-      const versionNum = existing?.type === 'version' ? existing.nextVersion : 1;
-
       const file = new File([buffer], att.name, { type: att.contentType });
-      const text = await extractTextFromFile(file);
-      const preview = text.slice(0, 500);
 
+      // Pre-extract + pre-classify so finalize() doesn't redo the work.
+      // classifyDocument needs the text; if extraction yielded nothing, we
+      // keep 'other' as the category and skip the LLM call.
+      const text = await extractTextFromFile(file);
       let docCategory = 'other';
       if (text.length > 20) {
         try {
@@ -154,65 +132,44 @@ export async function processEmailAttachments(
         } catch { /* keep 'other' */ }
       }
 
-      await env.D1.prepare(
-        `INSERT INTO documents
-           (id, org_id, title, document_type, source, r2_key, file_name, file_size, mime_type,
-            contact_id, company_id, conversation_id, processing_status, extracted_text_preview,
-            content_hash, parent_document_id, version_number,
-            visibility, participant_user_ids, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'email_attachment', ?, ?, ?, ?,
-                 ?, ?, ?, 'processing', ?,
-                 ?, ?, ?,
-                 'private', ?, ?, ?)`
-      ).bind(
-        docId, orgId, att.name, docCategory, r2Key, att.name, att.size, att.contentType,
-        contactId, companyId, conversationId, preview,
-        contentHash, parentId, versionNum,
-        item.participantUserIds ? JSON.stringify(item.participantUserIds) : null,
-        now, now
-      ).run();
+      const persisted = await persistDocument({
+        file,
+        orgId,
+        source: 'email_attachment',
+        // Email attachments inherit the parent thread's privacy: always
+        // private, with the conversation's participant_user_ids carried into
+        // both the row and the vector chunk metadata.
+        visibility: 'private',
+        participantUserIds,
+        // System-ingested — no human uploader. NULL is intentional here.
+        uploadedBy: null,
+        links,
+        documentType: docCategory,
+        preExtractedText: text,
+        embed: true,
+      }, env);
 
-      if (text.length > 10) {
-        try {
-          const meta: ChunkMetadata = {
-            org_id: orgId,
-            document_type: docCategory,
-            source_table: 'documents',
-            source_id: docId,
-            r2_key: r2Key,
-            visibility: 'private',
-            participant_user_ids: (item.participantUserIds || []).join(','),
-            primary_entity_id: contactId || companyId || docId,
-            created_at: now,
-            entity_name: att.name,
-          };
-
-          const entries = await chunkEmbedAndPersistAll(text, meta, env);
-          if (entries.length > 0) {
-            await env.D1.batch(
-              entries.map(e =>
-                env.D1.prepare(
-                  'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-                ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
-              )
-            );
-          }
-        } catch (e: any) {
-          result.errors.push(`Embed "${att.name}": ${e.message}`);
-        }
+      if (persisted.isExisting) {
+        // Same file already present (cross-pipeline dedup). Don't re-link or
+        // re-finalize — the existing row owns it.
+        result.documents_skipped++;
+        attachmentCount++;
+        continue;
       }
 
-      await env.D1.prepare(
-        `UPDATE documents SET processing_status = 'completed' WHERE id = ?`
-      ).bind(docId).run();
+      try {
+        await persisted.finalize();
+      } catch (e: any) {
+        result.errors.push(`Finalize "${att.name}": ${e?.message || e}`);
+      }
 
       await emitAudit(env, {
         org_id: orgId,
         action: 'create',
         entity_type: 'document',
-        entity_id: docId,
+        entity_id: persisted.documentId,
         metadata: { source: 'email_attachment', file_name: att.name, conversation_id: conversationId, category: docCategory },
-        created_at: now,
+        created_at: new Date().toISOString(),
       });
 
       result.documents_created++;
