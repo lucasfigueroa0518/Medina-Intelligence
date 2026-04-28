@@ -466,7 +466,7 @@ async function routeAuthenticated(
 
   // --- Admin (owner/admin only) ---
   if (path.startsWith('/api/admin')) {
-    const forbidden = requireRole(ctx, ['super_admin', 'owner', 'admin']);
+    const forbidden = requireRole(ctx, ['owner', 'admin']);
     if (forbidden) return forbidden;
 
     if (path === '/api/admin/dlq' && method === 'GET') return Admin.listDlq(request, ctx, env);

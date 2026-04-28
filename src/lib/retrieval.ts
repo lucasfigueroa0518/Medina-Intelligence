@@ -70,8 +70,8 @@ export async function preprocessQuery(
 
   const postRetrievalFilter = (chunk: VectorMatch): boolean => {
     if (chunk.metadata.visibility === 'private') {
-      if (userRole === 'super_admin') {
-        // pass — super admin has full access
+      if (userRole === 'owner') {
+        // pass — owner has full access
       } else if (chunk.metadata.participant_user_ids) {
         const participants = String(chunk.metadata.participant_user_ids).split(',');
         if (participants.includes(userId)) {
@@ -91,7 +91,6 @@ export async function preprocessQuery(
 
     if (
       chunk.metadata.visibility === 'confidential' &&
-      userRole !== 'super_admin' &&
       userRole !== 'owner' &&
       userRole !== 'admin'
     ) {

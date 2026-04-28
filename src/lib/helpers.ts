@@ -128,7 +128,7 @@ export function canReadEmailContent(
 ): boolean {
   if (conversation.source === 'slack') return true;
   if ((conversation as any).is_campaign_email) return true;
-  if (userRole === 'super_admin') return true;
+  if (userRole === 'owner') return true;
 
   try {
     const participants: string[] = JSON.parse(conversation.participant_user_ids || '[]');

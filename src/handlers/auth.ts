@@ -176,7 +176,7 @@ export async function requireAuth(
 
 export function requireRole(
   ctx: AuthContext,
-  roles: Array<'super_admin' | 'owner' | 'admin' | 'member'>
+  roles: Array<'owner' | 'admin' | 'member'>
 ): Response | null {
   if (!roles.includes(ctx.userRole)) {
     return new Response(
