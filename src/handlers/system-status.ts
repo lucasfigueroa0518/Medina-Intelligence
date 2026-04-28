@@ -145,13 +145,15 @@ export async function getSystemStatus(
     eventTotalRow, eventEmbeddedRow, attendeeRow,
     userRow, userMissingRows,
   ] = await Promise.all([
-    env.D1.prepare(`SELECT COUNT(*) as n FROM conversations WHERE org_id = ? AND deleted_at IS NULL`).bind(orgId).first<{n:number}>(),
+    // conversations table has no deleted_at column (verified against live
+    // schema). All conversations rows are considered live.
+    env.D1.prepare(`SELECT COUNT(*) as n FROM conversations WHERE org_id = ?`).bind(orgId).first<{n:number}>(),
     env.D1.prepare(`SELECT COUNT(DISTINCT entity_id) as n FROM vector_entity_index WHERE source_table = 'conversations' AND org_id = ?`).bind(orgId).first<{n:number}>(),
     env.D1.prepare(
       `SELECT COUNT(DISTINCT cc.conversation_id) as n
          FROM conversation_contacts cc
          JOIN conversations c ON c.id = cc.conversation_id
-        WHERE c.org_id = ? AND c.deleted_at IS NULL`
+        WHERE c.org_id = ?`
     ).bind(orgId).first<{n:number}>(),
     env.D1.prepare(
       `SELECT COUNT(*) as total,
