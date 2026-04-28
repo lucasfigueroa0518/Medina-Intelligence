@@ -467,14 +467,15 @@ export interface DashboardPulse {
   status_message: string;
   active_processes: DashboardActiveProcess[];
   capacity: {
-    claude: DashboardCapacityGauge & { last_call_at?: string | null };
-    gemini: DashboardCapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null };
-    graph: DashboardCapacityGauge & { window_resets_at?: string | null };
-    slack: DashboardServiceStatus & { last_sync_at?: string | null; messages_today?: number };
-    reversecontact: DashboardServiceStatus & { last_enrichment_at?: string | null; enriched_today?: number };
+    claude: DashboardCapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null; calls_this_hour?: number; rate_limited?: boolean };
+    gemini: DashboardCapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null; calls_this_hour?: number; rate_limited?: boolean };
+    graph: DashboardCapacityGauge & { window_resets_at?: string | null; calls_this_hour?: number };
+    slack: DashboardServiceStatus & { last_sync_at?: string | null; messages_today?: number; calls_this_hour?: number };
+    reversecontact: DashboardServiceStatus & { last_enrichment_at?: string | null; enriched_today?: number; calls_this_hour?: number };
   };
   alerts: Array<{ type: 'warning' | 'error'; message: string; timestamp: string }>;
   next_runs: { ingestion: string; enrichment: string; daily: string };
+  generated_at: string;
 }
 
 export interface DashboardActivityEntry {
@@ -508,6 +509,7 @@ export interface DashboardActivity {
     documents_processed: number;
   };
   last_of_type: Partial<Record<DashboardActivityEntry['icon'], { timestamp: string; description: string }>>;
+  generated_at: string;
 }
 
 export interface DashboardSparklines {
@@ -517,6 +519,7 @@ export interface DashboardSparklines {
   slack: number[];
   hours: string[];
   total_24h: number;
+  generated_at: string;
 }
 
 export interface FireflyBackfillResult {

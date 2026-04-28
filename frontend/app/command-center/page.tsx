@@ -24,14 +24,22 @@ const PULSE_MS = 5_000;
 const ACTIVITY_MS = 30_000;
 const SPARKLINES_MS = 5 * 60_000;
 
-// Per-service rate limits — used to label sparkline cards. Mirror the
-// backend constants so the user sees the actual operational ceilings.
+// Per-service rate limits used for gauge labels. These mirror the backend's
+// self-imposed ceilings (rate-limit.ts), not the upstream provider's max.
+// Gemini self-limit is 500 RPM; Google Tier 1 actually allows 1000 — we
+// throttle to half as a safety buffer. Surfaced in tooltips so users see
+// both numbers.
 const RATE_LIMITS = {
-  claude: { perMinute: 60,    label: '60/min' },
-  gemini: { perMinute: 500,   label: '500/min' },
-  graph:  { per10min: 10000,  label: '10K/10m' },
-  slack:  { perMinute: 50,    label: '50/min' },
+  claude: { perMinute: 60,    label: '60/min',  upstream: 'Anthropic AI Gateway' },
+  gemini: { perMinute: 500,   label: '500/min', upstream: 'Google Gemini (Tier 1 max: 1,000/min)' },
+  graph:  { per10min: 10000,  label: '10K/10m', upstream: 'Microsoft Graph (10K per 10-min window)' },
+  slack:  { perMinute: 50,    label: '50/min',  upstream: 'Slack Web API' },
 } as const;
+
+// "Fresh enough" threshold — if the backend's generated_at is older than
+// this many ms, surface an amber "stale data" warning so users don't trust
+// numbers that haven't refreshed in a while (poll failure, tab background).
+const STALE_THRESHOLD_MS = 5 * 60_000;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Page
@@ -68,11 +76,29 @@ export default function CommandCenterPage() {
     return () => { document.removeEventListener('visibilitychange', handleVis); stop(); };
   }, []);
 
+  // The OLDEST generated_at across the three feeds drives the staleness
+  // indicator — if any panel hasn't refreshed in >5min, the user sees amber.
+  const oldestGeneratedAt = oldestTimestamp([
+    pulse?.generated_at, activity?.generated_at, sparks?.generated_at,
+  ]);
+  const stale = oldestGeneratedAt
+    ? Date.now() - new Date(oldestGeneratedAt).getTime() > STALE_THRESHOLD_MS
+    : false;
+
   return (
     <div className="flex-1 flex flex-col">
       <TopBar title="Command Center" />
       <div className="flex-1 overflow-auto">
         <div className="max-w-6xl mx-auto px-6 py-8 space-y-10">
+          {oldestGeneratedAt && (
+            <div className={`flex items-center gap-2 text-xs ${stale ? 'text-semantic-warning' : 'text-text-muted'}`}>
+              <span className={`inline-block w-1.5 h-1.5 rounded-full ${stale ? 'bg-semantic-warning' : 'bg-semantic-success animate-pulse'}`} />
+              {stale
+                ? `Data may be stale — last refreshed ${formatRelative(oldestGeneratedAt)} (polling may be paused or the backend isn't responding)`
+                : `Live · last refreshed ${formatRelative(oldestGeneratedAt)}`}
+            </div>
+          )}
+
           {/* Section order: status first, then trends, then details. */}
           <SystemPulseHero pulse={pulse} />
           <CapacityGauges capacity={pulse?.capacity} />
@@ -84,6 +110,13 @@ export default function CommandCenterPage() {
       </div>
     </div>
   );
+}
+
+function oldestTimestamp(times: Array<string | undefined>): string | null {
+  const valid = times.filter((t): t is string => !!t).map(t => ({ t, ms: new Date(t).getTime() }));
+  if (valid.length === 0) return null;
+  valid.sort((a, b) => a.ms - b.ms);
+  return valid[0].t;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -153,23 +186,70 @@ function CapacityGauges({ capacity }: { capacity: DashboardPulse['capacity'] | u
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         {capacity ? (
           <>
-            <GaugeCard name="Claude AI" gauge={capacity.claude} unitPerWindow={RATE_LIMITS.claude.label}
-              context={capacity.claude.last_call_at ? `Last call ${formatRelative(capacity.claude.last_call_at)}` : 'No recent activity'} />
-            <GaugeCard name="Gemini" gauge={capacity.gemini} unitPerWindow={RATE_LIMITS.gemini.label}
-              context={capacity.gemini.status === 'limited' && capacity.gemini.window_resets_at
-                ? `Resumes in ${secondsUntil(capacity.gemini.window_resets_at)}s`
-                : capacity.gemini.last_call_at
-                  ? `Last call ${formatRelative(capacity.gemini.last_call_at)}`
-                  : 'No recent activity'} />
-            <GaugeCard name="MS Graph" gauge={capacity.graph} unitPerWindow={RATE_LIMITS.graph.label}
-              context={capacity.graph.window_resets_at
-                ? `Window resets in ${secondsUntil(capacity.graph.window_resets_at)}s`
-                : `${capacity.graph.used.toLocaleString()} / ${capacity.graph.limit.toLocaleString()} this window`} />
+            <GaugeCard
+              name="Claude AI"
+              gauge={capacity.claude}
+              unitPerWindow="RPM"
+              callsThisHour={capacity.claude.calls_this_hour}
+              context={
+                capacity.claude.rate_limited ? 'Rate limited — backoff active'
+                : capacity.claude.window_resets_at ? `Window resets in ${secondsUntil(capacity.claude.window_resets_at)}s`
+                : capacity.claude.last_call_at ? `Last call ${formatRelative(capacity.claude.last_call_at)}`
+                : 'Idle — no recent calls'
+              }
+              tooltip={[
+                'Claude AI requests per minute (current 60s window).',
+                `Source: KV claude_rate:medina-ventures (count, resets_at).`,
+                `Self-imposed limit: ${RATE_LIMITS.claude.label}. Upstream: ${RATE_LIMITS.claude.upstream}.`,
+                'Hourly call count comes from KV bucket api_calls:claude:medina-ventures:{hour}, written on every Claude call.',
+                'Note: per-minute counter is approximate during concurrent bursts.',
+              ].join('\n')}
+            />
+            <GaugeCard
+              name="Gemini"
+              gauge={capacity.gemini}
+              unitPerWindow="RPM"
+              callsThisHour={capacity.gemini.calls_this_hour}
+              context={
+                capacity.gemini.rate_limited ? 'Rate limited — backoff active'
+                : capacity.gemini.window_resets_at ? `Window resets in ${secondsUntil(capacity.gemini.window_resets_at)}s`
+                : capacity.gemini.last_call_at ? `Last call ${formatRelative(capacity.gemini.last_call_at)}`
+                : 'Idle — no recent calls'
+              }
+              tooltip={[
+                'Gemini API requests per minute (current 60s window).',
+                `Source: KV gemini_rate:medina-ventures (count, resets_at).`,
+                `Self-imposed limit: ${RATE_LIMITS.gemini.label}. Upstream: ${RATE_LIMITS.gemini.upstream}.`,
+                'Hourly call count from KV bucket api_calls:gemini:medina-ventures:{hour}.',
+              ].join('\n')}
+            />
+            <GaugeCard
+              name="MS Graph"
+              gauge={capacity.graph}
+              unitPerWindow="per 10m"
+              callsThisHour={capacity.graph.calls_this_hour}
+              context={
+                capacity.graph.window_resets_at ? `Window resets in ${secondsUntil(capacity.graph.window_resets_at)}s`
+                : 'Idle — no recent calls'
+              }
+              tooltip={[
+                'Microsoft Graph API calls in the current 10-minute rolling window.',
+                'Source: KV graph_rpm:medina-ventures (count, window_start).',
+                `Soft cap: ${RATE_LIMITS.graph.label}. Upstream: ${RATE_LIMITS.graph.upstream}.`,
+                'When window_start is older than 10min, current usage shown as 0 (window expired).',
+              ].join('\n')}
+            />
             <ServiceCard
               name="Slack"
               service={capacity.slack}
               line1={capacity.slack.last_sync_at ? `Last sync ${formatRelative(capacity.slack.last_sync_at)}` : 'Awaiting first sync'}
-              line2={`${capacity.slack.messages_today ?? 0} messages today`}
+              line2={`${capacity.slack.messages_today ?? 0} messages today · ${capacity.slack.calls_this_hour ?? 0} calls this hour`}
+              tooltip={[
+                'Slack Web API status.',
+                'Source: KV slack_last_sync:medina-ventures (last successful poll), conversations table (today\'s messages), and api_calls:slack KV bucket (hourly calls).',
+                `Upstream: ${RATE_LIMITS.slack.upstream}.`,
+                'No quantitative cap shown — Slack throttles per-method, we don\'t track aggregate.',
+              ].join('\n')}
             />
             <ServiceCard
               name="ReverseContact"
@@ -182,7 +262,13 @@ function CapacityGauges({ capacity }: { capacity: DashboardPulse['capacity'] | u
                     ? `Last enrichment ${formatRelative(capacity.reversecontact.last_enrichment_at)}`
                     : 'No recent activity'
               }
-              line2={`${capacity.reversecontact.enriched_today ?? 0} enriched today`}
+              line2={`${capacity.reversecontact.enriched_today ?? 0} enriched today · ${capacity.reversecontact.calls_this_hour ?? 0} calls this hour`}
+              tooltip={[
+                'ReverseContact LinkedIn enrichment.',
+                'Source: KV rc_failures:medina-ventures (auth-failure circuit breaker), rate_limit:reversecontact:medina-ventures (429 backoff state).',
+                'Today\'s enriched count from contacts table where linkedin_data_r2_key was set since UTC midnight.',
+                'Hourly call count from api_calls:reversecontact KV bucket.',
+              ].join('\n')}
             />
           </>
         ) : (
@@ -193,8 +279,13 @@ function CapacityGauges({ capacity }: { capacity: DashboardPulse['capacity'] | u
   );
 }
 
-function GaugeCard({ name, gauge, unitPerWindow, context }: {
-  name: string; gauge: DashboardCapacityGauge; unitPerWindow: string; context: string;
+function GaugeCard({ name, gauge, unitPerWindow, context, tooltip, callsThisHour }: {
+  name: string;
+  gauge: DashboardCapacityGauge;
+  unitPerWindow: string;
+  context: string;
+  tooltip: string;
+  callsThisHour?: number;
 }) {
   const pct = gauge.percentage;
   const color = pct >= 80 ? '#EF4444' : pct >= 50 ? '#F59E0B' : '#22C55E';
@@ -202,8 +293,11 @@ function GaugeCard({ name, gauge, unitPerWindow, context }: {
   const circumference = Math.PI * radius;
   const dashOffset = circumference * (1 - pct / 100);
   return (
-    <div className="card p-4 text-center">
-      <div className="text-[10px] uppercase tracking-wider text-text-muted mb-2">{name}</div>
+    <div className="card p-4 text-center" title={tooltip}>
+      <div className="text-[10px] uppercase tracking-wider text-text-muted mb-2 flex items-center justify-center gap-1">
+        <span>{name}</span>
+        <InfoIcon />
+      </div>
       <div className="relative w-24 h-14 mx-auto">
         <svg viewBox="0 0 100 60" className="w-full h-full">
           <path d="M 10 50 A 38 38 0 0 1 90 50" fill="none" stroke="rgba(148,163,184,0.18)" strokeWidth="8" strokeLinecap="round" />
@@ -224,12 +318,27 @@ function GaugeCard({ name, gauge, unitPerWindow, context }: {
       </div>
       <div className="text-xs text-text-primary mt-1">{labelForStatus(gauge.status)}</div>
       <div className="text-[10px] text-text-muted">
-        {gauge.used.toLocaleString()} / {gauge.limit.toLocaleString()} · limit {unitPerWindow}
+        {gauge.used.toLocaleString()} / {gauge.limit.toLocaleString()} {unitPerWindow}
+      </div>
+      <div className="text-[10px] text-text-muted">
+        {(callsThisHour ?? 0).toLocaleString()} calls this hour
       </div>
       <div className="text-[10px] text-text-muted mt-1 truncate" style={{ color: pct >= 80 ? color : undefined }}>
         {context}
       </div>
     </div>
+  );
+}
+
+function InfoIcon() {
+  return (
+    <span
+      aria-hidden="true"
+      className="inline-flex items-center justify-center w-3 h-3 rounded-full border border-text-muted/40 text-text-muted/60 text-[8px] font-semibold leading-none cursor-help"
+      style={{ paddingTop: '0.5px' }}
+    >
+      i
+    </span>
   );
 }
 
@@ -241,8 +350,8 @@ function labelForStatus(s: DashboardCapacityGauge['status']): string {
   return 'Unknown';
 }
 
-function ServiceCard({ name, service, line1, line2 }: {
-  name: string; service: DashboardServiceStatus; line1: string; line2?: string;
+function ServiceCard({ name, service, line1, line2, tooltip }: {
+  name: string; service: DashboardServiceStatus; line1: string; line2?: string; tooltip?: string;
 }) {
   const color =
     service.status === 'rate_limited' ? '#F59E0B' :
@@ -250,8 +359,11 @@ function ServiceCard({ name, service, line1, line2 }: {
     '#22C55E';
   const breathe = service.status === 'active' || service.status === 'healthy';
   return (
-    <div className="card p-4 text-center flex flex-col">
-      <div className="text-[10px] uppercase tracking-wider text-text-muted">{name}</div>
+    <div className="card p-4 text-center flex flex-col" title={tooltip}>
+      <div className="text-[10px] uppercase tracking-wider text-text-muted flex items-center justify-center gap-1">
+        <span>{name}</span>
+        {tooltip && <InfoIcon />}
+      </div>
       <div className="my-3 flex items-center justify-center">
         <div
           className="w-4 h-4 rounded-full"
@@ -277,23 +389,49 @@ function ServiceCard({ name, service, line1, line2 }: {
 // ────────────────────────────────────────────────────────────────────────────
 
 function Sparklines({ data }: { data: DashboardSparklines | null }) {
+  const services: Array<{ key: 'claude'|'gemini'|'graph'|'slack'; name: string; color: string; limit: string; tooltip: string }> = [
+    {
+      key: 'claude', name: 'Claude AI', color: '#8B5CF6', limit: RATE_LIMITS.claude.label,
+      tooltip: `Real call counts. Source: KV bucket api_calls:claude:medina-ventures:{hour} (TTL 26h). Incremented on every Claude call via recordApiCall(). Self-imposed limit ${RATE_LIMITS.claude.label}; upstream ${RATE_LIMITS.claude.upstream}.`,
+    },
+    {
+      key: 'gemini', name: 'Gemini', color: '#EC4899', limit: RATE_LIMITS.gemini.label,
+      tooltip: `Real call counts. Source: KV bucket api_calls:gemini:medina-ventures:{hour}. Self-imposed ${RATE_LIMITS.gemini.label}; upstream ${RATE_LIMITS.gemini.upstream}.`,
+    },
+    {
+      key: 'graph', name: 'MS Graph', color: '#3B82F6', limit: RATE_LIMITS.graph.label,
+      tooltip: `Real call counts. Source: KV bucket api_calls:graph:medina-ventures:{hour}, mirrored from recordGraphApiCall(). Soft cap ${RATE_LIMITS.graph.label}; upstream ${RATE_LIMITS.graph.upstream}.`,
+    },
+    {
+      key: 'slack', name: 'Slack', color: '#22C55E', limit: RATE_LIMITS.slack.label,
+      tooltip: `Slack call counts (estimated per fetch cycle: 2 + channels + senders). Source: KV bucket api_calls:slack:medina-ventures:{hour}. Slack throttles per-method, no aggregate cap shown.`,
+    },
+  ];
   return (
     <Section
       title="API activity (last 24 hours)"
-      hint="Volume of calls to external services — spikes indicate heavy processing."
+      hint="Volume of calls to external services — spikes indicate heavy processing. Real counts from KV hourly buckets, written on every API call."
       headerRight={data ? <span className="text-xs text-text-muted">Total: {data.total_24h.toLocaleString()} calls in last 24h</span> : null}
     >
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <SparklineCard name="Claude AI" series={data?.claude} color="#8B5CF6" limit={RATE_LIMITS.claude.label} />
-        <SparklineCard name="Gemini" series={data?.gemini} color="#EC4899" limit={RATE_LIMITS.gemini.label} />
-        <SparklineCard name="MS Graph" series={data?.graph} color="#3B82F6" limit={RATE_LIMITS.graph.label} />
-        <SparklineCard name="Slack" series={data?.slack} color="#22C55E" limit={RATE_LIMITS.slack.label} />
+        {services.map(s => (
+          <SparklineCard
+            key={s.key}
+            name={s.name}
+            series={data ? (data[s.key] as number[]) : undefined}
+            color={s.color}
+            limit={s.limit}
+            tooltip={s.tooltip}
+          />
+        ))}
       </div>
     </Section>
   );
 }
 
-function SparklineCard({ name, series, color, limit }: { name: string; series?: number[]; color: string; limit: string }) {
+function SparklineCard({ name, series, color, limit, tooltip }: {
+  name: string; series?: number[]; color: string; limit: string; tooltip: string;
+}) {
   if (!series || series.length === 0) {
     return <div className="card p-4 h-32 animate-pulse" />;
   }
@@ -310,9 +448,12 @@ function SparklineCard({ name, series, color, limit }: { name: string; series?: 
   const peak = Math.max(...series);
 
   return (
-    <div className="card p-4">
+    <div className="card p-4" title={tooltip}>
       <div className="flex items-baseline justify-between mb-2">
-        <div className="text-xs text-text-muted uppercase tracking-wider">{name}</div>
+        <div className="text-xs text-text-muted uppercase tracking-wider flex items-center gap-1">
+          <span>{name}</span>
+          <InfoIcon />
+        </div>
         <div className="text-sm font-medium text-text-primary tabular-nums">{total.toLocaleString()} <span className="text-[10px] text-text-muted">calls</span></div>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-12">
@@ -340,25 +481,39 @@ function SparklineCard({ name, series, color, limit }: { name: string; series?: 
 function QuickStatsBar({
   stats, today,
 }: { stats: DashboardActivity['stats_24h'] | undefined; today: DashboardActivity['stats_today'] | undefined }) {
+  // Each stat carries its own provenance (the actual D1 query that produced
+  // the number) so users can verify the dashboard isn't lying.
+  const TIPS = {
+    emails: "COUNT(*) FROM conversations WHERE source='outlook' AND created_at > now -24h. Real D1 count.",
+    slack: "COUNT(*) FROM conversations WHERE source='slack' AND created_at > now -24h. Real D1 count.",
+    contacts: "COUNT(*) FROM contacts WHERE created_at > now -24h AND deleted_at IS NULL. Real D1 count.",
+    meetings: "COUNT(*) FROM events WHERE source='firefly' AND created_at > now -24h AND deleted_at IS NULL. Real D1 count.",
+    docs: "COUNT(*) FROM documents WHERE source='intelligent_import' AND created_at > now -24h AND deleted_at IS NULL.",
+    enriched: "COUNT(*) FROM contacts WHERE enrichment_last_run > now -24h AND deleted_at IS NULL.",
+    proposals: "COUNT(*) FROM approval_queue WHERE created_at > now -24h.",
+    approved: "COUNT(*) FROM approval_queue WHERE status != 'pending' AND resolved_at > now -24h.",
+  };
   return (
-    <Section title="Last 24 hours" hint="Everything the platform processed today across all data sources.">
+    <Section title="Last 24 hours" hint="Everything the platform processed today across all data sources. All counts are direct D1 queries with a 24-hour created_at filter — hover any stat for the exact SQL.">
       <div className="card p-4 flex flex-wrap gap-x-5 gap-y-3 items-center">
-        <Stat emoji="📧" value={stats?.emails_synced} delta={today?.emails_synced} label="emails" />
-        <Stat emoji="💬" value={stats?.slack_messages} label="Slack" />
-        <Stat emoji="👤" value={stats?.contacts_discovered} delta={today?.contacts_discovered} label="contacts" />
-        <Stat emoji="🤝" value={stats?.meetings_ingested} delta={today?.meetings_ingested} label="meetings" />
-        <Stat emoji="📄" value={stats?.documents_processed} delta={today?.documents_processed} label="docs" />
-        <Stat emoji="✅" value={stats?.contacts_enriched} delta={today?.contacts_enriched} label="enriched" />
-        <Stat emoji="📋" value={stats?.approval_items_created} label="proposals" />
-        <Stat emoji="✓"  value={stats?.approval_items_resolved} label="approved" />
+        <Stat emoji="📧" value={stats?.emails_synced} delta={today?.emails_synced} label="emails" tooltip={TIPS.emails} />
+        <Stat emoji="💬" value={stats?.slack_messages} label="Slack" tooltip={TIPS.slack} />
+        <Stat emoji="👤" value={stats?.contacts_discovered} delta={today?.contacts_discovered} label="contacts" tooltip={TIPS.contacts} />
+        <Stat emoji="🤝" value={stats?.meetings_ingested} delta={today?.meetings_ingested} label="meetings" tooltip={TIPS.meetings} />
+        <Stat emoji="📄" value={stats?.documents_processed} delta={today?.documents_processed} label="docs" tooltip={TIPS.docs} />
+        <Stat emoji="✅" value={stats?.contacts_enriched} delta={today?.contacts_enriched} label="enriched" tooltip={TIPS.enriched} />
+        <Stat emoji="📋" value={stats?.approval_items_created} label="proposals" tooltip={TIPS.proposals} />
+        <Stat emoji="✓"  value={stats?.approval_items_resolved} label="approved" tooltip={TIPS.approved} />
       </div>
     </Section>
   );
 }
 
-function Stat({ emoji, value, delta, label }: { emoji: string; value?: number; delta?: number; label: string }) {
+function Stat({ emoji, value, delta, label, tooltip }: {
+  emoji: string; value?: number; delta?: number; label: string; tooltip?: string;
+}) {
   return (
-    <div className="flex items-baseline gap-1.5 text-sm text-text-primary">
+    <div className="flex items-baseline gap-1.5 text-sm text-text-primary" title={tooltip}>
       <span>{emoji}</span>
       <AnimatedNumber value={value || 0} className="font-medium tabular-nums" />
       <span className="text-text-muted text-xs">{label}</span>
