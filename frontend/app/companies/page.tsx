@@ -164,12 +164,15 @@ export default function CompaniesPage() {
       ),
     },
     {
-      key: 'stage',
-      header: 'Stage',
-      width: '120px',
-      accessor: row => (
-        <span className="badge capitalize">{row.stage?.replace('_', ' ') || '\u2014'}</span>
-      ),
+      key: 'city',
+      header: 'City',
+      width: '140px',
+      accessor: row => {
+        const city = extractCity(row.hq_location);
+        return (
+          <span className="truncate block" title={row.hq_location || undefined}>{city}</span>
+        );
+      },
     },
     {
       key: 'status',
@@ -178,12 +181,6 @@ export default function CompaniesPage() {
       accessor: row => (
         <span className="badge capitalize">{row.investment_status?.replace('_', ' ')}</span>
       ),
-    },
-    {
-      key: 'valuation',
-      header: 'Valuation',
-      width: '120px',
-      accessor: row => formatCurrency(row.current_valuation),
     },
     {
       key: 'news_score',
@@ -380,10 +377,7 @@ export default function CompaniesPage() {
   );
 }
 
-function formatCurrency(v?: number | null): string {
-  if (v == null) return '\u2014';
-  if (v >= 1e9) return `$${(v / 1e9).toFixed(1)}B`;
-  if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
-  if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}K`;
-  return `$${v}`;
+function extractCity(location: string | null | undefined): string {
+  if (!location) return '\u2014';
+  return location.split(',')[0].trim() || '\u2014';
 }

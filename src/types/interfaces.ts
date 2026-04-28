@@ -165,6 +165,7 @@ export interface AgentSession {
 
 export interface ContactFilter {
   contact_types?: string[];
+  engagement_statuses?: string[];
   tags?: string[];
   tag_logic?: 'and' | 'or';
   company_tags?: string[];

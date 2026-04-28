@@ -29,6 +29,13 @@ export async function listContacts(
     binds.push(...filter.contact_types);
   }
 
+  if (filter.engagement_statuses?.length) {
+    where.push(
+      `c.engagement_status IN (${filter.engagement_statuses.map(() => '?').join(',')})`
+    );
+    binds.push(...filter.engagement_statuses);
+  }
+
   if (filter.company_id) {
     where.push('c.company_id = ?');
     binds.push(filter.company_id);
@@ -148,6 +155,7 @@ function parseContactFilter(url: URL): ContactFilter {
   const f: ContactFilter = {};
   const sp = url.searchParams;
   if (sp.getAll('contact_types').length) f.contact_types = sp.getAll('contact_types');
+  if (sp.getAll('engagement_statuses').length) f.engagement_statuses = sp.getAll('engagement_statuses');
   if (sp.getAll('tags').length) f.tags = sp.getAll('tags');
   if (sp.get('tag_logic')) f.tag_logic = sp.get('tag_logic') as 'and' | 'or';
   if (sp.get('company_id')) f.company_id = sp.get('company_id')!;
@@ -172,12 +180,18 @@ export async function getContactFilterCounts(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const [typeCounts, tagCounts, overdueCount] = await Promise.all([
+  const [typeCounts, statusCounts, tagCounts, overdueCount] = await Promise.all([
     env.D1.prepare(
       `SELECT contact_type, COUNT(*) as cnt FROM contacts
        WHERE org_id = ? AND deleted_at IS NULL
        GROUP BY contact_type`
     ).bind(ctx.orgId).all<{ contact_type: string; cnt: number }>(),
+
+    env.D1.prepare(
+      `SELECT engagement_status, COUNT(*) as cnt FROM contacts
+       WHERE org_id = ? AND deleted_at IS NULL
+       GROUP BY engagement_status`
+    ).bind(ctx.orgId).all<{ engagement_status: string | null; cnt: number }>(),
 
     env.D1.prepare(
       `SELECT ct.tag_id, COUNT(*) as cnt FROM contact_tags ct
@@ -197,11 +211,17 @@ export async function getContactFilterCounts(
   const contact_type: Record<string, number> = {};
   for (const r of typeCounts.results) contact_type[r.contact_type] = r.cnt;
 
+  const engagement_status: Record<string, number> = {};
+  for (const r of statusCounts.results) {
+    if (r.engagement_status) engagement_status[r.engagement_status] = r.cnt;
+  }
+
   const tags: Record<string, number> = {};
   for (const r of tagCounts.results) tags[r.tag_id] = r.cnt;
 
   return jsonResponse({
     contact_type,
+    engagement_status,
     tags,
     overdue_followups: overdueCount?.cnt || 0,
   });

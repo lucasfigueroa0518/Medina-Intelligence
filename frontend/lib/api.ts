@@ -204,7 +204,7 @@ export const api = {
   deleteTag: (id: string) =>
     request<{ ok: boolean }>(`/tags/${id}`, { method: 'DELETE' }),
   getContactFilterCounts: () =>
-    request<{ contact_type: Record<string, number>; tags: Record<string, number>; overdue_followups: number }>('/contacts/filter-counts'),
+    request<{ contact_type: Record<string, number>; engagement_status: Record<string, number>; tags: Record<string, number>; overdue_followups: number }>('/contacts/filter-counts'),
   getCompanyFilterCounts: () =>
     request<{ tags: Record<string, number> }>('/companies/filter-counts'),
 

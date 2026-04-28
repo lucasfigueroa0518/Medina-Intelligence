@@ -16,6 +16,7 @@ interface Contact {
   email: string;
   company_name?: string;
   contact_type: string;
+  engagement_status?: string | null;
   last_contact_date?: string;
   total_interactions: number;
   next_followup_date?: string;
@@ -30,6 +31,19 @@ interface Tag {
 
 const CONTACT_TYPES = ['individual', 'family', 'institutional_investor', 'company'];
 
+const ENGAGEMENT_STATUSES = ['active', 'warm', 'new', 'dormant', 'churning', 'close'];
+
+// Pill colors keyed to status. Active=green, warm=purple (app accent), dormant=gray,
+// churning=muted gray (cold), new=amber, close=neutral magenta.
+const STATUS_PILL: Record<string, { bg: string; text: string; label: string }> = {
+  active:   { bg: 'rgba(34,197,94,0.12)',  text: '#4ADE80', label: 'Active' },
+  warm:     { bg: 'rgba(168,85,247,0.14)', text: '#C084FC', label: 'Warm' },
+  new:      { bg: 'rgba(245,158,11,0.12)', text: '#FBBF24', label: 'New' },
+  dormant:  { bg: 'rgba(148,163,184,0.14)',text: '#94A3B8', label: 'Dormant' },
+  churning: { bg: 'rgba(100,116,139,0.14)',text: '#64748B', label: 'Churning' },
+  close:    { bg: 'rgba(217,70,168,0.12)', text: '#D946A8', label: 'Close' },
+};
+
 export default function ContactsPage() {
   const router = useRouter();
   const [contacts, setContacts] = React.useState<Contact[]>([]);
@@ -39,18 +53,20 @@ export default function ContactsPage() {
   const searchDebounceRef = React.useRef<NodeJS.Timeout>();
   const [filters, setFilters] = React.useState<{
     contact_types: string[];
+    engagement_statuses: string[];
     has_followup_overdue: boolean;
     tag_ids: string[];
-  }>({ contact_types: [], has_followup_overdue: false, tag_ids: [] });
+  }>({ contact_types: [], engagement_statuses: [], has_followup_overdue: false, tag_ids: [] });
   const [createOpen, setCreateOpen] = React.useState(false);
   const [tagManagerOpen, setTagManagerOpen] = React.useState(false);
   const [toast, setToast] = React.useState<string | null>(null);
   const [allTags, setAllTags] = React.useState<Tag[]>([]);
   const [filterCounts, setFilterCounts] = React.useState<{
     contact_type: Record<string, number>;
+    engagement_status: Record<string, number>;
     tags: Record<string, number>;
     overdue_followups: number;
-  }>({ contact_type: {}, tags: {}, overdue_followups: 0 });
+  }>({ contact_type: {}, engagement_status: {}, tags: {}, overdue_followups: 0 });
 
   const loadTags = React.useCallback(() => {
     api.listTags('contact').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
@@ -118,16 +134,21 @@ export default function ContactsPage() {
     if (filters.contact_types.length > 0) {
       result = result.filter(c => filters.contact_types.includes(c.contact_type));
     }
+    if (filters.engagement_statuses.length > 0) {
+      const statusSet = new Set(filters.engagement_statuses);
+      result = result.filter(c => c.engagement_status && statusSet.has(c.engagement_status));
+    }
     if (filters.tag_ids.length > 0) {
       const tagSet = new Set(filters.tag_ids);
       result = result.filter(c => c.tags?.some(t => tagSet.has(t.id)));
     }
     return result;
-  }, [contacts, filters.contact_types, filters.tag_ids]);
+  }, [contacts, filters.contact_types, filters.engagement_statuses, filters.tag_ids]);
 
-  const isFiltered = filters.contact_types.length > 0 || filters.tag_ids.length > 0;
+  const isFiltered = filters.contact_types.length > 0 || filters.engagement_statuses.length > 0 || filters.tag_ids.length > 0;
   const activeFilterLabels: string[] = [
     ...filters.contact_types.map(t => t.replace(/_/g, ' ')),
+    ...filters.engagement_statuses.map(s => STATUS_PILL[s]?.label ?? s),
     ...allTags.filter(t => filters.tag_ids.includes(t.id)).map(t => t.name),
   ];
 
@@ -196,16 +217,22 @@ export default function ContactsPage() {
       sortable: true,
     },
     {
-      key: 'followup',
-      header: 'Follow-up',
-      width: '120px',
+      key: 'status',
+      header: 'Status',
+      width: '110px',
       accessor: row => {
-        if (!row.next_followup_date) return '\u2014';
-        const overdue = new Date(row.next_followup_date) < new Date();
+        const s = row.engagement_status;
+        if (!s) return <span className="text-text-muted">\u2014</span>;
+        const pill = STATUS_PILL[s];
+        if (!pill) {
+          return <span className="badge capitalize">{s}</span>;
+        }
         return (
-          <span className={overdue ? 'text-semantic-error' : ''}>
-            {formatRelative(row.next_followup_date)}
-            {overdue && ' \u00b7 Overdue'}
+          <span
+            className="px-2 py-0.5 rounded-full text-[11px] font-semibold font-accent"
+            style={{ background: pill.bg, color: pill.text }}
+          >
+            {pill.label}
           </span>
         );
       },
@@ -236,6 +263,32 @@ export default function ContactsPage() {
                       setFilters({ ...filters, contact_types: next });
                     }} />
                   <span className="capitalize flex-1">{type.replace(/_/g, ' ')}</span>
+                  <span className={`text-[10px] tabular-nums ${count === 0 ? 'text-text-muted/50' : 'text-text-muted'}`}>{count}</span>
+                </label>
+              );
+            }),
+          },
+          {
+            label: 'Status',
+            defaultOpen: true,
+            children: ENGAGEMENT_STATUSES.map(status => {
+              const count = filterCounts.engagement_status[status] || 0;
+              const active = filters.engagement_statuses.includes(status);
+              const pill = STATUS_PILL[status];
+              return (
+                <label key={status}
+                  className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors ${
+                    active ? 'bg-accent-magenta/10 text-text-primary' : count === 0 ? 'text-text-muted' : 'text-text-secondary hover:text-text-primary'
+                  }`}>
+                  <input type="checkbox" checked={active}
+                    onChange={e => {
+                      const next = e.target.checked
+                        ? [...filters.engagement_statuses, status]
+                        : filters.engagement_statuses.filter(s => s !== status);
+                      setFilters({ ...filters, engagement_statuses: next });
+                    }} />
+                  <span className="w-2 h-2 rounded-full shrink-0" style={{ background: pill?.text || '#94A3B8' }} />
+                  <span className="flex-1">{pill?.label ?? status}</span>
                   <span className={`text-[10px] tabular-nums ${count === 0 ? 'text-text-muted/50' : 'text-text-muted'}`}>{count}</span>
                 </label>
               );
@@ -294,8 +347,8 @@ export default function ContactsPage() {
             })(),
           },
         ]}
-        onClearAll={() => setFilters({ contact_types: [], has_followup_overdue: false, tag_ids: [] })}
-        activeCount={filters.contact_types.length + (filters.has_followup_overdue ? 1 : 0) + filters.tag_ids.length}
+        onClearAll={() => setFilters({ contact_types: [], engagement_statuses: [], has_followup_overdue: false, tag_ids: [] })}
+        activeCount={filters.contact_types.length + filters.engagement_statuses.length + (filters.has_followup_overdue ? 1 : 0) + filters.tag_ids.length}
       />
 
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -327,7 +380,7 @@ export default function ContactsPage() {
                   {label}
                 </span>
               ))}
-              <button onClick={() => setFilters({ contact_types: [], has_followup_overdue: false, tag_ids: [] })}
+              <button onClick={() => setFilters({ contact_types: [], engagement_statuses: [], has_followup_overdue: false, tag_ids: [] })}
                 className="text-[10px] text-text-muted hover:text-text-secondary ml-1 flex items-center gap-0.5">
                 <XIcon size={10} /> Clear All
               </button>
