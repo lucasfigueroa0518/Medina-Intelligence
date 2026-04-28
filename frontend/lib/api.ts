@@ -282,6 +282,11 @@ export const api = {
   // Integrations
   getIntegrationsStatus: () =>
     request<IntegrationsStatusResponse>('/integrations/status'),
+
+  // Command Center / dashboard
+  getDashboardPulse: () => request<DashboardPulse>('/dashboard/pulse'),
+  getDashboardActivity: () => request<DashboardActivity>('/dashboard/activity'),
+  getDashboardSparklines: () => request<DashboardSparklines>('/dashboard/sparklines'),
   getFireflyWebhookSecret: () =>
     request<{ secret: string }>('/integrations/firefly/webhook-secret'),
   fireflyBackfill: (apiKey: string, days?: number, opts?: { start_date?: string; end_date?: string }) =>
@@ -428,6 +433,79 @@ export interface IntegrationsStatusResponse {
   slack: IntegrationRow;
   reversecontact: IntegrationRow;
   firefly: IntegrationRow;
+}
+
+// --- Command Center types (mirror src/handlers/dashboard.ts) ---
+
+export interface DashboardActiveProcess {
+  id: string;
+  type: 'ingestion' | 'enrichment' | 'daily_cron' | 'backfill' | 'import' | 'other';
+  label: string;
+  started_at: string;
+  elapsed_seconds: number;
+  progress?: { current: number; total?: number; percentage?: number };
+  status: 'running' | 'finalizing';
+}
+
+export interface DashboardCapacityGauge {
+  used: number;
+  limit: number;
+  percentage: number;
+  label: string;
+  status: 'low' | 'moderate' | 'high' | 'limited' | 'unknown';
+}
+
+export interface DashboardServiceStatus {
+  status: 'healthy' | 'rate_limited' | 'auth_failed' | 'circuit_open' | 'active' | 'unknown';
+  label: string;
+  blocked_until?: string;
+}
+
+export interface DashboardPulse {
+  system_status: 'healthy' | 'busy' | 'degraded' | 'error';
+  status_message: string;
+  active_processes: DashboardActiveProcess[];
+  capacity: {
+    claude: DashboardCapacityGauge;
+    gemini: DashboardCapacityGauge;
+    graph: DashboardCapacityGauge;
+    slack: DashboardServiceStatus;
+    reversecontact: DashboardServiceStatus;
+  };
+  alerts: Array<{ type: 'warning' | 'error'; message: string; timestamp: string }>;
+}
+
+export interface DashboardActivityEntry {
+  id: string;
+  type: string;
+  icon: 'email' | 'enrichment' | 'meeting' | 'import' | 'cron' | 'error' | 'news' | 'cleanup';
+  label: string;
+  description: string;
+  timestamp: string;
+  result?: { processed?: number; created?: number; enriched?: number; failed?: number };
+}
+
+export interface DashboardActivity {
+  recent_activity: DashboardActivityEntry[];
+  stats_24h: {
+    emails_synced: number;
+    contacts_discovered: number;
+    contacts_enriched: number;
+    companies_enriched: number;
+    meetings_ingested: number;
+    slack_messages: number;
+    documents_processed: number;
+    approval_items_created: number;
+    approval_items_resolved: number;
+  };
+}
+
+export interface DashboardSparklines {
+  claude: number[];
+  gemini: number[];
+  graph: number[];
+  overall: number[];
+  hours: string[];
 }
 
 export interface FireflyBackfillResult {

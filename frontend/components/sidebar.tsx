@@ -12,6 +12,7 @@ import {
   Upload,
   Settings as SettingsIcon,
   LogOut,
+  Activity,
   type LucideIcon,
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
@@ -28,6 +29,7 @@ interface NavLink {
 
 const NAV_LINKS: NavLink[] = [
   { label: 'MARTy', route: '/god-mode' },
+  { label: 'Command Center', icon: Activity, route: '/command-center' },
   { label: 'Contacts', icon: Users, route: '/contacts' },
   { label: 'Companies', icon: Building2, route: '/companies' },
   { label: 'Deals', icon: Handshake, route: '/deals' },

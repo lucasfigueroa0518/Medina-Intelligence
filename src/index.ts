@@ -31,6 +31,7 @@ import * as Webhooks from './handlers/webhooks';
 import * as AuthOAuth from './handlers/auth-oauth';
 import * as Users from './handlers/users';
 import * as Integrations from './handlers/integrations';
+import * as Dashboard from './handlers/dashboard';
 
 import { handleAuditBatch } from './workers/audit-consumer';
 import { handleWebhookBatch } from './workers/webhook-consumer';
@@ -499,6 +500,14 @@ async function routeAuthenticated(
     return Admin.getIntegrationStatus(ctx, env);
   if (path === '/api/integrations/status' && method === 'GET')
     return Integrations.getIntegrationsStatus(request, ctx, env);
+
+  // --- Command Center (real-time dashboard) ---
+  if (path === '/api/dashboard/pulse' && method === 'GET')
+    return Dashboard.getDashboardPulse(ctx, env);
+  if (path === '/api/dashboard/activity' && method === 'GET')
+    return Dashboard.getDashboardActivity(ctx, env);
+  if (path === '/api/dashboard/sparklines' && method === 'GET')
+    return Dashboard.getDashboardSparklines(ctx, env);
   if (path === '/api/integrations/firefly/webhook-secret' && method === 'GET')
     return Integrations.getFireflyWebhookSecret(ctx, env);
 
