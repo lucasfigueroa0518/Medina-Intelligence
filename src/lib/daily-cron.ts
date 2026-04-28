@@ -25,6 +25,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await recalculateAllAssociations(orgId, env); } catch (e) { console.error('Association recalc:', e); }
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
   try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
+  try { await processEmbedRetryQueue(orgId, env); } catch (e) { console.error('Embed retry queue:', e); }
   try { await rebuildEntityIndex(orgId, env); } catch (e) { console.error('Entity index rebuild:', e); }
   try { await cleanupExpiredResetTokens(env); } catch (e) { console.error('Reset token cleanup:', e); }
 }
@@ -459,6 +460,221 @@ export async function backfillUnembeddedConversations(orgId: string, env: Env): 
     console.log(`[daily-cron] backfilled ${embedded} unembedded conversations for org ${orgId}`);
   }
   return embedded;
+}
+
+// Embed retry queue processor (audit 2026-04-28 scale-up Fix 3).
+//
+// Drains embed_retry_queue: conversations / events / documents that
+// detect-embed-gaps detected as missing from vector_entity_index after a
+// failed embed step. Each entry tracks attempts; after MAX_ATTEMPTS the
+// entry is marked failed_permanent and surfaced in System Status.
+//
+// Called by the daily cron AND by POST /api/admin/process-embed-queue
+// for on-demand drains. The new BGE limiter (acquireEmbedSlot) keeps this
+// from re-creating the burst that put items in the queue in the first place.
+export async function processEmbedRetryQueue(
+  orgId: string,
+  env: Env
+): Promise<{ processed: number; succeeded: number; failed: number }> {
+  const MAX_PER_RUN = 100;
+  const MAX_ATTEMPTS = 3;
+
+  const queued = await env.D1.prepare(
+    `SELECT id, entity_id, source_table, attempts
+       FROM embed_retry_queue
+      WHERE org_id = ? AND status = 'pending' AND attempts < ?
+      ORDER BY created_at ASC
+      LIMIT ?`
+  ).bind(orgId, MAX_ATTEMPTS, MAX_PER_RUN).all<{
+    id: string; entity_id: string; source_table: string; attempts: number;
+  }>();
+
+  if (queued.results.length === 0) return { processed: 0, succeeded: 0, failed: 0 };
+
+  let succeeded = 0;
+  let failed = 0;
+
+  for (const item of queued.results) {
+    await env.D1.prepare(
+      `UPDATE embed_retry_queue
+          SET status = 'in_progress',
+              attempts = attempts + 1,
+              last_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(item.id).run();
+
+    try {
+      const ok = await embedSingleItem(item.entity_id, item.source_table, orgId, env);
+      if (ok === 'missing') {
+        // Source row was deleted between enqueue and retry — clean up.
+        await env.D1.prepare(`DELETE FROM embed_retry_queue WHERE id = ?`).bind(item.id).run();
+      } else {
+        await env.D1.prepare(`DELETE FROM embed_retry_queue WHERE id = ?`).bind(item.id).run();
+        succeeded += 1;
+      }
+    } catch (e: any) {
+      const errMsg = String(e?.message || e).slice(0, 500);
+      const newAttempts = item.attempts + 1;
+      const newStatus = newAttempts >= MAX_ATTEMPTS ? 'failed_permanent' : 'pending';
+      await env.D1.prepare(
+        `UPDATE embed_retry_queue SET status = ?, last_error = ? WHERE id = ?`
+      ).bind(newStatus, errMsg, item.id).run();
+      failed += 1;
+    }
+
+    // 100ms pacing — the limiter handles cross-org pacing, this just keeps
+    // a single drain from monopolizing the BGE slot.
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  console.log(
+    `[embed-retry-queue] org=${orgId} processed=${queued.results.length} succeeded=${succeeded} failed=${failed}`
+  );
+  return { processed: queued.results.length, succeeded, failed };
+}
+
+// Re-embed a single item from its source table. Returns:
+//   'embedded' — vectors written to vector_entity_index
+//   'skipped'  — item already has vectors (dedup guard hit), nothing to do
+//   'missing'  — source row gone (deleted since enqueue)
+async function embedSingleItem(
+  entityId: string,
+  sourceTable: string,
+  orgId: string,
+  env: Env
+): Promise<'embedded' | 'skipped' | 'missing'> {
+  const { chunkEmbedAndPersistAll } = await import('./embedding');
+
+  if (sourceTable === 'conversations') {
+    const row = await env.D1.prepare(
+      `SELECT id, body_r2_key, source, subject, sent_at, participant_user_ids
+         FROM conversations WHERE id = ? AND org_id = ?`
+    ).bind(entityId, orgId).first<{
+      id: string; body_r2_key: string | null; source: string;
+      subject: string | null; sent_at: string | null; participant_user_ids: string | null;
+    }>();
+    if (!row) return 'missing';
+    if (!row.body_r2_key) throw new Error('conversation has no body_r2_key');
+
+    const obj = await env.R2.get(row.body_r2_key);
+    if (!obj) throw new Error(`R2 body missing: ${row.body_r2_key}`);
+    const body = await obj.text();
+
+    const entries = await chunkEmbedAndPersistAll(body, {
+      org_id: orgId,
+      visibility: 'org_wide',
+      participant_user_ids: row.participant_user_ids || undefined,
+      document_type: row.source === 'manual' ? 'transcript' : 'email',
+      source_table: 'conversations',
+      source_id: row.id,
+      r2_key: row.body_r2_key,
+      created_at: row.sent_at || new Date().toISOString(),
+      primary_entity_id: row.id,
+      entity_name: row.subject || undefined,
+      date: row.sent_at || undefined,
+    }, env);
+
+    if (entries.length === 0) return 'skipped';
+    await env.D1.batch(
+      entries.map(e =>
+        env.D1.prepare(
+          'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+        ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+      )
+    );
+    return 'embedded';
+  }
+
+  if (sourceTable === 'events') {
+    const row = await env.D1.prepare(
+      `SELECT id, title, summary, transcript_r2_key, start_time
+         FROM events WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    ).bind(entityId, orgId).first<{
+      id: string; title: string; summary: string | null;
+      transcript_r2_key: string | null; start_time: string;
+    }>();
+    if (!row) return 'missing';
+
+    let text = row.summary || row.title || '';
+    let r2Key = '';
+    if (row.transcript_r2_key) {
+      const obj = await env.R2.get(row.transcript_r2_key);
+      if (obj) {
+        text = await obj.text();
+        r2Key = row.transcript_r2_key;
+      }
+    }
+    if (!text || text.trim().length < 10) return 'missing';
+
+    const entries = await chunkEmbedAndPersistAll(text, {
+      org_id: orgId,
+      visibility: 'org_wide',
+      document_type: 'transcript',
+      source_table: 'events',
+      source_id: row.id,
+      r2_key: r2Key,
+      created_at: row.start_time,
+      primary_entity_id: row.id,
+      entity_name: row.title,
+      date: row.start_time,
+    }, env);
+
+    if (entries.length === 0) return 'skipped';
+    await env.D1.batch(
+      entries.map(e =>
+        env.D1.prepare(
+          'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+        ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+      )
+    );
+    return 'embedded';
+  }
+
+  if (sourceTable === 'documents') {
+    const row = await env.D1.prepare(
+      `SELECT id, title, document_type, r2_key, extracted_text_preview, created_at,
+              contact_id, company_id, conversation_id
+         FROM documents WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    ).bind(entityId, orgId).first<{
+      id: string; title: string; document_type: string; r2_key: string;
+      extracted_text_preview: string | null; created_at: string;
+      contact_id: string | null; company_id: string | null; conversation_id: string | null;
+    }>();
+    if (!row) return 'missing';
+    if (!row.r2_key) return 'missing';
+
+    const { extractTextFromFile } = await import('./file-extraction');
+    const obj = await env.R2.get(row.r2_key);
+    if (!obj) return 'missing';
+    const buffer = await obj.arrayBuffer();
+    const file = new File([buffer], row.title, { type: '' });
+    const text = await extractTextFromFile(file);
+    if (!text || text.trim().length < 10) return 'missing';
+
+    const entries = await chunkEmbedAndPersistAll(text, {
+      org_id: orgId,
+      visibility: 'private',
+      document_type: row.document_type,
+      source_table: 'documents',
+      source_id: row.id,
+      r2_key: row.r2_key,
+      created_at: row.created_at,
+      primary_entity_id: row.contact_id || row.company_id || row.id,
+      entity_name: row.title,
+    }, env);
+
+    if (entries.length === 0) return 'skipped';
+    await env.D1.batch(
+      entries.map(e =>
+        env.D1.prepare(
+          'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+        ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+      )
+    );
+    return 'embedded';
+  }
+
+  throw new Error(`unknown source_table: ${sourceTable}`);
 }
 
 async function cleanupExpiredResetTokens(env: Env): Promise<void> {

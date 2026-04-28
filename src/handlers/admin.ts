@@ -9,6 +9,7 @@ import { runHistoricalBackfill, getUserSyncConfig, setUserSyncConfig, type Backf
 import { runDailyCron } from '../lib/daily-cron';
 import { triggerCompanyEnrichment, isDomainShapedName } from '../lib/enrichment';
 import { rebuildEntityIndex } from '../lib/entity-index';
+import { processEmbedRetryQueue } from '../lib/daily-cron';
 
 export async function listDlq(
   request: Request,
@@ -212,7 +213,7 @@ export async function repairVectorizeParticipantIds(
         errors.push(`${vectorId}: chunk text missing from KV`);
         continue;
       }
-      const values = await runEmbedding(env, chunkText);
+      const values = await runEmbedding(env, chunkText, ctx.orgId);
 
       const newCsv = csv.split(',').map(s => s === body.old_user_id ? body.new_user_id : s).join(',');
       await env.VECTORIZE.upsert([
@@ -842,5 +843,63 @@ export async function invalidateStaleCalendarTokens(
     cleared,
     next_steps:
       'Affected users must reconnect Outlook in Settings → Sync & Integrations. After reconnect, their next ingestion run does a full calendar sync.',
+  });
+}
+
+// On-demand embed retry queue drain (audit 2026-04-28 scale-up Fix 3).
+//
+// The daily cron also drains this queue, but during a bulk ingestion it's
+// useful to process it immediately rather than waiting overnight. Owner-only
+// because successive drains burn Workers AI quota.
+export async function processEmbedQueue(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can process the embed queue.');
+  }
+
+  // Pre-drain snapshot for the response so the caller sees what was queued.
+  const before = await env.D1.prepare(
+    `SELECT status, COUNT(*) as n FROM embed_retry_queue WHERE org_id = ? GROUP BY status`
+  ).bind(ctx.orgId).all<{ status: string; n: number }>();
+
+  const result = await processEmbedRetryQueue(ctx.orgId, env);
+
+  const after = await env.D1.prepare(
+    `SELECT status, COUNT(*) as n FROM embed_retry_queue WHERE org_id = ? GROUP BY status`
+  ).bind(ctx.orgId).all<{ status: string; n: number }>();
+
+  return jsonResponse({
+    ok: true,
+    before: Object.fromEntries(before.results.map(r => [r.status, r.n])),
+    after: Object.fromEntries(after.results.map(r => [r.status, r.n])),
+    drain: result,
+  });
+}
+
+// GET — for System Status to show pending / failed counts without a drain.
+export async function getEmbedQueueHealth(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const counts = await env.D1.prepare(
+    `SELECT status, COUNT(*) as n,
+            ROUND(AVG(attempts), 2) as avg_attempts,
+            MAX(last_attempt_at) as latest_attempt
+       FROM embed_retry_queue WHERE org_id = ? GROUP BY status`
+  ).bind(ctx.orgId).all<{ status: string; n: number; avg_attempts: number; latest_attempt: string | null }>();
+
+  const failed = await env.D1.prepare(
+    `SELECT entity_id, source_table, attempts, last_error, last_attempt_at
+       FROM embed_retry_queue
+      WHERE org_id = ? AND status = 'failed_permanent'
+      ORDER BY last_attempt_at DESC LIMIT 50`
+  ).bind(ctx.orgId).all();
+
+  return jsonResponse({
+    ok: true,
+    by_status: Object.fromEntries(counts.results.map(r => [r.status, { count: r.n, avg_attempts: r.avg_attempts, latest_attempt: r.latest_attempt }])),
+    failed_permanent: failed.results,
   });
 }

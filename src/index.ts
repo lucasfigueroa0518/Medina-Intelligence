@@ -454,6 +454,9 @@ async function routeAuthenticated(
   m = path.match(/^\/api\/agent\/sessions\/([^/]+)$/);
   if (m && method === 'DELETE') return Agent.deleteSession(m[1], ctx, env);
   if (m && method === 'PATCH') return Agent.updateSessionTitle(request, m[1], ctx, env);
+  if (path === '/api/agent/citation-click' && method === 'POST') {
+    return Agent.logCitationClick(request, ctx, env);
+  }
 
   // --- Audit log ---
   if (path === '/api/audit-log' && method === 'GET') {
@@ -512,6 +515,10 @@ async function routeAuthenticated(
       return Admin.getCalendarTokenHealth(ctx, env);
     if (path === '/api/admin/invalidate-stale-calendar-tokens' && method === 'POST')
       return Admin.invalidateStaleCalendarTokens(ctx, env);
+    if (path === '/api/admin/embed-queue-health' && method === 'GET')
+      return Admin.getEmbedQueueHealth(ctx, env);
+    if (path === '/api/admin/process-embed-queue' && method === 'POST')
+      return Admin.processEmbedQueue(ctx, env);
     m = path.match(/^\/api\/admin\/users\/([^/]+)\/reset-password$/);
     if (m && method === 'POST')
       return AuthLogin.adminResetPassword(m[1], request, ctx, env);

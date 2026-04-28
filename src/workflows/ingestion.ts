@@ -25,6 +25,17 @@ console.log('[IngestionWorkflow] module loaded');
 // discovery alone. 8 keeps a comfortable margin for the worst case.
 const CHILDREN_CHUNK_SIZE = 8;
 
+// Fanout pacing (audit 2026-04-28 scale-up Fix 2). Spawning all child
+// workflows simultaneously turned every large run into a thundering-herd
+// problem on Workers AI / Vectorize. Batching keeps concurrent work bounded:
+// spawn 25 children, wait for them to record completion in sync_job_chunks,
+// then spawn the next batch. Caps wait per batch so a single stuck chunk
+// doesn't lock the master forever — finalizer trigger still fires correctly
+// when the late chunk eventually records completion.
+const FANOUT_BATCH_SIZE = 25;
+const FANOUT_BATCH_WAIT_MS = 500;
+const FANOUT_MAX_WAIT_PER_BATCH_MS = 180_000;
+
 interface IngestionParams {
   org_id: string;
 }
@@ -229,9 +240,18 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         failures: [...coreData.failures, ...newsData.failures],
       };
 
-      // Step 3: write chunks to R2 + fan out children
+      // Step 3: write chunks to R2 + fan out children. With batched fanout
+      // (Fix 2 of 2026-04-28 scale-up) this step now blocks until all batches
+      // are spawned, so the budget needs to cover the full fanout duration.
+      // 263 chunks × ~30s/batch wait / 25 = ~5 min realistic; 15 min ceiling.
       console.log('[IngestionWorkflow] step → write-chunks-and-fanout');
-      await trackedStep(this.env, step, syncJobId, 'write-chunks-and-fanout', async () => {
+      await trackedStep(
+        this.env,
+        step,
+        syncJobId,
+        'write-chunks-and-fanout',
+        { timeout: '900 seconds', retries: { limit: 1, delay: '10 seconds' } },
+        async () => {
         const allItems: ClassifiableItem[] = [
           ...sourceData.outlook,
           ...sourceData.slack,
@@ -313,23 +333,69 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
           `UPDATE sync_jobs SET metadata = ? WHERE id = ?`
         ).bind(JSON.stringify(initialMetadata), syncJobId).run();
 
-        // Fan out. Each create() queues a fresh Worker invocation.
-        await Promise.all(
-          chunks.map((_, i) =>
-            this.env.INGESTION_CHUNK_WORKFLOW.create({
-              id: `chunk-${syncJobId}-${i}`,
-              params: {
-                org_id: org_id!,
-                sync_job_id: syncJobId,
-                chunk_index: i,
-                chunk_r2_key: chunkKeys[i],
-              },
+        // Batched fanout. Spawn FANOUT_BATCH_SIZE children, wait for them to
+        // record completion in sync_job_chunks, then spawn the next batch.
+        // The trailing pause between batches gives Workers AI / Vectorize
+        // KV state time to settle.
+        for (let batchStart = 0; batchStart < chunks.length; batchStart += FANOUT_BATCH_SIZE) {
+          const batchEnd = Math.min(batchStart + FANOUT_BATCH_SIZE, chunks.length);
+          const batchSize = batchEnd - batchStart;
+          const batchChunkIds: string[] = [];
+          for (let i = batchStart; i < batchEnd; i++) batchChunkIds.push(String(i));
+
+          await Promise.all(
+            batchChunkIds.map((chunkId, j) => {
+              const i = batchStart + j;
+              return this.env.INGESTION_CHUNK_WORKFLOW.create({
+                id: `chunk-${syncJobId}-${i}`,
+                params: {
+                  org_id: org_id!,
+                  sync_job_id: syncJobId,
+                  chunk_index: i,
+                  chunk_r2_key: chunkKeys[i],
+                },
+              });
             })
-          )
-        );
+          );
+
+          console.log(
+            `[IngestionWorkflow] spawned batch ${batchStart}-${batchEnd} of ${chunks.length}`
+          );
+
+          // Skip the wait for the final batch — the finalizer trigger fires
+          // when the last chunk records completion, regardless of whether
+          // the master is still in this step.
+          if (batchEnd >= chunks.length) break;
+
+          // Wait for this batch to record completion before spawning the
+          // next. Soft-cap at FANOUT_MAX_WAIT_PER_BATCH_MS — if a chunk is
+          // genuinely stuck, proceed and let the finalizer-trigger logic
+          // catch up when the straggler eventually completes.
+          const waitStartedAt = Date.now();
+          const placeholders = batchChunkIds.map(() => '?').join(',');
+          while (true) {
+            const completed = await this.env.D1.prepare(
+              `SELECT COUNT(*) AS cnt FROM sync_job_chunks
+                WHERE job_id = ? AND chunk_id IN (${placeholders})`
+            ).bind(syncJobId, ...batchChunkIds).first<{ cnt: number }>();
+
+            if ((completed?.cnt ?? 0) >= batchSize) break;
+
+            if (Date.now() - waitStartedAt > FANOUT_MAX_WAIT_PER_BATCH_MS) {
+              console.warn(
+                `[IngestionWorkflow] batch wait timeout — proceeding with ${completed?.cnt ?? 0}/${batchSize} complete in batch ${batchStart}-${batchEnd}`
+              );
+              break;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+
+          await new Promise(resolve => setTimeout(resolve, FANOUT_BATCH_WAIT_MS));
+        }
 
         console.log(
-          `[IngestionWorkflow] fanned out ${chunks.length} children for job=${syncJobId} (chunk_size=${CHILDREN_CHUNK_SIZE}, total_items=${allItems.length})`
+          `[IngestionWorkflow] fanned out ${chunks.length} children for job=${syncJobId} (chunk_size=${CHILDREN_CHUNK_SIZE}, batch_size=${FANOUT_BATCH_SIZE}, total_items=${allItems.length})`
         );
       });
 

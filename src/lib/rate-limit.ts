@@ -129,6 +129,72 @@ export async function clearEnrichmentRateLimit(
   await env.KV.delete(`rate_limit:${source}:${orgId}`);
 }
 
+// --- Workers AI BGE embedding rate limiter (audit 2026-04-28 scale-up) ---
+//
+// Unlike checkClaudeRateLimit (throw-on-excess), this one BACKS OFF AND WAITS.
+// Embedding is on the critical path — every ingested item needs it. If we
+// throw, the embed step fails after retries and chunks complete silently
+// with no vectors. Backoff-and-wait keeps work moving; it just paces it.
+//
+// Tuned to ~10 RPS per org (CF Workers AI BGE published soft limit ~12 RPS).
+// 30s ceiling on a single acquire — if we wait longer than that, surface the
+// failure explicitly so the caller can record it (the gap is then caught by
+// detect-embed-gaps in the finalizer and recovered via embed_retry_queue).
+
+const EMBED_MAX_RPS = 10;
+const EMBED_WINDOW_MS = 1000;
+const EMBED_BACKOFF_BASE_MS = 100;
+const EMBED_BACKOFF_MAX_MS = 5000;
+const EMBED_MAX_WAIT_MS = 30_000;
+
+interface EmbedRateState {
+  window_start: number;
+  count: number;
+}
+
+export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number> {
+  const startedAt = Date.now();
+  let attempt = 0;
+  const key = `embed_rate:${orgId}`;
+
+  while (true) {
+    const now = Date.now();
+    const raw = await env.KV.get(key);
+    let state: EmbedRateState;
+    try {
+      state = raw ? JSON.parse(raw) : { window_start: now, count: 0 };
+    } catch {
+      state = { window_start: now, count: 0 };
+    }
+
+    if (now - state.window_start >= EMBED_WINDOW_MS) {
+      state.window_start = now;
+      state.count = 0;
+    }
+
+    if (state.count < EMBED_MAX_RPS) {
+      state.count += 1;
+      // 2s TTL — window naturally expires; no stale state survives.
+      await env.KV.put(key, JSON.stringify(state), { expirationTtl: 2 });
+      return Date.now() - startedAt;
+    }
+
+    const backoff = Math.min(
+      EMBED_BACKOFF_BASE_MS * Math.pow(2, attempt) + Math.random() * 100,
+      EMBED_BACKOFF_MAX_MS
+    );
+
+    if (Date.now() - startedAt + backoff > EMBED_MAX_WAIT_MS) {
+      throw new Error(
+        `EMBED_RATE_LIMIT_TIMEOUT after ${Math.round((Date.now() - startedAt) / 1000)}s waiting for slot`
+      );
+    }
+
+    await new Promise(resolve => setTimeout(resolve, backoff));
+    attempt += 1;
+  }
+}
+
 // --- Microsoft Graph API rate tracking (§6.1) ---
 
 interface GraphRateState {

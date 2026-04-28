@@ -85,7 +85,7 @@ export async function classifyAndDeduplicate(
             const vectorId = v.vector_id;
             const chunkText = await env.KV.get(`chunk:${vectorId}`);
             if (chunkText) {
-              const values = await runEmbedding(env, chunkText);
+              const values = await runEmbedding(env, chunkText, orgId);
 
               const existingVec = await env.VECTORIZE.getByIds([vectorId]);
               if (existingVec.length > 0) {

@@ -2,6 +2,7 @@
 import type { Env } from '../types/env';
 import type { ChunkMetadata, VectorIndexEntry } from '../types/interfaces';
 import { createSplitter, CURRENT_CHUNK_VERSION } from './chunking';
+import { acquireEmbedSlot } from './rate-limit';
 
 export function prefixChunk(text: string, meta: ChunkMetadata): string {
   const parts = [`[Type: ${meta.document_type}]`];
@@ -11,23 +12,46 @@ export function prefixChunk(text: string, meta: ChunkMetadata): string {
   return `${parts.join(' ')}\n${text}`;
 }
 
-export async function runEmbedding(env: Env, text: string): Promise<number[]> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const result = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-        text: [text],
-        pooling: 'cls',
-      } as any);
-      return Array.isArray((result as any).data)
-        ? (result as any).data[0]
-        : (result as any).data;
-    } catch (e) {
-      lastErr = e;
-      if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
-    }
+// Per-isolate concurrency cap (audit 2026-04-28 scale-up Fix 1, Step 3).
+// KV-coordinated limiter handles cross-invocation pacing, but during a 1s
+// window two requests can race and both pass — actual peak concurrency can
+// exceed the configured RPS. This in-isolate semaphore bounds the burst to
+// 4 concurrent BGE calls per Worker invocation as a defensive ceiling.
+let inFlightEmbeds = 0;
+const MAX_IN_FLIGHT_PER_ISOLATE = 4;
+
+async function withInFlightCap<T>(fn: () => Promise<T>): Promise<T> {
+  while (inFlightEmbeds >= MAX_IN_FLIGHT_PER_ISOLATE) {
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw lastErr;
+  inFlightEmbeds += 1;
+  try {
+    return await fn();
+  } finally {
+    inFlightEmbeds -= 1;
+  }
+}
+
+export async function runEmbedding(env: Env, text: string, orgId: string): Promise<number[]> {
+  await acquireEmbedSlot(orgId, env);
+  return withInFlightCap(async () => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const result = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+          text: [text],
+          pooling: 'cls',
+        } as any);
+        return Array.isArray((result as any).data)
+          ? (result as any).data[0]
+          : (result as any).data;
+      } catch (e) {
+        lastErr = e;
+        if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+    throw lastErr;
+  });
 }
 
 export async function chunkEmbedAndPersist(
@@ -43,7 +67,7 @@ export async function chunkEmbedAndPersist(
   const compactSourceId = meta.source_id.replace(/-/g, '');
   const vectorId = `${orgPrefix}_${meta.source_table}_${compactSourceId}_${chunkIndex}`;
 
-  const values = await runEmbedding(env, prefixedChunk);
+  const values = await runEmbedding(env, prefixedChunk, meta.org_id);
 
   await Promise.all([
     env.VECTORIZE.upsert([

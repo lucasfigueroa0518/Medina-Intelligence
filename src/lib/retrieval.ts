@@ -1,4 +1,5 @@
-// TRD §8.2-8.5 — preprocessQuery, retrieveContext, crossEncoderRerank, assembleContext
+// TRD §8.2-8.5 — preprocessQuery, retrieveContext, crossEncoderRerank
+// (context assembly with citation sources lives in lib/citations.ts)
 import type { Env } from '../types/env';
 import type {
   AgentSession,
@@ -8,7 +9,7 @@ import type {
 } from '../types/interfaces';
 import { hydrateChunks } from './hydration';
 import { runEmbedding } from './embedding';
-import { estimateTokens, truncateToTokens } from './tokens';
+import { truncateToTokens } from './tokens';
 import { callClaude } from './claude';
 import { checkClaudeRateLimit } from './rate-limit';
 import { getOrgSettings, getSharingFlags } from './helpers';
@@ -172,7 +173,7 @@ export async function preprocessQuery(
   }
 
   const [values, sharingFlags] = await Promise.all([
-    runEmbedding(env, query),
+    runEmbedding(env, query, session.org_id),
     getSharingFlags(session.org_id, env),
   ]);
 
@@ -461,41 +462,3 @@ export const TOKEN_BUDGET = {
   buffer: 4000,
 };
 
-export function assembleContext(
-  internal: HydratedChunk[],
-  news: HydratedChunk[],
-  uploadedDoc?: string
-): string {
-  const docTokens = uploadedDoc
-    ? Math.min(estimateTokens(uploadedDoc), TOKEN_BUDGET.max_upload)
-    : 0;
-  const retrievedBudget = TOKEN_BUDGET.max_retrieved - docTokens;
-
-  let ctx = '';
-  let tokens = 0;
-  for (const chunk of internal) {
-    const t = estimateTokens(chunk.hydrated_text);
-    if (tokens + t > retrievedBudget) break;
-    const text = t > 2000 ? truncateToTokens(chunk.hydrated_text, 2000) : chunk.hydrated_text;
-    ctx += `\n\n[Source: ${chunk.metadata.document_type} | ${chunk.metadata.source_table} | ${chunk.metadata.created_at}]\n${text}`;
-    tokens += estimateTokens(text);
-  }
-
-  if (uploadedDoc) {
-    const truncated =
-      docTokens >= TOKEN_BUDGET.max_upload
-        ? truncateToTokens(uploadedDoc, TOKEN_BUDGET.max_upload) + '\n[DOCUMENT TRUNCATED]'
-        : uploadedDoc;
-    ctx += `\n\n--- UPLOADED DOCUMENT ---\n${truncated}`;
-  }
-
-  ctx += '\n\n--- EXTERNAL NEWS CONTEXT [UNVERIFIED] ---\n';
-  let nt = 0;
-  for (const n of news) {
-    const t = estimateTokens(n.hydrated_text);
-    if (nt + t > TOKEN_BUDGET.news) break;
-    ctx += `\n[EXTERNAL - UNVERIFIED | ${n.metadata.created_at}]\n${n.hydrated_text}`;
-    nt += t;
-  }
-  return ctx;
-}
