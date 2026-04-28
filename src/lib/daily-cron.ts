@@ -1,6 +1,6 @@
 // TRD §7.1, §10.4-10.7 — Daily cron operations
 import type { Env } from '../types/env';
-import { chunkArray } from './helpers';
+import { chunkArray, parseParticipantUserIds } from './helpers';
 import { promoteToStandalone, flagStaleOrphanedEvents } from './reconciliation';
 import { triggerContactEnrichment, triggerCompanyEnrichment, isDomainShapedName } from './enrichment';
 import { checkClaudeRateLimit } from './rate-limit';
@@ -9,6 +9,22 @@ import { renewExpiringSubscriptions } from './graph-subscriptions';
 import { proposeMultipleUpdates } from './progressive-enrichment';
 import { callClaude } from './claude';
 import { rebuildEntityIndex } from './entity-index';
+
+// Mirrors the visibility logic in classification.ts:233 — emails are always
+// 'private' regardless of source-side hint, transcripts/manual notes are
+// 'org_wide'. Daily-cron backfill previously hard-coded 'org_wide' for both,
+// which silently downgraded ingested emails to org-wide-readable.
+function visibilityForBackfill(source: string): 'private' | 'org_wide' {
+  return source === 'manual' ? 'org_wide' : 'private';
+}
+
+// D1 stores participant_user_ids as JSON-stringified array; vector metadata
+// stores it as comma-joined string. Daily-cron previously passed the D1 value
+// straight through, leaving vectors with an unparseable JSON string.
+function participantsForVectorMeta(rawFromD1: string | null): string | undefined {
+  const ids = parseParticipantUserIds(rawFromD1);
+  return ids.length > 0 ? ids.join(',') : undefined;
+}
 
 export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await applyNewsScoreDecay(orgId, env); } catch (e) { console.error('Score decay:', e); }
@@ -453,8 +469,8 @@ export async function backfillUnembeddedConversations(orgId: string, env: Env): 
 
       const meta = {
         org_id: orgId,
-        visibility: 'org_wide' as const,
-        participant_user_ids: row.participant_user_ids || undefined,
+        visibility: visibilityForBackfill(row.source),
+        participant_user_ids: participantsForVectorMeta(row.participant_user_ids),
         document_type: row.source === 'manual' ? 'transcript' : 'email',
         source_table: 'conversations',
         source_id: row.id,
@@ -606,8 +622,8 @@ async function embedSingleItem(
 
     const entries = await chunkEmbedAndPersistAll(body, {
       org_id: orgId,
-      visibility: 'org_wide',
-      participant_user_ids: row.participant_user_ids || undefined,
+      visibility: visibilityForBackfill(row.source),
+      participant_user_ids: participantsForVectorMeta(row.participant_user_ids),
       document_type: row.source === 'manual' ? 'transcript' : 'email',
       source_table: 'conversations',
       source_id: row.id,

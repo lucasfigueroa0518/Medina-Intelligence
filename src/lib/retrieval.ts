@@ -12,7 +12,7 @@ import { runEmbedding } from './embedding';
 import { truncateToTokens } from './tokens';
 import { callClaude } from './claude';
 import { checkClaudeRateLimit } from './rate-limit';
-import { getOrgSettings, getSharingFlags } from './helpers';
+import { getOrgSettings, getSharingFlags, parseParticipantUserIds } from './helpers';
 import { RERANKER_SYSTEM_PROMPT } from '../prompts/reranker';
 import { getEntityIndex } from './entity-index';
 
@@ -181,38 +181,55 @@ export async function preprocessQuery(
   const userRole = session.user_role || 'member';
   const sharingSet = new Set(Object.keys(sharingFlags));
 
+  // Post-retrieval ACL filter. Default-DENY on undefined / unknown visibility:
+  // earlier versions fell open (no `visibility` field → treated as accessible),
+  // which means a vector missing that metadata could leak. Owners always pass.
+  // Audit hook: every denial that's not the obvious 'private-and-not-a-participant'
+  // case gets a structured warn, so we can spot legitimate content being denied
+  // due to data-integrity gaps and backfill the missing visibility.
   const postRetrievalFilter = (chunk: VectorMatch): boolean => {
-    if (chunk.metadata.visibility === 'private') {
-      if (userRole === 'owner') {
-        // pass
-      } else if (chunk.metadata.participant_user_ids) {
-        const participants = String(chunk.metadata.participant_user_ids).split(',');
-        if (participants.includes(userId)) {
-          // pass
-        } else if (participants.some(pid => sharingSet.has(pid))) {
-          // pass
-        } else {
-          return false;
-        }
-      } else if (
-        chunk.metadata.user_id &&
-        chunk.metadata.user_id !== userId
-      ) {
-        return false;
-      }
-    }
+    if (userRole === 'owner') return true;
 
-    if (
-      chunk.metadata.visibility === 'confidential' &&
-      userRole !== 'owner' &&
-      userRole !== 'admin'
-    ) {
+    // The interface narrows visibility to a fixed union, but Vectorize stores
+    // `unknown` per-field — treat it as a string at runtime in case a vector
+    // was upserted with a stale or unrecognized value.
+    const visibility = chunk.metadata.visibility as unknown as string | undefined | null;
+
+    if (!visibility) {
+      console.warn('[acl] denying chunk with missing visibility', {
+        vector_id: (chunk as any).id,
+        source_table: chunk.metadata.source_table,
+        primary_entity_id: chunk.metadata.primary_entity_id,
+      });
       return false;
     }
 
-    if (chunk.metadata.reconciliation_status === 'orphaned') return false;
+    if (visibility === 'private') {
+      const participants = parseParticipantUserIds(chunk.metadata.participant_user_ids as any);
+      if (participants.includes(userId)) return true;
+      if (participants.some(pid => sharingSet.has(pid))) return true;
+      // Legacy fallback: chunks stamped with a single user_id rather than a
+      // participant list. Honor only if it matches the requester.
+      if (chunk.metadata.user_id && chunk.metadata.user_id === userId) return true;
+      return false;
+    }
 
-    return true;
+    if (visibility === 'confidential') {
+      return userRole === 'admin';
+    }
+
+    if (visibility === 'org_wide' || visibility === 'public' || visibility === 'org') {
+      if (chunk.metadata.reconciliation_status === 'orphaned') return false;
+      return true;
+    }
+
+    // Unknown visibility value — deny and log so we can find it.
+    console.warn('[acl] denying chunk with unknown visibility', {
+      visibility,
+      vector_id: (chunk as any).id,
+      source_table: chunk.metadata.source_table,
+    });
+    return false;
   };
 
   return {

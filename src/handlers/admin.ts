@@ -10,6 +10,7 @@ import { runDailyCron } from '../lib/daily-cron';
 import { triggerCompanyEnrichment, isDomainShapedName } from '../lib/enrichment';
 import { rebuildEntityIndex } from '../lib/entity-index';
 import { processEmbedRetryQueue } from '../lib/daily-cron';
+import { parseParticipantUserIds } from '../lib/helpers';
 
 export async function listDlq(
   request: Request,
@@ -236,6 +237,112 @@ export async function repairVectorizeParticipantIds(
   });
 
   return jsonResponse({ updated, skipped, errors, total_candidate_vectors: totalCandidates });
+}
+
+// One-time repair: walk every email/transcript chunk vector for this org and
+// fix the two ACL bugs introduced by the daily-cron backfill paths
+// (backfillUnembeddedConversations and embedEntityById):
+//   1. visibility was hard-coded 'org_wide' for emails; it should be 'private'
+//      to match the initial-ingest path (classification.ts:233).
+//   2. participant_user_ids was passed through as the D1 JSON-string format
+//      ('["a","b"]') instead of the canonical comma-joined form ('a,b'),
+//      so the post-retrieval ACL filter couldn't parse it.
+// Vectorize metadata is immutable; we re-upsert with the same vector_id and
+// re-embed from the cached chunk text in KV. Only the broken vectors are
+// touched — already-correct vectors are detected and skipped without
+// re-embedding so the repair is idempotent. Batched via `limit` (default 50,
+// max 200) to stay under the Worker CPU ceiling; call repeatedly until
+// updated === 0 and skipped covers the remaining candidates.
+export async function repairBackfilledAclMetadata(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ limit?: number; cursor?: number }>(request);
+  const limit = Math.min(Math.max(body?.limit ?? 50, 1), 200);
+  const cursor = Math.max(body?.cursor ?? 0, 0);
+
+  const candidates = await env.D1.prepare(
+    `SELECT vector_id FROM vector_entity_index
+       WHERE org_id = ? AND source_table = 'conversations'
+       ORDER BY vector_id LIMIT ? OFFSET ?`
+  ).bind(ctx.orgId, limit, cursor).all<{ vector_id: string }>();
+
+  const totalScanned = candidates.results.length;
+  let updated = 0;
+  let alreadyCorrect = 0;
+  let missingChunkText = 0;
+  let notInVectorize = 0;
+  const errors: string[] = [];
+
+  for (const { vector_id: vectorId } of candidates.results) {
+    try {
+      const existing = await env.VECTORIZE.getByIds([vectorId]);
+      if (existing.length === 0) {
+        notInVectorize++;
+        continue;
+      }
+      const meta: any = existing[0].metadata || {};
+
+      const rawParticipants = meta.participant_user_ids;
+      const isJsonFormat =
+        typeof rawParticipants === 'string' && rawParticipants.trim().startsWith('[');
+      const isOrgWideEmail =
+        meta.document_type === 'email' && meta.visibility === 'org_wide';
+
+      if (!isJsonFormat && !isOrgWideEmail) {
+        alreadyCorrect++;
+        continue;
+      }
+
+      const chunkText = await env.KV.get(`chunk:${vectorId}`);
+      if (!chunkText) {
+        missingChunkText++;
+        errors.push(`${vectorId}: chunk text missing from KV — needs full re-ingest`);
+        continue;
+      }
+      const values = await runEmbedding(env, chunkText, ctx.orgId);
+
+      const repairedParticipants = parseParticipantUserIds(rawParticipants).join(',');
+      const repairedVisibility =
+        meta.document_type === 'email' ? 'private' : meta.visibility || 'org_wide';
+
+      await env.VECTORIZE.upsert([
+        {
+          id: vectorId,
+          values,
+          metadata: {
+            ...meta,
+            visibility: repairedVisibility,
+            participant_user_ids: repairedParticipants || undefined,
+          },
+        },
+      ]);
+      updated++;
+    } catch (err: any) {
+      errors.push(`${vectorId}: ${err?.message || String(err)}`);
+    }
+  }
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'update',
+    entity_type: 'integration',
+    entity_id: `acl_repair:cursor=${cursor}`,
+    metadata: { scanned: totalScanned, updated, already_correct: alreadyCorrect, missing_chunk_text: missingChunkText, not_in_vectorize: notInVectorize, errors_count: errors.length },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({
+    scanned: totalScanned,
+    updated,
+    already_correct: alreadyCorrect,
+    missing_chunk_text: missingChunkText,
+    not_in_vectorize: notInVectorize,
+    errors,
+    next_cursor: totalScanned === limit ? cursor + limit : null,
+  });
 }
 
 export async function triggerIngestion(

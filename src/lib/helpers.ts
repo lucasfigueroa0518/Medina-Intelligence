@@ -120,6 +120,28 @@ export async function getDecryptedSlackBotToken(orgId: string, env: Env): Promis
 
 // --- §3.12: email content access check ---
 
+// `participant_user_ids` is stored in TWO places with TWO formats:
+//   • D1 conversations.participant_user_ids → JSON-stringified array '["a","b"]'
+//   • Vector metadata participant_user_ids  → comma-joined string 'a,b'
+// Defensive parser handles both so a reader can't silently break if it's
+// pointed at the wrong source. Returns [] for null/undefined/parse errors.
+export function parseParticipantUserIds(raw: string | string[] | null | undefined): string[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.filter(s => typeof s === 'string' && s.length > 0);
+  if (typeof raw !== 'string') return [];
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed.filter(s => typeof s === 'string' && s.length > 0) : [];
+    } catch {
+      return [];
+    }
+  }
+  return trimmed.split(',').map(s => s.trim()).filter(Boolean);
+}
+
 export function canReadEmailContent(
   conversation: Pick<Conversation, 'source' | 'participant_user_ids' | 'is_campaign_email'>,
   requestingUserId: string,
@@ -130,14 +152,11 @@ export function canReadEmailContent(
   if ((conversation as any).is_campaign_email) return true;
   if (userRole === 'owner') return true;
 
-  try {
-    const participants: string[] = JSON.parse(conversation.participant_user_ids || '[]');
-    if (participants.includes(requestingUserId)) return true;
-    if (participantSharingFlags && participants.some(pid => participantSharingFlags[pid])) return true;
-    return false;
-  } catch {
-    return false;
-  }
+  const participants = parseParticipantUserIds(conversation.participant_user_ids);
+  if (participants.length === 0) return false;
+  if (participants.includes(requestingUserId)) return true;
+  if (participantSharingFlags && participants.some(pid => participantSharingFlags[pid])) return true;
+  return false;
 }
 
 export async function getSharingFlags(orgId: string, env: Env): Promise<Record<string, boolean>> {
