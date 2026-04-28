@@ -1,12 +1,23 @@
 'use client';
 
 import React from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { Check, Copy } from 'lucide-react';
 import { citationsRemarkPlugin, type CitationSource } from '@/lib/citations';
 import { CitationPill } from './citation-pill';
+
+// React-markdown's defaultUrlTransform allowlists http/https/mailto/tel/#fragments
+// and blanks out everything else — which would silently strip our `citation:N`
+// scheme, leaving the <a> renderer with an empty href. That's why citation
+// pills were falling through to the plain magenta-link branch and rendering as
+// bare superscript numbers. Preserve `citation:N` URLs verbatim and delegate
+// everything else to the default sanitizer.
+function citationUrlTransform(url: string, _key: string, _node: any): string {
+  if (typeof url === 'string' && url.startsWith('citation:')) return url;
+  return defaultUrlTransform(url);
+}
 
 const HEADER_STYLE: React.CSSProperties = { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700 };
 const BODY_STYLE: React.CSSProperties = { fontFamily: "'DM Sans', sans-serif", fontWeight: 400 };
@@ -60,6 +71,7 @@ export function MarkdownMessage({
       <ReactMarkdown
         remarkPlugins={[citationsRemarkPlugin, remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
+        urlTransform={citationUrlTransform}
         components={{
           h1: ({ children }) => {
             const id = String(children).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
