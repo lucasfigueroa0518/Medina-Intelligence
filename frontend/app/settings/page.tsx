@@ -419,6 +419,59 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
     return () => clearInterval(interval);
   }, [backfillProgress?.status]);
 
+  // Auto-resume on paused. The inline historical backfill paginates ~10 pages
+  // / ~25s per call then returns paused with last_page_url. Without auto-resume
+  // the user has to click Resume after every page batch, which feels stuck.
+  // Hard cap at MAX_AUTO_RESUMES to prevent runaway loops if the backfill is
+  // genuinely failing every page (also surfaced via failed status).
+  const [autoResumeCount, setAutoResumeCount] = React.useState(0);
+  const MAX_AUTO_RESUMES = 50; // 50 × 500 = 25,000 emails ceiling
+  React.useEffect(() => {
+    if (backfillProgress?.status !== 'paused') return;
+    if (autoResumeCount >= MAX_AUTO_RESUMES) return;
+    const t = setTimeout(() => {
+      setAutoResumeCount(n => n + 1);
+      resumeBackfill();
+    }, 1500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backfillProgress?.status, backfillProgress?.total_fetched, autoResumeCount]);
+  // Reset auto-resume counter on a fresh backfill start or completion
+  React.useEffect(() => {
+    if (backfillProgress?.status === 'completed' || !backfillProgress) {
+      setAutoResumeCount(0);
+    }
+  }, [backfillProgress?.status]);
+
+  // Elapsed time ticker for the in-flight banner
+  const [tick, setTick] = React.useState(0);
+  React.useEffect(() => {
+    if (backfillProgress?.status !== 'in_progress' && backfillProgress?.status !== 'paused') return;
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [backfillProgress?.status]);
+  function elapsedSinceStart(): string {
+    if (!backfillProgress?.started_at) return '';
+    const ms = Date.now() - new Date(backfillProgress.started_at).getTime();
+    const s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}m ${r}s`;
+  }
+  function formatDateRange(): string {
+    const start = backfillProgress?.target_start_date
+      ? new Date(backfillProgress.target_start_date).toISOString().slice(0, 10)
+      : null;
+    const end = backfillProgress?.target_end_date
+      ? new Date(backfillProgress.target_end_date).toISOString().slice(0, 10)
+      : null;
+    if (start && end) return `${start} → ${end}`;
+    if (start) return `since ${start}`;
+    return '';
+  }
+  void tick; // keep referenced for re-render
+
   React.useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(null), 3500);
@@ -497,28 +550,33 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
                 <Loader2 size={16} className="text-accent-purple animate-spin" />
                 <div className="flex-1">
                   <div className="text-sm text-text-primary">
-                    Importing... {backfillProgress.total_fetched} emails processed
+                    Importing — {backfillProgress.total_fetched} emails so far
+                    {formatDateRange() && <span className="text-text-muted text-xs ml-2">({formatDateRange()})</span>}
                   </div>
                   <div className="text-[10px] text-text-muted mt-0.5">
-                    This runs in batches — the page will update automatically
+                    Elapsed {elapsedSinceStart()} · Page batches resume automatically · Status refreshes every 5s
                   </div>
                 </div>
               </div>
             ) : isPaused ? (
               <div className="space-y-2">
-                <div className="flex items-center gap-3 py-3 px-4 rounded-lg" style={{ background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.15)' }}>
-                  <Clock size={16} className="text-amber-400" />
+                <div className="flex items-center gap-3 py-3 px-4 rounded-lg" style={{ background: 'rgba(139,92,246,0.06)', border: '1px solid rgba(139,92,246,0.15)' }}>
+                  <Loader2 size={16} className="text-accent-purple animate-spin" />
                   <div className="flex-1">
                     <div className="text-sm text-text-primary">
-                      Paused — {backfillProgress.total_fetched} emails so far
+                      Importing — {backfillProgress.total_fetched} emails so far
+                      {formatDateRange() && <span className="text-text-muted text-xs ml-2">({formatDateRange()})</span>}
                     </div>
                     <div className="text-[10px] text-text-muted mt-0.5">
-                      {backfillProgress.error || 'Rate limit reached — click Resume to continue'}
+                      Elapsed {elapsedSinceStart()} · Auto-resuming page {autoResumeCount + 1}
+                      {autoResumeCount >= MAX_AUTO_RESUMES && ' · Cap reached, click Resume to continue'}
                     </div>
                   </div>
-                  <button onClick={resumeBackfill} disabled={backfillLoading} className="btn-secondary text-xs py-1">
-                    {backfillLoading ? 'Resuming...' : 'Resume'}
-                  </button>
+                  {autoResumeCount >= MAX_AUTO_RESUMES && (
+                    <button onClick={() => { setAutoResumeCount(0); resumeBackfill(); }} disabled={backfillLoading} className="btn-secondary text-xs py-1">
+                      {backfillLoading ? 'Resuming...' : 'Resume'}
+                    </button>
+                  )}
                 </div>
               </div>
             ) : backfillProgress?.status === 'completed' ? (
