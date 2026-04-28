@@ -424,7 +424,12 @@ export async function runHistoricalBackfill(
 
   while (url) {
     if (pagesThisBatch >= MAX_PAGES_PER_CALL || Date.now() - startTime > MAX_RUNTIME_MS) {
-      progress.status = 'in_progress';
+      // Page batch / wallclock cap hit — function returns here. Use 'paused'
+      // (NOT 'in_progress') so the frontend's auto-resume can kick in.
+      // Previously this stayed at 'in_progress' with last_page_url set, but
+      // nothing was actually processing — the polling UI just kept showing
+      // "Importing..." indefinitely until the user manually clicked Resume.
+      progress.status = 'paused';
       progress.last_page_url = url;
       progress.updated_at = new Date().toISOString();
       await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
