@@ -168,14 +168,9 @@ export async function recordGraphApiCall(
       count,
       window_start: new Date().toISOString(),
     }), { expirationTtl: 660 });
-  } else {
-    state.count += count;
-    await env.KV.put(key, JSON.stringify(state), { expirationTtl: 660 });
+    return;
   }
 
-  // Mirror to the hourly bucket counter that powers Command Center sparklines.
-  try {
-    const { recordApiCall } = await import('./api-metrics');
-    await recordApiCall(env, 'graph', orgId, count);
-  } catch { /* metrics never block real call */ }
+  state.count += count;
+  await env.KV.put(key, JSON.stringify(state), { expirationTtl: 660 });
 }

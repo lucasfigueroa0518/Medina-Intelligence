@@ -13,18 +13,23 @@ import {
   type IntegrationsStatusResponse,
   type UserProfile,
   type FireflyBackfillResult,
+  type SystemStatusResponse,
+  type SystemStatusActiveTask,
+  type SystemStatusRunHistoryEntry,
+  type CompletenessMetric,
 } from '@/lib/api';
 import { useBackgroundTasks } from '@/components/background-task-indicator';
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
 
-type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals';
+type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals' | 'system';
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: 'profile', label: 'Profile' },
   { id: 'security', label: 'Security' },
   { id: 'integrations', label: 'Sync & Integrations' },
   { id: 'approvals', label: 'Approval Queue' },
+  { id: 'system', label: 'System Status' },
 ];
 
 export default function SettingsPageWrapper() {
@@ -169,6 +174,7 @@ function SettingsPageInner() {
           />
         )}
         {activeTab === 'approvals' && <ApprovalQueueSection />}
+        {activeTab === 'system' && <SystemStatusSection />}
       </div>
 
       {showFirstConnect && (
@@ -1979,4 +1985,323 @@ function FireflyImportModal({ onClose }: { onClose: () => void }) {
       </div>
     </div>
   );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// System Status tab — active tasks + run history + data completeness.
+// All numbers come from a single GET /api/settings/system-status which runs
+// direct D1 queries (no KV counters, no estimates).
+// ────────────────────────────────────────────────────────────────────────────
+
+function SystemStatusSection() {
+  const [data, setData] = React.useState<SystemStatusResponse | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const load = React.useCallback(() => {
+    api.getSettingsSystemStatus().then(setData).catch(e => setError(e?.message || 'Failed to load'));
+  }, []);
+
+  React.useEffect(() => {
+    load();
+    // Refresh every 10s while the tab is open. No visibility-pause logic
+    // needed — Settings is a low-frequency page.
+    const id = window.setInterval(load, 10_000);
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  if (error) {
+    return (
+      <div className="card p-6">
+        <div className="text-sm text-semantic-error">{error}</div>
+        <button onClick={load} className="btn-secondary text-xs mt-3">Retry</button>
+      </div>
+    );
+  }
+  if (!data) {
+    return <div className="card p-6 text-sm text-text-muted">Loading…</div>;
+  }
+
+  return (
+    <div className="space-y-6">
+      <ActiveTasksCard tasks={data.active_tasks} />
+      <RunHistoryCard rows={data.run_history} />
+      <DataCompletenessCard c={data.completeness} />
+    </div>
+  );
+}
+
+// ── Section 1: Active Tasks ──────────────────────────────────────────────
+
+function ActiveTasksCard({ tasks }: { tasks: SystemStatusActiveTask[] }) {
+  return (
+    <div className="card p-5">
+      <div className="text-sm font-medium text-text-primary mb-3">Active Tasks</div>
+      {tasks.length === 0 ? (
+        <div className="text-sm text-text-muted">
+          <span className="inline-block w-1.5 h-1.5 rounded-full bg-semantic-success mr-2 align-middle" />
+          No active tasks. Next email sync at <span className="text-text-primary">:00</span>, next enrichment at <span className="text-text-primary">:05</span>.
+        </div>
+      ) : (
+        <ul className="space-y-1.5">
+          {tasks.map((t, i) => (
+            <li key={i} className="text-sm text-text-primary flex items-center gap-2">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-semantic-success animate-pulse" />
+              <span>
+                {t.type} in progress — {t.items_processed.toLocaleString()} item{t.items_processed === 1 ? '' : 's'} processed — started {formatDuration(t.elapsed_seconds)} ago
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ── Section 2: Run History ───────────────────────────────────────────────
+
+function RunHistoryCard({ rows }: { rows: SystemStatusRunHistoryEntry[] }) {
+  return (
+    <div className="card p-0 overflow-hidden">
+      <div className="px-5 pt-5 pb-3 text-sm font-medium text-text-primary">Run History</div>
+      {rows.length === 0 ? (
+        <div className="px-5 pb-5 text-sm text-text-muted">No runs recorded yet.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-bg-inset/50 border-y border-border">
+              <tr>
+                <Th>Type</Th>
+                <Th>Status</Th>
+                <Th align="right">Items</Th>
+                <Th align="right">Failed</Th>
+                <Th>Started</Th>
+                <Th>Duration</Th>
+                <Th>Error</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(r => <RunHistoryRow key={r.id} row={r} />)}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Th({ children, align }: { children: React.ReactNode; align?: 'right' }) {
+  return (
+    <th className={`px-4 py-2.5 text-xs font-medium uppercase tracking-wider text-text-muted ${align === 'right' ? 'text-right' : 'text-left'}`}>
+      {children}
+    </th>
+  );
+}
+
+function RunHistoryRow({ row }: { row: SystemStatusRunHistoryEntry }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const failed = row.status === 'failed';
+  return (
+    <tr className={`border-b border-border/40 ${failed ? 'bg-semantic-error/[0.04]' : ''}`}>
+      <td className="px-4 py-3 text-text-primary">{row.type}</td>
+      <td className="px-4 py-3">
+        <StatusBadge status={row.status} />
+      </td>
+      <td className="px-4 py-3 text-text-primary tabular-nums text-right">{row.items_processed.toLocaleString()}</td>
+      <td className={`px-4 py-3 tabular-nums text-right ${row.items_failed > 0 ? 'text-semantic-error' : 'text-text-muted'}`}>
+        {row.items_failed > 0 ? row.items_failed.toLocaleString() : '—'}
+      </td>
+      <td className="px-4 py-3 text-text-secondary whitespace-nowrap">{formatRelative(row.started_at)}</td>
+      <td className="px-4 py-3 text-text-secondary tabular-nums whitespace-nowrap">
+        {row.duration_seconds === 0 ? '—' : formatDuration(row.duration_seconds)}
+      </td>
+      <td className="px-4 py-3 text-text-secondary text-xs max-w-xs">
+        {row.error_message ? (
+          <button
+            onClick={() => setExpanded(e => !e)}
+            className="text-left text-semantic-error hover:underline"
+          >
+            {expanded
+              ? row.error_message
+              : (row.error_message.length > 60
+                  ? row.error_message.slice(0, 60) + '…'
+                  : row.error_message)}
+          </button>
+        ) : ''}
+      </td>
+    </tr>
+  );
+}
+
+function StatusBadge({ status }: { status: SystemStatusRunHistoryEntry['status'] }) {
+  const cfg = {
+    completed: { bg: 'bg-semantic-success/15', fg: 'text-semantic-success', label: 'Completed' },
+    failed:    { bg: 'bg-semantic-error/15',   fg: 'text-semantic-error',   label: 'Failed' },
+    timed_out: { bg: 'bg-semantic-warning/15', fg: 'text-semantic-warning', label: 'Timed out' },
+  }[status];
+  return (
+    <span className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${cfg.bg} ${cfg.fg}`}>
+      {cfg.label}
+    </span>
+  );
+}
+
+// ── Section 3: Data Completeness ─────────────────────────────────────────
+
+function DataCompletenessCard({ c }: { c: SystemStatusResponse['completeness'] }) {
+  return (
+    <div className="card p-5 space-y-5">
+      <div>
+        <div className="text-sm font-medium text-text-primary">Data Completeness</div>
+        <div className="text-xs text-text-muted mt-0.5">
+          How much of your data is captured, connected, and searchable.
+        </div>
+      </div>
+
+      <CompletenessGroup title="Email Coverage">
+        <CompletenessBar
+          label="embedded"
+          metric={c.email_embedding}
+          unit="conversations searchable by MARTy"
+          warningHint="Some emails were ingested before embedding was wired up — they're stored but not retrievable. A backfill would re-embed them."
+        />
+        <CompletenessBar
+          label="linked"
+          metric={c.email_linkage}
+          unit="connected to contacts"
+          warningHint="Some emails couldn't be linked to a contact — likely auto-generated, no-reply, or from senders not in the CRM."
+        />
+      </CompletenessGroup>
+
+      <CompletenessGroup title="Contact Coverage">
+        <CompletenessBar
+          label="enriched"
+          metric={c.contact_enrichment}
+          unit="contacts have enrichment data"
+          warningHint="Unenriched contacts are missing bio, title, or LinkedIn data. The enrichment cron picks them up over time."
+        />
+        <CompletenessBar
+          label="have company"
+          metric={c.contact_company}
+          unit="linked to a company"
+          warningHint="Contacts without a company are usually personal-domain emails (gmail.com, etc.) or first-time meeting attendees."
+        />
+        <CompletenessBar
+          label="have LinkedIn"
+          metric={c.contact_linkedin}
+          unit="have a LinkedIn URL"
+          warningHint="LinkedIn discovery only runs during enrichment. Many contacts won't have a discoverable profile (privacy settings, generic names, etc.)."
+        />
+      </CompletenessGroup>
+
+      <CompletenessGroup title="Company Coverage">
+        <CompletenessBar
+          label="enriched"
+          metric={c.company_enrichment}
+          unit="companies have enrichment data"
+        />
+        <CompletenessBar
+          label="have LinkedIn"
+          metric={c.company_linkedin}
+          unit="companies have a LinkedIn URL"
+          warningHint="Company enrichment doesn't currently resolve LinkedIn URLs — only contact-level enrichment does. Worth a separate pass."
+        />
+      </CompletenessGroup>
+
+      <CompletenessGroup title="Meeting Coverage">
+        <CompletenessBar
+          label="embedded"
+          metric={c.meeting_embedding}
+          unit="meetings searchable by MARTy"
+        />
+        <CompletenessBar
+          label="attendees linked"
+          metric={c.meeting_attendees}
+          unit="attendees connected to contacts or users"
+          warningHint="Unlinked attendees are real people Firefly captured but no contact exists for them yet — auto-create runs on each new meeting going forward."
+        />
+      </CompletenessGroup>
+
+      <ConnectedUsersBar metric={c.connected_users} />
+    </div>
+  );
+}
+
+function CompletenessGroup({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="text-xs uppercase tracking-wider text-text-muted mb-2">{title}</div>
+      <div className="space-y-3">{children}</div>
+    </div>
+  );
+}
+
+function CompletenessBar({
+  label, metric, unit, warningHint,
+}: { label: string; metric: CompletenessMetric; unit: string; warningHint?: string }) {
+  const pct = metric.percentage;
+  const color =
+    pct >= 90 ? '#22C55E' :
+    pct >= 50 ? '#F59E0B' :
+    '#EF4444';
+  const showHint = pct < 90 && warningHint;
+  return (
+    <div>
+      <div className="flex items-baseline justify-between text-xs mb-1">
+        <span className="text-text-primary tabular-nums font-medium" style={{ color }}>{pct}% {label}</span>
+        <span className="text-text-muted">
+          {metric.current.toLocaleString()} of {metric.total.toLocaleString()} {unit}
+        </span>
+      </div>
+      <div className="h-1.5 bg-bg-input rounded-full overflow-hidden">
+        <div
+          className="h-full rounded-full"
+          style={{
+            width: `${pct}%`,
+            background: color,
+            transition: 'width 600ms ease-out, background 400ms ease-out',
+          }}
+        />
+      </div>
+      {showHint && (
+        <div className="text-[11px] text-text-muted mt-1">{warningHint}</div>
+      )}
+    </div>
+  );
+}
+
+function ConnectedUsersBar({ metric }: { metric: CompletenessMetric & { names_missing: string[] } }) {
+  const pct = metric.percentage;
+  const color =
+    pct >= 90 ? '#22C55E' :
+    pct >= 50 ? '#F59E0B' :
+    '#EF4444';
+  return (
+    <div>
+      <div className="text-xs uppercase tracking-wider text-text-muted mb-2">Connected Users</div>
+      <div className="flex items-baseline justify-between text-xs mb-1">
+        <span className="text-text-primary tabular-nums font-medium" style={{ color }}>
+          {metric.current} of {metric.total} users have Outlook connected
+        </span>
+      </div>
+      <div className="h-1.5 bg-bg-input rounded-full overflow-hidden">
+        <div
+          className="h-full rounded-full"
+          style={{ width: `${pct}%`, background: color, transition: 'width 600ms ease-out' }}
+        />
+      </div>
+      {metric.names_missing.length > 0 && (
+        <div className="text-[11px] text-text-muted mt-1">
+          Missing: {metric.names_missing.join(', ')}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return `${m}m ${seconds % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
 }

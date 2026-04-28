@@ -283,10 +283,9 @@ export const api = {
   getIntegrationsStatus: () =>
     request<IntegrationsStatusResponse>('/integrations/status'),
 
-  // Command Center / dashboard
-  getDashboardPulse: () => request<DashboardPulse>('/dashboard/pulse'),
-  getDashboardActivity: () => request<DashboardActivity>('/dashboard/activity'),
-  getDashboardSparklines: () => request<DashboardSparklines>('/dashboard/sparklines'),
+  // Settings → System Status tab (distinct from getSystemStatus above which
+  // hits /system/status for admin mode/cache info).
+  getSettingsSystemStatus: () => request<SystemStatusResponse>('/settings/system-status'),
   getFireflyWebhookSecret: () =>
     request<{ secret: string }>('/integrations/firefly/webhook-secret'),
   fireflyBackfill: (apiKey: string, days?: number, opts?: { start_date?: string; end_date?: string }) =>
@@ -436,89 +435,47 @@ export interface IntegrationsStatusResponse {
   firefly: IntegrationRow;
 }
 
-// --- Command Center types (mirror src/handlers/dashboard.ts) ---
+// --- Settings → System Status types (mirror src/handlers/system-status.ts) ---
 
-export interface DashboardActiveProcess {
-  id: string;
-  type: 'ingestion' | 'enrichment' | 'daily_cron' | 'backfill' | 'import' | 'other';
-  label: string;
+export interface SystemStatusActiveTask {
+  type: string;
+  items_processed: number;
   started_at: string;
   elapsed_seconds: number;
-  progress?: { current: number; total?: number; percentage?: number };
-  status: 'running' | 'finalizing';
 }
 
-export interface DashboardCapacityGauge {
-  used: number;
-  limit: number;
-  percentage: number;
-  label: string;
-  status: 'low' | 'moderate' | 'high' | 'limited' | 'unknown';
-}
-
-export interface DashboardServiceStatus {
-  status: 'healthy' | 'rate_limited' | 'auth_failed' | 'circuit_open' | 'active' | 'unknown';
-  label: string;
-  blocked_until?: string;
-}
-
-export interface DashboardPulse {
-  system_status: 'healthy' | 'busy' | 'degraded' | 'error';
-  status_message: string;
-  active_processes: DashboardActiveProcess[];
-  capacity: {
-    claude: DashboardCapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null; calls_this_hour?: number; rate_limited?: boolean };
-    gemini: DashboardCapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null; calls_this_hour?: number; rate_limited?: boolean };
-    graph: DashboardCapacityGauge & { window_resets_at?: string | null; calls_this_hour?: number };
-    slack: DashboardServiceStatus & { last_sync_at?: string | null; messages_today?: number; calls_this_hour?: number };
-    reversecontact: DashboardServiceStatus & { last_enrichment_at?: string | null; enriched_today?: number; calls_this_hour?: number };
-  };
-  alerts: Array<{ type: 'warning' | 'error'; message: string; timestamp: string }>;
-  next_runs: { ingestion: string; enrichment: string; daily: string };
-  generated_at: string;
-}
-
-export interface DashboardActivityEntry {
+export interface SystemStatusRunHistoryEntry {
   id: string;
   type: string;
-  icon: 'email' | 'enrichment' | 'meeting' | 'import' | 'cron' | 'error' | 'news' | 'cleanup';
-  label: string;
-  description: string;
-  timestamp: string;
-  result?: { processed?: number; created?: number; enriched?: number; failed?: number };
+  status: 'completed' | 'failed' | 'timed_out';
+  items_processed: number;
+  items_failed: number;
+  started_at: string;
+  duration_seconds: number;
+  error_message: string | null;
 }
 
-export interface DashboardActivity {
-  recent_activity: DashboardActivityEntry[];
-  stats_24h: {
-    emails_synced: number;
-    contacts_discovered: number;
-    contacts_enriched: number;
-    companies_enriched: number;
-    meetings_ingested: number;
-    slack_messages: number;
-    documents_processed: number;
-    approval_items_created: number;
-    approval_items_resolved: number;
-  };
-  stats_today: {
-    emails_synced: number;
-    contacts_discovered: number;
-    contacts_enriched: number;
-    meetings_ingested: number;
-    documents_processed: number;
-  };
-  last_of_type: Partial<Record<DashboardActivityEntry['icon'], { timestamp: string; description: string }>>;
-  generated_at: string;
+export interface CompletenessMetric {
+  current: number;
+  total: number;
+  percentage: number;
 }
 
-export interface DashboardSparklines {
-  claude: number[];
-  gemini: number[];
-  graph: number[];
-  slack: number[];
-  hours: string[];
-  total_24h: number;
+export interface SystemStatusResponse {
+  active_tasks: SystemStatusActiveTask[];
+  run_history: SystemStatusRunHistoryEntry[];
+  completeness: {
+    email_embedding: CompletenessMetric;
+    email_linkage: CompletenessMetric;
+    contact_enrichment: CompletenessMetric;
+    contact_company: CompletenessMetric;
+    contact_linkedin: CompletenessMetric;
+    company_enrichment: CompletenessMetric;
+    company_linkedin: CompletenessMetric;
+    meeting_embedding: CompletenessMetric;
+    meeting_attendees: CompletenessMetric;
+    connected_users: CompletenessMetric & { names_missing: string[] };
+  };
   generated_at: string;
 }
 

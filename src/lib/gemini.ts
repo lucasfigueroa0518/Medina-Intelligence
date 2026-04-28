@@ -84,10 +84,6 @@ export async function callGemini(
     body: JSON.stringify(body),
   });
 
-  // Track every Gemini call for the Command Center sparklines.
-  const { recordApiCall } = await import('./api-metrics');
-  await recordApiCall(env, 'gemini', params.orgId || 'system');
-
   if (!resp.ok) {
     const errTxt = await resp.text();
     if (resp.status === 429) throw new Error('GEMINI_RATE_LIMITED');
