@@ -617,3 +617,120 @@ export async function rebuildEntityIndexEndpoint(
     size_bytes: JSON.stringify(index).length,
   });
 }
+
+// One-time cleanup of vector_entity_index bloat (audit 2026-04-28).
+//
+// Findings: 4,131 index rows for 565 conversations (731% inflation).
+//   - 2,064 orphaned (entity_id doesn't match any conversation)
+//   - 1,185 of the orphans point to contact IDs (old entity_id bug)
+//   - Top 20 conversations have 30–271 vectors each (re-embed bloat)
+//
+// Phase 1: orphans — delete from Vectorize and D1.
+// Phase 2: duplicates (>5 rows for one conversation) — delete all vectors
+//          for those entities. Next ingestion run re-embeds them once
+//          (with the new dedup guard preventing future bloat).
+//
+// Owner-only — destructive. Idempotent: re-running after a clean run is a no-op.
+export async function cleanupVectorBloat(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can run vector cleanup.');
+  }
+
+  const orgId = ctx.orgId;
+  const stats = {
+    orphaned_d1_rows_deleted: 0,
+    duplicate_d1_rows_deleted: 0,
+    vectors_deleted_from_vectorize: 0,
+    duplicate_entities_cleaned: 0,
+    vectorize_delete_errors: [] as string[],
+  };
+
+  // Helper: chunked Vectorize deleteByIds (Vectorize accepts up to 1000 IDs
+  // per call but we keep batches at 100 to bound Worker CPU per subrequest).
+  const deleteFromVectorize = async (vectorIds: string[]) => {
+    for (let i = 0; i < vectorIds.length; i += 100) {
+      const batch = vectorIds.slice(i, i + 100);
+      try {
+        await env.VECTORIZE.deleteByIds(batch);
+        stats.vectors_deleted_from_vectorize += batch.length;
+      } catch (e: any) {
+        stats.vectorize_delete_errors.push(
+          `batch[${i}-${i + batch.length - 1}]: ${e?.message || String(e)}`
+        );
+      }
+    }
+  };
+
+  // Helper: chunked D1 DELETE ... WHERE vector_id IN (...) — SQLite caps
+  // bound parameter count at 999, so we batch at 500 to leave headroom.
+  const deleteFromD1ByVectorIds = async (vectorIds: string[]): Promise<number> => {
+    let deleted = 0;
+    for (let i = 0; i < vectorIds.length; i += 500) {
+      const batch = vectorIds.slice(i, i + 500);
+      const placeholders = batch.map(() => '?').join(',');
+      const r = await env.D1.prepare(
+        `DELETE FROM vector_entity_index WHERE vector_id IN (${placeholders})`
+      ).bind(...batch).run();
+      deleted += r.meta.changes || 0;
+    }
+    return deleted;
+  };
+
+  // ── Phase 1: orphaned rows ─────────────────────────────────────────
+  const orphanRows = await env.D1.prepare(
+    `SELECT vector_id FROM vector_entity_index
+       WHERE source_table = 'conversations' AND org_id = ?
+         AND entity_id NOT IN (SELECT id FROM conversations WHERE org_id = ?)`
+  ).bind(orgId, orgId).all<{ vector_id: string }>();
+  const orphanedVectorIds = orphanRows.results.map(r => r.vector_id);
+
+  if (orphanedVectorIds.length > 0) {
+    await deleteFromVectorize(orphanedVectorIds);
+    stats.orphaned_d1_rows_deleted = await deleteFromD1ByVectorIds(orphanedVectorIds);
+  }
+
+  // ── Phase 2: duplicates ────────────────────────────────────────────
+  // For each entity with >5 vectors, drop ALL its vectors. Dedup at embed
+  // time means the next ingestion run re-embeds it exactly once.
+  const dupGroups = await env.D1.prepare(
+    `SELECT entity_id, GROUP_CONCAT(vector_id) AS vector_ids, COUNT(*) AS cnt
+       FROM vector_entity_index
+      WHERE source_table = 'conversations' AND org_id = ?
+        AND entity_id IN (SELECT id FROM conversations WHERE org_id = ?)
+      GROUP BY entity_id
+      HAVING cnt > 5`
+  ).bind(orgId, orgId).all<{ entity_id: string; vector_ids: string; cnt: number }>();
+
+  const dupVectorIds: string[] = [];
+  for (const g of dupGroups.results) {
+    if (!g.vector_ids) continue;
+    const ids = g.vector_ids.split(',').filter(Boolean);
+    dupVectorIds.push(...ids);
+  }
+
+  if (dupVectorIds.length > 0) {
+    await deleteFromVectorize(dupVectorIds);
+    stats.duplicate_d1_rows_deleted = await deleteFromD1ByVectorIds(dupVectorIds);
+    stats.duplicate_entities_cleaned = dupGroups.results.length;
+  }
+
+  await emitAudit(env, {
+    org_id: orgId,
+    user_id: ctx.userId,
+    action: 'hard_delete',
+    entity_type: 'integration',
+    entity_id: 'vector_entity_index_cleanup',
+    metadata: stats,
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({
+    ok: true,
+    stats,
+    next_steps:
+      'Cleared entities will be re-embedded by the next ingestion run, then dedup prevents new bloat.',
+  });
+}

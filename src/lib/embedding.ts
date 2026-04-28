@@ -75,6 +75,18 @@ export async function chunkEmbedAndPersist(
  * Splits `text` into chunks according to the current chunk config version
  * for meta.document_type, then embeds and persists each chunk.
  * Returns one VectorIndexEntry per chunk for batched D1 write by the caller.
+ *
+ * Dedup: if vector_entity_index already contains a row for this entity
+ * (meta.source_table + meta.source_id + meta.org_id), we skip — the entity
+ * has already been embedded by a prior run. Audit 2026-04-28 found 4,131
+ * vector_entity_index rows for 565 conversations (731% inflation) caused by
+ * re-embedding on every ingestion run; without dedup each run added a fresh
+ * set of vectors with new IDs and accumulated forever.
+ *
+ * Tradeoff: when an email's content changes (subject/body edited), the old
+ * embedding stays. To re-embed on edit, store a content_hash on the row and
+ * compare here, deleting old vectors before re-embedding. Not implementing
+ * that yet — edits to ingested email content are rare.
  */
 export async function chunkEmbedAndPersistAll(
   text: string,
@@ -82,6 +94,15 @@ export async function chunkEmbedAndPersistAll(
   env: Env
 ): Promise<VectorIndexEntry[]> {
   if (!text || text.trim().length < 10) return [];
+
+  const existing = await env.D1.prepare(
+    `SELECT 1 FROM vector_entity_index
+       WHERE entity_id = ? AND source_table = ? AND org_id = ?
+       LIMIT 1`
+  ).bind(meta.source_id, meta.source_table, meta.org_id).first();
+  if (existing) {
+    return [];
+  }
 
   const splitter = createSplitter(meta.document_type);
   const chunks = await splitter.splitText(text);

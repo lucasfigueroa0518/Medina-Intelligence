@@ -506,6 +506,8 @@ async function routeAuthenticated(
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')
       return Admin.rebuildEntityIndexEndpoint(ctx, env);
+    if (path === '/api/admin/cleanup-vector-bloat' && method === 'POST')
+      return Admin.cleanupVectorBloat(ctx, env);
     m = path.match(/^\/api\/admin\/users\/([^/]+)\/reset-password$/);
     if (m && method === 'POST')
       return AuthLogin.adminResetPassword(m[1], request, ctx, env);

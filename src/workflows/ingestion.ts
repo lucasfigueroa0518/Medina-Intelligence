@@ -14,6 +14,7 @@ import { fetchSlackMessages } from '../integrations/slack';
 import { fetchNewsForActiveCompanies } from '../integrations/news-search';
 import { chunkArray, getCurrentSyncJobId } from '../lib/helpers';
 import { emitAudit } from '../lib/audit';
+import { trackedStep } from '../lib/workflow-telemetry';
 
 console.log('[IngestionWorkflow] module loaded');
 
@@ -53,6 +54,7 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
 
     let org_id: string | undefined;
     let jobCreated = false;
+    let syncJobId: string | null = null;
 
     try {
       if (!event || !event.payload) {
@@ -72,7 +74,8 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       // treat any job running for >15 minutes as stale (healthy runs complete
       // the master in <2 min; children run independently).
       console.log('[IngestionWorkflow] step → check-concurrency');
-      const canProceed = await step.do('check-concurrency', async () => {
+      // No telemetry on this step — sync_jobs.id doesn't exist yet.
+      const newJobId = await step.do('check-concurrency', async () => {
         await this.env.D1.prepare(
           `UPDATE sync_jobs SET status = 'failed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
                  error_message = COALESCE(error_message, 'Timed out or interrupted by deploy')
@@ -84,20 +87,22 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         const running = await this.env.D1.prepare(
           `SELECT id FROM sync_jobs WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'running'`
         ).bind(org_id!).first();
-        if (running) return false;
+        if (running) return null;
 
-        await this.env.D1.prepare(
+        const inserted = await this.env.D1.prepare(
           `INSERT INTO sync_jobs (org_id, workflow_type, status, started_at, timeout_at)
-           VALUES (?, 'ingestion', 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 minutes'))`
-        ).bind(org_id!).run();
-        return true;
+           VALUES (?, 'ingestion', 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 minutes'))
+           RETURNING id`
+        ).bind(org_id!).first<{ id: string }>();
+        return inserted?.id ?? null;
       });
 
-      if (!canProceed) {
+      if (!newJobId) {
         console.log('[IngestionWorkflow] another run already in flight — exiting');
         return;
       }
       jobCreated = true;
+      syncJobId = newJobId;
 
       // Step 2a: fetch email + slack + calendar (fast sources)
       interface CoreSourceBundle {
@@ -108,7 +113,10 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       }
 
       console.log('[IngestionWorkflow] step → fetch-core-sources');
-      const coreData: CoreSourceBundle = await step.do(
+      const coreData: CoreSourceBundle = await trackedStep(
+        this.env,
+        step,
+        syncJobId,
         'fetch-core-sources',
         {
           retries: { limit: 2, delay: '10 seconds' },
@@ -164,7 +172,10 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
 
       // Step 2b: fetch news (slow — separate step so it doesn't block core ingestion)
       console.log('[IngestionWorkflow] step → fetch-news');
-      const newsData = await step.do(
+      const newsData = await trackedStep(
+        this.env,
+        step,
+        syncJobId,
         'fetch-news',
         {
           retries: { limit: 1, delay: '10 seconds' },
@@ -198,7 +209,7 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
 
       // Step 3: write chunks to R2 + fan out children
       console.log('[IngestionWorkflow] step → write-chunks-and-fanout');
-      await step.do('write-chunks-and-fanout', async () => {
+      await trackedStep(this.env, step, syncJobId, 'write-chunks-and-fanout', async () => {
         const allItems: ClassifiableItem[] = [
           ...sourceData.outlook,
           ...sourceData.slack,

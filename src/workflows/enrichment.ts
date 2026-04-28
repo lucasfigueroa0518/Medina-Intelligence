@@ -13,6 +13,7 @@ import { emitAudit } from '../lib/audit';
 import { extractTranscriptSignals, generateMeetingSummary } from '../lib/transcript-extraction';
 import { routeTranscriptSignals, distributeMeetingSummary } from '../lib/signal-router';
 import { incrementalAssociationUpdate } from '../lib/associations';
+import { trackedStep } from '../lib/workflow-telemetry';
 
 interface EnrichmentParams {
   org_id: string;
@@ -49,6 +50,7 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
 
     let org_id: string | undefined;
     let jobCreated = false;
+    let syncJobId: string | null = null;
 
     try {
       // Defensive payload unpack — if the runtime hands us no payload we want
@@ -66,28 +68,31 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
 
       // Step 1: concurrency guard
       console.log('[EnrichmentWorkflow] step → check-concurrency');
-      const canProceed = await step.do('check-concurrency', async () => {
+      // No telemetry on this step — sync_jobs.id doesn't exist yet.
+      const newJobId = await step.do('check-concurrency', async () => {
         const running = await this.env.D1.prepare(
           `SELECT id FROM sync_jobs WHERE org_id = ? AND workflow_type = 'enrichment' AND status = 'running' AND timeout_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`
         ).bind(org_id!).first();
-        if (running) return false;
+        if (running) return null;
 
         await this.env.D1.prepare(
           `UPDATE sync_jobs SET status = 'failed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE org_id = ? AND workflow_type = 'enrichment' AND status = 'running' AND (timeout_at IS NULL OR timeout_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
         ).bind(org_id!).run();
 
-        await this.env.D1.prepare(
+        const inserted = await this.env.D1.prepare(
           `INSERT INTO sync_jobs (org_id, workflow_type, status, started_at, timeout_at)
-           VALUES (?, 'enrichment', 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 minutes'))`
-        ).bind(org_id!).run();
-        return true;
+           VALUES (?, 'enrichment', 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 minutes'))
+           RETURNING id`
+        ).bind(org_id!).first<{ id: string }>();
+        return inserted?.id ?? null;
       });
 
-      if (!canProceed) {
+      if (!newJobId) {
         console.log('[EnrichmentWorkflow] another run already in flight — exiting');
         return;
       }
       jobCreated = true;
+      syncJobId = newJobId;
 
       // Step 2: identify pending entities
       console.log('[EnrichmentWorkflow] loading org settings');
@@ -96,7 +101,7 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
       console.log(`[EnrichmentWorkflow] max_per_cycle=${maxPerCycle}`);
 
       console.log('[EnrichmentWorkflow] step → identify-pending-contacts');
-      const contacts = await step.do('identify-pending-contacts', async () => {
+      const contacts = await trackedStep(this.env, step, syncJobId, 'identify-pending-contacts', async () => {
         // Two pools:
         //   1. Never enriched (enrichment_last_run IS NULL) — pick these up
         //      regardless of interaction count so manually-created contacts
@@ -139,7 +144,7 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
       console.log(`[EnrichmentWorkflow] pending contacts: ${contacts.length}`);
 
       console.log('[EnrichmentWorkflow] step → identify-pending-companies');
-      const companies = await step.do('identify-pending-companies', async () => {
+      const companies = await trackedStep(this.env, step, syncJobId, 'identify-pending-companies', async () => {
         // Order by enrichment_last_run NULLS FIRST (never-enriched first) and
         // bump the cap to 0.6 so the first cycle clears the auto-discovered
         // backlog instead of leaving 60% of companies un-enriched forever.
@@ -169,7 +174,10 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
       const contactBatches = chunkArray(contacts, 10);
       for (let i = 0; i < contactBatches.length; i++) {
         console.log(`[EnrichmentWorkflow] step → enrich-contacts-${i} (${contactBatches[i].length} contacts)`);
-        await step.do(
+        await trackedStep(
+          this.env,
+          step,
+          syncJobId,
           `enrich-contacts-${i}`,
           { retries: { limit: 2, delay: '30 seconds' } },
           async () => {
@@ -192,7 +200,10 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
       const companyBatches = chunkArray(companies, 10);
       for (let i = 0; i < companyBatches.length; i++) {
         console.log(`[EnrichmentWorkflow] step → enrich-companies-${i} (${companyBatches[i].length} companies)`);
-        await step.do(
+        await trackedStep(
+          this.env,
+          step,
+          syncJobId,
           `enrich-companies-${i}`,
           { retries: { limit: 2, delay: '30 seconds' } },
           async () => {
@@ -219,7 +230,7 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
       // same email gets re-sent to Claude up to 48× and stages a fresh approval
       // row each time.
       console.log('[EnrichmentWorkflow] step → llm-extraction');
-      await step.do('llm-extraction', async () => {
+      await trackedStep(this.env, step, syncJobId, 'llm-extraction', async () => {
         const recent = await this.env.D1.prepare(
           `SELECT * FROM conversations WHERE org_id = ?
              AND sent_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')
@@ -246,7 +257,7 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
 
       // Step 5: transcript signal extraction from Firefly meetings
       console.log('[EnrichmentWorkflow] step → transcript-extraction');
-      await step.do('transcript-extraction', { retries: { limit: 1, delay: '15 seconds' } }, async () => {
+      await trackedStep(this.env, step, syncJobId, 'transcript-extraction', { retries: { limit: 1, delay: '15 seconds' } }, async () => {
         const unextracted = await this.env.D1.prepare(
           `SELECT id, title, start_time, transcript_r2_key FROM events
            WHERE org_id = ? AND transcript_r2_key IS NOT NULL
@@ -318,14 +329,14 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
 
       // Step 6: event reconciliation
       console.log('[EnrichmentWorkflow] step → reconcile-events');
-      await step.do('reconcile-events', async () => {
+      await trackedStep(this.env, step, syncJobId, 'reconcile-events', async () => {
         await promoteToStandalone(org_id!, this.env);
         await flagStaleOrphanedEvents(org_id!, this.env);
       });
 
       // Step 7: update associations for enriched contacts
       console.log('[EnrichmentWorkflow] step → update-associations');
-      await step.do('update-associations', async () => {
+      await trackedStep(this.env, step, syncJobId, 'update-associations', async () => {
         for (const cid of contacts) {
           try {
             await incrementalAssociationUpdate(cid, org_id!, this.env);
@@ -337,13 +348,13 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
 
       // Step 8: cache invalidation
       console.log('[EnrichmentWorkflow] step → invalidate-cache');
-      await step.do('invalidate-cache', async () => {
+      await trackedStep(this.env, step, syncJobId, 'invalidate-cache', async () => {
         await invalidateRagCache(org_id!, this.env);
       });
 
       // Step 9: finalize
       console.log('[EnrichmentWorkflow] step → finalize');
-      await step.do('finalize', async () => {
+      await trackedStep(this.env, step, syncJobId, 'finalize', async () => {
         await this.env.D1.prepare(
           `UPDATE sync_jobs SET status = 'completed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
              items_processed = ?
