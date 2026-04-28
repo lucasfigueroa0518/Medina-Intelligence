@@ -6,6 +6,7 @@ import { buildSourcesAndContext, type CitationSource } from '../lib/citations';
 import { callClaude, callClaudeStreaming } from '../lib/claude';
 import type { ToolDefinition } from '../lib/claude';
 import { extractTextFromFile } from '../lib/file-extraction';
+import { assembleSessionAttachments, type UploadSummary } from '../lib/chat-uploads';
 import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { SESSION_TITLE_PROMPT } from '../prompts/session-title';
 import { estimateTokens, truncateToTokens } from '../lib/tokens';
@@ -356,15 +357,16 @@ export async function getSessionMessages(
   ).bind(id).all<Record<string, any>>();
   const hydratedMessages = messages.results.map(m => ({
     ...m,
-    sources: m.sources_json ? safeParseSources(m.sources_json) : null,
+    sources: m.sources_json ? safeParseJson<CitationSource[]>(m.sources_json) : null,
+    attachments: m.attachments ? safeParseJson<UploadSummary[]>(m.attachments) : null,
   }));
   return jsonResponse({ session, messages: hydratedMessages });
 }
 
-function safeParseSources(json: string): CitationSource[] | null {
+function safeParseJson<T>(json: string): T | null {
   try {
     const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? (parsed as CitationSource[]) : null;
+    return Array.isArray(parsed) ? (parsed as T) : null;
   } catch {
     return null;
   }
@@ -468,6 +470,7 @@ export async function queryAgent(
   let contextEntityId: string | null = null;
   let uploadedText: string | undefined;
   let deepDive = false;
+  let uploadIds: string[] = [];
 
   if (contentType.includes('multipart/form-data')) {
     const form = await request.formData();
@@ -476,9 +479,16 @@ export async function queryAgent(
     contextEntityType = (form.get('context_entity_type') as string) || null;
     contextEntityId = (form.get('context_entity_id') as string) || null;
     deepDive = (form.get('deep_dive') as string) === 'true';
+    // Legacy single-file path — kept until the multi-upload flow is verified
+    // end-to-end. New clients should pre-upload via /api/agent/upload-file and
+    // pass `upload_ids` instead.
     const file = form.get('file') as File | null;
     if (file && file.size > 0) {
       uploadedText = await extractTextFromFile(file);
+    }
+    const rawIds = form.get('upload_ids');
+    if (typeof rawIds === 'string' && rawIds.trim()) {
+      try { uploadIds = JSON.parse(rawIds); } catch { /* ignore */ }
     }
   } else {
     const body = await parseJsonBody<any>(request);
@@ -488,6 +498,9 @@ export async function queryAgent(
     contextEntityType = body.context_entity_type || null;
     contextEntityId = body.context_entity_id || null;
     deepDive = !!body.deep_dive;
+    if (Array.isArray(body.upload_ids)) {
+      uploadIds = body.upload_ids.filter((x: unknown): x is string => typeof x === 'string');
+    }
   }
 
   if (!query) return errorResponse('VALIDATION_ERROR', 400);
@@ -522,6 +535,19 @@ export async function queryAgent(
     };
   }
   session.user_role = ctx.userRole;
+
+  // --- Tag any newly-referenced uploads to this session ---
+  // Uploads created against `null` session (when the chat input had no session
+  // yet) need to inherit the session_id at first reference. Owner check is
+  // built into the WHERE clause so a forged upload_id from another user is a
+  // no-op.
+  if (uploadIds.length > 0) {
+    const placeholders = uploadIds.map(() => '?').join(',');
+    await env.D1.prepare(
+      `UPDATE chat_uploads SET session_id = ?
+       WHERE id IN (${placeholders}) AND user_id = ? AND (session_id IS NULL OR session_id = ?)`
+    ).bind(session.id, ...uploadIds, ctx.userId, session.id).run().catch(() => {});
+  }
 
   // --- Deep Dive rate limiting (check only — increment moved post-retrieval) ---
   const retrievalOptions: RetrievalOptions = { deepDive };
@@ -642,16 +668,40 @@ export async function queryAgent(
     ctx.orgId,
     env
   );
-  const userMessage = `${contextBlock}\n\n--- QUERY ---\n${query}`;
-  messages.push({ role: 'user', content: userMessage });
+
+  // --- Per-session attachment replay (Approach A + 50 MB cap) ---
+  const sessionAttachments = await assembleSessionAttachments(session.id, ctx.userId, env);
+  const userText = `${contextBlock}\n\n--- QUERY ---\n${query}`;
+  if (sessionAttachments.contentBlocks.length > 0) {
+    // Multi-block content: PDFs/images/text-extracted attachments first, then
+    // the RAG context + the user's actual query as the final text block.
+    messages.push({
+      role: 'user',
+      content: [
+        ...sessionAttachments.contentBlocks,
+        { type: 'text', text: userText },
+      ],
+    });
+  } else {
+    messages.push({ role: 'user', content: userText });
+  }
 
   // --- Save user turn ---
   const turnIndex = session.turn_count;
   const userMessageId = crypto.randomUUID();
+  // Filter the summaries down to only the uploads referenced by this turn —
+  // those are what we render under the user message bubble. Aged-out and
+  // older session attachments still ride along in `sessionAttachments` for
+  // the model's benefit, but the message bubble shouldn't be cluttered with
+  // them.
+  const turnAttachments: UploadSummary[] = uploadIds.length > 0
+    ? sessionAttachments.summaries.filter(s => uploadIds.includes(s.id))
+    : [];
+  const attachmentsJson = turnAttachments.length > 0 ? JSON.stringify(turnAttachments) : '[]';
   await env.D1.prepare(
-    `INSERT INTO agent_messages (id, session_id, turn_index, role, content, created_at)
-     VALUES (?, ?, ?, 'user', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-  ).bind(userMessageId, session.id, turnIndex, query).run();
+    `INSERT INTO agent_messages (id, session_id, turn_index, role, content, attachments, created_at)
+     VALUES (?, ?, ?, 'user', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+  ).bind(userMessageId, session.id, turnIndex, query, attachmentsJson).run();
 
   // --- Stream Claude response with tool use ---
   const orgId = ctx.orgId;
@@ -685,10 +735,20 @@ export async function queryAgent(
   const sourcesEvent = encoder.encode(
     `data: ${JSON.stringify({ type: 'sources', sources })}\n\n`
   );
+  const attachmentsEvent = encoder.encode(
+    `data: ${JSON.stringify({
+      type: 'attachments',
+      turn_attachments: turnAttachments,
+      session_attachments: sessionAttachments.summaries,
+      bytes_used: sessionAttachments.bytesUsed,
+      bytes_total: sessionAttachments.bytesTotal,
+    })}\n\n`
+  );
   const clientStream = new ReadableStream({
     async start(controller) {
       controller.enqueue(sessionEvent);
       controller.enqueue(sourcesEvent);
+      controller.enqueue(attachmentsEvent);
       const reader = rawClientStream.getReader();
       try {
         while (true) {

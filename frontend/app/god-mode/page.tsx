@@ -13,7 +13,10 @@ import {
 import { MartyEmblem } from '@/components/marty-emblem';
 import { CitationPill } from '@/components/citation-pill';
 import { SourcePanel } from '@/components/source-panel';
+import { PendingUploadPill, SentUploadPill, formatBytes } from '@/components/chat-upload-pill';
+import { UploadPreviewModal } from '@/components/upload-preview-modal';
 import { trimPartialCitation, type CitationSource } from '@/lib/citations';
+import type { ChatUploadSummary } from '@/lib/api';
 
 // ---------------------------------------------------------------------------
 // Thinking verbs (crossfade)
@@ -124,6 +127,49 @@ interface Message {
   error?: boolean;
   retryable?: boolean;
   sources?: CitationSource[];
+  attachments?: ChatUploadSummary[];
+}
+
+// Selected/in-flight uploads (state local to the input bar before send).
+interface PendingUpload {
+  // Local key — stable from selection until upload completes.
+  localId: string;
+  file: File;
+  uploadType: import('@/lib/api').ChatUploadType;
+  saveToDocuments: boolean;
+  uploading: boolean;
+  // Server-assigned id once the upload-file endpoint returns.
+  serverId?: string;
+  // Server-side preview-friendly summary.
+  summary?: ChatUploadSummary;
+  failed?: string | null;
+}
+
+const ACCEPTED_FILE_EXTS = '.pdf,.png,.jpg,.jpeg,.webp,.gif,.docx,.xlsx,.xls,.pptx,.csv,.txt,.md,.json';
+const MAX_PENDING_UPLOADS = 5;
+const MAX_FILE_BYTES = 32 * 1024 * 1024;
+
+function detectClientUploadType(file: File): import('@/lib/api').ChatUploadType | null {
+  const mt = (file.type || '').toLowerCase();
+  if (mt === 'application/pdf') return 'pdf';
+  if (mt.startsWith('image/')) return 'image';
+  if (mt === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') return 'document';
+  if (mt === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || mt === 'application/vnd.ms-excel') return 'spreadsheet';
+  if (mt === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') return 'presentation';
+  if (mt === 'text/csv') return 'data';
+  if (mt === 'application/json') return 'data';
+  if (mt.startsWith('text/')) return 'text';
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  switch (ext) {
+    case 'pdf': return 'pdf';
+    case 'png': case 'jpg': case 'jpeg': case 'webp': case 'gif': return 'image';
+    case 'docx': return 'document';
+    case 'xlsx': case 'xls': return 'spreadsheet';
+    case 'pptx': return 'presentation';
+    case 'csv': case 'json': return 'data';
+    case 'txt': case 'md': return 'text';
+    default: return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +558,12 @@ export default function GodModePage() {
   const [input, setInput] = React.useState('');
   const [streaming, setStreaming] = React.useState(false);
   const [attachedFile, setAttachedFile] = React.useState<File | null>(null);
+  const [pendingUploads, setPendingUploads] = React.useState<PendingUpload[]>([]);
+  const [sessionUploads, setSessionUploads] = React.useState<ChatUploadSummary[]>([]);
+  const [bytesUsed, setBytesUsed] = React.useState(0);
+  const [bytesTotal, setBytesTotal] = React.useState(0);
+  const [previewUpload, setPreviewUpload] = React.useState<ChatUploadSummary | null>(null);
+  const [uploadToast, setUploadToast] = React.useState<string | null>(null);
   const messagesRef = React.useRef<HTMLDivElement>(null);
   const inputRef = React.useRef<HTMLTextAreaElement>(null);
   const lastSentQueryRef = React.useRef('');
@@ -540,6 +592,80 @@ export default function GodModePage() {
   // Citation source side panel
   const [activeSource, setActiveSource] = React.useState<CitationSource | null>(null);
   const activeSourceMessageIdRef = React.useRef<string | null>(null);
+
+  const showToast = React.useCallback((msg: string) => {
+    setUploadToast(msg);
+    setTimeout(() => setUploadToast(null), 3500);
+  }, []);
+
+  const handleFilesPicked = React.useCallback(async (selected: File[]) => {
+    if (selected.length === 0) return;
+    const slotsLeft = MAX_PENDING_UPLOADS - pendingUploads.length;
+    if (slotsLeft <= 0) {
+      showToast(`Maximum ${MAX_PENDING_UPLOADS} files per message.`);
+      return;
+    }
+    const accepted: PendingUpload[] = [];
+    let rejectedTooLarge = 0;
+    let rejectedUnsupported = 0;
+    let truncated = false;
+    for (const f of selected) {
+      if (accepted.length >= slotsLeft) { truncated = true; break; }
+      const type = detectClientUploadType(f);
+      if (!type) { rejectedUnsupported++; continue; }
+      if (f.size > MAX_FILE_BYTES) { rejectedTooLarge++; continue; }
+      if (type === 'image' && f.size > Math.floor(5 * 1024 * 1024 * 0.75)) { rejectedTooLarge++; continue; }
+      accepted.push({
+        localId: crypto.randomUUID(),
+        file: f,
+        uploadType: type,
+        saveToDocuments: false,
+        uploading: true,
+      });
+    }
+    if (rejectedUnsupported > 0) showToast(`${rejectedUnsupported} unsupported file${rejectedUnsupported === 1 ? '' : 's'} skipped.`);
+    if (rejectedTooLarge > 0) showToast(`${rejectedTooLarge} file${rejectedTooLarge === 1 ? '' : 's'} too large (max 32 MB; images max 3.5 MB).`);
+    if (truncated) showToast(`Only the first ${slotsLeft} were added (max ${MAX_PENDING_UPLOADS} per message).`);
+    if (accepted.length === 0) return;
+
+    setPendingUploads(prev => [...prev, ...accepted]);
+
+    // One upload request per file so a single oversize file doesn't sink the
+    // whole batch on the server side. The endpoint accepts up to 5 anyway.
+    for (const p of accepted) {
+      try {
+        const result = await api.uploadChatFiles([p.file], {
+          sessionId: liveSessionIdRef.current ?? activeSessionId ?? null,
+          saveToDocuments: p.saveToDocuments,
+        });
+        const summary = result.uploads[0];
+        setPendingUploads(prev => prev.map(u =>
+          u.localId === p.localId
+            ? { ...u, uploading: false, serverId: summary.id, summary }
+            : u
+        ));
+      } catch (e: any) {
+        setPendingUploads(prev => prev.map(u =>
+          u.localId === p.localId ? { ...u, uploading: false, failed: e?.message || 'Upload failed' } : u
+        ));
+        showToast(e?.message || 'Upload failed.');
+      }
+    }
+  }, [pendingUploads.length, activeSessionId, showToast]);
+
+  const togglePendingSave = React.useCallback((localId: string) => {
+    setPendingUploads(prev => prev.map(u => {
+      if (u.localId !== localId) return u;
+      // Only allow toggling before upload completes — once saved server-side
+      // there's no in-place flip.
+      if (u.serverId) return u;
+      return { ...u, saveToDocuments: !u.saveToDocuments };
+    }));
+  }, []);
+
+  const removePending = React.useCallback((localId: string) => {
+    setPendingUploads(prev => prev.filter(u => u.localId !== localId));
+  }, []);
 
   const handleCitationClick = React.useCallback(
     (messageId: string) => (source: CitationSource) => {
@@ -606,11 +732,22 @@ export default function GodModePage() {
         if (!streamingRef.current) {
           setMessages(d.messages.map((m: any) => ({
             id: m.id, role: m.role, content: m.content, timestamp: m.created_at,
+            attachments: m.attachments || undefined,
+            sources: m.sources || undefined,
           })));
         }
       });
+      api.listSessionUploads(activeSessionId).then(d => {
+        setSessionUploads(d.uploads);
+        setBytesTotal(d.uploads.reduce((acc, u) => acc + u.size_bytes, 0));
+        setBytesUsed(d.uploads.filter(u => u.in_context).reduce((acc, u) => acc + u.size_bytes, 0));
+      }).catch(() => { /* ignore */ });
     } else if (!activeSessionId) {
       setMessages([]);
+      setSessionUploads([]);
+      setBytesUsed(0);
+      setBytesTotal(0);
+      setPendingUploads([]);
     }
   }, [activeSessionId]);
 
@@ -697,9 +834,17 @@ export default function GodModePage() {
     const assistantMsgId = crypto.randomUUID();
     const now = new Date().toISOString();
 
+    // Snapshot pending uploads for this turn — only those that finished
+    // uploading without error make it into the message bubble + the request.
+    const turnUploads = pendingUploads
+      .filter(u => u.serverId && u.summary && !u.failed)
+      .map(u => u.summary!) as ChatUploadSummary[];
+    const uploadIds = turnUploads.map(u => u.id);
+
     setMessages(m => [
       ...m,
-      { id: userMsgId, role: 'user', content: queryText, timestamp: now },
+      { id: userMsgId, role: 'user', content: queryText, timestamp: now,
+        attachments: turnUploads.length > 0 ? turnUploads : undefined },
       { id: assistantMsgId, role: 'assistant', content: '', streaming: true, toolCalls: [], timestamp: now },
     ]);
     setInput('');
@@ -714,10 +859,11 @@ export default function GodModePage() {
     const isDeepDive = deepDive;
     setAttachedFile(null);
     setDeepDive(false);
+    setPendingUploads([]);
 
     try {
       await streamAgentQuery(
-        queryText, activeSessionId, null, null, file, isDeepDive,
+        queryText, activeSessionId ?? liveSessionIdRef.current, null, null, file, isDeepDive,
         token => {
           if (typeof token === 'string') {
             setIsThinking(false);
@@ -790,6 +936,22 @@ export default function GodModePage() {
             ));
             return;
           }
+          if (event.type === 'attachments') {
+            const sessionAtt = (event.session_attachments || []) as ChatUploadSummary[];
+            const turnAtt = (event.turn_attachments || []) as ChatUploadSummary[];
+            setSessionUploads(sessionAtt);
+            setBytesUsed(event.bytes_used || 0);
+            setBytesTotal(event.bytes_total || 0);
+            // Replace the optimistic snapshot we set on send with the
+            // server's authoritative list (in_context flag is computed
+            // server-side and may differ from what the client guessed).
+            if (turnAtt.length > 0) {
+              setMessages(m => m.map(msg =>
+                msg.id === userMsgId ? { ...msg, attachments: turnAtt } : msg
+              ));
+            }
+            return;
+          }
           setMessages(m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
             const toolCalls = [...(msg.toolCalls || [])];
@@ -804,7 +966,8 @@ export default function GodModePage() {
             }
             return { ...msg, toolCalls };
           }));
-        }
+        },
+        uploadIds.length > 0 ? uploadIds : undefined,
       );
     } catch (e) {
       setIsThinking(false);
@@ -998,6 +1161,23 @@ export default function GodModePage() {
                 m.role === 'user' ? (
                   <div key={m.id} className="flex justify-end group/msg msg-slide-in">
                     <div className="relative max-w-[75%]">
+                      {m.attachments && m.attachments.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 justify-end mb-2">
+                          {m.attachments.map(a => (
+                            <SentUploadPill
+                              key={a.id}
+                              upload={a}
+                              onClick={(u) => {
+                                if (u.saved_to_documents && u.saved_document_id) {
+                                  window.location.href = `/documents/${u.saved_document_id}`;
+                                  return;
+                                }
+                                setPreviewUpload(u);
+                              }}
+                            />
+                          ))}
+                        </div>
+                      )}
                       <div className="bg-bg-surface rounded-2xl rounded-br-sm px-5 py-3">
                         <div className="text-sm text-text-primary whitespace-pre-wrap" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
                           {m.content}
@@ -1112,24 +1292,76 @@ export default function GodModePage() {
 
         {/* Fix 1+2: Floating prompt bar — absolutely positioned, doesn't take layout space */}
         <div className="absolute bottom-8 left-10 right-10 z-10">
-          <div className="floating-input-bar" style={{ padding: '12px 16px' }}>
-            {attachedFile && (
-              <div className="mb-2 flex items-center gap-2">
-                <div className="badge">{attachedFile.name} ({Math.round(attachedFile.size / 1024)}KB)</div>
-                <button onClick={() => setAttachedFile(null)} className="text-text-muted hover:text-text-primary text-xs">
-                  <XIcon size={12} />
-                </button>
+          {/* Session attachment indicator — shows what MARTy currently sees */}
+          {sessionUploads.length > 0 && (
+            <div className="mb-2 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 text-[11px]" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+              <Paperclip size={12} className="text-text-muted shrink-0" />
+              <span className="text-text-muted shrink-0">In this conversation:</span>
+              <div className="flex flex-wrap gap-1 min-w-0 flex-1">
+                {sessionUploads.map(u => (
+                  <button
+                    key={u.id}
+                    onClick={() => setPreviewUpload(u)}
+                    className={`text-text-secondary hover:text-text-primary truncate max-w-[180px] ${u.in_context ? '' : 'opacity-50'}`}
+                    title={u.in_context ? u.filename : `${u.filename} — out of context (re-attach to use)`}
+                  >
+                    {u.filename}{u.in_context ? '' : ' ·'}<span className="text-text-muted">{u.in_context ? '' : ' out'}</span>
+                  </button>
+                )).reduce<React.ReactNode[]>((acc, el, i) => {
+                  if (i > 0) acc.push(<span key={`sep-${i}`} className="text-text-muted">,</span>);
+                  acc.push(el);
+                  return acc;
+                }, [])}
               </div>
-            )}
+              <span className="text-text-muted shrink-0 ml-auto">
+                {sessionUploads.length} of 5 — {formatBytes(bytesUsed)} / 50 MB
+              </span>
+            </div>
+          )}
+          {/* Pending uploads (selected but not yet sent) */}
+          {pendingUploads.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {pendingUploads.map(p => (
+                <PendingUploadPill
+                  key={p.localId}
+                  filename={p.file.name}
+                  sizeBytes={p.file.size}
+                  uploadType={p.uploadType}
+                  uploading={p.uploading}
+                  failed={p.failed}
+                  saveToDocuments={p.saveToDocuments}
+                  onToggleSave={() => togglePendingSave(p.localId)}
+                  onRemove={() => removePending(p.localId)}
+                />
+              ))}
+            </div>
+          )}
+          {/* Toast */}
+          {uploadToast && (
+            <div className="mb-2 px-3 py-2 rounded-lg bg-semantic-error/15 border border-semantic-error/30 text-semantic-error text-xs"
+              style={{ fontFamily: "'DM Sans', sans-serif" }}>
+              {uploadToast}
+            </div>
+          )}
+          <div className="floating-input-bar" style={{ padding: '12px 16px' }}>
             <div className="flex items-center gap-3">
-              {/* Paperclip — fixed 36x36 */}
+              {/* Paperclip — fixed 36x36, multi-select */}
               <label className="w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer shrink-0 transition-colors"
                 style={{ color: 'rgba(255,255,255,0.5)' }}
                 onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.9)'; (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.05)'; }}
                 onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.5)'; (e.currentTarget as HTMLElement).style.background = 'transparent'; }}>
                 <Paperclip size={18} />
-                <input type="file" className="hidden" accept=".pdf,.docx,.csv,.txt,.md,.xlsx"
-                  onChange={e => setAttachedFile(e.target.files?.[0] || null)} />
+                <input
+                  type="file"
+                  multiple
+                  className="hidden"
+                  accept={ACCEPTED_FILE_EXTS}
+                  onChange={e => {
+                    const files = Array.from(e.target.files || []);
+                    handleFilesPicked(files);
+                    e.target.value = '';
+                  }}
+                />
               </label>
 
               {/* Deep Dive toggle */}
@@ -1202,6 +1434,7 @@ export default function GodModePage() {
       </main>
 
       <SourcePanel source={activeSource} onClose={() => setActiveSource(null)} />
+      <UploadPreviewModal upload={previewUpload} onClose={() => setPreviewUpload(null)} />
     </div>
   );
 }

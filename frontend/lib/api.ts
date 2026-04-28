@@ -30,6 +30,21 @@ export function clearAuthToken(): void {
   window.dispatchEvent(new CustomEvent(SESSION_EXPIRED_EVENT));
 }
 
+export type ChatUploadType = 'pdf' | 'image' | 'document' | 'spreadsheet' | 'presentation' | 'text' | 'data';
+
+export interface ChatUploadSummary {
+  id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  upload_type: ChatUploadType;
+  preview_text: string | null;
+  saved_to_documents: boolean;
+  saved_document_id: string | null;
+  in_context: boolean;
+  extraction_status: 'pending' | 'processing' | 'completed' | 'failed' | 'skipped';
+}
+
 export class ApiError extends Error {
   status: number;
   code?: string;
@@ -263,6 +278,32 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }).catch(() => ({ ok: false })),
+  uploadChatFiles: async (
+    files: File[],
+    opts?: { sessionId?: string | null; saveToDocuments?: boolean }
+  ) => {
+    const form = new FormData();
+    for (const f of files) form.append('files', f, f.name);
+    if (opts?.sessionId) form.append('session_id', opts.sessionId);
+    if (opts?.saveToDocuments) form.append('save_to_documents', 'true');
+    const token = getAuthToken();
+    const res = await fetch(`${API_BASE}/agent/upload-file`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      body: form,
+    });
+    const text = await res.text();
+    let parsed: any = {};
+    try { parsed = JSON.parse(text); } catch { /* leave empty */ }
+    if (!res.ok) {
+      const message = parsed?.message || parsed?.error || text || 'Upload failed';
+      throw new ApiError(res.status, message);
+    }
+    return parsed as { uploads: ChatUploadSummary[] };
+  },
+  listSessionUploads: (sessionId: string) =>
+    request<{ uploads: ChatUploadSummary[] }>(`/agent/sessions/${sessionId}/uploads`),
+  uploadContentUrl: (uploadId: string) => `${API_BASE}/agent/uploads/${uploadId}/content`,
 
   // Campaigns
   listCampaigns: () => request<{ campaigns: any[] }>('/campaigns'),
@@ -527,7 +568,8 @@ export async function streamAgentQuery(
   onToken: (token: string) => void,
   onDone: () => void,
   onError: (err: string, opts?: { retryable?: boolean }) => void,
-  onToolEvent?: (event: any) => void
+  onToolEvent?: (event: any) => void,
+  uploadIds?: string[]
 ): Promise<void> {
   const form = new FormData();
   form.append('query', query);
@@ -536,6 +578,7 @@ export async function streamAgentQuery(
   if (contextEntityId) form.append('context_entity_id', contextEntityId);
   if (file) form.append('file', file);
   if (deepDive) form.append('deep_dive', 'true');
+  if (uploadIds && uploadIds.length > 0) form.append('upload_ids', JSON.stringify(uploadIds));
 
   const token = getAuthToken();
 
@@ -605,6 +648,8 @@ export async function streamAgentQuery(
             onToolEvent?.({ type: 'session', session_id: evt.session_id });
           } else if (evt.type === 'sources') {
             onToolEvent?.({ type: 'sources', sources: evt.sources });
+          } else if (evt.type === 'attachments') {
+            onToolEvent?.(evt);
           } else if (evt.text) {
             receivedContent = true;
             onToken(evt.text);

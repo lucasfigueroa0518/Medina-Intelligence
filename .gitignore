@@ -25,6 +25,13 @@ out
 .wrangler
 **/.wrangler
 
+# Vercel
+.vercel
+**/.vercel
+
+# Claude Code
+.claude/scheduled_tasks.lock
+
 # Logs
 *.log
 npm-debug.log*
