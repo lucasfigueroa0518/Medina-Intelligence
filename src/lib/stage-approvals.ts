@@ -4,6 +4,7 @@ import type { ClassifiedItem } from '../types/interfaces';
 import { hashShort, getOrgSettings } from './helpers';
 import { autoLinkAttendees, autoLinkConversationParticipants } from './associations';
 import { processEmailSignature, processDisplayNameUpdate } from './email-signature-parser';
+import { updateEntityInIndex } from './entity-index';
 
 /**
  * Stages classified items as approval queue entries (or writes them directly
@@ -20,6 +21,8 @@ export async function stageAndCommitApprovals(
 ): Promise<void> {
   const settings = await getOrgSettings(orgId, env);
   const now = new Date().toISOString();
+  const modifiedContacts = new Set<string>();
+  const modifiedCompanies = new Set<string>();
 
   for (const item of items) {
     if (item.entityType === 'conversation') {
@@ -87,6 +90,7 @@ export async function stageAndCommitApprovals(
            WHERE id = ?`
         ).bind(cid).run();
       }
+      for (const cid of item.contactIds) modifiedContacts.add(cid);
 
       // Email signature extraction + display name updates (progressive enrichment)
       if (item.type === 'email' && item.direction !== 'internal' && item.contactIds.length > 0) {
@@ -141,6 +145,7 @@ export async function stageAndCommitApprovals(
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
            WHERE id = ?`
         ).bind(item.bodyPreview.slice(0, 500), item.relatedCompanyId).run();
+        modifiedCompanies.add(item.relatedCompanyId);
       }
       continue;
     }
@@ -148,6 +153,12 @@ export async function stageAndCommitApprovals(
     // Calendar events handled by integrations/outlook.ts directly (ON CONFLICT upsert).
   }
 
-  // Settings-gated field-level staging happens in extraction.ts for enrichment signals.
+  for (const cid of modifiedContacts) {
+    try { await updateEntityInIndex(orgId, 'contact', cid, env); } catch {}
+  }
+  for (const cid of modifiedCompanies) {
+    try { await updateEntityInIndex(orgId, 'company', cid, env); } catch {}
+  }
+
   void settings;
 }

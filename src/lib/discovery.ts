@@ -4,6 +4,7 @@ import type { ClassifiableItem } from '../types/interfaces';
 import { emitAudit } from './audit';
 import { isValidContactName, resolveContactName } from './name-quality';
 import { jaroWinkler } from './dedup';
+import { updateEntityInIndex } from './entity-index';
 
 // Domains whose mail is always automated/transactional — never discover as contacts.
 // Includes platform-noreply senders (slack.com, github.com), SaaS billing/notice
@@ -415,6 +416,8 @@ export async function findOrCreateCompanyByDomain(
     created_at: now,
   });
 
+  try { await updateEntityInIndex(orgId, 'company', companyId, env); } catch {}
+
   return companyId;
 }
 
@@ -548,11 +551,7 @@ export async function discoverNewContact(
     created_at: new Date().toISOString(),
   });
 
-  // No inline enrichment trigger here — every WORKFLOW.create is a subrequest,
-  // and high-fanout items would blow the per-invocation cap. The enrichment
-  // workflow's pickup loop already grabs `enrichment_last_run IS NULL` rows on
-  // its own cadence (and ingestion now also kicks a one-shot enrichment run at
-  // the end via `trigger-post-ingest-enrichment`).
+  try { await updateEntityInIndex(orgId, 'contact', contactId, env); } catch {}
 
   return { id: contactId, created: true };
 }

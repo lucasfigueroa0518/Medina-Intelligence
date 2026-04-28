@@ -35,10 +35,26 @@ export async function listEvents(
     binds.push(reconciliationStatus);
   }
 
-  const result = await env.D1.prepare(
-    `SELECT * FROM events WHERE ${where.join(' AND ')} ORDER BY start_time DESC LIMIT 500`
-  ).bind(...binds).all();
-  return jsonResponse({ events: result.results });
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const whereClause = where.join(' AND ');
+
+  const [result, countResult] = await Promise.all([
+    env.D1.prepare(
+      `SELECT * FROM events WHERE ${whereClause} ORDER BY start_time DESC LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as total FROM events WHERE ${whereClause}`
+    ).bind(...binds).first<{ total: number }>(),
+  ]);
+
+  return jsonResponse({
+    events: result.results,
+    total: countResult?.total || 0,
+    limit,
+    offset,
+    has_more: offset + limit < (countResult?.total || 0),
+  });
 }
 
 export async function getEvent(

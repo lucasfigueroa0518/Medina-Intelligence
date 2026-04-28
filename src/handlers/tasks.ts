@@ -20,11 +20,26 @@ export async function listTasks(
   if (assignee) { where.push('assigned_to = ?'); binds.push(assignee); }
   if (contactId) { where.push('contact_id = ?'); binds.push(contactId); }
 
-  const rows = await env.D1.prepare(
-    `SELECT * FROM tasks WHERE ${where.join(' AND ')} ORDER BY due_date ASC NULLS LAST LIMIT 500`
-  ).bind(...binds).all();
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const whereClause = where.join(' AND ');
 
-  return jsonResponse({ tasks: rows.results });
+  const [rows, countResult] = await Promise.all([
+    env.D1.prepare(
+      `SELECT * FROM tasks WHERE ${whereClause} ORDER BY due_date ASC NULLS LAST LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as total FROM tasks WHERE ${whereClause}`
+    ).bind(...binds).first<{ total: number }>(),
+  ]);
+
+  return jsonResponse({
+    tasks: rows.results,
+    total: countResult?.total || 0,
+    limit,
+    offset,
+    has_more: offset + limit < (countResult?.total || 0),
+  });
 }
 
 export async function createTask(

@@ -8,6 +8,7 @@ import { cleanupVectorsForEntity } from '../lib/merge';
 import { triggerCompanyEnrichment } from '../lib/enrichment';
 import { findDuplicateCompany } from '../lib/discovery';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
+import { updateEntityInIndex } from '../lib/entity-index';
 
 export async function listCompanies(
   request: Request,
@@ -179,7 +180,8 @@ export async function createCompany(
     created_at: now,
   });
 
-  // Trigger enrichment asynchronously
+  try { await updateEntityInIndex(ctx.orgId, 'company', id, env); } catch {}
+
   ctxExec.waitUntil(triggerCompanyEnrichment(id, ctx.orgId, env));
   await invalidateRagCache(ctx.orgId, env);
 

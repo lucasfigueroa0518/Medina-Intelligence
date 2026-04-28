@@ -2,6 +2,7 @@ import type { Env } from '../types/env';
 import { hashShort } from './helpers';
 import { triggerContactEnrichment } from './enrichment';
 import { emitAudit } from './audit';
+import { updateEntityInIndex } from './entity-index';
 
 interface FieldUpdate {
   field: string;
@@ -168,6 +169,7 @@ export async function proposeEntityUpdate(
     ).bind(orgId, entityType, entityId, field).run();
 
     console.log(`[progressive] auto-applied ${entityType}/${entityId} ${field} = "${proposedValue.slice(0, 60)}" (was NULL, source: ${source})`);
+    try { await updateEntityInIndex(orgId, entityType, entityId, env); } catch {}
     return 'auto_applied';
   }
 
@@ -199,6 +201,7 @@ export async function proposeEntityUpdate(
     });
 
     console.log(`[progressive] auto-applied ${entityType}/${entityId} ${field}: "${currentValue.slice(0, 30)}" → "${proposedValue.slice(0, 30)}" (high confidence ${confidence}, source: ${source})`);
+    try { await updateEntityInIndex(orgId, entityType, entityId, env); } catch {}
     return 'auto_applied';
   }
 

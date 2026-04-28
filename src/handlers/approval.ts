@@ -24,10 +24,17 @@ export async function listApprovalQueue(
     binds.push(entityType);
   }
 
-  const [rows, sharingFlags] = await Promise.all([
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 500);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const whereClause = where.join(' AND ');
+
+  const [rows, countResult, sharingFlags] = await Promise.all([
     env.D1.prepare(
-      `SELECT * FROM approval_queue WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 200`
-    ).bind(...binds).all(),
+      `SELECT * FROM approval_queue WHERE ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as total FROM approval_queue WHERE ${whereClause}`
+    ).bind(...binds).first<{ total: number }>(),
     getSharingFlags(ctx.orgId, env),
   ]);
 
@@ -74,7 +81,13 @@ export async function listApprovalQueue(
     })
   );
 
-  return jsonResponse({ entries });
+  return jsonResponse({
+    entries,
+    total: countResult?.total || 0,
+    limit,
+    offset,
+    has_more: offset + limit < (countResult?.total || 0),
+  });
 }
 
 export async function approveItem(
@@ -329,6 +342,9 @@ export async function listApprovalQueueGrouped(
     binds.push(entityTypeFilter);
   }
 
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10), 500);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+
   const rows = await env.D1.prepare(
     `SELECT aq.*,
             CASE WHEN aq.entity_type = 'contact' THEN (SELECT full_name FROM contacts WHERE id = aq.entity_id)
@@ -339,8 +355,8 @@ export async function listApprovalQueueGrouped(
      FROM approval_queue aq
      WHERE ${where.join(' AND ')}
      ORDER BY aq.entity_id, aq.created_at DESC
-     LIMIT 500`
-  ).bind(...binds).all();
+     LIMIT ? OFFSET ?`
+  ).bind(...binds, limit, offset).all();
 
   const grouped = new Map<string, any>();
   for (const row of rows.results as any[]) {

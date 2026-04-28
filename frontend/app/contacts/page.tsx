@@ -35,6 +35,8 @@ export default function ContactsPage() {
   const [contacts, setContacts] = React.useState<Contact[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [search, setSearch] = React.useState('');
+  const [debouncedSearch, setDebouncedSearch] = React.useState('');
+  const searchDebounceRef = React.useRef<NodeJS.Timeout>();
   const [filters, setFilters] = React.useState<{
     contact_types: string[];
     has_followup_overdue: boolean;
@@ -59,6 +61,12 @@ export default function ContactsPage() {
     api.getContactFilterCounts().then(setFilterCounts).catch(() => {});
   }, [loadTags]);
 
+  React.useEffect(() => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => setDebouncedSearch(search), 250);
+    return () => { if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current); };
+  }, [search]);
+
   // Cumulative pagination — initial load gets the first page; "Load more"
   // appends the next page. Total comes from the server so the UI can show
   // "X of Y". 100/page keeps initial render fast at any data scale.
@@ -68,10 +76,10 @@ export default function ContactsPage() {
 
   const buildParams = React.useCallback((offset: number): Record<string, string> => {
     const p: Record<string, string> = { limit: String(PAGE_SIZE), offset: String(offset) };
-    if (search) p.keyword = search;
+    if (debouncedSearch) p.keyword = debouncedSearch;
     if (filters.has_followup_overdue) p.has_followup_overdue = 'true';
     return p;
-  }, [search, filters.has_followup_overdue]);
+  }, [debouncedSearch, filters.has_followup_overdue]);
 
   const loadContacts = React.useCallback(() => {
     setLoading(true);

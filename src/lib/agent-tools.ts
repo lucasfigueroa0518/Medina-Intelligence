@@ -2,6 +2,7 @@ import type { Env } from '../types/env';
 import { emitAudit } from './audit';
 import { invalidateRagCache } from './cache';
 import { findDuplicateCompany } from './discovery';
+import { updateEntityInIndex } from './entity-index';
 
 // ---------------------------------------------------------------------------
 // READ TOOLS
@@ -376,6 +377,7 @@ export async function createContactTool(
         `INSERT INTO companies (id, org_id, name, company_type, created_at, updated_at)
          VALUES (?, ?, ?, 'other', ?, ?)`
       ).bind(companyId, orgId, input.company_name, now, now).run();
+      try { await updateEntityInIndex(orgId, 'company', companyId, env); } catch {}
     }
   }
 
@@ -431,6 +433,7 @@ export async function createContactTool(
     after_data: { id, full_name: input.full_name, source: 'manual' },
     created_at: now,
   });
+  try { await updateEntityInIndex(orgId, 'contact', id, env); } catch {}
   await invalidateRagCache(orgId, env);
 
   return { success: true, contact_id: id, message: `Created contact "${input.full_name}"` };
@@ -519,6 +522,7 @@ export async function createCompanyTool(
     after_data: { id, name: input.name, source: 'manual' },
     created_at: now,
   });
+  try { await updateEntityInIndex(orgId, 'company', id, env); } catch {}
   await invalidateRagCache(orgId, env);
 
   return { success: true, company_id: id, message: `Created company "${input.name}"` };

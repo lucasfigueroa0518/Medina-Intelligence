@@ -4,6 +4,7 @@ import { callClaude } from './claude';
 import { jaroWinkler, scoreSimilarity } from './dedup';
 import { proposeMultipleUpdates, type SourceType } from './progressive-enrichment';
 import { findOrCreateCompanyByDomain } from './discovery';
+import { updateEntityInIndex } from './entity-index';
 import { chunkEmbedAndPersistAll } from './embedding';
 import { extractTextFromFile } from './file-extraction';
 import { emitAudit } from './audit';
@@ -563,6 +564,8 @@ async function routeCompany(
     extracted.stage || null,
     now, now
   ).run();
+
+  try { await updateEntityInIndex(orgId, 'company', companyId, env); } catch {}
 
   return { created: true, updated: false, id: companyId };
 }

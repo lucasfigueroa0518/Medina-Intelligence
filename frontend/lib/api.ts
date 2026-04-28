@@ -512,6 +512,7 @@ export async function streamAgentQuery(
   contextEntityType: string | null,
   contextEntityId: string | null,
   file: File | null,
+  deepDive: boolean,
   onToken: (token: string) => void,
   onDone: () => void,
   onError: (err: string) => void,
@@ -523,6 +524,7 @@ export async function streamAgentQuery(
   if (contextEntityType) form.append('context_entity_type', contextEntityType);
   if (contextEntityId) form.append('context_entity_id', contextEntityId);
   if (file) form.append('file', file);
+  if (deepDive) form.append('deep_dive', 'true');
 
   const token = getAuthToken();
 

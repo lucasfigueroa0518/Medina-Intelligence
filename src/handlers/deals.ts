@@ -20,6 +20,9 @@ export async function listDeals(
   const companyId = url.searchParams.get('company_id');
   const ownerId = url.searchParams.get('owner_id');
 
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+
   const where: string[] = ['d.org_id = ?', 'd.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
 
@@ -36,18 +39,31 @@ export async function listDeals(
     binds.push(ownerId);
   }
 
-  const result = await env.D1.prepare(
-    `SELECT d.*, co.name AS company_name, co.sector AS company_sector,
-            (SELECT COUNT(*) FROM deal_contacts dc WHERE dc.deal_id = d.id) AS contacts_count,
-            (SELECT COUNT(*) FROM deal_action_items dai WHERE dai.deal_id = d.id AND dai.status IN ('open','in_progress')) AS open_items_count
-     FROM deals d
-     LEFT JOIN companies co ON d.company_id = co.id
-     WHERE ${where.join(' AND ')}
-     ORDER BY d.expected_close ASC NULLS LAST
-     LIMIT 500`
-  ).bind(...binds).all();
+  const whereClause = where.join(' AND ');
 
-  return jsonResponse({ deals: result.results });
+  const [result, countResult] = await Promise.all([
+    env.D1.prepare(
+      `SELECT d.*, co.name AS company_name, co.sector AS company_sector,
+              (SELECT COUNT(*) FROM deal_contacts dc WHERE dc.deal_id = d.id) AS contacts_count,
+              (SELECT COUNT(*) FROM deal_action_items dai WHERE dai.deal_id = d.id AND dai.status IN ('open','in_progress')) AS open_items_count
+       FROM deals d
+       LEFT JOIN companies co ON d.company_id = co.id
+       WHERE ${whereClause}
+       ORDER BY d.expected_close ASC NULLS LAST
+       LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as total FROM deals d WHERE ${whereClause}`
+    ).bind(...binds).first<{ total: number }>(),
+  ]);
+
+  return jsonResponse({
+    deals: result.results,
+    total: countResult?.total || 0,
+    limit,
+    offset,
+    has_more: offset + limit < (countResult?.total || 0),
+  });
 }
 
 // ---------------------------------------------------------------------------

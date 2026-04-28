@@ -1,7 +1,7 @@
 import type { Env } from '../types/env';
 import type { AgentSession, AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
-import { preprocessQuery, retrieveContext, assembleContext, TOKEN_BUDGET } from '../lib/retrieval';
+import { preprocessQuery, retrieveContext, assembleContext, TOKEN_BUDGET, type RetrievalOptions } from '../lib/retrieval';
 import { callClaude, callClaudeStreaming } from '../lib/claude';
 import type { ToolDefinition } from '../lib/claude';
 import { extractTextFromFile } from '../lib/file-extraction';
@@ -417,6 +417,7 @@ export async function queryAgent(
   let contextEntityType: string | null = null;
   let contextEntityId: string | null = null;
   let uploadedText: string | undefined;
+  let deepDive = false;
 
   if (contentType.includes('multipart/form-data')) {
     const form = await request.formData();
@@ -424,6 +425,7 @@ export async function queryAgent(
     sessionId = (form.get('session_id') as string) || null;
     contextEntityType = (form.get('context_entity_type') as string) || null;
     contextEntityId = (form.get('context_entity_id') as string) || null;
+    deepDive = (form.get('deep_dive') as string) === 'true';
     const file = form.get('file') as File | null;
     if (file && file.size > 0) {
       uploadedText = await extractTextFromFile(file);
@@ -435,6 +437,7 @@ export async function queryAgent(
     sessionId = body.session_id || null;
     contextEntityType = body.context_entity_type || null;
     contextEntityId = body.context_entity_id || null;
+    deepDive = !!body.deep_dive;
   }
 
   if (!query) return errorResponse('VALIDATION_ERROR', 400);
@@ -470,15 +473,26 @@ export async function queryAgent(
   }
   session.user_role = ctx.userRole;
 
+  // --- Deep Dive rate limiting ---
+  const retrievalOptions: RetrievalOptions = { deepDive };
+  if (deepDive) {
+    const ddKey = `deep_dive:${ctx.userId}:${new Date().toISOString().slice(0, 13)}`;
+    const ddCount = parseInt(await env.KV.get(ddKey) || '0');
+    if (ddCount >= 10) {
+      return errorResponse('Deep dive limit reached — try again next hour. Normal queries are still available.', 429);
+    }
+    await env.KV.put(ddKey, String(ddCount + 1), { expirationTtl: 7200 });
+  }
+
   // --- Pre-process query & retrieve RAG context ---
   const t0 = Date.now();
-  const pq = await preprocessQuery(query, session, env);
+  const pq = await preprocessQuery(query, session, env, retrievalOptions);
 
   if (session.context_entity_id && !pq.entityIds.includes(session.context_entity_id)) {
     pq.entityIds.push(session.context_entity_id);
   }
 
-  const { internal, news } = await retrieveContext(pq, env);
+  const { internal, news, stats } = await retrieveContext(pq, env, retrievalOptions);
   const tRetrieve = Date.now() - t0;
 
   // --- Load session history ---
@@ -528,11 +542,16 @@ export async function queryAgent(
   const orgId = ctx.orgId;
   const userId = ctx.userId;
 
+  let systemPrompt = GOD_MODE_SYSTEM_PROMPT;
+  if (deepDive && stats) {
+    systemPrompt += `\n\nYou are in Deep Dive mode. Begin your response with a single brief line summarizing the scope, formatted as:\n🔍 Deep dive: Searched ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts.\nThen proceed with your thorough analysis. Be exhaustive — reference every relevant piece of evidence you find. Cite specific emails, meetings, and documents by name and date. Don't summarize — be thorough.`;
+  }
+
   const stream = await callClaudeStreaming(
     {
-      system: GOD_MODE_SYSTEM_PROMPT,
+      system: systemPrompt,
       messages,
-      max_tokens: 4096,
+      max_tokens: deepDive ? 8192 : 4096,
       tools: AGENT_TOOLS,
       onToolCall: (name, input) => executeTool(name, input, orgId, userId, env),
     },

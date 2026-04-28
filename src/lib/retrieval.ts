@@ -13,6 +13,11 @@ import { callClaude } from './claude';
 import { checkClaudeRateLimit } from './rate-limit';
 import { getOrgSettings, getSharingFlags } from './helpers';
 import { RERANKER_SYSTEM_PROMPT } from '../prompts/reranker';
+import { getEntityIndex } from './entity-index';
+
+export interface RetrievalOptions {
+  deepDive?: boolean;
+}
 
 function isAggregationQuery(query: string): boolean {
   return /\b(how many|count|total|tally|all the|every|list all|summarize all|aggregate|across all|compile|gather all)\b/i.test(query);
@@ -37,25 +42,132 @@ function detectDocTypes(query: string): string[] {
 export async function preprocessQuery(
   query: string,
   session: AgentSession,
-  env: Env
+  env: Env,
+  options: RetrievalOptions = {}
 ): Promise<ProcessedQuery> {
+  const queryLower = query.toLowerCase();
   const entityIds: string[] = [];
+  const maxEntities = options.deepDive ? 20 : 5;
 
-  const contacts = await env.D1.prepare(
-    'SELECT id, full_name FROM contacts WHERE org_id = ? AND deleted_at IS NULL'
-  ).bind(session.org_id).all<{ id: string; full_name: string }>();
-  for (const c of contacts.results) {
-    if (query.toLowerCase().includes(c.full_name.toLowerCase())) {
-      entityIds.push(c.id);
+  if (options.deepDive) {
+    const [contacts, companies] = await Promise.all([
+      env.D1.prepare(
+        `SELECT id, full_name, email, job_title, bio_summary, topics_of_interest,
+                investment_focus, company_id
+         FROM contacts WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL`
+      ).bind(session.org_id).all<{
+        id: string; full_name: string; email: string | null; job_title: string | null;
+        bio_summary: string | null; topics_of_interest: string | null;
+        investment_focus: string | null; company_id: string | null;
+      }>(),
+      env.D1.prepare(
+        `SELECT id, name, domain, description, sector
+         FROM companies WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL`
+      ).bind(session.org_id).all<{
+        id: string; name: string; domain: string | null; description: string | null; sector: string | null;
+      }>(),
+    ]);
+
+    for (const c of contacts.results) {
+      const searchable = [c.full_name, c.email, c.job_title, c.bio_summary, c.topics_of_interest, c.investment_focus]
+        .filter(Boolean).join(' ').toLowerCase();
+      if (queryLower.includes(c.full_name.toLowerCase()) || searchable.includes(queryLower)) {
+        entityIds.push(c.id);
+      }
     }
-  }
+    for (const c of companies.results) {
+      const searchable = [c.name, c.domain, c.description, c.sector]
+        .filter(Boolean).join(' ').toLowerCase();
+      if (queryLower.includes(c.name.toLowerCase()) || searchable.includes(queryLower)) {
+        entityIds.push(c.id);
+      }
+    }
 
-  const companies = await env.D1.prepare(
-    'SELECT id, name FROM companies WHERE org_id = ? AND deleted_at IS NULL'
-  ).bind(session.org_id).all<{ id: string; name: string }>();
-  for (const c of companies.results) {
-    if (query.toLowerCase().includes(c.name.toLowerCase())) {
-      entityIds.push(c.id);
+    if (options.deepDive && entityIds.length > 0) {
+      const companyIds = new Set<string>();
+      const contactCompanyIds = new Set<string>();
+      for (const id of entityIds) {
+        const company = companies.results.find(c => c.id === id);
+        if (company) companyIds.add(company.id);
+        const contact = contacts.results.find(c => c.id === id);
+        if (contact?.company_id) contactCompanyIds.add(contact.company_id);
+      }
+      for (const cid of [...companyIds, ...contactCompanyIds]) {
+        for (const contact of contacts.results) {
+          if (contact.company_id === cid && !entityIds.includes(contact.id)) {
+            entityIds.push(contact.id);
+          }
+        }
+        if (!entityIds.includes(cid)) entityIds.push(cid);
+      }
+    }
+  } else {
+    try {
+      const index = await getEntityIndex(session.org_id, env);
+      type ScoredEntity = { id: string; score: number; interactions: number; recency: number };
+      const scored: ScoredEntity[] = [];
+
+      for (const c of index.contacts) {
+        let score = 0;
+        const nameLower = c.full_name.toLowerCase();
+        if (queryLower.includes(nameLower)) score += 1.0;
+        else if (nameLower.split(' ').some(part => part.length > 2 && queryLower.includes(part))) score += 0.4;
+        if (c.email && queryLower.includes(c.email.toLowerCase())) score += 0.8;
+        if (c.company_name && queryLower.includes(c.company_name.toLowerCase())) score += 0.3;
+        if (c.job_title && queryLower.includes(c.job_title.toLowerCase())) score += 0.2;
+        if (c.bio_keywords) {
+          const kws = c.bio_keywords.split(',');
+          const matched = kws.filter(kw => queryLower.includes(kw)).length;
+          if (matched > 0) score += 0.15 * matched;
+        }
+        if (score > 0) {
+          scored.push({
+            id: c.id,
+            score,
+            interactions: c.total_interactions || 0,
+            recency: c.last_contact_date ? new Date(c.last_contact_date).getTime() : 0,
+          });
+        }
+      }
+
+      for (const c of index.companies) {
+        let score = 0;
+        const nameLower = c.name.toLowerCase();
+        if (queryLower.includes(nameLower)) score += 1.0;
+        else if (nameLower.split(' ').some(part => part.length > 2 && queryLower.includes(part))) score += 0.4;
+        if (c.domain && queryLower.includes(c.domain.toLowerCase())) score += 0.5;
+        if (c.sector && queryLower.includes(c.sector.toLowerCase())) score += 0.2;
+        if (c.description_keywords) {
+          const kws = c.description_keywords.split(',');
+          const matched = kws.filter(kw => queryLower.includes(kw)).length;
+          if (matched > 0) score += 0.15 * matched;
+        }
+        if (score > 0) {
+          scored.push({ id: c.id, score, interactions: c.contact_count || 0, recency: 0 });
+        }
+      }
+
+      scored.sort((a, b) => {
+        if (Math.abs(a.score - b.score) > a.score * 0.1) return b.score - a.score;
+        if (a.recency !== b.recency) return b.recency - a.recency;
+        return b.interactions - a.interactions;
+      });
+
+      for (const s of scored.slice(0, maxEntities)) entityIds.push(s.id);
+    } catch (e) {
+      console.error('[retrieval] entity index failed, falling back to D1:', e);
+      const [contacts, companies] = await Promise.all([
+        env.D1.prepare('SELECT id, full_name FROM contacts WHERE org_id = ? AND deleted_at IS NULL')
+          .bind(session.org_id).all<{ id: string; full_name: string }>(),
+        env.D1.prepare('SELECT id, name FROM companies WHERE org_id = ? AND deleted_at IS NULL')
+          .bind(session.org_id).all<{ id: string; name: string }>(),
+      ]);
+      for (const c of contacts.results) {
+        if (queryLower.includes(c.full_name.toLowerCase())) entityIds.push(c.id);
+      }
+      for (const c of companies.results) {
+        if (queryLower.includes(c.name.toLowerCase())) entityIds.push(c.id);
+      }
     }
   }
 
@@ -71,13 +183,13 @@ export async function preprocessQuery(
   const postRetrievalFilter = (chunk: VectorMatch): boolean => {
     if (chunk.metadata.visibility === 'private') {
       if (userRole === 'owner') {
-        // pass — owner has full access
+        // pass
       } else if (chunk.metadata.participant_user_ids) {
         const participants = String(chunk.metadata.participant_user_ids).split(',');
         if (participants.includes(userId)) {
-          // pass — direct participant
+          // pass
         } else if (participants.some(pid => sharingSet.has(pid))) {
-          // pass — a participant has opted into org-wide sharing
+          // pass
         } else {
           return false;
         }
@@ -105,7 +217,7 @@ export async function preprocessQuery(
   return {
     originalQuery: query,
     embeddedQuery: values,
-    entityIds: [...new Set(entityIds)],
+    entityIds: [...new Set(entityIds)].slice(0, maxEntities),
     filters: {},
     orgId: session.org_id,
     postRetrievalFilter,
@@ -114,16 +226,17 @@ export async function preprocessQuery(
 
 export async function retrieveContext(
   pq: ProcessedQuery,
-  env: Env
-): Promise<{ internal: HydratedChunk[]; news: HydratedChunk[] }> {
+  env: Env,
+  options: RetrievalOptions = {}
+): Promise<{ internal: HydratedChunk[]; news: HydratedChunk[]; stats?: { emails: number; meetings: number; documents: number; contacts: number; companies: number } }> {
   const filter: any = {
     org_id: pq.orgId,
     document_type: { $nin: ['news'] },
   };
 
   const aggregation = isAggregationQuery(pq.originalQuery);
-  const broadTopK = aggregation ? 50 : 30;
-  const hydrateLimit = aggregation ? 30 : 20;
+  const broadTopK = options.deepDive ? 75 : (aggregation ? 50 : 30);
+  const hydrateLimit = options.deepDive ? 50 : (aggregation ? 30 : 20);
 
   let internalMatches: VectorMatch[];
 
@@ -198,6 +311,27 @@ export async function retrieveContext(
     }
   }
 
+  if (options.deepDive && pq.entityIds.length > 0) {
+    const seen = new Set(internalMatches.map(m => m.id));
+    const entityQueries = pq.entityIds.slice(0, 20).map(id =>
+      env.VECTORIZE.query(pq.embeddedQuery, {
+        topK: 10,
+        filter: { ...filter, primary_entity_id: id },
+        returnValues: false,
+        returnMetadata: 'all',
+      })
+    );
+    const entityResults = await Promise.all(entityQueries);
+    for (const r of entityResults) {
+      for (const m of (r.matches || []) as VectorMatch[]) {
+        if (!seen.has(m.id)) {
+          seen.add(m.id);
+          internalMatches.push(m);
+        }
+      }
+    }
+  }
+
   const filtered = internalMatches
     .filter(pq.postRetrievalFilter)
     .filter(m => m.score >= 0.55);
@@ -205,6 +339,7 @@ export async function retrieveContext(
   const { chunks: hydrated } = await hydrateChunks(filtered.slice(0, hydrateLimit), env);
   let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env);
 
+  const rerankedLimit = options.deepDive ? 20 : 10;
   if (pq.entityIds.length > 0) {
     const entitySet = new Set(pq.entityIds);
     const scoped = reranked.filter(c => {
@@ -216,7 +351,9 @@ export async function retrieveContext(
       );
     });
     const other = reranked.filter(c => !scoped.includes(c));
-    reranked = [...scoped, ...other].slice(0, 10);
+    reranked = [...scoped, ...other].slice(0, rerankedLimit);
+  } else {
+    reranked = reranked.slice(0, rerankedLimit);
   }
 
   const newsResult = await env.VECTORIZE.query(pq.embeddedQuery, {
@@ -229,6 +366,24 @@ export async function retrieveContext(
     .filter(m => m.score >= 0.55)
     .slice(0, 5);
   const { chunks: newsChunks } = await hydrateChunks(newsMatches, env);
+
+  if (options.deepDive) {
+    const allChunks = [...reranked, ...newsChunks];
+    const entitySet = new Set<string>();
+    let emails = 0, meetings = 0, documents = 0;
+    for (const c of allChunks) {
+      const dt = c.metadata.document_type as string;
+      if (dt === 'email') emails++;
+      else if (dt === 'transcript') meetings++;
+      else if (dt !== 'news') documents++;
+      if (c.metadata.primary_entity_id) entitySet.add(c.metadata.primary_entity_id as string);
+    }
+    return {
+      internal: reranked,
+      news: newsChunks,
+      stats: { emails, meetings, documents, contacts: entitySet.size, companies: 0 },
+    };
+  }
 
   return { internal: reranked, news: newsChunks };
 }

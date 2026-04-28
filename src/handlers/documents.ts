@@ -77,10 +77,26 @@ export async function listDocuments(
   if (companyId) { where.push('company_id = ?'); binds.push(companyId); }
   if (type) { where.push('document_type = ?'); binds.push(type); }
 
-  const result = await env.D1.prepare(
-    `SELECT * FROM documents WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 500`
-  ).bind(...binds).all();
-  return jsonResponse({ documents: result.results });
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const whereClause = where.join(' AND ');
+
+  const [result, countResult] = await Promise.all([
+    env.D1.prepare(
+      `SELECT * FROM documents WHERE ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as total FROM documents WHERE ${whereClause}`
+    ).bind(...binds).first<{ total: number }>(),
+  ]);
+
+  return jsonResponse({
+    documents: result.results,
+    total: countResult?.total || 0,
+    limit,
+    offset,
+    has_more: offset + limit < (countResult?.total || 0),
+  });
 }
 
 export async function uploadDocument(

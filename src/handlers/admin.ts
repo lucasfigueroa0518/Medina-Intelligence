@@ -8,6 +8,7 @@ import { emitAudit } from '../lib/audit';
 import { runHistoricalBackfill, getUserSyncConfig, setUserSyncConfig, type BackfillProgress } from '../integrations/outlook';
 import { runDailyCron } from '../lib/daily-cron';
 import { triggerCompanyEnrichment, isDomainShapedName } from '../lib/enrichment';
+import { rebuildEntityIndex } from '../lib/entity-index';
 
 export async function listDlq(
   request: Request,
@@ -600,5 +601,19 @@ export async function backfillUnembedded(
     skipped,
     failed,
     errors: errors.slice(0, 20),
+  });
+}
+
+export async function rebuildEntityIndexEndpoint(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const index = await rebuildEntityIndex(ctx.orgId, env);
+  return jsonResponse({
+    ok: true,
+    contacts: index.contacts.length,
+    companies: index.companies.length,
+    built_at: index.built_at,
+    size_bytes: JSON.stringify(index).length,
   });
 }

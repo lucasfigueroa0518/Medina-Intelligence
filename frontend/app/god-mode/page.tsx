@@ -8,7 +8,7 @@ import {
   X as XIcon, Pencil, Check, Copy, RefreshCw,
   Search, Database, Globe, FileText,
   CheckCircle2, AlertCircle, ChevronDown, ChevronRight,
-  BarChart3, Users, Newspaper, PenLine, List,
+  BarChart3, Users, Newspaper, PenLine, List, Radar,
 } from 'lucide-react';
 import { MartyEmblem } from '@/components/marty-emblem';
 
@@ -509,6 +509,7 @@ export default function GodModePage() {
   const [sidebarSearch, setSidebarSearch] = React.useState('');
   const [copiedMsgId, setCopiedMsgId] = React.useState<string | null>(null);
   const [placeholderText, setPlaceholderText] = React.useState('Ask MARTy anything...');
+  const [deepDive, setDeepDive] = React.useState(false);
 
   // Fix 4: Explicit isThinking state — only cleared on first text token
   const [isThinking, setIsThinking] = React.useState(false);
@@ -668,11 +669,13 @@ export default function GodModePage() {
     }
 
     const file = attachedFile;
+    const isDeepDive = deepDive;
     setAttachedFile(null);
+    setDeepDive(false);
 
     try {
       await streamAgentQuery(
-        queryText, activeSessionId, null, null, file,
+        queryText, activeSessionId, null, null, file, isDeepDive,
         token => {
           if (typeof token === 'string') {
             setIsThinking(false);
@@ -1033,6 +1036,20 @@ export default function GodModePage() {
                   onChange={e => setAttachedFile(e.target.files?.[0] || null)} />
               </label>
 
+              {/* Deep Dive toggle */}
+              <button
+                onClick={() => setDeepDive(d => !d)}
+                title={`Deep Dive — exhaustive search across all data (${navigator.platform?.includes('Mac') ? '⌘' : 'Ctrl'}⇧D)`}
+                className="w-9 h-9 flex items-center justify-center rounded-lg shrink-0 transition-all"
+                style={{
+                  color: deepDive ? '#A855F7' : 'rgba(255,255,255,0.4)',
+                  background: deepDive ? 'rgba(168,85,247,0.15)' : 'transparent',
+                  boxShadow: deepDive ? '0 0 12px rgba(168,85,247,0.3)' : 'none',
+                }}
+              >
+                <Radar size={18} />
+              </button>
+
               {/* Textarea — flex-1, auto-resizes */}
               <textarea
                 ref={inputRef}
@@ -1040,8 +1057,9 @@ export default function GodModePage() {
                 onChange={handleInputChange}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); }
+                  if (e.key === 'd' && (e.metaKey || e.ctrlKey) && e.shiftKey) { e.preventDefault(); setDeepDive(d => !d); }
                 }}
-                placeholder={placeholderText}
+                placeholder={deepDive ? 'Deep dive — searching everything...' : placeholderText}
                 onBlur={() => {
                   setTimeout(() => {
                     if (document.activeElement !== inputRef.current) {
