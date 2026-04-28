@@ -11,6 +11,11 @@ import { triggerCompanyEnrichment, isDomainShapedName } from '../lib/enrichment'
 import { rebuildEntityIndex } from '../lib/entity-index';
 import { processEmbedRetryQueue } from '../lib/daily-cron';
 import { parseParticipantUserIds } from '../lib/helpers';
+import {
+  createProgressiveBackfill as libCreateProgressiveBackfill,
+  getProgressiveStatus,
+  listProgressiveBackfills,
+} from '../lib/progressive-backfill';
 
 export async function listDlq(
   request: Request,
@@ -983,6 +988,72 @@ export async function processEmbedQueue(
     after: Object.fromEntries(after.results.map(r => [r.status, r.n])),
     drain: result,
   });
+}
+
+// Progressive backfill: split a long historical pull into N small windows
+// driven by cron, runs server-side without operator presence. Owner-only —
+// triggers Workers AI / Graph budget across many cron ticks.
+
+export async function createProgressiveBackfillHandler(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can start a progressive backfill.');
+  }
+  const body = await parseJsonBody<{
+    user_id?: string;
+    total_days?: number;
+    window_size_days?: number;
+  }>(request);
+  if (!body?.user_id) {
+    return errorResponse('VALIDATION_ERROR', 400, 'user_id required');
+  }
+  const totalDays = body.total_days ?? 180;
+  const windowSize = body.window_size_days ?? 10;
+  if (totalDays < 1 || totalDays > 730) {
+    return errorResponse('VALIDATION_ERROR', 400, 'total_days must be 1-730');
+  }
+  if (windowSize < 1 || windowSize > totalDays) {
+    return errorResponse('VALIDATION_ERROR', 400, 'window_size_days must be 1..total_days');
+  }
+  const userExists = await env.D1.prepare(
+    'SELECT id FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(body.user_id, ctx.orgId).first();
+  if (!userExists) return errorResponse('USER_NOT_FOUND', 404, 'User not in your org');
+
+  const result = await libCreateProgressiveBackfill(
+    ctx.orgId,
+    body.user_id,
+    totalDays,
+    windowSize,
+    env
+  );
+  if (!result.created) {
+    return errorResponse('PROGRESSIVE_BACKFILL_BLOCKED', 409, result.reason || 'cannot create');
+  }
+  return jsonResponse({
+    ok: true,
+    parent_id: result.parent_id,
+    total_days: totalDays,
+    window_size_days: windowSize,
+  });
+}
+
+export async function getProgressiveBackfillHandler(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const url = new URL(request.url);
+  const userId = url.searchParams.get('user_id');
+  if (!userId) {
+    const all = await listProgressiveBackfills(ctx.orgId, env);
+    return jsonResponse({ ok: true, jobs: all });
+  }
+  const status = await getProgressiveStatus(ctx.orgId, userId, env);
+  return jsonResponse({ ok: true, ...status });
 }
 
 // GET — for System Status to show pending / failed counts without a drain.

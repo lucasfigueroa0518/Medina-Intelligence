@@ -529,6 +529,10 @@ async function routeAuthenticated(
       return Admin.getEmbedQueueHealth(ctx, env);
     if (path === '/api/admin/process-embed-queue' && method === 'POST')
       return Admin.processEmbedQueue(ctx, env);
+    if (path === '/api/admin/progressive-backfill' && method === 'POST')
+      return Admin.createProgressiveBackfillHandler(request, ctx, env);
+    if (path === '/api/admin/progressive-backfill' && method === 'GET')
+      return Admin.getProgressiveBackfillHandler(request, ctx, env);
     m = path.match(/^\/api\/admin\/users\/([^/]+)\/reset-password$/);
     if (m && method === 'POST')
       return AuthLogin.adminResetPassword(m[1], request, ctx, env);
@@ -622,6 +626,17 @@ async function handleScheduled(
       } else if (cron === '0 0 * * *') {
         // Daily cron — runs inline as a standard Worker
         ctxExec.waitUntil(runDailyCron(org.id, env));
+      } else if (cron === '*/2 * * * *') {
+        // Progressive backfill driver — advances each active parent's
+        // current window by one paginated batch. Multiple users (Tony,
+        // Alvaro, ...) advance in parallel because they have different
+        // backfill_progress KV keys. Survives Worker CPU limits since each
+        // tick processes ~25s of work per user, no longer.
+        ctxExec.waitUntil((async () => {
+          const { driveAllActiveProgressive } = await import('./lib/progressive-backfill');
+          try { await driveAllActiveProgressive(org.id, env); }
+          catch (e) { console.error(`progressive backfill drive failed for ${org.id}:`, e); }
+        })());
       }
     } catch (e) {
       console.error(`Cron dispatch failed for org ${org.id}:`, e);
