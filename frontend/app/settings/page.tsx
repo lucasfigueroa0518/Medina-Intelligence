@@ -885,6 +885,8 @@ function ProfileSection() {
   const [uploading, setUploading] = React.useState(false);
   const [toast, setToast] = React.useState<{ tone: 'success' | 'error'; msg: string } | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const [sharingConfirmOpen, setSharingConfirmOpen] = React.useState(false);
+  const [togglingSharing, setTogglingSharing] = React.useState(false);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -1033,7 +1035,7 @@ function ProfileSection() {
         <div className="flex-1 min-w-0">
           <div className="text-base font-medium text-text-primary truncate">{user.full_name}</div>
           <div className="text-xs text-text-muted">{user.email}</div>
-          <div className="text-[10px] text-text-muted uppercase tracking-wider mt-1">{user.role}</div>
+          <div className="text-[10px] text-text-muted uppercase tracking-wider mt-1">{user.role === 'super_admin' ? 'Super Admin' : user.role}</div>
         </div>
       </div>
 
@@ -1073,6 +1075,60 @@ function ProfileSection() {
         </button>
       </div>
 
+      {/* Email Visibility Toggle */}
+      <div className="mt-8 pt-6 border-t border-border">
+        <div className="flex items-center gap-2 mb-3">
+          <Mail size={16} className="text-accent-magenta" />
+          <div className="font-medium text-sm">Email Visibility</div>
+        </div>
+        <div className="flex items-center justify-between rounded-xl p-4" style={{ background: 'rgba(17,17,20,0.5)', border: '1px solid rgba(255,255,255,0.05)' }}>
+          <div className="flex-1 min-w-0 mr-4">
+            <div className="text-sm text-text-primary font-medium">Share my emails with the team</div>
+            <div className="text-xs text-text-muted mt-1">
+              When enabled, all emails you&apos;re part of become visible to everyone in the organization.
+              Other team members will be able to see the full content of emails you sent or received.
+              This does not affect emails where you are not a participant.
+            </div>
+          </div>
+          <button
+            onClick={() => {
+              if (user.share_emails_org_wide) {
+                handleToggleSharing(false);
+              } else {
+                setSharingConfirmOpen(true);
+              }
+            }}
+            disabled={togglingSharing}
+            className="relative w-11 h-6 rounded-full shrink-0 transition-colors"
+            style={{ background: user.share_emails_org_wide ? '#22C55E' : 'rgba(255,255,255,0.1)' }}
+          >
+            <div className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform"
+              style={{ transform: user.share_emails_org_wide ? 'translateX(20px)' : 'translateX(0)' }} />
+          </button>
+        </div>
+      </div>
+
+      {/* Sharing confirmation modal */}
+      {sharingConfirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+          onClick={() => !togglingSharing && setSharingConfirmOpen(false)}>
+          <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+            onClick={e => e.stopPropagation()}>
+            <div className="text-lg font-medium text-text-primary mb-2">Share email content?</div>
+            <div className="text-sm text-text-secondary mb-6">
+              This will make all your email content visible to the entire team. Everyone in the organization will be able to read emails you sent or received. You can turn this off at any time.
+            </div>
+            <div className="flex justify-end gap-3">
+              <button className="btn-ghost" onClick={() => setSharingConfirmOpen(false)} disabled={togglingSharing}>Cancel</button>
+              <button className="btn-primary" onClick={() => handleToggleSharing(true)} disabled={togglingSharing}>
+                {togglingSharing ? 'Enabling...' : 'Enable Sharing'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {toast && (
         <div className="fixed bottom-6 right-6 z-[60] rounded-xl shadow-2xl px-5 py-3"
           style={{
@@ -1085,6 +1141,19 @@ function ProfileSection() {
       )}
     </div>
   );
+
+  async function handleToggleSharing(enable: boolean) {
+    setTogglingSharing(true);
+    try {
+      const { user: updated } = await api.updateMyProfile({ share_emails_org_wide: enable } as any);
+      setUser(updated);
+      setSharingConfirmOpen(false);
+      setToast({ tone: 'success', msg: enable ? 'Email sharing enabled' : 'Email sharing disabled' });
+    } catch (e: any) {
+      setToast({ tone: 'error', msg: e?.message || 'Failed to update sharing preference' });
+    }
+    setTogglingSharing(false);
+  }
 }
 
 function ProfileField({ label, required, helper, children }: { label: string; required?: boolean; helper?: string; children: React.ReactNode }) {

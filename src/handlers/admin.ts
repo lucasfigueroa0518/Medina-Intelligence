@@ -332,7 +332,7 @@ export async function getIntegrationStatus(
   env: Env
 ): Promise<Response> {
   const users = await env.D1.prepare(
-    `SELECT id, email, full_name, outlook_token IS NOT NULL as has_outlook, slack_token IS NOT NULL as has_slack
+    `SELECT id, email, full_name, role, share_emails_org_wide, outlook_token IS NOT NULL as has_outlook, slack_token IS NOT NULL as has_slack
      FROM users WHERE org_id = ? AND deleted_at IS NULL`
   ).bind(ctx.orgId).all();
 

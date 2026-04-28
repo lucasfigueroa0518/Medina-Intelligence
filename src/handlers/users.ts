@@ -8,7 +8,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 
 const PROFILE_FIELDS = ['full_name', 'phone', 'job_title', 'linkedin_url', 'bio', 'avatar_url'] as const;
-type ProfileField = typeof PROFILE_FIELDS[number];
+type ProfileField = typeof PROFILE_FIELDS[number] | 'share_emails_org_wide';
 
 interface ProfileUpdateBody {
   full_name?: string;
@@ -17,6 +17,7 @@ interface ProfileUpdateBody {
   linkedin_url?: string | null;
   bio?: string | null;
   avatar_url?: string | null;
+  share_emails_org_wide?: boolean;
 }
 
 /**
@@ -38,8 +39,7 @@ export async function updateMyProfile(
     }
   }
 
-  // Only allow whitelisted fields; silently drop anything else (incl. email/role/org_id).
-  const updates: Array<{ col: ProfileField; value: string | null }> = [];
+  const updates: Array<{ col: ProfileField; value: string | number | null }> = [];
   for (const field of PROFILE_FIELDS) {
     if (!(field in body)) continue;
     const raw = (body as any)[field];
@@ -47,9 +47,12 @@ export async function updateMyProfile(
       updates.push({ col: field, value: null });
     } else if (typeof raw === 'string') {
       const trimmed = raw.trim();
-      // Treat empty string as null for nullable fields, but full_name must be non-empty (checked above).
       updates.push({ col: field, value: field === 'full_name' ? trimmed : (trimmed.length === 0 ? null : trimmed) });
     }
+  }
+
+  if ('share_emails_org_wide' in body && typeof body.share_emails_org_wide === 'boolean') {
+    updates.push({ col: 'share_emails_org_wide', value: body.share_emails_org_wide ? 1 : 0 });
   }
 
   if (updates.length === 0) {
@@ -57,7 +60,7 @@ export async function updateMyProfile(
   }
 
   const setClause = updates.map(u => `${u.col} = ?`).join(', ');
-  const binds = updates.map(u => u.value);
+  const binds: (string | number | null)[] = updates.map(u => u.value);
   binds.push(ctx.userId);
 
   await env.D1.prepare(
@@ -65,7 +68,7 @@ export async function updateMyProfile(
   ).bind(...binds).run();
 
   const user = await env.D1.prepare(
-    `SELECT id, email, full_name, role, org_id, avatar_url, phone, job_title, linkedin_url, bio, last_login_at
+    `SELECT id, email, full_name, role, org_id, avatar_url, phone, job_title, linkedin_url, bio, last_login_at, share_emails_org_wide
      FROM users WHERE id = ?`
   ).bind(ctx.userId).first();
 

@@ -382,6 +382,7 @@ export interface UserProfile {
   linkedin_url: string | null;
   bio: string | null;
   last_login_at: string | null;
+  share_emails_org_wide: number | null;
 }
 
 // Resolve avatar_url for display. The backend stores R2-backed avatars as `r2:<key>`

@@ -4,7 +4,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
-import { canReadEmailContent } from '../lib/helpers';
+import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 
 // ---------------------------------------------------------------------------
 // GET /api/deals
@@ -442,7 +442,7 @@ export async function getDealTimeline(
   ).bind(id, ctx.orgId).first();
   if (!deal) return errorResponse('DEAL_NOT_FOUND', 404);
 
-  const [conversations, events, notes, auditEntries] = await Promise.all([
+  const [conversations, events, notes, auditEntries, sharingFlags] = await Promise.all([
     // Conversations involving deal contacts
     env.D1.prepare(
       `SELECT DISTINCT conv.id, conv.subject AS title, conv.sent_at AS timestamp,
@@ -492,6 +492,8 @@ export async function getDealTimeline(
        ORDER BY al.created_at DESC
        LIMIT ?`
     ).bind(id, ctx.orgId, limit).all(),
+
+    getSharingFlags(ctx.orgId, env),
   ]);
 
   const parsedAudit = (auditEntries.results as any[]).map(row => {
@@ -533,7 +535,8 @@ export async function getDealTimeline(
         is_campaign_email: c.is_campaign_email,
       } as any,
       ctx.userId,
-      ctx.userRole
+      ctx.userRole,
+      sharingFlags
     );
     return {
       ...c,

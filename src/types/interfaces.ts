@@ -368,6 +368,6 @@ export interface MergeResult {
 export interface AuthContext {
   userId: string;
   orgId: string;
-  userRole: 'owner' | 'admin' | 'member';
+  userRole: 'super_admin' | 'owner' | 'admin' | 'member';
   email: string;
 }

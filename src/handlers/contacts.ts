@@ -5,7 +5,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { mergeContacts, resolveMergedContact, cleanupVectorsForEntity } from '../lib/merge';
-import { canReadEmailContent } from '../lib/helpers';
+import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 
@@ -589,7 +589,7 @@ export async function getContactTimeline(
   const url = new URL(request.url);
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
 
-  const [events, conversations, tasks, documents] = await Promise.all([
+  const [events, conversations, tasks, documents, sharingFlags] = await Promise.all([
     env.D1.prepare(
       `SELECT e.id, e.title, e.start_time as timestamp, 'event' as type, e.event_type as subtype
        FROM events e JOIN event_attendees ea ON e.id = ea.event_id
@@ -615,6 +615,7 @@ export async function getContactTimeline(
        FROM documents WHERE contact_id = ? AND org_id = ? AND deleted_at IS NULL
        ORDER BY created_at DESC LIMIT ?`
     ).bind(id, ctx.orgId, limit).all(),
+    getSharingFlags(ctx.orgId, env),
   ]);
 
   const conversationIds = conversations.results
@@ -643,7 +644,8 @@ export async function getContactTimeline(
         is_campaign_email: c.is_campaign_email,
       } as any,
       ctx.userId,
-      ctx.userRole
+      ctx.userRole,
+      sharingFlags
     );
     return {
       ...c,

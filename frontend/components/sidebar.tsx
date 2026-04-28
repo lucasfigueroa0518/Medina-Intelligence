@@ -76,7 +76,7 @@ export function Sidebar() {
       .then(res => {
         if (cancelled) return;
         setMe(res.user);
-        setIsAdmin(res.user.role === 'owner' || res.user.role === 'admin');
+        setIsAdmin(res.user.role === 'super_admin' || res.user.role === 'owner' || res.user.role === 'admin');
       })
       .catch(() => { /* unauthenticated — leave defaults */ });
     return () => { cancelled = true; };
@@ -84,7 +84,7 @@ export function Sidebar() {
 
   const initial = me?.full_name?.trim()?.charAt(0)?.toUpperCase() || me?.email?.charAt(0)?.toUpperCase() || '?';
   const displayName = me?.full_name?.trim() || me?.email || 'Loading…';
-  const roleLabel = me?.role || '';
+  const roleLabel = me?.role === 'super_admin' ? 'Super Admin' : me?.role || '';
 
   return (
     <aside className="w-[240px] bg-bg-inset border-r border-border flex-shrink-0 flex flex-col">

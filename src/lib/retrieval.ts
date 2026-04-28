@@ -11,7 +11,7 @@ import { runEmbedding } from './embedding';
 import { estimateTokens, truncateToTokens } from './tokens';
 import { callClaude } from './claude';
 import { checkClaudeRateLimit } from './rate-limit';
-import { getOrgSettings } from './helpers';
+import { getOrgSettings, getSharingFlags } from './helpers';
 import { RERANKER_SYSTEM_PROMPT } from '../prompts/reranker';
 
 function isAggregationQuery(query: string): boolean {
@@ -59,16 +59,28 @@ export async function preprocessQuery(
     }
   }
 
-  const values = await runEmbedding(env, query);
+  const [values, sharingFlags] = await Promise.all([
+    runEmbedding(env, query),
+    getSharingFlags(session.org_id, env),
+  ]);
 
   const userId = session.user_id;
   const userRole = session.user_role || 'member';
+  const sharingSet = new Set(Object.keys(sharingFlags));
 
   const postRetrievalFilter = (chunk: VectorMatch): boolean => {
     if (chunk.metadata.visibility === 'private') {
-      if (chunk.metadata.participant_user_ids) {
+      if (userRole === 'super_admin') {
+        // pass — super admin has full access
+      } else if (chunk.metadata.participant_user_ids) {
         const participants = String(chunk.metadata.participant_user_ids).split(',');
-        if (!participants.includes(userId)) return false;
+        if (participants.includes(userId)) {
+          // pass — direct participant
+        } else if (participants.some(pid => sharingSet.has(pid))) {
+          // pass — a participant has opted into org-wide sharing
+        } else {
+          return false;
+        }
       } else if (
         chunk.metadata.user_id &&
         chunk.metadata.user_id !== userId
@@ -79,6 +91,7 @@ export async function preprocessQuery(
 
     if (
       chunk.metadata.visibility === 'confidential' &&
+      userRole !== 'super_admin' &&
       userRole !== 'owner' &&
       userRole !== 'admin'
     ) {

@@ -326,6 +326,8 @@ function SyncTab() {
               <tr className="text-left text-xs text-text-muted border-b border-border">
                 <th className="pb-2">Name</th>
                 <th className="pb-2">Email</th>
+                <th className="pb-2">Role</th>
+                <th className="pb-2">Sharing</th>
                 <th className="pb-2">Outlook</th>
                 <th className="pb-2">Failures</th>
               </tr>
@@ -343,6 +345,18 @@ function SyncTab() {
                   <tr key={u.id} className={`border-b border-border/30 ${rowColor}`}>
                     <td className="py-2 text-text-primary">{u.full_name || '—'}</td>
                     <td className="py-2 text-text-secondary">{u.email}</td>
+                    <td className="py-2">
+                      <span className={`text-xs font-medium ${u.role === 'super_admin' ? 'text-accent-magenta' : 'text-text-muted'}`}>
+                        {u.role === 'super_admin' ? 'Super Admin' : u.role}
+                      </span>
+                    </td>
+                    <td className="py-2">
+                      {u.share_emails_org_wide ? (
+                        <span className="text-semantic-success text-xs">Shared</span>
+                      ) : (
+                        <span className="text-text-muted text-xs">Private</span>
+                      )}
+                    </td>
                     <td className="py-2">
                       {!u.has_outlook ? (
                         <span className="text-text-muted">Not connected</span>

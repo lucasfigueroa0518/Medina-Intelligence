@@ -4,7 +4,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
-import { canReadEmailContent } from '../lib/helpers';
+import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { commitProgressiveApproval, markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { triggerContactEnrichment } from '../lib/enrichment';
 
@@ -24,11 +24,13 @@ export async function listApprovalQueue(
     binds.push(entityType);
   }
 
-  const rows = await env.D1.prepare(
-    `SELECT * FROM approval_queue WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 200`
-  ).bind(...binds).all();
+  const [rows, sharingFlags] = await Promise.all([
+    env.D1.prepare(
+      `SELECT * FROM approval_queue WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 200`
+    ).bind(...binds).all(),
+    getSharingFlags(ctx.orgId, env),
+  ]);
 
-  // Parse JSON wrappers + email privacy gating
   const entries = await Promise.all(
     rows.results.map(async (row: any) => {
       let proposedDisplay = row.proposed_value;
@@ -57,7 +59,7 @@ export async function listApprovalQueue(
         ).bind(row.source_communication_id).first<any>();
 
         const canRead = conv
-          ? canReadEmailContent(conv, ctx.userId, ctx.userRole)
+          ? canReadEmailContent(conv, ctx.userId, ctx.userRole, sharingFlags)
           : false;
 
         if (!canRead) {

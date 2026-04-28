@@ -123,15 +123,28 @@ export async function getDecryptedSlackBotToken(orgId: string, env: Env): Promis
 export function canReadEmailContent(
   conversation: Pick<Conversation, 'source' | 'participant_user_ids' | 'is_campaign_email'>,
   requestingUserId: string,
-  _userRole: string
+  userRole: string,
+  participantSharingFlags?: Record<string, boolean>
 ): boolean {
   if (conversation.source === 'slack') return true;
   if ((conversation as any).is_campaign_email) return true;
+  if (userRole === 'super_admin') return true;
 
   try {
     const participants: string[] = JSON.parse(conversation.participant_user_ids || '[]');
-    return participants.includes(requestingUserId);
+    if (participants.includes(requestingUserId)) return true;
+    if (participantSharingFlags && participants.some(pid => participantSharingFlags[pid])) return true;
+    return false;
   } catch {
     return false;
   }
+}
+
+export async function getSharingFlags(orgId: string, env: Env): Promise<Record<string, boolean>> {
+  const rows = await env.D1.prepare(
+    'SELECT id FROM users WHERE org_id = ? AND share_emails_org_wide = 1 AND deleted_at IS NULL'
+  ).bind(orgId).all<{ id: string }>();
+  const flags: Record<string, boolean> = {};
+  for (const r of rows.results) flags[r.id] = true;
+  return flags;
 }

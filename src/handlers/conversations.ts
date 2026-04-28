@@ -2,7 +2,7 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
-import { canReadEmailContent } from '../lib/helpers';
+import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 
 export async function listConversations(
   request: Request,
@@ -37,11 +37,13 @@ export async function listConversations(
     binds.push(source);
   }
 
-  const result = await env.D1.prepare(
-    `SELECT c.* FROM conversations c ${join} WHERE ${where.join(' AND ')} ORDER BY c.sent_at DESC LIMIT 200`
-  ).bind(...binds).all();
+  const [result, sharingFlags] = await Promise.all([
+    env.D1.prepare(
+      `SELECT c.* FROM conversations c ${join} WHERE ${where.join(' AND ')} ORDER BY c.sent_at DESC LIMIT 200`
+    ).bind(...binds).all(),
+    getSharingFlags(ctx.orgId, env),
+  ]);
 
-  // Strip content for non-participants
   const conversations = result.results.map((c: any) => {
     const canRead = canReadEmailContent(
       {
@@ -50,7 +52,8 @@ export async function listConversations(
         is_campaign_email: c.is_campaign_email,
       } as any,
       ctx.userId,
-      ctx.userRole
+      ctx.userRole,
+      sharingFlags
     );
     return {
       ...c,
@@ -70,13 +73,16 @@ export async function getConversation(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const conv = await env.D1.prepare(
-    'SELECT * FROM conversations WHERE id = ? AND org_id = ?'
-  ).bind(id, ctx.orgId).first<any>();
+  const [conv, sharingFlags] = await Promise.all([
+    env.D1.prepare(
+      'SELECT * FROM conversations WHERE id = ? AND org_id = ?'
+    ).bind(id, ctx.orgId).first<any>(),
+    getSharingFlags(ctx.orgId, env),
+  ]);
 
   if (!conv) return errorResponse('CONVERSATION_NOT_FOUND', 404);
 
-  const canRead = canReadEmailContent(conv, ctx.userId, ctx.userRole);
+  const canRead = canReadEmailContent(conv, ctx.userId, ctx.userRole, sharingFlags);
 
   const out: any = {
     ...conv,
