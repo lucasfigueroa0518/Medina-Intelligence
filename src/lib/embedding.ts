@@ -32,19 +32,43 @@ async function withInFlightCap<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// Per-request timeout on env.AI.run. The binding API doesn't accept
+// AbortSignal directly, so we race it against a setTimeout. Without this,
+// a hung BGE call could pin one of the MAX_IN_FLIGHT_PER_ISOLATE = 4
+// semaphore slots indefinitely (residual risk #12 from the v2 simulation).
+// 20s is generous — typical p99 BGE latency is well under 2s.
+const BGE_REQUEST_TIMEOUT_MS = 20_000;
+
+async function bgeWithTimeout(env: Env, text: string): Promise<number[]> {
+  const aiPromise = env.AI.run('@cf/baai/bge-base-en-v1.5', {
+    text: [text],
+    pooling: 'cls',
+  } as any).then((result: any) =>
+    Array.isArray(result.data) ? result.data[0] : result.data
+  );
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(
+      () => reject(new Error('BGE_TIMEOUT')),
+      BGE_REQUEST_TIMEOUT_MS
+    );
+  });
+
+  try {
+    return await Promise.race([aiPromise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
 export async function runEmbedding(env: Env, text: string, orgId: string): Promise<number[]> {
   await acquireEmbedSlot(orgId, env);
   return withInFlightCap(async () => {
     let lastErr: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const result = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-          text: [text],
-          pooling: 'cls',
-        } as any);
-        return Array.isArray((result as any).data)
-          ? (result as any).data[0]
-          : (result as any).data;
+        return await bgeWithTimeout(env, text);
       } catch (e) {
         lastErr = e;
         if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
