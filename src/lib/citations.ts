@@ -1,0 +1,402 @@
+// MARTy citations — turn hydrated retrieval chunks into a numbered source list
+// that Claude can reference inline as [^N], plus a CitationSource[] payload the
+// frontend can render as pills. The same shape is persisted alongside the
+// assistant message so reloads keep their citations.
+import type { Env } from '../types/env';
+import type { HydratedChunk } from '../types/interfaces';
+import { estimateTokens, truncateToTokens } from './tokens';
+
+export type CitationSourceType =
+  | 'email'
+  | 'meeting'
+  | 'document'
+  | 'contact'
+  | 'company'
+  | 'slack'
+  | 'news';
+
+export interface CitationSource {
+  id: number;
+  type: CitationSourceType;
+  source_table: string;
+  source_id: string;
+  entity_id?: string;
+  title: string;
+  subtitle?: string;
+  date?: string;
+  url_path: string;
+  external_url?: string;
+}
+
+interface ChunkRef {
+  chunk: HydratedChunk;
+  sourceKey: string;
+}
+
+const CONTEXT_TOKEN_BUDGET = 60000;
+const NEWS_TOKEN_BUDGET = 2000;
+const UPLOAD_TOKEN_BUDGET = 20000;
+const PER_CHUNK_MAX = 2000;
+
+function sourceKeyFor(chunk: HydratedChunk): string {
+  const table = String(chunk.metadata.source_table || 'unknown');
+  const id = String(chunk.metadata.source_id || chunk.id);
+  return `${table}::${id}`;
+}
+
+function classifyType(chunk: HydratedChunk): CitationSourceType {
+  const docType = String(chunk.metadata.document_type || '');
+  const sourceTable = String(chunk.metadata.source_table || '');
+  if (docType === 'news' || sourceTable === 'news_articles') return 'news';
+  if (docType === 'transcript' || sourceTable === 'events') return 'meeting';
+  if (docType === 'email') return 'email';
+  if (docType === 'conversation') return 'slack';
+  if (sourceTable === 'documents') return 'document';
+  return 'document';
+}
+
+function placeholderSource(id: number, chunk: HydratedChunk): CitationSource {
+  const type = classifyType(chunk);
+  const fallbackTitle =
+    (chunk.metadata.entity_name as string | undefined) ||
+    (chunk.metadata.text_preview as string | undefined)?.slice(0, 60) ||
+    `Source ${id}`;
+  return {
+    id,
+    type,
+    source_table: String(chunk.metadata.source_table || 'unknown'),
+    source_id: String(chunk.metadata.source_id || chunk.id),
+    entity_id: chunk.metadata.primary_entity_id as string | undefined,
+    title: fallbackTitle,
+    date: chunk.metadata.created_at as string | undefined,
+    url_path: '/',
+  };
+}
+
+function fmtDate(iso?: string): string | undefined {
+  if (!iso) return undefined;
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  } catch {
+    return iso;
+  }
+}
+
+async function hydrateSources(
+  refs: { id: number; chunk: HydratedChunk }[],
+  orgId: string,
+  env: Env
+): Promise<CitationSource[]> {
+  // Bucket by table for batched lookups.
+  const byTable = new Map<string, { id: number; chunk: HydratedChunk; sourceId: string }[]>();
+  for (const r of refs) {
+    const table = String(r.chunk.metadata.source_table || 'unknown');
+    const sourceId = String(r.chunk.metadata.source_id || r.chunk.id);
+    const arr = byTable.get(table) || [];
+    arr.push({ id: r.id, chunk: r.chunk, sourceId });
+    byTable.set(table, arr);
+  }
+
+  // Initialize with placeholders so any failed lookup still produces a usable
+  // source row.
+  const out: Map<number, CitationSource> = new Map();
+  for (const r of refs) out.set(r.id, placeholderSource(r.id, r.chunk));
+
+  const lookups: Promise<void>[] = [];
+
+  // Conversations (emails + slack messages share this table).
+  const convRows = byTable.get('conversations');
+  if (convRows && convRows.length > 0) {
+    const ids = convRows.map(r => r.sourceId);
+    const placeholders = ids.map(() => '?').join(',');
+    lookups.push(
+      env.D1.prepare(
+        `SELECT id, source, subject, from_email, from_contact_id, sent_at, body_preview
+         FROM conversations WHERE org_id = ? AND id IN (${placeholders})`
+      )
+        .bind(orgId, ...ids)
+        .all<{
+          id: string;
+          source: string;
+          subject: string | null;
+          from_email: string | null;
+          from_contact_id: string | null;
+          sent_at: string | null;
+          body_preview: string | null;
+        }>()
+        .then(async res => {
+          const fromContactIds = Array.from(
+            new Set(res.results.map(r => r.from_contact_id).filter(Boolean) as string[])
+          );
+          const contactNames = new Map<string, string>();
+          if (fromContactIds.length > 0) {
+            const cph = fromContactIds.map(() => '?').join(',');
+            const c = await env.D1.prepare(
+              `SELECT id, full_name FROM contacts WHERE org_id = ? AND id IN (${cph})`
+            )
+              .bind(orgId, ...fromContactIds)
+              .all<{ id: string; full_name: string }>();
+            for (const row of c.results) contactNames.set(row.id, row.full_name);
+          }
+
+          const byId = new Map(res.results.map(r => [r.id, r]));
+          for (const ref of convRows) {
+            const row = byId.get(ref.sourceId);
+            if (!row) continue;
+            const isSlack = row.source === 'slack';
+            const senderName =
+              (row.from_contact_id && contactNames.get(row.from_contact_id)) ||
+              row.from_email ||
+              'Unknown sender';
+            const title =
+              (row.subject && row.subject.trim()) ||
+              (isSlack
+                ? (row.body_preview?.slice(0, 60) || 'Slack message')
+                : `Email from ${senderName}`);
+            const subtitle = isSlack
+              ? `Slack — ${senderName}`
+              : `${senderName}`;
+            out.set(ref.id, {
+              id: ref.id,
+              type: isSlack ? 'slack' : 'email',
+              source_table: 'conversations',
+              source_id: row.id,
+              entity_id: ref.chunk.metadata.primary_entity_id as string | undefined,
+              title,
+              subtitle,
+              date: row.sent_at || undefined,
+              url_path: `/conversations/${row.id}`,
+            });
+          }
+        })
+        .catch(e => console.error('[citations] conversations lookup failed:', e))
+    );
+  }
+
+  const eventRows = byTable.get('events');
+  if (eventRows && eventRows.length > 0) {
+    const ids = eventRows.map(r => r.sourceId);
+    const ph = ids.map(() => '?').join(',');
+    lookups.push(
+      env.D1.prepare(
+        `SELECT id, title, event_type, start_time FROM events
+         WHERE org_id = ? AND id IN (${ph})`
+      )
+        .bind(orgId, ...ids)
+        .all<{ id: string; title: string; event_type: string; start_time: string }>()
+        .then(res => {
+          const byId = new Map(res.results.map(r => [r.id, r]));
+          for (const ref of eventRows) {
+            const row = byId.get(ref.sourceId);
+            if (!row) continue;
+            out.set(ref.id, {
+              id: ref.id,
+              type: 'meeting',
+              source_table: 'events',
+              source_id: row.id,
+              entity_id: ref.chunk.metadata.primary_entity_id as string | undefined,
+              title: row.title,
+              subtitle: row.event_type === 'meeting' ? 'Meeting' : row.event_type,
+              date: row.start_time,
+              url_path: `/events/${row.id}`,
+            });
+          }
+        })
+        .catch(e => console.error('[citations] events lookup failed:', e))
+    );
+  }
+
+  const docRows = byTable.get('documents');
+  if (docRows && docRows.length > 0) {
+    const ids = docRows.map(r => r.sourceId);
+    const ph = ids.map(() => '?').join(',');
+    lookups.push(
+      env.D1.prepare(
+        `SELECT id, title, document_type, file_name, contact_id, company_id, deal_id, created_at
+         FROM documents WHERE org_id = ? AND id IN (${ph})`
+      )
+        .bind(orgId, ...ids)
+        .all<{
+          id: string;
+          title: string;
+          document_type: string;
+          file_name: string | null;
+          contact_id: string | null;
+          company_id: string | null;
+          deal_id: string | null;
+          created_at: string;
+        }>()
+        .then(res => {
+          const byId = new Map(res.results.map(r => [r.id, r]));
+          for (const ref of docRows) {
+            const row = byId.get(ref.sourceId);
+            if (!row) continue;
+            out.set(ref.id, {
+              id: ref.id,
+              type: 'document',
+              source_table: 'documents',
+              source_id: row.id,
+              entity_id: row.deal_id || row.company_id || row.contact_id || undefined,
+              title: row.title || row.file_name || 'Document',
+              subtitle: row.document_type.replace(/_/g, ' '),
+              date: row.created_at,
+              url_path: `/documents/${row.id}`,
+            });
+          }
+        })
+        .catch(e => console.error('[citations] documents lookup failed:', e))
+    );
+  }
+
+  const newsRows = byTable.get('news_articles');
+  if (newsRows && newsRows.length > 0) {
+    const ids = newsRows.map(r => r.sourceId);
+    const ph = ids.map(() => '?').join(',');
+    lookups.push(
+      env.D1.prepare(
+        `SELECT id, title, source_name, source_url, published_at, company_id
+         FROM news_articles WHERE org_id = ? AND id IN (${ph})`
+      )
+        .bind(orgId, ...ids)
+        .all<{
+          id: string;
+          title: string;
+          source_name: string | null;
+          source_url: string | null;
+          published_at: string | null;
+          company_id: string | null;
+        }>()
+        .then(res => {
+          const byId = new Map(res.results.map(r => [r.id, r]));
+          for (const ref of newsRows) {
+            const row = byId.get(ref.sourceId);
+            if (!row) continue;
+            out.set(ref.id, {
+              id: ref.id,
+              type: 'news',
+              source_table: 'news_articles',
+              source_id: row.id,
+              entity_id: row.company_id || undefined,
+              title: row.title,
+              subtitle: row.source_name || 'News',
+              date: row.published_at || undefined,
+              url_path: row.company_id ? `/companies/${row.company_id}` : '/',
+              external_url: row.source_url || undefined,
+            });
+          }
+        })
+        .catch(e => console.error('[citations] news lookup failed:', e))
+    );
+  }
+
+  await Promise.all(lookups);
+  return Array.from(out.values()).sort((a, b) => a.id - b.id);
+}
+
+function formatSourceLine(s: CitationSource): string {
+  const date = fmtDate(s.date);
+  switch (s.type) {
+    case 'email':
+      return `[${s.id}] EMAIL — "${s.title}"${s.subtitle ? ` — ${s.subtitle}` : ''}${date ? ` — ${date}` : ''}`;
+    case 'slack':
+      return `[${s.id}] SLACK — ${s.subtitle || 'message'}: "${s.title}"${date ? ` — ${date}` : ''}`;
+    case 'meeting':
+      return `[${s.id}] MEETING — "${s.title}"${date ? ` — ${date}` : ''}`;
+    case 'document':
+      return `[${s.id}] DOCUMENT — "${s.title}"${s.subtitle ? ` (${s.subtitle})` : ''}${date ? ` — ${date}` : ''}`;
+    case 'news':
+      return `[${s.id}] NEWS — "${s.title}"${s.subtitle ? ` — ${s.subtitle}` : ''}${date ? ` — ${date}` : ''}`;
+    case 'contact':
+      return `[${s.id}] CONTACT — ${s.title}${s.subtitle ? ` (${s.subtitle})` : ''}`;
+    case 'company':
+      return `[${s.id}] COMPANY — ${s.title}${s.subtitle ? ` (${s.subtitle})` : ''}`;
+  }
+}
+
+export interface BuildSourcesResult {
+  sources: CitationSource[];
+  contextBlock: string;
+}
+
+export async function buildSourcesAndContext(
+  internal: HydratedChunk[],
+  news: HydratedChunk[],
+  uploadedDoc: string | undefined,
+  orgId: string,
+  env: Env
+): Promise<BuildSourcesResult> {
+  // Assign one source number per unique (source_table, source_id) — multiple
+  // chunks from the same email/meeting collapse to a single citation.
+  const sourceIdByKey = new Map<string, number>();
+  const refs: { id: number; chunk: HydratedChunk }[] = [];
+  const orderedChunks: ChunkRef[] = [];
+
+  let nextId = 1;
+  for (const chunk of [...internal, ...news]) {
+    const key = sourceKeyFor(chunk);
+    if (!sourceIdByKey.has(key)) {
+      sourceIdByKey.set(key, nextId);
+      refs.push({ id: nextId, chunk });
+      nextId++;
+    }
+    orderedChunks.push({ chunk, sourceKey: key });
+  }
+
+  const sources = await hydrateSources(refs, orgId, env);
+
+  // SOURCES list at the top of the context — Claude reads this as the lookup
+  // table for [^N] markers.
+  let header = 'SOURCES (cite these by number using [^N] format — never with parentheticals):\n';
+  for (const s of sources) header += formatSourceLine(s) + '\n';
+
+  // Body: each chunk prefixed with its source number so Claude can match it
+  // back. Truncated to PER_CHUNK_MAX tokens, hard-capped at CONTEXT_TOKEN_BUDGET
+  // total.
+  const docTokens = uploadedDoc
+    ? Math.min(estimateTokens(uploadedDoc), UPLOAD_TOKEN_BUDGET)
+    : 0;
+  const retrievedBudget = CONTEXT_TOKEN_BUDGET - docTokens;
+
+  let body = '\nCONTEXT FROM SOURCES:\n';
+  let tokens = 0;
+  for (const ref of orderedChunks) {
+    const isNews = (ref.chunk.metadata.document_type as string) === 'news';
+    if (isNews) continue; // news rendered separately below with UNVERIFIED tag
+    const sourceId = sourceIdByKey.get(ref.sourceKey)!;
+    const t = estimateTokens(ref.chunk.hydrated_text);
+    if (tokens + t > retrievedBudget) break;
+    const text =
+      t > PER_CHUNK_MAX
+        ? truncateToTokens(ref.chunk.hydrated_text, PER_CHUNK_MAX)
+        : ref.chunk.hydrated_text;
+    body += `\n[${sourceId}] ${text}\n`;
+    tokens += estimateTokens(text);
+  }
+
+  if (uploadedDoc) {
+    const truncated =
+      docTokens >= UPLOAD_TOKEN_BUDGET
+        ? truncateToTokens(uploadedDoc, UPLOAD_TOKEN_BUDGET) + '\n[DOCUMENT TRUNCATED]'
+        : uploadedDoc;
+    body += `\n\n--- UPLOADED DOCUMENT ---\n${truncated}`;
+  }
+
+  let newsBlock = '\n\n--- EXTERNAL NEWS CONTEXT [UNVERIFIED] ---\n';
+  let nt = 0;
+  for (const ref of orderedChunks) {
+    const isNews = (ref.chunk.metadata.document_type as string) === 'news';
+    if (!isNews) continue;
+    const sourceId = sourceIdByKey.get(ref.sourceKey)!;
+    const t = estimateTokens(ref.chunk.hydrated_text);
+    if (nt + t > NEWS_TOKEN_BUDGET) break;
+    newsBlock += `\n[${sourceId}] [EXTERNAL — UNVERIFIED | ${ref.chunk.metadata.created_at || ''}]\n${ref.chunk.hydrated_text}\n`;
+    nt += t;
+  }
+
+  return {
+    sources,
+    contextBlock: header + body + newsBlock,
+  };
+}

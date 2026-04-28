@@ -11,6 +11,9 @@ import {
   BarChart3, Users, Newspaper, PenLine, List, Radar,
 } from 'lucide-react';
 import { MartyEmblem } from '@/components/marty-emblem';
+import { CitationPill } from '@/components/citation-pill';
+import { SourcePanel } from '@/components/source-panel';
+import { trimPartialCitation, type CitationSource } from '@/lib/citations';
 
 // ---------------------------------------------------------------------------
 // Thinking verbs (crossfade)
@@ -119,6 +122,7 @@ interface Message {
   toolCalls?: ToolCall[];
   timestamp?: string;
   error?: boolean;
+  sources?: CitationSource[];
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +518,25 @@ export default function GodModePage() {
   // Fix 4: Explicit isThinking state — only cleared on first text token
   const [isThinking, setIsThinking] = React.useState(false);
 
+  // Citation source side panel
+  const [activeSource, setActiveSource] = React.useState<CitationSource | null>(null);
+  const activeSourceMessageIdRef = React.useRef<string | null>(null);
+
+  const handleCitationClick = React.useCallback(
+    (messageId: string) => (source: CitationSource) => {
+      activeSourceMessageIdRef.current = messageId;
+      setActiveSource(source);
+      api.logCitationClick({
+        message_id: messageId,
+        source_id: source.id,
+        source_type: source.type,
+        source_table: source.source_table,
+        source_row_id: source.source_id,
+      });
+    },
+    []
+  );
+
   // Fix 1: Smart auto-scroll — respect user's scroll position
   const userScrolledUpRef = React.useRef(false);
 
@@ -531,7 +554,7 @@ export default function GodModePage() {
           setActiveSessionId(sessionId);
           api.getSessionMessages(sessionId).then(d => {
             setMessages(d.messages.map((m: any) => ({
-              id: m.id, role: m.role, content: m.content, timestamp: m.created_at,
+              id: m.id, role: m.role, content: m.content, timestamp: m.created_at, sources: m.sources || undefined,
             })));
             localStorage.removeItem('marty_pending');
             window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
@@ -731,6 +754,13 @@ export default function GodModePage() {
             }
             localStorage.setItem('marty_pending', JSON.stringify({ sessionId: event.session_id }));
             window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+            return;
+          }
+          if (event.type === 'sources') {
+            const sources = (event.sources || []) as CitationSource[];
+            setMessages(m => m.map(msg =>
+              msg.id === assistantMsgId ? { ...msg, sources } : msg
+            ));
             return;
           }
           setMessages(m => m.map(msg => {
@@ -981,7 +1011,38 @@ export default function GodModePage() {
                       <div className="relative">
                         <div className="border-l-2 border-[#8B5CF6]/30 pl-4">
                           {!m.streaming && <TableOfContents content={m.content} />}
-                          <MarkdownMessage content={m.content} />
+                          <MarkdownMessage
+                            content={m.streaming ? trimPartialCitation(m.content) : m.content}
+                            sources={m.sources}
+                            onCitationClick={handleCitationClick(m.id)}
+                          />
+                          {!m.streaming && m.sources && m.sources.length > 0 && (() => {
+                            // Only show sources that were actually cited inline.
+                            const cited = new Set<number>();
+                            const re = /\[\^(\d+)\]/g;
+                            let mm: RegExpExecArray | null;
+                            while ((mm = re.exec(m.content)) !== null) cited.add(parseInt(mm[1], 10));
+                            const used = (m.sources || []).filter(s => cited.has(s.id));
+                            if (used.length === 0) return null;
+                            return (
+                              <div className="mt-4 pt-3 border-t border-border/30">
+                                <div className="text-[10px] uppercase tracking-wider text-text-muted font-semibold mb-2" style={{ fontFamily: "'Exo 2', sans-serif" }}>
+                                  Sources
+                                </div>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {used.map(s => (
+                                    <CitationPill
+                                      key={s.id}
+                                      sourceId={s.id}
+                                      source={s}
+                                      variant="footer"
+                                      onClick={handleCitationClick(m.id)}
+                                    />
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })()}
                         </div>
                         {m.justFinished && <div className="response-done-line mt-2 ml-4" />}
 
@@ -1104,6 +1165,8 @@ export default function GodModePage() {
           </div>
         </div>
       </main>
+
+      <SourcePanel source={activeSource} onClose={() => setActiveSource(null)} />
     </div>
   );
 }

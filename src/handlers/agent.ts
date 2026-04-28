@@ -1,7 +1,8 @@
 import type { Env } from '../types/env';
 import type { AgentSession, AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
-import { preprocessQuery, retrieveContext, assembleContext, TOKEN_BUDGET, type RetrievalOptions } from '../lib/retrieval';
+import { preprocessQuery, retrieveContext, TOKEN_BUDGET, type RetrievalOptions } from '../lib/retrieval';
+import { buildSourcesAndContext, type CitationSource } from '../lib/citations';
 import { callClaude, callClaudeStreaming } from '../lib/claude';
 import type { ToolDefinition } from '../lib/claude';
 import { extractTextFromFile } from '../lib/file-extraction';
@@ -352,8 +353,21 @@ export async function getSessionMessages(
 
   const messages = await env.D1.prepare(
     'SELECT * FROM agent_messages WHERE session_id = ? ORDER BY turn_index ASC'
-  ).bind(id).all();
-  return jsonResponse({ session, messages: messages.results });
+  ).bind(id).all<Record<string, any>>();
+  const hydratedMessages = messages.results.map(m => ({
+    ...m,
+    sources: m.sources_json ? safeParseSources(m.sources_json) : null,
+  }));
+  return jsonResponse({ session, messages: hydratedMessages });
+}
+
+function safeParseSources(json: string): CitationSource[] | null {
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? (parsed as CitationSource[]) : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function deleteSession(
@@ -386,6 +400,42 @@ export async function updateSessionTitle(
   await env.D1.prepare(
     'UPDATE agent_sessions SET title = ? WHERE id = ? AND org_id = ? AND user_id = ?'
   ).bind(body.title.trim().slice(0, 80), id, ctx.orgId, ctx.userId).run();
+  return jsonResponse({ ok: true });
+}
+
+export async function logCitationClick(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    message_id?: string;
+    source_id: number;
+    source_type?: string;
+    source_table?: string;
+    source_row_id?: string;
+  }>(request);
+  if (!body || typeof body.source_id !== 'number') {
+    return errorResponse('VALIDATION_ERROR', 400);
+  }
+  try {
+    await env.D1.prepare(
+      `INSERT INTO marty_citation_clicks
+         (id, org_id, user_id, message_id, source_id, source_type, source_table, source_row_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      crypto.randomUUID(),
+      ctx.orgId,
+      ctx.userId,
+      body.message_id || null,
+      body.source_id,
+      body.source_type || null,
+      body.source_table || null,
+      body.source_row_id || null
+    ).run();
+  } catch (e) {
+    console.error('[citations] click log failed:', e);
+  }
   return jsonResponse({ ok: true });
 }
 
@@ -525,8 +575,14 @@ export async function queryAgent(
     messages.push({ role: m.role as 'user' | 'assistant', content: m.content });
   }
 
-  // --- Assemble context ---
-  const contextBlock = assembleContext(internal, news, uploadedText);
+  // --- Assemble context with numbered sources ---
+  const { sources, contextBlock } = await buildSourcesAndContext(
+    internal,
+    news,
+    uploadedText,
+    ctx.orgId,
+    env
+  );
   const userMessage = `${contextBlock}\n\n--- QUERY ---\n${query}`;
   messages.push({ role: 'user', content: userMessage });
 
@@ -561,14 +617,19 @@ export async function queryAgent(
   // Tee stream to capture full response
   const [rawClientStream, captureStream] = stream.tee();
 
-  // Prepend a session event so the frontend knows the session ID
+  // Prepend a session event + the numbered source list so the frontend can
+  // render citation pills as soon as Claude starts streaming text.
   const encoder = new TextEncoder();
   const sessionEvent = encoder.encode(
     `data: ${JSON.stringify({ type: 'session', session_id: session.id })}\n\n`
   );
+  const sourcesEvent = encoder.encode(
+    `data: ${JSON.stringify({ type: 'sources', sources })}\n\n`
+  );
   const clientStream = new ReadableStream({
     async start(controller) {
       controller.enqueue(sessionEvent);
+      controller.enqueue(sourcesEvent);
       const reader = rawClientStream.getReader();
       try {
         while (true) {
@@ -606,13 +667,47 @@ export async function queryAgent(
         console.error('[Agent] stream capture error:', streamErr);
       }
 
-      // Save assistant turn (full or partial)
+      // Save assistant turn (full or partial), with the numbered source list
+      // so reloading the session keeps inline pills working.
+      let assistantMessageId: string | null = null;
       if (fullText) {
-        const assistantMessageId = crypto.randomUUID();
+        assistantMessageId = crypto.randomUUID();
+        const sourcesJson = sources.length > 0 ? JSON.stringify(sources) : null;
         await env.D1.prepare(
-          `INSERT INTO agent_messages (id, session_id, turn_index, role, content, created_at)
-           VALUES (?, ?, ?, 'assistant', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-        ).bind(assistantMessageId, session.id, turnIndex + 1, fullText).run();
+          `INSERT INTO agent_messages (id, session_id, turn_index, role, content, sources_json, created_at)
+           VALUES (?, ?, ?, 'assistant', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+        ).bind(assistantMessageId, session.id, turnIndex + 1, fullText, sourcesJson).run();
+      }
+
+      // Citation telemetry — counts valid vs. invalid [^N] markers so we can
+      // monitor citation hit rate and Claude hallucinating numbers.
+      if (assistantMessageId && fullText) {
+        try {
+          const validIds = new Set(sources.map(s => s.id));
+          let used = 0;
+          let invalid = 0;
+          const re = /\[\^(\d+)\]/g;
+          let m: RegExpExecArray | null;
+          while ((m = re.exec(fullText)) !== null) {
+            const n = parseInt(m[1], 10);
+            if (validIds.has(n)) used++;
+            else invalid++;
+          }
+          await env.D1.prepare(
+            `INSERT INTO marty_citation_metrics
+               (id, org_id, user_id, session_id, message_id, sources_provided,
+                citations_used, invalid_citations, response_length, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+          ).bind(
+            crypto.randomUUID(), ctx.orgId, ctx.userId, session.id, assistantMessageId,
+            sources.length, used, invalid, fullText.length
+          ).run();
+          if (invalid > 0) {
+            console.warn(`[citations] ${invalid} invalid [^N] markers (sources=${sources.length}) in message ${assistantMessageId}`);
+          }
+        } catch (e) {
+          console.error('[citations] metrics insert failed:', e);
+        }
       }
 
       // Update session

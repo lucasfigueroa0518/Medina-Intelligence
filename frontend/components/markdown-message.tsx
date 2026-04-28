@@ -5,6 +5,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { Check, Copy } from 'lucide-react';
+import { citationsRemarkPlugin, type CitationSource } from '@/lib/citations';
+import { CitationPill } from './citation-pill';
 
 const HEADER_STYLE: React.CSSProperties = { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700 };
 const BODY_STYLE: React.CSSProperties = { fontFamily: "'DM Sans', sans-serif", fontWeight: 400 };
@@ -38,11 +40,25 @@ function CodeBlock({ className, children }: { className?: string; children: Reac
   );
 }
 
-export function MarkdownMessage({ content }: { content: string }) {
+export function MarkdownMessage({
+  content,
+  sources,
+  onCitationClick,
+}: {
+  content: string;
+  sources?: CitationSource[];
+  onCitationClick?: (source: CitationSource) => void;
+}) {
+  const sourceMap = React.useMemo(() => {
+    const map = new Map<number, CitationSource>();
+    for (const s of sources || []) map.set(s.id, s);
+    return map;
+  }, [sources]);
+
   return (
     <div className="markdown-body text-sm text-text-primary leading-relaxed" style={BODY_STYLE}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[citationsRemarkPlugin, remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
         components={{
           h1: ({ children }) => {
@@ -70,12 +86,20 @@ export function MarkdownMessage({ content }: { content: string }) {
               {children}
             </blockquote>
           ),
-          a: ({ href, children }) => (
-            <a href={href} target="_blank" rel="noopener noreferrer"
-              className="text-accent-magenta hover:underline">
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) => {
+            if (typeof href === 'string' && href.startsWith('citation:')) {
+              const id = parseInt(href.slice('citation:'.length), 10);
+              if (!Number.isNaN(id)) {
+                return <CitationPill sourceId={id} source={sourceMap.get(id)} onClick={onCitationClick} />;
+              }
+            }
+            return (
+              <a href={href} target="_blank" rel="noopener noreferrer"
+                className="text-accent-magenta hover:underline">
+                {children}
+              </a>
+            );
+          },
           strong: ({ children }) => <strong className="font-semibold text-text-primary">{children}</strong>,
           em: ({ children }) => <em className="italic">{children}</em>,
           code: ({ className, children, ...props }) => {
