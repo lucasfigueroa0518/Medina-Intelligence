@@ -118,7 +118,14 @@ html, body {
   color: #FAFAFA;
   border: 1px solid #27272A;
   border-radius: 8px;
-  padding: 10px 14px;
+  /* Longhand padding so per-side Tailwind utilities (pl-10, pr-8, etc.)
+     can override individual sides — the shorthand `padding: 10px 14px`
+     would beat them on specificity-tied source order, causing icons
+     positioned inside the input to overlap the text. */
+  padding-top: 10px;
+  padding-right: 14px;
+  padding-bottom: 10px;
+  padding-left: 14px;
   font-size: 14px;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
