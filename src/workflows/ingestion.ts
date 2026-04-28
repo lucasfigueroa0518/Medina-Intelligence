@@ -170,7 +170,9 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         }
       );
 
-      // Step 2b: fetch news (slow — separate step so it doesn't block core ingestion)
+      // Step 2b: fetch news. New design (audit 2026-04-28 Task 1): staleness
+      // filter + hard cap (25/run) + parallel-per-company + per-company budget.
+      // 25 companies in parallel × ~5–10s each = total wallclock well under 60s.
       console.log('[IngestionWorkflow] step → fetch-news');
       const newsData = await trackedStep(
         this.env,
@@ -179,14 +181,34 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         'fetch-news',
         {
           retries: { limit: 1, delay: '10 seconds' },
-          timeout: '300 seconds',
+          timeout: '60 seconds',
         },
-        async (): Promise<{ news: ClassifiableItem[]; failures: Array<{ source: string; error: string }> }> => {
+        async (): Promise<{
+          news: ClassifiableItem[];
+          failures: Array<{ source: string; error: string }>;
+          telemetry: {
+            companies_queried: number;
+            succeeded: number;
+            failed: number;
+            articles_fetched: number;
+            step_duration_ms: number;
+          };
+        }> => {
           try {
-            const news = await fetchNewsForActiveCompanies(org_id!, this.env);
-            return { news, failures: [] };
+            const result = await fetchNewsForActiveCompanies(org_id!, this.env);
+            return { news: result.items, failures: [], telemetry: result.telemetry };
           } catch (e: any) {
-            return { news: [], failures: [{ source: 'news', error: e?.message || 'unknown' }] };
+            return {
+              news: [],
+              failures: [{ source: 'news', error: e?.message || 'unknown' }],
+              telemetry: {
+                companies_queried: 0,
+                succeeded: 0,
+                failed: 0,
+                articles_fetched: 0,
+                step_duration_ms: 0,
+              },
+            };
           }
         }
       );
@@ -224,6 +246,11 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
           fetched_news: sourceData.news.length,
           fetched_calendar: sourceData.calendar_events_upserted,
           source_failures: sourceData.failures,
+          news_companies_queried: newsData.telemetry.companies_queried,
+          news_companies_succeeded: newsData.telemetry.succeeded,
+          news_companies_failed: newsData.telemetry.failed,
+          news_articles_fetched: newsData.telemetry.articles_fetched,
+          news_step_duration_ms: newsData.telemetry.step_duration_ms,
         };
 
         // No items → finalize immediately (no children, no finalizer needed).
