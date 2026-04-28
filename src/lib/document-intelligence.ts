@@ -636,6 +636,15 @@ export async function processIntelligentImport(
   const buffer = await file.arrayBuffer();
   await env.R2.put(r2Key, buffer);
 
+  // Compute content hash so cross-pipeline dedup works. Without this, the
+  // same file uploaded via /api/documents and via /api/imports/intelligent
+  // both land — findExistingVersion in the upload paths queries content_hash
+  // and silently skips this column when it's NULL.
+  const hashBuf = await crypto.subtle.digest('SHA-256', buffer);
+  const contentHash = Array.from(new Uint8Array(hashBuf))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+
   // Try to extract text. If extraction fails or yields nothing, we still
   // ingest the file — it just lands as `reference` with no entity payload.
   let text = '';
@@ -671,8 +680,8 @@ export async function processIntelligentImport(
   await env.D1.prepare(
     `INSERT INTO documents
        (id, org_id, title, document_type, source, r2_key, file_name, file_size, mime_type,
-        uploaded_by, processing_status, extracted_text_preview, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'intelligent_import', ?, ?, ?, ?, ?, 'processing', ?, ?, ?)`
+        uploaded_by, processing_status, extracted_text_preview, content_hash, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'intelligent_import', ?, ?, ?, ?, ?, 'processing', ?, ?, ?, ?)`
   ).bind(
     documentId, orgId,
     file.name,
@@ -683,6 +692,7 @@ export async function processIntelligentImport(
     file.type || null,
     userId,
     text.slice(0, 500),
+    contentHash,
     now, now
   ).run();
   await logCreated('document', documentId);

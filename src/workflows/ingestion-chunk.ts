@@ -93,22 +93,51 @@ export class IngestionChunkWorkflow extends WorkflowEntrypoint<Env, ChunkParams>
         { retries: { limit: 1, delay: '5 seconds' } },
         async () => {
         const { processEmailAttachments } = await import('../lib/attachment-processor');
+        // Counters track every attachment we observe vs. what landed in
+        // documents. Persisted into sync_jobs.metadata at the end of the step
+        // so a single SQL query (`SELECT json_extract(metadata, '$.attachments_*')
+        // FROM sync_jobs ...`) can detect divergence between conversations
+        // declaring attachments and documents actually written. Without this,
+        // the email-attachment pipeline silently dropping rows was invisible.
+        let attempted = 0;
         let totalDocs = 0;
         let totalSkipped = 0;
+        let totalFailed = 0;
         for (const item of classified) {
           if (item.attachments?.length) {
+            attempted += item.attachments.length;
             try {
               const r = await processEmailAttachments(item, org_id, this.env);
               totalDocs += r.documents_created;
               totalSkipped += r.documents_skipped;
+              totalFailed += r.errors.length;
               if (r.errors.length) console.warn(`[IngestionChunkWorkflow] attachment errors:`, r.errors);
             } catch (e) {
+              totalFailed += item.attachments.length;
               console.error(`[IngestionChunkWorkflow] attachment processing failed for ${item.entityId}:`, errMessage(e));
             }
           }
         }
-        if (totalDocs + totalSkipped > 0) {
-          console.log(`[IngestionChunkWorkflow] chunk=${chunk_index} attachments: created=${totalDocs} skipped=${totalSkipped}`);
+        if (attempted > 0) {
+          console.log(`[IngestionChunkWorkflow] chunk=${chunk_index} attachments: attempted=${attempted} created=${totalDocs} skipped=${totalSkipped} failed=${totalFailed}`);
+          // Accumulate across chunks via json_set + COALESCE: each chunk
+          // increments the running total without clobbering siblings'
+          // contributions. NULL metadata bootstraps to '{}'.
+          try {
+            await this.env.D1.prepare(
+              `UPDATE sync_jobs
+                  SET metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attachments_attempted', COALESCE(json_extract(metadata, '$.attachments_attempted'), 0) + ?,
+                    '$.attachments_processed', COALESCE(json_extract(metadata, '$.attachments_processed'), 0) + ?,
+                    '$.attachments_skipped',   COALESCE(json_extract(metadata, '$.attachments_skipped'),   0) + ?,
+                    '$.attachments_failed',    COALESCE(json_extract(metadata, '$.attachments_failed'),    0) + ?
+                  )
+                WHERE id = ?`
+            ).bind(attempted, totalDocs, totalSkipped, totalFailed, sync_job_id).run();
+          } catch (e) {
+            console.error(`[IngestionChunkWorkflow] sync_jobs metadata update failed:`, errMessage(e));
+          }
         }
       });
 

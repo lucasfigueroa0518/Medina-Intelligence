@@ -6,6 +6,8 @@ import { emitAudit } from '../lib/audit';
 import { extractTextFromFile } from '../lib/file-extraction';
 import { chunkEmbedAndPersistAll } from '../lib/embedding';
 import { classifyDocument } from '../lib/document-intelligence';
+import { getSharingFlags } from '../lib/helpers';
+import { isDocumentAccessibleToUser } from '../lib/document-acl';
 
 async function computeContentHash(buffer: ArrayBuffer): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', buffer);
@@ -81,21 +83,47 @@ export async function listDocuments(
   const offset = parseInt(url.searchParams.get('offset') || '0', 10);
   const whereClause = where.join(' AND ');
 
-  const [result, countResult] = await Promise.all([
+  // ACL filter is applied in JS, not SQL: visibility/participant_user_ids
+  // aren't structured for cheap SQL filtering (JSON-stringified array column),
+  // and the documents corpus is small enough that an in-process filter is
+  // cleaner than a CTE. Pull just IDs+ACL fields, filter+paginate, then fetch
+  // full rows for the page.
+  const [candidates, sharingFlags] = await Promise.all([
     env.D1.prepare(
-      `SELECT * FROM documents WHERE ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
-    ).bind(...binds, limit, offset).all(),
-    env.D1.prepare(
-      `SELECT COUNT(*) as total FROM documents WHERE ${whereClause}`
-    ).bind(...binds).first<{ total: number }>(),
+      `SELECT id, visibility, participant_user_ids, uploaded_by
+       FROM documents WHERE ${whereClause} ORDER BY created_at DESC`
+    ).bind(...binds).all<{
+      id: string;
+      visibility: string | null;
+      participant_user_ids: string | null;
+      uploaded_by: string | null;
+    }>(),
+    getSharingFlags(ctx.orgId, env),
   ]);
 
+  const sharingSet = new Set(Object.keys(sharingFlags));
+  const accessible = candidates.results.filter(doc =>
+    isDocumentAccessibleToUser(doc, ctx.userId, ctx.userRole, sharingSet)
+  );
+
+  const total = accessible.length;
+  const pageIds = accessible.slice(offset, offset + limit).map(d => d.id);
+
+  if (pageIds.length === 0) {
+    return jsonResponse({ documents: [], total, limit, offset, has_more: false });
+  }
+
+  const placeholders = pageIds.map(() => '?').join(',');
+  const fullRows = await env.D1.prepare(
+    `SELECT * FROM documents WHERE id IN (${placeholders}) ORDER BY created_at DESC`
+  ).bind(...pageIds).all();
+
   return jsonResponse({
-    documents: result.results,
-    total: countResult?.total || 0,
+    documents: fullRows.results,
+    total,
     limit,
     offset,
-    has_more: offset + limit < (countResult?.total || 0),
+    has_more: offset + limit < total,
   });
 }
 
@@ -233,14 +261,31 @@ export async function uploadDocument(
   return jsonResponse({ document: doc }, 201);
 }
 
+async function loadDocumentForUser(
+  id: string,
+  ctx: AuthContext,
+  env: Env
+): Promise<any | null> {
+  const doc = await env.D1.prepare(
+    'SELECT * FROM documents WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(id, ctx.orgId).first<any>();
+  if (!doc) return null;
+
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+  const sharingSet = new Set(Object.keys(sharingFlags));
+  if (!isDocumentAccessibleToUser(doc, ctx.userId, ctx.userRole, sharingSet)) {
+    // Return 404, not 403 — don't disclose the existence of inaccessible docs.
+    return null;
+  }
+  return doc;
+}
+
 export async function getDocument(
   id: string,
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const doc = await env.D1.prepare(
-    'SELECT * FROM documents WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(id, ctx.orgId).first<any>();
+  const doc = await loadDocumentForUser(id, ctx, env);
   if (!doc) return errorResponse('DOCUMENT_NOT_FOUND', 404);
 
   // R2 signed URL — Workers doesn't support native signed URLs, so return a
@@ -255,9 +300,7 @@ export async function downloadDocument(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const doc = await env.D1.prepare(
-    'SELECT * FROM documents WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(id, ctx.orgId).first<any>();
+  const doc = await loadDocumentForUser(id, ctx, env);
   if (!doc) return errorResponse('DOCUMENT_NOT_FOUND', 404);
 
   const obj = await env.R2.get(doc.r2_key);

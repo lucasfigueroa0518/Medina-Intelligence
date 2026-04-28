@@ -243,7 +243,9 @@ export async function cleanupExpiredMergeLocks(env: Env): Promise<void> {
   ).run();
 }
 
-export async function cleanupExpiredChatUploads(env: Env): Promise<void> {
+export async function cleanupExpiredChatUploads(env: Env): Promise<{ candidates: number; r2_deleted: number; r2_failed: number; rows_deleted: number }> {
+  const stats = { candidates: 0, r2_deleted: 0, r2_failed: 0, rows_deleted: 0 };
+
   // Skip rows where the file was promoted to permanent Documents — those are
   // owned by the documents pipeline now and have a different retention policy.
   const rows = await env.D1.prepare(
@@ -252,6 +254,7 @@ export async function cleanupExpiredChatUploads(env: Env): Promise<void> {
        AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
      LIMIT 500`
   ).all<{ id: string; r2_key: string }>();
+  stats.candidates = rows.results.length;
 
   for (const row of rows.results) {
     // R2 first — if this fails we leave the D1 row for retry next run, so a
@@ -259,12 +262,20 @@ export async function cleanupExpiredChatUploads(env: Env): Promise<void> {
     // most a few extra cron cycles).
     try {
       await env.R2.delete(row.r2_key);
+      stats.r2_deleted += 1;
     } catch (e) {
       console.error(`[chat-uploads] R2 delete failed for ${row.id}:`, e);
+      stats.r2_failed += 1;
       continue;
     }
-    await env.D1.prepare(`DELETE FROM chat_uploads WHERE id = ?`).bind(row.id).run().catch(() => {});
+    const del = await env.D1.prepare(`DELETE FROM chat_uploads WHERE id = ?`).bind(row.id).run().catch(() => null);
+    if (del?.meta.changes) stats.rows_deleted += del.meta.changes;
   }
+
+  if (stats.candidates > 0) {
+    console.log(`[chat-uploads] TTL sweep: candidates=${stats.candidates} r2_deleted=${stats.r2_deleted} r2_failed=${stats.r2_failed} rows_deleted=${stats.rows_deleted}`);
+  }
+  return stats;
 }
 
 export async function warmCrmCache(orgId: string, env: Env): Promise<void> {
