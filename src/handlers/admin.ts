@@ -1081,3 +1081,258 @@ export async function getEmbedQueueHealth(
     failed_permanent: failed.results,
   });
 }
+
+// ---------------------------------------------------------------------------
+// RAG Wave 2 backfills
+// ---------------------------------------------------------------------------
+
+// Recompute primary_entity_id on existing conversation vectors written by the
+// pre-Wave-2 daily-cron paths. They stamped `primary_entity_id = conversation_id`
+// instead of resolving to the from_contact_id (or first to-contact for outbound).
+// Walk vectors, look up the conversation row, run resolvePrimaryEntityId, and
+// re-upsert if the value changed. Idempotent — re-runs are no-ops once correct.
+// Cursor-paginated to stay under Worker CPU.
+export async function recomputePrimaryEntityIds(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ limit?: number; cursor?: number }>(request);
+  const limit = Math.min(Math.max(body?.limit ?? 50, 1), 200);
+  const cursor = Math.max(body?.cursor ?? 0, 0);
+
+  const { resolvePrimaryEntityId } = await import('../lib/embedding');
+
+  const candidates = await env.D1.prepare(
+    `SELECT vei.vector_id, vei.entity_id, c.id AS conv_id, c.source AS conv_source,
+            c.from_contact_id, c.from_email
+       FROM vector_entity_index vei
+       JOIN conversations c ON c.id = vei.entity_id AND c.org_id = vei.org_id
+       WHERE vei.org_id = ? AND vei.source_table = 'conversations'
+       ORDER BY vei.vector_id LIMIT ? OFFSET ?`
+  ).bind(ctx.orgId, limit, cursor).all<{
+    vector_id: string; entity_id: string; conv_id: string; conv_source: string;
+    from_contact_id: string | null; from_email: string | null;
+  }>();
+
+  const totalScanned = candidates.results.length;
+  let updated = 0;
+  let alreadyCorrect = 0;
+  let notInVectorize = 0;
+  const errors: string[] = [];
+
+  // Cache org users (one round-trip)
+  const userRows = await env.D1.prepare(
+    `SELECT email FROM users WHERE org_id = ? AND deleted_at IS NULL`
+  ).bind(ctx.orgId).all<{ email: string }>();
+  const internalEmails = new Set<string>();
+  for (const u of userRows.results) {
+    if (u.email) internalEmails.add(u.email.toLowerCase());
+  }
+
+  // Cache to-contact lookups per conv_id within this batch
+  const convIds = [...new Set(candidates.results.map(r => r.conv_id))];
+  const toContactsByConv = new Map<string, string[]>();
+  if (convIds.length > 0) {
+    const placeholders = convIds.map(() => '?').join(',');
+    const tcRows = await env.D1.prepare(
+      `SELECT conversation_id, contact_id, role FROM conversation_contacts
+         WHERE conversation_id IN (${placeholders}) AND role IN ('to','cc')
+         ORDER BY role = 'to' DESC`
+    ).bind(...convIds).all<{ conversation_id: string; contact_id: string; role: string }>();
+    for (const r of tcRows.results) {
+      const arr = toContactsByConv.get(r.conversation_id) || [];
+      arr.push(r.contact_id);
+      toContactsByConv.set(r.conversation_id, arr);
+    }
+  }
+
+  for (const row of candidates.results) {
+    try {
+      const existing = await env.VECTORIZE.getByIds([row.vector_id]);
+      if (existing.length === 0) { notInVectorize++; continue; }
+
+      const meta: any = existing[0].metadata || {};
+      const docType = meta.document_type || 'email';
+
+      const correctPrimary = resolvePrimaryEntityId({
+        document_type: docType,
+        source: row.conv_source,
+        source_id: row.conv_id,
+        from_contact_id: row.from_contact_id,
+        from_email: row.from_email,
+        to_contact_ids: toContactsByConv.get(row.conv_id) || [],
+        internal_user_emails: internalEmails,
+      });
+
+      if (meta.primary_entity_id === correctPrimary) {
+        alreadyCorrect++;
+        continue;
+      }
+
+      await env.VECTORIZE.upsert([{
+        id: row.vector_id,
+        values: existing[0].values,
+        metadata: { ...meta, primary_entity_id: correctPrimary },
+      }]);
+      updated++;
+    } catch (err: any) {
+      errors.push(`${row.vector_id}: ${err?.message || String(err)}`);
+    }
+  }
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'update',
+    entity_type: 'integration',
+    entity_id: `recompute_primary_entity:cursor=${cursor}`,
+    metadata: { scanned: totalScanned, updated, already_correct: alreadyCorrect, not_in_vectorize: notInVectorize, errors_count: errors.length },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({
+    scanned: totalScanned,
+    updated,
+    already_correct: alreadyCorrect,
+    not_in_vectorize: notInVectorize,
+    errors,
+    next_cursor: totalScanned === limit ? cursor + limit : null,
+  });
+}
+
+// Re-embed transcripts using the now-wired speaker-turn chunker. Walks events
+// rows that have a transcript_r2_key, deletes existing vectors, then re-runs
+// chunkEmbedAndPersistAll which will detect transcript content and use the
+// speaker-turn splitter. Bounded to 10 transcripts per batch — each transcript
+// can produce ~15 chunks, each requiring a BGE call.
+export async function reembedTranscripts(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ limit?: number; cursor?: number }>(request);
+  const limit = Math.min(Math.max(body?.limit ?? 10, 1), 30);
+  const cursor = Math.max(body?.cursor ?? 0, 0);
+
+  const { chunkEmbedAndPersistAll } = await import('../lib/embedding');
+
+  const events = await env.D1.prepare(
+    `SELECT id, title, summary, transcript_r2_key, start_time
+       FROM events WHERE org_id = ? AND deleted_at IS NULL AND transcript_r2_key IS NOT NULL
+       ORDER BY id LIMIT ? OFFSET ?`
+  ).bind(ctx.orgId, limit, cursor).all<{
+    id: string; title: string; summary: string | null;
+    transcript_r2_key: string; start_time: string;
+  }>();
+
+  const stats = { scanned: 0, reembedded: 0, missing_r2: 0, errors: 0 };
+  const errorList: string[] = [];
+
+  for (const ev of events.results) {
+    stats.scanned++;
+    try {
+      // Delete prior vectors for this event
+      const existing = await env.D1.prepare(
+        `SELECT vector_id FROM vector_entity_index WHERE entity_id = ? AND source_table = 'events' AND org_id = ?`
+      ).bind(ev.id, ctx.orgId).all<{ vector_id: string }>();
+      if (existing.results.length > 0) {
+        const ids = existing.results.map(r => r.vector_id);
+        await env.VECTORIZE.deleteByIds(ids).catch(() => {});
+        const placeholders = ids.map(() => '?').join(',');
+        await env.D1.prepare(
+          `DELETE FROM vector_entity_index WHERE vector_id IN (${placeholders})`
+        ).bind(...ids).run();
+        await Promise.all(ids.map(id => env.KV.delete(`chunk:${id}`).catch(() => {})));
+      }
+
+      const obj = await env.R2.get(ev.transcript_r2_key);
+      if (!obj) { stats.missing_r2++; continue; }
+      const text = await obj.text();
+      if (!text || text.trim().length < 10) { stats.missing_r2++; continue; }
+
+      const entries = await chunkEmbedAndPersistAll(text, {
+        org_id: ctx.orgId,
+        visibility: 'org_wide',
+        document_type: 'transcript',
+        source_table: 'events',
+        source_id: ev.id,
+        r2_key: ev.transcript_r2_key,
+        created_at: ev.start_time,
+        primary_entity_id: ev.id,
+        entity_name: ev.title,
+        date: ev.start_time,
+      }, env);
+
+      if (entries.length > 0) {
+        await env.D1.batch(entries.map(e =>
+          env.D1.prepare(
+            'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+          ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+        ));
+        stats.reembedded++;
+      }
+    } catch (err: any) {
+      stats.errors++;
+      errorList.push(`${ev.id}: ${err?.message || String(err)}`);
+    }
+  }
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'update',
+    entity_type: 'integration',
+    entity_id: `reembed_transcripts:cursor=${cursor}`,
+    metadata: stats,
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({
+    ...stats,
+    errors_list: errorList,
+    next_cursor: stats.scanned === limit ? cursor + limit : null,
+  });
+}
+
+// Backfill all deals into Vectorize. Pages through deals, calls embedDeal on
+// each. Idempotent — embedDeal's chunkEmbedAndPersistAll dedup guard skips
+// already-embedded deals.
+export async function embedAllDeals(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ limit?: number; cursor?: number }>(request);
+  const limit = Math.min(Math.max(body?.limit ?? 25, 1), 100);
+  const cursor = Math.max(body?.cursor ?? 0, 0);
+
+  const { embedDeal } = await import('../lib/embedding');
+
+  const deals = await env.D1.prepare(
+    `SELECT id FROM deals WHERE org_id = ? AND deleted_at IS NULL
+       ORDER BY id LIMIT ? OFFSET ?`
+  ).bind(ctx.orgId, limit, cursor).all<{ id: string }>();
+
+  const stats = { scanned: 0, embedded: 0, skipped: 0, missing: 0, errors: 0 };
+  const errorList: string[] = [];
+
+  for (const d of deals.results) {
+    stats.scanned++;
+    try {
+      const r = await embedDeal(d.id, ctx.orgId, env);
+      if (r === 'embedded') stats.embedded++;
+      else if (r === 'skipped') stats.skipped++;
+      else if (r === 'missing') stats.missing++;
+    } catch (err: any) {
+      stats.errors++;
+      errorList.push(`${d.id}: ${err?.message || String(err)}`);
+    }
+  }
+
+  return jsonResponse({
+    ...stats,
+    errors_list: errorList,
+    next_cursor: stats.scanned === limit ? cursor + limit : null,
+  });
+}

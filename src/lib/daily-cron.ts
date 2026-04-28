@@ -26,6 +26,19 @@ function participantsForVectorMeta(rawFromD1: string | null): string | undefined
   return ids.length > 0 ? ids.join(',') : undefined;
 }
 
+// Cache one round-trip per cron run for internal user-email lookup. Used by
+// the primary_entity_id resolver to detect outbound vs inbound mail.
+async function loadInternalUserEmails(orgId: string, env: Env): Promise<Set<string>> {
+  const rows = await env.D1.prepare(
+    `SELECT email FROM users WHERE org_id = ? AND deleted_at IS NULL`
+  ).bind(orgId).all<{ email: string }>();
+  const set = new Set<string>();
+  for (const r of rows.results) {
+    if (r.email) set.add(r.email.toLowerCase());
+  }
+  return set;
+}
+
 export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await applyNewsScoreDecay(orgId, env); } catch (e) { console.error('Score decay:', e); }
   try { await scheduleReEnrichment(orgId, env); } catch (e) { console.error('Re-enrichment:', e); }
@@ -42,6 +55,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await recalculateAllAssociations(orgId, env); } catch (e) { console.error('Association recalc:', e); }
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
   try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
+  try { await backfillUnembeddedEntities(orgId, env); } catch (e) { console.error('Entity backfill:', e); }
   try { await processEmbedRetryQueue(orgId, env); } catch (e) { console.error('Embed retry queue:', e); }
   try { await rebuildEntityIndex(orgId, env); } catch (e) { console.error('Entity index rebuild:', e); }
   try { await cleanupExpiredResetTokens(env); } catch (e) { console.error('Reset token cleanup:', e); }
@@ -450,10 +464,11 @@ export async function checkWebhookHealth(orgId: string, env: Env): Promise<void>
 }
 
 export async function backfillUnembeddedConversations(orgId: string, env: Env): Promise<number> {
-  const { chunkEmbedAndPersistAll } = await import('./embedding');
+  const { chunkEmbedAndPersistAll, resolvePrimaryEntityId } = await import('./embedding');
 
   const rows = await env.D1.prepare(
-    `SELECT c.id, c.body_r2_key, c.source, c.subject, c.from_email, c.sent_at, c.participant_user_ids
+    `SELECT c.id, c.body_r2_key, c.source, c.subject, c.from_email, c.from_contact_id,
+            c.sent_at, c.participant_user_ids
        FROM conversations c
        WHERE c.org_id = ?
          AND NOT EXISTS (
@@ -465,10 +480,13 @@ export async function backfillUnembeddedConversations(orgId: string, env: Env): 
        LIMIT 200`
   ).bind(orgId).all<{
     id: string; body_r2_key: string | null; source: string; subject: string | null;
-    from_email: string | null; sent_at: string | null; participant_user_ids: string | null;
+    from_email: string | null; from_contact_id: string | null;
+    sent_at: string | null; participant_user_ids: string | null;
   }>();
 
   if (rows.results.length === 0) return 0;
+
+  const internalEmails = await loadInternalUserEmails(orgId, env);
 
   let embedded = 0;
   for (const row of rows.results) {
@@ -478,16 +496,36 @@ export async function backfillUnembeddedConversations(orgId: string, env: Env): 
       if (!obj) continue;
       const body = await obj.text();
 
+      // Resolve recipient contact_ids via the conversation_contacts join. Lets
+      // the resolver pick a real to-contact for outbound mail when from is
+      // internal (without this, outbound mail falls back to source_id).
+      const toContacts = await env.D1.prepare(
+        `SELECT contact_id FROM conversation_contacts WHERE conversation_id = ?
+           AND role IN ('to','cc') ORDER BY role = 'to' DESC`
+      ).bind(row.id).all<{ contact_id: string }>();
+
+      const docType = row.source === 'manual' ? 'transcript'
+        : row.source === 'slack' ? 'conversation'
+        : 'email';
+
       const meta = {
         org_id: orgId,
         visibility: visibilityForBackfill(row.source),
         participant_user_ids: participantsForVectorMeta(row.participant_user_ids),
-        document_type: row.source === 'manual' ? 'transcript' : 'email',
+        document_type: docType,
         source_table: 'conversations',
         source_id: row.id,
         r2_key: row.body_r2_key,
         created_at: row.sent_at || new Date().toISOString(),
-        primary_entity_id: row.id,
+        primary_entity_id: resolvePrimaryEntityId({
+          document_type: docType,
+          source: row.source,
+          source_id: row.id,
+          from_contact_id: row.from_contact_id,
+          from_email: row.from_email,
+          to_contact_ids: toContacts.results.map(r => r.contact_id),
+          internal_user_emails: internalEmails,
+        }),
         entity_name: row.subject || undefined,
         date: row.sent_at || undefined,
       };
@@ -512,6 +550,63 @@ export async function backfillUnembeddedConversations(orgId: string, env: Env): 
     console.log(`[daily-cron] backfilled ${embedded} unembedded conversations for org ${orgId}`);
   }
   return embedded;
+}
+
+// Backfill embeddings for contacts/companies that have content-bearing fields
+// but no Vectorize coverage. The full enrichment.ts pipeline only embeds when
+// it runs (re-)enrichment; entities that were ingested with an existing
+// bio_summary or description but never re-enriched fall through. This loop
+// closes that gap incrementally — 20 contacts + 20 companies per cron run.
+export async function backfillUnembeddedEntities(orgId: string, env: Env): Promise<{ contacts: number; companies: number }> {
+  const { embedContactBio, embedCompanyDescription } = await import('./embedding');
+  const stats = { contacts: 0, companies: 0 };
+
+  const contacts = await env.D1.prepare(
+    `SELECT id FROM contacts c
+       WHERE c.org_id = ? AND c.deleted_at IS NULL AND c.merged_into IS NULL
+         AND c.bio_summary IS NOT NULL AND length(trim(c.bio_summary)) > 30
+         AND NOT EXISTS (
+           SELECT 1 FROM vector_entity_index
+            WHERE entity_id = c.id AND source_table = 'contacts' AND org_id = c.org_id
+         )
+       ORDER BY c.total_interactions DESC, c.last_contact_date DESC
+       LIMIT 20`
+  ).bind(orgId).all<{ id: string }>();
+
+  for (const c of contacts.results) {
+    try {
+      const r = await embedContactBio(c.id, orgId, env);
+      if (r === 'embedded') stats.contacts++;
+    } catch (e) {
+      console.error(`[daily-cron:backfill] embed contact ${c.id} failed:`, e);
+    }
+  }
+
+  const companies = await env.D1.prepare(
+    `SELECT id FROM companies co
+       WHERE co.org_id = ? AND co.deleted_at IS NULL AND co.merged_into IS NULL
+         AND co.description IS NOT NULL AND length(trim(co.description)) > 30
+         AND NOT EXISTS (
+           SELECT 1 FROM vector_entity_index
+            WHERE entity_id = co.id AND source_table = 'companies' AND org_id = co.org_id
+         )
+       ORDER BY co.news_relevance_score DESC, co.updated_at DESC
+       LIMIT 20`
+  ).bind(orgId).all<{ id: string }>();
+
+  for (const c of companies.results) {
+    try {
+      const r = await embedCompanyDescription(c.id, orgId, env);
+      if (r === 'embedded') stats.companies++;
+    } catch (e) {
+      console.error(`[daily-cron:backfill] embed company ${c.id} failed:`, e);
+    }
+  }
+
+  if (stats.contacts > 0 || stats.companies > 0) {
+    console.log(`[daily-cron] entity backfill org=${orgId} contacts=${stats.contacts} companies=${stats.companies}`);
+  }
+  return stats;
 }
 
 // Embed retry queue processor (audit 2026-04-28 scale-up Fix 3).
@@ -617,12 +712,15 @@ async function embedSingleItem(
   const { chunkEmbedAndPersistAll } = await import('./embedding');
 
   if (sourceTable === 'conversations') {
+    const { resolvePrimaryEntityId } = await import('./embedding');
     const row = await env.D1.prepare(
-      `SELECT id, body_r2_key, source, subject, sent_at, participant_user_ids
+      `SELECT id, body_r2_key, source, subject, sent_at, participant_user_ids,
+              from_email, from_contact_id
          FROM conversations WHERE id = ? AND org_id = ?`
     ).bind(entityId, orgId).first<{
       id: string; body_r2_key: string | null; source: string;
       subject: string | null; sent_at: string | null; participant_user_ids: string | null;
+      from_email: string | null; from_contact_id: string | null;
     }>();
     if (!row) return 'missing';
     if (!row.body_r2_key) throw new Error('conversation has no body_r2_key');
@@ -631,16 +729,34 @@ async function embedSingleItem(
     if (!obj) throw new Error(`R2 body missing: ${row.body_r2_key}`);
     const body = await obj.text();
 
+    const internalEmails = await loadInternalUserEmails(orgId, env);
+    const toContacts = await env.D1.prepare(
+      `SELECT contact_id FROM conversation_contacts WHERE conversation_id = ?
+         AND role IN ('to','cc') ORDER BY role = 'to' DESC`
+    ).bind(row.id).all<{ contact_id: string }>();
+
+    const docType = row.source === 'manual' ? 'transcript'
+      : row.source === 'slack' ? 'conversation'
+      : 'email';
+
     const entries = await chunkEmbedAndPersistAll(body, {
       org_id: orgId,
       visibility: visibilityForBackfill(row.source),
       participant_user_ids: participantsForVectorMeta(row.participant_user_ids),
-      document_type: row.source === 'manual' ? 'transcript' : 'email',
+      document_type: docType,
       source_table: 'conversations',
       source_id: row.id,
       r2_key: row.body_r2_key,
       created_at: row.sent_at || new Date().toISOString(),
-      primary_entity_id: row.id,
+      primary_entity_id: resolvePrimaryEntityId({
+        document_type: docType,
+        source: row.source,
+        source_id: row.id,
+        from_contact_id: row.from_contact_id,
+        from_email: row.from_email,
+        to_contact_ids: toContacts.results.map(r => r.contact_id),
+        internal_user_emails: internalEmails,
+      }),
       entity_name: row.subject || undefined,
       date: row.sent_at || undefined,
     }, env);

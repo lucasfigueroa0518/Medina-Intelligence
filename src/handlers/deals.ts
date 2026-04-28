@@ -142,6 +142,16 @@ export async function createDeal(
   });
 
   await invalidateRagCache(ctx.orgId, env);
+  // Embed the new deal so MARTy's broad and per-entity Vectorize queries can
+  // surface it. Inline (no ctxExec available here) so the embedding lands
+  // before the next ingest run dedups against an absent record. Wrapped in
+  // try/catch — embed failure must not block deal creation.
+  try {
+    const { embedDeal } = await import('../lib/embedding');
+    await embedDeal(id, ctx.orgId, env);
+  } catch (e) {
+    console.error(`[deals] embed failed for new deal ${id}:`, e);
+  }
   const created = await env.D1.prepare('SELECT * FROM deals WHERE id = ?').bind(id).first();
   return jsonResponse({ deal: created }, 201);
 }
@@ -350,6 +360,21 @@ export async function updateDeal(
   });
 
   await invalidateRagCache(ctx.orgId, env);
+
+  // Re-embed when content-bearing fields change. Stage/amount don't change
+  // the embedding text materially but title/notes/thesis do; we re-embed on
+  // any of those to keep RAG fresh.
+  const contentFields = ['title', 'stage', 'notes', 'thesis_fit', 'amount', 'valuation', 'our_allocation', 'instrument_type'];
+  const contentChanged = contentFields.some(f => f in body && body[f] !== (before as any)[f]);
+  if (contentChanged) {
+    try {
+      const { reembedDeal } = await import('../lib/embedding');
+      await reembedDeal(id, ctx.orgId, env);
+    } catch (e) {
+      console.error(`[deals] reembed failed for ${id}:`, e);
+    }
+  }
+
   return jsonResponse({ deal: after });
 }
 

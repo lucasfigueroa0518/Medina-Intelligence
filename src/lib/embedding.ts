@@ -1,8 +1,105 @@
 // TRD §4.3 — Chunk embed + persist to Vectorize + KV
 import type { Env } from '../types/env';
-import type { ChunkMetadata, VectorIndexEntry } from '../types/interfaces';
-import { createSplitter, CURRENT_CHUNK_VERSION } from './chunking';
+import type { ChunkMetadata, SpeakerTurn, VectorIndexEntry } from '../types/interfaces';
+import {
+  createSplitter,
+  chunkTranscriptBySpeakerTurns,
+  determineOverlapTurns,
+  CURRENT_CHUNK_VERSION,
+} from './chunking';
 import { acquireEmbedSlot } from './rate-limit';
+
+// Parse a "Speaker Name: text" formatted transcript into structured turns.
+// Mirrors the parser in integrations/firefly.ts so re-embeds via the generic
+// chunkEmbedAndPersistAll path produce the same shape as initial-ingest.
+// Returns [] if the text doesn't match the speaker-prefixed format, in which
+// case the caller falls back to the recursive splitter.
+function parseSpeakerTurns(text: string): SpeakerTurn[] {
+  const turns: SpeakerTurn[] = [];
+  const lines = text.split('\n').filter(l => l.trim());
+  for (const line of lines) {
+    const match = line.match(/^([^:]{2,80}):\s*(.+)$/);
+    if (!match) continue;
+    turns.push({
+      speaker: match[1].trim(),
+      affiliation: 'External',
+      text: match[2].trim(),
+    });
+  }
+  // Require at least 3 detected turns AND >50% of non-empty lines parsed as
+  // turns — otherwise it's likely a body that contains stray "Subject: …"
+  // style lines and isn't actually a transcript.
+  const nonEmptyLines = lines.length;
+  if (turns.length < 3 || turns.length / Math.max(nonEmptyLines, 1) < 0.5) return [];
+  return turns;
+}
+
+// The "primary entity" of a chunk is the entity it's most about — what users
+// query for and expect to see this content surface against. The per-entity
+// boosted Vectorize query (retrieval.ts, topK=15, our most precise lever)
+// filters by primary_entity_id, so a misset value tanks recall on
+// entity-targeted questions ("show me emails from Patrick Dyer").
+//
+// For emails:
+//   - Inbound (sender is external): the sender's contact_id
+//   - Outbound (sender is internal): the most prominent external recipient
+//   - All-internal or no contact match: fall back to the conversation_id
+// For Slack: the sender's contact_id if they're a known external contact
+// For meetings: the linked company_id, else the event_id
+// For documents (attachments / uploads): the linked contact_id, else company,
+//   else deal, else the document's own id.
+export interface PrimaryEntityContext {
+  document_type: string;
+  source: 'outlook' | 'slack' | 'manual' | 'firefly' | 'document_upload' | string;
+  source_id: string;
+  from_contact_id?: string | null;
+  from_email?: string | null;
+  to_contact_ids?: string[];
+  company_id?: string | null;
+  contact_id?: string | null;
+  deal_id?: string | null;
+  internal_user_emails?: Set<string>;
+}
+
+export function resolvePrimaryEntityId(ctx: PrimaryEntityContext): string {
+  const internalSet = ctx.internal_user_emails;
+  const senderIsInternal =
+    !!ctx.from_email && !!internalSet && internalSet.has(ctx.from_email.toLowerCase());
+
+  if (ctx.document_type === 'email') {
+    if (senderIsInternal) {
+      const firstExternal = (ctx.to_contact_ids || []).find(id => id);
+      if (firstExternal) return firstExternal;
+    } else if (ctx.from_contact_id) {
+      return ctx.from_contact_id;
+    }
+    return ctx.source_id;
+  }
+
+  if (ctx.document_type === 'conversation' /* slack */) {
+    if (ctx.from_contact_id) return ctx.from_contact_id;
+    return ctx.source_id;
+  }
+
+  if (ctx.document_type === 'transcript') {
+    if (ctx.company_id) return ctx.company_id;
+    return ctx.source_id;
+  }
+
+  if (
+    ctx.document_type === 'document' ||
+    ctx.document_type === 'pdf' ||
+    ctx.document_type === 'pitch_deck' ||
+    ctx.source === 'document_upload'
+  ) {
+    if (ctx.contact_id) return ctx.contact_id;
+    if (ctx.company_id) return ctx.company_id;
+    if (ctx.deal_id) return ctx.deal_id;
+    return ctx.source_id;
+  }
+
+  return ctx.source_id;
+}
 
 export function prefixChunk(text: string, meta: ChunkMetadata): string {
   const parts = [`[Type: ${meta.document_type}]`];
@@ -152,6 +249,33 @@ export async function chunkEmbedAndPersistAll(
     return [];
   }
 
+  // Transcripts: parse the "Speaker: text" format and chunk by speaker turns
+  // when possible. The Firefly webhook path already does this on initial
+  // ingest (integrations/firefly.ts), but re-embeds via daily-cron and admin
+  // backfills used to fall back to the recursive splitter, which buried
+  // individual speakers' words mid-chunk and degraded "what did X say"
+  // queries. Falls back to recursive when the text doesn't match the
+  // speaker-prefixed format.
+  if (meta.document_type === 'transcript') {
+    const turns = parseSpeakerTurns(text);
+    if (turns.length >= 3) {
+      const overlapTurns = determineOverlapTurns(turns);
+      const chunks = chunkTranscriptBySpeakerTurns(turns, 1024, overlapTurns);
+      if (chunks.length === 0) return [];
+      const entries: VectorIndexEntry[] = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const chunkMeta: ChunkMetadata = {
+          ...meta,
+          speakers: chunks[i].speakers.join(','),
+          primary_speaker: chunks[i].primary_speaker,
+        };
+        const entry = await chunkEmbedAndPersist(chunks[i].text, chunkMeta, i, chunks.length, env);
+        entries.push(entry);
+      }
+      return entries;
+    }
+  }
+
   const splitter = createSplitter(meta.document_type);
   const chunks = await splitter.splitText(text);
   if (chunks.length === 0) return [];
@@ -162,4 +286,205 @@ export async function chunkEmbedAndPersistAll(
     entries.push(entry);
   }
   return entries;
+}
+
+// Compose a structured-text representation of a deal that BGE can index well.
+// Deals don't have rich freeform text by default, so we synthesize a single
+// blob from the structured fields plus the linked company description and
+// key contacts. The labeled "Field: value" lines double as semantic anchors
+// that improve retrieval on pipeline-style queries ("what fintech deals are
+// we tracking", "Series A in defense tech").
+export function buildDealEmbeddingText(
+  deal: any,
+  company: { name?: string | null; sector?: string | null; description?: string | null } | null,
+  contacts: Array<{ full_name: string; role?: string | null }>
+): string {
+  const parts: string[] = [];
+  parts.push(`Deal: ${deal.title || deal.name || 'Untitled'}`);
+  if (company?.name) parts.push(`Company: ${company.name}`);
+  if (company?.sector) parts.push(`Sector: ${company.sector}`);
+  if (company?.description) parts.push(`Company description: ${company.description}`);
+  if (deal.stage) parts.push(`Stage: ${String(deal.stage).replace(/_/g, ' ')}`);
+  if (deal.amount) parts.push(`Round size: ${deal.amount}`);
+  if (deal.valuation) parts.push(`Valuation: ${deal.valuation}`);
+  if (deal.our_allocation) parts.push(`Our allocation: ${deal.our_allocation}`);
+  if (deal.instrument_type) parts.push(`Instrument: ${deal.instrument_type}`);
+  if (deal.lead_source) parts.push(`Lead source: ${deal.lead_source}`);
+  if (deal.thesis_fit) parts.push(`Thesis fit: ${deal.thesis_fit}`);
+  if (deal.notes) parts.push(`Notes: ${deal.notes}`);
+  if (deal.expected_close) parts.push(`Expected close: ${deal.expected_close}`);
+  if (contacts.length > 0) {
+    const list = contacts
+      .map(c => (c.role ? `${c.full_name} (${c.role})` : c.full_name))
+      .join(', ');
+    parts.push(`Key contacts: ${list}`);
+  }
+  return parts.join('\n');
+}
+
+// Embed a single deal record into Vectorize. Idempotent — skips if a vector
+// already exists for this deal. Visibility is org_wide (deals are inherently
+// shared firm-internal artifacts). primary_entity_id is the linked
+// company_id when present so "what's our exposure to X" queries pull the
+// right deal alongside the company's enrichment vectors.
+export async function embedDeal(dealId: string, orgId: string, env: Env): Promise<'embedded' | 'skipped' | 'missing'> {
+  const deal = await env.D1.prepare(
+    `SELECT id, title, stage, amount, currency, probability, expected_close, notes,
+            valuation, our_allocation, instrument_type, lead_source, thesis_fit,
+            company_id, deleted_at
+       FROM deals WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(dealId, orgId).first<any>();
+  if (!deal) return 'missing';
+
+  const company = deal.company_id
+    ? await env.D1.prepare(
+        `SELECT id, name, sector, description FROM companies
+           WHERE id = ? AND deleted_at IS NULL`
+      ).bind(deal.company_id).first<any>()
+    : null;
+
+  const contactsResult = await env.D1.prepare(
+    `SELECT c.full_name, dc.role FROM deal_contacts dc
+       JOIN contacts c ON c.id = dc.contact_id
+       WHERE dc.deal_id = ? AND c.deleted_at IS NULL
+       ORDER BY dc.added_at`
+  ).bind(dealId).all<{ full_name: string; role: string | null }>();
+
+  const text = buildDealEmbeddingText(deal, company, contactsResult.results);
+
+  const meta: ChunkMetadata = {
+    org_id: orgId,
+    document_type: 'deal_record',
+    source_table: 'deals',
+    source_id: dealId,
+    r2_key: `${orgId}/deals/${dealId}.txt`, // synthesized; deals don't have an R2 body
+    visibility: 'org_wide',
+    primary_entity_id: deal.company_id || dealId,
+    secondary_entity_ids: contactsResult.results.length > 0
+      ? contactsResult.results.map(c => (c as any).contact_id || '').filter(Boolean).join(',') || undefined
+      : undefined,
+    created_at: new Date().toISOString(),
+    entity_name: deal.title || undefined,
+    deal_stage: deal.stage || undefined,
+  };
+
+  const entries = await chunkEmbedAndPersistAll(text, meta, env);
+  if (entries.length === 0) return 'skipped';
+
+  await env.D1.batch(
+    entries.map(e =>
+      env.D1.prepare(
+        'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+      ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+    )
+  );
+  return 'embedded';
+}
+
+// Lightweight bio backfill — embeds a contact's existing bio_summary as a
+// single 'enrichment' chunk. Used by the daily-cron backfill loop to close
+// the unembedded-but-has-bio gap (the full enrichment.ts pipeline only fires
+// on enrichment, not on contacts that already had a bio when ingested).
+// Idempotent — chunkEmbedAndPersistAll's dedup guard skips if a vector
+// already exists for this entity.
+export async function embedContactBio(
+  contactId: string,
+  orgId: string,
+  env: Env
+): Promise<'embedded' | 'skipped' | 'missing'> {
+  const contact = await env.D1.prepare(
+    `SELECT id, full_name, bio_summary FROM contacts
+       WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(contactId, orgId).first<{ id: string; full_name: string; bio_summary: string | null }>();
+  if (!contact) return 'missing';
+  if (!contact.bio_summary || contact.bio_summary.trim().length < 30) return 'missing';
+
+  const text = `${contact.full_name}\n\n${contact.bio_summary}`;
+  const meta: ChunkMetadata = {
+    org_id: orgId,
+    document_type: 'enrichment',
+    source_table: 'contacts',
+    source_id: contactId,
+    r2_key: `${orgId}/contact-bio/${contactId}.txt`,
+    visibility: 'org_wide',
+    primary_entity_id: contactId,
+    created_at: new Date().toISOString(),
+    entity_name: contact.full_name,
+  };
+
+  const entries = await chunkEmbedAndPersistAll(text, meta, env);
+  if (entries.length === 0) return 'skipped';
+
+  await env.D1.batch(
+    entries.map(e =>
+      env.D1.prepare(
+        'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+      ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+    )
+  );
+  return 'embedded';
+}
+
+export async function embedCompanyDescription(
+  companyId: string,
+  orgId: string,
+  env: Env
+): Promise<'embedded' | 'skipped' | 'missing'> {
+  const company = await env.D1.prepare(
+    `SELECT id, name, description, sector FROM companies
+       WHERE id = ? AND org_id = ? AND deleted_at IS NULL AND merged_into IS NULL`
+  ).bind(companyId, orgId).first<{ id: string; name: string; description: string | null; sector: string | null }>();
+  if (!company) return 'missing';
+  if (!company.description || company.description.trim().length < 30) return 'missing';
+
+  const parts = [company.name];
+  if (company.sector) parts.push(`Sector: ${company.sector}`);
+  parts.push(company.description);
+  const text = parts.join('\n\n');
+
+  const meta: ChunkMetadata = {
+    org_id: orgId,
+    document_type: 'enrichment',
+    source_table: 'companies',
+    source_id: companyId,
+    r2_key: `${orgId}/company-desc/${companyId}.txt`,
+    visibility: 'org_wide',
+    primary_entity_id: companyId,
+    created_at: new Date().toISOString(),
+    entity_name: company.name,
+  };
+
+  const entries = await chunkEmbedAndPersistAll(text, meta, env);
+  if (entries.length === 0) return 'skipped';
+
+  await env.D1.batch(
+    entries.map(e =>
+      env.D1.prepare(
+        'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+      ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+    )
+  );
+  return 'embedded';
+}
+
+// Re-embed a deal: deletes prior vectors first, then re-embeds. Use after a
+// content-bearing field changes (title, stage, notes, thesis, etc).
+export async function reembedDeal(dealId: string, orgId: string, env: Env): Promise<'embedded' | 'skipped' | 'missing'> {
+  const existing = await env.D1.prepare(
+    `SELECT vector_id FROM vector_entity_index WHERE entity_id = ? AND source_table = 'deals' AND org_id = ?`
+  ).bind(dealId, orgId).all<{ vector_id: string }>();
+
+  if (existing.results.length > 0) {
+    const ids = existing.results.map(r => r.vector_id);
+    await env.VECTORIZE.deleteByIds(ids).catch(() => {});
+    const placeholders = ids.map(() => '?').join(',');
+    await env.D1.prepare(
+      `DELETE FROM vector_entity_index WHERE vector_id IN (${placeholders})`
+    ).bind(...ids).run();
+    await Promise.all(
+      ids.map(id => env.KV.delete(`chunk:${id}`).catch(() => {}))
+    );
+  }
+
+  return embedDeal(dealId, orgId, env);
 }
