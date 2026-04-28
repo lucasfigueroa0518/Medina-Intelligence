@@ -489,7 +489,7 @@ async function routeAuthenticated(
     if (path === '/api/admin/run-daily-cron' && method === 'POST')
       return Admin.runDailyCronManually(ctx, env);
     if (path === '/api/admin/backfill-unembedded' && method === 'POST')
-      return Admin.backfillUnembedded(ctx, env);
+      return Admin.backfillUnembedded(request, ctx, env);
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     m = path.match(/^\/api\/admin\/users\/([^/]+)\/reset-password$/);

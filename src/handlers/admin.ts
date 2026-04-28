@@ -519,10 +519,13 @@ export async function updateSyncConfig(
 }
 
 export async function backfillUnembedded(
+  request: Request,
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
   const orgId = ctx.orgId;
+  const url = new URL(request.url);
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '25', 10) || 25, 1), 100);
 
   const unembedded = await env.D1.prepare(
     `SELECT c.id, c.body_r2_key, c.source, c.subject, c.from_email, c.sent_at,
@@ -535,8 +538,8 @@ export async function backfillUnembedded(
               AND vei.entity_id = c.id
          )
        ORDER BY c.sent_at DESC
-       LIMIT 500`
-  ).bind(orgId).all<{
+       LIMIT ?`
+  ).bind(orgId, limit).all<{
     id: string; body_r2_key: string | null; source: string; subject: string | null;
     from_email: string | null; sent_at: string | null; participant_user_ids: string | null;
   }>();
