@@ -231,6 +231,11 @@ export interface ClassifiableItem {
   visibility: 'private' | 'org_wide' | 'confidential';
   relatedCompanyId?: string;
   relatedCompanyName?: string;
+  // For type === 'news': the row id in news_articles. Threaded through so
+  // classification can use it as entityId (and source_table='news_articles')
+  // — news items don't get inserted into the conversations table, so a fresh
+  // UUID would orphan the vector_entity_index row (audit 2026-04-28).
+  articleId?: string;
   metadata?: ChunkMetadata;
   text?: string;
   attachments?: AttachmentMeta[];

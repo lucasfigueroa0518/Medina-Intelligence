@@ -20,14 +20,20 @@ interface OutlookAttachment {
   isInline?: boolean;
 }
 
+// Fields from Microsoft Graph that LOOK guaranteed but aren't, in practice:
+// drafts, calendar invites in mailbox, system notifications, and messages
+// from external systems (no-reply / mailer-daemon) routinely come back with
+// missing toRecipients, ccRecipients, from, or body. Marking everything that
+// can be missing as optional matches reality and lets TypeScript catch unsafe
+// reads at compile time.
 interface OutlookMessage {
   id: string;
-  subject: string;
-  bodyPreview: string;
-  body: { contentType: 'text' | 'html'; content: string };
-  from: { emailAddress: { name: string; address: string } };
-  toRecipients: Array<{ emailAddress: { name: string; address: string } }>;
-  ccRecipients: Array<{ emailAddress: { name: string; address: string } }>;
+  subject?: string;
+  bodyPreview?: string;
+  body?: { contentType: 'text' | 'html'; content: string };
+  from?: { emailAddress: { name: string; address: string } };
+  toRecipients?: Array<{ emailAddress: { name: string; address: string } }>;
+  ccRecipients?: Array<{ emailAddress: { name: string; address: string } }>;
   sentDateTime: string;
   receivedDateTime: string;
   conversationId: string;
@@ -107,17 +113,33 @@ async function fetchFolderDelta(
   return messages;
 }
 
+// Graph emails can be missing toRecipients / ccRecipients / from / body for
+// drafts, calendar-invite-as-email, system notifications, and a few other
+// states that Microsoft sends through the same /messages endpoint. The type
+// declarations claim these fields are always present, but the audit
+// 2026-04-28 captured "Cannot read properties of undefined (reading 'map')"
+// from the Outlook fetcher in two distinct runs. All raw-Graph reads in this
+// file null-coalesce defensively now.
 function classifyDirection(
   msg: OutlookMessage,
   internalDomains: string[]
 ): 'inbound' | 'outbound' | 'internal' {
-  const allRecipients = [
-    ...msg.toRecipients.map(r => r.emailAddress.address),
-    ...msg.ccRecipients.map(r => r.emailAddress.address),
-  ];
-  const fromIsInternal = internalDomains.some(d =>
-    msg.from.emailAddress.address.endsWith(`@${d}`)
-  );
+  const toAddrs = (msg.toRecipients ?? [])
+    .map(r => r?.emailAddress?.address)
+    .filter((a): a is string => Boolean(a));
+  const ccAddrs = (msg.ccRecipients ?? [])
+    .map(r => r?.emailAddress?.address)
+    .filter((a): a is string => Boolean(a));
+  const allRecipients = [...toAddrs, ...ccAddrs];
+
+  const fromAddr = msg.from?.emailAddress?.address;
+  const fromIsInternal = !!fromAddr && internalDomains.some(d => fromAddr.endsWith(`@${d}`));
+
+  // No recipients (e.g. malformed draft) → no recipients to classify against;
+  // treat as inbound so we don't drop the message but also don't wrongly tag
+  // it as internal/outbound.
+  if (allRecipients.length === 0) return 'inbound';
+
   const allRecipientsInternal = allRecipients.every(e =>
     internalDomains.some(d => e.endsWith(`@${d}`))
   );
@@ -161,19 +183,25 @@ function messageToClassifiableItem(
         .map(a => ({ id: a.id, name: a.name, size: a.size, contentType: a.contentType, isInline: a.isInline }))
     : undefined;
 
+  const bodyContent = msg.body?.content ?? msg.bodyPreview ?? '';
+  const bodyText = msg.body?.contentType === 'html' ? stripHtml(bodyContent) : bodyContent;
+
   return {
     type: 'email',
     source: 'outlook',
     externalId: msg.id,
     threadId: msg.conversationId,
-    subject: msg.subject,
-    bodyText:
-      msg.body.contentType === 'html' ? stripHtml(msg.body.content) : msg.body.content,
+    subject: msg.subject ?? '(no subject)',
+    bodyText,
     bodyPreview: (msg.bodyPreview || '').substring(0, 500),
-    fromEmail: msg.from.emailAddress.address,
-    fromName: msg.from.emailAddress.name,
-    toEmails: msg.toRecipients.map(r => r.emailAddress.address),
-    ccEmails: msg.ccRecipients.map(r => r.emailAddress.address),
+    fromEmail: msg.from?.emailAddress?.address ?? '',
+    fromName: msg.from?.emailAddress?.name ?? '',
+    toEmails: (msg.toRecipients ?? [])
+      .map(r => r?.emailAddress?.address)
+      .filter((a): a is string => Boolean(a)),
+    ccEmails: (msg.ccRecipients ?? [])
+      .map(r => r?.emailAddress?.address)
+      .filter((a): a is string => Boolean(a)),
     recipientNames,
     sentAt: msg.sentDateTime,
     direction,
@@ -562,9 +590,16 @@ export async function fetchOutlookCalendarDelta(
 
         if (!resp.ok) {
           const status = resp.status;
-          if (status === 410) {
+          // 410 Gone is the documented signal for "delta token expired";
+          // however Microsoft Graph also returns 400 with errors like
+          // "Resync required" or "Bad delta link" when the delta is stale,
+          // so treat 400 the same way: discard delta, log, retry next run
+          // with a fresh full sync. Audit 2026-04-28: Lucas, Alvaro, and
+          // Tony all sat with broken deltas for >24h because we only handled
+          // 410.
+          if (status === 410 || status === 400) {
             await env.KV.delete(deltaKey);
-            console.warn(`[outlook] Calendar delta token expired (410) for user ${user.id}, cleared for full re-sync`);
+            console.warn(`[outlook] Calendar delta token rejected (HTTP ${status}) for user ${user.id}, cleared for full re-sync`);
           } else if (status === 401) {
             await recordTokenFailure(user.id, 'outlook', env);
           }

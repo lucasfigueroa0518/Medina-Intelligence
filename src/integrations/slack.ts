@@ -7,6 +7,7 @@ interface SlackChannel {
   id: string;
   name: string;
   is_private?: boolean;
+  is_member?: boolean;
 }
 
 interface SlackMessage {
@@ -108,6 +109,25 @@ export async function fetchSlackMessages(
   const channels = channelsData.channels || [];
   let anyChannelReturnedMessages = false;
 
+  // Persist the channel inventory + membership state so System Status can
+  // surface "bot not in #X" without having to call Slack on every page load.
+  // Audit 2026-04-28: this is also the surface where auto-join outcomes are
+  // recorded — see the not_in_channel handler below.
+  if (channels.length > 0) {
+    await env.D1.batch(
+      channels.map(c =>
+        env.D1.prepare(
+          `INSERT INTO slack_channels (org_id, channel_id, channel_name, is_member, is_private)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(org_id, channel_id) DO UPDATE SET
+             channel_name = excluded.channel_name,
+             is_member = excluded.is_member,
+             is_private = excluded.is_private`
+        ).bind(orgId, c.id, c.name, c.is_member ? 1 : 0, c.is_private ? 1 : 0)
+      )
+    );
+  }
+
   for (const channel of channels) {
     // Per-channel marker so a newly-invited channel backfills from oldest=0
     // instead of inheriting the org-wide "last sync = now" and missing every
@@ -137,8 +157,46 @@ export async function fetchSlackMessages(
       };
       if (!data.ok) {
         const code = data.error || 'unknown';
+
+        // Auto-join recovery: if we got listed by conversations.list but the
+        // bot isn't actually in the channel, try to join and replay this
+        // history call once. Audit 2026-04-28: the prior code just recorded
+        // not_in_channel as an error every hour forever (#emerge sat
+        // unjoinable in every run for >24h). Auto-join makes new public
+        // channels reachable without manual /invite babysitting; private
+        // channels still need a human to invite the bot.
+        if (code === 'not_in_channel') {
+          console.log(`[slack] auto-joining #${channel.name} (${channel.id})`);
+          const joinResp = await slackFetchWithRetry(
+            `https://slack.com/api/conversations.join?channel=${encodeURIComponent(channel.id)}`,
+            authHeaders, `conversations.join #${channel.name}`,
+          );
+          const joinData = (await joinResp.json()) as { ok: boolean; error?: string };
+          const joinedAt = new Date().toISOString();
+          await env.D1.prepare(
+            `UPDATE slack_channels
+                SET is_member = ?, last_join_attempt_at = ?, last_error = ?
+              WHERE org_id = ? AND channel_id = ?`
+          ).bind(joinData.ok ? 1 : 0, joinedAt, joinData.ok ? null : (joinData.error || 'join_failed'), orgId, channel.id).run();
+
+          if (joinData.ok) {
+            console.log(`[slack] joined #${channel.name} — retrying history`);
+            cursor = undefined; // restart from oldest
+            continue;
+          } else {
+            const reason = joinData.error || 'join_failed';
+            console.warn(`[slack] couldn't join #${channel.name}: ${reason}`);
+            errors.push({ channel_id: channel.id, channel_name: channel.name, error: `cannot_join:${reason}` });
+            channelHadError = true;
+            break;
+          }
+        }
+
         console.warn(`[slack] conversations.history failed for #${channel.name}: ${code}`);
         errors.push({ channel_id: channel.id, channel_name: channel.name, error: code });
+        await env.D1.prepare(
+          `UPDATE slack_channels SET last_error = ? WHERE org_id = ? AND channel_id = ?`
+        ).bind(code, orgId, channel.id).run();
         channelHadError = true;
         break;
       }
@@ -185,6 +243,15 @@ export async function fetchSlackMessages(
     // messages that arrive between API call and our response.
     if (!channelHadError && latestTsThisChannel !== channelLastSync) {
       await env.KV.put(channelMarkerKey, latestTsThisChannel);
+    }
+
+    if (!channelHadError) {
+      await env.D1.prepare(
+        `UPDATE slack_channels
+            SET last_sync_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                last_error = NULL
+          WHERE org_id = ? AND channel_id = ?`
+      ).bind(orgId, channel.id).run();
     }
   }
 

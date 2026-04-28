@@ -210,7 +210,12 @@ export async function classifyAndDeduplicate(
     }.txt`;
     await env.R2.put(r2Key, item.bodyText);
 
-    const entityId = crypto.randomUUID();
+    // News items already exist as rows in news_articles (inserted by
+    // fetchNewsForActiveCompanies). Use that ID so vector_entity_index points
+    // at a real row. Everything else gets a fresh UUID — stage-approvals will
+    // INSERT a conversations / events row with this ID.
+    const entityId =
+      item.type === 'news' && item.articleId ? item.articleId : crypto.randomUUID();
 
     // --- participant resolution (v3.0 email privacy) ---
     let participantUserIds: string[] = [];
@@ -236,8 +241,15 @@ export async function classifyAndDeduplicate(
         ? 'news'
         : 'transcript';
 
+    // Match the actual table the entityId lives in. Audit 2026-04-28: the
+    // prior "everything-not-an-event = conversations" branch sent news items
+    // through with source_table='conversations', orphaning 50+ vectors per
+    // run because news items are persisted in news_articles and never land
+    // in conversations.
     const sourceTable =
-      item.type === 'calendar_event' ? 'events' : 'conversations';
+      item.type === 'calendar_event' ? 'events'
+      : item.type === 'news' ? 'news_articles'
+      : 'conversations';
 
     const metadata: ChunkMetadata = {
       org_id: orgId,

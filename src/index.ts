@@ -508,6 +508,10 @@ async function routeAuthenticated(
       return Admin.rebuildEntityIndexEndpoint(ctx, env);
     if (path === '/api/admin/cleanup-vector-bloat' && method === 'POST')
       return Admin.cleanupVectorBloat(ctx, env);
+    if (path === '/api/admin/calendar-token-health' && method === 'GET')
+      return Admin.getCalendarTokenHealth(ctx, env);
+    if (path === '/api/admin/invalidate-stale-calendar-tokens' && method === 'POST')
+      return Admin.invalidateStaleCalendarTokens(ctx, env);
     m = path.match(/^\/api\/admin\/users\/([^/]+)\/reset-password$/);
     if (m && method === 'POST')
       return AuthLogin.adminResetPassword(m[1], request, ctx, env);

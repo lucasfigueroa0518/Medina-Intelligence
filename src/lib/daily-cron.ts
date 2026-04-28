@@ -149,6 +149,11 @@ export async function backfillDomainShapedCompanyNames(orgId: string, env: Env):
 }
 
 export async function reconcileVectorIndex(orgId: string, env: Env): Promise<void> {
+  // Audit 2026-04-28: news_articles was missing from this UNION, so news
+  // vectors (after the source_table='news_articles' fix) would have been
+  // wrongly flagged as orphans on the next daily cron. Also widening the LIMIT
+  // because a single bad ingestion can create dozens of orphans we want
+  // cleared in one pass.
   const orphaned = await env.D1.prepare(
     `SELECT vei.vector_id FROM vector_entity_index vei WHERE vei.org_id = ?
        AND NOT EXISTS (
@@ -158,8 +163,13 @@ export async function reconcileVectorIndex(orgId: string, env: Env): Promise<voi
          UNION ALL SELECT 1 FROM conversations WHERE id = vei.entity_id AND vei.source_table = 'conversations'
          UNION ALL SELECT 1 FROM documents WHERE id = vei.entity_id AND vei.source_table = 'documents' AND deleted_at IS NULL
          UNION ALL SELECT 1 FROM deals WHERE id = vei.entity_id AND vei.source_table = 'deals' AND deleted_at IS NULL
-       ) LIMIT 200`
+         UNION ALL SELECT 1 FROM news_articles WHERE id = vei.entity_id AND vei.source_table = 'news_articles'
+       ) LIMIT 500`
   ).bind(orgId).all<{ vector_id: string }>();
+
+  if (orphaned.results.length > 0) {
+    console.warn(`[daily-cron] reconcileVectorIndex: ${orphaned.results.length} orphaned vectors found in org ${orgId}`);
+  }
 
   const ids = orphaned.results.map(r => r.vector_id);
   if (ids.length === 0) return;

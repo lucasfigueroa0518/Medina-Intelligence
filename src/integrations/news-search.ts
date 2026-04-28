@@ -313,6 +313,10 @@ async function fetchOneCompany(
             type: 'news',
             source: 'claude_search',
             externalId: `news:${hashShort(article.title + article.date)}`,
+            // articleId === news_articles.id from the INSERT above. Used by
+            // classification as entityId so vector_entity_index points at a
+            // real row (was orphaned with a fresh UUID prior to 2026-04-28).
+            articleId,
             subject: article.title,
             bodyText: `[${tag.toUpperCase()}] ${article.title}\n\n${article.summary}\n\nSource: ${article.source}${
               article.url ? ` (${article.url})` : ''

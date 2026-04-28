@@ -734,3 +734,113 @@ export async function cleanupVectorBloat(
       'Cleared entities will be re-embedded by the next ingestion run, then dedup prevents new bloat.',
   });
 }
+
+// Calendar OAuth health + recovery (audit 2026-04-28 Issue 1).
+//
+// 4 users have been failing token_refresh_failed every ingestion for >24h.
+// Calendars.Read is in the requested scope (auth-oauth.ts:37) so the issue
+// is stale refresh tokens — the user revoked access in Microsoft, changed
+// their password with MFA enabled, or didn't grant the calendar consent on
+// their original sign-in (pre-scope-addition).
+//
+// This endpoint:
+//   GET   — surfaces who's affected and the count, so you know who to ask to
+//           reconnect
+//   POST  — clears KV failure state + calendar_delta for affected users; the
+//           next sync after they re-OAuth will pick up calendar from scratch.
+//
+// Owner-only — destructive (clears state).
+export async function getCalendarTokenHealth(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const users = await env.D1.prepare(
+    `SELECT id, email, full_name, outlook_token IS NOT NULL AS has_token
+       FROM users WHERE org_id = ? AND deleted_at IS NULL
+       ORDER BY email`
+  ).bind(ctx.orgId).all<{ id: string; email: string; full_name: string | null; has_token: number }>();
+
+  const report: Array<{
+    user_id: string;
+    email: string;
+    full_name: string | null;
+    has_outlook_token: boolean;
+    consecutive_failures: number;
+    last_failed: string | null;
+    has_calendar_delta: boolean;
+  }> = [];
+
+  for (const u of users.results) {
+    const failState = await env.KV.get<{ count: number; last_failed: string }>(
+      `token_failed:${u.id}:outlook`,
+      'json'
+    );
+    const calDelta = await env.KV.get(`calendar_delta:${u.id}`);
+    report.push({
+      user_id: u.id,
+      email: u.email,
+      full_name: u.full_name,
+      has_outlook_token: !!u.has_token,
+      consecutive_failures: failState?.count ?? 0,
+      last_failed: failState?.last_failed ?? null,
+      has_calendar_delta: !!calDelta,
+    });
+  }
+
+  const affected = report.filter(r => r.consecutive_failures > 0);
+  return jsonResponse({
+    ok: true,
+    total_users: report.length,
+    affected_count: affected.length,
+    affected,
+    all_users: report,
+  });
+}
+
+export async function invalidateStaleCalendarTokens(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can invalidate calendar tokens.');
+  }
+
+  const users = await env.D1.prepare(
+    `SELECT id, email FROM users WHERE org_id = ? AND deleted_at IS NULL`
+  ).bind(ctx.orgId).all<{ id: string; email: string }>();
+
+  const cleared: Array<{ user_id: string; email: string; consecutive_failures: number }> = [];
+  for (const u of users.results) {
+    const failState = await env.KV.get<{ count: number }>(`token_failed:${u.id}:outlook`, 'json');
+    if (!failState || (failState.count ?? 0) === 0) continue;
+
+    // Clear the calendar delta so the post-reconnect sync starts fresh
+    // rather than trying to resume from a token issued under the bad
+    // session. Keep the token_failed counter — clearing it would let the
+    // worker burn through quota retrying still-broken tokens.
+    await env.KV.delete(`calendar_delta:${u.id}`);
+    cleared.push({
+      user_id: u.id,
+      email: u.email,
+      consecutive_failures: failState.count ?? 0,
+    });
+  }
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'hard_delete',
+    entity_type: 'integration',
+    entity_id: 'calendar_delta_invalidation',
+    metadata: { cleared_count: cleared.length, cleared_users: cleared.map(c => c.email) },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({
+    ok: true,
+    cleared_count: cleared.length,
+    cleared,
+    next_steps:
+      'Affected users must reconnect Outlook in Settings → Sync & Integrations. After reconnect, their next ingestion run does a full calendar sync.',
+  });
+}
