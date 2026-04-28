@@ -31,7 +31,7 @@ import * as Webhooks from './handlers/webhooks';
 import * as AuthOAuth from './handlers/auth-oauth';
 import * as Users from './handlers/users';
 import * as Integrations from './handlers/integrations';
-import * as Dashboard from './handlers/dashboard';
+import * as SystemStatusHandler from './handlers/system-status';
 
 import { handleAuditBatch } from './workers/audit-consumer';
 import { handleWebhookBatch } from './workers/webhook-consumer';
@@ -157,6 +157,12 @@ if (path === '/webhooks/firefly' && method === 'POST') {
   }
   if (path === '/api/auth/set-initial-password' && method === 'POST') {
     return withCors(await AuthLogin.setInitialPassword(request, env), reqOrigin, env);
+  }
+  if (path === '/api/auth/verify' && method === 'GET') {
+    return withCors(await AuthLogin.verifyEmail(request, env), reqOrigin, env);
+  }
+  if (path === '/api/auth/resend-verification' && method === 'POST') {
+    return withCors(await AuthLogin.resendVerification(request, env), reqOrigin, env);
   }
 
   // --- Authenticated routes ---
@@ -503,13 +509,9 @@ async function routeAuthenticated(
   if (path === '/api/integrations/status' && method === 'GET')
     return Integrations.getIntegrationsStatus(request, ctx, env);
 
-  // --- Command Center (real-time dashboard) ---
-  if (path === '/api/dashboard/pulse' && method === 'GET')
-    return Dashboard.getDashboardPulse(ctx, env);
-  if (path === '/api/dashboard/activity' && method === 'GET')
-    return Dashboard.getDashboardActivity(ctx, env);
-  if (path === '/api/dashboard/sparklines' && method === 'GET')
-    return Dashboard.getDashboardSparklines(ctx, env);
+  // --- Settings → System Status tab ---
+  if (path === '/api/settings/system-status' && method === 'GET')
+    return SystemStatusHandler.getSystemStatus(ctx, env);
   if (path === '/api/integrations/firefly/webhook-secret' && method === 'GET')
     return Integrations.getFireflyWebhookSecret(ctx, env);
 

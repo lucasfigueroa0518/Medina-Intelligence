@@ -15,6 +15,9 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showEntrance, setShowEntrance] = useState(false);
+  const [unverifiedEmail, setUnverifiedEmail] = useState('');
+  const [resending, setResending] = useState(false);
+  const [resent, setResent] = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -33,14 +36,19 @@ export default function LoginPage() {
       });
       clearTimeout(timeout);
 
+      const data = await res.json().catch(() => ({} as any));
+
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
+        if (data.error === 'EMAIL_NOT_VERIFIED') {
+          setUnverifiedEmail(data.email || email);
+          setError('Please verify your email address before signing in.');
+          setLoading(false);
+          return;
+        }
         setError(data.message || 'Invalid email or password');
         setLoading(false);
         return;
       }
-
-      const data = await res.json();
 
       if (data.mfa_required === 'verify' && data.mfa_token) {
         sessionStorage.setItem('mfa_pending_token', data.mfa_token);
@@ -64,6 +72,28 @@ export default function LoginPage() {
     }
   }
 
+  async function handleResendVerification() {
+    if (!unverifiedEmail || resending) return;
+    setResending(true);
+    try {
+      const res = await fetch(`${API_ORIGIN}/api/auth/resend-verification`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: unverifiedEmail }),
+      });
+      if (res.status === 429) {
+        setError('Please wait a minute before requesting another email.');
+      } else {
+        setResent(true);
+        setError('');
+      }
+    } catch {
+      setError('Unable to connect to the server.');
+    } finally {
+      setResending(false);
+    }
+  }
+
   if (showEntrance) {
     return <EntranceAnimation onComplete={() => router.push('/god-mode')} />;
   }
@@ -83,6 +113,22 @@ export default function LoginPage() {
           {error && (
             <div className="bg-semantic-error/10 border border-semantic-error/30 rounded-lg px-4 py-3 text-sm text-semantic-error">
               {error}
+            </div>
+          )}
+
+          {unverifiedEmail && !resent && (
+            <button
+              type="button"
+              onClick={handleResendVerification}
+              disabled={resending}
+              className="w-full text-center text-sm text-accent-purple hover:underline disabled:opacity-50"
+            >
+              {resending ? 'Sending...' : 'Resend verification email'}
+            </button>
+          )}
+          {resent && (
+            <div className="bg-semantic-success/10 border border-semantic-success/30 rounded-lg px-4 py-3 text-sm text-semantic-success">
+              Verification email sent. Check your inbox.
             </div>
           )}
 

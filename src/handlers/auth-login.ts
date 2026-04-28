@@ -4,6 +4,7 @@ import { signJwt, verifyJwt, verifyPurposeJwt } from './auth';
 import { jsonResponse, errorResponse } from './utils';
 import { emitAudit } from '../lib/audit';
 import { generateSecret, otpauthUrl, verifyTotp, generateRecoveryCodes, hashRecoveryCode } from '../lib/totp';
+import { sendVerificationEmail } from '../lib/verification-email';
 
 const PBKDF2_ITERATIONS = 100_000;
 const SALT_BYTES = 32;
@@ -83,6 +84,28 @@ export async function isTokenRevoked(token: string, env: Env): Promise<boolean> 
   return row.revoked_at !== null;
 }
 
+async function generateVerificationToken(): Promise<string> {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function createVerificationToken(
+  userId: string,
+  email: string,
+  env: Env
+): Promise<string> {
+  const token = await generateVerificationToken();
+  const tokenHash = await hashTokenForStorage(token);
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+  await env.D1.prepare(
+    `INSERT INTO email_verification_tokens (user_id, token_hash, email, expires_at)
+     VALUES (?, ?, ?, ?)`
+  ).bind(userId, tokenHash, email, expiresAt).run();
+
+  return token;
+}
+
 /**
  * POST /api/auth/register
  */
@@ -119,18 +142,12 @@ export async function register(request: Request, env: Env): Promise<Response> {
 
   const userId = crypto.randomUUID();
   const passwordHash = await hashPassword(password);
+  const lowerEmail = email.toLowerCase();
 
   await env.D1.prepare(
-    `INSERT INTO users (id, org_id, email, full_name, role, password_hash, is_active)
-     VALUES (?, ?, ?, ?, 'member', ?, 1)`
-  ).bind(userId, org_id, email.toLowerCase(), full_name, passwordHash).run();
-
-  const expiresAt = new Date(Date.now() + 7 * 86400 * 1000).toISOString();
-  const token = await signJwt(
-    { sub: userId, org_id, role: 'member', email: email.toLowerCase() },
-    env
-  );
-  await recordToken(userId, token, expiresAt, env);
+    `INSERT INTO users (id, org_id, email, full_name, role, password_hash, is_active, email_verified)
+     VALUES (?, ?, ?, ?, 'member', ?, 1, 0)`
+  ).bind(userId, org_id, lowerEmail, full_name, passwordHash).run();
 
   await emitAudit(env, {
     org_id,
@@ -142,9 +159,16 @@ export async function register(request: Request, env: Env): Promise<Response> {
     created_at: new Date().toISOString(),
   });
 
+  const verificationToken = await createVerificationToken(userId, lowerEmail, env);
+  const emailResult = await sendVerificationEmail(userId, lowerEmail, full_name, verificationToken, org_id, env);
+  if (!emailResult.ok) {
+    console.error(`[register] verification email failed for ${lowerEmail}: ${emailResult.error}`);
+  }
+
   return jsonResponse({
-    token,
-    user: { id: userId, email: email.toLowerCase(), full_name, role: 'member' },
+    verification_pending: true,
+    email: lowerEmail,
+    message: 'Account created. Please check your email to verify your address.',
   }, 201);
 }
 
@@ -185,6 +209,13 @@ export async function login(request: Request, env: Env): Promise<Response> {
   const valid = await verifyPassword(password, user.password_hash);
   if (!valid) {
     return errorResponse('INVALID_CREDENTIALS', 401, 'Invalid email or password');
+  }
+
+  if (!user.email_verified) {
+    return jsonResponse(
+      { error: 'EMAIL_NOT_VERIFIED', message: 'Please verify your email address before signing in.', email: user.email },
+      403
+    );
   }
 
   // If 2FA is enabled, return a short-lived purpose-scoped token instead of a session.
@@ -548,15 +579,8 @@ export async function signup(request: Request, env: Env): Promise<Response> {
   const passwordHash = await hashPassword(password);
   await env.D1.prepare(
     `INSERT INTO users (id, org_id, email, full_name, role, password_hash, is_active, email_verified)
-     VALUES (?, ?, ?, ?, 'member', ?, 1, 1)`
+     VALUES (?, ?, ?, ?, 'member', ?, 1, 0)`
   ).bind(userId, orgId, lowerEmail, full_name, passwordHash).run();
-
-  const expiresAt = new Date(Date.now() + 7 * 86400 * 1000).toISOString();
-  const token = await signJwt(
-    { sub: userId, org_id: orgId, role: 'member', email: lowerEmail },
-    env
-  );
-  await recordToken(userId, token, expiresAt, env);
 
   await emitAudit(env, {
     org_id: orgId,
@@ -568,10 +592,128 @@ export async function signup(request: Request, env: Env): Promise<Response> {
     created_at: new Date().toISOString(),
   });
 
+  const verificationToken = await createVerificationToken(userId, lowerEmail, env);
+  const emailResult = await sendVerificationEmail(userId, lowerEmail, full_name, verificationToken, orgId, env);
+  if (!emailResult.ok) {
+    console.error(`[signup] verification email failed for ${lowerEmail}: ${emailResult.error}`);
+  }
+
   return jsonResponse({
-    token,
-    user: { id: userId, email: lowerEmail, full_name, role: 'member', org_id: orgId },
+    verification_pending: true,
+    email: lowerEmail,
+    message: 'Account created. Please check your email to verify your address.',
   }, 201);
+}
+
+// =====================================================================
+// Email Verification
+// =====================================================================
+
+/**
+ * GET /api/auth/verify?token=...
+ * Public endpoint — verifies email and returns success/failure JSON.
+ */
+export async function verifyEmail(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const token = url.searchParams.get('token');
+  if (!token) {
+    return jsonResponse({ error: 'MISSING_TOKEN', message: 'Verification token is required.' }, 400);
+  }
+
+  const tokenHash = await hashTokenForStorage(token);
+
+  const row = await env.D1.prepare(
+    `SELECT id, user_id, email, expires_at, used_at
+     FROM email_verification_tokens WHERE token_hash = ?`
+  ).bind(tokenHash).first<{
+    id: string; user_id: string; email: string; expires_at: string; used_at: string | null;
+  }>();
+
+  if (!row) {
+    return jsonResponse({ error: 'INVALID_TOKEN', message: 'This verification link is invalid.' }, 400);
+  }
+
+  if (row.used_at) {
+    return jsonResponse({ error: 'ALREADY_VERIFIED', message: 'This email has already been verified.' }, 400);
+  }
+
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    return jsonResponse({ error: 'TOKEN_EXPIRED', message: 'This verification link has expired. Please request a new one.' }, 400);
+  }
+
+  await env.D1.prepare(
+    `UPDATE users SET email_verified = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id = ? AND email = ?`
+  ).bind(row.user_id, row.email).run();
+
+  await env.D1.prepare(
+    `UPDATE email_verification_tokens SET used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id = ?`
+  ).bind(row.id).run();
+
+  const user = await env.D1.prepare(
+    'SELECT org_id FROM users WHERE id = ?'
+  ).bind(row.user_id).first<{ org_id: string }>();
+
+  await emitAudit(env, {
+    org_id: user?.org_id || '',
+    user_id: row.user_id,
+    action: 'email_verified',
+    entity_type: 'user',
+    entity_id: row.user_id,
+    metadata: { email: row.email },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ ok: true, message: 'Email verified successfully. You can now sign in.' });
+}
+
+const RESEND_COOLDOWN_MS = 60 * 1000;
+
+/**
+ * POST /api/auth/resend-verification
+ * Body: { email }. Public endpoint — rate-limited to 1 per minute per email.
+ */
+export async function resendVerification(request: Request, env: Env): Promise<Response> {
+  let body: { email?: string };
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('INVALID_BODY', 400);
+  }
+
+  const email = body.email?.toLowerCase();
+  if (!email) {
+    return errorResponse('MISSING_FIELDS', 400, 'email is required');
+  }
+
+  const rateLimitKey = `verify_resend:${email}`;
+  const lastSent = await env.KV.get(rateLimitKey);
+  if (lastSent) {
+    return jsonResponse(
+      { error: 'RATE_LIMITED', message: 'Please wait before requesting another verification email.' },
+      429
+    );
+  }
+
+  const user = await env.D1.prepare(
+    `SELECT id, org_id, full_name, email_verified
+     FROM users WHERE email = ? AND deleted_at IS NULL`
+  ).bind(email).first<{ id: string; org_id: string; full_name: string; email_verified: number | null }>();
+
+  await env.KV.put(rateLimitKey, '1', { expirationTtl: 60 });
+
+  if (!user || user.email_verified) {
+    return jsonResponse({ ok: true, message: 'If that email exists and is unverified, a verification link has been sent.' });
+  }
+
+  const verificationToken = await createVerificationToken(user.id, email, env);
+  const emailResult = await sendVerificationEmail(user.id, email, user.full_name, verificationToken, user.org_id, env);
+  if (!emailResult.ok) {
+    console.error(`[resend-verification] email failed for ${email}: ${emailResult.error}`);
+  }
+
+  return jsonResponse({ ok: true, message: 'If that email exists and is unverified, a verification link has been sent.' });
 }
 
 // =====================================================================

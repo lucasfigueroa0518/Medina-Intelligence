@@ -171,6 +171,17 @@ export async function requireAuth(
       { status: 401, headers: { 'Content-Type': 'application/json' } }
     );
   }
+
+  const verified = await env.D1.prepare(
+    'SELECT email_verified FROM users WHERE id = ? AND deleted_at IS NULL'
+  ).bind(ctx.userId).first<{ email_verified: number | null }>();
+  if (verified && !verified.email_verified) {
+    return new Response(
+      JSON.stringify({ error: 'EMAIL_NOT_VERIFIED', message: 'Please verify your email address.' }),
+      { status: 403, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
   return ctx;
 }
 

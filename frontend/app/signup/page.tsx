@@ -48,6 +48,10 @@ export default function SignupPage() {
         return;
       }
       const data = await res.json();
+      if (data.verification_pending) {
+        router.push(`/auth/check-email?email=${encodeURIComponent(data.email || email)}`);
+        return;
+      }
       localStorage.setItem('auth_token', data.token);
       router.push('/god-mode');
     } catch {
