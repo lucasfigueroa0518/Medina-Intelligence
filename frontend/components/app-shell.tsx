@@ -6,7 +6,7 @@ import { SessionExpiredBanner } from '@/components/session-expired-banner';
 import { IntegrationWarningBanner } from '@/components/integration-warning-banner';
 import { BackgroundTaskProvider, BackgroundTaskIndicator } from '@/components/background-task-indicator';
 
-const NO_SHELL_PATHS = ['/login', '/signup', '/mfa'];
+const NO_SHELL_PATHS = ['/login', '/signup', '/mfa', '/auth'];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();

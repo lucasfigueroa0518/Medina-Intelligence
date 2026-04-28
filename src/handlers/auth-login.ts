@@ -278,7 +278,7 @@ export async function logout(request: Request, ctx: AuthContext, env: Env): Prom
  */
 export async function me(ctx: AuthContext, env: Env): Promise<Response> {
   const user = await env.D1.prepare(
-    `SELECT id, email, full_name, role, org_id, avatar_url, phone, job_title, linkedin_url, bio, last_login_at, share_emails_org_wide
+    `SELECT id, email, full_name, role, org_id, avatar_url, phone, job_title, linkedin_url, bio, last_login_at, share_emails_org_wide, email_verified
      FROM users WHERE id = ? AND deleted_at IS NULL`
   ).bind(ctx.userId).first();
 

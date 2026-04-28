@@ -60,6 +60,22 @@ async function request<T>(
     throw new ApiError(401, 'Session expired', 'SESSION_EXPIRED');
   }
 
+  if (res.status === 403) {
+    const body = await res.text();
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed.error === 'EMAIL_NOT_VERIFIED') {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('auth:email-not-verified'));
+        }
+        throw new ApiError(403, parsed.message || 'Email not verified', 'EMAIL_NOT_VERIFIED');
+      }
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+    }
+    throw new ApiError(403, body);
+  }
+
   if (!res.ok) {
     const err = await res.text();
     throw new ApiError(res.status, err);
@@ -382,6 +398,7 @@ export interface UserProfile {
   bio: string | null;
   last_login_at: string | null;
   share_emails_org_wide: number | null;
+  email_verified: number | null;
 }
 
 // Resolve avatar_url for display. The backend stores R2-backed avatars as `r2:<key>`
