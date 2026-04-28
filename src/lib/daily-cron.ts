@@ -475,9 +475,28 @@ export async function backfillUnembeddedConversations(orgId: string, env: Env): 
 export async function processEmbedRetryQueue(
   orgId: string,
   env: Env
-): Promise<{ processed: number; succeeded: number; failed: number }> {
+): Promise<{ processed: number; succeeded: number; failed: number; stale_reset: number }> {
   const MAX_PER_RUN = 100;
   const MAX_ATTEMPTS = 3;
+  const STALE_AFTER_MINUTES = 10;
+
+  // Reset rows stuck in 'in_progress' from a prior drain that died mid-flight
+  // (Worker isolate eviction, ungraceful shutdown, or external script crash).
+  // Without this, a stalled row stays in_progress forever and never retries.
+  // STALE_AFTER_MINUTES gives a healthy drain plenty of time to finish a row;
+  // anything beyond that is genuinely stuck.
+  const staleReset = await env.D1.prepare(
+    `UPDATE embed_retry_queue
+        SET status = 'pending'
+      WHERE org_id = ?
+        AND status = 'in_progress'
+        AND (last_attempt_at IS NULL
+             OR last_attempt_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?))`
+  ).bind(orgId, `-${STALE_AFTER_MINUTES} minutes`).run();
+  const stale_reset = staleReset.meta.changes ?? 0;
+  if (stale_reset > 0) {
+    console.log(`[embed-retry-queue] reset ${stale_reset} stale in_progress rows for org ${orgId}`);
+  }
 
   const queued = await env.D1.prepare(
     `SELECT id, entity_id, source_table, attempts
@@ -489,7 +508,7 @@ export async function processEmbedRetryQueue(
     id: string; entity_id: string; source_table: string; attempts: number;
   }>();
 
-  if (queued.results.length === 0) return { processed: 0, succeeded: 0, failed: 0 };
+  if (queued.results.length === 0) return { processed: 0, succeeded: 0, failed: 0, stale_reset };
 
   let succeeded = 0;
   let failed = 0;
@@ -530,7 +549,7 @@ export async function processEmbedRetryQueue(
   console.log(
     `[embed-retry-queue] org=${orgId} processed=${queued.results.length} succeeded=${succeeded} failed=${failed}`
   );
-  return { processed: queued.results.length, succeeded, failed };
+  return { processed: queued.results.length, succeeded, failed, stale_reset };
 }
 
 // Re-embed a single item from its source table. Returns:
