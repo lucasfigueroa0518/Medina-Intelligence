@@ -72,11 +72,12 @@ export async function detectIngestionDivergence(
   orgId: string,
   env: Env
 ): Promise<{ orphan_attachment_conversations: number }> {
+  // `conversations` has no deleted_at column — soft-delete is not modeled
+  // for emails. Just guard against soft-deleted documents on the inner side.
   const row = await env.D1.prepare(
     `SELECT COUNT(*) as n FROM conversations c
        WHERE c.org_id = ?
          AND c.has_attachments = 1
-         AND c.deleted_at IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM documents d
             WHERE d.conversation_id = c.id
