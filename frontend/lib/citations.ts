@@ -54,13 +54,22 @@ export function trimPartialCitation(text: string): string {
   return text.replace(/\[\^?\d*$/, '');
 }
 
-// Remark plugin: walks the mdast tree, splits text nodes around `[^N]` matches,
-// and rewrites each marker as a `link` node whose URL is `citation:N`. The
-// MarkdownMessage component hooks into the `a` renderer and recognizes that
-// scheme to render a CitationPill instead of a real link.
+// Remark plugin: rewrites every `[^N]` marker into a `link` node whose URL is
+// `citation:N`. The MarkdownMessage component hooks into the `a` renderer and
+// recognizes that scheme to render a CitationPill instead of a real link.
 //
-// Runs before remark-gfm so GFM's footnote-reference parsing never sees the
-// markers; this avoids them being lifted into a footnote definitions list.
+// remark-gfm's footnote syntax extension runs at the PARSE stage, regardless
+// of plugin order — by the time any tree-transformer runs, `[^N]` has already
+// been parsed into `footnoteReference` mdast nodes (and any matching `[^N]: …`
+// definitions into `footnoteDefinition`s, which GFM otherwise renders as a
+// "Footnotes" section at the bottom of the message). To intercept citations,
+// the plugin handles BOTH cases:
+//   1. `footnoteReference` nodes — rewritten to `link → citation:N` in place.
+//   2. text nodes containing literal `[^N]` — split and rewritten the same way
+//      (covers the case where remark-gfm isn't loaded, or future markdown
+//      renderers without GFM footnote support).
+// `footnoteDefinition` nodes are stripped from the tree so the auto-generated
+// footnotes section never renders.
 export function citationsRemarkPlugin() {
   return function transform(tree: any) {
     walk(tree);
@@ -71,15 +80,43 @@ function walk(node: any): void {
   if (!node || !Array.isArray(node.children)) return;
   for (let i = 0; i < node.children.length; i++) {
     const child = node.children[i];
+
+    // Strip GFM's auto-generated footnote definitions — we render citations
+    // ourselves via CitationPill + the SourcePanel side panel, so the footnote
+    // section at the bottom of the message would be a duplicate.
+    if (child?.type === 'footnoteDefinition') {
+      node.children.splice(i, 1);
+      i -= 1;
+      continue;
+    }
+
+    // GFM has already parsed `[^N]` into a footnoteReference node. Replace it
+    // with a citation link node in place.
+    if (child?.type === 'footnoteReference') {
+      const idStr = String(child.identifier ?? child.label ?? '');
+      const idNum = parseInt(idStr, 10);
+      if (!Number.isNaN(idNum)) {
+        node.children[i] = {
+          type: 'link',
+          url: `citation:${idNum}`,
+          title: null,
+          children: [{ type: 'text', value: String(idNum) }],
+        };
+      }
+      continue;
+    }
+
+    // Fallback: GFM not loaded → markers are still in raw text nodes.
     if (child?.type === 'text' && typeof child.value === 'string' && child.value.includes('[^')) {
       const replacements = splitText(child.value);
       if (replacements) {
         node.children.splice(i, 1, ...replacements);
-        i += replacements.length - 1; // skip past the freshly inserted leaf nodes
+        i += replacements.length - 1;
         continue;
       }
     }
-    // Don't recurse into link children — citation:N links are already terminal.
+
+    // Don't recurse into citation:N links — they're already terminal.
     if (child?.type === 'link' && typeof child.url === 'string' && child.url.startsWith('citation:')) {
       continue;
     }
