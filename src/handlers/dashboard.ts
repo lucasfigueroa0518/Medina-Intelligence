@@ -41,13 +41,19 @@ export interface PulseResponse {
   status_message: string;
   active_processes: ActiveProcess[];
   capacity: {
-    claude: CapacityGauge;
-    gemini: CapacityGauge;
-    graph: CapacityGauge;
-    slack: ServiceStatus;
-    reversecontact: ServiceStatus;
+    claude: CapacityGauge & { last_call_at?: string | null };
+    gemini: CapacityGauge & { last_call_at?: string | null; window_resets_at?: string | null };
+    graph: CapacityGauge & { window_resets_at?: string | null };
+    slack: ServiceStatus & { last_sync_at?: string | null; messages_today?: number };
+    reversecontact: ServiceStatus & { last_enrichment_at?: string | null; enriched_today?: number };
   };
   alerts: Array<{ type: 'warning' | 'error'; message: string; timestamp: string }>;
+  // Idle-state context: next scheduled cron fires (ISO).
+  next_runs: {
+    ingestion: string;
+    enrichment: string;
+    daily: string;
+  };
 }
 
 const WORKFLOW_LABEL: Record<string, { type: ActiveProcess['type']; label: string }> = {
@@ -94,6 +100,36 @@ function gaugeFor(used: number, limit: number, name: string): CapacityGauge {
   return { used, limit, percentage: Math.round(pct), label, status };
 }
 
+// Compute the next firing time of a cron pattern. Supports our three
+// schedules: '0 * * * *' (top of hour), '5 * * * *' (5 past hour), and
+// '0 0 * * *' (midnight UTC).
+function nextCronFire(pattern: string, now: Date = new Date()): string {
+  const next = new Date(now);
+  next.setUTCSeconds(0, 0);
+  if (pattern === '0 0 * * *') {
+    next.setUTCHours(0, 0, 0, 0);
+    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+    return next.toISOString();
+  }
+  // Hourly patterns: 'M * * * *'
+  const minute = parseInt(pattern.split(' ')[0], 10);
+  if (Number.isFinite(minute)) {
+    next.setUTCMinutes(minute, 0, 0);
+    if (next <= now) next.setUTCHours(next.getUTCHours() + 1);
+    return next.toISOString();
+  }
+  // Fallback: 1 hour from now
+  return new Date(now.getTime() + 3600_000).toISOString();
+}
+
+// Boundary of "today" in UTC — used for the "+N today" deltas in the stats
+// bar and for messages_today / enriched_today on capacity cards.
+function startOfTodayUtc(): string {
+  const d = new Date();
+  d.setUTCHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
 export async function getDashboardPulse(
   ctx: AuthContext,
   env: Env
@@ -137,34 +173,93 @@ export async function getDashboardPulse(
   const geminiMax = parseInt((env as any).GEMINI_MAX_RPM || '500', 10);
   const graphMax = 10000;
 
-  const [claudeBackoff, geminiBackoff, geminiNewsBackoff, graphState, rcCircuitRaw, rcRateRaw] = await Promise.all([
+  const todayStart = startOfTodayUtc();
+
+  const [
+    claudeBackoff, geminiBackoff, geminiNewsBackoff, graphState,
+    rcCircuitRaw, rcRateRaw, slackLastSyncRaw,
+    lastEnrichmentRow, slackTodayRow, rcEnrichedTodayRow,
+  ] = await Promise.all([
     env.KV.get(`rate_limit:claude:${orgId}`),
     env.KV.get(`rate_limit:gemini_enrichment:${orgId}`),
     env.KV.get(`rate_limit:gemini_news:${orgId}`),
     env.KV.get<{ count?: number; window_start?: string }>(`graph_rpm:${orgId}`, 'json'),
     env.KV.get(`rc_failures:${orgId}`),
     env.KV.get<{ blocked_until?: string }>(`rate_limit:reversecontact:${orgId}`, 'json'),
+    env.KV.get(`slack_last_sync:${orgId}`),
+    // Last enrichment cycle is our best proxy for "last Claude/Gemini call"
+    // since we don't write per-call timestamps. Cheap single row read.
+    env.D1.prepare(
+      `SELECT MAX(completed_at) as t FROM sync_jobs WHERE org_id = ? AND workflow_type = 'enrichment' AND status = 'completed'`
+    ).bind(orgId).first<{ t: string | null }>(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as n FROM conversations WHERE org_id = ? AND source = 'slack' AND created_at >= ?`
+    ).bind(orgId, todayStart).first<{ n: number }>(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as n FROM contacts WHERE org_id = ? AND linkedin_data_r2_key IS NOT NULL AND updated_at >= ? AND deleted_at IS NULL`
+    ).bind(orgId, todayStart).first<{ n: number }>(),
   ]);
 
-  const claude: CapacityGauge = claudeBackoff
-    ? gaugeFor(claudeMax, claudeMax, 'Claude')
-    : gaugeFor(0, claudeMax, 'Claude');
-  const gemini: CapacityGauge = (geminiBackoff || geminiNewsBackoff)
-    ? gaugeFor(geminiMax, geminiMax, 'Gemini')
-    : gaugeFor(0, geminiMax, 'Gemini');
-  const graphUsed = graphState?.count || 0;
-  const graph: CapacityGauge = gaugeFor(graphUsed, graphMax, 'Microsoft Graph');
+  const lastEnrichmentAt = lastEnrichmentRow?.t || null;
+  const slackLastSyncAt = slackLastSyncRaw || null;
 
-  const slack: ServiceStatus = { status: 'healthy', label: 'Active' };
+  const claude = {
+    ...(claudeBackoff
+      ? gaugeFor(claudeMax, claudeMax, 'Claude')
+      : gaugeFor(0, claudeMax, 'Claude')),
+    last_call_at: lastEnrichmentAt,
+  };
+  const geminiLimited = !!(geminiBackoff || geminiNewsBackoff);
+  const gemini = {
+    ...(geminiLimited
+      ? gaugeFor(geminiMax, geminiMax, 'Gemini')
+      : gaugeFor(0, geminiMax, 'Gemini')),
+    last_call_at: lastEnrichmentAt,
+    // Rate-limit windows reset 60s after the backoff was set; we don't
+    // store the exact timestamp, so estimate "soon" as 60s from now when
+    // limited.
+    window_resets_at: geminiLimited ? new Date(Date.now() + 60_000).toISOString() : null,
+  };
+  const graphUsed = graphState?.count || 0;
+  // Graph soft limit is 10k per 10min — window resets 10min after start.
+  const graphWindowStart = graphState?.window_start ? new Date(graphState.window_start).getTime() : 0;
+  const graph = {
+    ...gaugeFor(graphUsed, graphMax, 'Microsoft Graph'),
+    window_resets_at: graphWindowStart > 0 ? new Date(graphWindowStart + 10 * 60_000).toISOString() : null,
+  };
+
+  const slack = {
+    status: 'healthy' as const,
+    label: 'Active',
+    last_sync_at: slackLastSyncAt,
+    messages_today: slackTodayRow?.n || 0,
+  };
 
   const rcFailures = rcCircuitRaw ? parseInt(rcCircuitRaw, 10) : 0;
-  let reversecontact: ServiceStatus;
+  let reversecontact: PulseResponse['capacity']['reversecontact'];
+  const rcEnrichedToday = rcEnrichedTodayRow?.n || 0;
   if (rcFailures >= 3) {
-    reversecontact = { status: 'circuit_open', label: 'Circuit breaker open — needs operator reset' };
+    reversecontact = {
+      status: 'circuit_open',
+      label: 'Paused — auth issue, needs operator reset',
+      enriched_today: rcEnrichedToday,
+      last_enrichment_at: lastEnrichmentAt,
+    };
   } else if (rcRateRaw?.blocked_until && new Date(rcRateRaw.blocked_until) > new Date()) {
-    reversecontact = { status: 'rate_limited', label: 'Rate limited', blocked_until: rcRateRaw.blocked_until };
+    reversecontact = {
+      status: 'rate_limited',
+      label: 'Rate limited',
+      blocked_until: rcRateRaw.blocked_until,
+      enriched_today: rcEnrichedToday,
+      last_enrichment_at: lastEnrichmentAt,
+    };
   } else {
-    reversecontact = { status: 'active', label: 'Active' };
+    reversecontact = {
+      status: 'active',
+      label: 'Active',
+      enriched_today: rcEnrichedToday,
+      last_enrichment_at: lastEnrichmentAt,
+    };
   }
 
   // ── Alerts ──────────────────────────────────────────────────────────────
@@ -209,12 +304,21 @@ export async function getDashboardPulse(
     status_message = 'All systems operational';
   }
 
+  // Cron schedule from wrangler.toml: 0 * * * * = ingestion, 5 * * * * =
+  // enrichment, 0 0 * * * = daily maintenance.
+  const next_runs = {
+    ingestion: nextCronFire('0 * * * *'),
+    enrichment: nextCronFire('5 * * * *'),
+    daily: nextCronFire('0 0 * * *'),
+  };
+
   return jsonResponse({
     system_status,
     status_message,
     active_processes,
     capacity: { claude, gemini, graph, slack, reversecontact },
     alerts,
+    next_runs,
   } satisfies PulseResponse);
 }
 
@@ -245,6 +349,20 @@ export interface ActivityResponse {
     approval_items_created: number;
     approval_items_resolved: number;
   };
+  // Counts since UTC midnight today — used for "+N today" deltas in the
+  // stats bar so users see momentum, not just the rolling 24h total.
+  stats_today: {
+    emails_synced: number;
+    contacts_discovered: number;
+    contacts_enriched: number;
+    meetings_ingested: number;
+    documents_processed: number;
+  };
+  // For each activity icon type, the most recent entry of that type
+  // regardless of the 24h window. Used by the feed's filtered-empty state
+  // to tell the user "Last X was Y ago" instead of leaving them with a
+  // blank "no activity" panel.
+  last_of_type: Partial<Record<ActivityEntry['icon'], { timestamp: string; description: string }>>;
 }
 
 function describeCompletedJob(workflowType: string, metadata: any, itemsProcessed: number, status: string): {
@@ -268,16 +386,16 @@ function describeCompletedJob(workflowType: string, metadata: any, itemsProcesse
     if (n > 0) parts.push(`${n} news article${n === 1 ? '' : 's'}`);
     const desc = parts.length > 0
       ? `Synced ${parts.join(', ')}.${failures > 0 ? ` ${failures} channel issue${failures === 1 ? '' : 's'}.` : ''}`
-      : 'Nothing new this cycle.';
+      : 'Completed — no new messages found, all up to date.';
     return { icon: 'email', label: 'Email & Slack sync', description: desc };
   }
   if (workflowType === 'enrichment') {
     return {
       icon: 'enrichment',
-      label: 'Contact enrichment cycle',
+      label: 'Contact enrichment',
       description: itemsProcessed > 0
-        ? `Enriched ${itemsProcessed} entity${itemsProcessed === 1 ? '' : ' entries'}.`
-        : 'No contacts due for enrichment this cycle.',
+        ? `Enriched ${itemsProcessed} ${itemsProcessed === 1 ? 'entry' : 'entries'}.`
+        : 'All contacts up to date — next batch in 30 days.',
     };
   }
   if (workflowType === 'daily') {
@@ -322,13 +440,15 @@ export async function getDashboardActivity(
     };
   });
 
-  // ── 24h stats ──────────────────────────────────────────────────────────
+  // ── 24h stats + today-deltas ──────────────────────────────────────────
   const since24h = `strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')`;
+  const todayStart = startOfTodayUtc();
 
   const [
     emailsRow, slackRow, contactsRow, contactsEnrichedRow,
     companiesEnrichedRow, meetingsRow, docsRow,
     apqCreatedRow, apqResolvedRow,
+    emailsTodayRow, contactsTodayRow, contactsEnrichedTodayRow, meetingsTodayRow, docsTodayRow,
   ] = await Promise.all([
     env.D1.prepare(`SELECT COUNT(*) as n FROM conversations WHERE org_id=? AND source='outlook' AND created_at > ${since24h}`).bind(orgId).first<{n:number}>(),
     env.D1.prepare(`SELECT COUNT(*) as n FROM conversations WHERE org_id=? AND source='slack' AND created_at > ${since24h}`).bind(orgId).first<{n:number}>(),
@@ -339,7 +459,37 @@ export async function getDashboardActivity(
     env.D1.prepare(`SELECT COUNT(*) as n FROM documents WHERE org_id=? AND source='intelligent_import' AND created_at > ${since24h} AND deleted_at IS NULL`).bind(orgId).first<{n:number}>(),
     env.D1.prepare(`SELECT COUNT(*) as n FROM approval_queue WHERE org_id=? AND created_at > ${since24h}`).bind(orgId).first<{n:number}>(),
     env.D1.prepare(`SELECT COUNT(*) as n FROM approval_queue WHERE org_id=? AND status != 'pending' AND resolved_at > ${since24h}`).bind(orgId).first<{n:number}>(),
+    // Today (since UTC midnight) variants for the "+N today" delta pills.
+    env.D1.prepare(`SELECT COUNT(*) as n FROM conversations WHERE org_id=? AND source='outlook' AND created_at >= ?`).bind(orgId, todayStart).first<{n:number}>(),
+    env.D1.prepare(`SELECT COUNT(*) as n FROM contacts WHERE org_id=? AND created_at >= ? AND deleted_at IS NULL`).bind(orgId, todayStart).first<{n:number}>(),
+    env.D1.prepare(`SELECT COUNT(*) as n FROM contacts WHERE org_id=? AND enrichment_last_run >= ? AND deleted_at IS NULL`).bind(orgId, todayStart).first<{n:number}>(),
+    env.D1.prepare(`SELECT COUNT(*) as n FROM events WHERE org_id=? AND source='firefly' AND created_at >= ? AND deleted_at IS NULL`).bind(orgId, todayStart).first<{n:number}>(),
+    env.D1.prepare(`SELECT COUNT(*) as n FROM documents WHERE org_id=? AND source='intelligent_import' AND created_at >= ? AND deleted_at IS NULL`).bind(orgId, todayStart).first<{n:number}>(),
   ]);
+
+  // ── Last-of-type fallback for the activity feed's filtered-empty state ──
+  // When a user filters to e.g. "imports" and there's been no import in 24h,
+  // we still want to tell them "Last import was 3 days ago — N transcripts
+  // from Firefly" instead of leaving them with a blank panel.
+  const last_of_type: ActivityResponse['last_of_type'] = {};
+  const newest = await env.D1.prepare(
+    `SELECT workflow_type, status, items_processed, completed_at, metadata
+       FROM sync_jobs
+      WHERE org_id = ? AND completed_at IS NOT NULL
+      ORDER BY completed_at DESC
+      LIMIT 100`
+  ).bind(orgId).all<{
+    workflow_type: string; status: string; items_processed: number;
+    completed_at: string; metadata: string | null;
+  }>();
+  for (const r of newest.results) {
+    let metadata: any = {};
+    try { metadata = r.metadata ? JSON.parse(r.metadata) : {}; } catch { /* ignore */ }
+    const desc = describeCompletedJob(r.workflow_type, metadata, r.items_processed, r.status);
+    if (!last_of_type[desc.icon]) {
+      last_of_type[desc.icon] = { timestamp: r.completed_at, description: desc.description };
+    }
+  }
 
   return jsonResponse({
     recent_activity,
@@ -354,6 +504,14 @@ export async function getDashboardActivity(
       approval_items_created: apqCreatedRow?.n || 0,
       approval_items_resolved: apqResolvedRow?.n || 0,
     },
+    stats_today: {
+      emails_synced: emailsTodayRow?.n || 0,
+      contacts_discovered: contactsTodayRow?.n || 0,
+      contacts_enriched: contactsEnrichedTodayRow?.n || 0,
+      meetings_ingested: meetingsTodayRow?.n || 0,
+      documents_processed: docsTodayRow?.n || 0,
+    },
+    last_of_type,
   } satisfies ActivityResponse);
 }
 
@@ -367,8 +525,9 @@ export interface SparklinesResponse {
   claude: number[];
   gemini: number[];
   graph: number[];
-  overall: number[];
-  hours: string[]; // ISO hour starts, 24 entries
+  slack: number[];
+  hours: string[];          // ISO hour starts, 24 entries
+  total_24h: number;        // sum across all four series — shown as a header line
 }
 
 export async function getDashboardSparklines(
@@ -391,7 +550,7 @@ export async function getDashboardSparklines(
   const now = Date.now();
   const buckets = Array.from({ length: 24 }, (_, i) => ({
     hourStart: new Date(now - (23 - i) * 3600_000).toISOString().slice(0, 13) + ':00:00.000Z',
-    claude: 0, gemini: 0, graph: 0, overall: 0,
+    claude: 0, gemini: 0, graph: 0, slack: 0,
   }));
 
   function hourIndex(iso: string): number {
@@ -412,20 +571,36 @@ export async function getDashboardSparklines(
       buckets[idx].claude += items * 3;
       buckets[idx].gemini += items * 1;
     } else if (r.workflow_type === 'ingestion') {
-      const fetched = (metadata.fetched_outlook || 0) + (metadata.fetched_slack || 0);
-      buckets[idx].graph += metadata.fetched_outlook || 0;
-      buckets[idx].claude += fetched; // classification + extraction
+      const slackFetched = metadata.fetched_slack || 0;
+      const outlookFetched = metadata.fetched_outlook || 0;
+      const totalFetched = outlookFetched + slackFetched;
+      buckets[idx].graph += outlookFetched;
+      buckets[idx].claude += totalFetched; // classification + extraction
+      // Slack API estimate: each ingestion that fetched Slack does
+      // ~3 calls (auth.test + conversations.list + N×conversations.history).
+      // With per-channel paging we approximate at slackFetched/200 + 2.
+      if (slackFetched > 0) {
+        buckets[idx].slack += Math.max(2, Math.ceil(slackFetched / 50));
+      } else {
+        // Even a no-message poll calls auth.test + conversations.list.
+        buckets[idx].slack += 2;
+      }
     } else if (r.workflow_type === 'daily') {
       buckets[idx].claude += 5;
     }
-    buckets[idx].overall += 1;
   }
+
+  const total_24h = buckets.reduce(
+    (s, b) => s + b.claude + b.gemini + b.graph + b.slack,
+    0
+  );
 
   return jsonResponse({
     claude: buckets.map(b => b.claude),
     gemini: buckets.map(b => b.gemini),
     graph: buckets.map(b => b.graph),
-    overall: buckets.map(b => b.overall),
+    slack: buckets.map(b => b.slack),
     hours: buckets.map(b => b.hourStart),
+    total_24h,
   } satisfies SparklinesResponse);
 }
