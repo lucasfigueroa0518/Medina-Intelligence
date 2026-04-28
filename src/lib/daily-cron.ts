@@ -8,6 +8,7 @@ import { recalculateAllAssociations } from './associations';
 import { renewExpiringSubscriptions } from './graph-subscriptions';
 import { proposeMultipleUpdates } from './progressive-enrichment';
 import { callClaude } from './claude';
+import { rebuildEntityIndex } from './entity-index';
 
 export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await applyNewsScoreDecay(orgId, env); } catch (e) { console.error('Score decay:', e); }
@@ -24,6 +25,8 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await recalculateAllAssociations(orgId, env); } catch (e) { console.error('Association recalc:', e); }
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
   try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
+  try { await rebuildEntityIndex(orgId, env); } catch (e) { console.error('Entity index rebuild:', e); }
+  try { await cleanupExpiredResetTokens(env); } catch (e) { console.error('Reset token cleanup:', e); }
 }
 
 export async function applyNewsScoreDecay(orgId: string, env: Env): Promise<void> {
@@ -446,4 +449,13 @@ export async function backfillUnembeddedConversations(orgId: string, env: Env): 
     console.log(`[daily-cron] backfilled ${embedded} unembedded conversations for org ${orgId}`);
   }
   return embedded;
+}
+
+async function cleanupExpiredResetTokens(env: Env): Promise<void> {
+  await env.D1.prepare(
+    `DELETE FROM password_reset_tokens WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')`
+  ).run();
+  await env.D1.prepare(
+    `DELETE FROM email_verification_tokens WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')`
+  ).run();
 }

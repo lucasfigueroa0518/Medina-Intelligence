@@ -5,6 +5,7 @@ import { jsonResponse, errorResponse } from './utils';
 import { emitAudit } from '../lib/audit';
 import { generateSecret, otpauthUrl, verifyTotp, generateRecoveryCodes, hashRecoveryCode } from '../lib/totp';
 import { sendVerificationEmail } from '../lib/verification-email';
+import { sendResetEmail } from '../lib/reset-email';
 
 const PBKDF2_ITERATIONS = 100_000;
 const SALT_BYTES = 32;
@@ -720,6 +721,144 @@ export async function resendVerification(request: Request, env: Env): Promise<Re
   }
 
   return jsonResponse({ ok: true, message: 'If that email exists and is unverified, a verification link has been sent.' });
+}
+
+// =====================================================================
+// Password Reset
+// =====================================================================
+
+/**
+ * POST /api/auth/forgot-password
+ * Public endpoint — always returns the same response to prevent email enumeration.
+ */
+export async function forgotPassword(request: Request, env: Env): Promise<Response> {
+  const successMsg = 'If an account exists with that email, a password reset link has been sent.';
+
+  let body: { email?: string };
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ message: successMsg });
+  }
+
+  const email = body.email?.toLowerCase().trim();
+  if (!email) return jsonResponse({ message: successMsg });
+
+  const rateLimitKey = `reset_rate:${email}`;
+  const rateCount = parseInt(await env.KV.get(rateLimitKey) || '0');
+  if (rateCount >= 3) {
+    return jsonResponse({ message: successMsg });
+  }
+  await env.KV.put(rateLimitKey, String(rateCount + 1), { expirationTtl: 3600 });
+
+  const user = await env.D1.prepare(
+    'SELECT id, org_id, email, full_name FROM users WHERE email = ? AND deleted_at IS NULL AND is_active = 1'
+  ).bind(email).first<{ id: string; org_id: string; email: string; full_name: string }>();
+
+  if (!user) return jsonResponse({ message: successMsg });
+
+  await env.D1.prepare(
+    `UPDATE password_reset_tokens SET used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE user_id = ? AND used_at IS NULL`
+  ).bind(user.id).run();
+
+  const rawToken = crypto.randomUUID() + '-' + crypto.randomUUID();
+  const tokenHash = await hashTokenForStorage(rawToken);
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+
+  await env.D1.prepare(
+    `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, ip_address)
+     VALUES (?, ?, ?, ?)`
+  ).bind(user.id, tokenHash, expiresAt, ip).run();
+
+  const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+  const resetUrl = `${frontendUrl}/auth/reset-password?token=${encodeURIComponent(rawToken)}`;
+
+  const emailResult = await sendResetEmail(user.email, user.full_name, resetUrl, user.org_id, env);
+  if (!emailResult.ok) {
+    console.error(`[forgot-password] email send failed for ${email}: ${emailResult.error}`);
+  }
+
+  return jsonResponse({ message: successMsg });
+}
+
+/**
+ * POST /api/auth/reset-password
+ * Public endpoint — validates token and sets new password.
+ */
+export async function resetPassword(request: Request, env: Env): Promise<Response> {
+  let body: { token?: string; password?: string };
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('INVALID_BODY', 400);
+  }
+
+  const { token, password } = body;
+  if (!token) return errorResponse('MISSING_TOKEN', 400, 'Reset token is required.');
+  if (!password || password.length < 8) {
+    return errorResponse('WEAK_PASSWORD', 400, 'Password must be at least 8 characters.');
+  }
+
+  const tokenHash = await hashTokenForStorage(token);
+
+  const resetRecord = await env.D1.prepare(
+    'SELECT id, user_id, expires_at, used_at FROM password_reset_tokens WHERE token_hash = ?'
+  ).bind(tokenHash).first<{
+    id: string; user_id: string; expires_at: string; used_at: string | null;
+  }>();
+
+  if (!resetRecord) {
+    return jsonResponse(
+      { error: 'INVALID_TOKEN', message: 'This reset link is invalid. Please request a new one.' },
+      400
+    );
+  }
+  if (resetRecord.used_at) {
+    return jsonResponse(
+      { error: 'TOKEN_USED', message: 'This reset link has already been used. Please request a new one.' },
+      400
+    );
+  }
+  if (new Date(resetRecord.expires_at).getTime() < Date.now()) {
+    return jsonResponse(
+      { error: 'TOKEN_EXPIRED', message: 'This reset link has expired. Please request a new one.' },
+      400
+    );
+  }
+
+  const newHash = await hashPassword(password);
+
+  await env.D1.prepare(
+    `UPDATE users SET password_hash = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+  ).bind(newHash, resetRecord.user_id).run();
+
+  await env.D1.prepare(
+    `UPDATE password_reset_tokens SET used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE user_id = ? AND used_at IS NULL`
+  ).bind(resetRecord.user_id).run();
+
+  await env.D1.prepare(
+    `UPDATE auth_tokens SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE user_id = ? AND revoked_at IS NULL`
+  ).bind(resetRecord.user_id).run();
+
+  const user = await env.D1.prepare(
+    'SELECT org_id FROM users WHERE id = ?'
+  ).bind(resetRecord.user_id).first<{ org_id: string }>();
+
+  await emitAudit(env, {
+    org_id: user?.org_id || '',
+    user_id: resetRecord.user_id,
+    action: 'password_reset',
+    entity_type: 'user',
+    entity_id: resetRecord.user_id,
+    metadata: { ip: request.headers.get('cf-connecting-ip') || 'unknown' },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ ok: true, message: 'Password has been reset. Please sign in with your new password.' });
 }
 
 // =====================================================================

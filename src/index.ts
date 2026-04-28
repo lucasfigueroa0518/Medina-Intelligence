@@ -164,6 +164,12 @@ if (path === '/webhooks/firefly' && method === 'POST') {
   if (path === '/api/auth/resend-verification' && method === 'POST') {
     return withCors(await AuthLogin.resendVerification(request, env), reqOrigin, env);
   }
+  if (path === '/api/auth/forgot-password' && method === 'POST') {
+    return withCors(await AuthLogin.forgotPassword(request, env), reqOrigin, env);
+  }
+  if (path === '/api/auth/reset-password' && method === 'POST') {
+    return withCors(await AuthLogin.resetPassword(request, env), reqOrigin, env);
+  }
 
   // --- Authenticated routes ---
   const authResult = await requireAuth(request, env);
@@ -498,6 +504,8 @@ async function routeAuthenticated(
       return Admin.backfillUnembedded(request, ctx, env);
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
+    if (path === '/api/admin/rebuild-entity-index' && method === 'POST')
+      return Admin.rebuildEntityIndexEndpoint(ctx, env);
     m = path.match(/^\/api\/admin\/users\/([^/]+)\/reset-password$/);
     if (m && method === 'POST')
       return AuthLogin.adminResetPassword(m[1], request, ctx, env);
