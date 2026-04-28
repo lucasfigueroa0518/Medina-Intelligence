@@ -10,6 +10,7 @@ const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL ?? '';
 export default function CheckEmailPage() {
   const params = useSearchParams();
   const email = params.get('email') || '';
+  const emailFailed = params.get('email_failed') === '1';
   const [resending, setResending] = useState(false);
   const [resent, setResent] = useState(false);
   const [error, setError] = useState('');
@@ -51,13 +52,27 @@ export default function CheckEmailPage() {
             </svg>
           </div>
 
-          <p className="text-text-secondary text-sm">
-            We sent a verification link to{' '}
-            {email ? <span className="text-text-primary font-medium">{email}</span> : 'your email address'}.
-          </p>
-          <p className="text-text-muted text-xs">
-            Click the link in the email to verify your account. The link expires in 24 hours.
-          </p>
+          {emailFailed ? (
+            <>
+              <p className="text-text-secondary text-sm">
+                Your account was created but we couldn&apos;t send a verification email to{' '}
+                {email ? <span className="text-text-primary font-medium">{email}</span> : 'your address'}.
+              </p>
+              <p className="text-text-muted text-xs">
+                Click &ldquo;Resend&rdquo; below to try again, or check your spam folder.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-text-secondary text-sm">
+                We sent a verification link to{' '}
+                {email ? <span className="text-text-primary font-medium">{email}</span> : 'your email address'}.
+              </p>
+              <p className="text-text-muted text-xs">
+                Click the link in the email to verify your account. The link expires in 24 hours.
+              </p>
+            </>
+          )}
 
           {error && (
             <div className="bg-semantic-error/10 border border-semantic-error/30 rounded-lg px-3 py-2 text-xs text-semantic-error">

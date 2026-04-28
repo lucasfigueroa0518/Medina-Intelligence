@@ -49,7 +49,9 @@ export default function SignupPage() {
       }
       const data = await res.json();
       if (data.verification_pending) {
-        router.push(`/auth/check-email?email=${encodeURIComponent(data.email || email)}`);
+        const emailParam = encodeURIComponent(data.email || email);
+        const failedParam = data.email_sent === false ? '&email_failed=1' : '';
+        router.push(`/auth/check-email?email=${emailParam}${failedParam}`);
         return;
       }
       localStorage.setItem('auth_token', data.token);

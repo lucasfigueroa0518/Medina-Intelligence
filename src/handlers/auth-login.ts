@@ -167,8 +167,11 @@ export async function register(request: Request, env: Env): Promise<Response> {
 
   return jsonResponse({
     verification_pending: true,
+    email_sent: emailResult.ok,
     email: lowerEmail,
-    message: 'Account created. Please check your email to verify your address.',
+    message: emailResult.ok
+      ? 'Account created. Please check your email to verify your address.'
+      : 'Account created. We could not send a verification email — please use "Resend" on the next page.',
   }, 201);
 }
 
@@ -600,8 +603,11 @@ export async function signup(request: Request, env: Env): Promise<Response> {
 
   return jsonResponse({
     verification_pending: true,
+    email_sent: emailResult.ok,
     email: lowerEmail,
-    message: 'Account created. Please check your email to verify your address.',
+    message: emailResult.ok
+      ? 'Account created. Please check your email to verify your address.'
+      : 'Account created. We could not send a verification email — please use "Resend" on the next page.',
   }, 201);
 }
 

@@ -48,33 +48,43 @@ export async function sendVerificationEmail(
   orgId: string,
   env: Env
 ): Promise<{ ok: boolean; error?: string }> {
-  const senderUserId = await getSystemSenderUserId(orgId, env);
-  if (!senderUserId) {
-    return { ok: false, error: 'No user with Outlook token available to send verification email' };
+  try {
+    const senderUserId = await getSystemSenderUserId(orgId, env);
+    if (!senderUserId) {
+      console.error(`[verification-email] No user with Outlook token in org ${orgId}`);
+      return { ok: false, error: 'No user with Outlook token available to send verification email' };
+    }
+    console.log(`[verification-email] Using sender ${senderUserId} for ${email}`);
+
+    const refreshResult = await refreshOutlookToken(senderUserId, orgId, env);
+    if (!refreshResult.success) {
+      console.error(`[verification-email] Token refresh failed for sender ${senderUserId}`);
+      return { ok: false, error: 'Failed to refresh sender Outlook token' };
+    }
+
+    const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+    const verifyUrl = `${frontendUrl}/auth/verify?token=${encodeURIComponent(verificationToken)}`;
+    const html = buildVerificationHtml(fullName, verifyUrl);
+
+    const result = await sendViaOutlook(
+      {
+        senderUserId,
+        subject: 'Verify your Medina Intelligence account',
+        body: html,
+        toEmail: email,
+      },
+      env
+    );
+
+    if (!result.ok) {
+      console.error(`[verification-email] Graph API sendMail failed: ${result.status} ${result.errorMessage}`);
+      return { ok: false, error: result.errorMessage || `Send failed: ${result.status}` };
+    }
+
+    console.log(`[verification-email] Sent to ${email} successfully`);
+    return { ok: true };
+  } catch (e) {
+    console.error(`[verification-email] Unexpected error:`, e);
+    return { ok: false, error: `Unexpected error: ${(e as Error).message}` };
   }
-
-  const refreshResult = await refreshOutlookToken(senderUserId, orgId, env);
-  if (!refreshResult.success) {
-    return { ok: false, error: 'Failed to refresh sender Outlook token' };
-  }
-
-  const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
-  const verifyUrl = `${frontendUrl}/auth/verify?token=${encodeURIComponent(verificationToken)}`;
-  const html = buildVerificationHtml(fullName, verifyUrl);
-
-  const result = await sendViaOutlook(
-    {
-      senderUserId,
-      subject: 'Verify your Medina Intelligence account',
-      body: html,
-      toEmail: email,
-    },
-    env
-  );
-
-  if (!result.ok) {
-    return { ok: false, error: result.errorMessage || `Send failed: ${result.status}` };
-  }
-
-  return { ok: true };
 }
