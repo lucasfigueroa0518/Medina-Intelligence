@@ -515,6 +515,39 @@ export async function runHistoricalBackfill(
   progress.updated_at = new Date().toISOString();
   await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 * 7 });
 
+  // Self-heal: enqueue any conversations created during this backfill that
+  // didn't make it into vector_entity_index. The inline path doesn't have
+  // detect-embed-gaps like the workflow finalizer does — a Workers AI hiccup
+  // mid-batch would leave a conversation row without vectors. The hourly
+  // self-heal cron also catches these, but enqueuing here means the retry
+  // queue gets populated immediately without waiting up to an hour.
+  try {
+    const gaps = await env.D1.prepare(
+      `SELECT c.id FROM conversations c
+         LEFT JOIN vector_entity_index vei
+                ON vei.entity_id = c.id
+               AND vei.source_table = 'conversations'
+               AND vei.org_id = c.org_id
+        WHERE c.org_id = ?
+          AND c.created_at >= ?
+          AND vei.entity_id IS NULL`
+    ).bind(orgId, progress.started_at).all<{ id: string }>();
+
+    if (gaps.results.length > 0) {
+      console.warn(
+        `[backfill] enqueueing ${gaps.results.length} embed gaps from inline backfill for retry`
+      );
+      const enqueue = env.D1.prepare(
+        `INSERT OR IGNORE INTO embed_retry_queue (org_id, entity_id, source_table) VALUES (?, ?, 'conversations')`
+      );
+      await env.D1.batch(gaps.results.map(g => enqueue.bind(orgId, g.id)));
+    }
+  } catch (e) {
+    // Self-heal best-effort — don't fail the backfill response on enqueue
+    // errors; the hourly self-heal cron will catch any missed gaps.
+    console.error('[backfill] gap enqueue failed:', e);
+  }
+
   return progress;
 }
 

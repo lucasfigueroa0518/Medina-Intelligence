@@ -27,6 +27,7 @@ import * as Imports from './handlers/imports';
 import * as IntelligentImport from './handlers/intelligent-import';
 import * as Campaigns from './handlers/campaigns';
 import * as Agent from './handlers/agent';
+import * as ChatUploads from './handlers/chat-uploads';
 import * as Webhooks from './handlers/webhooks';
 import * as AuthOAuth from './handlers/auth-oauth';
 import * as Users from './handlers/users';
@@ -457,6 +458,13 @@ async function routeAuthenticated(
   if (path === '/api/agent/citation-click' && method === 'POST') {
     return Agent.logCitationClick(request, ctx, env);
   }
+  if (path === '/api/agent/upload-file' && method === 'POST') {
+    return ChatUploads.uploadChatFiles(request, ctx, env, ctxExec);
+  }
+  m = path.match(/^\/api\/agent\/uploads\/([^/]+)\/content$/);
+  if (m && method === 'GET') return ChatUploads.getChatUploadContent(m[1], ctx, env);
+  m = path.match(/^\/api\/agent\/sessions\/([^/]+)\/uploads$/);
+  if (m && method === 'GET') return ChatUploads.listSessionUploads(m[1], ctx, env);
 
   // --- Audit log ---
   if (path === '/api/audit-log' && method === 'GET') {
@@ -592,6 +600,17 @@ async function handleScheduled(
           id: `ingestion-${org.id}-${Date.now()}`,
           params: { org_id: org.id },
         });
+        // Hourly self-heal pass — catches any conversations / events / docs
+        // that landed in D1 but never got embedded (e.g. from the inline
+        // historical backfill path which doesn't have detect-embed-gaps).
+        // waitUntil so it doesn't block cron dispatch for other orgs.
+        ctxExec.waitUntil((async () => {
+          const { backfillUnembeddedConversations, processEmbedRetryQueue } = await import('./lib/daily-cron');
+          try { await backfillUnembeddedConversations(org.id, env); }
+          catch (e) { console.error(`hourly self-heal: backfillUnembedded failed for ${org.id}:`, e); }
+          try { await processEmbedRetryQueue(org.id, env); }
+          catch (e) { console.error(`hourly self-heal: processEmbedRetryQueue failed for ${org.id}:`, e); }
+        })());
       } else if (cron === '5 * * * *') {
         // Enrichment
         await env.ENRICHMENT_WORKFLOW.create({

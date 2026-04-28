@@ -18,6 +18,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await reconcileVectorIndex(orgId, env); } catch (e) { console.error('Vector reconciliation:', e); }
   try { await archiveOldAuditLogs(orgId, env); } catch (e) { console.error('Audit archival:', e); }
   try { await cleanupExpiredMergeLocks(env); } catch (e) { console.error('Lock cleanup:', e); }
+  try { await cleanupExpiredChatUploads(env); } catch (e) { console.error('Chat upload cleanup:', e); }
   try { await warmCrmCache(orgId, env); } catch (e) { console.error('Cache warming:', e); }
   try { await checkWebhookHealth(orgId, env); } catch (e) { console.error('Webhook health:', e); }
   try { await promoteToStandalone(orgId, env); } catch (e) { console.error('Standalone promotion:', e); }
@@ -226,6 +227,30 @@ export async function cleanupExpiredMergeLocks(env: Env): Promise<void> {
   ).run();
 }
 
+export async function cleanupExpiredChatUploads(env: Env): Promise<void> {
+  // Skip rows where the file was promoted to permanent Documents — those are
+  // owned by the documents pipeline now and have a different retention policy.
+  const rows = await env.D1.prepare(
+    `SELECT id, r2_key FROM chat_uploads
+     WHERE saved_to_documents = 0
+       AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     LIMIT 500`
+  ).all<{ id: string; r2_key: string }>();
+
+  for (const row of rows.results) {
+    // R2 first — if this fails we leave the D1 row for retry next run, so a
+    // stale row never points at a missing R2 object (and an R2 leak is at
+    // most a few extra cron cycles).
+    try {
+      await env.R2.delete(row.r2_key);
+    } catch (e) {
+      console.error(`[chat-uploads] R2 delete failed for ${row.id}:`, e);
+      continue;
+    }
+    await env.D1.prepare(`DELETE FROM chat_uploads WHERE id = ?`).bind(row.id).run().catch(() => {});
+  }
+}
+
 export async function warmCrmCache(orgId: string, env: Env): Promise<void> {
   try {
     const contacts = await env.D1.prepare(
@@ -410,7 +435,7 @@ export async function backfillUnembeddedConversations(orgId: string, env: Env): 
               AND vei.entity_id = c.id
          )
        ORDER BY c.sent_at DESC
-       LIMIT 20`
+       LIMIT 200`
   ).bind(orgId).all<{
     id: string; body_r2_key: string | null; source: string; subject: string | null;
     from_email: string | null; sent_at: string | null; participant_user_ids: string | null;
