@@ -472,12 +472,35 @@ export async function runHistoricalBackfill(
       items.push(messageToClassifiableItem(msg, direction, userId, orgId));
     }
 
-    // Store each message as a conversation via the same ingestion path
+    // Store each message as a conversation via the same ingestion path.
+    // Wrap each stage so a single batch failure (e.g. transient FK error
+    // inside contact-association inserts when a contact race-condition
+    // happens) doesn't fail the whole window — the affected items are
+    // retryable via the hourly backfillUnembeddedConversations sweep and
+    // the embed_retry_queue, so it's safe to swallow + log + continue.
+    let classified: any[] = [];
     if (items.length > 0) {
-      const { classifyAndDeduplicate } = await import('../lib/classification');
-      const { stageAndCommitApprovals } = await import('../lib/stage-approvals');
-      const classified = await classifyAndDeduplicate(items, orgId, env);
-      await stageAndCommitApprovals(classified, orgId, `backfill-${userId}`, env);
+      try {
+        const { classifyAndDeduplicate } = await import('../lib/classification');
+        classified = await classifyAndDeduplicate(items, orgId, env);
+      } catch (e) {
+        console.error(`[backfill] classifyAndDeduplicate failed for batch (page ${pagesThisBatch}):`, e);
+        classified = [];
+      }
+    }
+
+    if (classified.length > 0) {
+      try {
+        const { stageAndCommitApprovals } = await import('../lib/stage-approvals');
+        await stageAndCommitApprovals(classified, orgId, `backfill-${userId}`, env);
+      } catch (e) {
+        console.error(`[backfill] stageAndCommitApprovals failed for batch (page ${pagesThisBatch}):`, e);
+        // Conversations may still be partially inserted. The embed step
+        // below skips items that have no conversation row (their
+        // chunkEmbedAndPersistAll dedup guard would still let them through
+        // since vector_entity_index is empty for them), but that's caught
+        // by the hourly self-heal anyway.
+      }
 
       const { chunkEmbedAndPersistAll } = await import('../lib/embedding');
       for (let b = 0; b < classified.length; b += 5) {
