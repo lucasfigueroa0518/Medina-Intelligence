@@ -174,8 +174,11 @@ export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number>
 
     if (state.count < EMBED_MAX_RPS) {
       state.count += 1;
-      // 2s TTL — window naturally expires; no stale state survives.
-      await env.KV.put(key, JSON.stringify(state), { expirationTtl: 2 });
+      // Window enforcement is timestamp-based in `state` (window_start/count) — TTL
+      // is just disaster-recovery cleanup. Cloudflare KV minimum TTL is 60s; passing
+      // less than that throws KV PUT 400 Invalid expiration_ttl on every write,
+      // which previously crashed every embed-touching path (news, Deep Dive, ingestion).
+      await env.KV.put(key, JSON.stringify(state), { expirationTtl: 60 });
       return Date.now() - startedAt;
     }
 

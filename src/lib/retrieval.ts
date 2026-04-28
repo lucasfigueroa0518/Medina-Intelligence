@@ -236,7 +236,17 @@ export async function retrieveContext(
   };
 
   const aggregation = isAggregationQuery(pq.originalQuery);
-  const broadTopK = options.deepDive ? 75 : (aggregation ? 50 : 30);
+  // Vectorize hard limit: topK > 50 requires returnMetadata='indexed' + returnValues=false.
+  // We use returnMetadata='all' here for ACL filtering (visibility, participant_user_ids,
+  // user_id, reconciliation_status — none of which are indexed) and for chunk hydration
+  // (r2_key, chunk_index, text_preview — also not indexed). So 50 is our ceiling.
+  // Deep Dive's real value comes from per-entity boosts (×20), document-type queries, and
+  // cross-entity bridging — not raw broad topK. (See: VECTOR_QUERY_ERROR 40025)
+  // TODO: to raise broad topK above 50, declare metadata indexes for the four ACL fields,
+  // re-upsert all existing vectors (Vectorize indexes are not retroactive), refactor
+  // hydration.ts to read r2_key/chunk_index/text_preview from D1, and move ACL filtering
+  // from post-retrieval JS to a D1 join. Multi-day project, not a hotfix.
+  const broadTopK = options.deepDive ? 50 : (aggregation ? 50 : 30);
   const hydrateLimit = options.deepDive ? 50 : (aggregation ? 30 : 20);
 
   let internalMatches: VectorMatch[];

@@ -122,6 +122,7 @@ interface Message {
   toolCalls?: ToolCall[];
   timestamp?: string;
   error?: boolean;
+  retryable?: boolean;
   sources?: CitationSource[];
 }
 
@@ -354,7 +355,23 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
 // Error card
 // ---------------------------------------------------------------------------
 
-function ErrorCard({ message, onRetry }: { message: string; onRetry: () => void }) {
+function ErrorCard({ message, retryable = true, onRetry }: { message: string; retryable?: boolean; onRetry: () => void }) {
+  // Strip any leading "Error:" / "NNN:" prefix and JSON-ish payloads that may
+  // have leaked from earlier failure paths. Falls back to a generic message
+  // if we can't recover anything human-readable.
+  const cleaned = (() => {
+    const trimmed = message.replace(/^Error:\s*/i, '').replace(/^\d{3}:\s*/, '').trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return parsed.message || parsed.error || 'I ran into a problem with that question. Try again or rephrase.';
+      } catch {
+        return 'I ran into a problem with that question. Try again or rephrase.';
+      }
+    }
+    return trimmed || 'I ran into a problem with that question. Try again or rephrase.';
+  })();
+
   return (
     <div className="error-card rounded-xl border border-semantic-error/20 bg-semantic-error/5 backdrop-blur-sm p-4 max-w-md">
       <div className="flex items-center gap-2 mb-2">
@@ -364,14 +381,16 @@ function ErrorCard({ message, onRetry }: { message: string; onRetry: () => void 
         </span>
       </div>
       <p className="text-xs text-text-secondary mb-3" style={{ fontFamily: "'DM Sans', sans-serif" }}>
-        {message.replace(/^Error:\s*/i, '')}
+        {cleaned}
       </p>
-      <button
-        onClick={onRetry}
-        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-semantic-error/30 text-semantic-error text-xs hover:bg-semantic-error/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
-      >
-        <RefreshCw size={12} /> Try again
-      </button>
+      {retryable && (
+        <button
+          onClick={onRetry}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-semantic-error/30 text-semantic-error text-xs hover:bg-semantic-error/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
+        >
+          <RefreshCw size={12} /> Try again
+        </button>
+      )}
     </div>
   );
 }
@@ -732,10 +751,18 @@ export default function GodModePage() {
             ));
           }, 1000);
         },
-        err => {
+        (err, opts) => {
           setIsThinking(false);
           setMessages(m => m.map(msg =>
-            msg.id === assistantMsgId ? { ...msg, content: msg.content || `Error: ${err}`, streaming: false, error: !msg.content } : msg
+            msg.id === assistantMsgId
+              ? {
+                  ...msg,
+                  content: msg.content || err,
+                  streaming: false,
+                  error: !msg.content,
+                  retryable: opts?.retryable !== false,
+                }
+              : msg
           ));
           setStreaming(false);
           if (pendingSessionIdRef.current) {
@@ -782,7 +809,15 @@ export default function GodModePage() {
     } catch (e) {
       setIsThinking(false);
       setMessages(m => m.map(msg =>
-        msg.id === assistantMsgId ? { ...msg, content: msg.content || `Error: ${(e as Error).message || 'Unexpected error'}`, streaming: false, error: true } : msg
+        msg.id === assistantMsgId
+          ? {
+              ...msg,
+              content: msg.content || ((e as Error).message || 'I ran into a problem with that question. Try again or rephrase.'),
+              streaming: false,
+              error: !msg.content,
+              retryable: true,
+            }
+          : msg
       ));
       setStreaming(false);
       if (pendingSessionIdRef.current) {
@@ -1006,7 +1041,7 @@ export default function GodModePage() {
                     )}
 
                     {m.content && m.error ? (
-                      <ErrorCard message={m.content} onRetry={() => retryFrom(m.id)} />
+                      <ErrorCard message={m.content} retryable={m.retryable !== false} onRetry={() => retryFrom(m.id)} />
                     ) : m.content ? (
                       <div className="relative">
                         <div className="border-l-2 border-[#8B5CF6]/30 pl-4">

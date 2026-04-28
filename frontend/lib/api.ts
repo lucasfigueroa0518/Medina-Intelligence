@@ -526,7 +526,7 @@ export async function streamAgentQuery(
   deepDive: boolean,
   onToken: (token: string) => void,
   onDone: () => void,
-  onError: (err: string) => void,
+  onError: (err: string, opts?: { retryable?: boolean }) => void,
   onToolEvent?: (event: any) => void
 ): Promise<void> {
   const form = new FormData();
@@ -560,7 +560,19 @@ export async function streamAgentQuery(
   }
 
   if (!res.ok) {
-    onError(`${res.status}: ${await res.text()}`);
+    // Backend returns JSON: { error, message, retryable }. Prefer the friendly
+    // `message` over the technical `error` code when surfacing to users.
+    const body = await res.text();
+    let friendly = body;
+    let retryable: boolean | undefined;
+    try {
+      const parsed = JSON.parse(body);
+      friendly = parsed.message || parsed.error || body;
+      retryable = parsed.retryable;
+    } catch {
+      // Plain-text body — leave as-is.
+    }
+    onError(friendly, { retryable });
     return;
   }
   if (!res.body) {

@@ -523,15 +523,20 @@ export async function queryAgent(
   }
   session.user_role = ctx.userRole;
 
-  // --- Deep Dive rate limiting ---
+  // --- Deep Dive rate limiting (check only — increment moved post-retrieval) ---
   const retrievalOptions: RetrievalOptions = { deepDive };
-  if (deepDive) {
-    const ddKey = `deep_dive:${ctx.userId}:${new Date().toISOString().slice(0, 13)}`;
+  const ddKey = deepDive
+    ? `deep_dive:${ctx.userId}:${new Date().toISOString().slice(0, 13)}`
+    : null;
+  if (deepDive && ddKey) {
     const ddCount = parseInt(await env.KV.get(ddKey) || '0');
     if (ddCount >= 10) {
-      return errorResponse('Deep dive limit reached — try again next hour. Normal queries are still available.', 429);
+      return jsonResponse({
+        error: 'Deep dive limit reached',
+        message: "You've hit your hourly Deep Dive limit. Try again in a few minutes — normal queries still work.",
+        retryable: false,
+      }, 429);
     }
-    await env.KV.put(ddKey, String(ddCount + 1), { expirationTtl: 7200 });
   }
 
   // --- Pre-process query & retrieve RAG context ---
@@ -542,8 +547,62 @@ export async function queryAgent(
     pq.entityIds.push(session.context_entity_id);
   }
 
-  const { internal, news, stats } = await retrieveContext(pq, env, retrievalOptions);
+  let internal: any[];
+  let news: any[];
+  let stats: { emails: number; meetings: number; documents: number; contacts: number; companies: number } | undefined;
+  try {
+    const result = await retrieveContext(pq, env, retrievalOptions);
+    internal = result.internal;
+    news = result.news;
+    stats = result.stats;
+  } catch (e: any) {
+    const errMsg = String(e?.message || e);
+    console.error('[agent] retrieval failed:', errMsg);
+
+    // Persist a friendly assistant message so the session doesn't show a hanging user turn.
+    // We've already saved the user's turn (or are about to); record the assistant side here
+    // before returning so reloads show a complete exchange.
+    const userTurnIndex = session.turn_count;
+    const assistantTurnIndex = session.turn_count + 1;
+    const userMessageId = crypto.randomUUID();
+    const assistantMessageId = crypto.randomUUID();
+    await env.D1.prepare(
+      `INSERT INTO agent_messages (id, session_id, turn_index, role, content, created_at)
+       VALUES (?, ?, ?, 'user', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+    ).bind(userMessageId, session.id, userTurnIndex, query).run().catch(() => {});
+    await env.D1.prepare(
+      `INSERT INTO agent_messages (id, session_id, turn_index, role, content, metadata, created_at)
+       VALUES (?, ?, ?, 'assistant', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+    ).bind(
+      assistantMessageId,
+      session.id,
+      assistantTurnIndex,
+      'I ran into a problem retrieving context for that question. Try again, or rephrase.',
+      JSON.stringify({ retrieval_failed: true, deep_dive: deepDive, error: errMsg })
+    ).run().catch(() => {});
+
+    // Defense-in-depth refund: even though we moved the increment to post-retrieval,
+    // any future code path that increments earlier still gets refunded here.
+    if (ddKey) {
+      const current = parseInt(await env.KV.get(ddKey) || '0');
+      if (current > 0) {
+        await env.KV.put(ddKey, String(current - 1), { expirationTtl: 7200 }).catch(() => {});
+      }
+    }
+
+    return jsonResponse({
+      error: 'Retrieval failed',
+      message: 'I ran into a problem retrieving context for that question. Try again, or rephrase.',
+      retryable: true,
+    }, 500);
+  }
   const tRetrieve = Date.now() - t0;
+
+  // --- Increment Deep Dive quota only after retrieval succeeded ---
+  if (ddKey) {
+    const ddCount = parseInt(await env.KV.get(ddKey) || '0');
+    await env.KV.put(ddKey, String(ddCount + 1), { expirationTtl: 7200 }).catch(() => {});
+  }
 
   // --- Load session history ---
   // Fetch recent turns. We guarantee the last 3 complete exchanges (6 messages)
