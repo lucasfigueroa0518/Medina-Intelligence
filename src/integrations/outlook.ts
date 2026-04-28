@@ -351,10 +351,16 @@ export async function runHistoricalBackfill(
     backfillStart = new Date(opts.start_date);
     backfillEnd = opts.end_date ? new Date(opts.end_date) : new Date();
   } else {
-    const syncConfig = await getUserSyncConfig(userId, env);
-    const initialSyncCutoff = new Date(Date.now() - syncConfig.sync_history_days * 86400000);
+    // Bug fix 2026-04-28: previously this set backfillEnd = initialSyncCutoff
+    // (now - sync_history_days). When daysBack === sync_history_days (e.g. user
+    // has sync_history_days=90 and clicks "Last 90 days") the range collapsed
+    // to zero and the backfill silently fetched 0 emails. The original intent
+    // was to fill the gap BEFORE the standard delta sync covers, but that
+    // gap is empty when the two windows match. Always use 'now' as the upper
+    // bound. Dedup in stage-approvals (INSERT OR IGNORE on external_message_id)
+    // makes any overlap with delta-sync results harmless.
     backfillStart = new Date(Date.now() - daysBack * 86400000);
-    backfillEnd = initialSyncCutoff;
+    backfillEnd = new Date();
   }
 
   let progress: BackfillProgress;
