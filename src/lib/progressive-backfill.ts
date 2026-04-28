@@ -224,8 +224,15 @@ export async function driveProgressiveBackfill(
 }
 
 /** Driver entry point for the cron — finds every active parent for an org
- *  and advances each in parallel. Different users have different
- *  backfill_progress KV keys so they don't contend. */
+ *  and advances each one SEQUENTIALLY. Different users have different
+ *  backfill_progress KV keys so per-user state doesn't contend, but they
+ *  share a single per-org Workers AI BGE rate limiter (10 RPS). When two
+ *  users run in parallel inside the same cron tick, one consistently
+ *  starves the other (audit 2026-04-28: Tony's per-batch progress stalled
+ *  while Alvaro's ran clean). Serializing gives each user a clean 25s
+ *  window per tick at the cost of half the parallelism — but with two
+ *  active users and a 2-minute cron cadence, each user still gets one
+ *  batch every 4 minutes, which is fine for the 18-window pace. */
 export async function driveAllActiveProgressive(orgId: string, env: Env): Promise<void> {
   const active = await env.D1.prepare(
     `SELECT user_id FROM progressive_backfill_jobs
@@ -233,9 +240,21 @@ export async function driveAllActiveProgressive(orgId: string, env: Env): Promis
   ).bind(orgId).all<{ user_id: string }>();
   if (active.results.length === 0) return;
 
-  await Promise.allSettled(
-    active.results.map(r => driveProgressiveBackfill(orgId, r.user_id, env))
-  );
+  // Sort so the user with the OLDEST updated_at goes first — naturally
+  // gives catch-up priority to whichever user is lagging.
+  const ordered = await env.D1.prepare(
+    `SELECT user_id FROM progressive_backfill_jobs
+       WHERE org_id = ? AND status = 'active'
+       ORDER BY updated_at ASC`
+  ).bind(orgId).all<{ user_id: string }>();
+
+  for (const r of ordered.results) {
+    try {
+      await driveProgressiveBackfill(orgId, r.user_id, env);
+    } catch (e) {
+      console.error(`progressive backfill drive failed for ${r.user_id}:`, e);
+    }
+  }
 }
 
 /** Per-user status: parent + all 18 windows with stats. */
