@@ -78,11 +78,26 @@ export async function callGemini(
   }
 
   const url = `${GEMINI_BASE}/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  // Per-request timeout. Without this, a single hung Gemini call blocks the
+  // surrounding workflow step indefinitely — audit 2026-04-28 caught this
+  // when the parallel news fetcher's 60s step timeout fired because a few
+  // slow Gemini calls held up the parallel batch. 12s is generous for a
+  // normal grounded response (typical p99 ~3-5s) and tight enough that a
+  // hung tail can't poison the whole step.
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(12_000),
+    });
+  } catch (e: any) {
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      throw new Error('GEMINI_TIMEOUT');
+    }
+    throw e;
+  }
 
   if (!resp.ok) {
     const errTxt = await resp.text();
