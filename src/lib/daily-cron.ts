@@ -659,7 +659,7 @@ export async function processEmbedRetryQueue(
   orgId: string,
   env: Env
 ): Promise<{ processed: number; succeeded: number; failed: number; stale_reset: number }> {
-  const MAX_PER_RUN = 100;
+  const MAX_PER_RUN = 200;
   const MAX_ATTEMPTS = 3;
   const STALE_AFTER_MINUTES = 10;
 
