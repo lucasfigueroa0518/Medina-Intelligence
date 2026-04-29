@@ -3,9 +3,11 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
 import { emitAudit } from '../lib/audit';
-import { getSharingFlags } from '../lib/helpers';
+import { getSharingFlags, parseParticipantUserIds } from '../lib/helpers';
 import { isDocumentAccessibleToUser } from '../lib/document-acl';
-import { persistDocument, type DocumentLink } from '../lib/persist-document';
+import { persistDocument, type DocumentLink, type DocumentVisibility } from '../lib/persist-document';
+
+const ALLOWED_VISIBILITIES: DocumentVisibility[] = ['private', 'org_wide', 'public', 'confidential'];
 
 export async function listDocuments(
   request: Request,
@@ -108,6 +110,27 @@ export async function uploadDocument(
   const companyId = form.get('company_id') as string | null;
   const dealId = form.get('deal_id') as string | null;
 
+  // ACL: caller may pass `visibility` and `participants`. Default flips to
+  // 'private' for manual uploads (Wave 3a) — pre-Wave-3 the column-default
+  // 'org_wide' silently made every uploaded file org-readable, including
+  // confidential pitch decks. P3 (intelligent_import) and P4 (chat_save)
+  // keep their org_wide defaults — different surfaces, different expectations.
+  const rawVisibility = (form.get('visibility') as string) || 'private';
+  if (!(ALLOWED_VISIBILITIES as string[]).includes(rawVisibility)) {
+    return errorResponse('VALIDATION_ERROR', 400, `invalid visibility "${rawVisibility}" — allowed: ${ALLOWED_VISIBILITIES.join(', ')}`);
+  }
+  const visibility = rawVisibility as DocumentVisibility;
+
+  const participantsRaw = form.get('participants') as string | null;
+  let participantUserIds = participantsRaw ? parseParticipantUserIds(participantsRaw) : null;
+  // For private/confidential uploads with no participants supplied, default
+  // to the uploader so the row is readable by at least its creator at the
+  // RAG layer (otherwise post-retrieval filter denies it). The full
+  // participant picker is Wave 4.
+  if ((visibility === 'private' || visibility === 'confidential') && (!participantUserIds || participantUserIds.length === 0)) {
+    participantUserIds = [ctx.userId];
+  }
+
   // Form fields → primary links. The first of these (contact ahead of company
   // ahead of deal) is what scalar contact_id/company_id/deal_id columns get.
   const links: DocumentLink[] = [];
@@ -119,8 +142,8 @@ export async function uploadDocument(
     file,
     orgId: ctx.orgId,
     source: 'manual_upload',
-    visibility: 'org_wide',
-    participantUserIds: null,
+    visibility,
+    participantUserIds,
     uploadedBy: ctx.userId,
     links,
     title,

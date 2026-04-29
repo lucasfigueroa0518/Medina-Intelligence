@@ -521,6 +521,8 @@ async function routeAuthenticated(
       return Admin.runDailyCronManually(ctx, env);
     if (path === '/api/admin/backfill-unembedded' && method === 'POST')
       return Admin.backfillUnembedded(request, ctx, env);
+    if (path === '/api/admin/backfill-attachments' && method === 'POST')
+      return Admin.backfillAttachments(request, ctx, env);
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')

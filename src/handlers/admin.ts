@@ -1419,3 +1419,70 @@ export async function embedAllDeals(
     next_cursor: stats.scanned === limit ? cursor + limit : null,
   });
 }
+
+// Wave 3a — drain orphan-attachment conversations.
+//
+// POST /api/admin/backfill-attachments
+// Body: { user_id?, batch_size?, concurrency?, dry_run? }
+//   user_id     — whose Outlook token to use. Defaults to the caller.
+//   batch_size  — conversations per call. Default 100, capped at 100 (Worker
+//                 CPU budget).
+//   concurrency — parallel per-conversation workers. Default 25, capped at 25
+//                 (Graph rate limits).
+//   dry_run     — true: returns counts only, doesn't fetch from Graph or
+//                 write anything.
+//
+// Returns the orchestrator's stats + `remaining` count of orphans not yet
+// processed. Caller loops until remaining=0.
+export async function backfillAttachments(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  // Owner-only — this fans out Graph calls + writes documents at scale.
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('FORBIDDEN', 403, 'owner role required');
+  }
+
+  const body = await parseJsonBody<{
+    user_id?: string;
+    batch_size?: number;
+    concurrency?: number;
+    dry_run?: boolean;
+  }>(request) || {};
+
+  const userId = body.user_id || ctx.userId;
+  const batchSize = Math.min(Math.max(1, body.batch_size || 100), 100);
+  const concurrency = Math.min(Math.max(1, body.concurrency || 25), 25);
+  const dryRun = body.dry_run === true;
+
+  const {
+    runAttachmentBackfillBatch,
+    countOrphanAttachmentConversations,
+    pickOrphanBatch,
+  } = await import('../lib/attachment-backfill-orchestrator');
+
+  const totalOrphans = await countOrphanAttachmentConversations(ctx.orgId, env);
+  const conversationIds = await pickOrphanBatch(ctx.orgId, batchSize, env);
+
+  if (dryRun) {
+    return jsonResponse({
+      dry_run: true,
+      orphans_in_batch: conversationIds.length,
+      total_orphans: totalOrphans,
+      sample_conversation_ids: conversationIds.slice(0, 5),
+    });
+  }
+
+  if (conversationIds.length === 0) {
+    return jsonResponse({ message: 'No orphan conversations to process', remaining: 0 });
+  }
+
+  const result = await runAttachmentBackfillBatch(
+    { orgId: ctx.orgId, userId, conversationIds, concurrency },
+    env
+  );
+  const remaining = await countOrphanAttachmentConversations(ctx.orgId, env);
+
+  return jsonResponse({ ...result, remaining });
+}

@@ -81,6 +81,7 @@ export default function ContactDetailPage() {
   const [documents, setDocuments] = React.useState<any[]>([]);
   const [docsLoading, setDocsLoading] = React.useState(false);
   const [uploading, setUploading] = React.useState(false);
+  const [uploadVisibility, setUploadVisibility] = React.useState<'private' | 'org_wide'>('private');
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   React.useEffect(() => {
@@ -126,7 +127,7 @@ export default function ContactDetailPage() {
     if (!file) return;
     setUploading(true);
     try {
-      const res = await api.uploadDocument(file, { contact_id: id });
+      const res = await api.uploadDocument(file, { contact_id: id, visibility: uploadVisibility });
       if (res.duplicate) {
         setToast('Duplicate document — already exists');
       } else {
@@ -833,11 +834,23 @@ export default function ContactDetailPage() {
               <div className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
                 Documents ({documents.length})
               </div>
-              <label className={`btn-secondary flex items-center gap-2 cursor-pointer ${uploading ? 'opacity-50 pointer-events-none' : ''}`}>
-                <Upload size={14} />
-                {uploading ? 'Uploading...' : 'Upload'}
-                <input ref={fileInputRef} type="file" className="hidden" onChange={handleDocUpload} disabled={uploading} />
-              </label>
+              <div className="flex items-center gap-2">
+                <select
+                  value={uploadVisibility}
+                  onChange={e => setUploadVisibility(e.target.value as 'private' | 'org_wide')}
+                  disabled={uploading}
+                  className="bg-bg-inset border border-border text-text-secondary text-xs px-2.5 py-1.5 rounded-lg disabled:opacity-50"
+                  title="Who can read this document"
+                >
+                  <option value="private">Private — only you</option>
+                  <option value="org_wide">Org-wide — everyone in your team</option>
+                </select>
+                <label className={`btn-secondary flex items-center gap-2 cursor-pointer ${uploading ? 'opacity-50 pointer-events-none' : ''}`}>
+                  <Upload size={14} />
+                  {uploading ? 'Uploading...' : 'Upload'}
+                  <input ref={fileInputRef} type="file" className="hidden" onChange={handleDocUpload} disabled={uploading} />
+                </label>
+              </div>
             </div>
             {docsLoading ? (
               <div className="space-y-3">

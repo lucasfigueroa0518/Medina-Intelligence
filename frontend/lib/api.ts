@@ -367,7 +367,18 @@ export const api = {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
     return request<{ documents: any[] }>(`/documents${q}`);
   },
-  uploadDocument: (file: File, data: { title?: string; contact_id?: string; company_id?: string; deal_id?: string; document_type?: string }) => {
+  uploadDocument: (
+    file: File,
+    data: {
+      title?: string;
+      contact_id?: string;
+      company_id?: string;
+      deal_id?: string;
+      document_type?: string;
+      visibility?: 'private' | 'org_wide' | 'public' | 'confidential';
+      participants?: string[];
+    }
+  ) => {
     const fd = new FormData();
     fd.append('file', file);
     if (data.title) fd.append('title', data.title);
@@ -375,6 +386,8 @@ export const api = {
     if (data.company_id) fd.append('company_id', data.company_id);
     if (data.deal_id) fd.append('deal_id', data.deal_id);
     if (data.document_type) fd.append('document_type', data.document_type);
+    if (data.visibility) fd.append('visibility', data.visibility);
+    if (data.participants && data.participants.length > 0) fd.append('participants', JSON.stringify(data.participants));
     return request<{ document: any; duplicate?: boolean }>('/documents', { method: 'POST', body: fd });
   },
   deleteDocument: (id: string) =>
