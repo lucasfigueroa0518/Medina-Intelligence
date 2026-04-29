@@ -23,6 +23,7 @@ import * as Approval from './handlers/approval';
 import * as Sync from './handlers/sync';
 import * as AuditLog from './handlers/audit-log';
 import * as Admin from './handlers/admin';
+import * as Cleanup from './handlers/cleanup';
 import * as Imports from './handlers/imports';
 import * as IntelligentImport from './handlers/intelligent-import';
 import * as Campaigns from './handlers/campaigns';
@@ -526,6 +527,18 @@ async function routeAuthenticated(
       return Admin.backfillUnembedded(request, ctx, env);
     if (path === '/api/admin/backfill-attachments' && method === 'POST')
       return Admin.backfillAttachments(request, ctx, env);
+
+    // Wave 3 cleanup endpoints (owner-only enforced inside each handler).
+    // Run order: evidence-preservation → d1-phase2 → dangling-vectors-batch (loop) → dangling-docs-batch (loop).
+    if (path === '/api/admin/cleanup-evidence-preservation' && method === 'POST')
+      return Cleanup.cleanupEvidencePreservation(request, ctx, env);
+    if (path === '/api/admin/cleanup-d1-phase2' && method === 'POST')
+      return Cleanup.cleanupD1Phase2(request, ctx, env);
+    if (path === '/api/admin/cleanup-dangling-vectors-batch' && method === 'POST')
+      return Cleanup.cleanupDanglingVectorsBatch(request, ctx, env);
+    if (path === '/api/admin/cleanup-dangling-docs-batch' && method === 'POST')
+      return Cleanup.cleanupDanglingDocsBatch(request, ctx, env);
+
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')
