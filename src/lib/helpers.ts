@@ -30,21 +30,31 @@ export function stripHtml(html: string): string {
 // across thread members. Run AFTER stripHtml so the patterns below match
 // against plaintext.
 //
+// 2026-04-29 hotfix: stripHtml's `replace(/\s+/g, ' ')` collapses every
+// newline into a single space. The earlier `\n+`-anchored markers therefore
+// never matched in production — the entire reply chain leaked into the
+// embedded body for every HTML email. Anchored each marker on `\s+` (any
+// whitespace, including the single space stripHtml leaves behind) and made
+// the in-marker `.+` non-greedy so a long body doesn't swallow multiple
+// reply blocks into one match. Plain-text emails (which preserve newlines)
+// still match — `\s+` is a strict superset of `\n+`.
+//
 // Patterns covered (any one truncates the body at its first occurrence):
-//   • "On <date>, <person> wrote:" (Gmail/most clients)
-//   • "On <date> at <time>, <person> wrote:" (alternate Gmail)
-//   • "From: ... Sent: ..." block (Outlook forwarded format)
+//   • "On <date>, <person> wrote:" / "On <date> at <time>, <person> wrote:"
+//   • "From: ... Sent: ..." block (Outlook forwarded/replied format)
 //   • "----- Original Message -----" (older Outlook)
 //   • "________" horizontal-rule + "From:" (Outlook web)
-// Plus a final pass to drop any residual "> " / ">> " line prefixes.
+// Plus a final pass to drop any residual "> " / ">> " line prefixes (only
+// effective on plain-text input — HTML quoted blocks lose those after
+// stripHtml, which is fine since the reply-marker truncation already cut
+// them).
 export function stripQuotedReplies(text: string): string {
   if (!text) return '';
   const replyMarkers: RegExp[] = [
-    /\n+On .+, .+ wrote:/i,
-    /\n+On .+ at .+, .+ wrote:/i,
-    /\n+From: .+\nSent: /i,
-    /\n+-{3,}\s*Original Message\s*-{3,}/i,
-    /\n+_{3,}\s*\n+From: /i,
+    /\s+On .+? wrote:/i,                       // Gmail / generic, non-greedy
+    /\s+From: .+? Sent: /i,                    // Outlook From/Sent block
+    /\s+-{3,}\s*Original Message\s*-{3,}/i,    // Older Outlook
+    /\s+_{3,}\s+From: /i,                      // Outlook web HR + From
   ];
   let stripped = text;
   for (const marker of replyMarkers) {
