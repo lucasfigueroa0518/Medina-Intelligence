@@ -85,6 +85,92 @@ function emptyStats(syncJobId: string): TranscriptStats {
   };
 }
 
+/**
+ * Run the full receive-to-extracted pipeline on a batch of Firefly transcript
+ * items. The single source of truth for "what happens to a transcript between
+ * 'we have the data' and 'the meeting is durable + searchable + extracted'."
+ *
+ * Both Firefly callers route through this helper:
+ *   - processFireflyWebhook        (src/integrations/firefly.ts)
+ *   - ingestTranscript (backfill)  (src/handlers/firefly-backfill.ts)
+ *
+ * Phases run sequentially:
+ *
+ *   1. Stage events — `INSERT OR IGNORE INTO events` then read back the
+ *      canonical id by `firefly_event_id`. The read-back is race-safe: if a
+ *      concurrent caller (or an earlier delivery of the same webhook)
+ *      already inserted a row, our INSERT no-ops and the read-back resolves
+ *      to the winner's id. All FK-bearing downstream work attaches to that
+ *      canonicalId, which may differ from the locally-generated candidate
+ *      UUID we tried to insert. Race occurrences are logged at WARN level
+ *      ("firefly_event_id race: ...") so operators can monitor frequency.
+ *
+ *   2. Per-item: attendees → chunks → reconcile (best-effort).
+ *      Attendees: `event_attendees` rows with `user_id` set when the email
+ *      matches an internal users row, contact_id otherwise (auto-creating
+ *      contacts via autoCreateContactFromAttendee for unknown attendees).
+ *      Chunks: speaker-turn chunking (1024 tokens, dynamic overlap) with
+ *      `visibility='private'` + `participant_user_ids` = comma-sep internal
+ *      user_ids. Speakers without internal-email matches do NOT grant ACL.
+ *      Reconciliation: best-effort match against existing Outlook calendar
+ *      events; failure is logged but doesn't enter stats.errors.
+ *
+ *   3. Signal extraction — `extractAndRouteSignals(canonicalId, ...)` per
+ *      staged item. No race: we receive the canonical id directly from
+ *      Phase 1, replacing the legacy webhook-consumer's "find latest event
+ *      ORDER BY created_at LIMIT 1" pattern that could attribute signals
+ *      to the wrong event under concurrent delivery.
+ *
+ * Phase 1 bail: if `items_staged < items_total` after the staging loop,
+ * Phases 2 and 3 are skipped for the entire batch. Mirrors the structural-
+ * fix philosophy from Outlook ingestion: never write FK-bearing rows
+ * (event_attendees, vector_entity_index) when the parent set is incomplete.
+ *
+ * Failure semantics — IMPORTANT for callers:
+ *
+ *   • This helper does NOT throw on Phase 2 or Phase 3 errors. Per-item,
+ *     per-phase errors are caught, pushed into `stats.errors[]`, and
+ *     persisted to `sync_jobs.metadata.errors_sample` (capped at 5 entries
+ *     × 500 chars). Callers wanting per-transcript failure visibility
+ *     beyond Phase 1 must read sync_jobs.metadata; the return value's
+ *     `staged_event_ids[]` only confirms Phase 1 succeeded.
+ *
+ *   • Throws are reserved for catastrophic conditions (e.g. an unhandled
+ *     D1 error inside the staging loop's outer try). Even then the
+ *     `finally` block calls `closeSyncJob` so the row never sits in
+ *     `running` indefinitely.
+ *
+ * sync_jobs lifecycle:
+ *
+ *   • One row per call. `workflow_type = ctx.sourcePath` ('firefly-webhook'
+ *     or 'firefly-backfill'). Status starts 'running' and closes to one of
+ *     'completed' (no errors), 'partial' (some errors but at least one item
+ *     staged), or 'failed' (zero items staged).
+ *
+ *   • Counter accumulation uses `json_patch` (single-call replacement) at
+ *     close time rather than per-phase increments — the helper holds stats
+ *     in-memory across phases and writes once. Differs from Outlook's
+ *     `persistClassifiedStats` which uses `json_set + COALESCE` for
+ *     accumulation across multiple chunk-workflow steps; that's
+ *     intentional — transcripts process as a single batch, no chunking.
+ *
+ *   • `error_message` column on the row is populated from
+ *     `errors_sample[0].message` when status is 'failed' so the row is
+ *     diagnosable from sync_jobs UI listings without unpacking metadata.
+ *
+ * Idempotency: callers are responsible for de-duplicating before calling.
+ * The webhook gates on KV `webhook_idem:{key}` 24h TTL; backfill does a
+ * `firefly_event_id`-and-fuzzy-title pre-check. The helper itself relies
+ * on the events.firefly_event_id UNIQUE constraint as a safety net via
+ * Phase 1's read-back.
+ *
+ * @param items   Pre-shaped transcript items. Caller writes R2 first; the
+ *                helper takes the R2 key as input.
+ * @param ctx     orgId + sourcePath (drives sync_jobs.workflow_type).
+ * @param env     Worker bindings.
+ * @returns       Stats with per-phase counters, errors[], staged canonical
+ *                event ids, and the sync_jobs row id.
+ */
 export async function processTranscriptItems(
   items: TranscriptItem[],
   ctx: ProcessTranscriptContext,
@@ -173,6 +259,22 @@ export async function processTranscriptItems(
             error: `${item.fireflyEventId}: events INSERT no-op'd and read-back returned no row`,
           });
           continue;
+        }
+
+        // Race-detection log: when canonical id differs from the candidate
+        // we generated, INSERT OR IGNORE no-op'd because a concurrent caller
+        // (or earlier delivery of this same firefly_event_id) won the
+        // UNIQUE constraint first. The read-back correctly resolved to the
+        // winner's row; downstream FK-bearing work attaches to canonicalId.
+        // Operators can grep for this log to see how often the race fires
+        // in production.
+        if (canonical.id !== candidateId) {
+          console.warn(
+            `[process-transcript] firefly_event_id race: ` +
+            `firefly_event_id=${item.fireflyEventId} ` +
+            `candidate=${candidateId} canonical=${canonical.id} ` +
+            `sync_job=${syncJobId} source=${ctx.sourcePath}`
+          );
         }
 
         stats.items_staged += 1;
