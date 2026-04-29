@@ -23,6 +23,8 @@ import { encryptToken } from '../lib/encryption';
 import { verifyJwt } from './auth';
 import { emitAudit } from '../lib/audit';
 import { ensureSubscriptionsForUser } from '../lib/graph-subscriptions';
+import { createProgressiveBackfill } from '../lib/progressive-backfill';
+import { DEFAULT_ONBOARDING_BACKFILL_DAYS } from './backfill';
 
 interface OAuthStateRecord {
   user_id: string;
@@ -370,6 +372,42 @@ export async function outlookOAuthCallback(
     await ensureSubscriptionsForUser(record.user_id, record.org_id, env);
   } catch (e) {
     console.error('[auth-oauth] Graph subscription creation failed (non-fatal):', e);
+  }
+
+  // Onboarding hook: kick off a default 90-day progressive backfill the
+  // first time this user connects Outlook. Skipped silently if any
+  // progressive_backfill_jobs row already exists (so reconnecting after
+  // a token revoke doesn't re-trigger). The cron driver picks it up on
+  // the next */2 tick — no operator action required.
+  try {
+    const existingProgressive = await env.D1.prepare(
+      `SELECT id FROM progressive_backfill_jobs WHERE user_id = ? LIMIT 1`
+    ).bind(record.user_id).first();
+    if (!existingProgressive) {
+      const r = await createProgressiveBackfill(
+        record.org_id,
+        record.user_id,
+        DEFAULT_ONBOARDING_BACKFILL_DAYS,
+        10,
+        env
+      );
+      if (r.created) {
+        // Grep-able instrumentation: fires once per first-time onboarding,
+        // never on reconnect. Use this to confirm the hook actually ran when
+        // Adam / Alvaro / Intel connect Outlook for the first time.
+        console.log(
+          `[onboarding-backfill] seeded ${DEFAULT_ONBOARDING_BACKFILL_DAYS}-day backfill for ${connectedEmail ?? '(unknown_email)'} (user_id=${record.user_id}, parent_job_id=${r.parent_id})`
+        );
+      } else {
+        console.log(
+          `[auth-oauth] onboarding progressive backfill NOT seeded for ${record.user_id}: ${r.reason}`
+        );
+      }
+    } else {
+      console.log(`[auth-oauth] onboarding skipped — progressive history already exists for ${record.user_id}`);
+    }
+  } catch (e) {
+    console.error('[auth-oauth] onboarding progressive backfill seed failed (non-fatal):', e);
   }
 
   await emitAudit(env, {
