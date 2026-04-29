@@ -1,12 +1,16 @@
 'use client';
 
 import React from 'react';
+import { ChevronUp, ChevronDown } from 'lucide-react';
 
 export interface Column<T> {
   key: string;
   header: string;
   accessor: (row: T) => React.ReactNode;
   sortable?: boolean;
+  // When this column is sortable, sortKey is the value passed to onSort.
+  // Defaults to `key` when omitted.
+  sortKey?: string;
   width?: string;
 }
 
@@ -19,6 +23,13 @@ interface DataTableProps<T> {
   onRowClick?: (row: T) => void;
   selectable?: boolean;
   getRowId?: (row: T) => string;
+  // Active sort state. When set, the matching header renders an arrow.
+  sortKey?: string;
+  sortDir?: 'asc' | 'desc';
+  // Click handler for sortable headers. Receives the column's sortKey
+  // (or column.key if sortKey is omitted). The parent decides whether to
+  // toggle direction or switch to a new sort.
+  onSort?: (key: string) => void;
 }
 
 export function DataTable<T>({
@@ -30,6 +41,9 @@ export function DataTable<T>({
   onRowClick,
   selectable,
   getRowId,
+  sortKey,
+  sortDir,
+  onSort,
 }: DataTableProps<T>) {
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
 
@@ -68,15 +82,30 @@ export function DataTable<T>({
         <thead>
           <tr className="border-b border-border bg-bg-inset/50">
             {selectable && <th className="w-10 p-3" />}
-            {columns.map(col => (
-              <th
-                key={col.key}
-                className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted"
-                style={col.width ? { width: col.width } : undefined}
-              >
-                {col.header}
-              </th>
-            ))}
+            {columns.map(col => {
+              const colSortKey = col.sortKey ?? col.key;
+              const isActiveSort = !!col.sortable && sortKey === colSortKey;
+              const clickable = !!col.sortable && !!onSort;
+              return (
+                <th
+                  key={col.key}
+                  className={`text-left px-4 py-3 text-xs font-medium uppercase tracking-wider ${
+                    isActiveSort ? 'text-text-secondary' : 'text-text-muted'
+                  } ${clickable ? 'cursor-pointer select-none hover:bg-bg-surface-hover/40 transition-colors' : ''}`}
+                  style={col.width ? { width: col.width } : undefined}
+                  onClick={clickable ? () => onSort!(colSortKey) : undefined}
+                >
+                  <span className="inline-flex items-center gap-1">
+                    {col.header}
+                    {isActiveSort && (
+                      sortDir === 'asc'
+                        ? <ChevronUp size={12} className="text-text-secondary" />
+                        : <ChevronDown size={12} className="text-text-secondary" />
+                    )}
+                  </span>
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>

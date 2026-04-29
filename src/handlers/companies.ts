@@ -10,6 +10,42 @@ import { findDuplicateCompany } from '../lib/discovery';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { updateEntityInIndex } from '../lib/entity-index';
 
+// News-score buckets. The underlying scale is 0-10 (see lib/news-scoring).
+function newsScorePredicate(bucket: string): string | null {
+  switch (bucket) {
+    case 'high': return 'co.news_relevance_score >= 7';
+    case 'medium': return 'co.news_relevance_score >= 3 AND co.news_relevance_score < 7';
+    case 'low': return 'co.news_relevance_score > 0 AND co.news_relevance_score < 3';
+    case 'none': return '(co.news_relevance_score IS NULL OR co.news_relevance_score = 0)';
+    default: return null;
+  }
+}
+
+const COMPANY_SORT_MAP: Record<string, { col: string; defaultDir: 'ASC' | 'DESC' }> = {
+  news_score: { col: 'co.news_relevance_score', defaultDir: 'DESC' },
+  name: { col: 'co.name', defaultDir: 'ASC' },
+  city: { col: 'co.hq_location', defaultDir: 'ASC' },
+  investment_status: { col: 'co.investment_status', defaultDir: 'ASC' },
+  stage: { col: 'co.stage', defaultDir: 'ASC' },
+  current_valuation: { col: 'co.current_valuation', defaultDir: 'DESC' },
+  created_at: { col: 'co.created_at', defaultDir: 'DESC' },
+};
+
+function parseList(raw: string | null): string[] | undefined {
+  if (!raw) return undefined;
+  const items = raw.split(',').map(s => s.trim()).filter(Boolean);
+  return items.length ? items : undefined;
+}
+
+// Same dual-form helper used by the contacts handler — handles legacy
+// multi-value params and the new comma-separated form transparently.
+function readMulti(sp: URLSearchParams, key: string): string[] | undefined {
+  const all = sp.getAll(key);
+  if (all.length === 0) return undefined;
+  if (all.length === 1) return parseList(all[0]);
+  return all;
+}
+
 export async function listCompanies(
   request: Request,
   ctx: AuthContext,
@@ -17,55 +53,131 @@ export async function listCompanies(
 ): Promise<Response> {
   const url = new URL(request.url);
   const f = parseCompanyFilter(url);
+  const sp = url.searchParams;
 
-  const where: string[] = ['org_id = ?', 'deleted_at IS NULL'];
+  const where: string[] = ['co.org_id = ?', 'co.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
 
-  if (f.company_types?.length) {
-    where.push(`company_type IN (${f.company_types.map(() => '?').join(',')})`);
-    binds.push(...f.company_types);
+  // Type filter — new comma-separated `type` OR legacy multi-value `company_types`.
+  const typeList = readMulti(sp, 'type') ?? f.company_types;
+  if (typeList?.length) {
+    where.push(`co.company_type IN (${typeList.map(() => '?').join(',')})`);
+    binds.push(...typeList);
   }
-  if (f.investment_status?.length) {
-    where.push(
-      `investment_status IN (${f.investment_status.map(() => '?').join(',')})`
-    );
-    binds.push(...f.investment_status);
+
+  // Investment status — comma-separated `investment_status` OR legacy multi.
+  const investmentStatus = readMulti(sp, 'investment_status') ?? f.investment_status;
+  if (investmentStatus?.length) {
+    where.push(`co.investment_status IN (${investmentStatus.map(() => '?').join(',')})`);
+    binds.push(...investmentStatus);
   }
+
   if (f.stage?.length) {
-    where.push(`stage IN (${f.stage.map(() => '?').join(',')})`);
+    where.push(`co.stage IN (${f.stage.map(() => '?').join(',')})`);
     binds.push(...f.stage);
   }
   if (f.sector?.length) {
-    where.push(`sector IN (${f.sector.map(() => '?').join(',')})`);
+    where.push(`co.sector IN (${f.sector.map(() => '?').join(',')})`);
     binds.push(...f.sector);
   }
-  if (f.keyword) {
-    where.push('(name LIKE ? OR description LIKE ?)');
-    binds.push(`%${f.keyword}%`, `%${f.keyword}%`);
+
+  // City filter — hq_location stores "City, Region" or just "City"; match on
+  // the leading segment so queries are intuitive ("San Francisco" finds
+  // "San Francisco, CA").
+  const city = sp.get('city');
+  if (city) {
+    where.push('(co.hq_location = ? OR co.hq_location LIKE ?)');
+    binds.push(city, `${city},%`);
   }
 
-  const sortBy = f.sort_by || 'name';
-  const sortDir = f.sort_dir === 'desc' ? 'DESC' : 'ASC';
-  const allowedSort = new Set([
-    'name',
-    'investment_status',
-    'stage',
-    'current_valuation',
-    'created_at',
-  ]);
-  const sortCol = allowedSort.has(sortBy) ? sortBy : 'name';
+  // News score bucket. Comma-separated combines buckets ("In News" =
+  // high,medium).
+  const newsScoreBuckets = readMulti(sp, 'news_score');
+  if (newsScoreBuckets?.length) {
+    const predicates = newsScoreBuckets
+      .map(b => newsScorePredicate(b))
+      .filter((p): p is string => !!p);
+    if (predicates.length) where.push(`(${predicates.join(' OR ')})`);
+  }
+
+  // Has-deals — only include companies with at least one non-deleted active
+  // deal (excludes closed_won/closed_lost so "in active deals" matches).
+  if (sp.get('has_deals') === 'true') {
+    where.push(
+      `EXISTS (SELECT 1 FROM deals d
+               WHERE d.company_id = co.id
+                 AND d.deleted_at IS NULL
+                 AND d.stage NOT IN ('closed_won','closed_lost'))`
+    );
+  }
+
+  // Search — name + domain + description. Matches the placeholder text in
+  // the companies search input.
+  const search = sp.get('search') ?? f.keyword;
+  if (search) {
+    const pat = `%${search}%`;
+    where.push('(co.name LIKE ? OR co.domain LIKE ? OR co.description LIKE ?)');
+    binds.push(pat, pat, pat);
+  }
+
+  // Tag filtering — IDs preferred, fall back to names for legacy callers.
+  let tagJoin = '';
+  const tagsParam = readMulti(sp, 'tags') ?? f.tags;
+  if (tagsParam?.length) {
+    const looksLikeIds = tagsParam.every(t => /^[a-f0-9]{16,}$/i.test(t));
+    tagJoin = `JOIN company_tags ctg ON co.id = ctg.company_id
+               JOIN tags t ON ctg.tag_id = t.id`;
+    if (looksLikeIds) {
+      where.push(`t.id IN (${tagsParam.map(() => '?').join(',')})`);
+    } else {
+      where.push(`t.name IN (${tagsParam.map(() => '?').join(',')})`);
+    }
+    binds.push(...tagsParam);
+  }
+
+  // Sort. New `sort`/`order` aliases override legacy `sort_by`/`sort_dir`.
+  const sortKey = sp.get('sort') ?? f.sort_by;
+  const sortMeta = COMPANY_SORT_MAP[sortKey ?? 'news_score'] ?? COMPANY_SORT_MAP.news_score;
+  const orderParam = sp.get('order') ?? f.sort_dir;
+  const sortDir = orderParam
+    ? (orderParam.toLowerCase() === 'asc' ? 'ASC' : 'DESC')
+    : sortMeta.defaultDir;
+
+  // Default sort is news_score DESC NULLS LAST tiebroken alpha — beats pure
+  // alphabetical because the in-news rows surface to the top without burying
+  // the rest.
+  const tieBreak = sortKey === 'news_score' || !sortKey ? ', co.name COLLATE NOCASE ASC' : ', co.id ASC';
 
   // Default 100/page, ceiling 500. Frontend cumulative-paginates.
   const limit = Math.min(f.limit || 100, 500);
   const offset = f.offset || 0;
 
+  const havingClause =
+    tagsParam?.length && f.tag_logic === 'and'
+      ? `HAVING COUNT(DISTINCT t.id) = ${tagsParam.length}`
+      : '';
+
+  const sql = `
+    SELECT co.*
+    FROM companies co
+    ${tagJoin}
+    WHERE ${where.join(' AND ')}
+    GROUP BY co.id
+    ${havingClause}
+    ORDER BY ${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
+    LIMIT ? OFFSET ?
+  `;
+
+  const countSql = `
+    SELECT COUNT(DISTINCT co.id) as n
+    FROM companies co
+    ${tagJoin}
+    WHERE ${where.join(' AND ')}
+  `;
+
   const [result, countResult] = await Promise.all([
-    env.D1.prepare(
-      `SELECT * FROM companies WHERE ${where.join(' AND ')} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`
-    ).bind(...binds, limit, offset).all(),
-    env.D1.prepare(
-      `SELECT COUNT(*) as n FROM companies WHERE ${where.join(' AND ')}`
-    ).bind(...binds).first<{ n: number }>(),
+    env.D1.prepare(sql).bind(...binds, limit, offset).all(),
+    env.D1.prepare(countSql).bind(...binds).first<{ n: number }>(),
   ]);
   const total = countResult?.n ?? 0;
 
@@ -89,7 +201,44 @@ export async function listCompanies(
     }
   }
 
-  return jsonResponse({ companies, limit, offset, total });
+  return jsonResponse({
+    companies,
+    limit,
+    offset,
+    total,
+    has_more: offset + companies.length < total,
+  });
+}
+
+// --- GET /api/companies/cities ---
+// Distinct city list extracted from the leading segment of hq_location, with
+// a count per city. Cached for 5 minutes — these don't move quickly and the
+// dropdown calls this on every page load.
+export async function listCompanyCities(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const rows = await env.D1.prepare(
+    `SELECT hq_location FROM companies
+     WHERE org_id = ? AND deleted_at IS NULL AND hq_location IS NOT NULL AND hq_location != ''`
+  ).bind(ctx.orgId).all<{ hq_location: string }>();
+
+  const counts = new Map<string, number>();
+  for (const r of rows.results) {
+    const city = r.hq_location.split(',')[0].trim();
+    if (!city) continue;
+    counts.set(city, (counts.get(city) || 0) + 1);
+  }
+
+  const cities = Array.from(counts.entries())
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return jsonResponse(
+    { cities },
+    200,
+    { 'Cache-Control': 'private, max-age=300' }
+  );
 }
 
 function parseCompanyFilter(url: URL): CompanyFilter {

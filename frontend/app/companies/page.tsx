@@ -1,13 +1,53 @@
 'use client';
 
-import React from 'react';
-import { useRouter } from 'next/navigation';
+import React, { Suspense } from 'react';
+import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
 import { DataTable, Column } from '@/components/data-table';
 import { FilterPanel } from '@/components/filter-panel';
+import { SortDropdown, SortOption } from '@/components/sort-dropdown';
+import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { TagManagerModal } from '@/components/tag-manager-modal';
 import { api } from '@/lib/api';
+import { initialFromName, faviconUrl } from '@/lib/avatar';
 import { Plus, Search, X as XIcon, Settings2 } from 'lucide-react';
+
+interface Tag { id: string; name: string; color: string }
+interface CityOpt { name: string; count: number }
+
+const COMPANY_TYPES = [
+  { value: 'startup',       label: 'Startup' },
+  { value: 'vc_firm',       label: 'VC Firm' },
+  { value: 'family_office', label: 'Family Office' },
+  { value: 'portfolio',     label: 'Portfolio' },
+  { value: 'lp',            label: 'LP' },
+  { value: 'other',         label: 'Other' },
+];
+
+const INVESTMENT_STATUSES = [
+  { value: 'tracking',       label: 'Tracking' },
+  { value: 'prospect',       label: 'Prospect' },
+  { value: 'due_diligence',  label: 'Due Diligence' },
+  { value: 'term_sheet',     label: 'Term Sheet' },
+  { value: 'invested',       label: 'Invested' },
+  { value: 'passed',         label: 'Passed' },
+  { value: 'exited',         label: 'Exited' },
+];
+
+const NEWS_SCORE_OPTIONS = [
+  { value: 'high',   label: 'High (7+)' },
+  { value: 'medium', label: 'Medium (3–7)' },
+  { value: 'low',    label: 'Low (0–3)' },
+  { value: 'none',   label: 'None' },
+];
+
+const SORT_OPTIONS: SortOption[] = [
+  { key: 'news_score',        label: 'News Score (highest first)', defaultDir: 'desc' },
+  { key: 'name',              label: 'Name (A–Z)',                 defaultDir: 'asc' },
+  { key: 'city',              label: 'City',                       defaultDir: 'asc' },
+  { key: 'investment_status', label: 'Investment Status',          defaultDir: 'asc' },
+  { key: 'created_at',        label: 'Date Added (newest first)',  defaultDir: 'desc' },
+];
 
 const COMPANY_TYPE_OPTIONS = [
   { value: 'startup', label: 'Startup' },
@@ -18,25 +58,139 @@ const COMPANY_TYPE_OPTIONS = [
   { value: 'other', label: 'Other' },
 ];
 
-interface Tag {
-  id: string;
-  name: string;
-  color: string;
+const PAGE_SIZE = 100;
+
+interface FilterState {
+  search: string;
+  type: string[];
+  investment_status: string[];
+  city: string;
+  news_score: string;            // single-select
+  has_deals: boolean;
+  tags: string[];
+  sort: string;
+  order: 'asc' | 'desc';
 }
 
-export default function CompaniesPage() {
+const DEFAULT_SORT = 'news_score';
+const DEFAULT_ORDER: 'asc' | 'desc' = 'desc';
+
+function emptyFilters(): FilterState {
+  return {
+    search: '',
+    type: [],
+    investment_status: [],
+    city: '',
+    news_score: '',
+    has_deals: false,
+    tags: [],
+    sort: DEFAULT_SORT,
+    order: DEFAULT_ORDER,
+  };
+}
+
+function readFromUrl(sp: URLSearchParams): FilterState {
+  const csv = (k: string) => (sp.get(k) || '').split(',').map(s => s.trim()).filter(Boolean);
+  const order = sp.get('order');
+  return {
+    search: sp.get('search') || '',
+    type: csv('type'),
+    investment_status: csv('investment_status'),
+    city: sp.get('city') || '',
+    news_score: sp.get('news_score') || '',
+    has_deals: sp.get('has_deals') === 'true',
+    tags: csv('tags'),
+    sort: sp.get('sort') || DEFAULT_SORT,
+    order: order === 'asc' || order === 'desc' ? order : DEFAULT_ORDER,
+  };
+}
+
+function toParams(f: FilterState): Record<string, string> {
+  const p: Record<string, string> = {};
+  if (f.search) p.search = f.search;
+  if (f.type.length) p.type = f.type.join(',');
+  if (f.investment_status.length) p.investment_status = f.investment_status.join(',');
+  if (f.city) p.city = f.city;
+  if (f.news_score) p.news_score = f.news_score;
+  if (f.has_deals) p.has_deals = 'true';
+  if (f.tags.length) p.tags = f.tags.join(',');
+  if (f.sort && f.sort !== DEFAULT_SORT) p.sort = f.sort;
+  if (f.order !== DEFAULT_ORDER) p.order = f.order;
+  return p;
+}
+
+const QUICK_FILTERS: QuickFilter<FilterState>[] = [
+  { key: 'portfolio', label: 'Portfolio',        preset: { investment_status: ['invested'] } },
+  { key: 'tracking',  label: 'Tracking',         preset: { investment_status: ['tracking'] } },
+  { key: 'in_news',   label: 'In News',          preset: { news_score: 'high,medium' } },
+  { key: 'has_deals', label: 'Has Active Deals', preset: { has_deals: true } },
+];
+
+function newsScoreLabel(value: string): string {
+  const map: Record<string, string> = {
+    high: 'High (7+)',
+    medium: 'Medium (3–7)',
+    low: 'Low (0–3)',
+    none: 'None',
+    'high,medium': 'In News',
+  };
+  return map[value] ?? value;
+}
+
+export default function CompaniesPageWrapper() {
+  return (
+    <Suspense fallback={<div className="flex-1" />}>
+      <CompaniesPage />
+    </Suspense>
+  );
+}
+
+function CompaniesPage() {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  const [filters, setFilters] = React.useState<FilterState>(() =>
+    readFromUrl(searchParams ? new URLSearchParams(searchParams.toString()) : new URLSearchParams())
+  );
+  const [searchInput, setSearchInput] = React.useState(filters.search);
+  const searchDebounceRef = React.useRef<ReturnType<typeof setTimeout>>();
+
   const [companies, setCompanies] = React.useState<any[]>([]);
+  const [total, setTotal] = React.useState(0);
   const [loading, setLoading] = React.useState(true);
-  const [search, setSearch] = React.useState('');
-  const [tagFilter, setTagFilter] = React.useState<string[]>([]);
-  const [allTags, setAllTags] = React.useState<Tag[]>([]);
-  const [tagManagerOpen, setTagManagerOpen] = React.useState(false);
-  const [filterCounts, setFilterCounts] = React.useState<{ tags: Record<string, number> }>({ tags: {} });
+  const [loadingMore, setLoadingMore] = React.useState(false);
   const [createOpen, setCreateOpen] = React.useState(false);
   const [createForm, setCreateForm] = React.useState({ name: '', domain: '', website: '', sector: '', company_type: '', location: '' });
   const [creating, setCreating] = React.useState(false);
+  const [tagManagerOpen, setTagManagerOpen] = React.useState(false);
   const [toast, setToast] = React.useState<string | null>(null);
+
+  const [allTags, setAllTags] = React.useState<Tag[]>([]);
+  const [allCities, setAllCities] = React.useState<CityOpt[]>([]);
+  const [filterCounts, setFilterCounts] = React.useState<{ tags: Record<string, number> }>({ tags: {} });
+
+  // URL sync
+  React.useEffect(() => {
+    const params = toParams(filters);
+    const qs = new URLSearchParams(params).toString();
+    const next = qs ? `${pathname}?${qs}` : pathname;
+    router.replace(next, { scroll: false });
+  }, [filters, pathname, router]);
+
+  React.useEffect(() => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      setFilters(f => f.search === searchInput ? f : { ...f, search: searchInput });
+    }, 300);
+    return () => { if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current); };
+  }, [searchInput]);
+
+  React.useEffect(() => {
+    api.listTags('company').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
+    api.listCompanyCities().then(d => setAllCities(d.cities)).catch(() => {});
+    api.getCompanyFilterCounts().then(setFilterCounts).catch(() => {});
+  }, []);
 
   React.useEffect(() => {
     if (!toast) return;
@@ -44,33 +198,34 @@ export default function CompaniesPage() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // Cumulative pagination — same shape as the contacts page: 100/page, total
-  // from server, "Load more" button below the list. Scales cleanly to ~10k
-  // records; if the dataset crosses 100k swap to cursor-based.
-  const PAGE_SIZE = 100;
-  const [total, setTotal] = React.useState(0);
-  const [loadingMore, setLoadingMore] = React.useState(false);
+  const buildParams = React.useCallback((offset: number): Record<string, string> => ({
+    ...toParams(filters),
+    limit: String(PAGE_SIZE),
+    offset: String(offset),
+  }), [filters]);
 
   const loadCompanies = React.useCallback(() => {
     setLoading(true);
-    api.listCompanies({ limit: String(PAGE_SIZE), offset: '0' })
+    return api.listCompanies(buildParams(0))
       .then(d => {
         setCompanies(d.companies);
         setTotal(d.total ?? d.companies.length);
       })
       .finally(() => setLoading(false));
-  }, []);
+  }, [buildParams]);
 
   const loadMore = React.useCallback(() => {
     if (loadingMore || companies.length >= total) return;
     setLoadingMore(true);
-    api.listCompanies({ limit: String(PAGE_SIZE), offset: String(companies.length) })
+    api.listCompanies(buildParams(companies.length))
       .then(d => {
         setCompanies(prev => [...prev, ...d.companies]);
         if (typeof d.total === 'number') setTotal(d.total);
       })
       .finally(() => setLoadingMore(false));
-  }, [companies.length, total, loadingMore]);
+  }, [buildParams, companies.length, total, loadingMore]);
+
+  React.useEffect(() => { loadCompanies(); }, [loadCompanies]);
 
   async function handleCreateCompany() {
     if (!createForm.name.trim()) return;
@@ -92,63 +247,66 @@ export default function CompaniesPage() {
     finally { setCreating(false); }
   }
 
-  const loadTags = React.useCallback(() => {
-    api.listTags('company').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
-  }, []);
+  // Chips
+  type Chip = { label: string; onRemove: () => void };
+  const chips: Chip[] = [];
+  for (const t of filters.type) chips.push({
+    label: `Type: ${COMPANY_TYPES.find(o => o.value === t)?.label ?? t}`,
+    onRemove: () => setFilters(f => ({ ...f, type: f.type.filter(x => x !== t) })),
+  });
+  for (const s of filters.investment_status) chips.push({
+    label: `Status: ${INVESTMENT_STATUSES.find(o => o.value === s)?.label ?? s}`,
+    onRemove: () => setFilters(f => ({ ...f, investment_status: f.investment_status.filter(x => x !== s) })),
+  });
+  if (filters.city) chips.push({
+    label: `City: ${filters.city}`,
+    onRemove: () => setFilters(f => ({ ...f, city: '' })),
+  });
+  if (filters.news_score) chips.push({
+    label: `News: ${newsScoreLabel(filters.news_score)}`,
+    onRemove: () => setFilters(f => ({ ...f, news_score: '' })),
+  });
+  if (filters.has_deals) chips.push({
+    label: 'Has Active Deals',
+    onRemove: () => setFilters(f => ({ ...f, has_deals: false })),
+  });
+  for (const tagId of filters.tags) {
+    const tag = allTags.find(t => t.id === tagId);
+    if (!tag) continue;
+    chips.push({
+      label: `Tag: ${tag.name}`,
+      onRemove: () => setFilters(f => ({ ...f, tags: f.tags.filter(x => x !== tagId) })),
+    });
+  }
+  if (filters.sort !== DEFAULT_SORT || filters.order !== DEFAULT_ORDER) {
+    const opt = SORT_OPTIONS.find(o => o.key === filters.sort);
+    chips.push({
+      label: `Sort: ${opt?.label ?? filters.sort} ${filters.order === 'asc' ? '↑' : '↓'}`,
+      onRemove: () => setFilters(f => ({ ...f, sort: DEFAULT_SORT, order: DEFAULT_ORDER })),
+    });
+  }
 
-  React.useEffect(() => {
-    loadTags();
-    api.getCompanyFilterCounts().then(setFilterCounts).catch(() => {});
-  }, [loadTags]);
+  const isFiltered = chips.length > 0;
 
-  React.useEffect(() => {
-    loadCompanies();
-  }, [loadCompanies]);
-
-  const filtered = React.useMemo(() => {
-    let result = companies;
-    if (search) {
-      const q = search.toLowerCase();
-      result = result.filter(c =>
-        c.name?.toLowerCase().includes(q) ||
-        c.sector?.toLowerCase().includes(q) ||
-        c.company_type?.toLowerCase().includes(q)
-      );
-    }
-    if (tagFilter.length > 0) {
-      const tagSet = new Set(tagFilter);
-      result = result.filter(c => c.tags?.some((t: any) => tagSet.has(t.id)));
-    }
-    return result;
-  }, [companies, search, tagFilter]);
-
-  const isFiltered = tagFilter.length > 0;
-  const activeFilterLabels = allTags.filter(t => tagFilter.includes(t.id)).map(t => t.name);
+  function handleSort(key: string) {
+    setFilters(f => {
+      if (f.sort === key) return { ...f, order: f.order === 'asc' ? 'desc' : 'asc' };
+      const opt = SORT_OPTIONS.find(o => o.key === key);
+      return { ...f, sort: key, order: opt?.defaultDir ?? 'asc' };
+    });
+  }
 
   const columns: Column<any>[] = [
     {
-      key: 'name',
-      header: 'Name',
-      width: '220px',
-      accessor: row => (
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="w-8 h-8 shrink-0 rounded-lg bg-brand-gradient flex items-center justify-center text-white text-xs font-medium">
-            {row.name?.charAt(0)}
-          </div>
-          <span className="font-medium truncate" title={row.name}>{row.name}</span>
-        </div>
-      ),
+      key: 'name', sortKey: 'name', header: 'Name', width: '220px', sortable: true,
+      accessor: row => <CompanyAvatarCell name={row.name} domain={row.domain} logoUrl={row.logo_url} />,
     },
     {
-      key: 'type',
-      header: 'Type',
-      width: '100px',
-      accessor: row => <span className="badge capitalize">{row.company_type}</span>,
+      key: 'type', header: 'Type', width: '110px', sortable: false,
+      accessor: row => <span className="badge capitalize">{(row.company_type || '').replace(/_/g, ' ')}</span>,
     },
     {
-      key: 'tags',
-      header: 'Tags',
-      width: '180px',
+      key: 'tags', header: 'Tags', width: '180px',
       accessor: row => (
         <div className="flex items-center gap-1 flex-wrap">
           {(row.tags || []).slice(0, 3).map((t: any) => (
@@ -164,31 +322,21 @@ export default function CompaniesPage() {
       ),
     },
     {
-      key: 'city',
-      header: 'City',
-      width: '140px',
+      key: 'city', sortKey: 'city', header: 'City', width: '140px', sortable: true,
       accessor: row => {
         const city = extractCity(row.hq_location);
-        return (
-          <span className="truncate block" title={row.hq_location || undefined}>{city}</span>
-        );
+        return <span className="truncate block" title={row.hq_location || undefined}>{city}</span>;
       },
     },
     {
-      key: 'status',
-      header: 'Investment Status',
-      width: '150px',
-      accessor: row => (
-        <span className="badge capitalize">{row.investment_status?.replace('_', ' ')}</span>
-      ),
+      key: 'investment_status', sortKey: 'investment_status', header: 'Investment Status', width: '150px', sortable: true,
+      accessor: row => <span className="badge capitalize">{row.investment_status?.replace('_', ' ')}</span>,
     },
     {
-      key: 'news_score',
-      header: 'News Score',
-      width: '110px',
+      key: 'news_score', sortKey: 'news_score', header: 'News Score', width: '110px', sortable: true,
       accessor: row => {
         const score = row.news_relevance_score;
-        if (!score) return <span className="text-xs text-text-muted">{'\u2014'}</span>;
+        if (!score) return <span className="text-xs text-text-muted">{'—'}</span>;
         const color = score > 7 ? '#22C55E' : score >= 4 ? '#F59E0B' : '#EF4444';
         return (
           <div className="flex items-center gap-2">
@@ -207,24 +355,98 @@ export default function CompaniesPage() {
       <FilterPanel
         sections={[
           {
-            label: 'Tags',
+            label: 'Type',
             defaultOpen: true,
+            children: COMPANY_TYPES.map(opt => {
+              const active = filters.type.includes(opt.value);
+              return (
+                <label key={opt.value}
+                  className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors ${
+                    active ? 'bg-accent-magenta/10 text-text-primary' : 'text-text-secondary hover:text-text-primary'
+                  }`}>
+                  <input type="checkbox" checked={active}
+                    onChange={e => setFilters(f => ({
+                      ...f, type: e.target.checked ? [...f.type, opt.value] : f.type.filter(t => t !== opt.value),
+                    }))} />
+                  <span className="flex-1">{opt.label}</span>
+                </label>
+              );
+            }),
+          },
+          {
+            label: 'Investment Status',
+            defaultOpen: true,
+            children: INVESTMENT_STATUSES.map(opt => {
+              const active = filters.investment_status.includes(opt.value);
+              return (
+                <label key={opt.value}
+                  className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors ${
+                    active ? 'bg-accent-magenta/10 text-text-primary' : 'text-text-secondary hover:text-text-primary'
+                  }`}>
+                  <input type="checkbox" checked={active}
+                    onChange={e => setFilters(f => ({
+                      ...f,
+                      investment_status: e.target.checked
+                        ? [...f.investment_status, opt.value]
+                        : f.investment_status.filter(s => s !== opt.value),
+                    }))} />
+                  <span className="flex-1">{opt.label}</span>
+                </label>
+              );
+            }),
+          },
+          {
+            label: 'City',
+            defaultOpen: false,
+            children: <CityTypeahead options={allCities} value={filters.city} onChange={c => setFilters(f => ({ ...f, city: c }))} />,
+          },
+          {
+            label: 'News Score',
+            defaultOpen: false,
+            children: NEWS_SCORE_OPTIONS.map(opt => {
+              const active = filters.news_score === opt.value;
+              return (
+                <label key={opt.value}
+                  className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors ${
+                    active ? 'bg-accent-magenta/10 text-text-primary' : 'text-text-secondary hover:text-text-primary'
+                  }`}>
+                  <input type="radio" name="news_score" checked={active}
+                    onChange={() => setFilters(f => ({ ...f, news_score: opt.value }))} />
+                  <span className="flex-1">{opt.label}</span>
+                </label>
+              );
+            }),
+          },
+          {
+            label: 'Deals',
+            defaultOpen: false,
+            children: (
+              <label className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors ${
+                filters.has_deals ? 'bg-accent-magenta/10 text-text-primary' : 'text-text-secondary hover:text-text-primary'
+              }`}>
+                <input type="checkbox" checked={filters.has_deals}
+                  onChange={e => setFilters(f => ({ ...f, has_deals: e.target.checked }))} />
+                <span className="flex-1">Only companies with deals</span>
+              </label>
+            ),
+          },
+          {
+            label: 'Tags',
+            defaultOpen: false,
             children: (
               <>
                 {allTags.length > 0 ? allTags.map(tag => {
                   const count = filterCounts.tags[tag.id] || 0;
-                  const active = tagFilter.includes(tag.id);
+                  const active = filters.tags.includes(tag.id);
                   return (
                     <label key={tag.id}
                       className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors ${
                         active ? 'bg-accent-magenta/10 text-text-primary' : count === 0 ? 'text-text-muted' : 'text-text-secondary hover:text-text-primary'
                       }`}>
                       <input type="checkbox" checked={active}
-                        onChange={e => {
-                          setTagFilter(prev =>
-                            e.target.checked ? [...prev, tag.id] : prev.filter(t => t !== tag.id)
-                          );
-                        }} />
+                        onChange={e => setFilters(f => ({
+                          ...f, tags: e.target.checked ? [...f.tags, tag.id] : f.tags.filter(t => t !== tag.id),
+                        }))} />
                       <span className="w-2 h-2 rounded-full shrink-0" style={{ background: tag.color }} />
                       <span className="flex-1">{tag.name}</span>
                       <span className={`text-[10px] tabular-nums ${count === 0 ? 'text-text-muted/50' : 'text-text-muted'}`}>{count}</span>
@@ -241,8 +463,8 @@ export default function CompaniesPage() {
             ),
           },
         ]}
-        onClearAll={() => setTagFilter([])}
-        activeCount={tagFilter.length}
+        onClearAll={() => { setFilters(emptyFilters()); setSearchInput(''); }}
+        activeCount={chips.length}
       />
 
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -251,59 +473,76 @@ export default function CompaniesPage() {
           search={
             <div className="relative flex-1 min-w-[320px]">
               <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none" />
-              <input type="text" placeholder="Search companies..."
-                value={search} onChange={e => setSearch(e.target.value)}
+              <input type="text" placeholder="Search companies by name, domain, or description..."
+                value={searchInput} onChange={e => setSearchInput(e.target.value)}
                 className="input pl-10 w-full" />
             </div>
           }
           actions={
-            <button className="btn-primary flex items-center gap-2" onClick={() => setCreateOpen(true)}>
-              <Plus size={16} /> Add Company
-            </button>
+            <div className="flex items-center gap-2">
+              <SortDropdown
+                options={SORT_OPTIONS}
+                value={filters.sort}
+                dir={filters.order}
+                onChange={(key, dir) => setFilters(f => ({ ...f, sort: key, order: dir }))}
+              />
+              <button className="btn-primary flex items-center gap-2" onClick={() => setCreateOpen(true)}>
+                <Plus size={16} /> Add Company
+              </button>
+            </div>
           }
         />
+
         <div className="flex-1 p-6 overflow-auto">
-          {/* Active filter summary */}
+          <QuickFilters<FilterState>
+            filters={filters}
+            presets={QUICK_FILTERS}
+            onApply={next => setFilters(next)}
+            onClearAll={() => { setFilters(emptyFilters()); setSearchInput(''); }}
+          />
           {isFiltered && (
             <div className="flex items-center gap-2 mb-3 flex-wrap">
-              <span className="text-xs text-text-muted">Filtering:</span>
-              {activeFilterLabels.map(label => (
-                <span key={label} className="px-2 py-0.5 rounded text-[10px] font-medium"
+              {chips.map((chip, i) => (
+                <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium"
                   style={{ background: 'rgba(217,70,168,0.1)', color: '#D946A8' }}>
-                  {label}
+                  {chip.label}
+                  <button onClick={chip.onRemove} className="hover:text-white transition-colors">
+                    <XIcon size={11} />
+                  </button>
                 </span>
               ))}
-              <button onClick={() => setTagFilter([])}
-                className="text-[10px] text-text-muted hover:text-text-secondary ml-1 flex items-center gap-0.5">
-                <XIcon size={10} /> Clear All
+              <button onClick={() => { setFilters(emptyFilters()); setSearchInput(''); }}
+                className="text-[11px] text-text-muted hover:text-text-secondary ml-1">
+                Clear All
               </button>
             </div>
           )}
 
           <div className="text-sm text-text-secondary mb-4">
-            {loading ? 'Loading...' : isFiltered
-              ? `Showing ${filtered.length} of ${companies.length} loaded (${total} total)`
-              : `Showing ${companies.length} of ${total} companies`
-            }
+            {loading ? 'Loading...' : `Showing ${companies.length} of ${total} ${isFiltered ? 'matching ' : ''}companies`}
           </div>
+
           <DataTable
             columns={columns}
-            data={filtered}
+            data={companies}
             loading={loading}
-            emptyMessage="No companies yet"
+            emptyMessage="No companies match your filters"
             getRowId={c => c.id}
             onRowClick={c => router.push(`/companies/${c.id}`)}
+            sortKey={filters.sort}
+            sortDir={filters.order}
+            onSort={handleSort}
           />
+
           {!loading && companies.length < total && (
             <div className="flex justify-center mt-4">
-              <button
-                onClick={loadMore}
-                disabled={loadingMore}
-                className="btn-secondary text-sm"
-              >
+              <button onClick={loadMore} disabled={loadingMore} className="btn-secondary text-sm">
                 {loadingMore ? 'Loading...' : `Load more (${total - companies.length} remaining)`}
               </button>
             </div>
+          )}
+          {!loading && companies.length > 0 && companies.length >= total && (
+            <div className="text-center mt-4 text-xs text-text-muted">End of results</div>
           )}
         </div>
       </main>
@@ -313,7 +552,7 @@ export default function CompaniesPage() {
         open={tagManagerOpen}
         onClose={() => setTagManagerOpen(false)}
         onChanged={() => {
-          loadTags();
+          api.listTags('company').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
           api.getCompanyFilterCounts().then(setFilterCounts).catch(() => {});
         }}
       />
@@ -377,7 +616,87 @@ export default function CompaniesPage() {
   );
 }
 
+// Avatar tile that prefers logo_url, falls back to a Google favicon if a
+// domain is present, and finally to a gradient tile with the initial of
+// the longest alpha-bearing word in the company name. The favicon image
+// disappears via onError so the gradient placeholder takes over without
+// a flicker of broken-image icon.
+function CompanyAvatarCell({ name, domain, logoUrl }: { name: string; domain?: string | null; logoUrl?: string | null }) {
+  const [imgFailed, setImgFailed] = React.useState(false);
+  const src = logoUrl || (!imgFailed ? faviconUrl(domain) : null);
+  return (
+    <div className="flex items-center gap-3 min-w-0">
+      {src ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={src}
+          alt=""
+          className="w-8 h-8 shrink-0 rounded-lg object-cover bg-bg-surface-hover"
+          onError={() => setImgFailed(true)}
+        />
+      ) : (
+        <div className="w-8 h-8 shrink-0 rounded-lg bg-brand-gradient flex items-center justify-center text-white text-xs font-medium">
+          {initialFromName(name)}
+        </div>
+      )}
+      <span className="font-medium truncate" title={name}>{name}</span>
+    </div>
+  );
+}
+
+function CityTypeahead({
+  options,
+  value,
+  onChange,
+}: {
+  options: CityOpt[];
+  value: string;
+  onChange: (city: string) => void;
+}) {
+  const [query, setQuery] = React.useState('');
+  if (value) {
+    return (
+      <div className="flex items-center gap-2 px-1.5 py-1 -mx-1.5 rounded bg-accent-magenta/10 text-sm">
+        <span className="flex-1 truncate text-text-primary" title={value}>{value}</span>
+        <button onClick={() => onChange('')} className="text-text-muted hover:text-text-primary">
+          <XIcon size={12} />
+        </button>
+      </div>
+    );
+  }
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? options.filter(o => o.name.toLowerCase().includes(q)).slice(0, 12)
+    : options.slice(0, 8);
+  return (
+    <div className="space-y-1">
+      <input
+        type="text"
+        value={query}
+        onChange={e => setQuery(e.target.value)}
+        placeholder="Search cities..."
+        className="input w-full text-sm"
+      />
+      <div className="max-h-48 overflow-y-auto space-y-0.5">
+        {filtered.map(opt => (
+          <button
+            key={opt.name}
+            onClick={() => { onChange(opt.name); setQuery(''); }}
+            className="w-full flex items-center gap-2 text-sm cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover/50"
+          >
+            <span className="flex-1 text-left truncate" title={opt.name}>{opt.name}</span>
+            <span className="text-[10px] tabular-nums text-text-muted">{opt.count}</span>
+          </button>
+        ))}
+        {filtered.length === 0 && (
+          <div className="text-xs text-text-muted px-1.5 py-1">No matches</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function extractCity(location: string | null | undefined): string {
-  if (!location) return '\u2014';
-  return location.split(',')[0].trim() || '\u2014';
+  if (!location) return '—';
+  return location.split(',')[0].trim() || '—';
 }
