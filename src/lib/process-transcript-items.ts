@@ -51,8 +51,12 @@ export interface TranscriptItem {
 
 export interface ProcessTranscriptContext {
   orgId: string;
-  /** Drives sync_jobs.workflow_type. */
-  sourcePath: 'firefly-webhook' | 'firefly-backfill';
+  /** Drives sync_jobs.workflow_type. Phase F adds the
+   * 'firefly-progressive-backfill-window' variant so progressive cron
+   * ticks produce per-window sync_jobs rows distinguishable from the
+   * legacy one-shot backfill (workflow_type='firefly-backfill') and the
+   * webhook ingest path (workflow_type='firefly-webhook'). */
+  sourcePath: 'firefly-webhook' | 'firefly-backfill' | 'firefly-progressive-backfill-window';
 }
 
 export interface TranscriptStats {
