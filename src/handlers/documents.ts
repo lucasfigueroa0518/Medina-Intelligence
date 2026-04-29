@@ -9,17 +9,60 @@ import { persistDocument, type DocumentLink, type DocumentVisibility } from '../
 
 const ALLOWED_VISIBILITIES: DocumentVisibility[] = ['private', 'org_wide', 'public', 'confidential'];
 
+// Whitelisted sort columns. The list-page UI exposes file name + size + date;
+// any other value falls back to created_at DESC. We can't bind a column name
+// as a SQL parameter, so the keys here gate the user-supplied `sort` query
+// param against an explicit allowlist before it reaches ORDER BY.
+const SORT_COLUMN_MAP: Record<string, string> = {
+  created_at: 'd.created_at',
+  date: 'd.created_at',
+  added: 'd.created_at',
+  file_name: 'd.file_name',
+  name: 'd.file_name',
+  file_size: 'd.file_size',
+  size: 'd.file_size',
+};
+
+function parseList(raw: string | null): string[] | undefined {
+  if (!raw) return undefined;
+  const items = raw.split(',').map(s => s.trim()).filter(Boolean);
+  return items.length ? items : undefined;
+}
+
 export async function listDocuments(
   request: Request,
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
   const url = new URL(request.url);
-  const contactId = url.searchParams.get('contact_id');
-  const companyId = url.searchParams.get('company_id');
-  const dealId = url.searchParams.get('deal_id');
-  const conversationId = url.searchParams.get('conversation_id');
-  const type = url.searchParams.get('document_type');
+  const sp = url.searchParams;
+
+  const contactId = sp.get('contact_id');
+  const companyId = sp.get('company_id');
+  const dealId = sp.get('deal_id');
+  const conversationId = sp.get('conversation_id');
+
+  // Multi-value filters: comma-separated CSV. parseList trims + drops empties.
+  const sources = parseList(sp.get('source'));
+  // document_type accepts both legacy single value and new CSV multi.
+  const documentTypes = parseList(sp.get('document_type'));
+
+  // Wave 4 Q2 chose Option B — keyword LIKE on title + file_name only. No
+  // full-text on extracted_text_preview (that's MARTy's job via vector search).
+  const search = (sp.get('search') || '').trim();
+  // ISO 8601 date strings. Compared lexicographically against created_at —
+  // works because both sides are 'YYYY-MM-DDTHH:MM:fffZ' and same calendar.
+  const dateFrom = sp.get('date_from');
+  const dateTo = sp.get('date_to');
+  // Convenience filter: uploaded_by = me. The "Mine" preset uses this rather
+  // than asking the UI to know the current user's UUID.
+  const minePreset = sp.get('mine') === 'true';
+
+  // Sort + order — whitelist column to prevent SQL injection. Default is
+  // newest-added first (created_at DESC) which matches the contacts list UX.
+  const sortKey = sp.get('sort') || 'created_at';
+  const sortColumn = SORT_COLUMN_MAP[sortKey] || 'd.created_at';
+  const sortDir = (sp.get('order') || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
   // When an entity filter is supplied we route through document_links so a
   // doc linked via 'mentioned' or 'attached' shows up alongside 'primary'
@@ -33,7 +76,32 @@ export async function listDocuments(
 
   const where: string[] = ['d.org_id = ?', 'd.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
-  if (type) { where.push('d.document_type = ?'); binds.push(type); }
+
+  if (sources?.length) {
+    where.push(`d.source IN (${sources.map(() => '?').join(',')})`);
+    binds.push(...sources);
+  }
+  if (documentTypes?.length) {
+    where.push(`d.document_type IN (${documentTypes.map(() => '?').join(',')})`);
+    binds.push(...documentTypes);
+  }
+  if (search) {
+    where.push('(d.title LIKE ? OR d.file_name LIKE ?)');
+    const pat = `%${search}%`;
+    binds.push(pat, pat);
+  }
+  if (dateFrom) {
+    where.push('d.created_at >= ?');
+    binds.push(dateFrom);
+  }
+  if (dateTo) {
+    where.push('d.created_at < ?');
+    binds.push(dateTo);
+  }
+  if (minePreset) {
+    where.push('d.uploaded_by = ?');
+    binds.push(ctx.userId);
+  }
 
   const fromAndJoin = entityFilter
     ? `documents d
@@ -43,27 +111,33 @@ export async function listDocuments(
           AND ${where.join(' AND ')}`
     : `documents d WHERE ${where.join(' AND ')}`;
 
-  const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
-  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const limit = Math.min(parseInt(sp.get('limit') || '100', 10), 500);
+  const offset = parseInt(sp.get('offset') || '0', 10);
 
   const candidateBinds = entityFilter ? [entityFilter.type, entityFilter.id, ...binds] : binds;
 
   // ACL filter is applied in JS, not SQL: visibility/participant_user_ids
   // aren't structured for cheap SQL filtering (JSON-stringified array column),
   // and the documents corpus is small enough that an in-process filter is
-  // cleaner than a CTE. Pull just IDs+ACL fields, filter+paginate, then fetch
-  // full rows for the page.
+  // cleaner than a CTE. Pull just IDs+ACL fields + sort columns, sort + filter
+  // + paginate in JS, then fetch full rows for the page.
+  //
+  // SORT_COLUMN_MAP gates `sortColumn` against an allowlist so the
+  // template-string interpolation is safe.
   const [candidates, sharingFlags] = await Promise.all([
     env.D1.prepare(
-      `SELECT DISTINCT d.id, d.visibility, d.participant_user_ids, d.uploaded_by, d.created_at
+      `SELECT DISTINCT d.id, d.visibility, d.participant_user_ids, d.uploaded_by,
+                       d.created_at, d.file_name, d.file_size
          FROM ${fromAndJoin}
-        ORDER BY d.created_at DESC`
+        ORDER BY ${sortColumn} ${sortDir}, d.id ${sortDir}`
     ).bind(...candidateBinds).all<{
       id: string;
       visibility: string | null;
       participant_user_ids: string | null;
       uploaded_by: string | null;
       created_at: string;
+      file_name: string | null;
+      file_size: number | null;
     }>(),
     getSharingFlags(ctx.orgId, env),
   ]);
@@ -74,23 +148,88 @@ export async function listDocuments(
   );
 
   const total = accessible.length;
-  const pageIds = accessible.slice(offset, offset + limit).map(d => d.id);
+  const pageOrder = accessible.slice(offset, offset + limit);
+  const pageIds = pageOrder.map(d => d.id);
 
   if (pageIds.length === 0) {
     return jsonResponse({ documents: [], total, limit, offset, has_more: false });
   }
 
+  // Fetch full rows by ID, then re-order to match the candidate sort. We
+  // can't trust SQL ORDER BY on the IN-list query because SQLite doesn't
+  // preserve the bind-order of an IN clause.
   const placeholders = pageIds.map(() => '?').join(',');
   const fullRows = await env.D1.prepare(
-    `SELECT * FROM documents WHERE id IN (${placeholders}) ORDER BY created_at DESC`
-  ).bind(...pageIds).all();
+    `SELECT * FROM documents WHERE id IN (${placeholders})`
+  ).bind(...pageIds).all<{ id: string; [k: string]: unknown }>();
+  const idIndex = new Map(pageIds.map((id, i) => [id, i]));
+  const ordered = [...fullRows.results].sort(
+    (a, b) => (idIndex.get(a.id) ?? 0) - (idIndex.get(b.id) ?? 0)
+  );
 
   return jsonResponse({
-    documents: fullRows.results,
+    documents: ordered,
     total,
     limit,
     offset,
     has_more: offset + limit < total,
+  });
+}
+
+// --- GET /api/documents/filter-counts ---
+//
+// Returns counts for every facet the /documents list page exposes. Mirrors
+// the contacts/companies filter-counts pattern. Counts are NOT ACL-filtered
+// — facet badges show org-level totals, which is consistent with how the
+// contacts page works (showing "Investor (12)" even if the user can only
+// access 8 of those 12).
+export async function getDocumentFilterCounts(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const [sourceCounts, typeCounts, dateBucketRow, mineRow] = await Promise.all([
+    env.D1.prepare(
+      `SELECT source, COUNT(*) as cnt FROM documents
+        WHERE org_id = ? AND deleted_at IS NULL
+        GROUP BY source`
+    ).bind(ctx.orgId).all<{ source: string; cnt: number }>(),
+
+    env.D1.prepare(
+      `SELECT document_type, COUNT(*) as cnt FROM documents
+        WHERE org_id = ? AND deleted_at IS NULL
+        GROUP BY document_type`
+    ).bind(ctx.orgId).all<{ document_type: string; cnt: number }>(),
+
+    env.D1.prepare(
+      `SELECT
+         SUM(CASE WHEN created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-7 days')  THEN 1 ELSE 0 END) as last_7d,
+         SUM(CASE WHEN created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') THEN 1 ELSE 0 END) as last_30d,
+         SUM(CASE WHEN created_at <  strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') THEN 1 ELSE 0 END) as older
+       FROM documents
+       WHERE org_id = ? AND deleted_at IS NULL`
+    ).bind(ctx.orgId).first<{ last_7d: number; last_30d: number; older: number }>(),
+
+    env.D1.prepare(
+      `SELECT COUNT(*) as cnt FROM documents
+        WHERE org_id = ? AND deleted_at IS NULL AND uploaded_by = ?`
+    ).bind(ctx.orgId, ctx.userId).first<{ cnt: number }>(),
+  ]);
+
+  const source: Record<string, number> = {};
+  for (const r of sourceCounts.results) source[r.source] = r.cnt;
+
+  const document_type: Record<string, number> = {};
+  for (const r of typeCounts.results) document_type[r.document_type] = r.cnt;
+
+  return jsonResponse({
+    source,
+    document_type,
+    date_bucket: {
+      last_7d: dateBucketRow?.last_7d || 0,
+      last_30d: dateBucketRow?.last_30d || 0,
+      older: dateBucketRow?.older || 0,
+    },
+    mine: mineRow?.cnt || 0,
   });
 }
 
