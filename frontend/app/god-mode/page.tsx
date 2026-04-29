@@ -126,6 +126,7 @@ interface Message {
   timestamp?: string;
   error?: boolean;
   retryable?: boolean;
+  cancelled?: boolean;
   sources?: CitationSource[];
   attachments?: ChatUploadSummary[];
 }
@@ -589,6 +590,39 @@ export default function GodModePage() {
   // Fix 4: Explicit isThinking state — only cleared on first text token
   const [isThinking, setIsThinking] = React.useState(false);
 
+  // MARTy Wave 1 cancellation. The server emits a request_id as the first
+  // stream event; we POST it to /api/agent/cancel on stop / Esc / Cmd+Backspace.
+  // Stored in a ref because we don't need React renders when it changes.
+  const activeRequestIdRef = React.useRef<string | null>(null);
+  const cancelledLocallyRef = React.useRef(false);
+
+  const cancelActiveStream = React.useCallback(() => {
+    const reqId = activeRequestIdRef.current;
+    if (!reqId) return;
+    cancelledLocallyRef.current = true;
+    api.cancelAgentQuery(reqId);
+  }, []);
+
+  // Global Esc / Cmd+Backspace cancel while streaming. Esc only fires when
+  // no input/textarea is focused so it doesn't fight with the input's own
+  // Escape behavior. Cmd+Backspace works regardless (power-user shortcut).
+  React.useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!streamingRef.current || !activeRequestIdRef.current) return;
+      const target = e.target as HTMLElement | null;
+      const inField = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+      if (e.key === 'Escape' && !inField) {
+        e.preventDefault();
+        cancelActiveStream();
+      } else if ((e.metaKey || e.ctrlKey) && e.key === 'Backspace') {
+        e.preventDefault();
+        cancelActiveStream();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [cancelActiveStream]);
+
   // Citation source side panel
   const [activeSource, setActiveSource] = React.useState<CitationSource | null>(null);
   const activeSourceMessageIdRef = React.useRef<string | null>(null);
@@ -730,11 +764,25 @@ export default function GodModePage() {
     if (activeSessionId && !streamingRef.current) {
       api.getSessionMessages(activeSessionId).then(d => {
         if (!streamingRef.current) {
-          setMessages(d.messages.map((m: any) => ({
-            id: m.id, role: m.role, content: m.content, timestamp: m.created_at,
-            attachments: m.attachments || undefined,
-            sources: m.sources || undefined,
-          })));
+          setMessages(d.messages.map((m: any) => {
+            // Pull cancelled flag out of the JSON metadata column.
+            let cancelled = false;
+            if (m.metadata) {
+              try {
+                const meta = typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata;
+                cancelled = !!meta?.cancelled;
+              } catch { /* ignore malformed metadata */ }
+            }
+            return {
+              id: m.id,
+              role: m.role,
+              content: m.content,
+              timestamp: m.created_at,
+              attachments: m.attachments || undefined,
+              sources: m.sources || undefined,
+              cancelled,
+            };
+          }));
         }
       });
       api.listSessionUploads(activeSessionId).then(d => {
@@ -873,9 +921,16 @@ export default function GodModePage() {
           }
         },
         () => {
+          const wasCancelled = cancelledLocallyRef.current;
+          cancelledLocallyRef.current = false;
+          activeRequestIdRef.current = null;
           setIsThinking(false);
           setMessages(m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
+            if (wasCancelled) {
+              const placeholder = msg.content || '_(cancelled before MARTy started generating)_';
+              return { ...msg, content: placeholder, streaming: false, cancelled: true };
+            }
             if (!msg.content && (!msg.toolCalls || msg.toolCalls.length === 0)) {
               return { ...msg, content: 'Something went wrong — no response was received. Please try again.', streaming: false, error: true };
             }
@@ -927,6 +982,11 @@ export default function GodModePage() {
             }
             localStorage.setItem('marty_pending', JSON.stringify({ sessionId: event.session_id }));
             window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+            return;
+          }
+          if (event.type === 'request' && event.request_id) {
+            activeRequestIdRef.current = event.request_id;
+            cancelledLocallyRef.current = false;
             return;
           }
           if (event.type === 'sources') {
@@ -1224,13 +1284,19 @@ export default function GodModePage() {
                       <ErrorCard message={m.content} retryable={m.retryable !== false} onRetry={() => retryFrom(m.id)} />
                     ) : m.content ? (
                       <div className="relative">
-                        <div className="border-l-2 border-[#8B5CF6]/30 pl-4">
+                        <div className={`border-l-2 ${m.cancelled ? 'border-text-muted/40' : 'border-[#8B5CF6]/30'} pl-4`}>
                           {!m.streaming && <TableOfContents content={m.content} />}
                           <MarkdownMessage
                             content={m.streaming ? trimPartialCitation(m.content) : m.content}
                             sources={m.sources}
                             onCitationClick={handleCitationClick(m.id)}
                           />
+                          {m.cancelled && (
+                            <div className="mt-2 inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-medium bg-text-muted/15 text-text-muted" style={{ fontFamily: "'Exo 2', sans-serif" }}>
+                              <span style={{ width: 6, height: 6, background: 'currentColor', borderRadius: 1 }} />
+                              Cancelled
+                            </div>
+                          )}
                           {!m.streaming && m.sources && m.sources.length > 0 && (() => {
                             // Only show sources that were actually cited inline.
                             const cited = new Set<number>();
@@ -1411,23 +1477,43 @@ export default function GodModePage() {
               />
 
               {/* Send button — fixed 36x36 */}
-              <button
-                onClick={() => sendMessage(input)}
-                disabled={!hasInput || streaming}
-                className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
-                style={{
-                  borderRadius: 10,
-                  background: hasInput && !streaming
-                    ? 'linear-gradient(135deg, #A855F7 0%, #EC4899 100%)'
-                    : 'rgba(255,255,255,0.08)',
-                  cursor: hasInput && !streaming ? 'pointer' : 'not-allowed',
-                  transform: sendPulse ? 'scale(0.95)' : 'scale(1)',
-                }}
-                onMouseEnter={e => { if (hasInput && !streaming) { (e.currentTarget as HTMLElement).style.filter = 'brightness(1.15)'; (e.currentTarget as HTMLElement).style.transform = 'scale(1.05)'; } }}
-                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.filter = ''; (e.currentTarget as HTMLElement).style.transform = ''; }}
-              >
-                <ArrowUp size={18} color="#ffffff" />
-              </button>
+              {streaming ? (
+                <button
+                  onClick={cancelActiveStream}
+                  disabled={!activeRequestIdRef.current}
+                  title="Stop generating (Esc, ⌘⌫)"
+                  aria-label="Stop generating"
+                  className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
+                  style={{
+                    borderRadius: 10,
+                    background: '#27272A',
+                    border: '1px solid rgba(255,255,255,0.18)',
+                    cursor: 'pointer',
+                  }}
+                  onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#3F3F46'; }}
+                  onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = '#27272A'; }}
+                >
+                  <span style={{ width: 10, height: 10, background: '#FAFAFA', borderRadius: 2, display: 'inline-block' }} />
+                </button>
+              ) : (
+                <button
+                  onClick={() => sendMessage(input)}
+                  disabled={!hasInput}
+                  className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
+                  style={{
+                    borderRadius: 10,
+                    background: hasInput
+                      ? 'linear-gradient(135deg, #A855F7 0%, #EC4899 100%)'
+                      : 'rgba(255,255,255,0.08)',
+                    cursor: hasInput ? 'pointer' : 'not-allowed',
+                    transform: sendPulse ? 'scale(0.95)' : 'scale(1)',
+                  }}
+                  onMouseEnter={e => { if (hasInput) { (e.currentTarget as HTMLElement).style.filter = 'brightness(1.15)'; (e.currentTarget as HTMLElement).style.transform = 'scale(1.05)'; } }}
+                  onMouseLeave={e => { (e.currentTarget as HTMLElement).style.filter = ''; (e.currentTarget as HTMLElement).style.transform = ''; }}
+                >
+                  <ArrowUp size={18} color="#ffffff" />
+                </button>
+              )}
             </div>
           </div>
         </div>

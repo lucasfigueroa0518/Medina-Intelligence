@@ -21,6 +21,12 @@ import {
   applyTagTool, deleteEntityTool,
 } from '../lib/agent-tools';
 import { webSearch, readUrl } from '../lib/agent-web-search';
+import {
+  registerActiveRequest,
+  cancelRequest,
+  unregisterRequest,
+  wasCancelledIncludingKV,
+} from '../lib/agent-cancellation';
 
 // ---------------------------------------------------------------------------
 // Tool definitions for Claude
@@ -441,6 +447,27 @@ export async function logCitationClick(
   return jsonResponse({ ok: true });
 }
 
+// POST /api/agent/cancel — abort an in-flight queryAgent request.
+// Body: { request_id: string } (the ID emitted as the first stream event).
+// Returns 200 even if the request isn't currently running on this isolate —
+// we still write the cross-isolate KV marker so a different isolate's poll
+// catches it. The response indicates whether we hit a local controller.
+export async function cancelAgentRequest(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ request_id?: string }>(request);
+  if (!body?.request_id || typeof body.request_id !== 'string') {
+    return errorResponse('VALIDATION_ERROR', 400, 'request_id required');
+  }
+  const result = await cancelRequest(body.request_id, env);
+  // Audit the cancel for debugging — keeps a trace in case Lucas reports
+  // "I clicked stop and nothing happened."
+  console.log(`[agent:cancel] request=${body.request_id} user=${ctx.userId} local=${result.local}`);
+  return jsonResponse({ ok: true, local: result.local });
+}
+
 export async function getSessionTrace(
   id: string,
   ctx: AuthContext,
@@ -712,6 +739,13 @@ export async function queryAgent(
     systemPrompt += `\n\nYou are in Deep Dive mode. Begin your response with a single brief line summarizing the scope, formatted as:\n🔍 Deep dive: Searched ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts.\nThen proceed with your thorough analysis. Be exhaustive — reference every relevant piece of evidence you find. Cite specific emails, meetings, and documents by name and date. Don't summarize — be thorough.`;
   }
 
+  // ---- Wave-1 cancellation: per-request AbortController ----
+  // Generated server-side and emitted to the client as the first stream
+  // event so the client can POST /api/agent/cancel with this ID. Same-isolate
+  // cancellation is sub-50ms; cross-isolate falls back to the KV marker.
+  const requestId = crypto.randomUUID();
+  const cancelController = registerActiveRequest(requestId);
+
   const stream = await callClaudeStreaming(
     {
       system: systemPrompt,
@@ -719,6 +753,7 @@ export async function queryAgent(
       max_tokens: deepDive ? 8192 : 4096,
       tools: AGENT_TOOLS,
       onToolCall: (name, input) => executeTool(name, input, orgId, userId, env),
+      signal: cancelController.signal,
     },
     env
   );
@@ -731,6 +766,10 @@ export async function queryAgent(
   const encoder = new TextEncoder();
   const sessionEvent = encoder.encode(
     `data: ${JSON.stringify({ type: 'session', session_id: session.id })}\n\n`
+  );
+  // Cancellation key — client posts this back to /api/agent/cancel.
+  const requestEvent = encoder.encode(
+    `data: ${JSON.stringify({ type: 'request', request_id: requestId })}\n\n`
   );
   const sourcesEvent = encoder.encode(
     `data: ${JSON.stringify({ type: 'sources', sources })}\n\n`
@@ -747,6 +786,7 @@ export async function queryAgent(
   const clientStream = new ReadableStream({
     async start(controller) {
       controller.enqueue(sessionEvent);
+      controller.enqueue(requestEvent);
       controller.enqueue(sourcesEvent);
       controller.enqueue(attachmentsEvent);
       const reader = rawClientStream.getReader();
@@ -787,16 +827,23 @@ export async function queryAgent(
       }
 
       // Save assistant turn (full or partial), with the numbered source list
-      // so reloading the session keeps inline pills working.
+      // so reloading the session keeps inline pills working. If the request
+      // was cancelled mid-stream, mark it in metadata so the UI can render
+      // a "Cancelled" badge on reload.
+      const cancelled = await wasCancelledIncludingKV(requestId, env);
+      const persistedContent = fullText || (cancelled ? '_(cancelled before MARTy started generating)_' : '');
       let assistantMessageId: string | null = null;
-      if (fullText) {
+      if (persistedContent) {
         assistantMessageId = crypto.randomUUID();
         const sourcesJson = sources.length > 0 ? JSON.stringify(sources) : null;
+        const metadataJson = cancelled ? JSON.stringify({ cancelled: true }) : null;
         await env.D1.prepare(
-          `INSERT INTO agent_messages (id, session_id, turn_index, role, content, sources_json, created_at)
-           VALUES (?, ?, ?, 'assistant', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-        ).bind(assistantMessageId, session.id, turnIndex + 1, fullText, sourcesJson).run();
+          `INSERT INTO agent_messages (id, session_id, turn_index, role, content, sources_json, metadata, created_at)
+           VALUES (?, ?, ?, 'assistant', ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+        ).bind(assistantMessageId, session.id, turnIndex + 1, persistedContent, sourcesJson, metadataJson).run();
       }
+      // Free the in-isolate controller entry (KV marker ages out on its own).
+      unregisterRequest(requestId);
 
       // Citation telemetry — counts valid vs. invalid [^N] markers so we can
       // monitor citation hit rate and Claude hallucinating numbers.

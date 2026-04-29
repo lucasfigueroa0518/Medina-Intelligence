@@ -445,6 +445,9 @@ async function routeAuthenticated(
   if (path === '/api/agent/query' && method === 'POST') {
     return Agent.queryAgent(request, ctx, env, ctxExec);
   }
+  if (path === '/api/agent/cancel' && method === 'POST') {
+    return Agent.cancelAgentRequest(request, ctx, env);
+  }
   if (path === '/api/agent/sessions' && method === 'GET') {
     return Agent.listSessions(ctx, env);
   }

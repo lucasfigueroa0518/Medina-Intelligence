@@ -267,6 +267,11 @@ export const api = {
     request<{ ok: boolean }>(`/agent/sessions/${id}`, { method: 'DELETE' }),
   renameSession: (id: string, title: string) =>
     request<{ ok: boolean }>(`/agent/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
+  cancelAgentQuery: (request_id: string) =>
+    request<{ ok: boolean; local: boolean }>('/agent/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ request_id }),
+    }).catch(() => ({ ok: false, local: false })),
   logCitationClick: (payload: {
     message_id?: string;
     source_id: number;
@@ -659,6 +664,9 @@ export async function streamAgentQuery(
           const evt = JSON.parse(json);
           if (evt.type === 'session') {
             onToolEvent?.({ type: 'session', session_id: evt.session_id });
+          } else if (evt.type === 'request') {
+            // Cancellation handle — first event the server emits per turn.
+            onToolEvent?.({ type: 'request', request_id: evt.request_id });
           } else if (evt.type === 'sources') {
             onToolEvent?.({ type: 'sources', sources: evt.sources });
           } else if (evt.type === 'attachments') {
