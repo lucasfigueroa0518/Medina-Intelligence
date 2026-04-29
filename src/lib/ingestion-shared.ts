@@ -86,6 +86,22 @@ export async function processClassifiedItems(
     stats.errors.push({ phase: 'stage-and-commit', error: e?.message || String(e) });
   }
 
+  // If Phase 1 didn't stage every item, abort the rest of the pipeline.
+  // Phases 2-4 write rows that REFERENCE conversations (vector_entity_index,
+  // documents.conversation_id, deal_signals_staged.source_conversation_id);
+  // running them when stage-and-commit threw produces dangling rows pointing
+  // at conversation IDs that don't exist. Diagnostic 2026-04-29 found 13
+  // dangling email_attachment docs created in 6 minutes from a single
+  // staged=0/28 batch. Bail here so we never make that mistake again.
+  if (stats.items_staged < classified.length) {
+    console.error(
+      `[ingestion-shared] Phase 1 partial-fail: staged=${stats.items_staged}/${classified.length} for syncJob=${ctx.syncJobId}. ` +
+      `Skipping phases 2-4 to avoid dangling references. ` +
+      `errors=${JSON.stringify(stats.errors.slice(0, 3))}`
+    );
+    return stats;
+  }
+
   // Phase 2 — chunk + embed. Per-item try/catch so a single bad text payload
   // (extraction error, AI rate-limit) doesn't drop the others. The hourly
   // self-heal cron (backfillUnembeddedConversations + embed_retry_queue)
@@ -190,6 +206,24 @@ export async function persistClassifiedStats(
       stats.deal_signals_staged,
       syncJobId
     ).run();
+
+    // Persist error context for debugging. Latest-wins (no accumulation
+    // across calls) — for the dangling-row diagnostic the first page's
+    // error is usually the cascade root cause; if a later page also
+    // fails we'd rather see its fresh state than wade through history.
+    // Skip when there are no errors so we don't clobber a prior page's
+    // useful context with an empty array.
+    if (stats.errors.length > 0) {
+      const errorsSample = stats.errors.slice(0, 5).map(e => ({
+        phase: e.phase,
+        message: String(e.error).slice(0, 500),
+      }));
+      await env.D1.prepare(
+        `UPDATE sync_jobs
+            SET metadata = json_set(COALESCE(metadata, '{}'), '$.errors_sample', json(?))
+          WHERE id = ?`
+      ).bind(JSON.stringify(errorsSample), syncJobId).run();
+    }
   } catch (e: any) {
     console.error(`[ingestion-shared] persistClassifiedStats failed for ${syncJobId}:`, e?.message || e);
   }

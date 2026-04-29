@@ -549,24 +549,48 @@ export async function runHistoricalBackfill(
 
     if (classified.length > 0) {
       const { processClassifiedItems, persistClassifiedStats } = await import('../lib/ingestion-shared');
-      const stats = await processClassifiedItems(
-        classified,
-        { orgId, syncJobId },
-        env
-      );
-      // Accumulate this page's counters into the sync_jobs metadata. Each
-      // page does its own UPDATE — partial progress is recorded even if
-      // a later page hits the rate-limit / page-cap return paths.
-      await persistClassifiedStats(stats, syncJobId, env);
-      console.log(
-        `[backfill] page=${pagesThisBatch} ` +
-        `staged=${stats.items_staged}/${stats.items_total} ` +
-        `embedded=${stats.items_embedded} embed_fail=${stats.embed_failures} ` +
-        `attachments(att/proc/skip/fail)=${stats.attachments_attempted}/${stats.attachments_processed}/${stats.attachments_skipped}/${stats.attachments_failed} ` +
-        `deals_staged=${stats.deal_signals_staged} errors=${stats.errors.length}`
-      );
-      if (stats.errors.length > 0) {
-        console.warn(`[backfill] page=${pagesThisBatch} errors:`, stats.errors.slice(0, 5));
+      // Wrap in try/catch so an uncaught throw inside the helper (e.g. a
+      // KV 429 cascading out of chunkEmbedAndPersistAll past its inner
+      // catches, or an `await import` that fails between phases) doesn't
+      // leave the sync_jobs row stuck in 'running' indefinitely. Without
+      // this, diagnostic 2026-04-29 found dozens of progressive-backfill
+      // rows dangling in 'running' for 30+ minutes after their owning
+      // function had thrown — closeSyncJob is only called from clean
+      // return points, never a catch.
+      try {
+        const stats = await processClassifiedItems(
+          classified,
+          { orgId, syncJobId },
+          env
+        );
+        // Accumulate this page's counters into the sync_jobs metadata. Each
+        // page does its own UPDATE — partial progress is recorded even if
+        // a later page hits the rate-limit / page-cap return paths.
+        await persistClassifiedStats(stats, syncJobId, env);
+        console.log(
+          `[backfill] page=${pagesThisBatch} ` +
+          `staged=${stats.items_staged}/${stats.items_total} ` +
+          `embedded=${stats.items_embedded} embed_fail=${stats.embed_failures} ` +
+          `attachments(att/proc/skip/fail)=${stats.attachments_attempted}/${stats.attachments_processed}/${stats.attachments_skipped}/${stats.attachments_failed} ` +
+          `deals_staged=${stats.deal_signals_staged} errors=${stats.errors.length}`
+        );
+        if (stats.errors.length > 0) {
+          console.warn(`[backfill] page=${pagesThisBatch} errors:`, stats.errors.slice(0, 5));
+        }
+      } catch (e: any) {
+        const msg = String(e?.message || e).slice(0, 500);
+        console.error(`[backfill] processClassifiedItems threw on page ${pagesThisBatch}: ${msg}`);
+        progress.status = 'failed';
+        progress.error = `processClassifiedItems threw: ${msg}`;
+        progress.last_page_url = url;
+        progress.updated_at = new Date().toISOString();
+        await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
+        await closeSyncJob('failed', {
+          reason: 'process_classified_items_threw',
+          error: msg,
+          pages_processed: pagesThisBatch,
+        });
+        return progress;
       }
     }
 
