@@ -1,12 +1,19 @@
 // TRD §6.3 — Firefly webhook handler
+//
+// Wave 4 (Phase B): processFireflyWebhook delegates to processTranscriptItems
+// — the converged helper that owns Phase 1 bail, per-attendee ACL, sync_jobs
+// lifecycle, and errors_sample. Pre-Wave-4 the webhook open-coded events
+// INSERT, attendee linking, embed, reconcile, and audit, missing the
+// race-safe canonical-id read-back that ingestTranscript already had. After
+// this commit both webhook + backfill (Phase C) route through one helper.
+
 import type { Env } from '../types/env';
-import { chunkTranscriptBySpeakerTurns, determineOverlapTurns } from '../lib/chunking';
-import type { ChunkMetadata, SpeakerTurn } from '../types/interfaces';
-import { chunkEmbedAndPersist } from '../lib/embedding';
-import { reconcileFireflyWithoutId } from '../lib/reconciliation';
+import type { SpeakerTurn } from '../types/interfaces';
 import { emitAudit } from '../lib/audit';
-import { autoCreateContactFromAttendee } from '../lib/firefly-intelligence';
-import { autoLinkAttendees } from '../lib/associations';
+import {
+  processTranscriptItems,
+  type TranscriptItem,
+} from '../lib/process-transcript-items';
 
 interface FireflyWebhookPayload {
   event_type: 'meeting_completed' | 'meeting_started' | 'transcript_ready';
@@ -81,137 +88,80 @@ export async function processFireflyWebhook(
     return;
   }
 
-  // Store transcript in R2
-  const now = new Date().toISOString();
-  const eventId = crypto.randomUUID();
-  const r2Key = `${orgId}/transcript/${now.slice(0, 7)}/${eventId}.txt`;
-
-  if (payload.transcript?.content) {
-    await env.R2.put(r2Key, payload.transcript.content);
+  const fireflyEventId = payload.event_id || payload.meeting_id || '';
+  if (!fireflyEventId) {
+    console.warn(
+      `[firefly] webhook payload missing event_id and meeting_id; skipping (title="${payload.meeting_title}")`
+    );
+    return;
   }
 
-  // Upsert event record
-  await env.D1.prepare(
-    `INSERT OR IGNORE INTO events
-       (id, org_id, title, event_type, start_time, end_time, source, firefly_event_id,
-        reconciliation_status, transcript_r2_key, transcript_source, summary, action_items, topics_discussed,
-        created_at, updated_at)
-     VALUES (?, ?, ?, 'meeting', ?, ?, 'firefly', ?, 'pending_reconciliation', ?, 'firefly', ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      eventId,
-      orgId,
-      payload.meeting_title,
-      payload.start_time,
-      payload.end_time,
-      payload.event_id || payload.meeting_id || null,
-      payload.transcript?.content ? r2Key : null,
-      payload.summary || null,
-      JSON.stringify(payload.action_items || []),
-      JSON.stringify(payload.key_topics || []),
-      now,
-      now
-    )
-    .run();
+  // Caller-side R2 PUT. The helper accepts an already-staged key — keeping
+  // the upload here lets the webhook own its own R2 path scheme. We name the
+  // object by a transient UUID; the canonical event id from Phase 1's
+  // read-back may differ when a duplicate firefly_event_id wins the race
+  // (in that case our R2 object becomes orphaned but the existing winner's
+  // transcript_r2_key is preserved on its row).
+  const transientId = crypto.randomUUID();
+  const r2Stamp = new Date().toISOString().slice(0, 7);
+  const r2Key = `${orgId}/transcript/${r2Stamp}/${transientId}.txt`;
 
-  // Attempt Outlook reconciliation
-  try {
-    await reconcileFireflyWithoutId(
-      {
-        id: eventId,
-        firefly_event_id: payload.event_id || payload.meeting_id || null,
-        start_time: payload.start_time,
-        transcript_r2_key: payload.transcript?.content ? r2Key : null,
+  const transcriptText = payload.transcript?.content ?? null;
+  if (transcriptText) {
+    await env.R2.put(r2Key, transcriptText);
+  }
+
+  const speakerTurns = transcriptText
+    ? parseTranscriptToTurns(transcriptText, payload.participants)
+    : [];
+
+  const item: TranscriptItem = {
+    fireflyEventId,
+    title: payload.meeting_title,
+    startTime: payload.start_time,
+    endTime: payload.end_time,
+    transcriptR2Key: transcriptText ? r2Key : null,
+    transcriptText,
+    participants: payload.participants.map(p => ({
+      displayName: p.name,
+      email: p.email ?? null,
+    })),
+    summaryOverview: payload.summary ?? null,
+    actionItems: payload.action_items ?? [],
+    topics: payload.key_topics ?? [],
+    speakerTurns,
+  };
+
+  const stats = await processTranscriptItems(
+    [item],
+    { orgId, sourcePath: 'firefly-webhook' },
+    env
+  );
+
+  const eventId = stats.staged_event_ids[0];
+  if (eventId) {
+    await emitAudit(env, {
+      org_id: orgId,
+      action: 'create',
+      entity_type: 'event',
+      entity_id: eventId,
+      metadata: {
+        source: 'firefly',
+        title: payload.meeting_title,
+        sync_job_id: stats.sync_job_id,
+        chunks_embedded: stats.chunks_embedded,
+        signals_extracted: stats.signals_extracted,
+        errors: stats.errors.length,
       },
-      orgId,
-      env
-    );
-  } catch (e) {
-    console.error('Firefly reconciliation failed:', e);
+      created_at: new Date().toISOString(),
+    });
   }
 
-  // Add attendees — auto-create contact from email when none exists, so the
-  // co-meeting graph and downstream relationship signals have real entities
-  // to point at instead of orphan rows.
-  for (const p of payload.participants) {
-    const email = p.email || '';
-    if (!email) continue;
-
-    const user = await env.D1.prepare(
-      'SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND org_id = ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(email, orgId).first<{ id: string }>();
-
-    let contactId: string | null = null;
-    if (!user) {
-      const auto = await autoCreateContactFromAttendee({
-        email, displayName: p.name, orgId, env,
-      });
-      if (auto) contactId = auto.contactId;
-    }
-
-    await env.D1.prepare(
-      `INSERT OR IGNORE INTO event_attendees (event_id, contact_id, user_id, email, display_name, role, is_internal)
-       VALUES (?, ?, ?, ?, ?, 'attendee', ?)`
-    )
-      .bind(eventId, contactId, user?.id || null, email, p.name, user ? 1 : 0)
-      .run();
-  }
-
-  // Embed transcript chunks with speaker-turn-aware chunking
-  if (payload.transcript?.content) {
-    const turns = parseTranscriptToTurns(
-      payload.transcript.content,
-      payload.participants
-    );
-    if (turns.length > 0) {
-      const overlapTurns = determineOverlapTurns(turns);
-      const chunks = chunkTranscriptBySpeakerTurns(turns, 1024, overlapTurns);
-
-      for (let i = 0; i < chunks.length; i++) {
-        const meta: ChunkMetadata = {
-          org_id: orgId,
-          document_type: 'transcript',
-          source_table: 'events',
-          source_id: eventId,
-          r2_key: r2Key,
-          visibility: 'org_wide',
-          primary_entity_id: eventId,
-          created_at: now,
-          entity_name: payload.meeting_title,
-          date: payload.start_time,
-          speakers: chunks[i].speakers.join(','),
-          primary_speaker: chunks[i].primary_speaker,
-        };
-
-        const entry = await chunkEmbedAndPersist(
-          chunks[i].text,
-          meta,
-          i,
-          chunks.length,
-          env
-        );
-
-        await env.D1.prepare(
-          'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-        ).bind(entry.vectorId, entry.entityId, entry.sourceTable, entry.orgId).run();
-      }
-    }
-  }
-
-  // Co-meeting graph — needs autoCreateContactFromAttendee above to have run
-  // first so attendees actually have contact_ids to pair up.
-  try {
-    await autoLinkAttendees(eventId, orgId, env);
-  } catch (e) {
-    console.error('[firefly] autoLinkAttendees failed:', e);
-  }
-
-  await emitAudit(env, {
-    org_id: orgId,
-    action: 'create',
-    entity_type: 'event',
-    entity_id: eventId,
-    metadata: { source: 'firefly', title: payload.meeting_title },
-    created_at: now,
-  });
+  console.log(
+    `[firefly] webhook processed: firefly_event_id=${fireflyEventId} ` +
+    `staged=${stats.items_staged}/${stats.items_total} ` +
+    `chunks=${stats.chunks_embedded} attendees=${stats.attendees_linked} ` +
+    `signals=${stats.signals_extracted} errors=${stats.errors.length} ` +
+    `sync_job=${stats.sync_job_id}`
+  );
 }
