@@ -90,19 +90,46 @@ function walk(node: any): void {
       continue;
     }
 
-    // GFM has already parsed `[^N]` into a footnoteReference node. Replace it
-    // with a citation link node in place.
+    // GFM has already parsed `[^X]` into a footnoteReference node. Two valid
+    // identifier shapes:
+    //   • Small positive integer (1–999) — the canonical [^N] format Claude
+    //     is instructed to emit. Matches a source by numeric index.
+    //   • 6+ hex chars — off-spec but observed in production when Claude
+    //     occasionally cites raw UUID fragments. Defer to the link renderer
+    //     for partial-prefix lookup against source_id / entity_id; if no
+    //     match found, render as empty (don't leak raw IDs to the user).
+    // Anything else: strip silently.
+    //
+    // Earlier versions used `parseInt(idStr, 10)` which silently returns 50
+    // for "50af6179" (parseInt stops at first non-digit) — that produced a
+    // misleading citation pill linking to source 50. Strict regex check now.
     if (child?.type === 'footnoteReference') {
       const idStr = String(child.identifier ?? child.label ?? '');
-      const idNum = parseInt(idStr, 10);
-      if (!Number.isNaN(idNum)) {
+      if (/^\d+$/.test(idStr)) {
+        const idNum = parseInt(idStr, 10);
+        if (idNum > 0 && idNum < 1000) {
+          node.children[i] = {
+            type: 'link',
+            url: `citation:${idNum}`,
+            title: null,
+            children: [{ type: 'text', value: String(idNum) }],
+          };
+          continue;
+        }
+      }
+      if (/^[a-f0-9]{6,}$/i.test(idStr)) {
         node.children[i] = {
           type: 'link',
-          url: `citation:${idNum}`,
+          url: `citation:hash:${idStr.toLowerCase()}`,
           title: null,
-          children: [{ type: 'text', value: String(idNum) }],
+          children: [{ type: 'text', value: idStr }],
         };
+        continue;
       }
+      // Unknown identifier shape — strip silently rather than leak the
+      // <sup><a href="#user-content-fn-..."> footnote default render.
+      node.children.splice(i, 1);
+      i -= 1;
       continue;
     }
 
@@ -125,21 +152,44 @@ function walk(node: any): void {
 }
 
 function splitText(value: string): any[] | null {
-  const regex = /\[\^(\d+)\]/g;
+  // Match either the canonical [^N] (small int) or [^HEX] off-spec format.
+  // Same disposition as the footnoteReference branch above: numeric → pill,
+  // hex → defer to link renderer, anything else won't match this regex at all
+  // (so it stays as plain text).
+  const regex = /\[\^(\d+|[a-f0-9]{6,})\]/gi;
   const out: any[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = regex.exec(value)) !== null) {
     if (m.index > last) out.push({ type: 'text', value: value.slice(last, m.index) });
+    const tok = m[1];
+    const url = /^\d+$/.test(tok) ? `citation:${tok}` : `citation:hash:${tok.toLowerCase()}`;
     out.push({
       type: 'link',
-      url: `citation:${m[1]}`,
+      url,
       title: null,
-      children: [{ type: 'text', value: m[1] }],
+      children: [{ type: 'text', value: tok }],
     });
     last = m.index + m[0].length;
   }
   if (out.length === 0) return null;
   if (last < value.length) out.push({ type: 'text', value: value.slice(last) });
   return out;
+}
+
+// Find a CitationSource whose source_id or entity_id starts with `hash`
+// (UUID prefix lookup). Used by the link renderer when the marker was an
+// off-spec hex identifier rather than a numeric index.
+export function findSourceByHashPrefix(
+  hash: string,
+  sources: CitationSource[]
+): CitationSource | undefined {
+  const needle = hash.toLowerCase();
+  for (const s of sources) {
+    const sid = (s.source_id || '').replace(/-/g, '').toLowerCase();
+    if (sid.startsWith(needle)) return s;
+    const eid = (s.entity_id || '').replace(/-/g, '').toLowerCase();
+    if (eid && eid.startsWith(needle)) return s;
+  }
+  return undefined;
 }
