@@ -6,6 +6,7 @@ import { TopBar } from '@/components/top-bar';
 import { DataTable, Column } from '@/components/data-table';
 import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
+import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { ContactCreateModal } from '@/components/contact-create-modal';
 import { TagManagerModal } from '@/components/tag-manager-modal';
 import { api } from '@/lib/api';
@@ -71,11 +72,15 @@ interface FilterState {
   search: string;
   type: string[];
   status: string[];
-  last_contact: string;       // single-select bucket
+  // last_contact stores either a single bucket value ("this_week") or a
+  // comma-joined bucket list ("1_3_months,3_plus_months") used by the
+  // "Stale 30+ Days" quick filter. The backend's readMulti splits on commas.
+  last_contact: string;
   interactions: string;       // single-select bucket
   company_id: string;
   tags: string[];
   has_followup_overdue: boolean;
+  in_active_deals: boolean;
   sort: string;
   order: 'asc' | 'desc';
 }
@@ -93,6 +98,7 @@ function emptyFilters(): FilterState {
     company_id: '',
     tags: [],
     has_followup_overdue: false,
+    in_active_deals: false,
     sort: DEFAULT_SORT,
     order: DEFAULT_ORDER,
   };
@@ -110,6 +116,7 @@ function readFiltersFromUrl(sp: URLSearchParams): FilterState {
     company_id: sp.get('company_id') || '',
     tags: csv('tags'),
     has_followup_overdue: sp.get('has_followup_overdue') === 'true',
+    in_active_deals: sp.get('in_active_deals') === 'true',
     sort: sp.get('sort') || DEFAULT_SORT,
     order: order === 'asc' || order === 'desc' ? order : DEFAULT_ORDER,
   };
@@ -125,9 +132,30 @@ function filtersToParams(f: FilterState): Record<string, string> {
   if (f.company_id) p.company_id = f.company_id;
   if (f.tags.length) p.tags = f.tags.join(',');
   if (f.has_followup_overdue) p.has_followup_overdue = 'true';
+  if (f.in_active_deals) p.in_active_deals = 'true';
   if (f.sort && f.sort !== DEFAULT_SORT) p.sort = f.sort;
   if (f.order !== DEFAULT_ORDER) p.order = f.order;
   return p;
+}
+
+const QUICK_FILTERS: QuickFilter<FilterState>[] = [
+  { key: 'active',          label: 'Active',         preset: { status: ['active'] } },
+  { key: 'new_this_week',   label: 'New This Week',  preset: { status: ['new'], last_contact: 'this_week' } },
+  { key: 'stale_30_plus',   label: 'Stale 30+ Days', preset: { last_contact: '1_3_months,3_plus_months' } },
+  { key: 'in_active_deals', label: 'In Active Deals', preset: { in_active_deals: true } },
+];
+
+function lastContactLabel(value: string): string {
+  const map: Record<string, string> = {
+    today: 'Today',
+    this_week: 'This Week',
+    this_month: 'This Month',
+    '1_3_months': '1–3 Months Ago',
+    '3_plus_months': '3+ Months Ago',
+    never: 'Never',
+    '1_3_months,3_plus_months': '30+ Days Ago',
+  };
+  return map[value] ?? value;
 }
 
 export default function ContactsPageWrapper() {
@@ -240,7 +268,7 @@ function ContactsPage() {
     onRemove: () => setFilters(f => ({ ...f, status: f.status.filter(x => x !== s) })),
   });
   if (filters.last_contact) chips.push({
-    label: `Last Contact: ${LAST_CONTACT_OPTIONS.find(o => o.value === filters.last_contact)?.label ?? filters.last_contact}`,
+    label: `Last Contact: ${lastContactLabel(filters.last_contact)}`,
     onRemove: () => setFilters(f => ({ ...f, last_contact: '' })),
   });
   if (filters.interactions) chips.push({
@@ -265,6 +293,10 @@ function ContactsPage() {
   if (filters.has_followup_overdue) chips.push({
     label: 'Overdue Follow-up',
     onRemove: () => setFilters(f => ({ ...f, has_followup_overdue: false })),
+  });
+  if (filters.in_active_deals) chips.push({
+    label: 'In Active Deals',
+    onRemove: () => setFilters(f => ({ ...f, in_active_deals: false })),
   });
   if (filters.sort !== DEFAULT_SORT || filters.order !== DEFAULT_ORDER) {
     const opt = SORT_OPTIONS.find(o => o.key === filters.sort);
@@ -530,6 +562,12 @@ function ContactsPage() {
         />
 
         <div className="flex-1 p-6 overflow-auto">
+          <QuickFilters<FilterState>
+            filters={filters}
+            presets={QUICK_FILTERS}
+            onApply={next => setFilters(next)}
+            onClearAll={() => { setFilters(emptyFilters()); setSearchInput(''); }}
+          />
           {isFiltered && (
             <div className="flex items-center gap-2 mb-3 flex-wrap">
               {chips.map((chip, i) => (

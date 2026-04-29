@@ -6,6 +6,7 @@ import { TopBar } from '@/components/top-bar';
 import { DataTable, Column } from '@/components/data-table';
 import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
+import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { TagManagerModal } from '@/components/tag-manager-modal';
 import { api } from '@/lib/api';
 import { initialFromName, faviconUrl } from '@/lib/avatar';
@@ -116,6 +117,24 @@ function toParams(f: FilterState): Record<string, string> {
   if (f.sort && f.sort !== DEFAULT_SORT) p.sort = f.sort;
   if (f.order !== DEFAULT_ORDER) p.order = f.order;
   return p;
+}
+
+const QUICK_FILTERS: QuickFilter<FilterState>[] = [
+  { key: 'portfolio', label: 'Portfolio',        preset: { investment_status: ['invested'] } },
+  { key: 'tracking',  label: 'Tracking',         preset: { investment_status: ['tracking'] } },
+  { key: 'in_news',   label: 'In News',          preset: { news_score: 'high,medium' } },
+  { key: 'has_deals', label: 'Has Active Deals', preset: { has_deals: true } },
+];
+
+function newsScoreLabel(value: string): string {
+  const map: Record<string, string> = {
+    high: 'High (7+)',
+    medium: 'Medium (3–7)',
+    low: 'Low (0–3)',
+    none: 'None',
+    'high,medium': 'In News',
+  };
+  return map[value] ?? value;
 }
 
 export default function CompaniesPageWrapper() {
@@ -244,7 +263,7 @@ function CompaniesPage() {
     onRemove: () => setFilters(f => ({ ...f, city: '' })),
   });
   if (filters.news_score) chips.push({
-    label: `News: ${NEWS_SCORE_OPTIONS.find(o => o.value === filters.news_score)?.label ?? filters.news_score}`,
+    label: `News: ${newsScoreLabel(filters.news_score)}`,
     onRemove: () => setFilters(f => ({ ...f, news_score: '' })),
   });
   if (filters.has_deals) chips.push({
@@ -475,6 +494,12 @@ function CompaniesPage() {
         />
 
         <div className="flex-1 p-6 overflow-auto">
+          <QuickFilters<FilterState>
+            filters={filters}
+            presets={QUICK_FILTERS}
+            onApply={next => setFilters(next)}
+            onClearAll={() => { setFilters(emptyFilters()); setSearchInput(''); }}
+          />
           {isFiltered && (
             <div className="flex items-center gap-2 mb-3 flex-wrap">
               {chips.map((chip, i) => (
