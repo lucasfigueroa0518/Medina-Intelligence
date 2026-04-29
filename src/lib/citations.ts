@@ -249,7 +249,8 @@ async function hydrateSources(
     const ph = ids.map(() => '?').join(',');
     lookups.push(
       env.D1.prepare(
-        `SELECT id, title, document_type, file_name, contact_id, company_id, deal_id, created_at
+        `SELECT id, title, document_type, file_name, contact_id, company_id, deal_id, created_at,
+                extracted_text_preview
          FROM documents WHERE org_id = ? AND id IN (${ph})`
       )
         .bind(orgId, ...ids)
@@ -262,6 +263,7 @@ async function hydrateSources(
           company_id: string | null;
           deal_id: string | null;
           created_at: string;
+          extracted_text_preview: string | null;
         }>()
         .then(async res => {
           // Collect distinct linked-entity IDs by table for batched name lookup.
@@ -276,7 +278,24 @@ async function hydrateSources(
           const contactNames = new Map<string, string>();
           const companyNames = new Map<string, string>();
           const dealTitles = new Map<string, string>();
+
+          // KV chunk fetch — the citation excerpt should be the actual text
+          // Claude saw, not the doc-level intro. KV is keyed by vector_id
+          // (a.k.a. chunk.id). Older docs ingested before chunk caching may
+          // miss; fall back to extracted_text_preview and log a warning so
+          // we can track how often the fallback fires.
+          const chunkTextByVectorId = new Map<string, string>();
+          const kvChunkFetch = Promise.all(
+            docRows.map(async ref => {
+              try {
+                const txt = await env.KV.get(`chunk:${ref.chunk.id}`);
+                if (txt) chunkTextByVectorId.set(ref.chunk.id, txt);
+              } catch { /* swallow — fallback will handle */ }
+            })
+          );
+
           await Promise.all([
+            kvChunkFetch,
             contactIds.length > 0
               ? env.D1.prepare(
                   `SELECT id, full_name FROM contacts WHERE org_id = ? AND id IN (${contactIds.map(() => '?').join(',')})`
@@ -301,6 +320,7 @@ async function hydrateSources(
           ]);
 
           const byId = new Map(res.results.map(r => [r.id, r]));
+          let kvMissCount = 0;
           for (const ref of docRows) {
             const row = byId.get(ref.sourceId);
             if (!row) continue;
@@ -318,6 +338,22 @@ async function hydrateSources(
               entityName = contactNames.get(row.contact_id);
               entityUrl = `/contacts/${row.contact_id}`;
             }
+
+            // Excerpt resolution — the actual chunk text Claude saw, NOT the
+            // doc-level intro. Order: KV chunk → extracted_text_preview → the
+            // hydration-layer text (which already tries KV/R2-rechunk). The
+            // last fallback exists so old docs still produce something useful.
+            const kvChunk = chunkTextByVectorId.get(ref.chunk.id);
+            let excerpt: string | undefined;
+            if (kvChunk) {
+              excerpt = extractExcerpt(kvChunk);
+            } else {
+              kvMissCount++;
+              excerpt = row.extracted_text_preview
+                ? extractExcerpt(row.extracted_text_preview)
+                : extractExcerpt(ref.chunk.hydrated_text);
+            }
+
             out.set(ref.id, {
               id: ref.id,
               type: 'document',
@@ -328,10 +364,16 @@ async function hydrateSources(
               subtitle: row.document_type.replace(/_/g, ' '),
               date: row.created_at,
               url_path: `/documents/${row.id}`,
-              excerpt: extractExcerpt(ref.chunk.hydrated_text),
+              excerpt,
               entity_name: entityName,
               entity_url_path: entityUrl,
             });
+          }
+
+          if (kvMissCount > 0) {
+            console.warn(
+              `[citations] KV chunk miss for ${kvMissCount}/${docRows.length} document citations — falling back to extracted_text_preview. Older docs likely uncached.`
+            );
           }
         })
         .catch(e => console.error('[citations] documents lookup failed:', e))
