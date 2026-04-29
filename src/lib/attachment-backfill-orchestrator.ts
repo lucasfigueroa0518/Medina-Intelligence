@@ -88,6 +88,7 @@ interface ConversationRow {
   from_email: string | null;
   from_contact_id: string | null;
   sent_at: string | null;
+  direction: string | null;
   participant_user_ids: string | null;
   attachment_count: number | null;
 }
@@ -157,16 +158,37 @@ async function writeUnrecoverableMarker(
 }
 
 // Per-batch token resolver. Outlook's /me/messages is mailbox-scoped — a
-// caller's token can only see messages in their OWN mailbox. Conversations
-// ingested via different users' delta syncs need different tokens to refetch.
-// We resolve candidate user IDs from conversations.participant_user_ids and
-// try each in order; first 200 wins. Tokens are cached so we don't refresh +
-// decrypt once per conversation.
+// caller's token can only see messages in their OWN mailbox. The previous
+// "try every candidate participant" implementation generated 2-4 redundant
+// 404s per conversation since Graph message IDs are mailbox-scoped (the same
+// physical email has different IDs in each user's mailbox). Wave 3 picks ONE
+// originating user and accepts a 404 from that mailbox as the final answer —
+// see resolveOriginatingUserId below.
 type TokenResolver = (userId: string) => Promise<string | null>;
+type UserEmailMap = Map<string, string>;  // lowercase email → user_id
+
+// Identify the single user whose mailbox most likely contains this message.
+// For outbound or internal email, the sender's mailbox has it (in
+// /sentitems). For inbound, the first participant is our best heuristic for
+// the user whose delta-sync produced the stored external_message_id. We
+// don't fan out to other participants — cross-mailbox recovery would require
+// a different Graph endpoint (sharing-permission lookups) and isn't in
+// Wave 3 scope. The marker text is honest about this trade-off.
+function resolveOriginatingUserId(
+  conv: ConversationRow,
+  userEmailMap: UserEmailMap
+): string | null {
+  if (conv.from_email) {
+    const u = userEmailMap.get(conv.from_email.toLowerCase());
+    if (u) return u;
+  }
+  const participants = parseParticipantUserIds(conv.participant_user_ids);
+  return participants[0] || null;
+}
 
 async function processOneConversation(
   conversationId: string,
-  ctx: { orgId: string; jobId: string; getTokenForUser: TokenResolver },
+  ctx: { orgId: string; jobId: string; getTokenForUser: TokenResolver; userEmailMap: UserEmailMap },
   env: Env
 ): Promise<ConversationStats> {
   const stats: ConversationStats = {
@@ -194,70 +216,65 @@ async function processOneConversation(
     return stats;
   }
 
-  // 2. Resolve which user's token to use. participant_user_ids holds every
-  // org user who saw this email; any of them MIGHT have it in their mailbox.
-  // Try them in order until one returns a non-404 list response. If all 404,
-  // the message is genuinely gone everywhere.
-  const candidateUserIds = parseParticipantUserIds(conv.participant_user_ids);
-  if (candidateUserIds.length === 0) {
+  // 2. Pick the originating mailbox. One user, one Graph attempt.
+  const originatingUserId = resolveOriginatingUserId(conv, ctx.userEmailMap);
+  if (!originatingUserId) {
     stats.skipped += conv.attachment_count || 1;
-    stats.errors.push({ conversation_id: conversationId, phase: 'lookup', error: 'no participant_user_ids — cannot determine mailbox owner' });
-    await writeUnrecoverableMarker(conversationId, ctx, conv, 'no participant_user_ids', env);
+    stats.errors.push({ conversation_id: conversationId, phase: 'lookup', error: 'no resolvable originating mailbox (no from_email match, no participants)' });
+    await writeUnrecoverableMarker(conversationId, ctx, conv, 'no resolvable originating mailbox', env);
     return stats;
   }
 
-  // 3. List attachments via Graph. Try each candidate user's mailbox.
+  const token = await ctx.getTokenForUser(originatingUserId);
+  if (!token) {
+    // Token resolution failed (refresh or decrypt error). Treat as transient
+    // — don't write a marker; the next drain iteration will retry once the
+    // user re-authenticates or token refresh succeeds.
+    stats.failed += conv.attachment_count || 1;
+    stats.errors.push({ conversation_id: conversationId, phase: 'list', error: `no valid token for originating user ${originatingUserId}` });
+    return stats;
+  }
+
+  // 3. Single Graph list attempt against the originating mailbox.
   let attachmentList: GraphAttachmentMeta[] = [];
-  let resolvedToken: string | null = null;
-  let last404 = false;
-  let lastError: string | null = null;
+  try {
+    const listRes = await fetch(
+      `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(conv.external_message_id)}/attachments?$select=id,name,size,contentType,isInline`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
 
-  for (const candidateUserId of candidateUserIds) {
-    const token = await ctx.getTokenForUser(candidateUserId);
-    if (!token) {
-      lastError = `no valid token for user ${candidateUserId}`;
-      continue;
-    }
-    try {
-      const listRes = await fetch(
-        `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(conv.external_message_id)}/attachments?$select=id,name,size,contentType,isInline`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (listRes.status === 404) {
-        last404 = true;
-        lastError = `404 for user ${candidateUserId}`;
-        continue;  // try next candidate
-      }
-      if (!listRes.ok) {
-        const body = await listRes.text();
-        lastError = `graph ${listRes.status}: ${body.slice(0, 200)}`;
-        continue;  // try next candidate
-      }
-      const data = await listRes.json() as { value?: GraphAttachmentMeta[] };
-      attachmentList = (data.value || []).filter(a => !a.isInline);
-      resolvedToken = token;
-      break;  // success — use this token for downloads too
-    } catch (e: any) {
-      lastError = e?.message || String(e);
-      continue;
-    }
-  }
-
-  if (!resolvedToken) {
-    if (last404) {
-      // Every candidate's mailbox returned 404 — message is genuinely gone.
+    if (listRes.status === 404) {
+      // The originating mailbox doesn't have this message_id anymore. Could
+      // be: user deleted it, mailbox retention policy purged it, or the
+      // message_id is from a mailbox we resolved wrong. We accept it as
+      // unrecoverable in this wave and write a marker so pickOrphanBatch
+      // doesn't keep re-selecting this conversation.
       stats.skipped += conv.attachment_count || 1;
-      stats.errors.push({ conversation_id: conversationId, phase: 'list', error: `message deleted from all mailboxes (404 across ${candidateUserIds.length} candidates)` });
-      await writeUnrecoverableMarker(conversationId, ctx, conv, 'message deleted from all candidate mailboxes (404)', env);
-    } else {
-      // Transient — non-404 errors. Don't write marker; let next drain retry.
-      stats.failed += conv.attachment_count || 1;
-      stats.errors.push({ conversation_id: conversationId, phase: 'list', error: lastError || 'all candidates failed without 404' });
+      stats.errors.push({ conversation_id: conversationId, phase: 'list', error: `originating mailbox 404 (user=${originatingUserId})` });
+      await writeUnrecoverableMarker(conversationId, ctx, conv, 'originating mailbox returned 404 (cross-mailbox recovery not implemented)', env);
+      return stats;
     }
+    if (!listRes.ok) {
+      const body = await listRes.text();
+      stats.failed += conv.attachment_count || 1;
+      stats.errors.push({
+        conversation_id: conversationId,
+        phase: 'list',
+        error: `graph ${listRes.status}: ${body.slice(0, 200)}`,
+      });
+      return stats;
+    }
+    const data = await listRes.json() as { value?: GraphAttachmentMeta[] };
+    attachmentList = (data.value || []).filter(a => !a.isInline);
+  } catch (e: any) {
+    stats.failed += conv.attachment_count || 1;
+    stats.errors.push({ conversation_id: conversationId, phase: 'list', error: e?.message || String(e) });
     return stats;
   }
 
-  // From here on, resolvedToken is the user whose mailbox contains the message.
+  // From here on, `token` is the originating user's token — also used for
+  // per-attachment download calls below.
+  const resolvedToken = token;
   if (attachmentList.length === 0) {
     // Header said has_attachments=1 but Graph returns nothing usable (all
     // inline signature images, only reference attachments, or zero after
@@ -400,11 +417,8 @@ export async function runAttachmentBackfillBatch(
     })
   ).run();
 
-  // Per-user token cache. /me/messages is mailbox-scoped, so we resolve a
-  // token per candidate user (from each conversation's participant_user_ids)
-  // and cache results across the whole batch — refresh + decrypt is expensive
-  // and we'd otherwise pay it once per conversation. A failed lookup is
-  // cached as null so we don't retry it for every conv on this user's behalf.
+  // Per-user token cache. Refresh + decrypt is expensive — pay once per user
+  // across the whole batch. Failed lookups cache as null so we don't retry.
   const tokenCache = new Map<string, string | null>();
   const getTokenForUser: TokenResolver = async (userId: string) => {
     if (tokenCache.has(userId)) return tokenCache.get(userId) ?? null;
@@ -420,10 +434,20 @@ export async function runAttachmentBackfillBatch(
     }
   };
 
+  // Load org users → email map for resolveOriginatingUserId. One D1 call
+  // shared across all conversations in the batch.
+  const usersResult = await env.D1.prepare(
+    `SELECT id, email FROM users WHERE org_id = ? AND deleted_at IS NULL`
+  ).bind(config.orgId).all<{ id: string; email: string | null }>();
+  const userEmailMap: UserEmailMap = new Map();
+  for (const u of usersResult.results) {
+    if (u.email) userEmailMap.set(u.email.toLowerCase(), u.id);
+  }
+
   const perConvResults = await runWithConcurrency(
     config.conversationIds,
     concurrency,
-    convId => processOneConversation(convId, { orgId: config.orgId, jobId, getTokenForUser }, env)
+    convId => processOneConversation(convId, { orgId: config.orgId, jobId, getTokenForUser, userEmailMap }, env)
   );
 
   const result: OrchestratorResult = {
@@ -491,11 +515,29 @@ export async function countOrphanAttachmentConversations(orgId: string, env: Env
   return row?.n || 0;
 }
 
-/** Pick the next batch of orphan conversation IDs. Newest sent_at first. */
+/**
+ * Pick the next batch of orphan conversation IDs.
+ *
+ * Two filters keep this loop efficient:
+ *   1. NOT EXISTS — exclude conversations that already have an
+ *      email_attachment doc (or skipped placeholder).
+ *   2. created_at < now-5min — exclude in-flight conversations that an
+ *      active backfill page just inserted via stageAndCommitApprovals but
+ *      hasn't yet finished processClassifiedItems on. Without this cutoff
+ *      the orchestrator races against Wave 2's helper and wastes Graph
+ *      lookups on rows that are about to get their attachments processed
+ *      organically.
+ *
+ * The strftime format must match conversations.created_at exactly
+ * (T-separated, fractional seconds, Z suffix) — SQLite's `datetime()`
+ * returns a space-separated format that fails lexicographic compare on
+ * same-day rows. See diagnostic 2026-04-29.
+ */
 export async function pickOrphanBatch(orgId: string, batchSize: number, env: Env): Promise<string[]> {
   const rows = await env.D1.prepare(
     `SELECT c.id FROM conversations c
        WHERE c.org_id = ? AND c.has_attachments = 1
+         AND c.created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes')
          AND NOT EXISTS (
            SELECT 1 FROM documents d
             WHERE d.conversation_id = c.id
