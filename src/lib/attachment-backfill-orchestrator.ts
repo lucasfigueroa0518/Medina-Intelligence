@@ -101,6 +101,61 @@ interface GraphAttachmentMeta {
   '@odata.type'?: string;
 }
 
+// When the source message is gone or has no usable attachments, write a
+// single placeholder document row (status='skipped', empty r2_key, error
+// message) plus a conversation link. Without this, pickOrphanBatch would
+// re-select the same conversation on every drain iteration — the NOT EXISTS
+// query only sees email_attachment docs, not "we tried and failed" markers.
+// Mirrors the oversize-skip pattern in P1 attachment-processor.ts.
+async function writeUnrecoverableMarker(
+  conversationId: string,
+  ctx: { orgId: string; jobId: string },
+  conv: ConversationRow,
+  reason: string,
+  env: Env
+): Promise<void> {
+  const docId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const participantsJson = conv.participant_user_ids || null;
+  try {
+    await env.D1.prepare(
+      `INSERT INTO documents
+         (id, org_id, title, document_type, source, r2_key, file_name, file_size, mime_type,
+          contact_id, conversation_id, processing_status, error_message,
+          visibility, participant_user_ids, created_at, updated_at)
+       VALUES (?, ?, ?, 'other', 'email_attachment', '', ?, 0, NULL,
+               ?, ?, 'skipped', ?,
+               'private', ?, ?, ?)`
+    ).bind(
+      docId, ctx.orgId, 'Attachment unavailable', 'unavailable',
+      conv.from_contact_id, conversationId,
+      reason,
+      participantsJson,
+      now, now
+    ).run();
+
+    // Link the placeholder to the conversation so contact/conversation queries
+    // can surface "we tried" rather than silently omitting.
+    const links = [
+      { entityType: 'conversation', entityId: conversationId, kind: 'attached' },
+    ];
+    if (conv.from_contact_id) {
+      links.push({ entityType: 'contact', entityId: conv.from_contact_id, kind: 'primary' });
+    }
+    await env.D1.batch(
+      links.map(l =>
+        env.D1.prepare(
+          `INSERT OR IGNORE INTO document_links
+             (id, document_id, org_id, entity_type, entity_id, link_kind, link_source, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pipeline', ?)`
+        ).bind(crypto.randomUUID(), docId, ctx.orgId, l.entityType, l.entityId, l.kind, now)
+      )
+    );
+  } catch (e: any) {
+    console.error(`[backfill-orchestrator] writeUnrecoverableMarker failed for ${conversationId}:`, e?.message || e);
+  }
+}
+
 async function processOneConversation(
   conversationId: string,
   ctx: { orgId: string; graphToken: string; jobId: string },
@@ -142,9 +197,13 @@ async function processOneConversation(
     );
 
     if (listRes.status === 404) {
-      // Email is gone from the mailbox — unrecoverable.
+      // Email is gone from the mailbox — unrecoverable. Write a placeholder
+      // doc + link so the conversation is no longer an orphan in
+      // pickOrphanBatch's NOT EXISTS query (otherwise the drain loop re-picks
+      // this conversation forever).
       stats.skipped += conv.attachment_count || 1;
       stats.errors.push({ conversation_id: conversationId, phase: 'list', error: 'message deleted from mailbox (404)' });
+      await writeUnrecoverableMarker(conversationId, ctx, conv, 'message deleted from mailbox (404)', env);
       return stats;
     }
     if (!listRes.ok) {
@@ -155,6 +214,8 @@ async function processOneConversation(
         phase: 'list',
         error: `graph ${listRes.status}: ${body.slice(0, 200)}`,
       });
+      // Don't write a marker for transient non-404 failures (5xx, 429) —
+      // those should retry on the next drain iteration.
       return stats;
     }
     const data = await listRes.json() as { value?: GraphAttachmentMeta[] };
@@ -167,8 +228,11 @@ async function processOneConversation(
 
   if (attachmentList.length === 0) {
     // Header said has_attachments=1 but Graph returns nothing usable (all
-    // inline / all reference). Treat as unrecoverable, not failed.
+    // inline signature images, only reference attachments, or zero after
+    // filter). Treat as unrecoverable so this conversation drops out of the
+    // orphan set permanently.
     stats.skipped += conv.attachment_count || 0;
+    await writeUnrecoverableMarker(conversationId, ctx, conv, 'no usable attachments after filter (all inline / reference)', env);
     return stats;
   }
 
