@@ -26,6 +26,20 @@ export interface CitationSource {
   date?: string;
   url_path: string;
   external_url?: string;
+
+  // ---- Display fields populated for the side panel ----
+  // Snippet of the chunk text that Claude actually saw — the "what was cited"
+  // payload. ~400 chars, prefix metadata stripped. Optional because some
+  // panels only need title + linked entity (e.g. contact/company sources).
+  excerpt?: string;
+  // Resolved name of the linked entity (for documents: contact/company/deal
+  // human-readable name; for news: company name). Lets the panel render
+  // "About: <name>" instead of a raw UUID.
+  entity_name?: string;
+  // Click target for the linked entity ("/contacts/<id>", "/companies/<id>",
+  // "/deals/<id>"). Only set when entity_id resolves to something that has
+  // a detail page in the app.
+  entity_url_path?: string;
 }
 
 interface ChunkRef {
@@ -71,6 +85,25 @@ function placeholderSource(id: number, chunk: HydratedChunk): CitationSource {
     date: chunk.metadata.created_at as string | undefined,
     url_path: '/',
   };
+}
+
+// Extract a clean excerpt from a hydrated chunk. The prefix block
+// ("[Type: …] [Entity: …] [Date: …]\n") is internal context for retrieval
+// and shouldn't appear in the side panel. Strip it, take the next ~400 chars,
+// collapse runs of whitespace, and ellipsize. Returns undefined if the chunk
+// is empty after stripping.
+function extractExcerpt(hydratedText: string | undefined): string | undefined {
+  if (!hydratedText) return undefined;
+  let body = hydratedText;
+  // Drop a leading "[Type: …] [Entity: …] [Date: …]" line if present.
+  const newlineIdx = body.indexOf('\n');
+  if (newlineIdx > 0 && body.slice(0, newlineIdx).match(/^\[Type:\s/)) {
+    body = body.slice(newlineIdx + 1);
+  }
+  body = body.trim().replace(/\s+/g, ' ');
+  if (!body) return undefined;
+  if (body.length <= 400) return body;
+  return body.slice(0, 400).trim() + '…';
 }
 
 function fmtDate(iso?: string): string | undefined {
@@ -168,6 +201,7 @@ async function hydrateSources(
               subtitle,
               date: row.sent_at || undefined,
               url_path: `/conversations/${row.id}`,
+              excerpt: extractExcerpt(ref.chunk.hydrated_text),
             });
           }
         })
@@ -201,6 +235,7 @@ async function hydrateSources(
               subtitle: row.event_type === 'meeting' ? 'Meeting' : row.event_type,
               date: row.start_time,
               url_path: `/events/${row.id}`,
+              excerpt: extractExcerpt(ref.chunk.hydrated_text),
             });
           }
         })
@@ -228,11 +263,61 @@ async function hydrateSources(
           deal_id: string | null;
           created_at: string;
         }>()
-        .then(res => {
+        .then(async res => {
+          // Collect distinct linked-entity IDs by table for batched name lookup.
+          const contactIds: string[] = [];
+          const companyIds: string[] = [];
+          const dealIds: string[] = [];
+          for (const r of res.results) {
+            if (r.contact_id) contactIds.push(r.contact_id);
+            if (r.company_id) companyIds.push(r.company_id);
+            if (r.deal_id) dealIds.push(r.deal_id);
+          }
+          const contactNames = new Map<string, string>();
+          const companyNames = new Map<string, string>();
+          const dealTitles = new Map<string, string>();
+          await Promise.all([
+            contactIds.length > 0
+              ? env.D1.prepare(
+                  `SELECT id, full_name FROM contacts WHERE org_id = ? AND id IN (${contactIds.map(() => '?').join(',')})`
+                ).bind(orgId, ...contactIds).all<{ id: string; full_name: string }>()
+                  .then(r => { for (const row of r.results) contactNames.set(row.id, row.full_name); })
+                  .catch(() => {})
+              : Promise.resolve(),
+            companyIds.length > 0
+              ? env.D1.prepare(
+                  `SELECT id, name FROM companies WHERE org_id = ? AND id IN (${companyIds.map(() => '?').join(',')})`
+                ).bind(orgId, ...companyIds).all<{ id: string; name: string }>()
+                  .then(r => { for (const row of r.results) companyNames.set(row.id, row.name); })
+                  .catch(() => {})
+              : Promise.resolve(),
+            dealIds.length > 0
+              ? env.D1.prepare(
+                  `SELECT id, title FROM deals WHERE org_id = ? AND id IN (${dealIds.map(() => '?').join(',')})`
+                ).bind(orgId, ...dealIds).all<{ id: string; title: string }>()
+                  .then(r => { for (const row of r.results) dealTitles.set(row.id, row.title); })
+                  .catch(() => {})
+              : Promise.resolve(),
+          ]);
+
           const byId = new Map(res.results.map(r => [r.id, r]));
           for (const ref of docRows) {
             const row = byId.get(ref.sourceId);
             if (!row) continue;
+            // Pick the most-specific linked entity (deal > company > contact)
+            // and resolve to a human name + click target.
+            let entityName: string | undefined;
+            let entityUrl: string | undefined;
+            if (row.deal_id && dealTitles.has(row.deal_id)) {
+              entityName = dealTitles.get(row.deal_id);
+              entityUrl = `/deals/${row.deal_id}`;
+            } else if (row.company_id && companyNames.has(row.company_id)) {
+              entityName = companyNames.get(row.company_id);
+              entityUrl = `/companies/${row.company_id}`;
+            } else if (row.contact_id && contactNames.has(row.contact_id)) {
+              entityName = contactNames.get(row.contact_id);
+              entityUrl = `/contacts/${row.contact_id}`;
+            }
             out.set(ref.id, {
               id: ref.id,
               type: 'document',
@@ -243,6 +328,9 @@ async function hydrateSources(
               subtitle: row.document_type.replace(/_/g, ' '),
               date: row.created_at,
               url_path: `/documents/${row.id}`,
+              excerpt: extractExcerpt(ref.chunk.hydrated_text),
+              entity_name: entityName,
+              entity_url_path: entityUrl,
             });
           }
         })
@@ -268,11 +356,27 @@ async function hydrateSources(
           published_at: string | null;
           company_id: string | null;
         }>()
-        .then(res => {
+        .then(async res => {
+          // Resolve linked company names so the panel can render
+          // "About: <Company>" instead of a UUID.
+          const companyIds = Array.from(
+            new Set(res.results.map(r => r.company_id).filter(Boolean) as string[])
+          );
+          const companyNames = new Map<string, string>();
+          if (companyIds.length > 0) {
+            const cph = companyIds.map(() => '?').join(',');
+            await env.D1.prepare(
+              `SELECT id, name FROM companies WHERE org_id = ? AND id IN (${cph})`
+            ).bind(orgId, ...companyIds).all<{ id: string; name: string }>()
+              .then(r => { for (const row of r.results) companyNames.set(row.id, row.name); })
+              .catch(() => {});
+          }
+
           const byId = new Map(res.results.map(r => [r.id, r]));
           for (const ref of newsRows) {
             const row = byId.get(ref.sourceId);
             if (!row) continue;
+            const entityName = row.company_id ? companyNames.get(row.company_id) : undefined;
             out.set(ref.id, {
               id: ref.id,
               type: 'news',
@@ -284,6 +388,9 @@ async function hydrateSources(
               date: row.published_at || undefined,
               url_path: row.company_id ? `/companies/${row.company_id}` : '/',
               external_url: row.source_url || undefined,
+              excerpt: extractExcerpt(ref.chunk.hydrated_text),
+              entity_name: entityName,
+              entity_url_path: row.company_id ? `/companies/${row.company_id}` : undefined,
             });
           }
         })

@@ -19,6 +19,12 @@ export interface CitationSource {
   date?: string;
   url_path: string;
   external_url?: string;
+
+  // Display-only fields populated by buildSourcesAndContext for the side
+  // panel — not part of the prompt sent to Claude.
+  excerpt?: string;
+  entity_name?: string;
+  entity_url_path?: string;
 }
 
 // Tokenized form for non-markdown rendering paths (footer, plain-text fallback).
