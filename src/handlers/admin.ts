@@ -280,21 +280,30 @@ export async function repairBackfilledAclMetadata(
   let notInVectorize = 0;
   const errors: string[] = [];
 
-  // Batch the round-trips: one getByIds for the whole page, parallel KV
-  // checks, one upsert for everything that needs repair. Replaces 50
-  // sequential GETs + 50 sequential KV.gets + ~50 BGE re-embeds + 50 upserts
-  // with 1 GET + 50 parallel KV.gets + 1 UPSERT. The previous BGE re-embed
+  // Batch the round-trips. Vectorize.getByIds is capped at 20 IDs per call
+  // (VECTOR_GET_ERROR 40007), so chunk into windows of 20 in parallel.
+  // KV.get has no batch API — parallelize via Promise.all. Upsert tolerates
+  // larger batches so all repairs go in one call. The previous BGE re-embed
   // was redundant — the chunk text didn't change, so existing.values is
   // already the right embedding for the new metadata.
+  const VEC_GET_MAX = 20;
   const candidateIds = candidates.results.map(r => r.vector_id);
+  const idChunks: string[][] = [];
+  for (let i = 0; i < candidateIds.length; i += VEC_GET_MAX) {
+    idChunks.push(candidateIds.slice(i, i + VEC_GET_MAX));
+  }
   const fetchedMap = new Map<string, { values: number[]; metadata: any }>();
-  try {
-    const fetched = await env.VECTORIZE.getByIds(candidateIds);
-    for (const v of fetched) {
-      fetchedMap.set(v.id, { values: v.values as number[], metadata: v.metadata || {} });
+  const getResults = await Promise.allSettled(
+    idChunks.map(ids => env.VECTORIZE.getByIds(ids))
+  );
+  for (const r of getResults) {
+    if (r.status === 'fulfilled') {
+      for (const v of r.value) {
+        fetchedMap.set(v.id, { values: v.values as number[], metadata: v.metadata || {} });
+      }
+    } else {
+      errors.push(`getByIds_chunk: ${r.reason?.message || String(r.reason)}`);
     }
-  } catch (err: any) {
-    errors.push(`getByIds_batch: ${err?.message || String(err)}`);
   }
 
   // Parallel KV chunk-text presence check (informational — doesn't block the
@@ -1180,19 +1189,29 @@ export async function recomputePrimaryEntityIds(
     }
   }
 
-  // Batch the Vectorize round-trips: one getByIds for all candidate vectors,
-  // one upsert for all that need updating. Replaces 50 sequential GETs +
-  // up to 50 sequential UPSERTs with 1 + 1. Vectorize accepts up to 100 IDs
-  // per getByIds and 1000 vectors per upsert, both well above our batch size.
+  // Batch the Vectorize round-trips. getByIds is capped at 20 IDs per call
+  // (VECTOR_GET_ERROR 40007); we chunk candidates into windows of 20 and run
+  // them in parallel. upsert tolerates much larger batches (~1000) so we send
+  // one upsert at the end. Net: 50-vector batch → 3 parallel GETs + 1 UPSERT,
+  // versus 50 sequential GETs + ~30 sequential UPSERTs in the prior code.
+  const VEC_GET_MAX = 20;
   const candidateIds = candidates.results.map(r => r.vector_id);
-  let existingMap = new Map<string, { values: number[]; metadata: any }>();
-  try {
-    const fetched = await env.VECTORIZE.getByIds(candidateIds);
-    for (const v of fetched) {
-      existingMap.set(v.id, { values: v.values as number[], metadata: v.metadata || {} });
+  const idChunks: string[][] = [];
+  for (let i = 0; i < candidateIds.length; i += VEC_GET_MAX) {
+    idChunks.push(candidateIds.slice(i, i + VEC_GET_MAX));
+  }
+  const existingMap = new Map<string, { values: number[]; metadata: any }>();
+  const getResults = await Promise.allSettled(
+    idChunks.map(ids => env.VECTORIZE.getByIds(ids))
+  );
+  for (const r of getResults) {
+    if (r.status === 'fulfilled') {
+      for (const v of r.value) {
+        existingMap.set(v.id, { values: v.values as number[], metadata: v.metadata || {} });
+      }
+    } else {
+      errors.push(`getByIds_chunk: ${r.reason?.message || String(r.reason)}`);
     }
-  } catch (err: any) {
-    errors.push(`getByIds_batch: ${err?.message || String(err)}`);
   }
 
   const toUpsert: Array<{ id: string; values: number[]; metadata: any }> = [];
