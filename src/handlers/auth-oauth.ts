@@ -391,11 +391,18 @@ export async function outlookOAuthCallback(
         10,
         env
       );
-      console.log(
-        `[auth-oauth] onboarding progressive backfill seeded for ${record.user_id}: ${
-          r.created ? `parent=${r.parent_id}` : `skipped (${r.reason})`
-        }`
-      );
+      if (r.created) {
+        // Grep-able instrumentation: fires once per first-time onboarding,
+        // never on reconnect. Use this to confirm the hook actually ran when
+        // Adam / Alvaro / Intel connect Outlook for the first time.
+        console.log(
+          `[onboarding-backfill] seeded ${DEFAULT_ONBOARDING_BACKFILL_DAYS}-day backfill for ${connectedEmail ?? '(unknown_email)'} (user_id=${record.user_id}, parent_job_id=${r.parent_id})`
+        );
+      } else {
+        console.log(
+          `[auth-oauth] onboarding progressive backfill NOT seeded for ${record.user_id}: ${r.reason}`
+        );
+      }
     } else {
       console.log(`[auth-oauth] onboarding skipped — progressive history already exists for ${record.user_id}`);
     }
