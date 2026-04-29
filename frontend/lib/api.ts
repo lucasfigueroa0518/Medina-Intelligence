@@ -351,6 +351,76 @@ export const api = {
     request<{ ok: boolean; progress: any }>('/admin/backfill-email', { method: 'POST', body: JSON.stringify(data) }),
   getBackfillProgress: () =>
     request<{ progress: any }>('/admin/backfill-progress'),
+
+  // Progressive backfill (server-side, multi-window, cron-driven)
+  startProgressiveBackfill: (data: { user_id?: string; days_back?: 30 | 60 | 90 | 180; start_date?: string; end_date?: string }) =>
+    request<{
+      ok: boolean;
+      parent_id: string;
+      mode: 'days_back' | 'date_range';
+      days_back?: number;
+      start_date?: string;
+      end_date?: string;
+      window_size_days: number;
+      total_windows: number;
+    }>('/backfill/start', { method: 'POST', body: JSON.stringify(data) }),
+  getProgressiveBackfillProgress: (userId?: string) =>
+    request<{
+      ok: boolean;
+      parent: null | {
+        id: string;
+        org_id: string;
+        user_id: string;
+        window_size_days: number;
+        total_windows: number;
+        status: 'active' | 'completed' | 'cancelled';
+        created_at: string;
+        updated_at: string;
+        completed_at: string | null;
+      };
+      windows: Array<{
+        id: string;
+        window_index: number;
+        start_date: string;
+        end_date: string;
+        status: 'pending' | 'in_progress' | 'completed' | 'failed';
+        emails_fetched: number;
+        conversations_added: number;
+        embedded_count: number;
+        attachments_processed: number;
+        attachments_persisted: number;
+        attachments_failed: number;
+        attachments_skipped: number;
+        started_at: string | null;
+        completed_at: string | null;
+        last_error: string | null;
+      }>;
+      summary: null | {
+        windows_completed: number;
+        windows_total: number;
+        windows_in_progress_index: number | null;
+        emails_total: number;
+        conversations_added: number;
+        embedded_total: number;
+        attachments_processed: number;
+        attachments_persisted: number;
+        attachments_failed: number;
+        attachments_skipped: number;
+        avg_window_seconds: number | null;
+        eta_seconds: number | null;
+        elapsed_seconds: number;
+      };
+    }>(`/backfill/progress${userId ? `?user_id=${encodeURIComponent(userId)}` : ''}`),
+  cancelProgressiveBackfill: (userId?: string) =>
+    request<{ ok: boolean; result: 'cancelled' | 'not_found'; user_id: string }>(
+      '/backfill/cancel',
+      { method: 'POST', body: JSON.stringify(userId ? { user_id: userId } : {}) }
+    ),
+  listProgressiveEligibleUsers: () =>
+    request<{
+      ok: boolean;
+      users: Array<{ id: string; email: string; full_name: string | null; role: string }>;
+    }>('/backfill/eligible-users'),
   triggerSync: (workflow: 'ingestion' | 'enrichment') =>
     request<{ ok: boolean; instance_id: string }>('/admin/trigger-sync', {
       method: 'POST', body: JSON.stringify({ workflow }),

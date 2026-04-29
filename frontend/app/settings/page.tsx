@@ -223,6 +223,8 @@ function SyncIntegrationsTab({
         </div>
       </div>
 
+      <EmailHistoricalBackfillSection isOutlookConnected={status?.outlook?.status === 'connected'} />
+
       <EmailSyncSection isOutlookConnected={status?.outlook?.status === 'connected'} />
 
       <div className="card">
@@ -390,6 +392,12 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
   const [dateRangeOpen, setDateRangeOpen] = React.useState(false);
   const [backfillDays, setBackfillDays] = React.useState(365);
   const [toast, setToast] = React.useState<string | null>(null);
+  // Legacy guard: when the new progressive backfill (server-driven, multi-window)
+  // has an active parent for this user, suppress this section's auto-resume
+  // useEffect so the two paths don't fight each other (one tries to advance via
+  // /admin/backfill-email page-batches while the other advances via the */2
+  // cron driver). The progressive section above takes over the UX entirely.
+  const [hasActiveProgressive, setHasActiveProgressive] = React.useState(false);
 
   React.useEffect(() => {
     api.getSyncConfig()
@@ -403,6 +411,10 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
 
     api.getBackfillProgress()
       .then(d => setBackfillProgress(d.progress))
+      .catch(() => {});
+
+    api.getProgressiveBackfillProgress()
+      .then(d => setHasActiveProgressive(d.parent?.status === 'active'))
       .catch(() => {});
   }, []);
 
@@ -424,9 +436,17 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
   // the user has to click Resume after every page batch, which feels stuck.
   // Hard cap at MAX_AUTO_RESUMES to prevent runaway loops if the backfill is
   // genuinely failing every page (also surfaced via failed status).
+  //
+  // Bail out entirely when the new progressive backfill is active — the two
+  // paths share KV state (`backfill_progress:${userId}`) and both manipulate
+  // the same Outlook delta token, so concurrent advancement causes
+  // double-fetching / token desync. The progressive UI above is now the
+  // primary path; this useEffect stays for users who haven't started a
+  // progressive job yet (legacy admin curl + this useEffect remain functional).
   const [autoResumeCount, setAutoResumeCount] = React.useState(0);
   const MAX_AUTO_RESUMES = 50; // 50 × 500 = 25,000 emails ceiling
   React.useEffect(() => {
+    if (hasActiveProgressive) return;
     if (backfillProgress?.status !== 'paused') return;
     if (autoResumeCount >= MAX_AUTO_RESUMES) return;
     const t = setTimeout(() => {
@@ -435,7 +455,7 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
     }, 1500);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backfillProgress?.status, backfillProgress?.total_fetched, autoResumeCount]);
+  }, [backfillProgress?.status, backfillProgress?.total_fetched, autoResumeCount, hasActiveProgressive]);
   // Reset auto-resume counter on a fresh backfill start or completion
   React.useEffect(() => {
     if (backfillProgress?.status === 'completed' || !backfillProgress) {
@@ -676,6 +696,378 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
           <div className="text-sm text-text-primary">{toast}</div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── Email Historical Backfill (progressive, server-side, cron-driven) ─────
+//
+// Sibling to EmailSyncSection. The legacy section uses /admin/backfill-email
+// (single-call inline backfill driven by a browser useEffect that auto-resumes
+// page-batches). This section uses /backfill/{start,progress,cancel} which
+// queues a parent + N×10-day window jobs that the server's */2 cron drives
+// to completion with no browser involvement. UX: 18-pill progress strip, 5s
+// poll, cancel button, owner user-picker, custom date-range modal.
+
+const PROGRESSIVE_DAYS_OPTIONS: Array<30 | 60 | 90 | 180> = [30, 60, 90, 180];
+
+function fmtDuration(s: number | null | undefined): string {
+  if (s == null) return '—';
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m < 60) return `${m}m ${r}s`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${h}h ${mm}m`;
+}
+
+function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConnected: boolean }) {
+  const [me, setMe] = React.useState<UserProfile | null>(null);
+  const [eligibleUsers, setEligibleUsers] = React.useState<Array<{
+    id: string; email: string; full_name: string | null; role: string;
+  }>>([]);
+  const [selectedUserId, setSelectedUserId] = React.useState<string | null>(null);
+  const [progress, setProgress] = React.useState<{
+    parent: any | null;
+    windows: any[];
+    summary: any | null;
+  } | null>(null);
+  const [days, setDays] = React.useState<30 | 60 | 90 | 180>(90);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+  const [dateRangeOpen, setDateRangeOpen] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [, setTickN] = React.useState(0);
+  const [toast, setToast] = React.useState<string | null>(null);
+
+  const isOwner = me?.role === 'owner' || me?.role === 'super_admin';
+
+  React.useEffect(() => {
+    api.getMe().then(d => {
+      setMe(d.user);
+      setSelectedUserId(d.user.id);
+      if (d.user.role === 'owner' || d.user.role === 'super_admin') {
+        api.listProgressiveEligibleUsers()
+          .then(r => setEligibleUsers(r.users))
+          .catch(() => {});
+      }
+    }).catch(() => {});
+  }, []);
+
+  const fetchProgress = React.useCallback(async () => {
+    if (!selectedUserId) return;
+    try {
+      const isSelf = selectedUserId === me?.id;
+      const r = await api.getProgressiveBackfillProgress(isSelf ? undefined : selectedUserId);
+      setProgress({ parent: r.parent, windows: r.windows, summary: r.summary });
+    } catch { /* ignore */ }
+  }, [selectedUserId, me?.id]);
+
+  React.useEffect(() => { fetchProgress(); }, [fetchProgress]);
+
+  // 5s poll while active
+  React.useEffect(() => {
+    if (progress?.parent?.status !== 'active') return;
+    const id = setInterval(fetchProgress, 5000);
+    return () => clearInterval(id);
+  }, [progress?.parent?.status, fetchProgress]);
+
+  // 1s tick for elapsed display
+  React.useEffect(() => {
+    if (progress?.parent?.status !== 'active') return;
+    const id = setInterval(() => setTickN(n => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [progress?.parent?.status]);
+
+  React.useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3500);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  async function startBackfill(daysBack: 30 | 60 | 90 | 180) {
+    setConfirmOpen(false);
+    setLoading(true);
+    try {
+      const isSelf = selectedUserId === me?.id;
+      await api.startProgressiveBackfill({
+        days_back: daysBack,
+        ...(isSelf ? {} : { user_id: selectedUserId! }),
+      });
+      setToast('Backfill started — first window kicks off within 2 minutes');
+      fetchProgress();
+    } catch (e: any) {
+      setToast(`Failed: ${e?.message || 'unknown error'}`);
+    }
+    setLoading(false);
+  }
+
+  async function cancelBackfill() {
+    setLoading(true);
+    try {
+      const isSelf = selectedUserId === me?.id;
+      await api.cancelProgressiveBackfill(isSelf ? undefined : selectedUserId!);
+      setToast('Backfill cancelled');
+      fetchProgress();
+    } catch (e: any) {
+      setToast(`Cancel failed: ${e?.message || 'unknown'}`);
+    }
+    setLoading(false);
+  }
+
+  if (!isOutlookConnected) return null;
+
+  const status = progress?.parent?.status;
+  const summary = progress?.summary;
+  const windows = progress?.windows ?? [];
+  const isActive = status === 'active';
+  const isDone = status === 'completed';
+  const isCancelled = status === 'cancelled';
+  const isIdle = !progress?.parent;
+  const targetUserLabel = selectedUserId === me?.id
+    ? 'yourself'
+    : (eligibleUsers.find(u => u.id === selectedUserId)?.email ?? 'this user');
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-2 mb-4">
+        <Clock size={16} className="text-accent-purple" />
+        <div className="font-medium">Email Historical Backfill</div>
+        {isActive && (
+          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold ml-1"
+            style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>
+            ACTIVE
+          </span>
+        )}
+      </div>
+
+      {isOwner && eligibleUsers.length > 1 && (
+        <div className="mb-4">
+          <div className="text-xs text-text-muted mb-1">Backfill for</div>
+          <select
+            value={selectedUserId ?? ''}
+            onChange={e => setSelectedUserId(e.target.value)}
+            className="input text-sm py-1.5 px-3 w-72"
+          >
+            {eligibleUsers.map(u => (
+              <option key={u.id} value={u.id}>
+                {u.id === me?.id ? 'Yourself' : `${u.full_name || u.email}`}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {isIdle && (
+        <div>
+          <div className="text-xs text-text-secondary mb-3">
+            Pull historical email in the background. Runs server-side in 10-day windows.
+            Survives page refresh, paces itself across cron ticks. No babysitting.
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {PROGRESSIVE_DAYS_OPTIONS.map(d => (
+              <button
+                key={d}
+                onClick={() => { setDays(d); setConfirmOpen(true); }}
+                disabled={loading}
+                className="btn-secondary text-xs py-1.5 flex items-center gap-2"
+              >
+                <Clock size={13} /> Last {d} days
+              </button>
+            ))}
+            <button
+              onClick={() => setDateRangeOpen(true)}
+              disabled={loading}
+              className="btn-secondary text-xs py-1.5 flex items-center gap-2"
+            >
+              <Calendar size={13} /> Custom Date Range
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(isActive || isDone || isCancelled) && summary && (
+        <div className="space-y-3">
+          <div className="text-sm text-text-primary">
+            <span className="font-medium">
+              {isActive
+                ? `${summary.windows_completed} of ${summary.windows_total} windows`
+                : isDone
+                ? 'Backfill complete'
+                : 'Backfill cancelled'}
+            </span>
+            <span className="text-text-muted">
+              {' · '}{summary.emails_total.toLocaleString()} emails
+              {' · '}{summary.attachments_persisted.toLocaleString()} attachments
+              {isActive && summary.eta_seconds !== null && ` · ETA ${fmtDuration(summary.eta_seconds)}`}
+            </span>
+          </div>
+
+          {/* 18-pill progress strip */}
+          <div className="flex flex-wrap gap-1">
+            {windows.map((w: any) => {
+              const cls = w.status === 'completed'
+                ? 'bg-green-500/30 border-green-500/50'
+                : w.status === 'in_progress'
+                ? 'bg-accent-purple/30 border-accent-purple/60 animate-pulse'
+                : w.status === 'failed'
+                ? 'bg-red-500/30 border-red-500/50'
+                : 'bg-white/5 border-white/10';
+              const range = `${new Date(w.start_date).toISOString().slice(0, 10)} → ${new Date(w.end_date).toISOString().slice(0, 10)}`;
+              const subtitle = `${w.emails_fetched ?? 0} emails · ${w.attachments_persisted ?? 0} attachments`;
+              return (
+                <div
+                  key={w.id}
+                  title={`Window ${w.window_index} (${range})\nstatus: ${w.status}\n${subtitle}${w.last_error ? '\n' + w.last_error : ''}`}
+                  className={`h-2 w-6 rounded-sm border ${cls}`}
+                />
+              );
+            })}
+          </div>
+
+          <div className="text-[10px] text-text-muted">
+            Elapsed {fmtDuration(summary.elapsed_seconds)}
+            {summary.avg_window_seconds !== null && ` · avg ${fmtDuration(summary.avg_window_seconds)}/window`}
+            {summary.attachments_failed > 0 && ` · ${summary.attachments_failed} attachment failures`}
+            {summary.attachments_skipped > 0 && ` · ${summary.attachments_skipped} skipped`}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {isActive && (
+              <button
+                onClick={cancelBackfill}
+                disabled={loading}
+                className="btn-ghost text-xs py-1.5 flex items-center gap-2 text-red-400 hover:text-red-300"
+              >
+                <XIcon size={13} /> Cancel backfill
+              </button>
+            )}
+            {(isDone || isCancelled) && (
+              <button
+                onClick={() => setProgress(null)}
+                className="btn-secondary text-xs py-1.5 flex items-center gap-2"
+              >
+                <Clock size={13} /> Start a new backfill
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation modal for days_back */}
+      {confirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+          onClick={() => setConfirmOpen(false)}>
+          <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+            onClick={e => e.stopPropagation()}>
+            <div className="text-lg font-medium text-text-primary mb-2">Start backfill</div>
+            <div className="text-sm text-text-secondary mb-4">
+              Pull last <strong>{days}</strong> days of email for <strong>{targetUserLabel}</strong>.
+              Runs in 10-day windows, server-side. No need to keep this tab open.
+            </div>
+            <div className="flex justify-end gap-3">
+              <button className="btn-ghost" onClick={() => setConfirmOpen(false)}>Cancel</button>
+              <button className="btn-primary" disabled={loading} onClick={() => startBackfill(days)}>
+                {loading ? 'Starting...' : 'Start'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom date range modal */}
+      {dateRangeOpen && (
+        <ProgressiveDateRangeModal
+          targetUserId={selectedUserId !== me?.id ? selectedUserId ?? undefined : undefined}
+          targetUserLabel={targetUserLabel}
+          onClose={() => setDateRangeOpen(false)}
+          onStarted={() => {
+            setDateRangeOpen(false);
+            setToast('Backfill started');
+            fetchProgress();
+          }}
+        />
+      )}
+
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-[60] rounded-xl shadow-2xl px-5 py-3"
+          style={{ background: '#1A1A1F', border: '1px solid rgba(34,197,94,0.3)', borderLeft: '3px solid #22C55E' }}>
+          <div className="text-sm text-text-primary">{toast}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProgressiveDateRangeModal({
+  targetUserId,
+  targetUserLabel,
+  onClose,
+  onStarted,
+}: {
+  targetUserId?: string;
+  targetUserLabel: string;
+  onClose: () => void;
+  onStarted: () => void;
+}) {
+  const [startDate, setStartDate] = React.useState('');
+  const [endDate, setEndDate] = React.useState('');
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function submit() {
+    setError(null);
+    if (!startDate || !endDate) {
+      setError('Both dates are required');
+      return;
+    }
+    setLoading(true);
+    try {
+      await api.startProgressiveBackfill({
+        start_date: new Date(startDate).toISOString(),
+        end_date: new Date(endDate).toISOString(),
+        ...(targetUserId ? { user_id: targetUserId } : {}),
+      });
+      onStarted();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start');
+    }
+    setLoading(false);
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+      onClick={onClose}>
+      <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+        style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="text-lg font-medium text-text-primary mb-2">Custom date range</div>
+        <div className="text-sm text-text-secondary mb-4">
+          Pulled in 10-day windows for <strong>{targetUserLabel}</strong>, newest first.
+        </div>
+        <div className="space-y-3 mb-4">
+          <div>
+            <div className="text-xs text-text-muted mb-1">Start date</div>
+            <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
+              className="input text-sm w-full" />
+          </div>
+          <div>
+            <div className="text-xs text-text-muted mb-1">End date</div>
+            <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
+              className="input text-sm w-full" />
+          </div>
+        </div>
+        {error && <div className="text-xs text-red-400 mb-3">{error}</div>}
+        <div className="flex justify-end gap-3">
+          <button className="btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" disabled={loading} onClick={submit}>
+            {loading ? 'Starting...' : 'Start backfill'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -15,8 +15,11 @@ import {
   getProgressiveStatus,
 } from '../lib/progressive-backfill';
 
-const ALLOWED_DAYS_BACK = [30, 90, 365] as const;
-const DEFAULT_WINDOW_SIZE_DAYS = 10;
+const ALLOWED_DAYS_BACK = [30, 60, 90, 180] as const;
+// Hard-coded by product decision — never user-tunable. The cron tick budget
+// and BGE/Graph rate limiters are calibrated to a 10-day batch; varying it
+// would break the per-tick fetch headroom.
+const WINDOW_SIZE_DAYS = 10;
 const MAX_ACTIVE_PER_ORG = 3;
 export const DEFAULT_ONBOARDING_BACKFILL_DAYS = 90;
 
@@ -25,7 +28,6 @@ interface StartBody {
   days_back?: number;
   start_date?: string;
   end_date?: string;
-  window_size_days?: number;
 }
 
 /**
@@ -61,11 +63,6 @@ export async function startBackfill(
     return errorResponse('USER_NOT_FOUND', 404, 'User not in your org.');
   }
 
-  const windowSize = body.window_size_days ?? DEFAULT_WINDOW_SIZE_DAYS;
-  if (windowSize < 1 || windowSize > 90) {
-    return errorResponse('VALIDATION_ERROR', 400, 'window_size_days must be 1..90');
-  }
-
   const hasDateRange = !!(body.start_date || body.end_date);
   const hasDaysBack = body.days_back !== undefined;
   if (hasDateRange && hasDaysBack) {
@@ -88,7 +85,7 @@ export async function startBackfill(
   }
 
   if (hasDaysBack) {
-    if (!ALLOWED_DAYS_BACK.includes(body.days_back as 30 | 90 | 365)) {
+    if (!ALLOWED_DAYS_BACK.includes(body.days_back as (typeof ALLOWED_DAYS_BACK)[number])) {
       return errorResponse(
         'VALIDATION_ERROR',
         400,
@@ -99,7 +96,7 @@ export async function startBackfill(
       ctx.orgId,
       targetUserId,
       body.days_back!,
-      windowSize,
+      WINDOW_SIZE_DAYS,
       env
     );
     if (!result.created) {
@@ -110,8 +107,8 @@ export async function startBackfill(
       parent_id: result.parent_id,
       mode: 'days_back',
       days_back: body.days_back,
-      window_size_days: windowSize,
-      total_windows: Math.ceil(body.days_back! / windowSize),
+      window_size_days: WINDOW_SIZE_DAYS,
+      total_windows: Math.ceil(body.days_back! / WINDOW_SIZE_DAYS),
     });
   }
 
@@ -124,7 +121,7 @@ export async function startBackfill(
     targetUserId,
     body.start_date,
     body.end_date,
-    windowSize,
+    WINDOW_SIZE_DAYS,
     env
   );
   if (!result.created) {
@@ -136,7 +133,7 @@ export async function startBackfill(
     mode: 'date_range',
     start_date: body.start_date,
     end_date: body.end_date,
-    window_size_days: windowSize,
+    window_size_days: WINDOW_SIZE_DAYS,
     total_windows: result.total_windows,
   });
 }
