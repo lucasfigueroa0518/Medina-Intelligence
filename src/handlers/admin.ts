@@ -280,52 +280,85 @@ export async function repairBackfilledAclMetadata(
   let notInVectorize = 0;
   const errors: string[] = [];
 
+  // Batch the round-trips: one getByIds for the whole page, parallel KV
+  // checks, one upsert for everything that needs repair. Replaces 50
+  // sequential GETs + 50 sequential KV.gets + ~50 BGE re-embeds + 50 upserts
+  // with 1 GET + 50 parallel KV.gets + 1 UPSERT. The previous BGE re-embed
+  // was redundant — the chunk text didn't change, so existing.values is
+  // already the right embedding for the new metadata.
+  const candidateIds = candidates.results.map(r => r.vector_id);
+  const fetchedMap = new Map<string, { values: number[]; metadata: any }>();
+  try {
+    const fetched = await env.VECTORIZE.getByIds(candidateIds);
+    for (const v of fetched) {
+      fetchedMap.set(v.id, { values: v.values as number[], metadata: v.metadata || {} });
+    }
+  } catch (err: any) {
+    errors.push(`getByIds_batch: ${err?.message || String(err)}`);
+  }
+
+  // Parallel KV chunk-text presence check (informational — doesn't block the
+  // repair, since the metadata-only update doesn't depend on the chunk text).
+  const kvPresence = await Promise.all(
+    candidateIds.map(id => env.KV.get(`chunk:${id}`).then(v => !!v).catch(() => false))
+  );
+  const kvPresenceMap = new Map<string, boolean>();
+  candidateIds.forEach((id, i) => kvPresenceMap.set(id, kvPresence[i]));
+
+  const toUpsert: Array<{ id: string; values: number[]; metadata: any }> = [];
+
   for (const { vector_id: vectorId } of candidates.results) {
+    const existing = fetchedMap.get(vectorId);
+    if (!existing) { notInVectorize++; continue; }
+
+    const meta: any = existing.metadata;
+    const rawParticipants = meta.participant_user_ids;
+    const isJsonFormat =
+      typeof rawParticipants === 'string' && rawParticipants.trim().startsWith('[');
+    const isOrgWideEmail =
+      meta.document_type === 'email' && meta.visibility === 'org_wide';
+
+    if (!isJsonFormat && !isOrgWideEmail) {
+      alreadyCorrect++;
+      continue;
+    }
+
+    if (!kvPresenceMap.get(vectorId)) {
+      // Track the orphan but still repair the metadata — the metadata fix
+      // is independent of chunk text. The orphan needs a full re-ingest from
+      // R2 separately (Wave 2+ candidate).
+      missingChunkText++;
+    }
+
+    const repairedParticipants = parseParticipantUserIds(rawParticipants).join(',');
+    const repairedVisibility =
+      meta.document_type === 'email' ? 'private' : meta.visibility || 'org_wide';
+
+    toUpsert.push({
+      id: vectorId,
+      values: existing.values,
+      metadata: {
+        ...meta,
+        visibility: repairedVisibility,
+        participant_user_ids: repairedParticipants || undefined,
+      },
+    });
+  }
+
+  if (toUpsert.length > 0) {
     try {
-      const existing = await env.VECTORIZE.getByIds([vectorId]);
-      if (existing.length === 0) {
-        notInVectorize++;
-        continue;
-      }
-      const meta: any = existing[0].metadata || {};
-
-      const rawParticipants = meta.participant_user_ids;
-      const isJsonFormat =
-        typeof rawParticipants === 'string' && rawParticipants.trim().startsWith('[');
-      const isOrgWideEmail =
-        meta.document_type === 'email' && meta.visibility === 'org_wide';
-
-      if (!isJsonFormat && !isOrgWideEmail) {
-        alreadyCorrect++;
-        continue;
-      }
-
-      const chunkText = await env.KV.get(`chunk:${vectorId}`);
-      if (!chunkText) {
-        missingChunkText++;
-        errors.push(`${vectorId}: chunk text missing from KV — needs full re-ingest`);
-        continue;
-      }
-      const values = await runEmbedding(env, chunkText, ctx.orgId);
-
-      const repairedParticipants = parseParticipantUserIds(rawParticipants).join(',');
-      const repairedVisibility =
-        meta.document_type === 'email' ? 'private' : meta.visibility || 'org_wide';
-
-      await env.VECTORIZE.upsert([
-        {
-          id: vectorId,
-          values,
-          metadata: {
-            ...meta,
-            visibility: repairedVisibility,
-            participant_user_ids: repairedParticipants || undefined,
-          },
-        },
-      ]);
-      updated++;
+      await env.VECTORIZE.upsert(toUpsert);
+      updated = toUpsert.length;
     } catch (err: any) {
-      errors.push(`${vectorId}: ${err?.message || String(err)}`);
+      errors.push(`upsert_batch: ${err?.message || String(err)} (falling back per-vector)`);
+      for (const v of toUpsert) {
+        try {
+          await env.VECTORIZE.upsert([v]);
+          updated++;
+        } catch (perErr: any) {
+          errors.push(`${v.id}: ${perErr?.message || String(perErr)}`);
+        }
+      }
     }
   }
 
@@ -1147,37 +1180,68 @@ export async function recomputePrimaryEntityIds(
     }
   }
 
+  // Batch the Vectorize round-trips: one getByIds for all candidate vectors,
+  // one upsert for all that need updating. Replaces 50 sequential GETs +
+  // up to 50 sequential UPSERTs with 1 + 1. Vectorize accepts up to 100 IDs
+  // per getByIds and 1000 vectors per upsert, both well above our batch size.
+  const candidateIds = candidates.results.map(r => r.vector_id);
+  let existingMap = new Map<string, { values: number[]; metadata: any }>();
+  try {
+    const fetched = await env.VECTORIZE.getByIds(candidateIds);
+    for (const v of fetched) {
+      existingMap.set(v.id, { values: v.values as number[], metadata: v.metadata || {} });
+    }
+  } catch (err: any) {
+    errors.push(`getByIds_batch: ${err?.message || String(err)}`);
+  }
+
+  const toUpsert: Array<{ id: string; values: number[]; metadata: any }> = [];
+
   for (const row of candidates.results) {
+    const existing = existingMap.get(row.vector_id);
+    if (!existing) { notInVectorize++; continue; }
+
+    const meta: any = existing.metadata;
+    const docType = meta.document_type || 'email';
+
+    const correctPrimary = resolvePrimaryEntityId({
+      document_type: docType,
+      source: row.conv_source,
+      source_id: row.conv_id,
+      from_contact_id: row.from_contact_id,
+      from_email: row.from_email,
+      to_contact_ids: toContactsByConv.get(row.conv_id) || [],
+      internal_user_emails: internalEmails,
+    });
+
+    if (meta.primary_entity_id === correctPrimary) {
+      alreadyCorrect++;
+      continue;
+    }
+
+    toUpsert.push({
+      id: row.vector_id,
+      values: existing.values,
+      metadata: { ...meta, primary_entity_id: correctPrimary },
+    });
+  }
+
+  if (toUpsert.length > 0) {
     try {
-      const existing = await env.VECTORIZE.getByIds([row.vector_id]);
-      if (existing.length === 0) { notInVectorize++; continue; }
-
-      const meta: any = existing[0].metadata || {};
-      const docType = meta.document_type || 'email';
-
-      const correctPrimary = resolvePrimaryEntityId({
-        document_type: docType,
-        source: row.conv_source,
-        source_id: row.conv_id,
-        from_contact_id: row.from_contact_id,
-        from_email: row.from_email,
-        to_contact_ids: toContactsByConv.get(row.conv_id) || [],
-        internal_user_emails: internalEmails,
-      });
-
-      if (meta.primary_entity_id === correctPrimary) {
-        alreadyCorrect++;
-        continue;
-      }
-
-      await env.VECTORIZE.upsert([{
-        id: row.vector_id,
-        values: existing[0].values,
-        metadata: { ...meta, primary_entity_id: correctPrimary },
-      }]);
-      updated++;
+      await env.VECTORIZE.upsert(toUpsert);
+      updated = toUpsert.length;
     } catch (err: any) {
-      errors.push(`${row.vector_id}: ${err?.message || String(err)}`);
+      // On batch upsert failure, fall back to per-vector upsert so we know
+      // which one(s) caused the issue and don't lose the whole batch.
+      errors.push(`upsert_batch: ${err?.message || String(err)} (falling back per-vector)`);
+      for (const v of toUpsert) {
+        try {
+          await env.VECTORIZE.upsert([v]);
+          updated++;
+        } catch (perErr: any) {
+          errors.push(`${v.id}: ${perErr?.message || String(perErr)}`);
+        }
+      }
     }
   }
 
