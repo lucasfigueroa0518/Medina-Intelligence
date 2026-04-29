@@ -7,7 +7,7 @@ import {
   getOrgSettings,
   getDecryptedAccessToken,
 } from '../lib/helpers';
-import { stripHtml } from '../lib/helpers';
+import { stripHtml, stripQuotedReplies } from '../lib/helpers';
 import { refreshOutlookToken, recordTokenFailure } from './oauth';
 import { upsertOutlookEvent } from '../lib/reconciliation';
 import { checkGraphRateLimit, recordGraphApiCall } from '../lib/rate-limit';
@@ -184,7 +184,12 @@ function messageToClassifiableItem(
     : undefined;
 
   const bodyContent = msg.body?.content ?? msg.bodyPreview ?? '';
-  const bodyText = msg.body?.contentType === 'html' ? stripHtml(bodyContent) : bodyContent;
+  const plainBody = msg.body?.contentType === 'html' ? stripHtml(bodyContent) : bodyContent;
+  // Strip quoted reply chains so a 5-message thread doesn't embed 5× the same
+  // content. Only affects new ingestions — existing email vectors keep their
+  // bloated bodies (compute cost of a re-embed pass not justified for the
+  // efficiency-only gain).
+  const bodyText = stripQuotedReplies(plainBody);
 
   return {
     type: 'email',

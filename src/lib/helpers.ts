@@ -24,6 +24,70 @@ export function stripHtml(html: string): string {
   return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// Strip quoted reply chains from email body text. Outlook replies include
+// the entire prior thread quoted below the new content ("On Mar 5, Patrick
+// wrote:..."), which makes a 5-message thread embed 5× the same content
+// across thread members. Run AFTER stripHtml so the patterns below match
+// against plaintext.
+//
+// Patterns covered (any one truncates the body at its first occurrence):
+//   • "On <date>, <person> wrote:" (Gmail/most clients)
+//   • "On <date> at <time>, <person> wrote:" (alternate Gmail)
+//   • "From: ... Sent: ..." block (Outlook forwarded format)
+//   • "----- Original Message -----" (older Outlook)
+//   • "________" horizontal-rule + "From:" (Outlook web)
+// Plus a final pass to drop any residual "> " / ">> " line prefixes.
+export function stripQuotedReplies(text: string): string {
+  if (!text) return '';
+  const replyMarkers: RegExp[] = [
+    /\n+On .+, .+ wrote:/i,
+    /\n+On .+ at .+, .+ wrote:/i,
+    /\n+From: .+\nSent: /i,
+    /\n+-{3,}\s*Original Message\s*-{3,}/i,
+    /\n+_{3,}\s*\n+From: /i,
+  ];
+  let stripped = text;
+  for (const marker of replyMarkers) {
+    const match = stripped.match(marker);
+    if (match && match.index !== undefined) {
+      stripped = stripped.substring(0, match.index);
+    }
+  }
+  stripped = stripped
+    .split('\n')
+    .filter(line => !/^\s*>+\s/.test(line))
+    .join('\n');
+  return stripped.trim();
+}
+
+// Retry env.KV.put on transient failures (429, 5xx, network blips). Pure
+// retry wrapper — no rate limiting. Used by chunkEmbedAndPersist where bursty
+// chunk-text writes (15 chunks × 1 KV.put each, in rapid succession) can
+// outpace KV's per-namespace write rate. Attempts: 3, backoff 100ms→400ms
+// with proportional jitter.
+export async function kvPutWithRetry(
+  env: Env,
+  key: string,
+  value: string,
+  options?: KVNamespacePutOptions,
+  maxAttempts: number = 3
+): Promise<void> {
+  let lastErr: unknown;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      await env.KV.put(key, value, options);
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (i === maxAttempts - 1) break;
+      const base = 100 * Math.pow(2, i);
+      const delay = base + (Math.random() - 0.5) * base;
+      await new Promise(resolve => setTimeout(resolve, Math.max(50, delay)));
+    }
+  }
+  throw lastErr;
+}
+
 // --- §18.7: OrgSettings ---
 
 const DEFAULT_ORG_SETTINGS: OrgSettings = {

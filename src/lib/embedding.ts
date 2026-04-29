@@ -8,6 +8,7 @@ import {
   CURRENT_CHUNK_VERSION,
 } from './chunking';
 import { acquireEmbedSlot } from './rate-limit';
+import { kvPutWithRetry } from './helpers';
 
 // Parse a "Speaker Name: text" formatted transcript into structured turns.
 // Mirrors the parser in integrations/firefly.ts so re-embeds via the generic
@@ -205,7 +206,10 @@ export async function chunkEmbedAndPersist(
         },
       },
     ]),
-    env.KV.put(`chunk:${vectorId}`, prefixedChunk),
+    // Retrying wrapper — bursty chunk writes (e.g., 15 chunks for a transcript
+    // re-embed) can hit KV's per-namespace write throttle and 429. Audit
+    // 2026-04-29 saw 3/5 transcripts fail on KV PUT 429 during reembed.
+    kvPutWithRetry(env, `chunk:${vectorId}`, prefixedChunk),
   ]);
 
   return {

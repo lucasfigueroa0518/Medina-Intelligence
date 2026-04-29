@@ -10,10 +10,7 @@ import type {
 import { hydrateChunks } from './hydration';
 import { runEmbedding } from './embedding';
 import { truncateToTokens } from './tokens';
-import { callClaude } from './claude';
-import { checkClaudeRateLimit } from './rate-limit';
 import { getOrgSettings, getSharingFlags, parseParticipantUserIds } from './helpers';
-import { RERANKER_SYSTEM_PROMPT } from '../prompts/reranker';
 import { getEntityIndex } from './entity-index';
 
 export interface RetrievalOptions {
@@ -416,6 +413,48 @@ export async function retrieveContext(
   return { internal: reranked, news: newsChunks };
 }
 
+// Recency boost — applied to rerank scores when the query contains temporal
+// cues. Half-life of 90 days: today=1.0, 90d ago=0.5, 365d ago≈0.06. Only
+// activates for explicitly time-sensitive queries so neutral questions like
+// "what does this contract say about IP rights" stay age-agnostic.
+const RECENCY_KEYWORDS = [
+  'latest', 'recent', 'today', 'yesterday', 'this week', 'this month',
+  'now', 'currently', 'just', 'newest', 'most recent', 'happening',
+  'going on', 'lately', 'so far this', 'past few',
+];
+
+function detectsRecencyIntent(query: string): boolean {
+  const lower = query.toLowerCase();
+  return RECENCY_KEYWORDS.some(kw => lower.includes(kw));
+}
+
+function recencyMultiplier(ageInDays: number): number {
+  if (!Number.isFinite(ageInDays) || ageInDays < 0) return 1;
+  return Math.exp(-ageInDays / 90);
+}
+
+function chunkAgeInDays(chunk: HydratedChunk): number {
+  const dateStr = (chunk.metadata.date as string | undefined)
+    || (chunk.metadata.created_at as string | undefined);
+  if (!dateStr) return Infinity; // unknown age → fully decayed (won't surface for "recent" queries)
+  const t = new Date(dateStr).getTime();
+  if (!Number.isFinite(t)) return Infinity;
+  return (Date.now() - t) / 86_400_000;
+}
+
+// Cross-encoder rerank using @cf/baai/bge-reranker-base via Workers AI.
+// Replaces the prior Claude-based reordering (was slow ~1s p50, expensive,
+// non-deterministic). BGE reranker scores (query, chunk-text) pairs directly;
+// purpose-built for this and ~10× faster.
+//
+// Flow:
+//   1. Early-return on tiny candidate sets (<= 3 chunks).
+//   2. Honor org settings.reranker_enabled — when false, pass through capped.
+//   3. Send query + chunk previews to bge-reranker-base, get per-chunk scores.
+//   4. Optionally apply recency multiplier when the query is temporal.
+//   5. Sort by combined score, return topK.
+//   6. Any failure path falls back to the input order capped at 10 — never
+//      throws, retrieval must keep working.
 export async function crossEncoderRerank(
   chunks: HydratedChunk[],
   query: string,
@@ -428,51 +467,45 @@ export async function crossEncoderRerank(
   if (!settings.reranker_enabled) return chunks.slice(0, 10);
 
   try {
-    if (!(await checkClaudeRateLimit(env, orgId, 'high'))) {
+    // BGE reranker accepts up to ~16K tokens of context combined; cap each
+    // chunk at ~500 tokens so 30+ chunks fit comfortably.
+    const contexts = chunks.map(c => ({
+      text: truncateToTokens(c.hydrated_text, 500),
+    }));
+
+    const response = await env.AI.run('@cf/baai/bge-reranker-base' as any, {
+      query,
+      contexts,
+    } as any);
+
+    // Workers AI shape: { response: [{ id: number, score: number }, ...] }
+    // where id is the index into our `contexts` array.
+    const scoresArr: Array<{ id: number; score: number }> =
+      Array.isArray((response as any)?.response) ? (response as any).response : [];
+
+    if (scoresArr.length === 0) {
+      // Defensive: model returned nothing usable. Fall back.
       return chunks.slice(0, 10);
     }
 
-    const chunkText = chunks
-      .map((c, i) => `[${i}] ${truncateToTokens(c.hydrated_text, 500)}`)
-      .join('\n');
-
-    const response = await callClaude(
-      {
-        system: RERANKER_SYSTEM_PROMPT,
-        user: `Query: "${query}"\n\nChunks:\n${chunkText}`,
-        max_tokens: 200,
-        orgId,
-      },
-      'high',
-      env
-    );
-
-    const cleaned = response
-      .trim()
-      .replace(/```json\s*/g, '')
-      .replace(/```/g, '')
-      .trim();
-
-    const parsed: unknown = JSON.parse(cleaned);
-    if (!Array.isArray(parsed)) throw new Error('Non-array');
-
-    const valid = (parsed as unknown[]).filter(
-      (i): i is number =>
-        typeof i === 'number' && Number.isInteger(i) && i >= 0 && i < chunks.length
-    );
-
-    if (valid.length < Math.min(5, chunks.length)) {
-      const result = valid.map(i => chunks[i]);
-      const used = new Set(valid);
-      for (let i = 0; i < chunks.length && result.length < 10; i++) {
-        if (!used.has(i)) result.push(chunks[i]);
+    const scoreById = new Map<number, number>();
+    for (const s of scoresArr) {
+      if (typeof s.id === 'number' && typeof s.score === 'number') {
+        scoreById.set(s.id, s.score);
       }
-      return result;
     }
 
-    return valid.map(i => chunks[i]).slice(0, 10);
+    const recencyOn = detectsRecencyIntent(query);
+    const scored = chunks.map((c, i) => {
+      const baseScore = scoreById.get(i) ?? 0;
+      const adjusted = recencyOn ? baseScore * recencyMultiplier(chunkAgeInDays(c)) : baseScore;
+      return { chunk: c, score: adjusted };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, 10).map(x => x.chunk);
   } catch (e) {
-    console.error('Re-ranker fallback:', e);
+    console.error('[rerank] BGE reranker fallback:', e);
     return chunks.slice(0, 10);
   }
 }

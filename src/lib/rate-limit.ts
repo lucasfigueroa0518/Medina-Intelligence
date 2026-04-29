@@ -182,10 +182,17 @@ export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number>
       return Date.now() - startedAt;
     }
 
-    const backoff = Math.min(
-      EMBED_BACKOFF_BASE_MS * Math.pow(2, attempt) + Math.random() * 100,
+    // Exponential backoff with proportional jitter (±50% of the base delay).
+    // Audit 2026-04-29: the prior fixed 0–100ms jitter was too small relative
+    // to the larger backoff windows (lockstep retry every ~5s when many
+    // isolates hit the limit simultaneously). Proportional jitter spreads
+    // retries across a meaningful window and breaks lockstep cleanly.
+    const baseBackoff = Math.min(
+      EMBED_BACKOFF_BASE_MS * Math.pow(2, attempt),
       EMBED_BACKOFF_MAX_MS
     );
+    const jitter = (Math.random() - 0.5) * baseBackoff;
+    const backoff = Math.max(50, baseBackoff + jitter);
 
     if (Date.now() - startedAt + backoff > EMBED_MAX_WAIT_MS) {
       throw new Error(
