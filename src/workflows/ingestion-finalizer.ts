@@ -168,7 +168,7 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
         step,
         sync_job_id,
         'calc-relationship-status',
-        { timeout: '300 seconds', retries: { limit: 1, delay: '10 seconds' } },
+        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
         async () => {
           try {
             const c = await calculateAllRelationshipStatuses(org_id, this.env);
@@ -184,7 +184,7 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
         step,
         sync_job_id,
         'calc-contact-owners',
-        { timeout: '300 seconds', retries: { limit: 1, delay: '10 seconds' } },
+        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
         async () => {
           try {
             const c = await calculateAllRelationshipOwners(org_id, this.env);
@@ -200,7 +200,7 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
         step,
         sync_job_id,
         'calc-comms-patterns',
-        { timeout: '300 seconds', retries: { limit: 1, delay: '10 seconds' } },
+        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
         async () => {
           try {
             const c = await analyzeAllCommsPatterns(org_id, this.env);
@@ -216,7 +216,7 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
         step,
         sync_job_id,
         'calc-associations',
-        { timeout: '300 seconds', retries: { limit: 1, delay: '10 seconds' } },
+        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
         async () => {
           try {
             await recalculateAllAssociations(org_id, this.env);
