@@ -637,12 +637,11 @@ async function handleScheduled(
       } else if (cron === '0 0 * * *') {
         // Daily cron — runs inline as a standard Worker
         ctxExec.waitUntil(runDailyCron(org.id, env));
-      } else if (cron === '*/2 * * * *') {
+      } else if (cron === '* * * * *') {
         // Progressive backfill driver — advances each active parent's
-        // current window by one paginated batch. Multiple users (Tony,
-        // Alvaro, ...) advance in parallel because they have different
-        // backfill_progress KV keys. Survives Worker CPU limits since each
-        // tick processes ~25s of work per user, no longer.
+        // current window by one paginated batch. Bumped 2026-04-29 from
+        // */2 to every-minute to cut total Tony backfill time once Alvaro
+        // completed (no more parallel contention to coordinate around).
         ctxExec.waitUntil((async () => {
           const { driveAllActiveProgressive } = await import('./lib/progressive-backfill');
           try { await driveAllActiveProgressive(org.id, env); }

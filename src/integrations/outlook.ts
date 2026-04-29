@@ -471,9 +471,12 @@ export async function runHistoricalBackfill(
 
   const internalDomains = await getOrgDomains(orgId, env);
   let pagesThisBatch = 0;
-  const MAX_PAGES_PER_CALL = 10;
+  // Bumped 2026-04-29: scheduled handler 15-min wallclock ceiling on paid
+  // plan and runHistoricalBackfill is mostly network-bound, so larger
+  // per-tick budgets cut total backfill duration without breaking limits.
+  const MAX_PAGES_PER_CALL = 25;
   const startTime = Date.now();
-  const MAX_RUNTIME_MS = 25_000; // leave headroom before Worker 30s limit
+  const MAX_RUNTIME_MS = 45_000;
 
   while (url) {
     if (pagesThisBatch >= MAX_PAGES_PER_CALL || Date.now() - startTime > MAX_RUNTIME_MS) {
