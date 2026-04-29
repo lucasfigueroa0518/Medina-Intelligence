@@ -46,6 +46,10 @@ export async function listDocuments(
   const sources = parseList(sp.get('source'));
   // document_type accepts both legacy single value and new CSV multi.
   const documentTypes = parseList(sp.get('document_type'));
+  // mime_type CSV is matched as LIKE prefix patterns (each value gets a
+  // '%' suffix). Drives the "PDFs"/"Images" quick filters which need to
+  // span every variant of application/pdf, image/*, etc.
+  const mimePrefixes = parseList(sp.get('mime_type'));
 
   // Wave 4 Q2 chose Option B — keyword LIKE on title + file_name only. No
   // full-text on extracted_text_preview (that's MARTy's job via vector search).
@@ -84,6 +88,10 @@ export async function listDocuments(
   if (documentTypes?.length) {
     where.push(`d.document_type IN (${documentTypes.map(() => '?').join(',')})`);
     binds.push(...documentTypes);
+  }
+  if (mimePrefixes?.length) {
+    where.push(`(${mimePrefixes.map(() => 'd.mime_type LIKE ?').join(' OR ')})`);
+    binds.push(...mimePrefixes.map(p => `${p}%`));
   }
   if (search) {
     where.push('(d.title LIKE ? OR d.file_name LIKE ?)');
@@ -158,9 +166,22 @@ export async function listDocuments(
   // Fetch full rows by ID, then re-order to match the candidate sort. We
   // can't trust SQL ORDER BY on the IN-list query because SQLite doesn't
   // preserve the bind-order of an IN clause.
+  //
+  // LEFT JOIN to hydrate names of the legacy primary link (contact/company/
+  // deal) so the list page can render "Linked entity" without a second round
+  // trip. document_links junction is the truer source for multi-link docs,
+  // but for Phase A the scalar primary-link columns are sufficient.
   const placeholders = pageIds.map(() => '?').join(',');
   const fullRows = await env.D1.prepare(
-    `SELECT * FROM documents WHERE id IN (${placeholders})`
+    `SELECT d.*,
+            c.full_name  AS _contact_name,
+            co.name      AS _company_name,
+            de.title     AS _deal_title
+       FROM documents d
+       LEFT JOIN contacts  c  ON c.id  = d.contact_id  AND c.deleted_at  IS NULL
+       LEFT JOIN companies co ON co.id = d.company_id  AND co.deleted_at IS NULL
+       LEFT JOIN deals     de ON de.id = d.deal_id     AND de.deleted_at IS NULL
+      WHERE d.id IN (${placeholders})`
   ).bind(...pageIds).all<{ id: string; [k: string]: unknown }>();
   const idIndex = new Map(pageIds.map((id, i) => [id, i]));
   const ordered = [...fullRows.results].sort(
