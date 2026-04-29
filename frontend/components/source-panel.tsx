@@ -24,6 +24,32 @@ const TYPE_LABEL: Record<CitationSourceType, string> = {
   news: 'News',
 };
 
+function fmtDate(iso?: string): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function faviconFor(externalUrl?: string): string | null {
+  if (!externalUrl) return null;
+  try {
+    const u = new URL(externalUrl);
+    return `https://www.google.com/s2/favicons?domain=${u.hostname}&sz=32`;
+  } catch {
+    return null;
+  }
+}
+
+function domainFor(externalUrl?: string): string | null {
+  if (!externalUrl) return null;
+  try {
+    return new URL(externalUrl).hostname.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
+}
+
 export function SourcePanel({
   source,
   onClose,
@@ -67,19 +93,14 @@ export function SourcePanel({
           transform: open ? 'translateX(0)' : 'translateX(100%)',
         }}
       >
-        {source && <SourceContent source={source} onClose={onClose} />}
+        {source && <SourceHeaderAndBody source={source} onClose={onClose} />}
       </aside>
     </>
   );
 }
 
-function SourceContent({ source, onClose }: { source: CitationSource; onClose: () => void }) {
+function SourceHeaderAndBody({ source, onClose }: { source: CitationSource; onClose: () => void }) {
   const Icon = ICON_FOR_TYPE[source.type] || FileText;
-  const date = source.date ? new Date(source.date) : null;
-  const dateStr = date && !Number.isNaN(date.getTime())
-    ? date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
-    : null;
-
   return (
     <>
       <header className="px-5 pt-5 pb-4 border-b border-border">
@@ -93,7 +114,7 @@ function SourceContent({ source, onClose }: { source: CitationSource; onClose: (
                 {TYPE_LABEL[source.type]} · Source [{source.id}]
               </div>
               <div className="text-sm text-text-primary font-medium truncate" style={{ fontFamily: "'DM Sans', sans-serif" }}>
-                {source.title}
+                {source.title || 'Untitled'}
               </div>
             </div>
           </div>
@@ -108,59 +129,195 @@ function SourceContent({ source, onClose }: { source: CitationSource; onClose: (
       </header>
 
       <div className="flex-1 overflow-y-auto p-5 space-y-4">
-        {source.subtitle && (
-          <Field label="Detail" value={source.subtitle} />
-        )}
-        {dateStr && (
-          <Field label="Date" value={dateStr} />
-        )}
-        <Field label="Source table" value={source.source_table} mono />
-        <Field label="Source ID" value={source.source_id} mono />
-        {source.entity_id && (
-          <Field label="Linked entity" value={source.entity_id} mono />
-        )}
-
-        <div className="pt-2 space-y-2">
-          {source.url_path && source.url_path !== '/' && (
-            <a
-              href={source.url_path}
-              className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg bg-purple-500/10 hover:bg-purple-500/15 text-purple-300 transition-colors text-sm"
-              style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}
-            >
-              <span>Open in CRM</span>
-              <ArrowUpRight size={14} />
-            </a>
-          )}
-          {source.external_url && (
-            <a
-              href={source.external_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg bg-white/5 hover:bg-white/10 text-text-secondary transition-colors text-sm"
-              style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}
-            >
-              <span className="truncate">External source</span>
-              <ExternalLink size={14} />
-            </a>
-          )}
-        </div>
+        <PerTypeBody source={source} />
       </div>
     </>
   );
 }
 
-function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function PerTypeBody({ source }: { source: CitationSource }) {
+  switch (source.type) {
+    case 'email': return <EmailBody source={source} />;
+    case 'slack': return <SlackBody source={source} />;
+    case 'meeting': return <MeetingBody source={source} />;
+    case 'document': return <DocumentBody source={source} />;
+    case 'news': return <NewsBody source={source} />;
+    case 'contact': return <ContactBody source={source} />;
+    case 'company': return <CompanyBody source={source} />;
+    default: return <GenericBody source={source} />;
+  }
+}
+
+// ---------------- Per-type bodies ----------------
+
+function EmailBody({ source }: { source: CitationSource }) {
+  return (
+    <>
+      <MetaRow label="From" value={source.subtitle || 'Unknown sender'} />
+      {source.date && <MetaRow label="Sent" value={fmtDate(source.date) || source.date} />}
+      <Excerpt text={source.excerpt} />
+      <PrimaryAction href={source.url_path} label="Open thread" />
+    </>
+  );
+}
+
+function SlackBody({ source }: { source: CitationSource }) {
+  return (
+    <>
+      <MetaRow label="Channel" value={source.subtitle || 'Slack'} />
+      {source.date && <MetaRow label="Sent" value={fmtDate(source.date) || source.date} />}
+      <Excerpt text={source.excerpt} />
+      <PrimaryAction href={source.url_path} label="Open message" />
+    </>
+  );
+}
+
+function MeetingBody({ source }: { source: CitationSource }) {
+  return (
+    <>
+      {source.subtitle && <MetaRow label="Type" value={source.subtitle} />}
+      {source.date && <MetaRow label="Date" value={fmtDate(source.date) || source.date} />}
+      <Excerpt text={source.excerpt} label="Transcript excerpt" />
+      <PrimaryAction href={source.url_path} label="Open meeting" />
+    </>
+  );
+}
+
+function DocumentBody({ source }: { source: CitationSource }) {
+  return (
+    <>
+      {source.subtitle && <MetaRow label="Type" value={source.subtitle} />}
+      {source.date && <MetaRow label="Added" value={fmtDate(source.date) || source.date} />}
+      {source.entity_name && (
+        <MetaRow
+          label="About"
+          value={source.entity_name}
+          href={source.entity_url_path}
+        />
+      )}
+      <Excerpt text={source.excerpt} />
+      <PrimaryAction href={source.url_path} label="Open document" />
+    </>
+  );
+}
+
+function NewsBody({ source }: { source: CitationSource }) {
+  const favicon = faviconFor(source.external_url);
+  const domain = domainFor(source.external_url);
+  return (
+    <>
+      <div className="flex items-center gap-2">
+        {favicon && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={favicon} alt="" className="w-4 h-4 rounded-sm" />
+        )}
+        <div className="text-xs text-text-secondary" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+          {source.subtitle || 'News'}{domain ? ` · ${domain}` : ''}
+        </div>
+      </div>
+      {source.date && <MetaRow label="Published" value={fmtDate(source.date) || source.date} />}
+      {source.entity_name && (
+        <MetaRow label="About" value={source.entity_name} href={source.entity_url_path} />
+      )}
+      <Excerpt text={source.excerpt} />
+      {source.external_url ? (
+        <PrimaryAction href={source.external_url} label="Read article" external />
+      ) : source.url_path && source.url_path !== '/' ? (
+        <PrimaryAction href={source.url_path} label="Open in CRM" />
+      ) : null}
+    </>
+  );
+}
+
+function ContactBody({ source }: { source: CitationSource }) {
+  return (
+    <>
+      {source.subtitle && <MetaRow label="Role / company" value={source.subtitle} />}
+      <Excerpt text={source.excerpt} label="Bio" />
+      <PrimaryAction href={source.url_path} label="View contact" />
+    </>
+  );
+}
+
+function CompanyBody({ source }: { source: CitationSource }) {
+  return (
+    <>
+      {source.subtitle && <MetaRow label="Sector" value={source.subtitle} />}
+      <Excerpt text={source.excerpt} label="Description" />
+      <PrimaryAction href={source.url_path} label="View company" />
+    </>
+  );
+}
+
+function GenericBody({ source }: { source: CitationSource }) {
+  return (
+    <>
+      {source.subtitle && <MetaRow label="Detail" value={source.subtitle} />}
+      {source.date && <MetaRow label="Date" value={fmtDate(source.date) || source.date} />}
+      <Excerpt text={source.excerpt} />
+      {source.url_path && source.url_path !== '/' && (
+        <PrimaryAction href={source.url_path} label="Open in CRM" />
+      )}
+    </>
+  );
+}
+
+// ---------------- Shared atoms ----------------
+
+function MetaRow({ label, value, href }: { label: string; value: string; href?: string }) {
   return (
     <div>
       <div className="text-[10px] uppercase tracking-wider text-text-muted font-semibold mb-1" style={{ fontFamily: "'Exo 2', sans-serif" }}>
         {label}
       </div>
-      <div
-        className={`text-sm text-text-secondary break-words ${mono ? 'font-mono text-[12px]' : ''}`}
-        style={!mono ? { fontFamily: "'DM Sans', sans-serif" } : undefined}
-      >
-        {value}
-      </div>
+      {href ? (
+        <a
+          href={href}
+          className="text-sm text-purple-300 hover:text-purple-200 underline-offset-2 hover:underline inline-flex items-center gap-1"
+          style={{ fontFamily: "'DM Sans', sans-serif" }}
+        >
+          {value}
+          <ArrowUpRight size={12} />
+        </a>
+      ) : (
+        <div className="text-sm text-text-secondary break-words" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+          {value}
+        </div>
+      )}
     </div>
+  );
+}
+
+function Excerpt({ text, label = 'Excerpt' }: { text?: string; label?: string }) {
+  if (!text) return null;
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-text-muted font-semibold mb-1" style={{ fontFamily: "'Exo 2', sans-serif" }}>
+        {label}
+      </div>
+      <blockquote
+        className="text-sm text-text-secondary leading-relaxed border-l-2 border-purple-500/40 pl-3"
+        style={{ fontFamily: "'DM Sans', sans-serif" }}
+      >
+        {text}
+      </blockquote>
+    </div>
+  );
+}
+
+function PrimaryAction({ href, label, external }: { href?: string; label: string; external?: boolean }) {
+  if (!href || href === '/') return null;
+  const Icon = external ? ExternalLink : ArrowUpRight;
+  return (
+    <a
+      href={href}
+      target={external ? '_blank' : undefined}
+      rel={external ? 'noopener noreferrer' : undefined}
+      className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg bg-purple-500/10 hover:bg-purple-500/15 text-purple-300 transition-colors text-sm mt-2"
+      style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}
+    >
+      <span>{label}</span>
+      <Icon size={14} />
+    </a>
   );
 }

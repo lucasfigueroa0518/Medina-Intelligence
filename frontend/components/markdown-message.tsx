@@ -5,7 +5,7 @@ import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { Check, Copy } from 'lucide-react';
-import { citationsRemarkPlugin, type CitationSource } from '@/lib/citations';
+import { citationsRemarkPlugin, findSourceByHashPrefix, type CitationSource } from '@/lib/citations';
 import { CitationPill } from './citation-pill';
 
 // React-markdown's defaultUrlTransform allowlists http/https/mailto/tel/#fragments
@@ -100,7 +100,22 @@ export function MarkdownMessage({
           ),
           a: ({ href, children }) => {
             if (typeof href === 'string' && href.startsWith('citation:')) {
-              const id = parseInt(href.slice('citation:'.length), 10);
+              const rest = href.slice('citation:'.length);
+              // Off-spec hash form (citation:hash:HEX). Try partial-prefix
+              // match against source_id / entity_id; render pill if matched,
+              // render nothing if not (don't leak the raw hex to the user).
+              if (rest.startsWith('hash:')) {
+                const hash = rest.slice('hash:'.length);
+                const matched = findSourceByHashPrefix(hash, sources || []);
+                if (matched) {
+                  return <CitationPill sourceId={matched.id} source={matched} onClick={onCitationClick} />;
+                }
+                if (typeof console !== 'undefined') {
+                  console.warn('[citations] dropping unmatched hash citation', hash);
+                }
+                return <></>;
+              }
+              const id = parseInt(rest, 10);
               if (!Number.isNaN(id)) {
                 return <CitationPill sourceId={id} source={sourceMap.get(id)} onClick={onCitationClick} />;
               }

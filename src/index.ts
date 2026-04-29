@@ -23,6 +23,7 @@ import * as Approval from './handlers/approval';
 import * as Sync from './handlers/sync';
 import * as AuditLog from './handlers/audit-log';
 import * as Admin from './handlers/admin';
+import * as Cleanup from './handlers/cleanup';
 import * as Imports from './handlers/imports';
 import * as IntelligentImport from './handlers/intelligent-import';
 import * as Campaigns from './handlers/campaigns';
@@ -445,6 +446,9 @@ async function routeAuthenticated(
   if (path === '/api/agent/query' && method === 'POST') {
     return Agent.queryAgent(request, ctx, env, ctxExec);
   }
+  if (path === '/api/agent/cancel' && method === 'POST') {
+    return Agent.cancelAgentRequest(request, ctx, env);
+  }
   if (path === '/api/agent/sessions' && method === 'GET') {
     return Agent.listSessions(ctx, env);
   }
@@ -523,6 +527,18 @@ async function routeAuthenticated(
       return Admin.backfillUnembedded(request, ctx, env);
     if (path === '/api/admin/backfill-attachments' && method === 'POST')
       return Admin.backfillAttachments(request, ctx, env);
+
+    // Wave 3 cleanup endpoints (owner-only enforced inside each handler).
+    // Run order: evidence-preservation → d1-phase2 → dangling-vectors-batch (loop) → dangling-docs-batch (loop).
+    if (path === '/api/admin/cleanup-evidence-preservation' && method === 'POST')
+      return Cleanup.cleanupEvidencePreservation(request, ctx, env);
+    if (path === '/api/admin/cleanup-d1-phase2' && method === 'POST')
+      return Cleanup.cleanupD1Phase2(request, ctx, env);
+    if (path === '/api/admin/cleanup-dangling-vectors-batch' && method === 'POST')
+      return Cleanup.cleanupDanglingVectorsBatch(request, ctx, env);
+    if (path === '/api/admin/cleanup-dangling-docs-batch' && method === 'POST')
+      return Cleanup.cleanupDanglingDocsBatch(request, ctx, env);
+
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')
@@ -634,12 +650,11 @@ async function handleScheduled(
       } else if (cron === '0 0 * * *') {
         // Daily cron — runs inline as a standard Worker
         ctxExec.waitUntil(runDailyCron(org.id, env));
-      } else if (cron === '*/2 * * * *') {
+      } else if (cron === '* * * * *') {
         // Progressive backfill driver — advances each active parent's
-        // current window by one paginated batch. Multiple users (Tony,
-        // Alvaro, ...) advance in parallel because they have different
-        // backfill_progress KV keys. Survives Worker CPU limits since each
-        // tick processes ~25s of work per user, no longer.
+        // current window by one paginated batch. Bumped 2026-04-29 from
+        // */2 to every-minute to cut total Tony backfill time once Alvaro
+        // completed (no more parallel contention to coordinate around).
         ctxExec.waitUntil((async () => {
           const { driveAllActiveProgressive } = await import('./lib/progressive-backfill');
           try { await driveAllActiveProgressive(org.id, env); }

@@ -92,6 +92,9 @@ export async function callClaudeStreaming(
     max_tokens: number;
     tools?: ToolDefinition[];
     onToolCall?: ToolExecutor;
+    // Wave-1 cancellation: when this signal aborts, the streaming fetch is
+    // interrupted and the run loop exits cleanly between iterations.
+    signal?: AbortSignal;
   },
   env: Env
 ): Promise<ReadableStream<Uint8Array>> {
@@ -109,6 +112,13 @@ export async function callClaudeStreaming(
     const maxIterations = 10;
 
     while (iterations < maxIterations) {
+      // Cooperative cancellation between iterations: a Cmd+Backspace / stop
+      // click that lands while the run loop is between fetches (e.g. while
+      // a tool is executing) cleanly exits at this boundary.
+      if (params.signal?.aborted) {
+        console.log('[claude-stream] aborted by signal, exiting run loop');
+        break;
+      }
       iterations++;
       console.log(`[claude-stream] iteration ${iterations}/${maxIterations}, messages: ${messages.length}`);
 
@@ -121,11 +131,23 @@ export async function callClaudeStreaming(
       };
       if (params.tools?.length) body.tools = params.tools;
 
-      const response = await fetch(buildGatewayUrl(env), {
-        method: 'POST',
-        headers: buildGatewayHeaders(env),
-        body: JSON.stringify(body),
-      });
+      let response: Response;
+      try {
+        response = await fetch(buildGatewayUrl(env), {
+          method: 'POST',
+          headers: buildGatewayHeaders(env),
+          body: JSON.stringify(body),
+          // AbortSignal threading: aborts the in-flight fetch + breaks the
+          // SSE reader's next read with an error → caught by the outer try.
+          signal: params.signal,
+        });
+      } catch (fetchErr: any) {
+        if (fetchErr?.name === 'AbortError' || params.signal?.aborted) {
+          console.log('[claude-stream] fetch aborted');
+          break;
+        }
+        throw fetchErr;
+      }
 
       if (!response.ok) {
         const errorBody = await response.text();
@@ -146,9 +168,21 @@ export async function callClaudeStreaming(
       let currentTextBlock = '';
       let inToolUse = false;
 
+      let aborted = false;
       while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch (readErr: any) {
+          // AbortSignal-triggered fetch closure surfaces as a read error.
+          if (readErr?.name === 'AbortError' || params.signal?.aborted) {
+            aborted = true;
+            break;
+          }
+          throw readErr;
+        }
+        if (chunk.done) break;
+        const value = chunk.value;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -216,12 +250,20 @@ export async function callClaudeStreaming(
         assistantContent.push({ type: 'text', text: currentTextBlock });
       }
 
+      // If the SSE reader bailed because of an abort, exit the run loop
+      // before pushing more messages or kicking off another iteration.
+      if (aborted) break;
+
       if (stopReason === 'tool_use' && params.onToolCall) {
         messages.push({ role: 'assistant', content: assistantContent });
 
         const toolResults: any[] = [];
         for (const block of assistantContent) {
           if (block.type !== 'tool_use') continue;
+          // Cooperative abort between tool calls — a cancel mid-tool-batch
+          // skips remaining tools and exits the run loop on the next
+          // iteration check above.
+          if (params.signal?.aborted) break;
 
           await emit({ type: 'tool_call', tool: block.name, input: block.input, status: 'executing' });
 

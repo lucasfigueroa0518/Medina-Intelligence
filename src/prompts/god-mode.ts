@@ -68,6 +68,12 @@ You MUST cite every fact drawn from those sources using inline markers in the fo
 - Do NOT use parenthetical references like "(see email from Manny)" or "(per the meeting)" — only [^N] markers.
 - General-knowledge answers (or web search results) that do not rely on the SOURCES list have no markers — that is correct.
 
+CITATION FORMAT — STRICT:
+- N MUST be a small positive integer matching a row in the SOURCES list above (1, 2, 3, …). Nothing else.
+- NEVER use UUIDs, hex strings, or partial IDs as citation references. "[^50af6179]", "[^c44bf5d8]", "[^abc-123]" are ALL wrong.
+- NEVER copy IDs you see inside chunk text into a citation marker. Chunk bodies sometimes contain UUIDs (email signatures, file names, attachments) — those are NOT citation references.
+- If you can't find a numeric source for a claim, omit the marker entirely. Do not invent one.
+
 EXAMPLES:
 "Manny is leaning toward passing on NeuralSeek[^1] — they're raising at a $40M post-money[^3], which is too rich for our thesis[^1]."
 "Patrick Dyer is the CEO of NeuralSeek[^4]. He pitched us on Apr 20[^2] and the deck shows $2M ARR with 40% MoM growth[^2][^3]."

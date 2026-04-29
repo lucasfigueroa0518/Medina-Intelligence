@@ -1,15 +1,14 @@
 // TRD §5.2 — Webhook endpoints: Firefly + Slack + Outlook Graph
 import type { Env } from '../types/env';
-import type { ClassifiableItem } from '../types/interfaces';
+import type { ClassifiableItem, AttachmentMeta } from '../types/interfaces';
 import { jsonResponse } from './utils';
 import { extractIdempotencyKey } from '../lib/idempotency';
 import { verifyFireflySignature } from '../integrations/firefly';
 import { verifySlackSignature } from '../integrations/slack';
-import { getDecryptedAccessToken, getOrgDomains, stripHtml, getCurrentSyncJobId } from '../lib/helpers';
+import { getDecryptedAccessToken, getOrgDomains, stripHtml } from '../lib/helpers';
 import { refreshOutlookToken } from '../integrations/oauth';
 import { classifyAndDeduplicate } from '../lib/classification';
-import { chunkEmbedAndPersistAll } from '../lib/embedding';
-import { stageAndCommitApprovals } from '../lib/stage-approvals';
+import { processClassifiedItems, persistClassifiedStats } from '../lib/ingestion-shared';
 
 export async function receiveFireflyWebhook(
   request: Request,
@@ -215,9 +214,13 @@ async function processOneNotification(
     return;
   }
 
-  // Mail notification — fetch full message from Graph
+  // Mail notification — fetch full message from Graph. $expand=attachments
+  // is required for the Wave 3 webhook fix: without it, processEmailAttachments
+  // (called inside processClassifiedItems) sees no attachments to download
+  // and the conversation lands as a permanent orphan. Pre-fix the webhook
+  // ingestion path silently dropped every attachment that arrived this way.
   const msgResp = await fetch(
-    `https://graph.microsoft.com/v1.0/me/messages/${messageId}?$select=id,subject,bodyPreview,body,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,conversationId,importance,hasAttachments`,
+    `https://graph.microsoft.com/v1.0/me/messages/${messageId}?$select=id,subject,bodyPreview,body,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,conversationId,importance,hasAttachments&$expand=attachments($select=id,name,size,contentType,isInline)`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
 
@@ -238,6 +241,10 @@ async function processOneNotification(
     receivedDateTime: string;
     conversationId: string;
     importance?: string;
+    hasAttachments?: boolean;
+    attachments?: Array<{
+      id: string; name: string; size: number; contentType: string; isInline?: boolean;
+    }>;
   };
 
   // Classify direction
@@ -258,6 +265,19 @@ async function processOneNotification(
   else if (fromIsInternal) direction = 'outbound';
   else direction = 'inbound';
 
+  // Mirror the same attachment filter outlook.ts:179-184 uses for delta-sync:
+  // drop small inline images (signatures), cap at 5 per message.
+  const attachments: AttachmentMeta[] | undefined =
+    msg.hasAttachments && msg.attachments?.length
+      ? msg.attachments
+          .filter(a => !(a.isInline && a.size < 51200))
+          .slice(0, 5)
+          .map(a => ({
+            id: a.id, name: a.name, size: a.size,
+            contentType: a.contentType, isInline: a.isInline,
+          }))
+      : undefined;
+
   const item: ClassifiableItem = {
     type: 'email',
     source: 'outlook',
@@ -276,22 +296,55 @@ async function processOneNotification(
     userId,
     orgId,
     visibility: 'org_wide',
+    attachments,
   };
 
-  // Run through the standard ingestion pipeline
+  // Classify, then route through processClassifiedItems — the Wave 2
+  // converged helper that does stage → embed → process-attachments →
+  // detect-deals. Pre-Wave-3 the webhook open-coded only embed + stage,
+  // skipping attachments + deal signals (the same divergence Wave 2 closed
+  // for runHistoricalBackfill but didn't reach here).
   const classified = await classifyAndDeduplicate([item], orgId, env);
   if (classified.length === 0) return;
 
-  for (const ci of classified) {
-    try {
-      await chunkEmbedAndPersistAll(ci.text, ci.metadata, env);
-    } catch (e) {
-      console.error(`[graph-webhook] Embedding failed for ${ci.entityId}:`, e);
-    }
+  // Real sync_jobs row so persistClassifiedStats has a target for the
+  // attachments_attempted/processed/failed counters. workflow_type='webhook'
+  // is allowed since migration 0062 relaxed the CHECK enum.
+  const jobId = crypto.randomUUID();
+  const startedAt = new Date().toISOString();
+  await env.D1.prepare(
+    `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, metadata)
+     VALUES (?, ?, 'webhook', 'running', ?, ?)`
+  ).bind(
+    jobId, orgId, startedAt,
+    JSON.stringify({
+      subscription_id: notification.subscriptionId,
+      message_id: messageId,
+      user_id: userId,
+    })
+  ).run().catch(e => {
+    console.error(`[graph-webhook] sync_jobs insert failed for ${jobId}:`, e?.message || e);
+  });
+
+  try {
+    const stats = await processClassifiedItems(classified, { orgId, syncJobId: jobId }, env);
+    await persistClassifiedStats(stats, jobId, env);
+
+    const status = stats.errors.length > 0 ? 'partial' : 'completed';
+    await env.D1.prepare(
+      `UPDATE sync_jobs SET status = ?, completed_at = ? WHERE id = ?`
+    ).bind(status, new Date().toISOString(), jobId).run();
+
+    console.log(
+      `[graph-webhook] msg="${msg.subject}" user=${userId} ` +
+      `embedded=${stats.items_embedded} attachments(att/proc/skip/fail)=` +
+      `${stats.attachments_attempted}/${stats.attachments_processed}/${stats.attachments_skipped}/${stats.attachments_failed} ` +
+      `deals_staged=${stats.deal_signals_staged} errors=${stats.errors.length}`
+    );
+  } catch (e: any) {
+    console.error(`[graph-webhook] processClassifiedItems failed for msg ${messageId}:`, e?.message || e);
+    await env.D1.prepare(
+      `UPDATE sync_jobs SET status = 'failed', completed_at = ?, error_message = ? WHERE id = ?`
+    ).bind(new Date().toISOString(), String(e?.message || e).slice(0, 500), jobId).run().catch(() => undefined);
   }
-
-  const syncJobId = await getCurrentSyncJobId(orgId, 'webhook', env);
-  await stageAndCommitApprovals(classified, orgId, syncJobId, env);
-
-  console.log(`[graph-webhook] Processed message "${msg.subject}" for user ${userId}`);
 }

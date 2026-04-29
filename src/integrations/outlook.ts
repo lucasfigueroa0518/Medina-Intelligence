@@ -415,6 +415,54 @@ export async function runHistoricalBackfill(
     return progress;
   }
 
+  // Wave 3: real sync_jobs row per runHistoricalBackfill invocation. Pre-fix
+  // we passed `backfill-${userId}` as a synthetic syncJobId — persistClassifiedStats's
+  // UPDATE silently no-op'd against the non-existent row, so Wave 2's phase 3
+  // attachment-counter telemetry was invisible for this path. Now we INSERT
+  // a real row before processing and UPDATE on every return.
+  const userRow = await env.D1.prepare(
+    'SELECT email FROM users WHERE id = ? AND org_id = ?'
+  ).bind(userId, orgId).first<{ email: string | null }>();
+  const userEmail = userRow?.email ?? null;
+
+  const syncJobId = crypto.randomUUID();
+  const syncJobStartedAt = new Date().toISOString();
+  await env.D1.prepare(
+    `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, metadata)
+     VALUES (?, ?, 'progressive-backfill-window', 'running', ?, ?)`
+  ).bind(
+    syncJobId, orgId, syncJobStartedAt,
+    JSON.stringify({
+      user_id: userId,
+      user_email: userEmail,
+      window_start: progress.target_start_date,
+      window_end: progress.target_end_date,
+      resume_from_page: progress.last_page_url ? 'yes' : 'no',
+    })
+  ).run().catch(e => {
+    console.error(`[backfill] sync_jobs insert failed for ${syncJobId}:`, (e as any)?.message || e);
+  });
+
+  // Helper: close out the sync_jobs row at any return point. Each invocation
+  // owns one row; if a window pauses+resumes, each call gets its own row and
+  // operators can SUM across them by metadata.user_id + window_start.
+  const closeSyncJob = async (status: 'completed' | 'failed' | 'paused', extra?: Record<string, unknown>) => {
+    try {
+      await env.D1.prepare(
+        `UPDATE sync_jobs
+            SET status = ?, completed_at = ?,
+                metadata = json_patch(COALESCE(metadata, '{}'), ?)
+          WHERE id = ?`
+      ).bind(
+        status, new Date().toISOString(),
+        JSON.stringify({ ended_status: status, ...(extra || {}) }),
+        syncJobId
+      ).run();
+    } catch (e) {
+      console.error(`[backfill] sync_jobs close failed for ${syncJobId}:`, (e as any)?.message || e);
+    }
+  };
+
   let url = progress.last_page_url;
   if (!url) {
     const startFilter = `$filter=receivedDateTime ge ${progress.target_start_date} and receivedDateTime lt ${progress.target_end_date}`;
@@ -423,9 +471,12 @@ export async function runHistoricalBackfill(
 
   const internalDomains = await getOrgDomains(orgId, env);
   let pagesThisBatch = 0;
-  const MAX_PAGES_PER_CALL = 10;
+  // Bumped 2026-04-29: scheduled handler 15-min wallclock ceiling on paid
+  // plan and runHistoricalBackfill is mostly network-bound, so larger
+  // per-tick budgets cut total backfill duration without breaking limits.
+  const MAX_PAGES_PER_CALL = 25;
   const startTime = Date.now();
-  const MAX_RUNTIME_MS = 25_000; // leave headroom before Worker 30s limit
+  const MAX_RUNTIME_MS = 45_000;
 
   while (url) {
     if (pagesThisBatch >= MAX_PAGES_PER_CALL || Date.now() - startTime > MAX_RUNTIME_MS) {
@@ -438,6 +489,7 @@ export async function runHistoricalBackfill(
       progress.last_page_url = url;
       progress.updated_at = new Date().toISOString();
       await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
+      await closeSyncJob('paused', { reason: 'page_batch_cap', pages_processed: pagesThisBatch });
       return progress;
     }
 
@@ -447,6 +499,7 @@ export async function runHistoricalBackfill(
       progress.error = 'Graph API rate limit — will resume next call';
       progress.updated_at = new Date().toISOString();
       await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
+      await closeSyncJob('paused', { reason: 'graph_rate_limit', pages_processed: pagesThisBatch });
       return progress;
     }
 
@@ -463,6 +516,7 @@ export async function runHistoricalBackfill(
       progress.last_page_url = url;
       progress.updated_at = new Date().toISOString();
       await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
+      await closeSyncJob('failed', { reason: 'graph_error', http_status: resp.status, pages_processed: pagesThisBatch });
       return progress;
     }
 
@@ -494,21 +548,49 @@ export async function runHistoricalBackfill(
     }
 
     if (classified.length > 0) {
-      const { processClassifiedItems } = await import('../lib/ingestion-shared');
-      const stats = await processClassifiedItems(
-        classified,
-        { orgId, syncJobId: `backfill-${userId}` },
-        env
-      );
-      console.log(
-        `[backfill] page=${pagesThisBatch} ` +
-        `staged=${stats.items_staged}/${stats.items_total} ` +
-        `embedded=${stats.items_embedded} embed_fail=${stats.embed_failures} ` +
-        `attachments(att/proc/skip/fail)=${stats.attachments_attempted}/${stats.attachments_processed}/${stats.attachments_skipped}/${stats.attachments_failed} ` +
-        `deals_staged=${stats.deal_signals_staged} errors=${stats.errors.length}`
-      );
-      if (stats.errors.length > 0) {
-        console.warn(`[backfill] page=${pagesThisBatch} errors:`, stats.errors.slice(0, 5));
+      const { processClassifiedItems, persistClassifiedStats } = await import('../lib/ingestion-shared');
+      // Wrap in try/catch so an uncaught throw inside the helper (e.g. a
+      // KV 429 cascading out of chunkEmbedAndPersistAll past its inner
+      // catches, or an `await import` that fails between phases) doesn't
+      // leave the sync_jobs row stuck in 'running' indefinitely. Without
+      // this, diagnostic 2026-04-29 found dozens of progressive-backfill
+      // rows dangling in 'running' for 30+ minutes after their owning
+      // function had thrown — closeSyncJob is only called from clean
+      // return points, never a catch.
+      try {
+        const stats = await processClassifiedItems(
+          classified,
+          { orgId, syncJobId },
+          env
+        );
+        // Accumulate this page's counters into the sync_jobs metadata. Each
+        // page does its own UPDATE — partial progress is recorded even if
+        // a later page hits the rate-limit / page-cap return paths.
+        await persistClassifiedStats(stats, syncJobId, env);
+        console.log(
+          `[backfill] page=${pagesThisBatch} ` +
+          `staged=${stats.items_staged}/${stats.items_total} ` +
+          `embedded=${stats.items_embedded} embed_fail=${stats.embed_failures} ` +
+          `attachments(att/proc/skip/fail)=${stats.attachments_attempted}/${stats.attachments_processed}/${stats.attachments_skipped}/${stats.attachments_failed} ` +
+          `deals_staged=${stats.deal_signals_staged} errors=${stats.errors.length}`
+        );
+        if (stats.errors.length > 0) {
+          console.warn(`[backfill] page=${pagesThisBatch} errors:`, stats.errors.slice(0, 5));
+        }
+      } catch (e: any) {
+        const msg = String(e?.message || e).slice(0, 500);
+        console.error(`[backfill] processClassifiedItems threw on page ${pagesThisBatch}: ${msg}`);
+        progress.status = 'failed';
+        progress.error = `processClassifiedItems threw: ${msg}`;
+        progress.last_page_url = url;
+        progress.updated_at = new Date().toISOString();
+        await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
+        await closeSyncJob('failed', {
+          reason: 'process_classified_items_threw',
+          error: msg,
+          pages_processed: pagesThisBatch,
+        });
+        return progress;
       }
     }
 
@@ -559,6 +641,7 @@ export async function runHistoricalBackfill(
     console.error('[backfill] gap enqueue failed:', e);
   }
 
+  await closeSyncJob('completed', { pages_processed: pagesThisBatch });
   return progress;
 }
 
