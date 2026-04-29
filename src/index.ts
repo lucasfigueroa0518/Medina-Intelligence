@@ -541,6 +541,10 @@ async function routeAuthenticated(
       return Admin.repairVectorizeParticipantIds(request, ctx, env);
     if (path === '/api/admin/repair-acl-metadata' && method === 'POST')
       return Admin.repairBackfilledAclMetadata(request, ctx, env);
+    if (path === '/api/admin/cleanup-transcript-acl' && method === 'POST') {
+      const { handleCleanupTranscriptAcl } = await import('./handlers/cleanup-transcript-acl');
+      return handleCleanupTranscriptAcl(ctx, env);
+    }
     if (path === '/api/admin/recompute-primary-entity-ids' && method === 'POST')
       return Admin.recomputePrimaryEntityIds(request, ctx, env);
     if (path === '/api/admin/reembed-transcripts' && method === 'POST')
