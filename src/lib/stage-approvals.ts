@@ -65,20 +65,41 @@ export async function stageAndCommitApprovals(
       // overlap, or classifyAndDeduplicate's dedup SELECT racing with the
       // stage INSERT) already inserted the same email under a DIFFERENT
       // generated UUID. In that case item.entityId is a "phantom" id that
-      // never reached the table; using it for downstream FK references
-      // (conversation_contacts.conversation_id) was the root cause of the
-      // 71k dangling vector_entity_index rows surfaced 2026-04-29.
-      // Always read back the actual id and use it from here on.
+      // never reached the table; using it for ANY downstream reference
+      // (FK-enforced or polymorphic) leaves rows pointing at a conversation
+      // that doesn't exist.
+      //
+      // The original 6e1bca6 fix scoped this resolution narrowly to
+      // FK-enforced conversation_contacts. That missed polymorphic columns
+      // baked into item.metadata before stage runs:
+      //   - vector_entity_index.entity_id  (via item.metadata.source_id)
+      //   - documents.conversation_id      (via item.entityId in attachments)
+      //   - approval_queue.entity_id       (via item.entityId in deal-detect)
+      //   - relationship_pairs evidence    (via item.entityId in autoLink)
+      // A targeted backfill 2026-04-29 introduced 940 new dangling vectors +
+      // 1 new dangling doc this way.
+      //
+      // INVARIANT (post-mutation): after this block, item.entityId AND
+      // item.metadata.source_id (+ primary_entity_id when it falls back to
+      // entityId) are canonical. Every downstream phase — Phase 2 embed,
+      // Phase 3 attachments, Phase 4 deals, plus the in-stage autoLink /
+      // signature / display-name calls below — will use the canonical id
+      // automatically. Do NOT reintroduce code paths that capture
+      // item.entityId before this point.
       const resolved = item.externalId
         ? await env.D1.prepare(
             `SELECT id FROM conversations WHERE external_message_id = ? AND org_id = ?`
           ).bind(item.externalId, orgId).first<{ id: string }>()
         : null;
-      const actualConvId = resolved?.id ?? item.entityId;
-      if (actualConvId !== item.entityId) {
+      if (resolved?.id && resolved.id !== item.entityId) {
         console.log(
-          `[stage] resolved canonical conv id: local=${item.entityId} canonical=${actualConvId} ext=${item.externalId}`
+          `[stage] canonical-id divergence: local=${item.entityId} canonical=${resolved.id} ext=${item.externalId}`
         );
+        if (item.metadata.primary_entity_id === item.entityId) {
+          item.metadata.primary_entity_id = resolved.id;
+        }
+        item.metadata.source_id = resolved.id;
+        item.entityId = resolved.id;
       }
 
       // Junction rows for conversation_contacts. Only bump total_interactions
@@ -88,7 +109,7 @@ export async function stageAndCommitApprovals(
         const result = await env.D1.prepare(
           `INSERT OR IGNORE INTO conversation_contacts (conversation_id, contact_id, role)
            VALUES (?, ?, 'participant')`
-        ).bind(actualConvId, cid).run();
+        ).bind(item.entityId, cid).run();
         if (result.meta?.changes) newlyLinked.push(cid);
       }
 
