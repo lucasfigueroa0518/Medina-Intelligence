@@ -6,6 +6,7 @@ import Link from 'next/link';
 import {
   Info, Users, Briefcase, Target, MapPin, Globe, Mail,
   ChevronDown, ChevronUp, ExternalLink, RefreshCw, Link2,
+  Upload, FileText, Paperclip, Trash2,
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { TagPicker } from '@/components/tag-picker';
@@ -77,6 +78,13 @@ export default function CompanyDetailPage() {
   const [saving, setSaving] = React.useState(false);
   const [bioExpanded, setBioExpanded] = React.useState(false);
 
+  // Documents block — same pattern as contacts/[id]/page.tsx Documents tab
+  const [documents, setDocuments] = React.useState<any[]>([]);
+  const [docsLoading, setDocsLoading] = React.useState(false);
+  const [uploading, setUploading] = React.useState(false);
+  const [uploadVisibility, setUploadVisibility] = React.useState<'private' | 'org_wide'>('private');
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
+
   React.useEffect(() => {
     setLoading(true);
     Promise.all([
@@ -93,6 +101,33 @@ export default function CompanyDetailPage() {
       })
       .finally(() => setLoading(false));
   }, [id, refreshKey]);
+
+  React.useEffect(() => {
+    setDocsLoading(true);
+    api.listDocuments({ company_id: id }).then(r => setDocuments(r.documents || []))
+      .catch(() => setDocuments([]))
+      .finally(() => setDocsLoading(false));
+  }, [id, refreshKey]);
+
+  async function handleDocUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const res = await api.uploadDocument(file, { company_id: id, visibility: uploadVisibility });
+      setToast(res.duplicate ? 'Duplicate document — already exists' : 'Document uploaded');
+      setRefreshKey(k => k + 1);
+    } catch (err: any) { setToast(`Upload failed: ${err.message}`); }
+    finally { setUploading(false); if (fileInputRef.current) fileInputRef.current.value = ''; }
+  }
+
+  async function handleDocDelete(docId: string) {
+    try {
+      await api.deleteDocument(docId);
+      setDocuments(prev => prev.filter(d => d.id !== docId));
+      setToast('Document deleted');
+    } catch { setToast('Delete failed'); }
+  }
 
   React.useEffect(() => {
     if (!toast) return;
@@ -551,6 +586,109 @@ export default function CompanyDetailPage() {
           </div>
         )}
 
+        {/* Documents */}
+        <div className="card">
+          <div className="flex items-center justify-between mb-4">
+            <div className="text-xs uppercase text-text-muted flex items-center gap-2">
+              Documents
+              {documents.length > 0 && (
+                <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold tabular-nums"
+                  style={{ background: 'rgba(217,70,168,0.12)', color: '#D946A8' }}>
+                  {documents.length}
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                value={uploadVisibility}
+                onChange={e => setUploadVisibility(e.target.value as 'private' | 'org_wide')}
+                disabled={uploading}
+                className="bg-bg-inset border border-border text-text-secondary text-xs px-2.5 py-1.5 rounded-lg disabled:opacity-50"
+                title="Who can read this document"
+              >
+                <option value="private">Private — only you</option>
+                <option value="org_wide">Org-wide — everyone in your team</option>
+              </select>
+              <label className={`btn-secondary flex items-center gap-2 cursor-pointer ${uploading ? 'opacity-50 pointer-events-none' : ''}`}>
+                <Upload size={14} />
+                {uploading ? 'Uploading...' : 'Upload'}
+                <input ref={fileInputRef} type="file" className="hidden" onChange={handleDocUpload} disabled={uploading} />
+              </label>
+            </div>
+          </div>
+          {docsLoading ? (
+            <div className="space-y-3">
+              {Array.from({ length: 2 }).map((_, i) => (
+                <div key={i} className="h-16 bg-bg-surface animate-pulse rounded-xl" />
+              ))}
+            </div>
+          ) : documents.length === 0 ? (
+            <div className="text-center py-10">
+              <FileText size={28} className="mx-auto text-text-muted/30 mb-3" />
+              <div className="text-text-muted text-sm">No documents linked to this company yet</div>
+              <div className="text-text-muted/60 text-xs mt-1">Upload a document or it will appear here when MARTy or the system links one</div>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {documents.map((doc: any) => (
+                <div key={doc.id} className="flex items-center gap-4 rounded-xl p-4 transition-all hover:bg-white/[0.03]"
+                  style={{ background: 'rgba(17,17,20,0.5)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                  <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
+                    style={{ background: doc.source === 'email_attachment' ? 'rgba(59,130,246,0.12)' : 'rgba(139,92,246,0.12)' }}>
+                    {doc.source === 'email_attachment'
+                      ? <Paperclip size={16} className="text-blue-400" />
+                      : <FileText size={16} className="text-purple-400" />}
+                  </div>
+                  <Link href={`/documents/${doc.id}`} className="flex-1 min-w-0 group">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-text-primary truncate group-hover:text-accent-magenta transition-colors">
+                        {doc.title || doc.file_name}
+                      </span>
+                      {doc.version_number > 1 && (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
+                          style={{ background: 'rgba(245,158,11,0.12)', color: '#FBBF24' }}>
+                          v{doc.version_number}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+                        style={{ background: 'rgba(255,255,255,0.05)', color: '#A1A1AA' }}>
+                        {(doc.document_type || 'other').replace(/_/g, ' ')}
+                      </span>
+                      <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+                        style={{
+                          background: doc.source === 'email_attachment' ? 'rgba(59,130,246,0.08)' : 'rgba(139,92,246,0.08)',
+                          color: doc.source === 'email_attachment' ? '#93C5FD' : '#C084FC',
+                        }}>
+                        {doc.source === 'email_attachment' ? 'email' : doc.source}
+                      </span>
+                      {doc.file_size && (
+                        <span className="text-[10px] text-text-muted">{fmtSize(doc.file_size)}</span>
+                      )}
+                      <span className="text-[10px] text-text-muted">{fmtRel(doc.created_at)}</span>
+                      {doc.processing_status && doc.processing_status !== 'completed' && (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
+                          style={{
+                            background: doc.processing_status === 'failed' ? 'rgba(239,68,68,0.12)' : 'rgba(245,158,11,0.12)',
+                            color: doc.processing_status === 'failed' ? '#F87171' : '#FBBF24',
+                          }}>
+                          {doc.processing_status}
+                        </span>
+                      )}
+                    </div>
+                  </Link>
+                  <button onClick={() => handleDocDelete(doc.id)}
+                    className="p-2 rounded-lg text-text-muted hover:text-semantic-error hover:bg-semantic-error/10 transition-colors shrink-0"
+                    title="Delete document">
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         {companyAssociations.length > 0 && (
           <div className="card">
             <div className="text-xs uppercase text-text-muted mb-3">Associations</div>
@@ -644,4 +782,10 @@ function fmtRel(iso: string): string {
   if (ms < 7 * d) return `${Math.floor(ms / d)}d ago`;
   if (ms < 30 * d) return `${Math.floor(ms / (7 * d))}w ago`;
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
