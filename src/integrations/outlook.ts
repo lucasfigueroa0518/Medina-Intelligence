@@ -344,7 +344,7 @@ export async function runHistoricalBackfill(
   orgId: string,
   daysBack: number,
   env: Env,
-  opts?: { start_date?: string; end_date?: string }
+  opts?: { start_date?: string; end_date?: string; progressive_window_id?: string }
 ): Promise<BackfillProgress> {
   const progressKey = `backfill_progress:${userId}`;
   const existing = await env.KV.get<BackfillProgress>(progressKey, 'json');
@@ -438,6 +438,7 @@ export async function runHistoricalBackfill(
       window_start: progress.target_start_date,
       window_end: progress.target_end_date,
       resume_from_page: progress.last_page_url ? 'yes' : 'no',
+      progressive_window_id: opts?.progressive_window_id ?? null,
     })
   ).run().catch(e => {
     console.error(`[backfill] sync_jobs insert failed for ${syncJobId}:`, (e as any)?.message || e);
@@ -446,6 +447,13 @@ export async function runHistoricalBackfill(
   // Helper: close out the sync_jobs row at any return point. Each invocation
   // owns one row; if a window pauses+resumes, each call gets its own row and
   // operators can SUM across them by metadata.user_id + window_start.
+  //
+  // When status='completed' AND opts.progressive_window_id is set, ALSO stamp
+  // the matching progressive_backfill_windows row with attachment counters
+  // SUMMED across every sync_jobs row that shares this progressive_window_id
+  // (so multi-tick windows accumulate cleanly). Migration 0063 added the four
+  // attachment columns; UI reads them directly off the windows table.
+  const pwid = opts?.progressive_window_id ?? null;
   const closeSyncJob = async (status: 'completed' | 'failed' | 'paused', extra?: Record<string, unknown>) => {
     try {
       await env.D1.prepare(
@@ -458,6 +466,46 @@ export async function runHistoricalBackfill(
         JSON.stringify({ ended_status: status, ...(extra || {}) }),
         syncJobId
       ).run();
+
+      if (status === 'completed' && pwid) {
+        // Aggregate attachment metadata across every sync_jobs row tied to
+        // this progressive window (one per cron tick that touched the
+        // window). The column rename below maps the per-page metadata
+        // vocabulary onto the progressive_backfill_windows column names:
+        //   metadata.attachments_attempted → windows.attachments_processed
+        //   metadata.attachments_processed → windows.attachments_persisted
+        //   metadata.attachments_failed    → windows.attachments_failed
+        //   metadata.attachments_skipped   → windows.attachments_skipped
+        // See migration 0063 for the rationale on the rename.
+        await env.D1.prepare(
+          `UPDATE progressive_backfill_windows
+              SET attachments_processed = COALESCE((
+                    SELECT SUM(CAST(json_extract(metadata, '$.attachments_attempted') AS INTEGER))
+                      FROM sync_jobs
+                     WHERE workflow_type = 'progressive-backfill-window'
+                       AND json_extract(metadata, '$.progressive_window_id') = ?
+                  ), 0),
+                  attachments_persisted = COALESCE((
+                    SELECT SUM(CAST(json_extract(metadata, '$.attachments_processed') AS INTEGER))
+                      FROM sync_jobs
+                     WHERE workflow_type = 'progressive-backfill-window'
+                       AND json_extract(metadata, '$.progressive_window_id') = ?
+                  ), 0),
+                  attachments_failed = COALESCE((
+                    SELECT SUM(CAST(json_extract(metadata, '$.attachments_failed') AS INTEGER))
+                      FROM sync_jobs
+                     WHERE workflow_type = 'progressive-backfill-window'
+                       AND json_extract(metadata, '$.progressive_window_id') = ?
+                  ), 0),
+                  attachments_skipped = COALESCE((
+                    SELECT SUM(CAST(json_extract(metadata, '$.attachments_skipped') AS INTEGER))
+                      FROM sync_jobs
+                     WHERE workflow_type = 'progressive-backfill-window'
+                       AND json_extract(metadata, '$.progressive_window_id') = ?
+                  ), 0)
+            WHERE id = ?`
+        ).bind(pwid, pwid, pwid, pwid, pwid).run();
+      }
     } catch (e) {
       console.error(`[backfill] sync_jobs close failed for ${syncJobId}:`, (e as any)?.message || e);
     }

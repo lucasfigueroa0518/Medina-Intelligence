@@ -34,6 +34,7 @@ import * as AuthOAuth from './handlers/auth-oauth';
 import * as Users from './handlers/users';
 import * as Integrations from './handlers/integrations';
 import * as SystemStatusHandler from './handlers/system-status';
+import * as Backfill from './handlers/backfill';
 
 import { handleAuditBatch } from './workers/audit-consumer';
 import { handleWebhookBatch } from './workers/webhook-consumer';
@@ -498,6 +499,22 @@ async function routeAuthenticated(
   // Custom date-range ingestion trigger — any authenticated user
   if (path === '/api/admin/trigger-ingestion' && method === 'POST') {
     return Admin.triggerIngestion(request, ctx, env);
+  }
+
+  // --- User-facing progressive backfill (any authenticated user can hit
+  // these; authorization is enforced inside the handlers — members → self
+  // only, owners → any user in their org).
+  if (path === '/api/backfill/start' && method === 'POST') {
+    return Backfill.startBackfill(request, ctx, env);
+  }
+  if (path === '/api/backfill/progress' && method === 'GET') {
+    return Backfill.getBackfillProgress(request, ctx, env);
+  }
+  if (path === '/api/backfill/cancel' && method === 'POST') {
+    return Backfill.cancelBackfill(request, ctx, env);
+  }
+  if (path === '/api/backfill/eligible-users' && method === 'GET') {
+    return Backfill.listEligibleUsers(ctx, env);
   }
 
   // --- Admin (owner/admin only) ---

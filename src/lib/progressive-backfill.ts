@@ -97,6 +97,125 @@ export async function createProgressiveBackfill(
 }
 
 /**
+ * Sibling of createProgressiveBackfill for custom date-range mode. Same
+ * backward windowing semantics — window 0 is the most recent slice
+ * (endDate - windowSizeDays → endDate), window N-1 is the oldest. The
+ * only difference is the user provides explicit start/end anchors instead
+ * of "totalDays back from now".
+ *
+ * Reuses the same per-user "one active parent" guard as createProgressiveBackfill.
+ */
+export async function createProgressiveBackfillRange(
+  orgId: string,
+  userId: string,
+  startDate: string,
+  endDate: string,
+  windowSizeDays: number,
+  env: Env
+): Promise<{ created: boolean; parent_id?: string; total_windows?: number; reason?: string }> {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    return { created: false, reason: 'invalid start_date / end_date' };
+  }
+  if (end <= start) {
+    return { created: false, reason: 'end_date must be > start_date' };
+  }
+  if (windowSizeDays <= 0) {
+    return { created: false, reason: 'invalid windowSizeDays' };
+  }
+  const totalMs = end.getTime() - start.getTime();
+  const totalDays = Math.ceil(totalMs / 86400000);
+  if (totalDays > 730) {
+    return { created: false, reason: 'date range exceeds 730 days' };
+  }
+  const totalWindows = Math.ceil(totalDays / windowSizeDays);
+
+  const existing = await env.D1.prepare(
+    `SELECT id FROM progressive_backfill_jobs
+       WHERE org_id = ? AND user_id = ? AND status = 'active' LIMIT 1`
+  ).bind(orgId, userId).first<{ id: string }>();
+  if (existing) {
+    return { created: false, reason: `User already has active parent ${existing.id}` };
+  }
+
+  const insertedParent = await env.D1.prepare(
+    `INSERT INTO progressive_backfill_jobs (org_id, user_id, window_size_days, total_windows, status)
+     VALUES (?, ?, ?, ?, 'active')
+     RETURNING id`
+  ).bind(orgId, userId, windowSizeDays, totalWindows).first<{ id: string }>();
+  if (!insertedParent) {
+    return { created: false, reason: 'parent insert failed' };
+  }
+  const parentId = insertedParent.id;
+
+  // Anchor windows backward from endDate. Window 0 = endDate - windowSizeDays
+  // → endDate; window N-1 = startDate (clamped) → startDate + windowSizeDays.
+  // Last window's start is clamped to startDate so we never fetch outside the
+  // requested range.
+  const stmts = [];
+  const endMs = end.getTime();
+  const startMs = start.getTime();
+  for (let i = 0; i < totalWindows; i++) {
+    const winEndMs = endMs - i * windowSizeDays * 86400000;
+    const winStartMs = Math.max(startMs, endMs - (i + 1) * windowSizeDays * 86400000);
+    stmts.push(
+      env.D1.prepare(
+        `INSERT INTO progressive_backfill_windows (parent_id, window_index, start_date, end_date, status)
+         VALUES (?, ?, ?, ?, 'pending')`
+      ).bind(parentId, i, new Date(winStartMs).toISOString(), new Date(winEndMs).toISOString())
+    );
+  }
+  await env.D1.batch(stmts);
+
+  return { created: true, parent_id: parentId, total_windows: totalWindows };
+}
+
+/**
+ * Cancel an active backfill. Marks parent='cancelled' (CHECK allows it on the
+ * parent table) and any in-progress/pending windows as 'failed' with a
+ * cancellation note (CHECK on the windows table doesn't allow 'cancelled'
+ * — same constraint we ran into when manually stopping Tony's job).
+ *
+ * Returns 'not_found' if no active job, 'cancelled' otherwise.
+ */
+export async function cancelProgressiveBackfill(
+  orgId: string,
+  userId: string,
+  env: Env,
+  reason: string = 'cancelled by user'
+): Promise<{ ok: boolean; result: 'cancelled' | 'not_found' }> {
+  const parent = await env.D1.prepare(
+    `SELECT id FROM progressive_backfill_jobs
+       WHERE org_id = ? AND user_id = ? AND status = 'active' LIMIT 1`
+  ).bind(orgId, userId).first<{ id: string }>();
+  if (!parent) return { ok: true, result: 'not_found' };
+
+  await env.D1.prepare(
+    `UPDATE progressive_backfill_jobs
+        SET status = 'cancelled',
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(parent.id).run();
+
+  await env.D1.prepare(
+    `UPDATE progressive_backfill_windows
+        SET status = 'failed',
+            last_error = ?,
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE parent_id = ? AND status IN ('pending','in_progress')`
+  ).bind(reason, parent.id).run();
+
+  // Clear KV resume marker so any in-flight cron tick won't rehydrate the
+  // backfill_progress on next call. (Defensive — the cron driver also
+  // checks parent.status='active' before doing work.)
+  await env.KV.delete(`backfill_progress:${userId}`);
+
+  return { ok: true, result: 'cancelled' };
+}
+
+/**
  * One cron tick of work for one user: advance their currently-active
  * window by a single paginated batch. Idempotent — safe to call repeatedly.
  *
@@ -159,6 +278,7 @@ export async function driveProgressiveBackfill(
     result = await runHistoricalBackfill(userId, orgId, 10, env, {
       start_date: win.start_date,
       end_date: win.end_date,
+      progressive_window_id: win.id,
     });
   } catch (e: any) {
     const msg = String(e?.message || e).slice(0, 500);
