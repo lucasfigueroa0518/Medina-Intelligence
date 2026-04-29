@@ -4,6 +4,7 @@ import React from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { Download, FileText, AlertCircle, Loader2, ExternalLink } from 'lucide-react';
+import { FilePreview, kindFromMime } from '@/components/file-preview';
 
 const API_BASE = `${process.env.NEXT_PUBLIC_API_URL ?? ''}/api`;
 
@@ -40,6 +41,13 @@ export default function DocumentDetailPage() {
   const [error, setError] = React.useState<string | null>(null);
   const [downloading, setDownloading] = React.useState(false);
 
+  // Inline preview state. For PDFs and images we fetch the file as a blob
+  // (bearer auth required) and render via an object URL — iframe/img can't
+  // carry an Authorization header. Object URLs are revoked on cleanup.
+  const [previewBlobUrl, setPreviewBlobUrl] = React.useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = React.useState(false);
+  const [previewError, setPreviewError] = React.useState<string | null>(null);
+
   React.useEffect(() => {
     if (!id) return;
     let alive = true;
@@ -69,6 +77,45 @@ export default function DocumentDetailPage() {
       });
     return () => { alive = false; };
   }, [id]);
+
+  // Fetch the file as a blob and turn it into an object URL for inline
+  // preview. Only triggers for PDFs and images — text bodies are rendered
+  // from extracted_text_preview without a separate fetch.
+  React.useEffect(() => {
+    if (!doc) return;
+    const kind = kindFromMime(doc.mime_type);
+    if (kind !== 'pdf' && kind !== 'image') {
+      setPreviewBlobUrl(null);
+      return;
+    }
+    let alive = true;
+    let createdUrl: string | null = null;
+    setPreviewLoading(true);
+    setPreviewError(null);
+    fetch(`${API_BASE}/documents/${doc.id}/download`, { headers: authHeader() })
+      .then(async r => {
+        if (!alive) return;
+        if (!r.ok) {
+          setPreviewError(`Failed to load preview (${r.status}).`);
+          setPreviewLoading(false);
+          return;
+        }
+        const blob = await r.blob();
+        if (!alive) return;
+        createdUrl = URL.createObjectURL(blob);
+        setPreviewBlobUrl(createdUrl);
+        setPreviewLoading(false);
+      })
+      .catch((e: any) => {
+        if (!alive) return;
+        setPreviewError(e?.message || 'Failed to load preview');
+        setPreviewLoading(false);
+      });
+    return () => {
+      alive = false;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+  }, [doc]);
 
   // Download must pass the bearer token, so an <a href> won't work — fetch
   // the file as a blob, build an object URL, and click it programmatically.
@@ -159,6 +206,24 @@ export default function DocumentDetailPage() {
           Processing status: <span className="text-text-secondary">{doc.processing_status}</span>
         </div>
       )}
+
+      {(() => {
+        const kind = kindFromMime(doc.mime_type);
+        if (kind === 'pdf' || kind === 'image') {
+          return (
+            <section className="mb-6 bg-white/[0.03] border border-border rounded-lg overflow-hidden" style={{ height: 'min(70vh, 800px)' }}>
+              <FilePreview
+                kind={kind}
+                src={previewBlobUrl || undefined}
+                fileName={doc.file_name || doc.title || undefined}
+                loading={previewLoading}
+                error={previewError}
+              />
+            </section>
+          );
+        }
+        return null;
+      })()}
 
       {doc.extracted_text_preview && (
         <section className="mb-6 bg-white/[0.03] border border-border rounded-lg p-5">
