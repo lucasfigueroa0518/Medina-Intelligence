@@ -5,14 +5,13 @@
 // team member can backfill their own meeting history.
 
 import type { Env } from '../types/env';
-import type { AuthContext, ChunkMetadata, SpeakerTurn } from '../types/interfaces';
+import type { AuthContext, SpeakerTurn } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
-import { chunkTranscriptBySpeakerTurns, determineOverlapTurns } from '../lib/chunking';
-import { chunkEmbedAndPersist } from '../lib/embedding';
-import { reconcileFireflyWithoutId } from '../lib/reconciliation';
 import { emitAudit } from '../lib/audit';
-import { autoCreateContactFromAttendee, extractAndRouteSignals } from '../lib/firefly-intelligence';
-import { autoLinkAttendees } from '../lib/associations';
+import {
+  processTranscriptItems,
+  type TranscriptItem,
+} from '../lib/process-transcript-items';
 
 const FIREFLY_GRAPHQL = 'https://api.fireflies.ai/graphql';
 const PAGE_SIZE = 50;
@@ -211,7 +210,12 @@ async function fetchTranscriptBatch(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Per-transcript ingest — mirrors processFireflyWebhook in firefly.ts
+// Per-transcript ingest — delegates the safety envelope (Phase 1 bail,
+// per-attendee ACL, sync_jobs lifecycle, errors_sample) to processTranscriptItems.
+// Backfill keeps the duplicate pre-check as an early-return optimization to
+// avoid re-doing work for already-ingested transcripts. The race-safe canonical
+// id read-back that this function used to own (post-INSERT verify) is now
+// inside the helper's Phase 1 — removed here.
 // ────────────────────────────────────────────────────────────────────────────
 
 type IngestOutcome = 'ingested' | 'duplicate';
@@ -228,7 +232,10 @@ async function ingestTranscript(
     : null;
   const title = t.title?.trim() || '(untitled meeting)';
 
-  // ── Duplicate check: firefly_event_id (UNIQUE), then fuzzy title+start ──
+  // ── Duplicate pre-check: firefly_event_id (UNIQUE), then fuzzy title+start.
+  // Optimization for the common case — avoids the helper's INSERT+read-back
+  // round-trip when we know the transcript is already ingested. The helper's
+  // Phase 1 read-back still backs us up if we lose a race after this check.
   const existingById = await env.D1.prepare(
     `SELECT id FROM events WHERE org_id = ? AND firefly_event_id = ? AND deleted_at IS NULL LIMIT 1`
   ).bind(orgId, t.id).first<{ id: string }>();
@@ -245,154 +252,80 @@ async function ingestTranscript(
     if (fuzzy) return 'duplicate';
   }
 
-  // ── Build transcript text from sentences ──
+  // ── Build transcript text + speaker turns from sentences ──
   const sentences = t.sentences || [];
   const transcriptText = sentences
     .map(s => `${s.speaker_name}: ${s.text}`)
     .join('\n');
+  const speakerTurns: SpeakerTurn[] = sentences.map(s => ({
+    speaker: s.speaker_name,
+    affiliation: lookupAffiliation(s.speaker_name, t.meeting_attendees || []),
+    text: s.text,
+  }));
 
-  const eventId = crypto.randomUUID();
+  // Caller-side R2 PUT — helper takes the already-staged key. Path scheme
+  // matches legacy backfill (`{org}/transcripts/{YYYY}/{MM}/{id}.txt`); R2
+  // path standardization across webhook + backfill is deferred to Phase G.
+  const transientId = crypto.randomUUID();
   const startDate = startTime ? new Date(startTime) : new Date();
   const yyyy = startDate.getUTCFullYear();
   const mm = String(startDate.getUTCMonth() + 1).padStart(2, '0');
-  const r2Key = `${orgId}/transcripts/${yyyy}/${mm}/${eventId}.txt`;
+  const r2Key = `${orgId}/transcripts/${yyyy}/${mm}/${transientId}.txt`;
 
   if (transcriptText.length > 0) {
     await env.R2.put(r2Key, transcriptText);
   }
 
+  // Normalize summary fields for the helper. Firefly's GraphQL returns
+  // action_items as a single string blob; we wrap into a one-element array
+  // so it round-trips through the helper's JSON.stringify cleanly.
   const summaryOverview = t.summary?.overview?.trim() || null;
-  const actionItems = t.summary?.action_items?.trim() || null;
-  const keywords = t.summary?.keywords;
-  const topicsJson = JSON.stringify(Array.isArray(keywords) ? keywords : []);
-  const actionItemsJson = JSON.stringify(actionItems ? [actionItems] : []);
+  const actionItemsRaw = t.summary?.action_items?.trim();
+  const actionItems = actionItemsRaw ? [actionItemsRaw] : [];
+  const topics = Array.isArray(t.summary?.keywords) ? t.summary!.keywords! : [];
 
-  const now = new Date().toISOString();
-  await env.D1.prepare(
-    `INSERT OR IGNORE INTO events
-       (id, org_id, title, event_type, start_time, end_time, source, firefly_event_id,
-        reconciliation_status, transcript_r2_key, transcript_source, summary,
-        action_items, topics_discussed, created_at, updated_at)
-     VALUES (?, ?, ?, 'meeting', ?, ?, 'firefly', ?, 'pending_reconciliation', ?,
-             'firefly', ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      eventId,
-      orgId,
-      title,
-      startTime || now,
-      endTime,
-      t.id,
-      transcriptText.length > 0 ? r2Key : null,
-      summaryOverview,
-      actionItemsJson,
-      topicsJson,
-      now,
-      now
-    )
-    .run();
+  const item: TranscriptItem = {
+    fireflyEventId: t.id,
+    title,
+    startTime: startTime || new Date().toISOString(),
+    endTime,
+    transcriptR2Key: transcriptText.length > 0 ? r2Key : null,
+    transcriptText: transcriptText.length > 0 ? transcriptText : null,
+    participants: (t.meeting_attendees || []).map(a => ({
+      displayName: a.displayName || a.name || null,
+      email: a.email ?? null,
+    })),
+    summaryOverview,
+    actionItems,
+    topics,
+    speakerTurns,
+  };
 
-  // INSERT OR IGNORE silently no-ops on UNIQUE collision (firefly_event_id).
-  // If a parallel run beat us to it, the row we just inserted may not be
-  // ours — verify before doing downstream work.
-  const ours = await env.D1.prepare(
-    `SELECT id FROM events WHERE id = ?`
-  ).bind(eventId).first<{ id: string }>();
-  if (!ours) return 'duplicate';
+  const stats = await processTranscriptItems(
+    [item],
+    { orgId, sourcePath: 'firefly-backfill' },
+    env
+  );
 
-  // ── Attendees ──
-  // Three-step linkage:
-  //   1. Existing org user → user_id link, is_internal=1
-  //   2. Existing contact → contact_id link
-  //   3. Neither → auto-create contact from attendee (skips automated emails,
-  //      requires a usable display name) so the meeting graph isn't full of
-  //      orphan rows.
-  for (const p of t.meeting_attendees || []) {
-    const email = (p.email || '').toLowerCase().trim();
-    if (!email) continue;
-    const displayName = p.displayName || p.name || email.split('@')[0];
-
-    const user = await env.D1.prepare(
-      'SELECT id FROM users WHERE LOWER(email) = ? AND org_id = ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(email, orgId).first<{ id: string }>();
-
-    let contactId: string | null = null;
-    if (!user) {
-      const auto = await autoCreateContactFromAttendee({
-        email, displayName, orgId, env,
-      });
-      if (auto) contactId = auto.contactId;
-    }
-
-    await env.D1.prepare(
-      `INSERT OR IGNORE INTO event_attendees
-         (event_id, contact_id, user_id, email, display_name, role, is_internal)
-       VALUES (?, ?, ?, ?, ?, 'attendee', ?)`
-    )
-      .bind(eventId, contactId, user?.id || null, email, displayName, user ? 1 : 0)
-      .run();
-  }
-
-  // ── Speaker-turn chunking + embed ──
-  if (sentences.length > 0) {
-    const turns: SpeakerTurn[] = sentences.map(s => ({
-      speaker: s.speaker_name,
-      affiliation: lookupAffiliation(s.speaker_name, t.meeting_attendees || []),
-      text: s.text,
-    }));
-    const overlapTurns = determineOverlapTurns(turns);
-    const chunks = chunkTranscriptBySpeakerTurns(turns, 1024, overlapTurns);
-
-    for (let i = 0; i < chunks.length; i++) {
-      const meta: ChunkMetadata = {
-        org_id: orgId,
-        document_type: 'transcript',
-        source_table: 'events',
-        source_id: eventId,
-        r2_key: r2Key,
-        visibility: 'org_wide',
-        primary_entity_id: eventId,
-        created_at: now,
-        entity_name: title,
-        date: startTime || undefined,
-        speakers: chunks[i].speakers.join(','),
-        primary_speaker: chunks[i].primary_speaker,
-      };
-      const entry = await chunkEmbedAndPersist(chunks[i].text, meta, i, chunks.length, env);
-      await env.D1.prepare(
-        'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-      ).bind(entry.vectorId, entry.entityId, entry.sourceTable, entry.orgId).run();
-    }
-  }
-
-  // ── Outlook reconciliation (best-effort) ──
-  try {
-    await reconcileFireflyWithoutId(
-      { id: eventId, firefly_event_id: t.id, start_time: startTime || now, transcript_r2_key: transcriptText.length > 0 ? r2Key : null },
-      orgId,
-      env
+  // Phase 1 bail = fail this transcript. The helper's sync_jobs row already
+  // captured the staging error in errors_sample; surface the first message
+  // so the BackfillResult.errors entry is informative.
+  if (stats.items_staged === 0) {
+    const firstErr = stats.errors[0];
+    throw new Error(
+      firstErr ? `${firstErr.phase}: ${firstErr.error}` : 'staging failed'
     );
-  } catch (e) {
-    console.error('[firefly-backfill] reconciliation failed:', e);
   }
 
-  // ── Co-meeting graph: link every pair of contact-bearing attendees ──
-  try {
-    await autoLinkAttendees(eventId, orgId, env);
-  } catch (e) {
-    console.error('[firefly-backfill] autoLinkAttendees failed:', e);
-  }
-
-  // ── Transcript intelligence: signals + summary distribution ──
-  // Wrapped so a Claude failure doesn't lose the transcript we already
-  // persisted. The enrichment cron's Step 5 will retry next cycle if this
-  // fails (signals_extracted_at stays NULL).
-  if (transcriptText.length > 0) {
-    try {
-      await extractAndRouteSignals(eventId, orgId, env);
-    } catch (e) {
-      console.error('[firefly-backfill] signal extraction failed:', e);
-    }
+  // Partial success — Phase 2/3 had errors but the event row exists. Log
+  // for backfill-side visibility; the helper persisted full detail to
+  // sync_jobs.metadata.errors_sample.
+  if (stats.errors.length > 0) {
+    console.warn(
+      `[firefly-backfill] partial success firefly_event_id=${t.id} ` +
+      `errors=${stats.errors.length} sync_job=${stats.sync_job_id} ` +
+      `(see sync_jobs.metadata.errors_sample)`
+    );
   }
 
   return 'ingested';
