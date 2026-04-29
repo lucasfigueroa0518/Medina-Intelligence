@@ -12,6 +12,44 @@ import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 
 // --- GET /api/contacts ---
 
+// Maps the `sort` query param to a SQL column. Defaults to last_contact.
+const CONTACT_SORT_MAP: Record<string, { col: string; defaultDir: 'ASC' | 'DESC' }> = {
+  last_contact: { col: 'c.last_contact_date', defaultDir: 'DESC' },
+  name: { col: 'c.full_name', defaultDir: 'ASC' },
+  company: { col: 'co.name', defaultDir: 'ASC' },
+  interactions: { col: 'c.total_interactions', defaultDir: 'DESC' },
+  status: { col: 'c.engagement_status', defaultDir: 'ASC' },
+  type: { col: 'c.contact_type', defaultDir: 'ASC' },
+  created_at: { col: 'c.created_at', defaultDir: 'DESC' },
+};
+
+// Buckets that map the `last_contact` enum to a SQL predicate. The strings
+// rely on D1's strftime/datetime functions; null handling stays explicit so
+// `never` doesn't accidentally match every NULL row when the user picks a
+// different bucket.
+function lastContactPredicate(bucket: string): string | null {
+  switch (bucket) {
+    case 'today': return `c.last_contact_date >= datetime('now','start of day')`;
+    case 'this_week': return `c.last_contact_date >= datetime('now','-7 days')`;
+    case 'this_month': return `c.last_contact_date >= datetime('now','-30 days')`;
+    case '1_3_months': return `c.last_contact_date >= datetime('now','-90 days') AND c.last_contact_date < datetime('now','-30 days')`;
+    case '3_plus_months': return `c.last_contact_date IS NOT NULL AND c.last_contact_date < datetime('now','-90 days')`;
+    case 'never': return `c.last_contact_date IS NULL`;
+    default: return null;
+  }
+}
+
+function interactionsPredicate(bucket: string): string | null {
+  switch (bucket) {
+    case '0': return `(c.total_interactions IS NULL OR c.total_interactions = 0)`;
+    case '1_10': return `c.total_interactions BETWEEN 1 AND 10`;
+    case '11_50': return `c.total_interactions BETWEEN 11 AND 50`;
+    case '51_200': return `c.total_interactions BETWEEN 51 AND 200`;
+    case '200_plus': return `c.total_interactions > 200`;
+    default: return null;
+  }
+}
+
 export async function listContacts(
   request: Request,
   ctx: AuthContext,
@@ -19,22 +57,25 @@ export async function listContacts(
 ): Promise<Response> {
   const url = new URL(request.url);
   const filter = parseContactFilter(url);
+  const sp = url.searchParams;
 
   const where: string[] = ['c.org_id = ?', 'c.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
 
-  if (filter.contact_types?.length) {
-    where.push(
-      `c.contact_type IN (${filter.contact_types.map(() => '?').join(',')})`
-    );
-    binds.push(...filter.contact_types);
+  // Type — accepts new comma-separated `type` param OR legacy `contact_types`
+  // multi-value param. Both bucket into the same IN clause.
+  const typeList = readMulti(sp, 'type') ?? filter.contact_types;
+  if (typeList?.length) {
+    where.push(`c.contact_type IN (${typeList.map(() => '?').join(',')})`);
+    binds.push(...typeList);
   }
 
-  if (filter.engagement_statuses?.length) {
-    where.push(
-      `c.engagement_status IN (${filter.engagement_statuses.map(() => '?').join(',')})`
-    );
-    binds.push(...filter.engagement_statuses);
+  // Status — `status` is the user-facing alias for engagement_status. Legacy
+  // `engagement_statuses` still works.
+  const statusList = readMulti(sp, 'status') ?? filter.engagement_statuses;
+  if (statusList?.length) {
+    where.push(`c.engagement_status IN (${statusList.map(() => '?').join(',')})`);
+    binds.push(...statusList);
   }
 
   if (filter.company_id) {
@@ -42,14 +83,32 @@ export async function listContacts(
     binds.push(filter.company_id);
   }
 
+  // Last-contact bucket. Multi-value via comma-separated list ORs the buckets
+  // (covers the "Stale 30+ Days" quick-filter that combines 1_3_months and
+  // 3_plus_months).
+  const lastContactBuckets = readMulti(sp, 'last_contact');
+  if (lastContactBuckets?.length) {
+    const predicates = lastContactBuckets
+      .map(b => lastContactPredicate(b))
+      .filter((p): p is string => !!p);
+    if (predicates.length) where.push(`(${predicates.join(' OR ')})`);
+  }
+
+  // Legacy date range filters still honored.
   if (filter.last_contact_before) {
     where.push('c.last_contact_date < ?');
     binds.push(filter.last_contact_before);
   }
-
   if (filter.last_contact_after) {
     where.push('c.last_contact_date > ?');
     binds.push(filter.last_contact_after);
+  }
+
+  // Interactions bucket.
+  const interactionsBucket = sp.get('interactions');
+  if (interactionsBucket) {
+    const pred = interactionsPredicate(interactionsBucket);
+    if (pred) where.push(pred);
   }
 
   if (filter.meetings_last_30d_min !== undefined) {
@@ -57,9 +116,14 @@ export async function listContacts(
     binds.push(filter.meetings_last_30d_min);
   }
 
-  if (filter.keyword) {
-    where.push('(c.full_name LIKE ? OR c.email LIKE ?)');
-    binds.push(`%${filter.keyword}%`, `%${filter.keyword}%`);
+  // Search — joins `name`, `email`, and the linked company name. The LEFT
+  // JOIN to companies is already present (we select co.name), so this LIKE
+  // adds no extra round-trip.
+  const search = sp.get('search') ?? filter.keyword;
+  if (search) {
+    const pat = `%${search}%`;
+    where.push('(c.full_name LIKE ? OR c.email LIKE ? OR co.name LIKE ?)');
+    binds.push(pat, pat, pat);
   }
 
   if (filter.has_followup_overdue) {
@@ -68,26 +132,56 @@ export async function listContacts(
     );
   }
 
-  // Tag filtering — AND logic uses GROUP BY/HAVING
-  let tagJoin = '';
-  if (filter.tags?.length) {
-    tagJoin = `JOIN contact_tags ct ON c.id = ct.contact_id
-               JOIN tags t ON ct.tag_id = t.id`;
-    where.push(`t.name IN (${filter.tags.map(() => '?').join(',')})`);
-    binds.push(...filter.tags);
+  // "In active deals" — quick-filter predicate. Active = stage NOT closed_*.
+  if (sp.get('in_active_deals') === 'true') {
+    where.push(
+      `EXISTS (SELECT 1 FROM deal_contacts dc
+               JOIN deals d ON dc.deal_id = d.id
+               WHERE dc.contact_id = c.id
+                 AND d.deleted_at IS NULL
+                 AND d.stage NOT IN ('closed_won','closed_lost'))`
+    );
   }
 
-  const sortBy = filter.sort_by || 'last_contact_date';
-  const sortDir = filter.sort_dir === 'asc' ? 'ASC' : 'DESC';
+  // Tag filtering — `tags` accepts comma-separated tag IDs (new behavior) OR
+  // the legacy `tags` multi-value with names. We detect IDs by the 32-hex
+  // pattern they use; otherwise fall back to name matching for compatibility.
+  let tagJoin = '';
+  const tagsParam = readMulti(sp, 'tags') ?? filter.tags;
+  if (tagsParam?.length) {
+    const looksLikeIds = tagsParam.every(t => /^[a-f0-9]{16,}$/i.test(t));
+    tagJoin = `JOIN contact_tags ct ON c.id = ct.contact_id
+               JOIN tags t ON ct.tag_id = t.id`;
+    if (looksLikeIds) {
+      where.push(`t.id IN (${tagsParam.map(() => '?').join(',')})`);
+    } else {
+      where.push(`t.name IN (${tagsParam.map(() => '?').join(',')})`);
+    }
+    binds.push(...tagsParam);
+  }
+
+  // Sort. New `sort`/`order` aliases take precedence; legacy `sort_by`/
+  // `sort_dir` still works for older clients.
+  const sortKey = sp.get('sort') ?? legacySortAlias(filter.sort_by);
+  const sortMeta = CONTACT_SORT_MAP[sortKey ?? 'last_contact'] ?? CONTACT_SORT_MAP.last_contact;
+  const orderParam = sp.get('order') ?? filter.sort_dir;
+  const sortDir = orderParam
+    ? (orderParam.toLowerCase() === 'asc' ? 'ASC' : 'DESC')
+    : sortMeta.defaultDir;
+
   // Default to 100/page, ceiling 500. Frontend uses cumulative "load more"
   // pagination so initial load stays fast even at 10k+ records.
   const limit = Math.min(filter.limit || 100, 500);
   const offset = filter.offset || 0;
 
   const havingClause =
-    filter.tags?.length && filter.tag_logic === 'and'
-      ? `HAVING COUNT(DISTINCT t.id) = ${filter.tags.length}`
+    tagsParam?.length && filter.tag_logic === 'and'
+      ? `HAVING COUNT(DISTINCT t.id) = ${tagsParam.length}`
       : '';
+
+  // status sort breaks ties alphabetically so the "groups by status" output
+  // matches user expectation; otherwise just append id for stable pagination.
+  const tieBreak = sortKey === 'status' ? ', c.full_name ASC' : ', c.id ASC';
 
   const sql = `
     SELECT c.*, co.name as company_name
@@ -97,7 +191,7 @@ export async function listContacts(
     WHERE ${where.join(' AND ')}
     GROUP BY c.id
     ${havingClause}
-    ORDER BY ${sanitizeSortColumn(sortBy)} ${sortDir} NULLS LAST
+    ORDER BY ${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
     LIMIT ? OFFSET ?
   `;
 
@@ -137,19 +231,62 @@ export async function listContacts(
     }
   }
 
-  return jsonResponse({ contacts, limit, offset, total });
+  return jsonResponse({
+    contacts,
+    limit,
+    offset,
+    total,
+    has_more: offset + contacts.length < total,
+  });
 }
 
-function sanitizeSortColumn(col: string): string {
-  const allowed = new Set([
-    'last_contact_date',
-    'total_interactions',
-    'full_name',
-    'name',
-    'created_at',
-  ]);
-  const mapped = col === 'name' ? 'full_name' : col;
-  return allowed.has(mapped) ? `c.${mapped}` : 'c.last_contact_date';
+function parseList(raw: string | null): string[] | undefined {
+  if (!raw) return undefined;
+  const items = raw.split(',').map(s => s.trim()).filter(Boolean);
+  return items.length ? items : undefined;
+}
+
+// Reads a query param that may be supplied either as multiple
+// instances (legacy `tags=foo&tags=bar`) or as a single
+// comma-separated string (new `tags=foo,bar`). Returns undefined when
+// the param is absent so callers can fall through to other sources.
+function readMulti(sp: URLSearchParams, key: string): string[] | undefined {
+  const all = sp.getAll(key);
+  if (all.length === 0) return undefined;
+  if (all.length === 1) return parseList(all[0]);
+  return all;
+}
+
+// Old `sort_by` values still used by some callers — translate to the new keys.
+function legacySortAlias(key: string | undefined): string | undefined {
+  if (!key) return undefined;
+  if (key === 'last_contact_date') return 'last_contact';
+  if (key === 'total_interactions') return 'interactions';
+  if (key === 'full_name') return 'name';
+  return key;
+}
+
+// --- GET /api/contacts/companies ---
+// Distinct companies that have at least one contact, with contact counts.
+// Powers the typeahead in the contacts filter rail.
+export async function listContactCompanies(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const rows = await env.D1.prepare(
+    `SELECT co.id, co.name, COUNT(c.id) as count
+     FROM companies co
+     JOIN contacts c ON c.company_id = co.id
+     WHERE co.org_id = ? AND co.deleted_at IS NULL AND c.deleted_at IS NULL
+     GROUP BY co.id
+     ORDER BY co.name COLLATE NOCASE ASC`
+  ).bind(ctx.orgId).all<{ id: string; name: string; count: number }>();
+
+  return jsonResponse(
+    { companies: rows.results },
+    200,
+    { 'Cache-Control': 'private, max-age=300' }
+  );
 }
 
 function parseContactFilter(url: URL): ContactFilter {

@@ -255,6 +255,9 @@ async function routeAuthenticated(
   if (path === '/api/contacts/filter-counts' && method === 'GET') {
     return Contacts.getContactFilterCounts(ctx, env);
   }
+  if (path === '/api/contacts/companies' && method === 'GET') {
+    return Contacts.listContactCompanies(ctx, env);
+  }
   if (path === '/api/contacts/merge' && method === 'POST') {
     return Contacts.postContactMerge(request, ctx, env);
   }
@@ -283,6 +286,9 @@ async function routeAuthenticated(
   // --- Companies ---
   if (path === '/api/companies/filter-counts' && method === 'GET') {
     return Companies.getCompanyFilterCounts(ctx, env);
+  }
+  if (path === '/api/companies/cities' && method === 'GET') {
+    return Companies.listCompanyCities(ctx, env);
   }
   if (path === '/api/companies') {
     if (method === 'GET') return Companies.listCompanies(request, ctx, env);
