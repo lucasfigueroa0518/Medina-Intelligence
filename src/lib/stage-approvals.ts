@@ -59,6 +59,28 @@ export async function stageAndCommitApprovals(
         )
         .run();
 
+      // Resolve the canonical id by external_message_id. INSERT OR IGNORE
+      // above silently no-ops when external_message_id collides with an
+      // existing row — which happens whenever a concurrent run (cron tick
+      // overlap, or classifyAndDeduplicate's dedup SELECT racing with the
+      // stage INSERT) already inserted the same email under a DIFFERENT
+      // generated UUID. In that case item.entityId is a "phantom" id that
+      // never reached the table; using it for downstream FK references
+      // (conversation_contacts.conversation_id) was the root cause of the
+      // 71k dangling vector_entity_index rows surfaced 2026-04-29.
+      // Always read back the actual id and use it from here on.
+      const resolved = item.externalId
+        ? await env.D1.prepare(
+            `SELECT id FROM conversations WHERE external_message_id = ? AND org_id = ?`
+          ).bind(item.externalId, orgId).first<{ id: string }>()
+        : null;
+      const actualConvId = resolved?.id ?? item.entityId;
+      if (actualConvId !== item.entityId) {
+        console.log(
+          `[stage] resolved canonical conv id: local=${item.entityId} canonical=${actualConvId} ext=${item.externalId}`
+        );
+      }
+
       // Junction rows for conversation_contacts. Only bump total_interactions
       // for links that were newly inserted — replays/dedup must not double-count.
       const newlyLinked: string[] = [];
@@ -66,7 +88,7 @@ export async function stageAndCommitApprovals(
         const result = await env.D1.prepare(
           `INSERT OR IGNORE INTO conversation_contacts (conversation_id, contact_id, role)
            VALUES (?, ?, 'participant')`
-        ).bind(item.entityId, cid).run();
+        ).bind(actualConvId, cid).run();
         if (result.meta?.changes) newlyLinked.push(cid);
       }
 
