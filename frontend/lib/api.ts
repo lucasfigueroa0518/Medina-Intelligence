@@ -102,8 +102,10 @@ export const api = {
   // Contacts
   listContacts: (params?: Record<string, string>) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ contacts: any[]; limit: number; offset: number; total: number }>(`/contacts${q}`);
+    return request<{ contacts: any[]; limit: number; offset: number; total: number; has_more?: boolean }>(`/contacts${q}`);
   },
+  listContactCompanies: () =>
+    request<{ companies: { id: string; name: string; count: number }[] }>(`/contacts/companies`),
   getContact: (id: string) =>
     request<{ contact: any; tags: any[]; associations: any[] }>(`/contacts/${id}`),
   createContact: (data: any) =>
@@ -132,8 +134,10 @@ export const api = {
   // Companies
   listCompanies: (params?: Record<string, string>) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ companies: any[]; limit: number; offset: number; total: number }>(`/companies${q}`);
+    return request<{ companies: any[]; limit: number; offset: number; total: number; has_more?: boolean }>(`/companies${q}`);
   },
+  listCompanyCities: () =>
+    request<{ cities: { name: string; count: number }[] }>(`/companies/cities`),
   getCompany: (id: string) =>
     request<{ company: any; contacts: any[]; deals: any[]; tags: any[]; news_articles: any[] }>(`/companies/${id}`),
   createCompany: (data: any) =>
