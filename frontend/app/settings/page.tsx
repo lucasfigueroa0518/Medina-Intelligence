@@ -690,6 +690,8 @@ function ApprovalQueueSection() {
   const [toast, setToast] = React.useState<string | null>(null);
   const [showBulkConfirm, setShowBulkConfirm] = React.useState(false);
   const [bulkApproving, setBulkApproving] = React.useState(false);
+  const [showDismissAllConfirm, setShowDismissAllConfirm] = React.useState(false);
+  const [bulkDismissing, setBulkDismissing] = React.useState(false);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -751,6 +753,19 @@ function ApprovalQueueSection() {
     setShowBulkConfirm(false);
   }
 
+  async function handleDismissAll() {
+    setBulkDismissing(true);
+    try {
+      const result = await api.dismissAllApprovals();
+      setToast(`Dismissed ${result.resolved_count} item${result.resolved_count !== 1 ? 's' : ''}.`);
+      load();
+    } catch {
+      setToast('Dismiss all failed');
+    }
+    setBulkDismissing(false);
+    setShowDismissAllConfirm(false);
+  }
+
   const totalPending = entities.reduce((s, e) => s + e.updates.length, 0);
 
   return (
@@ -778,6 +793,14 @@ function ApprovalQueueSection() {
           </select>
           <button onClick={load} disabled={loading} className="btn-ghost text-xs">
             {loading ? 'Loading...' : 'Refresh'}
+          </button>
+          <button
+            onClick={() => setShowDismissAllConfirm(true)}
+            disabled={totalPending === 0 || loading}
+            className="btn-ghost text-xs py-1.5 px-3"
+            style={{ opacity: totalPending === 0 ? 0.5 : 1, cursor: totalPending === 0 ? 'not-allowed' : 'pointer' }}
+          >
+            Dismiss All
           </button>
           <button
             onClick={() => setShowBulkConfirm(true)}
@@ -926,6 +949,35 @@ function ApprovalQueueSection() {
                 disabled={bulkApproving}
               >
                 {bulkApproving ? 'Approving...' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Dismiss All Confirmation Modal */}
+      {showDismissAllConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+          onClick={() => setShowDismissAllConfirm(false)}>
+          <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+            onClick={e => e.stopPropagation()}>
+            <div className="text-lg font-medium text-text-primary mb-2">Dismiss All Pending</div>
+            <div className="text-sm text-text-secondary mb-5">
+              Reject all {totalPending} pending update{totalPending !== 1 ? 's' : ''} across {entities.length} {entities.length === 1 ? 'entity' : 'entities'}? This can&apos;t be undone — re-enrichment will surface new suggestions if applicable.
+            </div>
+            <div className="flex justify-end gap-3">
+              <button className="btn-ghost text-sm" onClick={() => setShowDismissAllConfirm(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary text-sm"
+                onClick={handleDismissAll}
+                disabled={bulkDismissing}
+                style={{ background: '#EF4444' }}
+              >
+                {bulkDismissing ? 'Dismissing...' : 'Dismiss All'}
               </button>
             </div>
           </div>

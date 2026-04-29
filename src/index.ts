@@ -444,6 +444,9 @@ async function routeAuthenticated(
   if (path === '/api/approval-queue/reject-all' && method === 'POST') {
     return Approval.rejectAllForEntity(request, ctx, env);
   }
+  if (path === '/api/approval-queue/dismiss-all' && method === 'POST') {
+    return Approval.rejectAllPending(request, ctx, env);
+  }
   if (path === '/api/approval-queue/grouped' && method === 'GET') {
     return Approval.listApprovalQueueGrouped(request, ctx, env);
   }

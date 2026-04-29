@@ -260,6 +260,10 @@ export const api = {
     request<{ ok: boolean; resolved_count: number }>('/approval-queue/reject-all', {
       method: 'POST', body: JSON.stringify({ entity_type: entityType, entity_id: entityId }),
     }),
+  dismissAllApprovals: () =>
+    request<{ ok: boolean; resolved_count: number }>('/approval-queue/dismiss-all', {
+      method: 'POST', body: JSON.stringify({}),
+    }),
   getContactPendingUpdates: (id: string) =>
     request<{ updates: any[] }>(`/contacts/${id}/pending-updates`),
 

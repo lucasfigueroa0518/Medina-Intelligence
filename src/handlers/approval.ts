@@ -325,6 +325,23 @@ export async function rejectAllForEntity(
   return jsonResponse({ ok: true, resolved_count: result.meta?.changes || 0 });
 }
 
+// Dismiss every pending approval for the org in one shot. Used by the
+// Settings → Approval Queue "Dismiss all" button when a user wants to
+// clear out a backlog of low-confidence enrichment updates rather than
+// triage them one by one. Single bulk UPDATE — no per-row loop.
+export async function rejectAllPending(
+  _request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const result = await env.D1.prepare(
+    `UPDATE approval_queue SET status = 'rejected', resolved_by = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE org_id = ? AND status = 'pending'`
+  ).bind(ctx.userId, ctx.orgId).run();
+
+  return jsonResponse({ ok: true, resolved_count: result.meta?.changes || 0 });
+}
+
 export async function listApprovalQueueGrouped(
   request: Request,
   ctx: AuthContext,
