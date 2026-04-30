@@ -260,9 +260,14 @@ export default function DealsPage() {
     setDragOverStage(null);
   }
 
+  /* Day-5 Phase B: per-column sort. Read from URL ?sort=...; client-side
+     sort applied to the already-loaded deals so column re-sort doesn't
+     trigger a refetch. Default 'expected_close' matches backend's existing
+     ORDER BY (server-side sort is the fallback when ?sort= is absent). */
+  const sortKey = (searchParams.get('sort') || 'expected_close') as DealSortKey;
   const dealsByStage = STAGES.map(stage => ({
     ...stage,
-    deals: deals.filter(d => d.stage === stage.key),
+    deals: sortDealsForColumn(deals.filter(d => d.stage === stage.key), sortKey),
   }));
 
   const totalPipeline = deals
@@ -292,6 +297,18 @@ export default function DealsPage() {
               <Filter size={14} />
               {filterCount > 0 ? `Filters (${filterCount})` : 'Filters'}
             </button>
+            {/* Day-5 Phase B: sort dropdown. Client-side sort applied to
+                already-loaded deals (no refetch). */}
+            <select
+              value={sortKey}
+              onChange={e => setScalarFilter('sort', e.target.value === 'expected_close' ? null : e.target.value)}
+              className="input text-xs py-1.5 px-2"
+              title="Sort within column"
+            >
+              {SORT_OPTIONS.map(opt => (
+                <option key={opt.value} value={opt.value}>Sort: {opt.label}</option>
+              ))}
+            </select>
             <button className="btn-primary flex items-center gap-2" onClick={openModal}>
               <Plus size={16} /> Add Deal
             </button>
@@ -799,6 +816,64 @@ function SentimentIndicator({ score, direction }: {
       {dirLabel}{scoreLabel}
     </span>
   );
+}
+
+/* ── Day-5 Phase B: per-column sort ── */
+
+type DealSortKey =
+  | 'expected_close'      // default — matches the server-side ORDER BY
+  | 'amount_desc'         // largest deals first
+  | 'last_activity_desc'  // most recently touched first (uses inferred field)
+  | 'days_in_stage_desc'; // longest-stuck first
+
+const SORT_OPTIONS: Array<{ value: DealSortKey; label: string }> = [
+  { value: 'expected_close',      label: 'Expected close' },
+  { value: 'amount_desc',         label: 'Amount (high → low)' },
+  { value: 'last_activity_desc',  label: 'Last activity' },
+  { value: 'days_in_stage_desc',  label: 'Stuck longest' },
+];
+
+function sortDealsForColumn(deals: any[], key: DealSortKey): any[] {
+  const copy = deals.slice();
+  switch (key) {
+    case 'amount_desc':
+      copy.sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0));
+      break;
+    case 'last_activity_desc': {
+      // Use the same fallback chain DealCard renders so the visible "Xd ago"
+      // dot ordering matches what the user sees.
+      const ts = (d: any): number => {
+        const iso = d.last_inferred_activity_date ?? d.last_activity_date ?? d.created_at;
+        const v = iso ? new Date(iso).getTime() : 0;
+        return Number.isFinite(v) ? v : 0;
+      };
+      copy.sort((a, b) => ts(b) - ts(a));
+      break;
+    }
+    case 'days_in_stage_desc': {
+      const days = (d: any): number => {
+        if (d.stage_changed_at) {
+          const dt = (Date.now() - new Date(d.stage_changed_at).getTime()) / 86_400_000;
+          return Number.isFinite(dt) ? dt : 0;
+        }
+        return d.days_in_stage ?? 0;
+      };
+      copy.sort((a, b) => days(b) - days(a));
+      break;
+    }
+    case 'expected_close':
+    default: {
+      // NULLs last (matches backend's ORDER BY ... NULLS LAST). Within
+      // not-NULL: ascending (closer = earlier).
+      copy.sort((a, b) => {
+        const av = a.expected_close ? new Date(a.expected_close).getTime() : Number.POSITIVE_INFINITY;
+        const bv = b.expected_close ? new Date(b.expected_close).getTime() : Number.POSITIVE_INFINITY;
+        return av - bv;
+      });
+      break;
+    }
+  }
+  return copy;
 }
 
 function formatCurrency(v: number): string {
