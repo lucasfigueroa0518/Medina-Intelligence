@@ -43,11 +43,26 @@ export async function listDeals(
 
   const [result, countResult] = await Promise.all([
     env.D1.prepare(
+      // last_inferred_activity_date: query-time MAX from the same two-hop join
+      // getDealTimeline uses (deal_contacts → conversation_contacts →
+      // conversations). Fixes the staleness of deals.last_activity_date,
+      // which is only bumped by manual deal edits / Marty's agent-tools and
+      // does NOT update when an inbound conversation lands. The legacy
+      // last_activity_date column is left untouched on the wire (still in
+      // d.*) — frontend reads the new field with a fallback to the old one.
+      // See Day 4 Priority 6 audit, Section 1.3 finding.
       `SELECT d.*, co.name AS company_name, co.sector AS company_sector,
+              u.full_name AS owner_name, u.email AS owner_email,
               (SELECT COUNT(*) FROM deal_contacts dc WHERE dc.deal_id = d.id) AS contacts_count,
-              (SELECT COUNT(*) FROM deal_action_items dai WHERE dai.deal_id = d.id AND dai.status IN ('open','in_progress')) AS open_items_count
+              (SELECT COUNT(*) FROM deal_action_items dai WHERE dai.deal_id = d.id AND dai.status IN ('open','in_progress')) AS open_items_count,
+              (SELECT MAX(conv.sent_at)
+                 FROM deal_contacts dc
+                 JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+                 JOIN conversations conv ON cc.conversation_id = conv.id
+                WHERE dc.deal_id = d.id) AS last_inferred_activity_date
        FROM deals d
        LEFT JOIN companies co ON d.company_id = co.id
+       LEFT JOIN users u ON d.owner_id = u.id
        WHERE ${whereClause}
        ORDER BY d.expected_close ASC NULLS LAST
        LIMIT ? OFFSET ?`
@@ -166,8 +181,15 @@ export async function getDeal(
   env: Env
 ): Promise<Response> {
   const deal = await env.D1.prepare(
+    // See listDeals comment above re: last_inferred_activity_date — same
+    // two-hop join, surfaced alongside the legacy last_activity_date column.
     `SELECT d.*, co.name AS company_name, co.sector AS company_sector,
-            u.full_name AS owner_name
+            u.full_name AS owner_name, u.email AS owner_email,
+            (SELECT MAX(conv.sent_at)
+               FROM deal_contacts dc
+               JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+               JOIN conversations conv ON cc.conversation_id = conv.id
+              WHERE dc.deal_id = d.id) AS last_inferred_activity_date
      FROM deals d
      LEFT JOIN companies co ON d.company_id = co.id
      LEFT JOIN users u ON d.owner_id = u.id
