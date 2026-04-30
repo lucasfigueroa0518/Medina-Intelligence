@@ -7,6 +7,7 @@ import { classifyDocument } from './document-intelligence';
 import { emitAudit } from './audit';
 import { persistDocument, type DocumentLink } from './persist-document';
 import { isDenylisted } from './document-denylist';
+import { classifyByFilename } from './document-filename-classifier';
 
 const MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024;
 
@@ -174,12 +175,28 @@ export async function processEmailAttachments(
         extractionError = String(e?.message || e);
         result.errors.push(`Extract "${att.name}": ${extractionError}`);
       }
+      // Wave 5 Phase C: cheap filename pre-classifier. Three tiers:
+      //   high   → use directly, skip the LLM call
+      //   medium → call LLM with the cheap match as a hint
+      //   null   → existing LLM-only path
+      // Skip entirely when extraction failed — the row is going to land
+      // 'failed' anyway, no point burning a classifier call.
       let docCategory = 'other';
-      if (text.length > 20) {
+      const cheap = extractionError ? null : classifyByFilename(att.name);
+      if (cheap?.confidence === 'high') {
+        docCategory = cheap.category;
+        console.log(`[doc-intel] cheap=${cheap.category} (high) skip-llm "${att.name}"`);
+      } else if (text.length > 20) {
         try {
-          const cls = await classifyDocument(text, att.name, env, orgId);
+          const cls = await classifyDocument(text, att.name, env, orgId, cheap);
           docCategory = cls.category;
+          console.log(`[doc-intel] llm=${cls.category} cheap=${cheap?.category || 'null'} "${att.name}"`);
         } catch { /* keep 'other' */ }
+      } else if (cheap?.confidence === 'medium') {
+        // No usable text but cheap had a hint — accept it on the medium
+        // tier rather than defaulting to 'other'. Better than nothing.
+        docCategory = cheap.category;
+        console.log(`[doc-intel] cheap=${cheap.category} (medium, no text) "${att.name}"`);
       }
 
       const persisted = await persistDocument({

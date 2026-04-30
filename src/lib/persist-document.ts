@@ -20,6 +20,7 @@ import type { Env } from '../types/env';
 import type { ChunkMetadata } from '../types/interfaces';
 import { extractTextFromFile } from './file-extraction';
 import { classifyDocument } from './document-intelligence';
+import { classifyByFilename } from './document-filename-classifier';
 import { chunkEmbedAndPersistAll } from './embedding';
 
 export type DocumentSource =
@@ -323,12 +324,28 @@ export async function persistDocument(
       }
       const preview = text.slice(0, 500);
 
+      // Wave 5 Phase C: cheap filename pre-classifier before LLM. Only
+      // applies when caller didn't pre-classify (userProvidedType is undef).
+      // Tier disposition:
+      //   high   → use directly, skip LLM
+      //   medium → call LLM with cheap match as a hint
+      //   null   → existing LLM-only path
       let finalType = userProvidedType || 'other';
-      if (!userProvidedType && text.length > 20) {
-        try {
-          const cls = await classifyDocument(text, input.file.name, env, input.orgId);
-          finalType = cls.category;
-        } catch { /* keep 'other' */ }
+      if (!userProvidedType) {
+        const cheap = classifyByFilename(input.file.name);
+        if (cheap?.confidence === 'high') {
+          finalType = cheap.category;
+          console.log(`[doc-intel] cheap=${cheap.category} (high) skip-llm "${input.file.name}"`);
+        } else if (text.length > 20) {
+          try {
+            const cls = await classifyDocument(text, input.file.name, env, input.orgId, cheap);
+            finalType = cls.category;
+            console.log(`[doc-intel] llm=${cls.category} cheap=${cheap?.category || 'null'} "${input.file.name}"`);
+          } catch { /* keep 'other' */ }
+        } else if (cheap?.confidence === 'medium') {
+          finalType = cheap.category;
+          console.log(`[doc-intel] cheap=${cheap.category} (medium, no text) "${input.file.name}"`);
+        }
       }
 
       if (wantEmbed && text.length > 10) {
