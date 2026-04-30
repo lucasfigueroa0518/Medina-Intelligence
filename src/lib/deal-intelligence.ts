@@ -135,29 +135,53 @@ interface ConversationRow {
 }
 
 /**
- * Pull the deal's conversation set via the canonical two-hop join.
- * Bound by the column-cap so a deal with many thousands of linked
- * messages doesn't blow up the prompt budget.
+ * Pull the deal's conversation set. Phase B introduced direct links via
+ * conversation_deals (and event_deals via fetchDealEvents); we prefer those
+ * when present and fall back to the two-hop contact-overlap join from
+ * PR #24's propagateContactToOpenDeals as a fallback evidence source.
+ *
+ * Why both paths: direct links are precise but incomplete during the
+ * transition window — most existing deals have zero direct rows yet, only
+ * contact-overlap. The UNION DISTINCT collapses dupes when a conversation
+ * is reachable via both paths. Bounded by MAX_CONVERSATIONS_FOR_PROMPT so
+ * a heavily-linked deal doesn't blow the prompt budget.
+ *
+ * conversations has no deleted_at column — every linked row is valid.
+ * (Other entity tables soft-delete; conversations hard-delete via cleanup.)
  */
 async function fetchDealConversations(
   dealId: string,
   orgId: string,
   env: Env
 ): Promise<ConversationRow[]> {
-  // conversations has no deleted_at column — treat every linked row as
-  // valid. (Other entity tables are soft-deleted; conversations are
-  // hard-deleted via cleanup paths.)
   const rows = await env.D1.prepare(
-    `SELECT DISTINCT conv.id, conv.source, conv.participant_user_ids,
-                     conv.is_campaign_email, conv.subject, conv.body_preview,
-                     conv.from_email, conv.sent_at, conv.direction
-       FROM deal_contacts dc
-       JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
-       JOIN conversations conv       ON cc.conversation_id = conv.id
-      WHERE dc.deal_id = ? AND dc.org_id = ? AND conv.org_id = ?
-      ORDER BY conv.sent_at DESC
+    `SELECT id, source, participant_user_ids, is_campaign_email, subject,
+            body_preview, from_email, sent_at, direction
+       FROM (
+         -- Direct links (Phase B+). source='manual' / 'auto_high' /
+         -- 'inherited_channel' / 'llm_classification' / etc.
+         SELECT conv.id, conv.source, conv.participant_user_ids,
+                conv.is_campaign_email, conv.subject, conv.body_preview,
+                conv.from_email, conv.sent_at, conv.direction
+           FROM conversation_deals cd
+           JOIN conversations conv ON cd.conversation_id = conv.id
+          WHERE cd.deal_id = ? AND conv.org_id = ?
+         UNION
+         -- Fallback: contact-overlap two-hop join via PR #24's
+         -- propagateContactToOpenDeals. Stays as evidence source for
+         -- deals that pre-date the direct-link era.
+         SELECT conv.id, conv.source, conv.participant_user_ids,
+                conv.is_campaign_email, conv.subject, conv.body_preview,
+                conv.from_email, conv.sent_at, conv.direction
+           FROM deal_contacts dc
+           JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+           JOIN conversations conv       ON cc.conversation_id = conv.id
+          WHERE dc.deal_id = ? AND dc.org_id = ? AND conv.org_id = ?
+       )
+      ORDER BY sent_at DESC
       LIMIT ?`
-  ).bind(dealId, orgId, orgId, MAX_CONVERSATIONS_FOR_PROMPT).all<ConversationRow>();
+  ).bind(dealId, orgId, dealId, orgId, orgId, MAX_CONVERSATIONS_FOR_PROMPT)
+   .all<ConversationRow>();
   return rows.results;
 }
 
