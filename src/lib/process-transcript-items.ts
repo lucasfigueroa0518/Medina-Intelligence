@@ -443,13 +443,15 @@ export async function processTranscriptItems(
         }
       }
 
-      // Outlook reconciliation (best-effort — same pattern as the legacy
-      // path; reconcileFireflyWithoutId handles its own no-match path by
-      // leaving reconciliation_status='pending_reconciliation' or moving it
-      // to 'standalone' / 'reconciled').
+      // Outlook reconciliation (best-effort). Runs unconditionally — the
+      // prior helper bailed when firefly_event_id was set, which silently
+      // skipped every Phase F + webhook event. The matcher leaves
+      // reconciliation_status='pending_reconciliation' on no match;
+      // `promoteToStandalone` (daily cron) flips long-pending rows to
+      // 'standalone' after 48-72h.
       try {
-        const { reconcileFireflyWithoutId } = await import('./reconciliation');
-        await reconcileFireflyWithoutId(
+        const { reconcileFireflyToOutlook } = await import('./reconciliation');
+        await reconcileFireflyToOutlook(
           {
             id: canonicalId,
             firefly_event_id: item.fireflyEventId,

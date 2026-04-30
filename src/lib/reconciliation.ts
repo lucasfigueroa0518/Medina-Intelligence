@@ -76,7 +76,31 @@ export async function upsertOutlookEvent(
   }
 }
 
-export async function reconcileFireflyWithoutId(
+/**
+ * Match a Firefly transcript event to an Outlook calendar event by attendee
+ * overlap + start-time window, and reconcile both rows on match.
+ *
+ * Runs the same matcher whether or not `firefly_event_id` is set — the prior
+ * `reconcileFireflyWithoutId` (since renamed) bailed when the id was present,
+ * which silently skipped 100% of Phase F backfill events and 100% of webhook
+ * events (both always carry firefly_event_id from Fireflies' GraphQL/payload).
+ * As a result, every Firefly event landed `pending_reconciliation` and stayed
+ * there. This unconditional matcher is the bidirectional reconciliation called
+ * out in TRD v2.3 §7.4 that shipped only one direction.
+ *
+ * Match phases (unchanged from prior helper):
+ *   • Phase 1: ±15 min, ≥2 attendee overlap (typical case)
+ *   • Phase 2: ±24h, ≥3 attendee overlap, Outlook event updated > 1h after
+ *     creation (catches reschedules where the calendar event moved but the
+ *     transcript was recorded against the original time)
+ *
+ * On match: stamp the Outlook row with the transcript pointer + transcript_source,
+ * flip both rows to `reconciled`. On no match: leave the Firefly row at
+ * `pending_reconciliation`; the existing `promoteToStandalone` daily-cron pass
+ * promotes it to `standalone` after 48-72h depending on whether firefly_event_id
+ * is set.
+ */
+export async function reconcileFireflyToOutlook(
   event: {
     id: string;
     firefly_event_id?: string | null;
@@ -86,8 +110,6 @@ export async function reconcileFireflyWithoutId(
   orgId: string,
   env: Env
 ): Promise<boolean> {
-  if (event.firefly_event_id) return false;
-
   const fireflyAttendees = await env.D1.prepare(
     'SELECT email FROM event_attendees WHERE event_id = ?'
   ).bind(event.id).all<{ email: string }>();
