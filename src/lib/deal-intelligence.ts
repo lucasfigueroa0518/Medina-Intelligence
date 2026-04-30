@@ -144,6 +144,9 @@ async function fetchDealConversations(
   orgId: string,
   env: Env
 ): Promise<ConversationRow[]> {
+  // conversations has no deleted_at column — treat every linked row as
+  // valid. (Other entity tables are soft-deleted; conversations are
+  // hard-deleted via cleanup paths.)
   const rows = await env.D1.prepare(
     `SELECT DISTINCT conv.id, conv.source, conv.participant_user_ids,
                      conv.is_campaign_email, conv.subject, conv.body_preview,
@@ -152,7 +155,6 @@ async function fetchDealConversations(
        JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
        JOIN conversations conv       ON cc.conversation_id = conv.id
       WHERE dc.deal_id = ? AND dc.org_id = ? AND conv.org_id = ?
-        AND conv.deleted_at IS NULL
       ORDER BY conv.sent_at DESC
       LIMIT ?`
   ).bind(dealId, orgId, orgId, MAX_CONVERSATIONS_FOR_PROMPT).all<ConversationRow>();
