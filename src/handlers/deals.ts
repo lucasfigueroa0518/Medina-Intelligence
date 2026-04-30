@@ -5,6 +5,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
+import { computeDealIntelligence, readDealIntelligence } from '../lib/deal-intelligence';
 
 // ---------------------------------------------------------------------------
 // GET /api/deals
@@ -1581,4 +1582,57 @@ export async function getDealMetrics(
     total_pipeline_value: pipeline?.total_pipeline_value ?? 0,
     stale_deals: staleDeals.results,
   });
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/deals/:id/intelligence — per-(deal, user) computed-cached
+// intelligence (sentiment / topics / risk_signals / momentum). Cold-path
+// reads compute synchronously then UPSERT and return. Subsequent reads
+// serve from cache, marked is_stale per the freshness contract.
+// Stale reads serve cached data + queue an async recompute via
+// ctxExec.waitUntil so the user-visible read never blocks on the LLM.
+// Per-(deal_id, user_id) PK enforces the ACL layered redaction principle:
+// each user's intelligence reflects only conversations they can read.
+// ---------------------------------------------------------------------------
+
+export async function getDealIntelligence(
+  id: string,
+  ctx: AuthContext,
+  env: Env,
+  ctxExec: ExecutionContext
+): Promise<Response> {
+  // ACL — same gate as deal detail page. If the deal isn't in the
+  // caller's org (or is soft-deleted), 404 without leaking existence.
+  const deal = await env.D1.prepare(
+    'SELECT id FROM deals WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(id, ctx.orgId).first();
+  if (!deal) return errorResponse('DEAL_NOT_FOUND', 404);
+
+  let intelligence = await readDealIntelligence(id, ctx.userId, env);
+
+  // Cold path — first read for this (deal, user) pair triggers a
+  // synchronous compute. Subsequent reads serve from cache.
+  if (!intelligence) {
+    try {
+      const result = await computeDealIntelligence(id, ctx.userId, ctx.userRole, ctx.orgId, env);
+      intelligence = result.intelligence;
+    } catch (e) {
+      console.error(`[deal-intelligence] cold-start compute failed for ${id}/${ctx.userId}:`, e);
+      return errorResponse('INTELLIGENCE_COMPUTE_FAILED', 500);
+    }
+  } else if (intelligence.is_stale) {
+    // Stale path — return cached row immediately, kick async recompute.
+    // The user-visible read never blocks on the LLM. Next read after
+    // recompute lands serves the fresh data; in the worst case the
+    // hourly batch picks it up.
+    ctxExec.waitUntil((async () => {
+      try {
+        await computeDealIntelligence(id, ctx.userId, ctx.userRole, ctx.orgId, env);
+      } catch (e) {
+        console.error(`[deal-intelligence] async recompute failed for ${id}/${ctx.userId}:`, e);
+      }
+    })());
+  }
+
+  return jsonResponse(intelligence);
 }

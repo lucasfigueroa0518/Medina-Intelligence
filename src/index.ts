@@ -335,6 +335,8 @@ async function routeAuthenticated(
   if (m && method === 'GET') return Deals.getDealTimeline(request, m[1], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/conversations$/);
   if (m && method === 'GET') return Deals.getDealConversations(request, m[1], ctx, env);
+  m = path.match(/^\/api\/deals\/([^/]+)\/intelligence$/);
+  if (m && method === 'GET') return Deals.getDealIntelligence(m[1], ctx, env, ctxExec);
   m = path.match(/^\/api\/deals\/([^/]+)\/contacts\/([^/]+)$/);
   if (m && method === 'DELETE') return Deals.removeDealContact(m[1], m[2], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/contacts$/);
@@ -763,6 +765,23 @@ async function handleScheduled(
           const { backfillUnembeddedEntities } = await import('./lib/daily-cron');
           try { await backfillUnembeddedEntities(org.id, env); }
           catch (e) { console.error(`hourly self-heal: backfillUnembeddedEntities failed for ${org.id}:`, e); }
+        })());
+        // deal_intelligence batch refresh — recompute the oldest 50
+        // stale-or-invalidated rows for this org. Bounded subrequest
+        // budget by HOURLY_BATCH_LIMIT (1 Claude call + ~3 D1 calls per
+        // row = ~200 subreqs/tick worst case). Sibling waitUntil so it
+        // races with the embed self-heal blocks above for the same
+        // shared budget, per the established pattern.
+        ctxExec.waitUntil((async () => {
+          const { refreshStaleIntelligence } = await import('./lib/deal-intelligence');
+          try {
+            const result = await refreshStaleIntelligence(org.id, env);
+            if (result.refreshed > 0) {
+              console.log(`[deal-intelligence] hourly refresh org=${org.id} refreshed=${result.refreshed}`);
+            }
+          } catch (e) {
+            console.error(`hourly refresh: refreshStaleIntelligence failed for ${org.id}:`, e);
+          }
         })());
       } else if (cron === '5 * * * *') {
         // Enrichment

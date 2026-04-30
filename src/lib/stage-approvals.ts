@@ -113,6 +113,36 @@ export async function stageAndCommitApprovals(
         if (result.meta?.changes) newlyLinked.push(cid);
       }
 
+      // deal_intelligence event-driven invalidation. Fires when any of
+      // this conversation's contacts is in any deal_contacts row — for
+      // each affected (deal_id, user_id), checks canReadEmailContent
+      // against this conversation and stamps invalidated_at on the
+      // readable subset only. NOT a broadcast — non-readable users see
+      // no invalidation since their ACL-filtered compute wouldn't have
+      // included this conversation anyway. Best-effort; never blocks
+      // staging. Guarded for zero-contact items and the (rare)
+      // 'claude_search' source which we map to 'manual' for ACL purposes.
+      if (item.contactIds.length > 0) {
+        try {
+          const { invalidateForConversation } = await import('./deal-intelligence');
+          const aclSource: 'outlook' | 'slack' | 'manual' =
+            item.source === 'outlook' ? 'outlook'
+            : item.source === 'slack' ? 'slack'
+            : 'manual';
+          const participantUserIdsJson = JSON.stringify(item.participantUserIds || []);
+          await invalidateForConversation(
+            item.contactIds,
+            participantUserIdsJson,
+            aclSource,
+            false, // is_campaign_email — conversations table always inserts 0 here
+            orgId,
+            env
+          );
+        } catch (e) {
+          console.error(`[deal-intelligence] invalidation hook failed for ${item.entityId}:`, e);
+        }
+      }
+
       // Auto-link pairs
       if (item.contactIds.length >= 2) {
         await autoLinkConversationParticipants(item.entityId, item.contactIds, orgId, env);
