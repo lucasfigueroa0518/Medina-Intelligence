@@ -15,11 +15,13 @@ import {
   buildR2Key,
   ensureUserUnderQuota,
   rowToSummary,
+  detectUploadType,
   MAX_FILES_PER_REQUEST,
   MAX_REQUEST_PAYLOAD_BYTES,
   RETENTION_DAYS,
   UploadValidationError,
 } from '../lib/chat-uploads';
+import { loadDocumentForUser } from './documents';
 
 export async function uploadChatFiles(
   request: Request,
@@ -302,5 +304,122 @@ export async function listSessionUploads(
   ).bind(sessionId, ctx.userId).all<ChatUploadRow>();
   return jsonResponse({
     uploads: result.results.map(r => rowToSummary(r)),
+  });
+}
+
+// Wave 5 Phase H — Send-to-MARTy endpoint. Materializes a chat_uploads row
+// from an existing documents row so the user can carry a permanent doc
+// into a MARTy chat session as an in-context attachment without re-
+// uploading. Reverse-link via saved_document_id maintains traceability:
+// the chat_uploads row references its source document, the documents row
+// retains its existing entity links.
+//
+// Body: { document_id: string, session_id?: string }
+// Returns: { upload_id, session_id, summary }
+//
+// ACL: loadDocumentForUser gates on visibility + participant_user_ids +
+// sharing flags — same as GET /api/documents/:id. A user who can't read
+// the doc gets a 404 here too.
+//
+// R2 strategy: COPY bytes (audit recommendation D-2). chat_uploads has a
+// 7-day TTL (RETENTION_DAYS); the temporary copy is bounded. Sharing the
+// documents R2 key would require a `r2_namespace` discriminator column +
+// careful coordination with the chat-uploads TTL sweep — copying is the
+// simpler, safer option for one-shot attachments.
+export async function attachDocumentToChat(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await request.json().catch(() => ({}))  as {
+    document_id?: string;
+    session_id?: string;
+  };
+  const documentId = body.document_id;
+  const sessionId = body.session_id || `sess_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+
+  if (!documentId) {
+    return errorResponse('VALIDATION_ERROR', 400, 'document_id required');
+  }
+
+  const doc = await loadDocumentForUser(documentId, ctx, env);
+  if (!doc) {
+    return errorResponse('NOT_FOUND', 404, 'document not accessible');
+  }
+  if (!doc.r2_key) {
+    return errorResponse('GONE', 410, 'document has no binary (likely oversize/excluded)');
+  }
+
+  // Pull bytes from documents R2 prefix.
+  const obj = await env.R2.get(doc.r2_key);
+  if (!obj) {
+    return errorResponse('GONE', 410, 'document binary missing in R2');
+  }
+  const buffer = await obj.arrayBuffer();
+
+  // Decide upload_type from filename/mime; fall back to 'document' for
+  // formats chat preview supports (extractable text + Documents save).
+  const uploadType = detectUploadType(doc.file_name || 'document', doc.mime_type || '') || 'document';
+
+  const uploadId = `upload_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  const r2Key = buildR2Key(ctx.userId, uploadId, doc.file_name || 'document');
+  await env.R2.put(r2Key, buffer, {
+    httpMetadata: { contentType: doc.mime_type || 'application/octet-stream' },
+  });
+
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + RETENTION_DAYS * 86400000).toISOString();
+  // Carry the document's extracted text directly so the chat upload is
+  // immediately searchable by MARTy. extraction_status='completed' marks
+  // it as not-needing-async-extraction (we already have the text via doc).
+  const extractedText = doc.extracted_text_preview || '';
+  const previewText = extractedText.slice(0, 500);
+  const extractionStatus = uploadType === 'image' ? 'skipped' : 'completed';
+
+  await env.D1.prepare(
+    `INSERT INTO chat_uploads
+       (id, user_id, org_id, session_id, filename, mime_type, size_bytes, r2_key,
+        upload_type, extraction_status, extracted_text, preview_text,
+        saved_to_documents, saved_document_id,
+        expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`
+  ).bind(
+    uploadId, ctx.userId, ctx.orgId, sessionId,
+    doc.file_name || 'document',
+    doc.mime_type || 'application/octet-stream',
+    doc.file_size || buffer.byteLength,
+    r2Key,
+    uploadType, extractionStatus, extractedText, previewText,
+    documentId,
+    expiresAt, now
+  ).run();
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    // 'create' = new chat_uploads row materialized from this document
+    action: 'create',
+    entity_type: 'document',
+    entity_id: documentId,
+    metadata: { session_id: sessionId, upload_id: uploadId, source: 'send_to_marty' },
+    created_at: now,
+  });
+
+  const row: ChatUploadRow = {
+    id: uploadId, user_id: ctx.userId, org_id: ctx.orgId, session_id: sessionId,
+    filename: doc.file_name || 'document',
+    mime_type: doc.mime_type || 'application/octet-stream',
+    size_bytes: doc.file_size || buffer.byteLength,
+    r2_key: r2Key,
+    upload_type: uploadType, extraction_status: extractionStatus,
+    extracted_text: extractedText, preview_text: previewText,
+    saved_to_documents: 1, saved_document_id: documentId,
+    expires_at: expiresAt, created_at: now,
+  };
+
+  return jsonResponse({
+    upload_id: uploadId,
+    session_id: sessionId,
+    summary: rowToSummary(row),
   });
 }

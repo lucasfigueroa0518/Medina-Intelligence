@@ -2,7 +2,8 @@
 
 import React from 'react';
 import Link from 'next/link';
-import { X as XIcon, ExternalLink, Download, AlertCircle, Loader2 } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { X as XIcon, ExternalLink, Download, AlertCircle, Loader2, Sparkles } from 'lucide-react';
 import { FilePreview, kindFromMime } from './file-preview';
 import { api } from '@/lib/api';
 
@@ -47,12 +48,14 @@ export function DocumentPreviewModal({
   docId: string | null;
   onClose: () => void;
 }) {
+  const router = useRouter();
   const [doc, setDoc] = React.useState<DocLite | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [previewBlobUrl, setPreviewBlobUrl] = React.useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = React.useState(false);
   const [downloading, setDownloading] = React.useState(false);
+  const [sendingToMarty, setSendingToMarty] = React.useState(false);
 
   React.useEffect(() => {
     if (!docId) return;
@@ -120,6 +123,25 @@ export function DocumentPreviewModal({
     };
   }, [docId, onClose]);
 
+  // Wave 5 Phase H — materialize chat_uploads row from this doc, then
+  // navigate to /god-mode with the upload pre-attached. Backend does the
+  // R2 byte copy; we receive upload_id + session_id and pass them via
+  // URL params so god-mode's URL-param consumer pushes the upload into
+  // pending state on mount.
+  async function handleSendToMarty() {
+    if (!doc) return;
+    setSendingToMarty(true);
+    try {
+      const res = await api.attachDocumentToChat(doc.id);
+      onClose();
+      router.push(`/god-mode?session_id=${encodeURIComponent(res.session_id)}&attach_upload=${encodeURIComponent(res.upload_id)}`);
+    } catch (e: any) {
+      setError(`Send to MARTy failed: ${e?.message || 'unknown error'}`);
+    } finally {
+      setSendingToMarty(false);
+    }
+  }
+
   async function handleDownload() {
     if (!doc) return;
     setDownloading(true);
@@ -168,6 +190,12 @@ export function DocumentPreviewModal({
             </div>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            <button onClick={handleSendToMarty} disabled={sendingToMarty || !doc}
+              title="Send to MARTy"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 mr-1 rounded-lg text-purple-300 bg-purple-500/10 hover:bg-purple-500/15 transition-colors text-xs font-medium disabled:opacity-30">
+              {sendingToMarty ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+              {sendingToMarty ? 'Sending…' : 'Send to MARTy'}
+            </button>
             <button onClick={handleDownload} disabled={downloading || !doc}
               title="Download"
               className="p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-white/5 disabled:opacity-30">

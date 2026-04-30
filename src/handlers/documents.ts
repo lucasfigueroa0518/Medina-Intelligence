@@ -346,7 +346,10 @@ export async function uploadDocument(
   return jsonResponse({ document: doc }, 201);
 }
 
-async function loadDocumentForUser(
+// Exported for Phase H Send-to-MARTy endpoint — same ACL gate (visibility +
+// participant_user_ids + sharing flags) so an attach-document call can't
+// bypass the access checks.
+export async function loadDocumentForUser(
   id: string,
   ctx: AuthContext,
   env: Env
