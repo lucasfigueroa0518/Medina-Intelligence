@@ -463,6 +463,20 @@ async function routeAuthenticated(
   if (path === '/api/approval-queue/grouped' && method === 'GET') {
     return Approval.listApprovalQueueGrouped(request, ctx, env);
   }
+  // Wave 6 UX — held proposals visibility surface (entity_field_state.pending_proposals).
+  if (path === '/api/approval-queue/held/approve' && method === 'POST') {
+    return Approval.approveHeldProposal(request, ctx, env);
+  }
+  if (path === '/api/approval-queue/held/dismiss' && method === 'POST') {
+    return Approval.dismissHeldProposal(request, ctx, env);
+  }
+  // Wave 6 UX — per-field permanent lock toggle + read.
+  if (path === '/api/field-locks' && method === 'GET') {
+    return Approval.listFieldLocks(request, ctx, env);
+  }
+  if (path === '/api/field-locks' && method === 'POST') {
+    return Approval.toggleFieldLock(request, ctx, env);
+  }
 
   // --- Agent ---
   if (path === '/api/agent/query' && method === 'POST') {

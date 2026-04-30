@@ -321,6 +321,27 @@ export const api = {
     request<{ ok: boolean; resolved_count: number }>('/approval-queue/dismiss-all', {
       method: 'POST', body: JSON.stringify({}),
     }),
+  // Wave 6 UX — held proposals (entity_field_state.pending_proposals)
+  approveHeldProposal: (entityType: string, entityId: string, fieldName: string, value: string) =>
+    request<{ ok: boolean }>('/approval-queue/held/approve', {
+      method: 'POST',
+      body: JSON.stringify({ entity_type: entityType, entity_id: entityId, field_name: fieldName, value }),
+    }),
+  dismissHeldProposal: (entityType: string, entityId: string, fieldName: string, value: string) =>
+    request<{ ok: boolean }>('/approval-queue/held/dismiss', {
+      method: 'POST',
+      body: JSON.stringify({ entity_type: entityType, entity_id: entityId, field_name: fieldName, value }),
+    }),
+  // Wave 6 UX — per-field permanent lock
+  listFieldLocks: (entityType: string, entityId: string) =>
+    request<{ fields: Array<{ field_name: string; permanently_locked: boolean; last_human_edit_at: string | null }> }>(
+      `/field-locks?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}`
+    ),
+  toggleFieldLock: (entityType: string, entityId: string, fieldName: string, locked: boolean) =>
+    request<{ ok: boolean; field_name: string; locked: boolean }>('/field-locks', {
+      method: 'POST',
+      body: JSON.stringify({ entity_type: entityType, entity_id: entityId, field_name: fieldName, locked }),
+    }),
   getContactPendingUpdates: (id: string) =>
     request<{ updates: any[] }>(`/contacts/${id}/pending-updates`),
 
