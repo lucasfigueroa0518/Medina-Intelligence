@@ -214,7 +214,7 @@ export async function sweepApprovalQueue(
           // the same defaults the evaluator uses cold-path.
           const stateRow = await env.D1.prepare(
             `SELECT id, current_value, current_value_sources, pending_proposals,
-                    rejected_values, last_human_edit_at, permanently_locked
+                    pending_deletions, rejected_values, last_human_edit_at, permanently_locked
                FROM entity_field_state
                WHERE entity_type = ? AND entity_id = ? AND field_name = ?`
           ).bind(row.entity_type, row.entity_id, row.field_name!).first<{
@@ -222,6 +222,7 @@ export async function sweepApprovalQueue(
             current_value: string | null;
             current_value_sources: string;
             pending_proposals: string;
+            pending_deletions: string;
             rejected_values: string;
             last_human_edit_at: string | null;
             permanently_locked: number;
@@ -238,14 +239,20 @@ export async function sweepApprovalQueue(
               current_value: null,
               current_value_sources: '[]',
               pending_proposals: '{}',
+              pending_deletions: '[]',
               rejected_values: '{}',
               last_human_edit_at: null,
               permanently_locked: 0,
             },
             currentSources: stateRow ? safeArray(stateRow.current_value_sources) : [],
             pending: stateRow ? safeMap(stateRow.pending_proposals) : {},
+            // The sweep is for legacy approval_queue rows which were
+            // never deletion-shaped — pending_deletions stays empty
+            // for the dry-run decision context.
+            pendingDeletions: stateRow ? safeArray(stateRow.pending_deletions) : [],
             rejected: stateRow ? safeRejected(stateRow.rejected_values) : {},
             proposedValue: proposal.proposedValue,
+            proposedDeletion: false,
           });
           tally(stats, decision.disposition);
           continue;

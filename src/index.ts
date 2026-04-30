@@ -20,6 +20,7 @@ import * as Tags from './handlers/tags';
 import * as Tasks from './handlers/tasks';
 import * as Documents from './handlers/documents';
 import * as Approval from './handlers/approval';
+import * as Observations from './handlers/observations';
 import * as Sync from './handlers/sync';
 import * as AuditLog from './handlers/audit-log';
 import * as Admin from './handlers/admin';
@@ -489,6 +490,12 @@ async function routeAuthenticated(
   if (path === '/api/field-locks' && method === 'POST') {
     return Approval.toggleFieldLock(request, ctx, env);
   }
+
+  // Q12 — synthetic observations (entity-scoped list + per-row dismiss).
+  m = path.match(/^\/api\/entities\/(contact|company|deal)\/([^/]+)\/observations$/);
+  if (m && method === 'GET') return Observations.listEntityObservations(m[1], m[2], ctx, env);
+  m = path.match(/^\/api\/observations\/([^/]+)\/dismiss$/);
+  if (m && method === 'POST') return Observations.dismissEntityObservation(m[1], ctx, env);
 
   // --- Agent ---
   if (path === '/api/agent/query' && method === 'POST') {

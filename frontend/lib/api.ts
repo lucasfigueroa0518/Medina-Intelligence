@@ -367,6 +367,43 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ entity_type: entityType, entity_id: entityId, field_name: fieldName, locked }),
     }),
+  // Q11 — held DELETION (clear-this-field) approve/dismiss. Backend
+  // overload of the same endpoints with is_deletion=true.
+  approveHeldDeletion: (entityType: string, entityId: string, fieldName: string) =>
+    request<{ ok: boolean; deletion: true }>('/approval-queue/held/approve', {
+      method: 'POST',
+      body: JSON.stringify({
+        entity_type: entityType, entity_id: entityId, field_name: fieldName,
+        is_deletion: true,
+      }),
+    }),
+  dismissHeldDeletion: (entityType: string, entityId: string, fieldName: string) =>
+    request<{ ok: boolean; deletion: true }>('/approval-queue/held/dismiss', {
+      method: 'POST',
+      body: JSON.stringify({
+        entity_type: entityType, entity_id: entityId, field_name: fieldName,
+        is_deletion: true,
+      }),
+    }),
+  // Q12 — synthetic observations (separate table, not approval_queue).
+  listEntityObservations: (entityType: string, entityId: string) =>
+    request<{
+      observations: Array<{
+        id: string;
+        observation_type: string;
+        observation_value: string;
+        channels: string[];
+        confidence: number;
+        evidence: string | null;
+        source_communication_id: string | null;
+        first_observed_at: string;
+        last_observed_at: string;
+      }>;
+    }>(`/entities/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}/observations`),
+  dismissObservation: (observationId: string) =>
+    request<{ ok: boolean }>(`/observations/${encodeURIComponent(observationId)}/dismiss`, {
+      method: 'POST',
+    }),
   getContactPendingUpdates: (id: string) =>
     request<{ updates: any[] }>(`/contacts/${id}/pending-updates`),
 

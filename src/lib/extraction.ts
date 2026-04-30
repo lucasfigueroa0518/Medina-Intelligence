@@ -8,6 +8,7 @@ import { callClaude } from './claude';
 import { truncateToTokens } from './tokens';
 import { hashShort } from './helpers';
 import { proposeEntityUpdate, type SourceType } from './progressive-enrichment';
+import { isSyntheticType, recordSyntheticObservation } from './synthetic-observations';
 import { LLM_PROMPTS } from '../prompts';
 
 // Fields that proposeEntityUpdate knows how to route. Anything outside this
@@ -208,15 +209,30 @@ export async function extractEnrichmentSignals(
           context: { userId: observerUserId, conversationId: conversation.id },
         }
       );
+    } else if (isSyntheticType(signal.field)) {
+      // Q12 — synthetic observation. Goes to synthetic_observations,
+      // NOT approval_queue. Same channel resolution flows through;
+      // append-with-merge means a second observation of the same value
+      // strengthens the row instead of creating a new queue item.
+      await recordSyntheticObservation({
+        orgId,
+        entityType: signal.entity_type,
+        entityId,
+        observationType: signal.field,
+        observationValue: proposed,
+        source: 'llm_extraction',
+        context: { userId: observerUserId, conversationId: conversation.id },
+        confidence: signal.confidence,
+        evidence: signal.evidence || null,
+        sourceCommunicationId: conversation.id,
+      }, env);
     } else {
       const idempotencyKey = `${orgId}:${entityId}:${signal.field}:${hashShort(
         JSON.stringify(signal.value)
       )}`;
-      // Wave 6 payload contract: { value, metadata: { source_type,
-      // source_description, context } }. Non-progressive fields
-      // (synthetic LLM observations like personal_update,
-      // follow_up_commitment) don't have a "current_value" to compare —
-      // they're observations, not field overrides.
+      // Pre-Q12 path — kept for any non-progressive non-synthetic field
+      // the LLM might emit that doesn't fit either model. Emits the
+      // same Wave 6 payload envelope so the existing UI renders cleanly.
       const proposedValue = JSON.stringify({
         value: signal.value,
         metadata: {
