@@ -1486,3 +1486,109 @@ export async function backfillAttachments(
 
   return jsonResponse({ ...result, remaining });
 }
+
+// Wave 5 Phase D — reclassify existing documents. Re-fetches from R2,
+// re-extracts via the new (unpdf-backed) pipeline, and re-classifies via
+// the cheap filename → LLM three-tier path. Targets the 1,337 'other'
+// rows + the 695 empty-preview PDF subset.
+//
+// Validation flow (per Lucas's pin):
+//   1. dry_run=true, batch_size=20 → returns BEFORE/AFTER for ALL 20.
+//      Eyeball the preview_excerpt outputs.
+//   2. If samples look right, dry_run=false, batch_size=10. Loop until
+//      rows_remaining=0.
+//
+// CF subrequest cap: batch=10, concurrency=3 → ~3-4 subrequests/row × 10
+// = ~30-40, comfortably under 50/request. Wall ~10s/call. 1,337 ÷ 10 ≈
+// 134 calls × 10s = ~22 min full drain.
+export async function reclassifyDocuments(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('FORBIDDEN', 403, 'owner role required');
+  }
+
+  const body = await parseJsonBody<{
+    batch_size?: number;
+    document_type_filter?: string;
+    mime_type_filter?: string;
+    dry_run?: boolean;
+    concurrency?: number;
+    document_ids?: string[];
+  }>(request) || {};
+
+  // Hard caps — exceed these and we risk CF subrequest cap or 30s CPU.
+  // dry_run unlocks larger batches because no LLM calls fire on the
+  // high-conf path; useful for the validation 20-sample.
+  const maxBatch = body.dry_run === true ? 20 : 10;
+  const batchSize = Math.min(Math.max(1, body.batch_size || (body.dry_run ? 20 : 8)), maxBatch);
+  const concurrency = Math.min(Math.max(1, body.concurrency || 3), 3);
+  const documentTypeFilter = body.document_type_filter || 'other';
+  const mimeTypeFilter = body.mime_type_filter;
+  const dryRun = body.dry_run === true;
+
+  // Wave 5.5: explicit document_ids targeting. Used by the Phase D
+  // 20-sample validation gate and post-incident spot-checks. Bypasses
+  // document_type / mime_type filters — caller is asserting "process
+  // these specific IDs regardless of their current category."
+  const documentIds = Array.isArray(body.document_ids)
+    ? body.document_ids.filter((s: unknown): s is string => typeof s === 'string' && s.length > 0)
+    : undefined;
+
+  if (documentIds && documentIds.length > maxBatch) {
+    return errorResponse('VALIDATION_ERROR', 400,
+      `document_ids length (${documentIds.length}) exceeds batch cap (${maxBatch}). Split into multiple calls.`);
+  }
+
+  const { runReclassifyBatch, countReclassifyCandidates } = await import('../lib/reclassify-orchestrator');
+
+  // When document_ids is targeted, the candidate pool IS those IDs. Skip
+  // the count query — irrelevant + the IDs may not match the type filter
+  // anyway. After the run, rows_remaining=0 (the explicit list is fully
+  // processed in one call since length is capped at batchSize).
+  const totalBefore = documentIds
+    ? documentIds.length
+    : await countReclassifyCandidates(ctx.orgId, documentTypeFilter, mimeTypeFilter, env);
+
+  if (totalBefore === 0) {
+    return jsonResponse({
+      message: documentIds ? 'document_ids was empty' : 'No documents match the filter',
+      dry_run: dryRun,
+      rows_processed: 0,
+      rows_remaining: 0,
+      rows_reclassified: 0,
+      rows_unchanged: 0,
+      rows_failed: 0,
+      errors: [],
+      sample_changes: [],
+    });
+  }
+
+  const result = await runReclassifyBatch({
+    orgId: ctx.orgId,
+    batchSize,
+    concurrency,
+    documentTypeFilter,
+    mimeTypeFilter,
+    dryRun,
+    documentIds,
+  }, env);
+
+  // Re-count after writes — dry_run keeps the count stable. document_ids
+  // path: caller targeted a finite list, so rows_remaining=0 once
+  // processed (or whatever didn't hit the safety floor: deleted_at /
+  // excluded / wrong-org). Drain path: re-run the count.
+  const rowsRemaining = dryRun
+    ? totalBefore
+    : documentIds
+      ? Math.max(0, documentIds.length - result.rows_processed)
+      : await countReclassifyCandidates(ctx.orgId, documentTypeFilter, mimeTypeFilter, env);
+
+  return jsonResponse({
+    dry_run: dryRun,
+    ...result,
+    rows_remaining: rowsRemaining,
+  });
+}

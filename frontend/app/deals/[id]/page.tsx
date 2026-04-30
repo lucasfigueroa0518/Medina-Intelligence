@@ -10,6 +10,7 @@ import {
   Sparkles, ArrowRight, Lock, Upload, Paperclip,
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
+import { DocumentUploadModal } from '@/components/document-upload-modal';
 import { api } from '@/lib/api';
 
 /* ───────── Stage configuration ───────── */
@@ -193,6 +194,11 @@ export default function DealDetailPage() {
   const [uploading, setUploading] = React.useState(false);
   const [uploadVisibility, setUploadVisibility] = React.useState<'private' | 'org_wide'>('private');
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  // Wave 5 Phase F: drag-drop on the Documents card.
+  const [docDropOver, setDocDropOver] = React.useState(false);
+  const [docUploadOpen, setDocUploadOpen] = React.useState(false);
+  const [docUploadFiles, setDocUploadFiles] = React.useState<File[]>([]);
+  const docDropCounterRef = React.useRef(0);
 
   /* ── Contact search state (Theirs / Other side) ── */
   const [contactQuery, setContactQuery] = React.useState('');
@@ -1265,7 +1271,38 @@ export default function DealDetailPage() {
             </GlassCard>
 
             {/* CARD: Documents */}
-            <GlassCard>
+            <div
+              className="relative"
+              onDragEnter={e => {
+                if (!e.dataTransfer.types.includes('Files')) return;
+                e.preventDefault();
+                docDropCounterRef.current++;
+                setDocDropOver(true);
+              }}
+              onDragOver={e => { if (e.dataTransfer.types.includes('Files')) e.preventDefault(); }}
+              onDragLeave={() => {
+                docDropCounterRef.current = Math.max(0, docDropCounterRef.current - 1);
+                if (docDropCounterRef.current === 0) setDocDropOver(false);
+              }}
+              onDrop={e => {
+                if (!e.dataTransfer.types.includes('Files')) return;
+                e.preventDefault();
+                docDropCounterRef.current = 0;
+                setDocDropOver(false);
+                const dropped = Array.from(e.dataTransfer.files);
+                if (dropped.length > 0) { setDocUploadFiles(dropped); setDocUploadOpen(true); }
+              }}
+            >
+              {docDropOver && (
+                <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none rounded-xl"
+                  style={{ background: 'rgba(217,70,168,0.08)', border: '2px dashed rgba(217,70,168,0.5)' }}>
+                  <div className="px-3 py-2 rounded-lg bg-bg-elevated border border-border shadow-xl flex items-center gap-2">
+                    <Upload size={14} className="text-accent-magenta" />
+                    <span className="text-xs font-medium text-text-primary">Drop to attach to this deal</span>
+                  </div>
+                </div>
+              )}
+              <GlassCard>
               <div className="flex items-center justify-between mb-3">
                 <div className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display flex items-center gap-1.5">
                   <FileText size={11} /> Documents
@@ -1342,9 +1379,18 @@ export default function DealDetailPage() {
                 </div>
               )}
             </GlassCard>
+            </div>
           </div>
         </div>
       </div>
+
+      <DocumentUploadModal
+        open={docUploadOpen}
+        onClose={() => { setDocUploadOpen(false); setDocUploadFiles([]); }}
+        onUploaded={() => { setRefreshKey(k => k + 1); setToast('Documents uploaded'); }}
+        initialFiles={docUploadFiles}
+        dealId={id}
+      />
 
       {/* ── Delete modal ── */}
       {deleteOpen && (

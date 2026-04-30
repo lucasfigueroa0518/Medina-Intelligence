@@ -5,6 +5,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
 import { extractTextFromFile } from '../lib/file-extraction';
 import { classifyDocument } from '../lib/document-intelligence';
+import { classifyByFilename } from '../lib/document-filename-classifier';
 import { emitAudit } from '../lib/audit';
 import { persistDocument } from '../lib/persist-document';
 import {
@@ -148,6 +149,7 @@ async function processUpload(args: ProcessArgs): Promise<void> {
 
   let extractedText = '';
   let preview: string | null = null;
+  let extractionError: string | undefined;
 
   if (extractable) {
     try {
@@ -163,8 +165,9 @@ async function processUpload(args: ProcessArgs): Promise<void> {
                                   extracted_text = ?, preview_text = ?
          WHERE id = ?`
       ).bind(extractedText, preview, id).run();
-    } catch (e) {
-      console.error(`[chat-uploads] extraction failed for ${id}:`, e);
+    } catch (e: any) {
+      extractionError = String(e?.message || e);
+      console.error(`[chat-uploads] extraction failed for ${id}:`, extractionError);
       await env.D1.prepare(
         `UPDATE chat_uploads SET extraction_status = 'failed' WHERE id = ?`
       ).bind(id).run().catch(() => {});
@@ -188,12 +191,23 @@ async function processUpload(args: ProcessArgs): Promise<void> {
     const buffer = await obj.arrayBuffer();
     const docFile = new File([buffer], filename, { type: file.type });
 
+    // Wave 5 Phase C: cheap filename pre-classifier. Skip when extraction
+    // already failed — the row will land 'failed' regardless. high → skip
+    // LLM, medium → call LLM with hint, null → existing LLM-only path.
     let classifiedType = 'other';
-    if (extractedText.length > 20) {
+    const cheap = extractionError ? null : classifyByFilename(filename);
+    if (cheap?.confidence === 'high') {
+      classifiedType = cheap.category;
+      console.log(`[doc-intel] cheap=${cheap.category} (high) skip-llm "${filename}"`);
+    } else if (extractedText.length > 20) {
       try {
-        const cls = await classifyDocument(extractedText, filename, env, ctx.orgId);
+        const cls = await classifyDocument(extractedText, filename, env, ctx.orgId, cheap);
         classifiedType = cls.category;
+        console.log(`[doc-intel] llm=${cls.category} cheap=${cheap?.category || 'null'} "${filename}"`);
       } catch { /* keep default */ }
+    } else if (cheap?.confidence === 'medium') {
+      classifiedType = cheap.category;
+      console.log(`[doc-intel] cheap=${cheap.category} (medium, no text) "${filename}"`);
     }
 
     const persisted = await persistDocument({
@@ -206,6 +220,7 @@ async function processUpload(args: ProcessArgs): Promise<void> {
       links: [],
       documentType: classifiedType,
       preExtractedText: extractedText,
+      extractionError,
       embed: true,
     }, env);
     await persisted.finalize();

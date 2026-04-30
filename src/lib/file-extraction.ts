@@ -1,5 +1,17 @@
 // TRD §18.6 — Extract text from uploaded files
-// Uses dynamic imports so Workers bundles pdf-parse + mammoth on demand.
+//
+// Wave 5 Phase A: extraction failures NO LONGER silently return ''. Each
+// binary-format branch (PDF / DOCX / XLSX / PPTX) re-throws with a wrapping
+// context, so callers can:
+//   1) propagate the throw → persistDocument finalize() catches and marks
+//      processing_status='failed' + error_message
+//   2) catch locally and decide per-pipeline (e.g. intelligent_import keeps
+//      ingesting but with no text payload)
+// The CSV / text / markdown / JSON branch returns file.text() directly — no
+// parser to fail. The "Unsupported file type" branch still returns '' (it's
+// a known case, not an error).
+
+import { extractText } from 'unpdf';
 
 export async function extractTextFromFile(file: File): Promise<string> {
   const mimeType = file.type.toLowerCase();
@@ -8,16 +20,10 @@ export async function extractTextFromFile(file: File): Promise<string> {
   if (mimeType === 'application/pdf' || fileName.endsWith('.pdf')) {
     try {
       const buffer = await file.arrayBuffer();
-      // @ts-expect-error — pdf-parse has no TypeScript types
-      const mod = await import('pdf-parse');
-      const pdfParse = (mod as any).default || mod;
-      // Buffer is available at runtime via nodejs_compat flag
-      const BufferCtor = (globalThis as any).Buffer;
-      const result = await pdfParse(BufferCtor.from(buffer));
-      return result.text as string;
-    } catch (e) {
-      console.error('PDF extraction failed:', e);
-      return '';
+      const { text } = await extractText(new Uint8Array(buffer), { mergePages: true });
+      return text;
+    } catch (e: any) {
+      throw new Error(`PDF extraction failed: ${e?.message || e}`);
     }
   }
 
@@ -31,9 +37,8 @@ export async function extractTextFromFile(file: File): Promise<string> {
       const mammoth = (mod as any).default || mod;
       const result = await mammoth.extractRawText({ buffer });
       return result.value;
-    } catch (e) {
-      console.error('DOCX extraction failed:', e);
-      return '';
+    } catch (e: any) {
+      throw new Error(`DOCX extraction failed: ${e?.message || e}`);
     }
   }
 
@@ -54,9 +59,8 @@ export async function extractTextFromFile(file: File): Promise<string> {
         if (csv.trim()) rows.push(`--- Sheet: ${sheetName} ---\n${csv}`);
       }
       return rows.join('\n\n');
-    } catch (e) {
-      console.error('XLSX extraction failed:', e);
-      return '';
+    } catch (e: any) {
+      throw new Error(`XLSX extraction failed: ${e?.message || e}`);
     }
   }
 
@@ -78,9 +82,8 @@ export async function extractTextFromFile(file: File): Promise<string> {
         if (texts.length > 0) slides.push(texts.join(' '));
       }
       return slides.join('\n\n');
-    } catch (e) {
-      console.error('PPTX extraction failed:', e);
-      return '';
+    } catch (e: any) {
+      throw new Error(`PPTX extraction failed: ${e?.message || e}`);
     }
   }
 
@@ -97,6 +100,8 @@ export async function extractTextFromFile(file: File): Promise<string> {
     return await file.text();
   }
 
+  // Known case, not an error: nothing to extract from this format. Caller
+  // gets an empty string and proceeds (classifier sees filename only).
   console.warn(`Unsupported file type for text extraction: ${mimeType} (${fileName})`);
   return '';
 }

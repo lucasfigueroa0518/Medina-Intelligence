@@ -62,6 +62,12 @@ export async function listDocuments(
   // than asking the UI to know the current user's UUID.
   const minePreset = sp.get('mine') === 'true';
 
+  // Wave 5 Phase B: junk-mime / placeholder rows are stamped
+  // processing_status='excluded' (denylist applied at ingest pre-persist;
+  // backfill via migration 0067). They're invisible to the list by default;
+  // power-user / admin debug surfaces opt in via ?include_excluded=true.
+  const includeExcluded = sp.get('include_excluded') === 'true';
+
   // Sort + order — whitelist column to prevent SQL injection. Default is
   // newest-added first (created_at DESC) which matches the contacts list UX.
   const sortKey = sp.get('sort') || 'created_at';
@@ -80,6 +86,10 @@ export async function listDocuments(
 
   const where: string[] = ['d.org_id = ?', 'd.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
+
+  if (!includeExcluded) {
+    where.push("d.processing_status != 'excluded'");
+  }
 
   if (sources?.length) {
     where.push(`d.source IN (${sources.map(() => '?').join(',')})`);
@@ -208,16 +218,18 @@ export async function getDocumentFilterCounts(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
+  // Wave 5 Phase B: facet counts exclude denylisted ('excluded') rows so
+  // the badges reconcile with the default list view, which also hides them.
   const [sourceCounts, typeCounts, dateBucketRow, mineRow] = await Promise.all([
     env.D1.prepare(
       `SELECT source, COUNT(*) as cnt FROM documents
-        WHERE org_id = ? AND deleted_at IS NULL
+        WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'
         GROUP BY source`
     ).bind(ctx.orgId).all<{ source: string; cnt: number }>(),
 
     env.D1.prepare(
       `SELECT document_type, COUNT(*) as cnt FROM documents
-        WHERE org_id = ? AND deleted_at IS NULL
+        WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'
         GROUP BY document_type`
     ).bind(ctx.orgId).all<{ document_type: string; cnt: number }>(),
 
@@ -227,12 +239,13 @@ export async function getDocumentFilterCounts(
          SUM(CASE WHEN created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') THEN 1 ELSE 0 END) as last_30d,
          SUM(CASE WHEN created_at <  strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') THEN 1 ELSE 0 END) as older
        FROM documents
-       WHERE org_id = ? AND deleted_at IS NULL`
+       WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'`
     ).bind(ctx.orgId).first<{ last_7d: number; last_30d: number; older: number }>(),
 
     env.D1.prepare(
       `SELECT COUNT(*) as cnt FROM documents
-        WHERE org_id = ? AND deleted_at IS NULL AND uploaded_by = ?`
+        WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'
+          AND uploaded_by = ?`
     ).bind(ctx.orgId, ctx.userId).first<{ cnt: number }>(),
   ]);
 

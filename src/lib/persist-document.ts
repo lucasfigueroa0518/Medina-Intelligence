@@ -20,12 +20,16 @@ import type { Env } from '../types/env';
 import type { ChunkMetadata } from '../types/interfaces';
 import { extractTextFromFile } from './file-extraction';
 import { classifyDocument } from './document-intelligence';
+import { classifyByFilename } from './document-filename-classifier';
 import { chunkEmbedAndPersistAll } from './embedding';
 
+// Wave 5 Phase E canonicalized to 4 active values. Legacy 'upload' and
+// 'manual' strings are migrated to canonical names by 0068 backfill.
+// 'drive_import' and 'meeting_transcript' have no callers yet but are
+// reserved for future ingest pipelines (cheap to keep in the type).
 export type DocumentSource =
   | 'email_attachment'
   | 'manual_upload'
-  | 'upload'                 // legacy alias for manual_upload (kept so existing rows match)
   | 'intelligent_import'
   | 'chat_upload'
   | 'drive_import'
@@ -67,6 +71,11 @@ export interface PersistDocumentInput {
   parentDocumentId?: string;
   /** Extracted text from a prior step. If provided, finalize() skips extraction. */
   preExtractedText?: string;
+  /** Caller pre-extracted and the parser threw. finalize() will skip extract +
+   *  classify + embed and stamp processing_status='failed' with this message in
+   *  documents.error_message. Wave 5 Phase A — closes the silent-fail class on
+   *  email_attachment / chat_upload / intelligent_import pre-extract sites. */
+  extractionError?: string;
 
   /** Default true. When false, dedup-on-hash is bypassed and a new row is always created. */
   dedupOnContentHash?: boolean;
@@ -206,9 +215,10 @@ export async function persistDocument(
     ? JSON.stringify(input.participantUserIds)
     : null;
 
-  // Normalize legacy 'manual_upload' to 'upload' so `source` matches existing
-  // rows produced by the manual handler — keeps cross-pipeline filters simple.
-  const sourceValue = input.source === 'manual_upload' ? 'upload' : input.source;
+  // Wave 5 Phase E: source is stored verbatim. The legacy
+  // `manual_upload → upload` normalization is gone; existing rows in the
+  // 'upload' / 'manual' state are migrated to canonical names by 0068.
+  const sourceValue = input.source;
 
   try {
     await env.D1.prepare(
@@ -265,6 +275,7 @@ export async function persistDocument(
   const fileForFinalize = input.file;
   const userProvidedType = input.documentType;
   const preExtractedText = input.preExtractedText;
+  const extractionError = input.extractionError;
   const wantEmbed = input.embed !== false;
   const links = input.links;
   const visibility = input.visibility;
@@ -277,17 +288,68 @@ export async function persistDocument(
         `UPDATE documents SET processing_status = 'processing' WHERE id = ?`
       ).bind(documentId).run();
 
-      const text = preExtractedText !== undefined
-        ? preExtractedText
-        : await extractTextFromFile(fileForFinalize);
+      // Wave 5 Phase A: caller pre-extract failed — persist as failed, skip
+      // classify + embed. Without this branch the row would silently land
+      // `'completed'` with empty preview + `'other'` category (the
+      // 695-PDF silent-fail class).
+      if (extractionError !== undefined) {
+        await env.D1.prepare(
+          `UPDATE documents
+              SET processing_status = 'failed',
+                  error_message = ?,
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?`
+        ).bind(extractionError.slice(0, 500), documentId).run();
+        return;
+      }
+
+      // Extract — only when caller didn't pre-extract. Throws here are
+      // caught locally so we mark `'failed'` + populate error_message,
+      // rather than letting the outer catch confuse extract failures with
+      // classify/embed failures.
+      let text: string;
+      if (preExtractedText !== undefined) {
+        text = preExtractedText;
+      } else {
+        try {
+          text = await extractTextFromFile(fileForFinalize);
+        } catch (e: any) {
+          const msg = String(e?.message || e).slice(0, 500);
+          console.error(`[persistDocument:finalize] extract failed for ${documentId}: ${msg}`);
+          await env.D1.prepare(
+            `UPDATE documents
+                SET processing_status = 'failed',
+                    error_message = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE id = ?`
+          ).bind(msg, documentId).run();
+          return;
+        }
+      }
       const preview = text.slice(0, 500);
 
+      // Wave 5 Phase C: cheap filename pre-classifier before LLM. Only
+      // applies when caller didn't pre-classify (userProvidedType is undef).
+      // Tier disposition:
+      //   high   → use directly, skip LLM
+      //   medium → call LLM with cheap match as a hint
+      //   null   → existing LLM-only path
       let finalType = userProvidedType || 'other';
-      if (!userProvidedType && text.length > 20) {
-        try {
-          const cls = await classifyDocument(text, input.file.name, env, input.orgId);
-          finalType = cls.category;
-        } catch { /* keep 'other' */ }
+      if (!userProvidedType) {
+        const cheap = classifyByFilename(input.file.name);
+        if (cheap?.confidence === 'high') {
+          finalType = cheap.category;
+          console.log(`[doc-intel] cheap=${cheap.category} (high) skip-llm "${input.file.name}"`);
+        } else if (text.length > 20) {
+          try {
+            const cls = await classifyDocument(text, input.file.name, env, input.orgId, cheap);
+            finalType = cls.category;
+            console.log(`[doc-intel] llm=${cls.category} cheap=${cheap?.category || 'null'} "${input.file.name}"`);
+          } catch { /* keep 'other' */ }
+        } else if (cheap?.confidence === 'medium') {
+          finalType = cheap.category;
+          console.log(`[doc-intel] cheap=${cheap.category} (medium, no text) "${input.file.name}"`);
+        }
       }
 
       if (wantEmbed && text.length > 10) {
@@ -333,10 +395,15 @@ export async function persistDocument(
           WHERE id = ?`
       ).bind(finalType, preview, documentId).run();
     } catch (e: any) {
-      console.error(`[persistDocument:finalize] failed for ${documentId}:`, e?.message || e);
+      const msg = String(e?.message || e).slice(0, 500);
+      console.error(`[persistDocument:finalize] failed for ${documentId}: ${msg}`);
       await env.D1.prepare(
-        `UPDATE documents SET processing_status = 'failed' WHERE id = ?`
-      ).bind(documentId).run().catch(() => undefined);
+        `UPDATE documents
+            SET processing_status = 'failed',
+                error_message = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`
+      ).bind(msg, documentId).run().catch(() => undefined);
     }
   };
 

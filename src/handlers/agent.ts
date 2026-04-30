@@ -510,7 +510,15 @@ export async function queryAgent(
     // pass `upload_ids` instead.
     const file = form.get('file') as File | null;
     if (file && file.size > 0) {
-      uploadedText = await extractTextFromFile(file);
+      // Wave 5 Phase A: legacy single-file path — extraction now throws
+      // on parser failure. Catch and proceed with empty text rather than
+      // crashing the agent turn.
+      try {
+        uploadedText = await extractTextFromFile(file);
+      } catch (e: any) {
+        console.error(`[agent] legacy upload extract failed: ${e?.message || e}`);
+        uploadedText = '';
+      }
     }
     const rawIds = form.get('upload_ids');
     if (typeof rawIds === 'string' && rawIds.trim()) {

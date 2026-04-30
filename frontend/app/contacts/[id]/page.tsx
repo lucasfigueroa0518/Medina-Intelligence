@@ -13,6 +13,7 @@ import { TopBar } from '@/components/top-bar';
 import { Timeline, TimelineEntry } from '@/components/timeline';
 import { CompanySearchField } from '@/components/company-search-field';
 import { TagPicker } from '@/components/tag-picker';
+import { DocumentUploadModal } from '@/components/document-upload-modal';
 import { api } from '@/lib/api';
 
 type Tab = 'overview' | 'timeline' | 'associations' | 'documents' | 'deals';
@@ -83,6 +84,12 @@ export default function ContactDetailPage() {
   const [uploading, setUploading] = React.useState(false);
   const [uploadVisibility, setUploadVisibility] = React.useState<'private' | 'org_wide'>('private');
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  // Wave 5 Phase F: drag-drop on the Documents tab. Existing single-file
+  // inline button is kept; drop opens the new multi-file modal instead.
+  const [docDropOver, setDocDropOver] = React.useState(false);
+  const [docUploadOpen, setDocUploadOpen] = React.useState(false);
+  const [docUploadFiles, setDocUploadFiles] = React.useState<File[]>([]);
+  const docDropCounterRef = React.useRef(0);
 
   React.useEffect(() => {
     setLoading(true);
@@ -829,7 +836,37 @@ export default function ContactDetailPage() {
           </div>
         )}
         {activeTab === 'documents' && (
-          <div>
+          <div
+            className="relative"
+            onDragEnter={e => {
+              if (!e.dataTransfer.types.includes('Files')) return;
+              e.preventDefault();
+              docDropCounterRef.current++;
+              setDocDropOver(true);
+            }}
+            onDragOver={e => { if (e.dataTransfer.types.includes('Files')) e.preventDefault(); }}
+            onDragLeave={() => {
+              docDropCounterRef.current = Math.max(0, docDropCounterRef.current - 1);
+              if (docDropCounterRef.current === 0) setDocDropOver(false);
+            }}
+            onDrop={e => {
+              if (!e.dataTransfer.types.includes('Files')) return;
+              e.preventDefault();
+              docDropCounterRef.current = 0;
+              setDocDropOver(false);
+              const dropped = Array.from(e.dataTransfer.files);
+              if (dropped.length > 0) { setDocUploadFiles(dropped); setDocUploadOpen(true); }
+            }}
+          >
+            {docDropOver && (
+              <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none rounded-xl"
+                style={{ background: 'rgba(217,70,168,0.08)', border: '2px dashed rgba(217,70,168,0.5)' }}>
+                <div className="px-4 py-2.5 rounded-lg bg-bg-elevated border border-border shadow-xl flex items-center gap-2.5">
+                  <Upload size={18} className="text-accent-magenta" />
+                  <span className="text-sm font-medium text-text-primary">Drop to attach to this contact</span>
+                </div>
+              </div>
+            )}
             <div className="flex items-center justify-between mb-5">
               <div className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
                 Documents ({documents.length})
@@ -925,6 +962,14 @@ export default function ContactDetailPage() {
         )}
         {activeTab === 'deals' && <div className="text-center text-text-muted py-12">No deals linked</div>}
       </div>
+
+      <DocumentUploadModal
+        open={docUploadOpen}
+        onClose={() => { setDocUploadOpen(false); setDocUploadFiles([]); }}
+        onUploaded={() => { setRefreshKey(k => k + 1); setToast('Documents uploaded'); }}
+        initialFiles={docUploadFiles}
+        contactId={id}
+      />
 
       {/* Delete modal */}
       {deleteOpen && (

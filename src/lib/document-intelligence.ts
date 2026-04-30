@@ -9,6 +9,7 @@ import { chunkEmbedAndPersistAll } from './embedding';
 import { extractTextFromFile } from './file-extraction';
 import { emitAudit } from './audit';
 import { persistDocument } from './persist-document';
+import { classifyByFilename } from './document-filename-classifier';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types
@@ -166,10 +167,18 @@ export async function classifyDocument(
   text: string,
   fileName: string,
   env: Env,
-  orgId: string
+  orgId: string,
+  // Wave 5 Phase C: optional cheap-filename hint. When provided, the prompt
+  // appends a one-liner with the filename classifier's medium-confidence
+  // guess. The LLM is still authoritative — it can override — but biases
+  // toward the cheap signal in ambiguous cases.
+  hint?: { category: DocumentCategory; reason?: string } | null
 ): Promise<{ category: DocumentCategory; confidence: number }> {
   const preview = text.slice(0, 3000);
-  const userPrompt = `File name: ${fileName}\n\nContent preview:\n${preview || '(no extractable text — classify based on filename and extension alone)'}`;
+  const hintLine = hint
+    ? `\n\nFilename hint: this looks like \`${hint.category}\` based on naming conventions${hint.reason ? ` (${hint.reason})` : ''}. Confirm or override.`
+    : '';
+  const userPrompt = `File name: ${fileName}\n\nContent preview:\n${preview || '(no extractable text — classify based on filename and extension alone)'}${hintLine}`;
 
   try {
     const response = await callClaude(
@@ -628,30 +637,43 @@ export async function processIntelligentImport(
     }
   };
 
-  // Try to extract text. If extraction fails or yields nothing, we still
-  // ingest the file — it just lands as `reference` with no entity payload.
+  // Try to extract text. If the parser throws, persist as `'failed'` with
+  // the error captured in documents.error_message — Wave 5 Phase A closes
+  // the silent-fail class. Empty-but-no-throw text is still ingested as
+  // `reference` with no entity payload (legitimate case for image-only
+  // PDFs etc).
   let text = '';
   let extractionFailed = false;
+  let extractionError: string | undefined;
   try {
     text = await extractTextFromFile(file);
   } catch (e: any) {
     extractionFailed = true;
-    errors.push(`Text extraction: ${e?.message || e}`);
+    extractionError = String(e?.message || e);
+    errors.push(`Text extraction: ${extractionError}`);
   }
   const hasUsableText = !!text && text.trim().length >= 20;
   if (!hasUsableText) extractionFailed = true;
 
-  // Classify — even when text is empty, the classifier sees the filename and
-  // returns a category (or `reference` on hard failure). Never throws.
-  const { category, confidence: classConfidence } = await classifyDocument(
-    text,
-    file.name,
-    env,
-    orgId
-  );
-  console.log(
-    `[doc-intel] classified "${file.name}" as ${category} (confidence: ${classConfidence}, text_extracted: ${hasUsableText})`
-  );
+  // Wave 5 Phase C: cheap filename classifier first. high → skip LLM,
+  // medium → pass as hint to LLM, null → LLM-only path. Even when text
+  // is empty, classifier sees the filename and returns a category (or
+  // `reference` on hard failure). Never throws.
+  const cheap = classifyByFilename(file.name);
+  let category: DocumentCategory;
+  let classConfidence: number;
+  if (cheap?.confidence === 'high') {
+    category = cheap.category;
+    classConfidence = 0.9;
+    console.log(`[doc-intel] cheap=${cheap.category} (high) skip-llm "${file.name}"`);
+  } else {
+    const result = await classifyDocument(text, file.name, env, orgId, cheap);
+    category = result.category;
+    classConfidence = result.confidence;
+    console.log(
+      `[doc-intel] llm=${category} cheap=${cheap?.category || 'null'} (confidence: ${classConfidence}, text_extracted: ${hasUsableText}) "${file.name}"`
+    );
+  }
 
   // Run base + category-specific extraction. Empty text → empty result, no Claude call wasted.
   const extraction = await extractEntities(text, category, env, orgId);
@@ -672,6 +694,7 @@ export async function processIntelligentImport(
     links: [],  // intelligent_import creates entities; back-linking is a future feature
     documentType: category,
     preExtractedText: text,
+    extractionError,
     embed: true,
   }, env);
   const documentId = persisted.documentId;

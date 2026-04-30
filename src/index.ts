@@ -581,6 +581,8 @@ async function routeAuthenticated(
       return Admin.backfillUnembedded(request, ctx, env);
     if (path === '/api/admin/backfill-attachments' && method === 'POST')
       return Admin.backfillAttachments(request, ctx, env);
+    if (path === '/api/admin/reclassify-documents' && method === 'POST')
+      return Admin.reclassifyDocuments(request, ctx, env);
 
     // Wave 3 cleanup endpoints (owner-only enforced inside each handler).
     // Run order: evidence-preservation → d1-phase2 → dangling-vectors-batch (loop) → dangling-docs-batch (loop).
