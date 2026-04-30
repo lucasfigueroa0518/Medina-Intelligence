@@ -651,6 +651,8 @@ async function routeAuthenticated(
       return Admin.getEmbedQueueHealth(ctx, env);
     if (path === '/api/admin/process-embed-queue' && method === 'POST')
       return Admin.processEmbedQueue(ctx, env);
+    if (path === '/api/admin/recover-deal-conversation-links' && method === 'POST')
+      return Admin.recoverDealConversationLinks(request, ctx, env);
     if (path === '/api/admin/progressive-backfill' && method === 'POST')
       return Admin.createProgressiveBackfillHandler(request, ctx, env);
     if (path === '/api/admin/progressive-backfill' && method === 'GET')

@@ -1592,3 +1592,45 @@ export async function reclassifyDocuments(
     rows_remaining: rowsRemaining,
   });
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/recover-deal-conversation-links — Day-5 hotfix
+// ---------------------------------------------------------------------------
+// One-time recovery sweep across the org's deals: for each non-deleted deal,
+// find every contact at the deal's company (contact.company_id ==
+// deal.company_id) and INSERT OR IGNORE into deal_contacts. Closes the
+// historical gap from before the auto-population paths shipped — existing
+// deals that had no deal_contacts entries get retroactively linked.
+//
+// Body: { dry_run?: boolean }  // default false
+//
+// Owner-only. Returns per-deal report so operators can eyeball before live
+// run. Idempotent: re-running a live sweep over already-linked deals
+// produces zero new inserts.
+//
+// Side effect on completion: the existing deal_intelligence event-driven
+// invalidation hook in stage-approvals.ts won't fire from this admin path
+// (we're not staging conversations). Affected deals' intelligence rows
+// will be picked up by the hourly refreshStaleIntelligence sweep that T3
+// already ships, OR will recompute on next read of the intelligence
+// endpoint. No manual invalidation needed.
+export async function recoverDealConversationLinks(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can run deal-conversation link recovery.');
+  }
+  const body = await parseJsonBody<{ dry_run?: boolean }>(request);
+  const dryRun = body?.dry_run === true;
+
+  const { recoverDealContactLinks } = await import('../lib/deal-association');
+  const result = await recoverDealContactLinks(ctx.orgId, env, { dry_run: dryRun });
+
+  return jsonResponse({
+    ok: true,
+    dry_run: dryRun,
+    ...result,
+  });
+}
