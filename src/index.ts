@@ -602,6 +602,18 @@ async function routeAuthenticated(
       const { handleEnsureGraphSubscriptions } = await import('./handlers/ensure-graph-subscriptions');
       return handleEnsureGraphSubscriptions(request, ctx, env);
     }
+    if (path === '/api/admin/reconcile-orphaned-fireflies' && method === 'POST') {
+      const { handleReconcileOrphanedFireflies } = await import('./handlers/firefly-reconcile');
+      return handleReconcileOrphanedFireflies(request, ctx, env);
+    }
+    if (path === '/api/admin/diagnose-calendar-sync' && method === 'POST') {
+      const { handleDiagnoseCalendarSync } = await import('./handlers/firefly-reconcile');
+      return handleDiagnoseCalendarSync(request, ctx, env);
+    }
+    if (path === '/api/admin/clear-calendar-delta' && method === 'POST') {
+      const { handleClearCalendarDelta } = await import('./handlers/firefly-reconcile');
+      return handleClearCalendarDelta(request, ctx, env);
+    }
     if (path === '/api/admin/backfill-unembedded' && method === 'POST')
       return Admin.backfillUnembedded(request, ctx, env);
     if (path === '/api/admin/backfill-attachments' && method === 'POST')
