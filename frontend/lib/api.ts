@@ -223,6 +223,8 @@ export const api = {
         participants: Array<{ contact_id: string | null; name: string | null; email: string | null }>;
         messages: Array<{
           id: string;
+          external_message_id: string | null;
+          source: string;
           sender_name: string | null;
           sender_email: string | null;
           sent_at: string;

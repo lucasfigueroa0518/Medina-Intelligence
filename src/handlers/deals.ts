@@ -95,6 +95,11 @@ export async function listDeals(
       // last_activity_date column is left untouched on the wire (still in
       // d.*) — frontend reads the new field with a fallback to the old one.
       // See Day 4 Priority 6 audit, Section 1.3 finding.
+      // Day-5 Phase D: also surface the most-recent linked conversation's
+      // subject + sender for the "Last touched by [name]" subtitle on the
+      // detail page's Last Activity tile. Correlated subqueries reuse the
+      // same two-hop join that powers last_inferred_activity_date so the
+      // subject + sender are guaranteed to match the timestamp.
       `SELECT d.*, co.name AS company_name, co.sector AS company_sector,
               u.full_name AS owner_name, u.email AS owner_email,
               (SELECT COUNT(*) FROM deal_contacts dc WHERE dc.deal_id = d.id) AS contacts_count,
@@ -103,7 +108,20 @@ export async function listDeals(
                  FROM deal_contacts dc
                  JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
                  JOIN conversations conv ON cc.conversation_id = conv.id
-                WHERE dc.deal_id = d.id) AS last_inferred_activity_date
+                WHERE dc.deal_id = d.id) AS last_inferred_activity_date,
+              (SELECT conv.subject
+                 FROM deal_contacts dc
+                 JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+                 JOIN conversations conv ON cc.conversation_id = conv.id
+                WHERE dc.deal_id = d.id
+                ORDER BY conv.sent_at DESC LIMIT 1) AS last_inferred_activity_subject,
+              (SELECT COALESCE(c.full_name, conv.from_email)
+                 FROM deal_contacts dc
+                 JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+                 JOIN conversations conv ON cc.conversation_id = conv.id
+                 LEFT JOIN contacts c ON conv.from_contact_id = c.id
+                WHERE dc.deal_id = d.id
+                ORDER BY conv.sent_at DESC LIMIT 1) AS last_inferred_activity_sender
        FROM deals d
        LEFT JOIN companies co ON d.company_id = co.id
        LEFT JOIN users u ON d.owner_id = u.id
@@ -233,7 +251,20 @@ export async function getDeal(
                FROM deal_contacts dc
                JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
                JOIN conversations conv ON cc.conversation_id = conv.id
-              WHERE dc.deal_id = d.id) AS last_inferred_activity_date
+              WHERE dc.deal_id = d.id) AS last_inferred_activity_date,
+            (SELECT conv.subject
+               FROM deal_contacts dc
+               JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+               JOIN conversations conv ON cc.conversation_id = conv.id
+              WHERE dc.deal_id = d.id
+              ORDER BY conv.sent_at DESC LIMIT 1) AS last_inferred_activity_subject,
+            (SELECT COALESCE(c2.full_name, conv.from_email)
+               FROM deal_contacts dc
+               JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+               JOIN conversations conv ON cc.conversation_id = conv.id
+               LEFT JOIN contacts c2 ON conv.from_contact_id = c2.id
+              WHERE dc.deal_id = d.id
+              ORDER BY conv.sent_at DESC LIMIT 1) AS last_inferred_activity_sender
      FROM deals d
      LEFT JOIN companies co ON d.company_id = co.id
      LEFT JOIN users u ON d.owner_id = u.id
@@ -872,7 +903,8 @@ export async function getDealConversations(
   const [rows, sharingFlags] = await Promise.all([
     env.D1.prepare(
       `SELECT DISTINCT
-              conv.id, conv.external_thread_id, conv.subject, conv.sent_at,
+              conv.id, conv.external_thread_id, conv.external_message_id,
+              conv.subject, conv.sent_at,
               conv.source, conv.body_preview, conv.participant_user_ids,
               conv.is_campaign_email, conv.from_email, conv.from_contact_id,
               conv.direction, conv.has_attachments
@@ -885,7 +917,8 @@ export async function getDealConversations(
                  conv.sent_at ASC
         LIMIT ?`
     ).bind(id, ctx.orgId, ctx.orgId, messageCap).all<{
-      id: string; external_thread_id: string | null; subject: string | null;
+      id: string; external_thread_id: string | null;
+      external_message_id: string | null; subject: string | null;
       sent_at: string; source: string; body_preview: string | null;
       participant_user_ids: string | null; is_campaign_email: number;
       from_email: string | null; from_contact_id: string | null;
@@ -913,6 +946,8 @@ export async function getDealConversations(
   // Group messages by external_thread_id. NULL → each row is its own thread.
   type Msg = {
     id: string;
+    external_message_id: string | null;  // for "Open in Outlook" deep-link
+    source: string;                       // 'outlook' / 'slack' / 'manual'
     sender_name: string | null;   // null when can_read_body=false (PII gate)
     sender_email: string | null;  // null when can_read_body=false
     sent_at: string;
@@ -955,6 +990,8 @@ export async function getDealConversations(
 
     const msg: Msg = {
       id: r.id,
+      external_message_id: r.external_message_id,
+      source: r.source,
       sender_name: canRead ? senderName : null,
       sender_email: canRead ? senderEmail : null,
       sent_at: r.sent_at,
