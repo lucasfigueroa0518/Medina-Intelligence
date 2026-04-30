@@ -1,8 +1,9 @@
 'use client';
 
 import React from 'react';
-import { X, ExternalLink, Mail, Calendar, FileText, Hash, Newspaper, User, Building2, ArrowUpRight, Download, Loader2 } from 'lucide-react';
+import { X, ExternalLink, Eye, Mail, Calendar, FileText, Hash, Newspaper, User, Building2, ArrowUpRight, Download, Loader2 } from 'lucide-react';
 import type { CitationSource, CitationSourceType } from '@/lib/citations';
+import { DocumentPreviewModal } from './document-preview-modal';
 
 const API_BASE = `${process.env.NEXT_PUBLIC_API_URL ?? ''}/api`;
 
@@ -192,6 +193,7 @@ function MeetingBody({ source }: { source: CitationSource }) {
 }
 
 function DocumentBody({ source }: { source: CitationSource }) {
+  const [previewOpen, setPreviewOpen] = React.useState(false);
   return (
     <>
       {source.subtitle && <MetaRow label="Type" value={source.subtitle} />}
@@ -204,8 +206,23 @@ function DocumentBody({ source }: { source: CitationSource }) {
         />
       )}
       <Excerpt text={source.excerpt} />
-      <PrimaryAction href={source.url_path} label="Open document" />
+      {/* Wave 5 Phase G — Preview button opens the shared modal in-context.
+          The modal's "Open in detail page" link is the escape hatch for
+          power users who want the deep-linkable URL. */}
+      <button
+        onClick={() => setPreviewOpen(true)}
+        className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg bg-purple-500/10 hover:bg-purple-500/15 text-purple-300 transition-colors text-sm mt-2 w-full"
+        style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}
+      >
+        <span>Preview document</span>
+        <Eye size={14} />
+      </button>
+      <PrimaryAction href={source.url_path} label="Open in new tab" />
       <DocumentDownloadButton documentId={source.source_id} fileName={source.title} />
+      <DocumentPreviewModal
+        docId={previewOpen ? source.source_id : null}
+        onClose={() => setPreviewOpen(false)}
+      />
     </>
   );
 }

@@ -87,7 +87,12 @@ export async function extractTextFromFile(file: File): Promise<string> {
       const buffer = await file.arrayBuffer();
       const mod = await import('mammoth');
       const mammoth = (mod as any).default || mod;
-      const result = await mammoth.extractRawText({ buffer });
+      // mammoth expects `arrayBuffer` for browser/Worker contexts;
+      // `buffer` is the Node Buffer key. Pre-Wave-5 this silently
+      // failed (returned '' under the old swallow). Phase A's re-
+      // throw made it visible during Phase D drain. Fix is the right
+      // option key for ArrayBuffer input.
+      const result = await mammoth.extractRawText({ arrayBuffer: buffer });
       return result.value;
     } catch (e: any) {
       throw new Error(`DOCX extraction failed: ${e?.message || e}`);

@@ -14,6 +14,7 @@ import { Timeline, TimelineEntry } from '@/components/timeline';
 import { CompanySearchField } from '@/components/company-search-field';
 import { TagPicker } from '@/components/tag-picker';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
+import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
 
@@ -91,6 +92,8 @@ export default function ContactDetailPage() {
   const [docUploadOpen, setDocUploadOpen] = React.useState(false);
   const [docUploadFiles, setDocUploadFiles] = React.useState<File[]>([]);
   const docDropCounterRef = React.useRef(0);
+  // Wave 5 Phase G — preview modal state
+  const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     setLoading(true);
@@ -909,7 +912,9 @@ export default function ContactDetailPage() {
             ) : (
               <div className="space-y-2">
                 {documents.map((doc: any) => (
-                  <div key={doc.id} className="flex items-center gap-4 rounded-xl p-4 transition-all hover:bg-white/[0.03]"
+                  <div key={doc.id}
+                    onClick={() => setPreviewDocId(doc.id)}
+                    className="flex items-center gap-4 rounded-xl p-4 transition-all hover:bg-white/[0.05] cursor-pointer"
                     style={{ background: 'rgba(17,17,20,0.5)', border: '1px solid rgba(255,255,255,0.05)' }}>
                     <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
                       style={{ background: doc.source === 'email_attachment' ? 'rgba(59,130,246,0.12)' : 'rgba(139,92,246,0.12)' }}>
@@ -974,6 +979,11 @@ export default function ContactDetailPage() {
         onUploaded={() => { setRefreshKey(k => k + 1); setToast('Documents uploaded'); }}
         initialFiles={docUploadFiles}
         contactId={id}
+      />
+
+      <DocumentPreviewModal
+        docId={previewDocId}
+        onClose={() => setPreviewDocId(null)}
       />
 
       {/* Delete modal */}
