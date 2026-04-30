@@ -166,12 +166,29 @@ async function stageDiscoveryForReview(
   env: Env
 ): Promise<void> {
   const key = `${orgId}:${contactId}:linkedin_discovery:${hashShort(candidates.join('|'))}`;
+  // Wave 6 payload contract: top candidate becomes the proposed_value,
+  // rest of the candidates ride in metadata.alternatives so the UI can
+  // surface them as a "or maybe one of these" picker. Channel:
+  // 'linkedin_data' (web-search-derived discoveries are a LinkedIn data
+  // path — same channel as direct LinkedIn pulls, so they don't
+  // double-corroborate against ReverseContact or each other).
+  const [topCandidate, ...alternatives] = candidates;
+  const proposedValue = JSON.stringify({
+    value: topCandidate || '',
+    metadata: {
+      source_type: 'linkedin_discovery',
+      source_description: `Web search discovered ${candidates.length} LinkedIn candidate${candidates.length === 1 ? '' : 's'} for ${contactName}`,
+      alternatives,
+      contact_name: contactName,
+      context: {},
+    },
+  });
   await env.D1.prepare(
     `INSERT OR IGNORE INTO approval_queue
        (idempotency_key, org_id, entity_type, entity_id, change_type, field_name,
         proposed_value, source_visibility, confidence, status)
      VALUES (?, ?, 'contact', ?, 'linkedin_discovery', 'linkedin_url', ?, 'org_wide', 0.5, 'pending')`
-  ).bind(key, orgId, contactId, JSON.stringify({ candidates, contact_name: contactName })).run();
+  ).bind(key, orgId, contactId, proposedValue).run();
 }
 
 // ── Multi-strategy search ────────────────────────────────────────────

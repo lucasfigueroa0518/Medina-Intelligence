@@ -200,7 +200,38 @@ export async function enrichContactFromLinkedIn(
 
   const identity = scoreIdentity(contact, data.person);
   if (identity.score < 0.8) {
-    if (contact.id) {
+    // Wave 6: stop dumping the whole LinkedIn person blob into the
+    // queue (audit 2026-04-30 found these were the dominant
+    // UX-hostile rows — kilobytes of JSON for the human to read).
+    // Extract a small set of structured candidate fields. If the
+    // record carries nothing identifying, drop it entirely rather
+    // than queue an empty placeholder.
+    const candidateFields: Record<string, string | null> = {
+      full_name: data.person.fullName || null,
+      job_title: data.person.currentTitle || null,
+      company_name: data.person.currentCompany || null,
+      location: data.person.location || null,
+      linkedin_url: data.person.linkedinUrl || null,
+    };
+    const hasAnyField = Object.values(candidateFields).some(
+      v => typeof v === 'string' && v.trim().length > 0
+    );
+
+    if (contact.id && hasAnyField) {
+      // One queue row per candidate field. The 0.8-threshold UI rolls
+      // these up under the contact card — same as any progressive
+      // proposal, no special-case rendering needed.
+      const proposedValue = JSON.stringify({
+        value: candidateFields,
+        metadata: {
+          source_type: 'reversecontact_unverified',
+          source_description: `LinkedIn identity unverified (match score ${identity.score.toFixed(2)} — ${identity.details.slice(0, 2).join('; ') || 'low confidence'}). Reviewer should confirm this is the right person before any field is applied.`,
+          identity_score: identity.score,
+          identity_details: identity.details,
+          candidate_fields: candidateFields,
+          context: {},
+        },
+      });
       await env.D1.prepare(
         `INSERT OR IGNORE INTO approval_queue
            (idempotency_key, org_id, entity_type, entity_id, change_type, field_name, proposed_value, confidence, status)
@@ -209,7 +240,7 @@ export async function enrichContactFromLinkedIn(
         `${orgId}:${contact.id}:linkedin_identity:${identity.score.toFixed(2)}`,
         orgId,
         contact.id,
-        JSON.stringify(data.person),
+        proposedValue,
         identity.score
       ).run();
     }

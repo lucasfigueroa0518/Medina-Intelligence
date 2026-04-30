@@ -75,6 +75,21 @@ async function stageSignalInApprovalQueue(
   // timestamp). Same proposal across cycles must collapse, not pile up.
   const idempotencyKey = `${orgId}:${entityId}:${field}:${hashShort(JSON.stringify(value))}`;
 
+  // Wave 6 payload contract: { value, metadata: { source_type,
+  // source_description, context } }. Transcript signals don't have a
+  // single observing user — meetings have multiple attendees, but the
+  // mention itself is one observation regardless. resolveChannel maps
+  // 'transcript_mention' to a single channel without observer
+  // attribution.
+  const proposedValue = JSON.stringify({
+    value,
+    metadata: {
+      source_type: 'transcript_mention',
+      source_description: 'Meeting transcript mention',
+      context: { conversationId: sourceEventId },
+    },
+  });
+
   await env.D1.prepare(
     `INSERT OR IGNORE INTO approval_queue
        (idempotency_key, org_id, entity_type, entity_id, change_type, field_name,
@@ -86,7 +101,7 @@ async function stageSignalInApprovalQueue(
     entityType,
     entityId,
     field,
-    JSON.stringify(value),
+    proposedValue,
     sourceEventId,
     confidence
   ).run();
@@ -245,12 +260,26 @@ export async function routeTranscriptSignals(
   if (newCompanies.size > 0) {
     for (const name of newCompanies) {
       const idempotencyKey = `${orgId}:new_company_flag:${hashShort(name)}`;
+      // Wave 6 payload contract — new_entity is a creation proposal,
+      // not a field overwrite. metadata.context still attributes to the
+      // transcript channel for the corroboration model (a company
+      // mentioned in 2+ different meetings has 2 transcript_mention
+      // observations, but TRANSCRIPT_MENTION is a single channel — so
+      // it counts as 1 corroborating channel).
+      const proposedValue = JSON.stringify({
+        value: name,
+        metadata: {
+          source_type: 'transcript_mention',
+          source_description: 'New company mentioned in meeting transcript',
+          context: { conversationId: eventId },
+        },
+      });
       await env.D1.prepare(
         `INSERT OR IGNORE INTO approval_queue
            (idempotency_key, org_id, entity_type, entity_id, change_type, field_name,
             proposed_value, source_communication_id, source_visibility, confidence, status)
          VALUES (?, ?, 'company', '', 'new_entity', 'company_name', ?, ?, 'org_wide', 0.75, 'pending')`
-      ).bind(idempotencyKey, orgId, JSON.stringify(name), eventId).run();
+      ).bind(idempotencyKey, orgId, proposedValue, eventId).run();
     }
   }
 

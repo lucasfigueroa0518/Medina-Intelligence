@@ -137,7 +137,13 @@ export async function processEmailSignature(
   senderDisplayName: string,
   conversationId: string,
   sentAt: string,
-  env: Env
+  env: Env,
+  /** Wave 6: observing user (mailbox owner) for channel attribution.
+   *  Same contact's signature observed in user A's vs user B's inbox
+   *  counts as two distinct channels in the corroboration model.
+   *  Optional during Phase B — callers that don't yet pass it produce
+   *  a fallback channel via resolveChannel('unknown'). */
+  observerUserId?: string | null
 ): Promise<void> {
   const parsed = parseEmailSignature(emailBody, senderDisplayName);
   const fields = Object.entries(parsed).filter(([, v]) => v);
@@ -153,6 +159,7 @@ export async function processEmailSignature(
     confidence: field === 'full_name' ? 0.85 : 0.9,
     source_description: `Email signature from ${senderDisplayName}, ${dateStr}`,
     source_communication_id: conversationId,
+    context: { userId: observerUserId, conversationId },
   }));
 
   const result = await proposeMultipleUpdates(orgId, 'contact', contactId, updates, env);
@@ -170,7 +177,10 @@ export async function processDisplayNameUpdate(
   displayName: string,
   conversationId: string,
   sentAt: string,
-  env: Env
+  env: Env,
+  /** Wave 6: observing user for channel attribution. See
+   *  processEmailSignature note. */
+  observerUserId?: string | null
 ): Promise<void> {
   if (!displayName || displayName.length < 3) return;
 
@@ -199,5 +209,6 @@ export async function processDisplayNameUpdate(
     confidence: 0.85,
     source_description: `Email display name, ${dateStr}`,
     source_communication_id: conversationId,
+    context: { userId: observerUserId, conversationId },
   }], env);
 }

@@ -24,6 +24,7 @@ import * as Sync from './handlers/sync';
 import * as AuditLog from './handlers/audit-log';
 import * as Admin from './handlers/admin';
 import * as Cleanup from './handlers/cleanup';
+import { sweepApprovalQueue } from './handlers/sweep-approval-queue';
 import * as Imports from './handlers/imports';
 import * as IntelligentImport from './handlers/intelligent-import';
 import * as Campaigns from './handlers/campaigns';
@@ -596,6 +597,11 @@ async function routeAuthenticated(
       return Cleanup.cleanupDanglingVectorsBatch(request, ctx, env);
     if (path === '/api/admin/cleanup-dangling-docs-batch' && method === 'POST')
       return Cleanup.cleanupDanglingDocsBatch(request, ctx, env);
+
+    // Wave 6 Phase E — re-evaluate pending approval_queue rows through
+    // the new corroboration model. Owner-only, batched, dry-run-able.
+    if (path === '/api/admin/sweep-approval-queue' && method === 'POST')
+      return sweepApprovalQueue(request, ctx, env);
 
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);

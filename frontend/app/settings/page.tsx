@@ -1767,31 +1767,108 @@ function ApprovalQueueSection() {
                     const proposed = cleanValue(u.proposed_value);
                     const current = u.current_value ? cleanValue(u.current_value) : null;
                     const isUrl = u.field_name?.includes('url');
+                    const hasCorroboration =
+                      Array.isArray(u.current_value_sources) ||
+                      Array.isArray(u.proposed_value_sources);
+                    const isReversecontactUnverified =
+                      u.candidate_fields && typeof u.candidate_fields === 'object';
+                    const hasAlternatives =
+                      Array.isArray(u.alternatives) && u.alternatives.length > 0;
                     return (
-                      <div key={u.id} className="grid grid-cols-[100px_1fr_1fr_50px_56px] gap-x-2 items-center px-4 py-2"
-                        style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-                        <span className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider truncate">{humanField(u.field_name)}</span>
-                        <span className="text-xs text-text-muted truncate">
-                          {current ? shortUrl(current) : <span className="text-text-muted/50 italic">empty</span>}
-                        </span>
-                        {isUrl ? (
-                          <a href={proposed} target="_blank" rel="noopener" className="text-xs text-accent-magenta hover:underline font-medium truncate">{shortUrl(proposed)}</a>
-                        ) : (
-                          <span className="text-xs text-text-primary font-medium truncate">{proposed}</span>
-                        )}
-                        <span className="text-[10px] text-text-muted tabular-nums">{Math.round((u.confidence || 0) * 100)}%</span>
-                        <div className="flex items-center gap-1 justify-end">
-                          <button onClick={() => approveOne(u.id)}
-                            className="w-6 h-6 rounded flex items-center justify-center hover:bg-green-500/20 transition-colors"
-                            style={{ background: 'rgba(34,197,94,0.08)' }}>
-                            <Check size={12} className="text-green-400" />
-                          </button>
-                          <button onClick={() => rejectOne(u.id)}
-                            className="w-6 h-6 rounded flex items-center justify-center hover:bg-red-500/20 transition-colors"
-                            style={{ background: 'rgba(255,255,255,0.03)' }}>
-                            <XIcon size={12} className="text-text-muted" />
-                          </button>
+                      <div key={u.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                        <div className="grid grid-cols-[100px_1fr_1fr_50px_56px] gap-x-2 items-center px-4 py-2">
+                          <span className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider truncate">{humanField(u.field_name)}</span>
+                          <span className="text-xs text-text-muted truncate">
+                            {current ? shortUrl(current) : <span className="text-text-muted/50 italic">empty</span>}
+                          </span>
+                          {isReversecontactUnverified ? (
+                            <span className="text-xs text-text-muted italic truncate">
+                              candidate · expand for fields
+                            </span>
+                          ) : isUrl ? (
+                            <a href={proposed} target="_blank" rel="noopener" className="text-xs text-accent-magenta hover:underline font-medium truncate">{shortUrl(proposed)}</a>
+                          ) : (
+                            <span className="text-xs text-text-primary font-medium truncate">{proposed}</span>
+                          )}
+                          <span className="text-[10px] text-text-muted tabular-nums">{Math.round((u.confidence || 0) * 100)}%</span>
+                          <div className="flex items-center gap-1 justify-end">
+                            <button onClick={() => approveOne(u.id)}
+                              className="w-6 h-6 rounded flex items-center justify-center hover:bg-green-500/20 transition-colors"
+                              style={{ background: 'rgba(34,197,94,0.08)' }}>
+                              <Check size={12} className="text-green-400" />
+                            </button>
+                            <button onClick={() => rejectOne(u.id)}
+                              className="w-6 h-6 rounded flex items-center justify-center hover:bg-red-500/20 transition-colors"
+                              style={{ background: 'rgba(255,255,255,0.03)' }}>
+                              <XIcon size={12} className="text-text-muted" />
+                            </button>
+                          </div>
                         </div>
+
+                        {/* Wave 6 corroboration packet — channel attribution
+                            for current and proposed values. Renders only
+                            when the queue row was produced by the
+                            evaluator's QUEUE path. */}
+                        {hasCorroboration && (
+                          <div className="px-4 pb-2 pt-0.5 grid grid-cols-[100px_1fr_1fr_50px_56px] gap-x-2 text-[10px] text-text-muted/70">
+                            <span></span>
+                            <span className="truncate" title={(u.current_value_sources || []).join(', ')}>
+                              {Array.isArray(u.current_value_sources) && u.current_value_sources.length > 0
+                                ? <>from <span className="text-text-muted">{u.current_value_sources.length === 1 ? u.current_value_sources[0] : `${u.current_value_sources.length} channels`}</span></>
+                                : <span className="italic">no source recorded</span>}
+                            </span>
+                            <span className="truncate" title={(u.proposed_value_sources || []).join(', ')}>
+                              {Array.isArray(u.proposed_value_sources) && u.proposed_value_sources.length > 0
+                                ? <>from <span className="text-emerald-400/80">{u.proposed_value_sources.length === 1 ? u.proposed_value_sources[0] : `${u.proposed_value_sources.length} channels`} agree</span></>
+                                : null}
+                            </span>
+                            <span></span>
+                            <span></span>
+                          </div>
+                        )}
+
+                        {/* ReverseContact unverified — render the
+                            structured candidate fields instead of the
+                            raw JSON blob. The reviewer sees real fields
+                            with the identity score's reasoning. */}
+                        {isReversecontactUnverified && (
+                          <div className="px-4 pb-2 pt-0.5 text-[11px] text-text-muted/80">
+                            {typeof u.identity_score === 'number' && (
+                              <div className="mb-1">
+                                identity match {Math.round(u.identity_score * 100)}%
+                                {Array.isArray(u.identity_details) && u.identity_details.length > 0 && (
+                                  <span className="text-text-muted/60"> — {u.identity_details.slice(0, 2).join('; ')}</span>
+                                )}
+                              </div>
+                            )}
+                            <div className="space-y-0.5">
+                              {Object.entries(u.candidate_fields).map(([k, v]) => (
+                                v ? (
+                                  <div key={k} className="flex gap-2">
+                                    <span className="text-amber-400/70 uppercase tracking-wider text-[9px] w-24 flex-shrink-0">{humanField(k)}</span>
+                                    <span className="text-text-secondary truncate">{String(v)}</span>
+                                  </div>
+                                ) : null
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* LinkedIn discovery alternatives — Phase B
+                            stopped dumping the candidates array as the
+                            top-level value. Top candidate is the
+                            proposed value; the rest live here as a
+                            collapsed list of alternates. */}
+                        {hasAlternatives && (
+                          <div className="px-4 pb-2 pt-0.5 text-[10px] text-text-muted/70">
+                            or one of: {(u.alternatives as string[]).slice(0, 3).map((alt: string, i: number) => (
+                              <a key={i} href={alt} target="_blank" rel="noopener" className="text-accent-magenta/80 hover:underline ml-1">
+                                {shortUrl(alt)}{i < Math.min(2, (u.alternatives as string[]).length - 1) ? ',' : ''}
+                              </a>
+                            ))}
+                            {(u.alternatives as string[]).length > 3 && <span className="ml-1">+{(u.alternatives as string[]).length - 3} more</span>}
+                          </div>
+                        )}
                       </div>
                     );
                   })}

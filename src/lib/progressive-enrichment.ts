@@ -1,8 +1,9 @@
 import type { Env } from '../types/env';
-import { hashShort } from './helpers';
 import { triggerContactEnrichment } from './enrichment';
 import { emitAudit } from './audit';
 import { updateEntityInIndex } from './entity-index';
+import type { ChannelContext } from './source-channels';
+import { evaluateProposal, recordApproval } from './proposal-evaluator';
 
 interface FieldUpdate {
   field: string;
@@ -11,6 +12,10 @@ interface FieldUpdate {
   confidence: number;
   source_description?: string;
   source_communication_id?: string;
+  /** Channel attribution for the Wave 6 corroboration model. Optional
+   *  during Phase B rollout — sources that don't yet thread context
+   *  will hit resolveChannel's fallback path. */
+  context?: ChannelContext;
 }
 
 export type SourceType =
@@ -18,17 +23,11 @@ export type SourceType =
   | 'enrichment' | 'llm_extraction' | 'display_name'
   | 'web_enrichment_company' | 'news_article';
 
+/** @deprecated Wave 6: corroboration is the only quality signal. The
+ *  policy distinction (always_queue vs auto_if_confident) is a no-op
+ *  but the type stays exported to avoid breaking call sites that pass
+ *  it through their own type signatures. */
 export type UpdatePolicy = 'always_queue' | 'auto_if_confident';
-
-// Threshold above which `auto_if_confident` writes directly instead of queuing
-// (provided no recent human edit on that field — see HUMAN_EDIT_LOCK_DAYS).
-const AUTO_APPLY_CONFIDENCE_THRESHOLD = 0.85;
-
-// A field touched by a human inside this window is treated as "curated" — the
-// auto-apply path always defers to the queue so a person can still see the
-// proposed change. Older edits no longer block (people forget; new info wins
-// after a quarter).
-const HUMAN_EDIT_LOCK_DAYS = 30;
 
 const CONTACT_FIELDS = new Set([
   'full_name', 'job_title', 'phone', 'email', 'linkedin_url', 'twitter_url',
@@ -74,6 +73,9 @@ async function getCurrentFieldValue(
   return row?.v ?? null;
 }
 
+// Title abbreviation expansion still drives normalizeForComparison so
+// "VP of Eng" and "Vice President of Engineering" hash to the same
+// pending_proposals key in the evaluator.
 const TITLE_ABBREVIATIONS: [RegExp, string][] = [
   [/\bvp\b/gi, 'vice president'],
   [/\bceo\b/gi, 'chief executive officer'],
@@ -113,24 +115,20 @@ function normalizeForComparison(field: string, value: string): string {
   return v;
 }
 
-async function fieldRecentlyHumanEdited(
-  orgId: string,
-  entityType: string,
-  entityId: string,
-  field: string,
-  env: Env
-): Promise<boolean> {
-  const row = await env.D1.prepare(
-    `SELECT last_human_edit_at FROM entity_field_provenance
-       WHERE org_id = ? AND entity_type = ? AND entity_id = ? AND field_name = ?`
-  ).bind(orgId, entityType, entityId, field).first<{ last_human_edit_at: string | null }>().catch(() => null);
-
-  if (!row?.last_human_edit_at) return false;
-  const editedAt = new Date(row.last_human_edit_at).getTime();
-  if (!Number.isFinite(editedAt)) return false;
-  return Date.now() - editedAt < HUMAN_EDIT_LOCK_DAYS * 86400000;
-}
-
+/**
+ * Wave 6: this is now a thin shim over evaluateProposal(). The legacy
+ * three-state return type is preserved for back-compat with existing
+ * callers, mapped from the evaluator's four dispositions:
+ *   apply (fill_empty)            → 'auto_applied'
+ *   apply (silent_corroboration)  → 'skipped'   (no value change visible)
+ *   queue                          → 'proposed'  (surfaced for human review)
+ *   hold                           → 'skipped'   (stashed, not surfaced)
+ *   reject                         → 'skipped'
+ *
+ * The pre-Wave-6 "auto-apply on high confidence" path is GONE — Wave 6
+ * is corroboration-only. The `policy` parameter is now a no-op, kept
+ * for back-compat to avoid touching every call site.
+ */
 export async function proposeEntityUpdate(
   orgId: string,
   entityType: 'contact' | 'company',
@@ -143,104 +141,47 @@ export async function proposeEntityUpdate(
   opts?: {
     source_description?: string;
     source_communication_id?: string;
+    /** @deprecated Wave 6: ignored. Corroboration is now the only
+     *  quality signal — confidence-based auto-apply was retired. */
     policy?: UpdatePolicy;
+    /** Channel attribution for the corroboration model. */
+    context?: ChannelContext;
   }
 ): Promise<'auto_applied' | 'proposed' | 'skipped'> {
   const allowed = fieldsForEntity(entityType);
   if (!allowed.has(field)) return 'skipped';
 
-  const policy: UpdatePolicy = opts?.policy ?? 'always_queue';
-
-  const currentValue = await getCurrentFieldValue(entityType, entityId, field, env);
-  const normalizedCurrent = currentValue ? normalizeForComparison(field, currentValue) : null;
+  // Normalize before passing to the evaluator so two source paths
+  // proposing the "same" value with different formatting (whitespace,
+  // case for non-meaningful fields) collapse to one corroboration
+  // bucket. The evaluator keys pending_proposals by exact string so
+  // normalization MUST happen here, not inside the evaluator.
   const normalizedProposed = normalizeForComparison(field, proposedValue);
 
-  if (normalizedCurrent === normalizedProposed) return 'skipped';
+  const result = await evaluateProposal(
+    {
+      orgId,
+      entityType,
+      entityId,
+      fieldName: field,
+      proposedValue: normalizedProposed,
+      source,
+      context: opts?.context || {},
+      confidence,
+      sourceCommunicationId: opts?.source_communication_id || null,
+      sourceVisibility: 'org_wide',
+      sourceDescription: opts?.source_description || source,
+    },
+    env
+  );
 
-  if (currentValue === null || currentValue.trim() === '') {
-    const table = tableForEntity(entityType);
-    await env.D1.prepare(
-      `UPDATE ${table} SET ${field} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-    ).bind(proposedValue.trim(), entityId).run();
-
-    // Clean up any stale pending entries for this field
-    await env.D1.prepare(
-      `DELETE FROM approval_queue WHERE org_id = ? AND entity_type = ? AND entity_id = ? AND field_name = ? AND status = 'pending'`
-    ).bind(orgId, entityType, entityId, field).run();
-
-    console.log(`[progressive] auto-applied ${entityType}/${entityId} ${field} = "${proposedValue.slice(0, 60)}" (was NULL, source: ${source})`);
+  // Update Vectorize index when the entity's actual value changed.
+  if (result.disposition === 'apply' && result.applyMode === 'fill_empty') {
     try { await updateEntityInIndex(orgId, entityType, entityId, env); } catch {}
     return 'auto_applied';
   }
-
-  if (
-    policy === 'auto_if_confident' &&
-    confidence >= AUTO_APPLY_CONFIDENCE_THRESHOLD &&
-    !(await fieldRecentlyHumanEdited(orgId, entityType, entityId, field, env))
-  ) {
-    const table = tableForEntity(entityType);
-    await env.D1.prepare(
-      `UPDATE ${table} SET ${field} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-    ).bind(proposedValue.trim(), entityId).run();
-
-    await env.D1.prepare(
-      `DELETE FROM approval_queue WHERE org_id = ? AND entity_type = ? AND entity_id = ? AND field_name = ? AND status = 'pending'`
-    ).bind(orgId, entityType, entityId, field).run();
-
-    await emitAudit(env, {
-      org_id: orgId,
-      action: 'enrich',
-      entity_type: entityType,
-      entity_id: entityId,
-      metadata: {
-        field, old_value: currentValue, new_value: proposedValue.trim(),
-        source, confidence,
-        reason: 'auto_apply_high_confidence',
-      },
-      created_at: new Date().toISOString(),
-    });
-
-    console.log(`[progressive] auto-applied ${entityType}/${entityId} ${field}: "${currentValue.slice(0, 30)}" → "${proposedValue.slice(0, 30)}" (high confidence ${confidence}, source: ${source})`);
-    try { await updateEntityInIndex(orgId, entityType, entityId, env); } catch {}
-    return 'auto_applied';
-  }
-
-  const metadataObj = {
-    current_value: currentValue,
-    source_type: source,
-    source_description: opts?.source_description || source,
-  };
-
-  const proposedJson = JSON.stringify({ value: proposedValue.trim(), metadata: metadataObj });
-
-  // Check for existing pending entry for same entity + field — update it instead of duplicating
-  const existing = await env.D1.prepare(
-    `SELECT id FROM approval_queue
-     WHERE org_id = ? AND entity_type = ? AND entity_id = ? AND field_name = ? AND status = 'pending'
-     LIMIT 1`
-  ).bind(orgId, entityType, entityId, field).first<{ id: string }>();
-
-  if (existing) {
-    await env.D1.prepare(
-      `UPDATE approval_queue SET proposed_value = ?, confidence = ?, source_communication_id = ?,
-              created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ?`
-    ).bind(proposedJson, confidence, opts?.source_communication_id || null, existing.id).run();
-  } else {
-    const idempotencyKey = `${orgId}:prog:${entityId}:${field}:${hashShort(proposedValue)}`;
-    await env.D1.prepare(
-      `INSERT OR IGNORE INTO approval_queue
-         (idempotency_key, org_id, entity_type, entity_id, change_type, field_name,
-          proposed_value, source_communication_id, source_visibility, confidence, status)
-       VALUES (?, ?, ?, ?, 'progressive_update', ?, ?, ?, 'org_wide', ?, 'pending')`
-    ).bind(
-      idempotencyKey, orgId, entityType, entityId, field,
-      proposedJson, opts?.source_communication_id || null, confidence
-    ).run();
-  }
-
-  console.log(`[progressive] proposed ${entityType}/${entityId} ${field}: "${currentValue?.slice(0, 30)}" → "${proposedValue.slice(0, 30)}" (source: ${source})`);
-  return 'proposed';
+  if (result.disposition === 'queue') return 'proposed';
+  return 'skipped';
 }
 
 export async function proposeMultipleUpdates(
@@ -260,6 +201,7 @@ export async function proposeMultipleUpdates(
         source_description: u.source_description,
         source_communication_id: u.source_communication_id,
         policy: opts?.policy,
+        context: u.context,
       }
     );
     result[outcome].push(u.field);
@@ -268,9 +210,22 @@ export async function proposeMultipleUpdates(
   return result;
 }
 
-// Records that a human (not enrichment, not the agent) edited these fields.
-// Auto-apply enrichment will defer to the approval queue for HUMAN_EDIT_LOCK_DAYS
-// after this stamp, so curated facts aren't silently overwritten.
+/**
+ * Records that a human edited these fields directly (PATCH endpoints
+ * on contacts/companies/deals, OR queue approval). Wave 6: ALSO syncs
+ * entity_field_state — the new value's source becomes the user's
+ * manual_edit channel, pending_proposals is reset to empty (any
+ * accumulated suggestions are stale now), and last_human_edit_at is
+ * stamped to gate the 180-day human-edit lock.
+ *
+ * Caller must have already written the new field value(s) to the
+ * entity table — this function reads the entity table to discover
+ * what value to record as the new current_value.
+ *
+ * Continues to write entity_field_provenance for back-compat with any
+ * read path that still queries it. Phase E or a follow-up commit may
+ * collapse the two tables.
+ */
 export async function markFieldsHumanEdited(
   orgId: string,
   entityType: 'contact' | 'company' | 'deal',
@@ -281,6 +236,8 @@ export async function markFieldsHumanEdited(
 ): Promise<void> {
   if (fields.length === 0) return;
   const now = new Date().toISOString();
+
+  // Provenance table — legacy back-compat write.
   await env.D1.batch(
     fields.map(f =>
       env.D1.prepare(
@@ -293,6 +250,40 @@ export async function markFieldsHumanEdited(
       ).bind(orgId, entityType, entityId, f, now, userId)
     )
   );
+
+  // entity_field_state — Wave 6 source of truth for corroboration math.
+  // Per-field: read the (just-written) entity value, call recordApproval
+  // which resets current_value_sources to [manual_edit_<userId>], clears
+  // pending_proposals, and stamps last_human_edit_at.
+  const table = tableForEntity(entityType);
+  for (const field of fields) {
+    if (!fieldsForEntity(entityType).has(field)) continue;
+    try {
+      const row = await env.D1.prepare(
+        `SELECT ${field} as v FROM ${table} WHERE id = ?`
+      ).bind(entityId).first<{ v: unknown }>();
+      const currentValue =
+        row?.v == null ? '' :
+        typeof row.v === 'string' ? row.v :
+        String(row.v);
+      await recordApproval(
+        {
+          orgId,
+          entityType,
+          entityId,
+          fieldName: field,
+          approvedValue: currentValue,
+          userId,
+        },
+        env
+      );
+    } catch (e) {
+      console.error(
+        `[progressive] markFieldsHumanEdited entity_field_state sync failed for ${entityType}/${entityId}.${field}:`,
+        e
+      );
+    }
+  }
 }
 
 const RE_ENRICH_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour

@@ -7,6 +7,7 @@ import { invalidateRagCache } from '../lib/cache';
 import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { commitProgressiveApproval, markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { triggerContactEnrichment } from '../lib/enrichment';
+import { recordRejection } from '../lib/proposal-evaluator';
 
 export async function listApprovalQueue(
   request: Request,
@@ -145,6 +146,22 @@ export async function rejectItem(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
+  // Read the row before updating so we can extract field_name +
+  // proposed_value for the Wave 6 rejection record (entity_field_state's
+  // rejected_values map drives the 90-day no-re-ask rule).
+  const item = await env.D1.prepare(
+    `SELECT id, entity_type, entity_id, field_name, proposed_value
+       FROM approval_queue
+       WHERE id = ? AND org_id = ? AND status = 'pending'`
+  ).bind(id, ctx.orgId).first<{
+    id: string;
+    entity_type: string;
+    entity_id: string;
+    field_name: string | null;
+    proposed_value: string | null;
+  }>();
+  if (!item) return errorResponse('APPROVAL_ALREADY_RESOLVED', 409);
+
   const result = await env.D1.prepare(
     `UPDATE approval_queue SET status = 'rejected', resolved_by = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      WHERE id = ? AND org_id = ? AND status = 'pending'`
@@ -152,6 +169,42 @@ export async function rejectItem(
 
   if ((result.meta?.changes || 0) === 0) {
     return errorResponse('APPROVAL_ALREADY_RESOLVED', 409);
+  }
+
+  // Wave 6: stamp the rejected value into entity_field_state so the
+  // evaluator auto-rejects re-asks of the same value within 90 days.
+  // Best-effort — never blocks the user-visible reject. Skip for
+  // proposal kinds that don't have a field-state row (new_entity,
+  // synthetic new_association, create_deal, etc.).
+  if (
+    item.field_name &&
+    item.proposed_value &&
+    (item.entity_type === 'contact' || item.entity_type === 'company' || item.entity_type === 'deal')
+  ) {
+    try {
+      let extractedValue: string;
+      try {
+        const parsed = JSON.parse(item.proposed_value);
+        extractedValue =
+          parsed && typeof parsed === 'object' && parsed.value !== undefined
+            ? String(parsed.value)
+            : item.proposed_value;
+      } catch {
+        extractedValue = item.proposed_value;
+      }
+      await recordRejection(
+        {
+          orgId: ctx.orgId,
+          entityType: item.entity_type as 'contact' | 'company' | 'deal',
+          entityId: item.entity_id,
+          fieldName: item.field_name,
+          rejectedValue: extractedValue,
+        },
+        env
+      );
+    } catch (e) {
+      console.error('[approval] recordRejection failed:', e);
+    }
   }
 
   await emitAudit(env, {
@@ -405,6 +458,35 @@ export async function listApprovalQueueGrouped(
       source_description: metadata?.source_description || row.change_type,
       created_at: row.created_at,
       change_type: row.change_type,
+      // Wave 6 corroboration packet — present when the row was produced
+      // by evaluateProposal's QUEUE path. Older rows or non-evaluator
+      // sources won't have it; UI renders gracefully when absent.
+      current_value_sources: Array.isArray(metadata?.current_value_sources)
+        ? metadata.current_value_sources
+        : null,
+      proposed_value_sources: Array.isArray(metadata?.proposed_value_sources)
+        ? metadata.proposed_value_sources
+        : null,
+      corroboration_count: typeof metadata?.corroboration_count === 'number'
+        ? metadata.corroboration_count
+        : null,
+      // ReverseContact unverified payloads carry their candidate-fields
+      // map here; the UI renders a structured field-list instead of a
+      // raw JSON blob (Phase B normalized this).
+      candidate_fields:
+        metadata?.candidate_fields && typeof metadata.candidate_fields === 'object'
+          ? metadata.candidate_fields
+          : null,
+      identity_score: typeof metadata?.identity_score === 'number'
+        ? metadata.identity_score
+        : null,
+      identity_details: Array.isArray(metadata?.identity_details)
+        ? metadata.identity_details
+        : null,
+      // LinkedIn discovery alternatives (Phase B normalized).
+      alternatives: Array.isArray(metadata?.alternatives)
+        ? metadata.alternatives
+        : null,
     };
 
     if (grouped.has(key)) {
