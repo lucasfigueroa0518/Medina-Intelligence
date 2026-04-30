@@ -42,9 +42,26 @@ interface Document {
   _deal_title: string | null;
 }
 
+// Source of truth: src/lib/document-intelligence.ts:184-190 (classifier
+// allowlist) + 'other' as a transitional bucket. The legacy 8-category list
+// (pitch_deck, financials, legal, memo, …) was a hold-over from the original
+// CHECK constraint that was dropped by migration 0048; the backend now
+// returns one of these 14 classifier categories. 'other' is kept as a 15th
+// filter option until the Wave 5 Phase D reclassify backfill drains the
+// 1,337 existing 'other' rows. Order mirrors the classifier prompt grouping.
 const DOCUMENT_TYPES = [
-  'pitch_deck', 'financials', 'legal', 'memo', 'report',
-  'spreadsheet', 'presentation', 'other',
+  // Deal flow
+  'deal_pitch', 'deal_diligence', 'deal_terms', 'deal_financials',
+  // Fund operations
+  'fund_reporting', 'fund_legal', 'fund_admin',
+  // Relationships
+  'contact_data', 'correspondence', 'meeting_material',
+  // Market intelligence
+  'research', 'portfolio_update',
+  // General
+  'internal_ops', 'reference',
+  // Transitional — pre-Phase-D leftovers
+  'other',
 ];
 
 // Sources that the backend stamps onto documents. The migration history
