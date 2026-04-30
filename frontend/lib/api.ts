@@ -206,6 +206,31 @@ export const api = {
     request<{ ok: boolean }>(`/deals/${id}`, { method: 'DELETE' }),
   getDealTimeline: (id: string) =>
     request<{ entries: any[] }>(`/deals/${id}/timeline`),
+  // Day-5 deal_intelligence consumer wave: read endpoint produced by T3's
+  // Wave 6+ evaluator (PR #15 schema, PR #16 + #17 compute + endpoint, live
+  // on worker 82c62635). Per-(deal_id, user_id) composite-keyed; auth
+  // header scopes to the requesting user. Returns is_stale=true when a row
+  // is served from cache + background recompute queued via
+  // ctxExec.waitUntil. See docs/deal-intelligence-contract.md for v1.0
+  // contract; T3's example payload + smoke tests on issue #4.
+  getDealIntelligence: (id: string) =>
+    request<{
+      deal_id: string;
+      user_id: string;
+      sentiment: 'positive' | 'neutral' | 'negative' | null;
+      sentiment_score: number | null;
+      topics: string[];
+      risk_signals: Array<{
+        type: string;
+        severity: 'info' | 'warning' | 'critical';
+        detail: string;
+      }>;
+      momentum: 'accelerating' | 'steady' | 'stalled' | 'declining' | null;
+      momentum_score: number | null;
+      conversation_count: number;
+      computed_at: string;
+      is_stale: boolean;
+    }>(`/deals/${id}/intelligence`),
   // Day-5 Phase-2: thread-grouped, ACL-aware conversation surfacing.
   // Subject + metadata visible to anyone who can see the deal; body_preview
   // + sender_name/email nulled when canReadEmailContent returns false for

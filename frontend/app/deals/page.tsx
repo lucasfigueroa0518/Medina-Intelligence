@@ -10,13 +10,19 @@ import {
   Plus,
   X as XIcon,
   GripVertical,
-  AlertCircle,
   ChevronLeft,
   ChevronRight,
   Filter,
   Check,
   Trash2,
 } from 'lucide-react';
+import {
+  SentimentIndicator,
+  TopicChips,
+  RiskFlag,
+  MomentumSparkline,
+} from '@/components/deal-intelligence';
+import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 
 type DealStage =
   | 'prospect' | 'first_contact' | 'meeting_scheduled'
@@ -684,38 +690,11 @@ export default function DealsPage() {
 
 /* ── Deal Card ── */
 
-// Deal Intelligence shape — populated by T3's Wave-6 evaluator into the
-// deal_intelligence table per docs/deal-intelligence-contract.md. Backend
-// hasn't joined this in yet (depends on T3 schema ack), so today every card
-// renders empty-state for the four fields. When T3 ships, listDeals' SELECT
-// will start returning these fields and the card lights up automatically.
-interface DealIntelligence {
-  sentiment_score: number | null;             // -1..+1
-  sentiment_direction: 'improving' | 'stable' | 'declining' | null;
-  active_topics: string[];                    // [] when none
-  risk_signal_count: number;                  // 0 when none
-  momentum_trend: 'increasing' | 'decreasing' | 'stable' | null;
-  momentum_buckets: Array<{ week_start: string; count: number }>;  // [] when none
-}
-
-function readDealIntelligence(deal: any): DealIntelligence {
-  const di = deal.deal_intelligence || {};
-  const parseJson = (v: unknown): any[] => {
-    if (Array.isArray(v)) return v;
-    if (typeof v !== 'string') return [];
-    try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; }
-  };
-  return {
-    sentiment_score: typeof di.sentiment_score === 'number' ? di.sentiment_score : null,
-    sentiment_direction: di.sentiment_direction ?? null,
-    active_topics: parseJson(di.active_topics).filter((s: unknown): s is string => typeof s === 'string'),
-    risk_signal_count: Number.isFinite(di.risk_signal_count) ? Number(di.risk_signal_count) : 0,
-    momentum_trend: di.momentum_trend ?? null,
-    momentum_buckets: parseJson(di.momentum_buckets).filter((b: any) =>
-      b && typeof b === 'object' && typeof b.week_start === 'string' && Number.isFinite(b.count)
-    ),
-  };
-}
+// Day-5 deal_intelligence consumer wave: card now reads via the shared
+// useDealIntelligence(dealId) hook against the future
+// GET /api/deals/:id/intelligence endpoint (T3's Wave 6+ evaluator populates).
+// The hook returns mock empty state today; components render their
+// empty-state paths cleanly until real data flows.
 
 function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd, selected, onToggleSelect }: {
   deal: any;
@@ -759,7 +738,7 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd, select
      card now surfaces sentiment / topics / risk / momentum from
      deal_intelligence (T3 evaluator wave) — empty-state today, fills in
      when T3 lands. See docs/deal-intelligence-contract.md. */
-  const intel = readDealIntelligence(deal);
+  const { intelligence } = useDealIntelligence(deal.id);
 
   return (
     <Link href={`/deals/${deal.id}`}>
@@ -812,47 +791,15 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd, select
         {/* Sentiment + momentum row — always renders, neutral when empty.
             Always-rendered so the card height stays stable when data lands. */}
         <div className="flex items-center gap-2 mt-2.5">
-          <MomentumSparkline buckets={intel.momentum_buckets} trend={intel.momentum_trend} />
-          <SentimentIndicator score={intel.sentiment_score} direction={intel.sentiment_direction} />
+          <MomentumSparkline intelligence={intelligence} size="compact" />
+          <SentimentIndicator intelligence={intelligence} size="compact" />
         </div>
 
         {/* Topic chips — hidden entirely when empty. */}
-        {intel.active_topics.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-1.5">
-            {intel.active_topics.slice(0, 2).map((topic, i) => (
-              <span
-                key={`${topic}-${i}`}
-                className="text-[10px] text-text-muted font-accent px-1.5 py-0.5 rounded"
-                style={{ background: 'rgba(139,92,246,0.08)', color: '#A78BFA' }}
-              >
-                #{topic}
-              </span>
-            ))}
-            {intel.active_topics.length > 2 && (
-              <span
-                className="text-[10px] text-text-muted font-accent px-1.5 py-0.5 rounded"
-                style={{ background: 'rgba(255,255,255,0.04)' }}
-                title={intel.active_topics.slice(2).map(t => `#${t}`).join(' ')}
-              >
-                +{intel.active_topics.length - 2}
-              </span>
-            )}
-          </div>
-        )}
+        <div className="mt-1.5"><TopicChips intelligence={intelligence} size="compact" /></div>
 
         {/* Risk flag — hidden entirely when count is 0. */}
-        {intel.risk_signal_count > 0 && (
-          <div className="mt-1.5">
-            <span
-              className="inline-flex items-center gap-1 text-[10px] font-accent font-semibold px-1.5 py-0.5 rounded"
-              style={{ background: 'rgba(239,68,68,0.10)', color: '#F87171' }}
-              title={`${intel.risk_signal_count} risk signal${intel.risk_signal_count === 1 ? '' : 's'} detected`}
-            >
-              <AlertCircle size={10} />
-              {intel.risk_signal_count} risk{intel.risk_signal_count === 1 ? '' : 's'}
-            </span>
-          </div>
-        )}
+        <div className="mt-1.5"><RiskFlag intelligence={intelligence} size="compact" /></div>
 
         {/* Bottom row: activity dot + days-in-stage. Stripped of probability,
             open_items_count, contacts_count per Day-5 reframe. */}
@@ -874,87 +821,11 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd, select
   );
 }
 
-/** Inline 4-week sparkline. Empty state: flat baseline at midpoint so the
- *  card layout stays stable. Color follows momentum_trend (green up, red
- *  down, neutral gray for stable / null). */
-function MomentumSparkline({ buckets, trend }: {
-  buckets: Array<{ week_start: string; count: number }>;
-  trend: 'increasing' | 'decreasing' | 'stable' | null;
-}) {
-  const W = 40, H = 14, PAD = 2;
-  const color = trend === 'increasing' ? '#22C55E'
-    : trend === 'decreasing' ? '#EF4444'
-    : '#71717A';
-  const tooltip = buckets.length === 0
-    ? 'Momentum: insufficient data yet'
-    : `Momentum: ${trend ?? 'unknown'} (${buckets.length} weeks)`;
-
-  // Empty state: flat horizontal baseline at midpoint. Card never shifts.
-  if (buckets.length === 0) {
-    return (
-      <svg width={W} height={H} className="shrink-0">
-        <title>{tooltip}</title>
-        <line x1={PAD} y1={H / 2} x2={W - PAD} y2={H / 2}
-          stroke="#71717A" strokeWidth={1} strokeDasharray="2 2" opacity={0.4} />
-      </svg>
-    );
-  }
-
-  const counts = buckets.map(b => b.count);
-  const maxC = Math.max(...counts, 1);
-  const stepX = (W - 2 * PAD) / Math.max(buckets.length - 1, 1);
-  const points = counts.map((c, i) => {
-    const x = PAD + i * stepX;
-    const y = H - PAD - ((c / maxC) * (H - 2 * PAD));
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(' ');
-
-  return (
-    <svg width={W} height={H} className="shrink-0">
-      <title>{tooltip}</title>
-      <polyline points={points} fill="none" stroke={color} strokeWidth={1.5}
-        strokeLinejoin="round" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-/** Sentiment indicator. Single visual: directional arrow + colored chip.
- *  Empty state: neutral gray dash. */
-function SentimentIndicator({ score, direction }: {
-  score: number | null;
-  direction: 'improving' | 'stable' | 'declining' | null;
-}) {
-  // Empty state when score is null AND direction is null.
-  if (score === null && direction === null) {
-    return (
-      <span
-        className="inline-flex items-center gap-1 text-[10px] text-text-muted font-accent"
-        title="Sentiment: insufficient data yet"
-      >
-        <span className="w-1.5 h-1.5 rounded-full" style={{ background: '#71717A' }} />
-        —
-      </span>
-    );
-  }
-
-  const dirLabel = direction === 'improving' ? '↑'
-    : direction === 'declining' ? '↓'
-    : '→';
-  const color = direction === 'improving' ? '#22C55E'
-    : direction === 'declining' ? '#EF4444'
-    : '#A1A1AA';
-  const scoreLabel = score === null ? '' : ` ${score >= 0 ? '+' : ''}${score.toFixed(2)}`;
-
-  return (
-    <span
-      className="inline-flex items-center gap-0.5 text-[10px] font-accent font-semibold"
-      style={{ color }}
-      title={`Sentiment: ${direction ?? 'unknown'}${scoreLabel}`}
-    >
-      {dirLabel}{scoreLabel}
-    </span>
-  );
-}
+/* (Inline MomentumSparkline + SentimentIndicator removed — replaced by the
+   shared `@/components/deal-intelligence` module which both the board card
+   and the detail page strip consume. The shared module accepts a single
+   `intelligence` prop from useDealIntelligence and handles its own
+   empty/populated state branching.) */
 
 /* ── Day-5 Phase B: per-column sort ── */
 

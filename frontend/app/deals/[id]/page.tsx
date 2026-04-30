@@ -11,6 +11,14 @@ import {
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
+import {
+  SentimentIndicator,
+  TopicChips,
+  RiskFlag,
+  MomentumSparkline,
+  IntelligenceFreshnessIndicator,
+} from '@/components/deal-intelligence';
+import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 import { api } from '@/lib/api';
 
 /* ───────── Stage configuration ───────── */
@@ -1465,33 +1473,34 @@ export default function DealDetailPage() {
 
 /* ───────── Sub-components ───────── */
 
-/** Day-5 Intelligence Pulse Strip. Reads from deal_intelligence (per-user
- *  storage, populated by T3's evaluator wave per docs/deal-intelligence-contract.md).
- *  Today this renders entirely as empty-state messaging — the contract is
- *  signed but no schema migration has landed yet, so the read shape is
- *  reserved on the deal object as `deal.deal_intelligence`. When T3 ships,
- *  the consumer handler joins the row in and the strip lights up.
+/** Day-5 Intelligence Pulse Strip. Now reads via the shared
+ *  useDealIntelligence(deal_id) hook against the future
+ *  GET /api/deals/:id/intelligence endpoint. Renders empty-state today
+ *  (hook returns mock empty); fills in when STEP 3 swaps the hook
+ *  implementation to a real fetch + T3 ships the producer.
  *
- *  Per-user is the load-bearing security invariant — sentiment / topics /
- *  risk are derived from conversation bodies the user can read, and a global
- *  row would leak content across canReadEmailContent boundaries. */
+ *  Per-user storage is the load-bearing security invariant per the
+ *  contract — sentiment / topics / risk are derived from conversation
+ *  bodies the user can read, so each (deal_id, user_id) pair gets its
+ *  own row. The hook scopes per (deal_id + auth header) so each
+ *  component instance owns its own state with no cross-user caching. */
 function DealIntelligenceStrip({ deal }: { deal: any }) {
-  const di = (deal && deal.deal_intelligence) || {};
-  const parseJson = (v: unknown): any[] => {
-    if (Array.isArray(v)) return v;
-    if (typeof v !== 'string') return [];
-    try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; }
-  };
-  const sentimentScore: number | null = typeof di.sentiment_score === 'number' ? di.sentiment_score : null;
-  const sentimentDirection: 'improving' | 'stable' | 'declining' | null = di.sentiment_direction ?? null;
-  const topics: string[] = parseJson(di.active_topics).filter((s: unknown): s is string => typeof s === 'string');
-  const riskCount: number = Number.isFinite(di.risk_signal_count) ? Number(di.risk_signal_count) : 0;
-  const riskExamples: Array<{ text: string; source_id?: string; source_type?: string; sent_at?: string }> =
-    parseJson(di.risk_signal_examples).filter((e: any) => e && typeof e === 'object' && typeof e.text === 'string');
-  const momentumTrend: 'increasing' | 'decreasing' | 'stable' | null = di.momentum_trend ?? null;
-  const momentumBuckets: Array<{ week_start: string; count: number }> =
-    parseJson(di.momentum_buckets).filter((b: any) =>
-      b && typeof b === 'object' && typeof b.week_start === 'string' && Number.isFinite(b.count)
+  const { intelligence, refresh } = useDealIntelligence(deal?.id ?? null);
+
+  // hasAnyData drives the header's "awaiting evaluator" hint vs the
+  // freshness indicator. T3's contract returns intelligence !== null even
+  // when all signal fields are empty (the "no readable conversations" path
+  // gives all nulls/empties + computed_at populated). So we treat presence
+  // of computed_at as the primary "data has flowed at least once" signal,
+  // independent of whether actual signals were extracted.
+  const hasAnyData =
+    intelligence !== null && (
+      intelligence.computed_at !== null ||
+      intelligence.sentiment !== null ||
+      intelligence.sentiment_score !== null ||
+      intelligence.topics.length > 0 ||
+      intelligence.risk_signals.length > 0 ||
+      intelligence.momentum !== null
     );
 
   return (
@@ -1500,35 +1509,32 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
         <span className="text-[10px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
           Intelligence
         </span>
-        <span className="text-[9px] text-text-muted/60 italic">
-          {Object.keys(di).length === 0
-            ? 'awaiting evaluator (T3 Wave 6) — data lands automatically'
-            : `last computed ${di.last_computed_at ? fmtRel(di.last_computed_at) : '—'}`}
-        </span>
+        {!hasAnyData ? (
+          <span className="text-[9px] text-text-muted/60 italic">
+            awaiting evaluator (T3 Wave 6) — data lands automatically
+          </span>
+        ) : (
+          <IntelligenceFreshnessIndicator
+            intelligence={intelligence}
+            onRefresh={refresh}
+            size="detail"
+          />
+        )}
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
         {/* Sentiment */}
         <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Sentiment</div>
-          {sentimentScore === null && sentimentDirection === null ? (
+          {intelligence?.sentiment === null && intelligence?.sentiment_score === null ? (
             <div className="text-xs text-text-muted italic">Insufficient data yet</div>
           ) : (
             <div className="flex items-center gap-2">
-              <span
-                className="text-2xl font-semibold tabular-nums font-accent"
-                style={{
-                  color:
-                    sentimentDirection === 'improving' ? '#22C55E' :
-                    sentimentDirection === 'declining' ? '#EF4444' : '#A1A1AA',
-                }}
-              >
-                {sentimentScore !== null
-                  ? `${sentimentScore >= 0 ? '+' : ''}${sentimentScore.toFixed(2)}`
-                  : '—'}
-              </span>
-              {sentimentDirection && (
-                <span className="text-[10px] text-text-muted capitalize">{sentimentDirection}</span>
+              <SentimentIndicator intelligence={intelligence} size="detail" />
+              {intelligence?.sentiment && (
+                <span className="text-[10px] text-text-muted capitalize">
+                  {intelligence.sentiment}
+                </span>
               )}
             </div>
           )}
@@ -1537,98 +1543,38 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
         {/* Active Topics */}
         <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Active Topics</div>
-          {topics.length === 0 ? (
+          {(intelligence?.topics ?? []).length === 0 ? (
             <div className="text-xs text-text-muted italic">No active topics extracted</div>
           ) : (
-            <div className="flex flex-wrap gap-1">
-              {topics.slice(0, 5).map((t, i) => (
-                <span
-                  key={`${t}-${i}`}
-                  className="text-[10px] font-accent px-1.5 py-0.5 rounded"
-                  style={{ background: 'rgba(139,92,246,0.10)', color: '#A78BFA' }}
-                >
-                  #{t}
-                </span>
-              ))}
-            </div>
+            <TopicChips intelligence={intelligence} size="detail" />
           )}
         </div>
 
         {/* Risk Signals */}
         <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Risk Signals</div>
-          {riskCount === 0 ? (
+          {(intelligence?.risk_signals ?? []).length === 0 ? (
             <div className="text-xs text-text-muted italic">No risk signals detected</div>
           ) : (
-            <div>
-              <div className="flex items-baseline gap-2">
-                <span className="text-2xl font-semibold tabular-nums font-accent text-red-400">
-                  {riskCount}
-                </span>
-                <span className="text-[10px] text-text-muted">
-                  signal{riskCount === 1 ? '' : 's'}
-                </span>
-              </div>
-              {riskExamples.length > 0 && (
-                <div className="text-[10px] text-text-muted mt-1 truncate" title={riskExamples[0].text}>
-                  ↳ {riskExamples[0].text}
-                </div>
-              )}
-            </div>
+            <RiskFlag intelligence={intelligence} size="detail" />
           )}
         </div>
 
         {/* Momentum */}
         <div className="px-5 py-4">
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Momentum</div>
-          {momentumBuckets.length === 0 ? (
-            <div className="text-xs text-text-muted italic">No conversation activity yet</div>
-          ) : (
-            <div className="flex items-center gap-2">
-              <DetailMomentumSparkline buckets={momentumBuckets} trend={momentumTrend} />
-              <span
-                className="text-[10px] capitalize"
-                style={{
-                  color:
-                    momentumTrend === 'increasing' ? '#22C55E' :
-                    momentumTrend === 'decreasing' ? '#EF4444' : '#A1A1AA',
-                }}
-              >
-                {momentumTrend ?? 'stable'}
-              </span>
+          {intelligence?.momentum === null ? (
+            <div className="text-xs text-text-muted italic">
+              {intelligence?.conversation_count === 0
+                ? 'No conversation activity yet'
+                : 'Insufficient signal yet'}
             </div>
+          ) : (
+            <MomentumSparkline intelligence={intelligence} size="detail" />
           )}
         </div>
       </div>
     </div>
-  );
-}
-
-/** Larger sparkline for the detail page strip. Same shape as the board card
- *  version but bigger (so the bucket-by-bucket trend reads). */
-function DetailMomentumSparkline({ buckets, trend }: {
-  buckets: Array<{ week_start: string; count: number }>;
-  trend: 'increasing' | 'decreasing' | 'stable' | null;
-}) {
-  const W = 80, H = 28, PAD = 3;
-  const color = trend === 'increasing' ? '#22C55E'
-    : trend === 'decreasing' ? '#EF4444'
-    : '#71717A';
-  const counts = buckets.map(b => b.count);
-  const maxC = Math.max(...counts, 1);
-  const stepX = (W - 2 * PAD) / Math.max(buckets.length - 1, 1);
-  const points = counts.map((c, i) => {
-    const x = PAD + i * stepX;
-    const y = H - PAD - ((c / maxC) * (H - 2 * PAD));
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(' ');
-  const tooltip = buckets.map(b => `${b.week_start.slice(0, 10)}: ${b.count}`).join('\n');
-  return (
-    <svg width={W} height={H} className="shrink-0">
-      <title>{tooltip}</title>
-      <polyline points={points} fill="none" stroke={color} strokeWidth={2}
-        strokeLinejoin="round" strokeLinecap="round" />
-    </svg>
   );
 }
 
