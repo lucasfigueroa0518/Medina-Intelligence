@@ -573,6 +573,10 @@ async function routeAuthenticated(
       return Admin.embedAllDeals(request, ctx, env);
     if (path === '/api/admin/run-daily-cron' && method === 'POST')
       return Admin.runDailyCronManually(ctx, env);
+    if (path === '/api/admin/ensure-graph-subscriptions' && method === 'POST') {
+      const { handleEnsureGraphSubscriptions } = await import('./handlers/ensure-graph-subscriptions');
+      return handleEnsureGraphSubscriptions(request, ctx, env);
+    }
     if (path === '/api/admin/backfill-unembedded' && method === 'POST')
       return Admin.backfillUnembedded(request, ctx, env);
     if (path === '/api/admin/backfill-attachments' && method === 'POST')
