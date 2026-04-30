@@ -498,3 +498,186 @@ async function invalidateDealIntelligence(
     console.error(`[deal-association] invalidate failed for deal=${dealId}:`, e);
   }
 }
+
+// ─── Phase E: Slack channel ↔ deal background classifier ────────────────
+//
+// Problem: Slack channels named after a portfolio company (#acme-deal,
+// "ACME — diligence", etc.) carry deal-relevant signal but never reach
+// deal_intelligence because their participant_user_ids don't intersect
+// with deal_contacts unless the same humans happen to also email each
+// other. We can't gate Slack on contact-overlap.
+//
+// Approach: classify the channel itself, not each message.
+//   • Signal 1 (v1): tokenize channel_name + open-deal company names,
+//     compute Jaccard overlap, link if ≥0.5.
+//   • Signal 2-5 (future): membership signals, body keywords, Haiku
+//     adjudication on ambiguous matches.
+//
+// When a channel links to a deal:
+//   • Backfill — every conversation in slack_channel for last 60 days
+//     gets a conversation_deals row via source='inherited_channel'.
+//   • Forward — at ingest time, stage-approvals.ts looks up
+//     slack_channel_deals via (org, channel_id) and links the new
+//     conversation automatically.
+
+const STOP_WORDS = new Set([
+  'the', 'and', 'inc', 'llc', 'ltd', 'co', 'corp', 'corporation',
+  'company', 'group', 'holdings', 'partners', 'capital', 'ventures',
+  'labs', 'tech', 'technologies', 'ai', 'app', 'apps', 'cloud',
+  'deal', 'deals', 'diligence', 'investment', 'investments', 'round',
+]);
+
+/** Tokenize a string into normalized lowercase tokens with stop-words
+ *  removed. Channel names use `-` and `_`; company names use spaces and
+ *  punctuation; both collapse the same way. */
+function tokenizeForChannelMatch(s: string): Set<string> {
+  return new Set(
+    s.toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length >= 2 && !STOP_WORDS.has(t))
+  );
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersect = 0;
+  for (const t of a) if (b.has(t)) intersect++;
+  const union = a.size + b.size - intersect;
+  return union === 0 ? 0 : intersect / union;
+}
+
+/** Backfill conversation_deals for every slack-source conversation in
+ *  this channel from the last 60 days. Source='inherited_channel'.
+ *  Idempotent (PK on conversation_deals). Returns inserted count.
+ *
+ *  Uses external_message_id LIKE '<channel>:%' as the channel filter —
+ *  see slack.ts integration where externalId is built as
+ *  `${channel.id}:${msg.ts}`. Bounded by LIMIT to keep subrequest count
+ *  predictable; channels that exceed the cap will continue to be linked
+ *  forward, just won't all backfill in a single classification pass. */
+export async function backfillSlackChannelToDeal(
+  channelId: string,
+  dealId: string,
+  orgId: string,
+  env: Env,
+  confidence: number = 0.85
+): Promise<{ inserted: number; scanned: number }> {
+  const cutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+  const rows = await env.D1.prepare(
+    `SELECT id FROM conversations
+       WHERE org_id = ?
+         AND source = 'slack'
+         AND external_message_id LIKE ?
+         AND sent_at >= ?
+       ORDER BY sent_at DESC
+       LIMIT 500`
+  ).bind(orgId, `${channelId}:%`, cutoff).all<{ id: string }>();
+
+  let inserted = 0;
+  for (const r of rows.results) {
+    const ins = await env.D1.prepare(
+      `INSERT OR IGNORE INTO conversation_deals
+         (conversation_id, deal_id, confidence, source, created_by)
+       VALUES (?, ?, ?, 'inherited_channel', NULL)`
+    ).bind(r.id, dealId, confidence).run();
+    if (ins.meta?.changes) inserted++;
+  }
+
+  if (inserted > 0) {
+    await invalidateDealIntelligence(dealId, orgId, env);
+  }
+  return { inserted, scanned: rows.results.length };
+}
+
+/** Look up open deals that should auto-link based on the channel name.
+ *  Returns deals scored above the threshold (default 0.5 Jaccard).
+ *  Used by both the channel-upsert classifier and admin tooling. */
+export async function findDealsByChannelNameMatch(
+  channelName: string,
+  orgId: string,
+  env: Env,
+  threshold: number = 0.5
+): Promise<Array<{ deal_id: string; company_name: string; score: number }>> {
+  const channelTokens = tokenizeForChannelMatch(channelName);
+  if (channelTokens.size === 0) return [];
+
+  const openDeals = await env.D1.prepare(
+    `SELECT d.id AS deal_id, c.name AS company_name
+       FROM deals d
+       JOIN companies c ON c.id = d.company_id
+      WHERE d.org_id = ?
+        AND d.deleted_at IS NULL
+        AND d.stage NOT IN ('closed_won','closed_lost')
+      LIMIT 200`
+  ).bind(orgId).all<{ deal_id: string; company_name: string }>();
+
+  const matches: Array<{ deal_id: string; company_name: string; score: number }> = [];
+  for (const d of openDeals.results) {
+    if (!d.company_name) continue;
+    const score = jaccard(channelTokens, tokenizeForChannelMatch(d.company_name));
+    if (score >= threshold) {
+      matches.push({ deal_id: d.deal_id, company_name: d.company_name, score });
+    }
+  }
+  matches.sort((a, b) => b.score - a.score);
+  return matches;
+}
+
+/** Background classifier for a single Slack channel. Called from slack.ts
+ *  after slack_channels upsert. Best-effort; per-channel failure swallowed.
+ *
+ *  On match: insert slack_channel_deals row + backfill last-60-days
+ *  conversations into conversation_deals via inherited_channel. Idempotent
+ *  via PKs on both tables. Skips channels already linked to the matched
+ *  deal (saves the backfill scan). */
+export async function classifySlackChannelForDeals(
+  channelId: string,
+  channelName: string,
+  orgId: string,
+  env: Env
+): Promise<{ linked: number; backfilled: number }> {
+  if (!channelName) return { linked: 0, backfilled: 0 };
+
+  const matches = await findDealsByChannelNameMatch(channelName, orgId, env);
+  if (matches.length === 0) return { linked: 0, backfilled: 0 };
+
+  let linked = 0;
+  let backfilled = 0;
+  for (const m of matches) {
+    const ins = await env.D1.prepare(
+      `INSERT OR IGNORE INTO slack_channel_deals
+         (org_id, channel_id, deal_id, confidence, source, created_by)
+       VALUES (?, ?, ?, ?, 'channel_name_match', NULL)`
+    ).bind(orgId, channelId, m.deal_id, m.score).run();
+    if (!ins.meta?.changes) continue;
+
+    linked++;
+    console.log(
+      `[slack-classifier] linked channel=${channelId} (${channelName}) → deal=${m.deal_id} (${m.company_name}) score=${m.score.toFixed(2)}`
+    );
+    const bf = await backfillSlackChannelToDeal(channelId, m.deal_id, orgId, env, m.score);
+    backfilled += bf.inserted;
+    if (bf.inserted > 0) {
+      console.log(
+        `[slack-classifier] backfilled ${bf.inserted}/${bf.scanned} messages from channel=${channelId} → deal=${m.deal_id}`
+      );
+    }
+  }
+  return { linked, backfilled };
+}
+
+/** Look up which deals are linked to a Slack channel. Used by the
+ *  ingest-time hook in stage-approvals.ts when a slack-source
+ *  conversation arrives. Returns [] when channel isn't classified. */
+export async function getDealsForSlackChannel(
+  channelId: string,
+  orgId: string,
+  env: Env
+): Promise<Array<{ deal_id: string; confidence: number }>> {
+  const rows = await env.D1.prepare(
+    `SELECT deal_id, confidence FROM slack_channel_deals
+      WHERE org_id = ? AND channel_id = ?`
+  ).bind(orgId, channelId).all<{ deal_id: string; confidence: number }>();
+  return rows.results;
+}
