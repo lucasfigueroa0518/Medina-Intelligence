@@ -11,20 +11,26 @@
 // parser to fail. The "Unsupported file type" branch still returns '' (it's
 // a known case, not an error).
 
-import { extractText } from 'unpdf';
+// Wave 5.6 (A safety-net): PDF extraction is currently disabled in
+// production. Both unpdf@1.6.2 and direct pdfjs-dist@5.7.284 fail under
+// esbuild + wrangler bundling — esbuild cannot preserve pdfjs's static-
+// class-block semantics, mangling identifiers and breaking polyfill setup
+// at module-init. Tracked as Wave 5.6 follow-up; needs either (a) Rollup-
+// pre-bundled artifact shipped as a Worker module, replicating what unpdf
+// does internally, or (b) external extraction service. Phase A's failure-
+// visibility infrastructure ensures every PDF now lands processing_status=
+// 'failed' with a clear, stable error_message so users see the limitation
+// rather than confusing parser internals like "Ch is not a constructor".
 
 export async function extractTextFromFile(file: File): Promise<string> {
   const mimeType = file.type.toLowerCase();
   const fileName = file.name.toLowerCase();
 
   if (mimeType === 'application/pdf' || fileName.endsWith('.pdf')) {
-    try {
-      const buffer = await file.arrayBuffer();
-      const { text } = await extractText(new Uint8Array(buffer), { mergePages: true });
-      return text;
-    } catch (e: any) {
-      throw new Error(`PDF extraction failed: ${e?.message || e}`);
-    }
+    // Phase A's catch-and-stamp infra still runs against this throw —
+    // the row lands processing_status='failed' with this stable message.
+    // Stable string > confusing parser internals while we scope Wave 5.6.
+    throw new Error('PDF extraction not yet supported in Workers runtime — Wave 5.6 follow-up');
   }
 
   if (
