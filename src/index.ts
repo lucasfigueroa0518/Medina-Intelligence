@@ -718,6 +718,22 @@ async function handleScheduled(
           try { await renewExpiringSubscriptions(env); }
           catch (e) { console.error(`hourly self-heal: renewExpiringSubscriptions failed:`, e); }
         })());
+        // Hourly contact + company embed backfill — backfillUnembeddedEntities
+        // is the SOLE callsite of embedContactBio + embedCompanyDescription
+        // in the codebase (no other ingestion path embeds these). With the
+        // 0 0 * * * daily cron silently dead since 2026-04-28 (commit
+        // 58ea134's 4th-trigger registration broke CF dispatch), new
+        // contacts/companies created in the last 48+ hours have NO Vectorize
+        // entries — they're invisible to MARTy semantic search. Cost: ~120
+        // subreqs/hour worst case (20 contacts + 20 companies × ~3 each + 2
+        // SELECTs), well within the per-invocation cap. Separate waitUntil
+        // so it races concurrently with the embed self-heal + renewal blocks
+        // for the same subrequest-budget rationale documented above.
+        ctxExec.waitUntil((async () => {
+          const { backfillUnembeddedEntities } = await import('./lib/daily-cron');
+          try { await backfillUnembeddedEntities(org.id, env); }
+          catch (e) { console.error(`hourly self-heal: backfillUnembeddedEntities failed for ${org.id}:`, e); }
+        })());
       } else if (cron === '5 * * * *') {
         // Enrichment
         await env.ENRICHMENT_WORKFLOW.create({
