@@ -316,6 +316,159 @@ export async function proposeLinkToDeal(opts: {
   return { inserted: (result.meta?.changes ?? 0) > 0 };
 }
 
+// ─── Phase D: hard/medium-signal detection at ingest time ──────────────
+//
+// Confidence ladder per T6's framework:
+//
+//   HARD signals (auto-link, source='auto_high' or 'inherited_*'):
+//     • inherited_thread: another conversation in the same external_thread_id
+//       is already linked → new conv inherits.
+//     • auto_high: subject contains an open-deal company name AND a
+//       deal-language keyword (subject is high-precision metadata; "Acme
+//       term sheet" effectively names the deal).
+//
+//   MEDIUM signals (propose via approval_queue):
+//     • Meeting heuristic: event with internal + external attendees,
+//       ≥30 min duration, attendee matches a deal_contact → propose.
+//
+//   WEAK signals: PR #24 contact-overlap fallback, untouched.
+//
+// Helpers run at stage-approvals.ts ingest time (best-effort). Idempotent
+// via INSERT OR IGNORE on the junctions / approval_queue.
+//
+// Out of scope this phase:
+//   • inherited_series — events table has no series_id column yet.
+//   • inherited_channel — Phase E.
+//   • Forwarded deal memo / data-room URL detection — body parsing.
+
+const SUBJECT_DEAL_KEYWORDS = [
+  'term sheet', 'data room', 'diligence', 'safe', 'investment',
+  'allocation', 'check size', 'pre-seed', 'seed round', 'series a',
+  'series b', 'series c', 'pitch', 'valuation', 'memo', 'closing',
+];
+
+/** Apply hard signals to a newly-staged conversation. Runs inline in
+ *  stage-approvals.ts after conversation_contacts is populated. Returns
+ *  count of new junction rows inserted. Best-effort — caller swallows. */
+export async function applyHardSignalsToConversation(
+  conversationId: string,
+  externalThreadId: string | null,
+  subject: string | null,
+  orgId: string,
+  env: Env
+): Promise<{ inherited_thread: number; auto_high: number }> {
+  let inheritedThread = 0;
+  let autoHigh = 0;
+
+  // (1) inherited_thread: any other conversation in the same external
+  // thread already linked to a deal → this conversation inherits.
+  if (externalThreadId) {
+    const siblings = await env.D1.prepare(
+      `SELECT cd.deal_id, MAX(cd.confidence) AS confidence
+         FROM conversations sib
+         JOIN conversation_deals cd ON cd.conversation_id = sib.id
+        WHERE sib.external_thread_id = ?
+          AND sib.org_id = ?
+          AND sib.id != ?
+        GROUP BY cd.deal_id
+        LIMIT 10`
+    ).bind(externalThreadId, orgId, conversationId).all<{ deal_id: string; confidence: number }>();
+    for (const s of siblings.results) {
+      const r = await linkConversationToDeal(
+        conversationId, s.deal_id, 'inherited_thread', s.confidence, orgId, env
+      );
+      if (r.inserted) inheritedThread++;
+    }
+  }
+
+  // (2) auto_high: subject names an open-deal company AND contains
+  // deal-language. Cheap O(open_deals) scan; orgs rarely have >50
+  // simultaneously-open deals.
+  if (subject) {
+    const subjectLower = subject.toLowerCase();
+    const hasDealLanguage = SUBJECT_DEAL_KEYWORDS.some(kw => subjectLower.includes(kw));
+    if (hasDealLanguage) {
+      const openDeals = await env.D1.prepare(
+        `SELECT d.id, c.name
+           FROM deals d
+           JOIN companies c ON c.id = d.company_id
+          WHERE d.org_id = ?
+            AND d.deleted_at IS NULL
+            AND d.stage NOT IN ('closed_won','closed_lost')
+          LIMIT 200`
+      ).bind(orgId).all<{ id: string; name: string }>();
+      for (const d of openDeals.results) {
+        if (!d.name) continue;
+        if (subjectLower.includes(d.name.toLowerCase())) {
+          const r = await linkConversationToDeal(
+            conversationId, d.id, 'auto_high', 0.95, orgId, env
+          );
+          if (r.inserted) autoHigh++;
+          // Keep scanning — "Acme + Beta term sheet" can legitimately
+          // reference both deals.
+        }
+      }
+    }
+  }
+
+  return { inherited_thread: inheritedThread, auto_high: autoHigh };
+}
+
+/** Apply medium-signal heuristic to a newly-staged event. Proposes a
+ *  link_to_deal in approval_queue when attendee profile + duration
+ *  suggest deal involvement. Returns count proposed. */
+export async function applyMeetingHeuristicToEvent(
+  eventId: string,
+  orgId: string,
+  env: Env
+): Promise<{ proposed: number }> {
+  const event = await env.D1.prepare(
+    `SELECT id, start_time, end_time
+       FROM events
+      WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(eventId, orgId).first<{ id: string; start_time: string; end_time: string | null }>();
+  if (!event) return { proposed: 0 };
+
+  // Duration filter — short standups don't pass the heuristic.
+  const startMs = Date.parse(event.start_time);
+  const endMs = event.end_time ? Date.parse(event.end_time) : NaN;
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return { proposed: 0 };
+  if ((endMs - startMs) / 60000 < 30) return { proposed: 0 };
+
+  // Need at least one internal user AND one external contact.
+  const attendees = await env.D1.prepare(
+    `SELECT contact_id, is_internal FROM event_attendees WHERE event_id = ?`
+  ).bind(eventId).all<{ contact_id: string | null; is_internal: number }>();
+  const hasInternal = attendees.results.some(a => a.is_internal === 1);
+  const externalContactIds = attendees.results
+    .filter(a => a.is_internal !== 1 && a.contact_id)
+    .map(a => a.contact_id!) as string[];
+  if (!hasInternal || externalContactIds.length === 0) return { proposed: 0 };
+
+  // Find any open deals whose deal_contacts intersect with external
+  // attendees. Multi-deal match is allowed — propose for each.
+  const placeholders = externalContactIds.map(() => '?').join(',');
+  const deals = await env.D1.prepare(
+    `SELECT DISTINCT d.id
+       FROM deals d
+       JOIN deal_contacts dc ON dc.deal_id = d.id
+      WHERE d.org_id = ? AND d.deleted_at IS NULL
+        AND d.stage NOT IN ('closed_won','closed_lost')
+        AND dc.contact_id IN (${placeholders})
+      LIMIT 5`
+  ).bind(orgId, ...externalContactIds).all<{ id: string }>();
+
+  let proposed = 0;
+  for (const d of deals.results) {
+    const r = await proposeLinkToDeal({
+      kind: 'event', sourceId: eventId, dealId: d.id, orgId,
+      confidence: 0.75, sourceCommunicationId: eventId,
+    }, env);
+    if (r.inserted) proposed++;
+  }
+  return { proposed };
+}
+
 /** Broadcast invalidate all deal_intelligence rows for a deal. Per-user
  *  ACL filtering still applies during the next recompute (compute calls
  *  filterConversationsByAcl), so over-invalidating is safe — at worst we

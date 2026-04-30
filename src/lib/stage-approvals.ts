@@ -138,6 +138,30 @@ export async function stageAndCommitApprovals(
         }
       }
 
+      // Phase D: confidence-ladder hard signals. Inherited-thread (any
+      // sibling conversation in the same external_thread_id is already
+      // linked to a deal → this conversation inherits) + auto_high
+      // (subject names an open-deal company AND contains deal-language).
+      // Best-effort; never blocks staging. Idempotent at the junction
+      // layer.
+      try {
+        const { applyHardSignalsToConversation } = await import('./deal-association');
+        const r = await applyHardSignalsToConversation(
+          item.entityId,
+          item.threadId || null,
+          item.subject || null,
+          orgId,
+          env
+        );
+        if (r.inherited_thread > 0 || r.auto_high > 0) {
+          console.log(
+            `[stage] hard-signals conversation=${item.entityId} inherited_thread=${r.inherited_thread} auto_high=${r.auto_high}`
+          );
+        }
+      } catch (e) {
+        console.error(`[stage] applyHardSignalsToConversation failed for ${item.entityId}:`, e);
+      }
+
       // deal_intelligence event-driven invalidation. Fires when any of
       // this conversation's contacts is in any deal_contacts row — for
       // each affected (deal_id, user_id), checks canReadEmailContent
