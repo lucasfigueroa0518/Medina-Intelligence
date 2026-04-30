@@ -305,30 +305,29 @@ const AGENT_TOOLS: ToolDefinition[] = [
 async function executeTool(
   toolName: string,
   toolInput: any,
-  orgId: string,
-  userId: string,
+  ctx: AuthContext,
   env: Env
 ): Promise<any> {
   switch (toolName) {
-    case 'search_contacts': return searchContacts(orgId, toolInput, env);
-    case 'search_companies': return searchCompanies(orgId, toolInput, env);
-    case 'search_deals': return searchDeals(orgId, toolInput, env);
-    case 'search_conversations': return searchConversations(orgId, toolInput, env);
-    case 'get_contact_detail': return getContactDetail(orgId, toolInput.contact_id, env);
-    case 'get_company_detail': return getCompanyDetail(orgId, toolInput.company_id, env);
-    case 'get_deal_detail': return getDealDetail(orgId, toolInput.deal_id, env);
+    case 'search_contacts': return searchContacts(ctx, toolInput, env);
+    case 'search_companies': return searchCompanies(ctx, toolInput, env);
+    case 'search_deals': return searchDeals(ctx, toolInput, env);
+    case 'search_conversations': return searchConversations(ctx, toolInput, env);
+    case 'get_contact_detail': return getContactDetail(ctx, toolInput.contact_id, env);
+    case 'get_company_detail': return getCompanyDetail(ctx, toolInput.company_id, env);
+    case 'get_deal_detail': return getDealDetail(ctx, toolInput.deal_id, env);
     case 'web_search': return webSearch(toolInput.query, toolInput.num_results, env);
     case 'read_url': return readUrl(toolInput.url);
-    case 'create_contact': return createContactTool(orgId, userId, toolInput, env);
-    case 'update_contact': return updateContactTool(orgId, userId, toolInput, env);
-    case 'create_company': return createCompanyTool(orgId, userId, toolInput, env);
-    case 'update_company': return updateCompanyTool(orgId, userId, toolInput, env);
-    case 'create_deal': return createDealTool(orgId, userId, toolInput, env);
-    case 'update_deal': return updateDealTool(orgId, userId, toolInput, env);
-    case 'add_note': return addNoteTool(orgId, userId, toolInput, env);
-    case 'add_deal_action_item': return addDealActionItemTool(orgId, userId, toolInput, env);
-    case 'apply_tag': return applyTagTool(orgId, toolInput, env);
-    case 'delete_entity': return deleteEntityTool(orgId, userId, toolInput, env);
+    case 'create_contact': return createContactTool(ctx.orgId, ctx.userId, toolInput, env);
+    case 'update_contact': return updateContactTool(ctx.orgId, ctx.userId, toolInput, env);
+    case 'create_company': return createCompanyTool(ctx.orgId, ctx.userId, toolInput, env);
+    case 'update_company': return updateCompanyTool(ctx.orgId, ctx.userId, toolInput, env);
+    case 'create_deal': return createDealTool(ctx.orgId, ctx.userId, toolInput, env);
+    case 'update_deal': return updateDealTool(ctx.orgId, ctx.userId, toolInput, env);
+    case 'add_note': return addNoteTool(ctx.orgId, ctx.userId, toolInput, env);
+    case 'add_deal_action_item': return addDealActionItemTool(ctx.orgId, ctx.userId, toolInput, env);
+    case 'apply_tag': return applyTagTool(ctx.orgId, toolInput, env);
+    case 'delete_entity': return deleteEntityTool(ctx.orgId, ctx.userId, toolInput, env);
     default: return { error: `Unknown tool: ${toolName}` };
   }
 }
@@ -731,9 +730,6 @@ export async function queryAgent(
   ).bind(userMessageId, session.id, turnIndex, query, attachmentsJson).run();
 
   // --- Stream Claude response with tool use ---
-  const orgId = ctx.orgId;
-  const userId = ctx.userId;
-
   let systemPrompt = GOD_MODE_SYSTEM_PROMPT;
   if (deepDive && stats) {
     systemPrompt += `\n\nYou are in Deep Dive mode. Begin your response with a single brief line summarizing the scope, formatted as:\n🔍 Deep dive: Searched ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts.\nThen proceed with your thorough analysis. Be exhaustive — reference every relevant piece of evidence you find. Cite specific emails, meetings, and documents by name and date. Don't summarize — be thorough.`;
@@ -752,7 +748,7 @@ export async function queryAgent(
       messages,
       max_tokens: deepDive ? 8192 : 4096,
       tools: AGENT_TOOLS,
-      onToolCall: (name, input) => executeTool(name, input, orgId, userId, env),
+      onToolCall: (name, input) => executeTool(name, input, ctx, env),
       signal: cancelController.signal,
     },
     env
