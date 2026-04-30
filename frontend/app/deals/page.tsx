@@ -2,6 +2,7 @@
 
 import React from 'react';
 import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
 import { CompanySearchField } from '@/components/company-search-field';
 import { api } from '@/lib/api';
@@ -12,6 +13,9 @@ import {
   AlertCircle,
   ChevronLeft,
   ChevronRight,
+  Filter,
+  Check,
+  Trash2,
 } from 'lucide-react';
 
 type DealStage =
@@ -59,6 +63,8 @@ const EMPTY_FORM: CreateDealForm = {
 };
 
 export default function DealsPage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const [deals, setDeals] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [modalOpen, setModalOpen] = React.useState(false);
@@ -69,6 +75,131 @@ export default function DealsPage() {
   const [dragDealId, setDragDealId] = React.useState<string | null>(null);
   const [dragOverStage, setDragOverStage] = React.useState<string | null>(null);
   const [refreshKey, setRefreshKey] = React.useState(0);
+  const [filterPanelOpen, setFilterPanelOpen] = React.useState(false);
+  /* Day-5 Phase C: bulk selection state. Set of selected deal IDs; cleared
+     on every fresh data load (deals re-fetched after a filter / sort change
+     would otherwise leave stale selection refs around). */
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  const [bulkConfirmArchive, setBulkConfirmArchive] = React.useState(false);
+
+  function toggleSelected(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function clearSelection() {
+    setSelectedIds(new Set());
+  }
+
+  async function bulkSetStage(stage: string) {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    try {
+      const r = await api.bulkUpdateDeals({
+        deal_ids: Array.from(selectedIds),
+        updates: { stage },
+      });
+      setToast(`${r.updated_count} deal${r.updated_count === 1 ? '' : 's'} moved to ${STAGES.find(s => s.key === stage)?.label || stage}`);
+      clearSelection();
+      setRefreshKey(k => k + 1);
+    } catch (e: any) {
+      setToast(`Bulk update failed: ${e?.message || 'unknown'}`);
+    }
+    setBulkBusy(false);
+  }
+  async function bulkSetOwner(ownerId: string | null) {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    try {
+      const r = await api.bulkUpdateDeals({
+        deal_ids: Array.from(selectedIds),
+        updates: { owner_id: ownerId },
+      });
+      const label = ownerId
+        ? (users.find(u => u.id === ownerId)?.full_name || users.find(u => u.id === ownerId)?.email || 'user')
+        : 'unassigned';
+      setToast(`${r.updated_count} deal${r.updated_count === 1 ? '' : 's'} → ${label}`);
+      clearSelection();
+      setRefreshKey(k => k + 1);
+    } catch (e: any) {
+      setToast(`Bulk reassign failed: ${e?.message || 'unknown'}`);
+    }
+    setBulkBusy(false);
+  }
+  async function bulkArchive() {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    try {
+      const r = await api.bulkUpdateDeals({
+        deal_ids: Array.from(selectedIds),
+        archive: true,
+      });
+      setToast(`${r.updated_count} deal${r.updated_count === 1 ? '' : 's'} archived`);
+      clearSelection();
+      setBulkConfirmArchive(false);
+      setRefreshKey(k => k + 1);
+    } catch (e: any) {
+      setToast(`Bulk archive failed: ${e?.message || 'unknown'}`);
+    }
+    setBulkBusy(false);
+  }
+
+  /* ── Day-5 Phase A: filter state. URL is the source of truth — values
+       persist across refresh and share-links. Filter row updates the URL,
+       the listDeals fetch reads from URL, refetch chained on URL changes. */
+  const filters = React.useMemo(() => ({
+    stage: searchParams.getAll('stage').filter(Boolean),
+    owner_id: searchParams.getAll('owner_id').filter(Boolean),
+    instrument_type: searchParams.getAll('instrument_type').filter(Boolean),
+    lead_source: searchParams.getAll('lead_source').filter(Boolean),
+    min_amount: searchParams.get('min_amount') ?? '',
+    max_amount: searchParams.get('max_amount') ?? '',
+    has_memo: searchParams.get('has_memo') ?? '',  // '' | 'true' | 'false'
+  }), [searchParams]);
+
+  const filterCount =
+    filters.stage.length +
+    filters.owner_id.length +
+    filters.instrument_type.length +
+    filters.lead_source.length +
+    (filters.min_amount ? 1 : 0) +
+    (filters.max_amount ? 1 : 0) +
+    (filters.has_memo ? 1 : 0);
+
+  function updateFilters(mut: (sp: URLSearchParams) => void) {
+    const next = new URLSearchParams(searchParams.toString());
+    mut(next);
+    const qs = next.toString();
+    router.replace(qs ? `?${qs}` : '?', { scroll: false });
+  }
+
+  function toggleArrayFilter(key: string, value: string) {
+    updateFilters(sp => {
+      const cur = sp.getAll(key);
+      sp.delete(key);
+      if (cur.includes(value)) {
+        for (const v of cur) if (v !== value) sp.append(key, v);
+      } else {
+        for (const v of cur) sp.append(key, v);
+        sp.append(key, value);
+      }
+    });
+  }
+
+  function setScalarFilter(key: string, value: string | null) {
+    updateFilters(sp => {
+      sp.delete(key);
+      if (value !== null && value !== '') sp.append(key, value);
+    });
+  }
+
+  function clearAllFilters() {
+    router.replace('?', { scroll: false });
+  }
 
   /* ── Horizontal scroll state ── */
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -101,13 +232,15 @@ export default function DealsPage() {
     el.scrollBy({ left: dir === 'left' ? -300 : 300, behavior: 'smooth' });
   }
 
-  /* ── Data loading ── */
-
+  /* ── Data loading ── refetch when filters change OR refreshKey bumps. */
   React.useEffect(() => {
-    api.listDeals()
+    setLoading(true);
+    api.listDeals(searchParams)
       .then(d => setDeals(d.deals))
       .finally(() => setLoading(false));
-  }, [refreshKey]);
+    // searchParams from useSearchParams is reactive; this effect fires
+    // every time the URL filter set changes.
+  }, [refreshKey, searchParams]);
 
   React.useEffect(() => {
     api.listUsers().then(u => setUsers(u.users || []));
@@ -200,9 +333,14 @@ export default function DealsPage() {
     setDragOverStage(null);
   }
 
+  /* Day-5 Phase B: per-column sort. Read from URL ?sort=...; client-side
+     sort applied to the already-loaded deals so column re-sort doesn't
+     trigger a refetch. Default 'expected_close' matches backend's existing
+     ORDER BY (server-side sort is the fallback when ?sort= is absent). */
+  const sortKey = (searchParams.get('sort') || 'expected_close') as DealSortKey;
   const dealsByStage = STAGES.map(stage => ({
     ...stage,
-    deals: deals.filter(d => d.stage === stage.key),
+    deals: sortDealsForColumn(deals.filter(d => d.stage === stage.key), sortKey),
   }));
 
   const totalPipeline = deals
@@ -224,12 +362,47 @@ export default function DealsPage() {
                 <span className="text-xl font-bold text-semantic-success">{formatCurrency(totalPipeline)}</span>
               </span>
             )}
+            <button
+              onClick={() => setFilterPanelOpen(o => !o)}
+              className={`btn-ghost flex items-center gap-2 text-xs py-1.5 ${filterCount > 0 ? 'text-accent-magenta' : ''}`}
+              title="Filters"
+            >
+              <Filter size={14} />
+              {filterCount > 0 ? `Filters (${filterCount})` : 'Filters'}
+            </button>
+            {/* Day-5 Phase B: sort dropdown. Client-side sort applied to
+                already-loaded deals (no refetch). */}
+            <select
+              value={sortKey}
+              onChange={e => setScalarFilter('sort', e.target.value === 'expected_close' ? null : e.target.value)}
+              className="input text-xs py-1.5 px-2"
+              title="Sort within column"
+            >
+              {SORT_OPTIONS.map(opt => (
+                <option key={opt.value} value={opt.value}>Sort: {opt.label}</option>
+              ))}
+            </select>
             <button className="btn-primary flex items-center gap-2" onClick={openModal}>
               <Plus size={16} /> Add Deal
             </button>
           </div>
         }
       />
+
+      {/* ── Day-5 Phase A: filter panel. URL-state-driven; refresh / share-link
+           preserves selections. Multi-select chips for stage/owner/instrument/
+           lead-source. Range inputs for amount. Tri-state for has_memo. ── */}
+      {filterPanelOpen && (
+        <DealFiltersPanel
+          filters={filters}
+          users={users}
+          allDeals={deals}
+          onToggle={toggleArrayFilter}
+          onSetScalar={setScalarFilter}
+          onClearAll={clearAllFilters}
+          onClose={() => setFilterPanelOpen(false)}
+        />
+      )}
 
       {/* ── Pipeline board with scroll arrows ── */}
       <div className="flex-1 relative">
@@ -312,6 +485,8 @@ export default function DealsPage() {
                           isDragging={dragDealId === deal.id}
                           onDragStart={handleDragStart}
                           onDragEnd={handleDragEnd}
+                          selected={selectedIds.has(deal.id)}
+                          onToggleSelect={() => toggleSelected(deal.id)}
                         />
                       ))}
                     </div>
@@ -339,6 +514,53 @@ export default function DealsPage() {
           background: rgba(255,255,255,0.22);
         }
       `}} />
+
+      {/* ── Day-5 Phase C: bulk action bar. Floats at the bottom when 1+
+          deals are selected. Stays out of the way otherwise. ── */}
+      {selectedIds.size > 0 && (
+        <BulkActionBar
+          selectedCount={selectedIds.size}
+          users={users}
+          busy={bulkBusy}
+          onSetStage={bulkSetStage}
+          onSetOwner={bulkSetOwner}
+          onArchive={() => setBulkConfirmArchive(true)}
+          onClear={clearSelection}
+        />
+      )}
+
+      {bulkConfirmArchive && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+          onClick={() => !bulkBusy && setBulkConfirmArchive(false)}
+        >
+          <div
+            className="bg-bg-elevated rounded-2xl w-full max-w-sm shadow-2xl border border-border p-6"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="text-lg font-medium text-text-primary mb-2">
+              Archive {selectedIds.size} deal{selectedIds.size === 1 ? '' : 's'}?
+            </div>
+            <div className="text-sm text-text-secondary mb-4">
+              Archived deals are soft-deleted (hidden from the board) but kept in the database
+              for audit / restore. This is reversible — contact an admin to recover if needed.
+            </div>
+            <div className="flex justify-end gap-3">
+              <button className="btn-ghost" onClick={() => setBulkConfirmArchive(false)} disabled={bulkBusy}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                style={{ background: '#DC2626', borderColor: '#DC2626' }}
+                onClick={bulkArchive}
+                disabled={bulkBusy}
+              >
+                {bulkBusy ? 'Archiving...' : 'Archive'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Create Deal Modal ── */}
       {modalOpen && (
@@ -495,12 +717,14 @@ function readDealIntelligence(deal: any): DealIntelligence {
   };
 }
 
-function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
+function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd, selected, onToggleSelect }: {
   deal: any;
   stageColor: string;
   isDragging: boolean;
   onDragStart: (e: React.DragEvent, id: string) => void;
   onDragEnd: () => void;
+  selected: boolean;
+  onToggleSelect: () => void;
 }) {
   const daysInStage = deal.stage_changed_at
     ? Math.floor((Date.now() - new Date(deal.stage_changed_at).getTime()) / 86_400_000)
@@ -545,11 +769,25 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
         onDragEnd={onDragEnd}
         className={`card cursor-grab active:cursor-grabbing hover:border-border-hover transition-all group ${
           isDragging ? 'opacity-40 scale-95' : ''
-        }`}
+        } ${selected ? 'ring-2 ring-accent-magenta/40' : ''}`}
         style={{ borderLeft: `3px solid ${stageColor}20` }}
       >
-        {/* Top row: grip + title + company */}
+        {/* Top row: select checkbox + grip + title + company. Checkbox click
+            stops propagation so it never navigates to detail. */}
         <div className="flex items-start gap-1.5">
+          <button
+            type="button"
+            onClick={e => { e.preventDefault(); e.stopPropagation(); onToggleSelect(); }}
+            className={`shrink-0 mt-0.5 w-3.5 h-3.5 rounded flex items-center justify-center transition-all ${
+              selected
+                ? 'bg-accent-magenta border-accent-magenta'
+                : 'border border-white/15 opacity-0 group-hover:opacity-100 hover:border-white/40'
+            }`}
+            title={selected ? 'Deselect' : 'Select for bulk action'}
+            style={{ borderWidth: 1 }}
+          >
+            {selected && <Check size={10} className="text-white" />}
+          </button>
           <GripVertical
             size={14}
             className="text-text-muted/30 shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
@@ -718,9 +956,443 @@ function SentimentIndicator({ score, direction }: {
   );
 }
 
+/* ── Day-5 Phase B: per-column sort ── */
+
+type DealSortKey =
+  | 'expected_close'      // default — matches the server-side ORDER BY
+  | 'amount_desc'         // largest deals first
+  | 'last_activity_desc'  // most recently touched first (uses inferred field)
+  | 'days_in_stage_desc'; // longest-stuck first
+
+const SORT_OPTIONS: Array<{ value: DealSortKey; label: string }> = [
+  { value: 'expected_close',      label: 'Expected close' },
+  { value: 'amount_desc',         label: 'Amount (high → low)' },
+  { value: 'last_activity_desc',  label: 'Last activity' },
+  { value: 'days_in_stage_desc',  label: 'Stuck longest' },
+];
+
+function sortDealsForColumn(deals: any[], key: DealSortKey): any[] {
+  const copy = deals.slice();
+  switch (key) {
+    case 'amount_desc':
+      copy.sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0));
+      break;
+    case 'last_activity_desc': {
+      // Use the same fallback chain DealCard renders so the visible "Xd ago"
+      // dot ordering matches what the user sees.
+      const ts = (d: any): number => {
+        const iso = d.last_inferred_activity_date ?? d.last_activity_date ?? d.created_at;
+        const v = iso ? new Date(iso).getTime() : 0;
+        return Number.isFinite(v) ? v : 0;
+      };
+      copy.sort((a, b) => ts(b) - ts(a));
+      break;
+    }
+    case 'days_in_stage_desc': {
+      const days = (d: any): number => {
+        if (d.stage_changed_at) {
+          const dt = (Date.now() - new Date(d.stage_changed_at).getTime()) / 86_400_000;
+          return Number.isFinite(dt) ? dt : 0;
+        }
+        return d.days_in_stage ?? 0;
+      };
+      copy.sort((a, b) => days(b) - days(a));
+      break;
+    }
+    case 'expected_close':
+    default: {
+      // NULLs last (matches backend's ORDER BY ... NULLS LAST). Within
+      // not-NULL: ascending (closer = earlier).
+      copy.sort((a, b) => {
+        const av = a.expected_close ? new Date(a.expected_close).getTime() : Number.POSITIVE_INFINITY;
+        const bv = b.expected_close ? new Date(b.expected_close).getTime() : Number.POSITIVE_INFINITY;
+        return av - bv;
+      });
+      break;
+    }
+  }
+  return copy;
+}
+
 function formatCurrency(v: number): string {
   if (v >= 1e9) return `$${(v / 1e9).toFixed(1)}B`;
   if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
   if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}K`;
   return `$${v}`;
+}
+
+/* ── Day-5 Phase C: bulk action bar ── */
+
+function BulkActionBar({
+  selectedCount, users, busy, onSetStage, onSetOwner, onArchive, onClear,
+}: {
+  selectedCount: number;
+  users: any[];
+  busy: boolean;
+  onSetStage: (stage: string) => void;
+  onSetOwner: (ownerId: string | null) => void;
+  onArchive: () => void;
+  onClear: () => void;
+}) {
+  const [stagePickerOpen, setStagePickerOpen] = React.useState(false);
+  const [ownerPickerOpen, setOwnerPickerOpen] = React.useState(false);
+
+  // Close pickers on outside click. Lightweight — both are simple dropdowns
+  // and don't justify a portal / focus-trap.
+  React.useEffect(() => {
+    if (!stagePickerOpen && !ownerPickerOpen) return;
+    function onClick(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (!target.closest('[data-bulk-picker]')) {
+        setStagePickerOpen(false);
+        setOwnerPickerOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [stagePickerOpen, ownerPickerOpen]);
+
+  return (
+    <div
+      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 rounded-xl shadow-2xl px-4 py-3 flex items-center gap-3"
+      style={{
+        background: '#1A1A1F',
+        border: '1px solid rgba(217,70,168,0.30)',
+        borderLeft: '3px solid #D946A8',
+      }}
+    >
+      <span className="text-sm text-text-primary font-medium">
+        {selectedCount} selected
+      </span>
+
+      <div className="w-px h-5 bg-white/10" />
+
+      {/* Set stage */}
+      <div className="relative" data-bulk-picker>
+        <button
+          onClick={() => { setStagePickerOpen(o => !o); setOwnerPickerOpen(false); }}
+          disabled={busy}
+          className="btn-secondary text-xs py-1 disabled:opacity-50"
+        >
+          Set stage…
+        </button>
+        {stagePickerOpen && (
+          <div
+            className="absolute bottom-full left-0 mb-2 rounded-lg shadow-xl py-1 min-w-[180px]"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+          >
+            {STAGES.map(s => (
+              <button
+                key={s.key}
+                onClick={() => { onSetStage(s.key); setStagePickerOpen(false); }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text-primary hover:bg-white/[0.04] text-left"
+              >
+                <span className="w-2 h-2 rounded-full shrink-0" style={{ background: s.color }} />
+                {s.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Reassign owner */}
+      <div className="relative" data-bulk-picker>
+        <button
+          onClick={() => { setOwnerPickerOpen(o => !o); setStagePickerOpen(false); }}
+          disabled={busy}
+          className="btn-secondary text-xs py-1 disabled:opacity-50"
+        >
+          Reassign…
+        </button>
+        {ownerPickerOpen && (
+          <div
+            className="absolute bottom-full left-0 mb-2 rounded-lg shadow-xl py-1 min-w-[200px] max-h-64 overflow-y-auto"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+          >
+            <button
+              onClick={() => { onSetOwner(null); setOwnerPickerOpen(false); }}
+              className="w-full px-3 py-1.5 text-xs text-text-muted hover:bg-white/[0.04] text-left italic"
+            >
+              Unassigned
+            </button>
+            {users.map(u => (
+              <button
+                key={u.id}
+                onClick={() => { onSetOwner(u.id); setOwnerPickerOpen(false); }}
+                className="w-full px-3 py-1.5 text-xs text-text-primary hover:bg-white/[0.04] text-left"
+              >
+                {u.full_name || u.email}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Archive */}
+      <button
+        onClick={onArchive}
+        disabled={busy}
+        className="btn-ghost text-xs py-1 flex items-center gap-1 text-red-400 hover:text-red-300 disabled:opacity-50"
+      >
+        <Trash2 size={12} /> Archive
+      </button>
+
+      <div className="w-px h-5 bg-white/10" />
+
+      <button
+        onClick={onClear}
+        disabled={busy}
+        className="btn-ghost text-xs py-1 disabled:opacity-50"
+      >
+        Clear
+      </button>
+    </div>
+  );
+}
+
+/* ── Day-5 Phase A: filter panel ── */
+
+const FILTER_INSTRUMENT_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'safe', label: 'SAFE' },
+  { value: 'convertible_note', label: 'Convertible Note' },
+  { value: 'equity', label: 'Equity' },
+  { value: 'debt', label: 'Debt' },
+  { value: 'other', label: 'Other' },
+];
+
+interface FiltersShape {
+  stage: string[];
+  owner_id: string[];
+  instrument_type: string[];
+  lead_source: string[];
+  min_amount: string;
+  max_amount: string;
+  has_memo: string;
+}
+
+function DealFiltersPanel({
+  filters, users, allDeals, onToggle, onSetScalar, onClearAll, onClose,
+}: {
+  filters: FiltersShape;
+  users: any[];
+  allDeals: any[];
+  onToggle: (key: string, value: string) => void;
+  onSetScalar: (key: string, value: string | null) => void;
+  onClearAll: () => void;
+  onClose: () => void;
+}) {
+  // Distinct lead_source values from currently-loaded deals (cheap; no need
+  // for a separate /distinct-lead-sources endpoint with current data volume).
+  // 0% population today means this list is empty; we surface a freeform input
+  // alongside the chip list so users can filter ahead of data.
+  const distinctLeadSources = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const d of allDeals) {
+      const ls = (d.lead_source ?? '').trim();
+      if (ls) set.add(ls);
+    }
+    return Array.from(set).sort();
+  }, [allDeals]);
+  const [leadSourceInput, setLeadSourceInput] = React.useState('');
+
+  return (
+    <div
+      className="border-b border-border px-6 py-4"
+      style={{ background: 'rgba(17,17,20,0.55)' }}
+    >
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
+          Filters
+        </span>
+        <div className="flex items-center gap-3">
+          <button onClick={onClearAll} className="btn-ghost text-xs py-1">Clear all</button>
+          <button onClick={onClose} className="btn-ghost text-xs py-1 flex items-center gap-1">
+            <XIcon size={12} /> Close
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {/* Stage (multi) */}
+        <FilterColumn label="Stage">
+          <ChipRow>
+            {STAGES.map(s => (
+              <FilterChip
+                key={s.key}
+                label={s.label}
+                active={filters.stage.includes(s.key)}
+                onClick={() => onToggle('stage', s.key)}
+                color={s.color}
+              />
+            ))}
+          </ChipRow>
+        </FilterColumn>
+
+        {/* Owner (multi + Unassigned sentinel) */}
+        <FilterColumn label="Owner">
+          <ChipRow>
+            <FilterChip
+              label="Unassigned"
+              active={filters.owner_id.includes('unassigned')}
+              onClick={() => onToggle('owner_id', 'unassigned')}
+            />
+            {users.map(u => (
+              <FilterChip
+                key={u.id}
+                label={u.full_name || u.email}
+                active={filters.owner_id.includes(u.id)}
+                onClick={() => onToggle('owner_id', u.id)}
+              />
+            ))}
+          </ChipRow>
+        </FilterColumn>
+
+        {/* Instrument */}
+        <FilterColumn label="Instrument">
+          <ChipRow>
+            {FILTER_INSTRUMENT_OPTIONS.map(opt => (
+              <FilterChip
+                key={opt.value}
+                label={opt.label}
+                active={filters.instrument_type.includes(opt.value)}
+                onClick={() => onToggle('instrument_type', opt.value)}
+              />
+            ))}
+          </ChipRow>
+        </FilterColumn>
+
+        {/* Lead source — distinct values from current data + freeform add */}
+        <FilterColumn label="Lead Source">
+          <div className="space-y-2">
+            <ChipRow>
+              {distinctLeadSources.length === 0 && filters.lead_source.length === 0 && (
+                <span className="text-[10px] text-text-muted/70 italic">
+                  No lead_source values populated yet
+                </span>
+              )}
+              {distinctLeadSources.map(ls => (
+                <FilterChip
+                  key={ls}
+                  label={ls}
+                  active={filters.lead_source.includes(ls)}
+                  onClick={() => onToggle('lead_source', ls)}
+                />
+              ))}
+              {filters.lead_source.filter(ls => !distinctLeadSources.includes(ls)).map(ls => (
+                <FilterChip
+                  key={`extra-${ls}`}
+                  label={ls}
+                  active={true}
+                  onClick={() => onToggle('lead_source', ls)}
+                />
+              ))}
+            </ChipRow>
+            <div className="flex gap-1.5">
+              <input
+                type="text"
+                value={leadSourceInput}
+                onChange={e => setLeadSourceInput(e.target.value)}
+                placeholder="Add filter value..."
+                className="input text-xs py-1 px-2 flex-1 min-w-0"
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && leadSourceInput.trim()) {
+                    onToggle('lead_source', leadSourceInput.trim());
+                    setLeadSourceInput('');
+                  }
+                }}
+              />
+              <button
+                onClick={() => {
+                  if (leadSourceInput.trim()) {
+                    onToggle('lead_source', leadSourceInput.trim());
+                    setLeadSourceInput('');
+                  }
+                }}
+                className="btn-secondary text-xs py-1 px-2"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        </FilterColumn>
+
+        {/* Has Memo (tri-state) */}
+        <FilterColumn label="Memo">
+          <ChipRow>
+            <FilterChip
+              label="Has memo"
+              active={filters.has_memo === 'true'}
+              onClick={() => onSetScalar('has_memo', filters.has_memo === 'true' ? null : 'true')}
+            />
+            <FilterChip
+              label="No memo"
+              active={filters.has_memo === 'false'}
+              onClick={() => onSetScalar('has_memo', filters.has_memo === 'false' ? null : 'false')}
+            />
+          </ChipRow>
+        </FilterColumn>
+
+        {/* Amount range */}
+        <FilterColumn label="Amount range">
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              value={filters.min_amount}
+              onChange={e => onSetScalar('min_amount', e.target.value || null)}
+              placeholder="Min"
+              className="input text-xs py-1 px-2 w-28"
+            />
+            <span className="text-text-muted text-xs">to</span>
+            <input
+              type="number"
+              value={filters.max_amount}
+              onChange={e => onSetScalar('max_amount', e.target.value || null)}
+              placeholder="Max"
+              className="input text-xs py-1 px-2 w-28"
+            />
+          </div>
+        </FilterColumn>
+      </div>
+    </div>
+  );
+}
+
+function FilterColumn({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-1.5">{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function ChipRow({ children }: { children: React.ReactNode }) {
+  return <div className="flex flex-wrap gap-1">{children}</div>;
+}
+
+function FilterChip({ label, active, onClick, color }: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  color?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="text-[10px] font-accent px-2 py-0.5 rounded transition-colors"
+      style={{
+        background: active
+          ? (color ? `${color}30` : 'rgba(217,70,168,0.20)')
+          : 'rgba(255,255,255,0.04)',
+        color: active
+          ? (color || '#F0ABFC')
+          : 'rgba(255,255,255,0.65)',
+        border: active
+          ? `1px solid ${color ? color + '50' : 'rgba(217,70,168,0.40)'}`
+          : '1px solid rgba(255,255,255,0.08)',
+      }}
+    >
+      {label}
+    </button>
+  );
 }

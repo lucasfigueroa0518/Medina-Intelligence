@@ -167,15 +167,39 @@ export const api = {
   getCompanyAssociations: (id: string) =>
     request<{ associations: any[] }>(`/companies/${id}/associations`),
 
-  // Deals
-  listDeals: (params?: Record<string, string>) => {
-    const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ deals: any[] }>(`/deals${q}`);
+  // Deals — Day-5 Phase A: multi-value filter support. Pass a value
+  // as `string` for single-value params (back-compat) or `string[]` to
+  // emit ?key=v1&key=v2 (matches the backend's getAll('key') reads).
+  listDeals: (params?: Record<string, string | string[]> | URLSearchParams) => {
+    let q = '';
+    if (params instanceof URLSearchParams) {
+      const s = params.toString();
+      q = s ? `?${s}` : '';
+    } else if (params) {
+      const sp = new URLSearchParams();
+      for (const [k, v] of Object.entries(params)) {
+        if (Array.isArray(v)) for (const item of v) sp.append(k, item);
+        else if (v !== undefined && v !== '') sp.append(k, v);
+      }
+      const s = sp.toString();
+      q = s ? `?${s}` : '';
+    }
+    return request<{ deals: any[]; total?: number; limit?: number; offset?: number; has_more?: boolean }>(`/deals${q}`);
   },
   createDeal: (data: any) =>
     request<{ deal: any }>('/deals', { method: 'POST', body: JSON.stringify(data) }),
   updateDeal: (id: string, data: any) =>
     request<{ deal: any }>(`/deals/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  // Day-5 Phase C: bulk update / bulk archive. Backend caps at 100 ids per
+  // call. archive=true sets deleted_at=now (soft delete); otherwise the
+  // updates object is field-whitelisted server-side (stage / owner_id /
+  // instrument_type / lead_source / thesis_fit / expected_close /
+  // actual_close_date / probability).
+  bulkUpdateDeals: (data: { deal_ids: string[]; updates?: Record<string, unknown>; archive?: boolean }) =>
+    request<{ ok: boolean; updated_count: number; skipped_ids: string[]; archived: boolean }>(
+      '/deals/bulk-update',
+      { method: 'POST', body: JSON.stringify(data) }
+    ),
   getDeal: (id: string) =>
     request<{ deal: any; contacts: { theirs: any[]; ours: any[]; other: any[] }; action_items: any[]; notes: any[]; company: any; users: any[] }>(`/deals/${id}`),
   deleteDeal: (id: string) =>
@@ -199,6 +223,8 @@ export const api = {
         participants: Array<{ contact_id: string | null; name: string | null; email: string | null }>;
         messages: Array<{
           id: string;
+          external_message_id: string | null;
+          source: string;
           sender_name: string | null;
           sender_email: string | null;
           sent_at: string;
