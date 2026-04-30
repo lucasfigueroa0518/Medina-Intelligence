@@ -691,6 +691,19 @@ async function handleScheduled(
           try { await processEmbedRetryQueue(org.id, env); }
           catch (e) { console.error(`hourly self-heal: processEmbedRetryQueue failed for ${org.id}:`, e); }
         })());
+        // Hourly Graph subscription renewal — back-stops the daily cron's
+        // step 14, which has been observed not firing on its own schedule
+        // (CF cron dispatch issue under investigation 2026-04-30). Idle
+        // cost is one D1 SELECT (no-op when nothing within 24h cutoff);
+        // active cost ~5 subreqs per renewing sub × LIMIT 50 cap.
+        // Separate waitUntil so it races concurrently with the embed
+        // self-heal — its tiny subrequest footprint always wins under
+        // the per-invocation cap before the heavier embed work depletes it.
+        ctxExec.waitUntil((async () => {
+          const { renewExpiringSubscriptions } = await import('./lib/graph-subscriptions');
+          try { await renewExpiringSubscriptions(env); }
+          catch (e) { console.error(`hourly self-heal: renewExpiringSubscriptions failed:`, e); }
+        })());
       } else if (cron === '5 * * * *') {
         // Enrichment
         await env.ENRICHMENT_WORKFLOW.create({
