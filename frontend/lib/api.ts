@@ -421,6 +421,71 @@ export const api = {
       ok: boolean;
       users: Array<{ id: string; email: string; full_name: string | null; role: string }>;
     }>('/backfill/eligible-users'),
+
+  // Progressive Firefly backfill (Phase F, owner-gated). API key is one-time
+  // per backfill — encrypted server-side, nuked when parent flips to
+  // completed/cancelled. Same shape as the Outlook progressive endpoints
+  // except days_back ∈ {30,60,90,180} instead of just {30,90,365} and the
+  // body includes fireflies_api_key.
+  startFireflyProgressiveBackfill: (data: {
+    user_id: string;
+    fireflies_api_key: string;
+    days_back?: 30 | 60 | 90 | 180;
+    start_date?: string;
+    end_date?: string;
+    window_size_days?: number;
+  }) =>
+    request<{
+      ok: boolean;
+      parent_id: string;
+      mode: 'days_back' | 'date_range';
+      days_back?: number;
+      start_date?: string;
+      end_date?: string;
+      window_size_days: number;
+      total_windows: number;
+    }>('/admin/firefly-progressive-backfill', { method: 'POST', body: JSON.stringify(data) }),
+  getFireflyProgressiveBackfillProgress: (userId?: string) =>
+    request<{
+      ok: boolean;
+      parent: null | {
+        id: string;
+        org_id: string;
+        user_id: string;
+        api_key_encrypted: string;          // wire payload: '<redacted>' or ''
+        window_size_days: number;
+        total_windows: number;
+        status: 'active' | 'completed' | 'cancelled';
+        created_at: string;
+        updated_at: string;
+        completed_at: string | null;
+      };
+      windows: Array<{
+        id: string;
+        window_index: number;
+        start_date: string;
+        end_date: string;
+        status: 'pending' | 'in_progress' | 'completed' | 'failed';
+        last_skip: number;
+        transcripts_fetched: number;
+        transcripts_persisted: number;
+        transcripts_skipped_duplicate: number;
+        transcripts_failed: number;
+        started_at: string | null;
+        completed_at: string | null;
+        last_error: string | null;
+      }>;
+    }>(
+      userId
+        ? `/admin/firefly-progressive-backfill?user_id=${encodeURIComponent(userId)}`
+        : `/admin/firefly-progressive-backfill`
+    ),
+  cancelFireflyProgressiveBackfill: (userId: string) =>
+    request<{ ok: boolean; result: 'cancelled' | 'not_found'; user_id: string }>(
+      '/admin/firefly-progressive-backfill/cancel',
+      { method: 'POST', body: JSON.stringify({ user_id: userId }) }
+    ),
+
   triggerSync: (workflow: 'ingestion' | 'enrichment') =>
     request<{ ok: boolean; instance_id: string }>('/admin/trigger-sync', {
       method: 'POST', body: JSON.stringify({ workflow }),

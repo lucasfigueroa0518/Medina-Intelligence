@@ -3,7 +3,7 @@
 import React from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2, Calendar } from 'lucide-react';
+import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2, Calendar, Mic } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import {
   api,
@@ -224,6 +224,8 @@ function SyncIntegrationsTab({
       </div>
 
       <EmailHistoricalBackfillSection isOutlookConnected={status?.outlook?.status === 'connected'} />
+
+      <FireflyHistoricalBackfillSection />
 
       <EmailSyncSection isOutlookConnected={status?.outlook?.status === 'connected'} />
 
@@ -1058,6 +1060,502 @@ function ProgressiveDateRangeModal({
             <div className="text-xs text-text-muted mb-1">End date</div>
             <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
               className="input text-sm w-full" />
+          </div>
+        </div>
+        {error && <div className="text-xs text-red-400 mb-3">{error}</div>}
+        <div className="flex justify-end gap-3">
+          <button className="btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" disabled={loading} onClick={submit}>
+            {loading ? 'Starting...' : 'Start backfill'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Fireflies Historical Backfill (progressive, server-side, cron-driven) ─
+//
+// Sibling to EmailHistoricalBackfillSection. Owner-gated entirely (the
+// underlying admin endpoints require role='owner'); the section returns null
+// for non-owners. UX mirrors the Outlook section but the trigger modal also
+// requires a Fireflies API key (one-time per backfill — encrypted server-side
+// via TOKEN_ENCRYPTION_KEY, nuked when the parent flips to completed/cancelled,
+// per Phase F's least-privilege design for transactional secrets).
+//
+// User-on-behalf-of selector reuses /backfill/eligible-users (lists Outlook-
+// connected users in the org). Tony, the only org user we expect to need
+// Fireflies recovery in this wave, is Outlook-connected, so this list is a
+// fine proxy for "active org users" without adding a new backend endpoint.
+
+const FIREFLY_PROGRESSIVE_DAYS_OPTIONS: Array<30 | 60 | 90 | 180> = [30, 60, 90, 180];
+
+function FireflyHistoricalBackfillSection() {
+  const [me, setMe] = React.useState<UserProfile | null>(null);
+  const [eligibleUsers, setEligibleUsers] = React.useState<Array<{
+    id: string; email: string; full_name: string | null; role: string;
+  }>>([]);
+  const [selectedUserId, setSelectedUserId] = React.useState<string | null>(null);
+  const [progress, setProgress] = React.useState<{
+    parent: any | null;
+    windows: any[];
+  } | null>(null);
+  const [days, setDays] = React.useState<30 | 60 | 90 | 180>(90);
+  const [triggerOpen, setTriggerOpen] = React.useState(false);
+  const [dateRangeOpen, setDateRangeOpen] = React.useState(false);
+  const [cancelConfirmOpen, setCancelConfirmOpen] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [toast, setToast] = React.useState<string | null>(null);
+
+  const isOwner = me?.role === 'owner' || me?.role === 'super_admin';
+
+  React.useEffect(() => {
+    api.getMe().then(d => {
+      setMe(d.user);
+      setSelectedUserId(d.user.id);
+      if (d.user.role === 'owner' || d.user.role === 'super_admin') {
+        api.listProgressiveEligibleUsers()
+          .then(r => setEligibleUsers(r.users))
+          .catch(() => {});
+      }
+    }).catch(() => {});
+  }, []);
+
+  const fetchProgress = React.useCallback(async () => {
+    if (!selectedUserId) return;
+    try {
+      const r = await api.getFireflyProgressiveBackfillProgress(selectedUserId);
+      setProgress({ parent: r.parent, windows: r.windows });
+    } catch { /* ignore — owner-gated, may 403 for non-owners */ }
+  }, [selectedUserId]);
+
+  React.useEffect(() => { fetchProgress(); }, [fetchProgress]);
+
+  // 5s poll while active; 30s poll while idle so the card refreshes if a
+  // backfill is started from another tab / curl.
+  React.useEffect(() => {
+    if (!selectedUserId) return;
+    const intervalMs = progress?.parent?.status === 'active' ? 5000 : 30000;
+    const id = setInterval(fetchProgress, intervalMs);
+    return () => clearInterval(id);
+  }, [progress?.parent?.status, fetchProgress, selectedUserId]);
+
+  React.useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3500);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  async function startDaysBackfill(daysBack: 30 | 60 | 90 | 180, fireflyApiKey: string) {
+    if (!selectedUserId) return;
+    setLoading(true);
+    try {
+      await api.startFireflyProgressiveBackfill({
+        user_id: selectedUserId,
+        fireflies_api_key: fireflyApiKey,
+        days_back: daysBack,
+      });
+      setTriggerOpen(false);
+      setToast('Backfill started — first window kicks off within 60 seconds');
+      fetchProgress();
+    } catch (e: any) {
+      setToast(`Failed: ${e?.message || 'unknown error'}`);
+    }
+    setLoading(false);
+  }
+
+  async function cancelBackfill() {
+    if (!selectedUserId) return;
+    setLoading(true);
+    setCancelConfirmOpen(false);
+    try {
+      await api.cancelFireflyProgressiveBackfill(selectedUserId);
+      setToast('Backfill cancelled');
+      fetchProgress();
+    } catch (e: any) {
+      setToast(`Cancel failed: ${e?.message || 'unknown'}`);
+    }
+    setLoading(false);
+  }
+
+  // Owner-only — backend endpoints all require role='owner'. Hide for
+  // members so we don't show controls that would 403 on every action.
+  if (!isOwner) return null;
+
+  const status = progress?.parent?.status;
+  const windows = progress?.windows ?? [];
+  const isActive = status === 'active';
+  const isDone = status === 'completed';
+  const isCancelled = status === 'cancelled';
+  const isIdle = !progress?.parent;
+
+  // Sum counters across windows for the active/done summary line.
+  const counters = windows.reduce(
+    (acc: { fetched: number; persisted: number; duplicate: number; failed: number }, w: any) => ({
+      fetched: acc.fetched + (w.transcripts_fetched ?? 0),
+      persisted: acc.persisted + (w.transcripts_persisted ?? 0),
+      duplicate: acc.duplicate + (w.transcripts_skipped_duplicate ?? 0),
+      failed: acc.failed + (w.transcripts_failed ?? 0),
+    }),
+    { fetched: 0, persisted: 0, duplicate: 0, failed: 0 }
+  );
+  const completedCount = windows.filter((w: any) => w.status === 'completed').length;
+  const totalWindows = progress?.parent?.total_windows ?? windows.length;
+  const targetUserLabel = selectedUserId === me?.id
+    ? 'yourself'
+    : (eligibleUsers.find(u => u.id === selectedUserId)?.email ?? 'this user');
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-2 mb-4">
+        <Mic size={16} className="text-accent-purple" />
+        <div className="font-medium">Fireflies Historical Backfill</div>
+        {isActive && (
+          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold ml-1"
+            style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>
+            ACTIVE
+          </span>
+        )}
+      </div>
+
+      {eligibleUsers.length > 1 && (
+        <div className="mb-4">
+          <div className="text-xs text-text-muted mb-1">Backfill for</div>
+          <select
+            value={selectedUserId ?? ''}
+            onChange={e => setSelectedUserId(e.target.value)}
+            className="input text-sm py-1.5 px-3 w-72"
+          >
+            {eligibleUsers.map(u => (
+              <option key={u.id} value={u.id}>
+                {u.id === me?.id ? 'Yourself' : `${u.full_name || u.email}`}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {isIdle && (
+        <div>
+          <div className="text-xs text-text-secondary mb-3">
+            Pull historical Fireflies meetings in the background. Runs server-side in
+            10-day windows. Survives page refresh, paces itself across cron ticks.
+            Requires the user's Fireflies API key (one-time, encrypted, nuked at
+            completion).
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {FIREFLY_PROGRESSIVE_DAYS_OPTIONS.map(d => (
+              <button
+                key={d}
+                onClick={() => { setDays(d); setTriggerOpen(true); }}
+                disabled={loading}
+                className="btn-secondary text-xs py-1.5 flex items-center gap-2"
+              >
+                <Mic size={13} /> Last {d} days
+              </button>
+            ))}
+            <button
+              onClick={() => setDateRangeOpen(true)}
+              disabled={loading}
+              className="btn-secondary text-xs py-1.5 flex items-center gap-2"
+            >
+              <Calendar size={13} /> Custom Date Range
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(isActive || isDone || isCancelled) && (
+        <div className="space-y-3">
+          <div className="text-sm text-text-primary">
+            <span className="font-medium">
+              {isActive
+                ? `${completedCount} of ${totalWindows} windows`
+                : isDone
+                ? 'Backfill complete'
+                : 'Backfill cancelled'}
+            </span>
+            <span className="text-text-muted">
+              {' · '}{counters.persisted.toLocaleString()} transcripts ingested
+              {counters.duplicate > 0 && ` · ${counters.duplicate} already had`}
+              {counters.failed > 0 && ` · ${counters.failed} failed`}
+            </span>
+          </div>
+
+          {/* Per-window pill strip — 9 windows for a 90-day backfill. */}
+          <div className="flex flex-wrap gap-1">
+            {windows.map((w: any) => {
+              const cls = w.status === 'completed'
+                ? 'bg-green-500/30 border-green-500/50'
+                : w.status === 'in_progress'
+                ? 'bg-accent-purple/30 border-accent-purple/60 animate-pulse'
+                : w.status === 'failed'
+                ? 'bg-red-500/30 border-red-500/50'
+                : 'bg-white/5 border-white/10';
+              const range = `${new Date(w.start_date).toISOString().slice(0, 10)} → ${new Date(w.end_date).toISOString().slice(0, 10)}`;
+              const subtitle = `${w.transcripts_persisted ?? 0} ingested · ${w.transcripts_skipped_duplicate ?? 0} dupes${w.transcripts_failed ? ` · ${w.transcripts_failed} failed` : ''}`;
+              return (
+                <div
+                  key={w.id}
+                  title={`Window ${w.window_index} (${range})\nstatus: ${w.status}\n${subtitle}${w.last_error ? '\n' + w.last_error : ''}`}
+                  className={`h-2 w-6 rounded-sm border ${cls}`}
+                />
+              );
+            })}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {isActive && (
+              <button
+                onClick={() => setCancelConfirmOpen(true)}
+                disabled={loading}
+                className="btn-ghost text-xs py-1.5 flex items-center gap-2 text-red-400 hover:text-red-300"
+              >
+                <XIcon size={13} /> Cancel backfill
+              </button>
+            )}
+            {(isDone || isCancelled) && (
+              <button
+                onClick={() => setProgress(null)}
+                className="btn-secondary text-xs py-1.5 flex items-center gap-2"
+              >
+                <Mic size={13} /> Start a new backfill
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Trigger modal — pill-strip path passes days, Custom path passes
+          start/end dates. Both share the API key + submit handler via the
+          same modal component to keep the API-key UX consistent. */}
+      {triggerOpen && (
+        <FireflyTriggerModal
+          days={days}
+          targetUserLabel={targetUserLabel}
+          loading={loading}
+          onClose={() => setTriggerOpen(false)}
+          onSubmit={(apiKey) => startDaysBackfill(days, apiKey)}
+        />
+      )}
+
+      {dateRangeOpen && (
+        <FireflyDateRangeModal
+          targetUserId={selectedUserId ?? undefined}
+          targetUserLabel={targetUserLabel}
+          onClose={() => setDateRangeOpen(false)}
+          onStarted={() => {
+            setDateRangeOpen(false);
+            setToast('Backfill started');
+            fetchProgress();
+          }}
+        />
+      )}
+
+      {cancelConfirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+          onClick={() => setCancelConfirmOpen(false)}>
+          <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+            onClick={e => e.stopPropagation()}>
+            <div className="text-lg font-medium text-text-primary mb-2">Cancel the backfill?</div>
+            <div className="text-sm text-text-secondary mb-4">
+              Transcripts already ingested will be kept. Pending and in-progress
+              windows will be marked failed and the encrypted API key will be wiped.
+              You'll need to start a new backfill from scratch (and re-enter the
+              API key) to resume.
+            </div>
+            <div className="flex justify-end gap-3">
+              <button className="btn-ghost" onClick={() => setCancelConfirmOpen(false)}>Keep running</button>
+              <button className="btn-primary" disabled={loading}
+                style={{ background: '#DC2626', borderColor: '#DC2626' }}
+                onClick={cancelBackfill}>
+                {loading ? 'Cancelling...' : 'Cancel backfill'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-[60] rounded-xl shadow-2xl px-5 py-3"
+          style={{ background: '#1A1A1F', border: '1px solid rgba(34,197,94,0.3)', borderLeft: '3px solid #22C55E' }}>
+          <div className="text-sm text-text-primary">{toast}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FireflyTriggerModal({
+  days,
+  targetUserLabel,
+  loading,
+  onClose,
+  onSubmit,
+}: {
+  days: 30 | 60 | 90 | 180;
+  targetUserLabel: string;
+  loading: boolean;
+  onClose: () => void;
+  onSubmit: (apiKey: string) => void;
+}) {
+  const [apiKey, setApiKey] = React.useState('');
+  const [showKey, setShowKey] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  function submit() {
+    setError(null);
+    const trimmed = apiKey.trim();
+    if (!trimmed) {
+      setError('Fireflies API key is required');
+      return;
+    }
+    // Pass the key up; clear local state immediately so the typed secret
+    // doesn't linger in the closed modal's component memory if the parent
+    // re-opens it.
+    onSubmit(trimmed);
+    setApiKey('');
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+      onClick={onClose}>
+      <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+        style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="text-lg font-medium text-text-primary mb-2">Start Fireflies backfill</div>
+        <div className="text-sm text-text-secondary mb-4">
+          Pull last <strong>{days}</strong> days of meetings for <strong>{targetUserLabel}</strong>.
+          Runs in 10-day windows, server-side. No need to keep this tab open.
+        </div>
+
+        <div className="mb-4">
+          <div className="text-xs text-text-muted mb-1">Fireflies API Key</div>
+          <div className="flex gap-2">
+            <input
+              type={showKey ? 'text' : 'password'}
+              value={apiKey}
+              onChange={e => setApiKey(e.target.value)}
+              placeholder="paste here"
+              className="input text-sm py-1.5 px-3 flex-1 font-mono"
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button
+              type="button"
+              onClick={() => setShowKey(s => !s)}
+              className="btn-ghost text-xs py-1.5 px-3"
+            >
+              {showKey ? 'Hide' : 'Show'}
+            </button>
+          </div>
+          <div className="text-[10px] text-text-muted mt-1.5">
+            Encrypted server-side and used only for this backfill, then wiped when it
+            completes or is cancelled. Get yours at <span className="text-text-secondary">app.fireflies.ai → Settings → Developer settings</span>.
+          </div>
+        </div>
+
+        {error && <div className="text-xs text-red-400 mb-3">{error}</div>}
+        <div className="flex justify-end gap-3">
+          <button className="btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" disabled={loading} onClick={submit}>
+            {loading ? 'Starting...' : 'Start backfill'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FireflyDateRangeModal({
+  targetUserId,
+  targetUserLabel,
+  onClose,
+  onStarted,
+}: {
+  targetUserId?: string;
+  targetUserLabel: string;
+  onClose: () => void;
+  onStarted: () => void;
+}) {
+  const [startDate, setStartDate] = React.useState('');
+  const [endDate, setEndDate] = React.useState('');
+  const [apiKey, setApiKey] = React.useState('');
+  const [showKey, setShowKey] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function submit() {
+    setError(null);
+    if (!startDate || !endDate) { setError('Both dates are required'); return; }
+    const trimmedKey = apiKey.trim();
+    if (!trimmedKey) { setError('Fireflies API key is required'); return; }
+    if (!targetUserId) { setError('No target user selected'); return; }
+    setLoading(true);
+    try {
+      await api.startFireflyProgressiveBackfill({
+        user_id: targetUserId,
+        fireflies_api_key: trimmedKey,
+        start_date: new Date(startDate).toISOString(),
+        end_date: new Date(endDate).toISOString(),
+      });
+      setApiKey('');
+      onStarted();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start');
+    }
+    setLoading(false);
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+      onClick={onClose}>
+      <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+        style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="text-lg font-medium text-text-primary mb-2">Custom date range</div>
+        <div className="text-sm text-text-secondary mb-4">
+          Pulled in 10-day windows for <strong>{targetUserLabel}</strong>, newest first.
+        </div>
+        <div className="space-y-3 mb-4">
+          <div>
+            <div className="text-xs text-text-muted mb-1">Start date</div>
+            <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
+              className="input text-sm w-full" />
+          </div>
+          <div>
+            <div className="text-xs text-text-muted mb-1">End date</div>
+            <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
+              className="input text-sm w-full" />
+          </div>
+          <div>
+            <div className="text-xs text-text-muted mb-1">Fireflies API Key</div>
+            <div className="flex gap-2">
+              <input
+                type={showKey ? 'text' : 'password'}
+                value={apiKey}
+                onChange={e => setApiKey(e.target.value)}
+                placeholder="paste here"
+                className="input text-sm py-1.5 px-3 flex-1 font-mono"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                onClick={() => setShowKey(s => !s)}
+                className="btn-ghost text-xs py-1.5 px-3"
+              >
+                {showKey ? 'Hide' : 'Show'}
+              </button>
+            </div>
+            <div className="text-[10px] text-text-muted mt-1.5">
+              Encrypted and wiped at completion.
+            </div>
           </div>
         </div>
         {error && <div className="text-xs text-red-400 mb-3">{error}</div>}
