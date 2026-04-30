@@ -237,9 +237,15 @@ async function processRow(row: ReclassifyRow, opts: BatchOpts, env: Env): Promis
     newType = cheap.category;
     source = 'cheap';
   } else {
-    // No usable text + no cheap match → keep current category, mark unchanged.
-    // Don't burn an LLM call on a 0-byte preview.
-    newType = row.document_type;
+    // No usable text + no cheap match → bucket as 'reference' (the LLM
+    // classifier's own explicit fallback per document-intelligence.ts:
+    // "anything else"). Pre-Wave-5.6.D this kept the row as 'other',
+    // which left it in the reclassify queue forever — orchestrator picks
+    // by document_type='other' so unchanged rows would reappear every
+    // batch. Tagging 'reference' drains the queue while preserving the
+    // semantic ("we couldn't determine, here's the safety-net category").
+    // Skip if doc was already 'reference' — leave as-is.
+    newType = row.document_type === 'reference' ? row.document_type : 'reference';
     source = 'unchanged';
   }
 

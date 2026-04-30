@@ -520,6 +520,9 @@ async function routeAuthenticated(
   if (path === '/api/agent/upload-file' && method === 'POST') {
     return ChatUploads.uploadChatFiles(request, ctx, env, ctxExec);
   }
+  if (path === '/api/agent/attach-document' && method === 'POST') {
+    return ChatUploads.attachDocumentToChat(request, ctx, env);
+  }
   m = path.match(/^\/api\/agent\/uploads\/([^/]+)\/content$/);
   if (m && method === 'GET') return ChatUploads.getChatUploadContent(m[1], ctx, env);
   m = path.match(/^\/api\/agent\/sessions\/([^/]+)\/uploads$/);

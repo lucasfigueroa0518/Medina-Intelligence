@@ -744,6 +744,31 @@ export default function GodModePage() {
       }
     } catch { /* ignore corrupt localStorage */ }
 
+    // Wave 5 Phase H — Send-to-MARTy URL-param consumer. Backend's
+    // attach-document endpoint creates the chat_uploads row and redirects
+    // here with ?session_id=<id>&attach_upload=<id>. Adopt the session,
+    // refresh its uploads, and let listSessionUploads pick up the new
+    // attachment as a pending in-context pill above the chat input.
+    try {
+      if (typeof window !== 'undefined') {
+        const sp = new URLSearchParams(window.location.search);
+        const incomingSession = sp.get('session_id');
+        const incomingUpload = sp.get('attach_upload');
+        if (incomingSession) {
+          setActiveSessionId(incomingSession);
+          if (incomingUpload) {
+            // listSessionUploads runs on activeSessionId change; the
+            // attachment will surface there. Strip the query params so
+            // refresh doesn't re-trigger.
+            const url = new URL(window.location.href);
+            url.searchParams.delete('session_id');
+            url.searchParams.delete('attach_upload');
+            window.history.replaceState({}, '', url.toString());
+          }
+        }
+      }
+    } catch { /* ignore */ }
+
     return () => clearTimeout(t);
   }, []);
 

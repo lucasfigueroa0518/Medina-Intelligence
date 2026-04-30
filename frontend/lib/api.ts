@@ -454,6 +454,26 @@ export const api = {
     }
     return parsed as { uploads: ChatUploadSummary[] };
   },
+
+  // Wave 5 Phase H — Send a permanent document into a MARTy chat as an
+  // ephemeral attachment. Backend materializes a chat_uploads row from
+  // the documents row (R2 bytes copied; 7-day TTL) and returns the
+  // upload_id + session_id (created if not provided) for navigation.
+  attachDocumentToChat: async (
+    documentId: string,
+    opts?: { sessionId?: string | null }
+  ) => {
+    return request<{ upload_id: string; session_id: string; summary: ChatUploadSummary }>(
+      `/agent/attach-document`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          document_id: documentId,
+          session_id: opts?.sessionId || undefined,
+        }),
+      }
+    );
+  },
   listSessionUploads: (sessionId: string) =>
     request<{ uploads: ChatUploadSummary[] }>(`/agent/sessions/${sessionId}/uploads`),
   uploadContentUrl: (uploadId: string) => `${API_BASE}/agent/uploads/${uploadId}/content`,
