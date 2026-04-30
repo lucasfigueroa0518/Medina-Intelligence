@@ -330,13 +330,24 @@ async function applyUnifiedEnrichment(
 
           const slug = proposedName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
           const idempotencyKey = `${orgId}:${contactId}:company_mismatch:${slug}`;
+          // Wave 6 payload contract: { value, metadata: { current_value,
+          // source_type, source_description, context } }. The previous
+          // shape used a `context` key at the top level which the
+          // listApprovalQueue parser ignored, so the rich detail (current
+          // company name, mismatch reason) wasn't reaching the UI.
+          // Mapping to `metadata` makes it visible.
           const proposedValue = JSON.stringify({
             value: proposedCompanyId,
-            context: {
-              current_company_id: link.company_id,
-              current_company_name: current.name,
-              proposed_company_name: proposedName,
-              reason: 'email_domain_disagrees_with_bio',
+            metadata: {
+              current_value: link.company_id,
+              source_type: 'enrichment',
+              source_description: `Email domain disagrees with bio (current: ${current.name}, proposed: ${proposedName})`,
+              context: {
+                current_company_id: link.company_id,
+                current_company_name: current.name,
+                proposed_company_name: proposedName,
+                reason: 'email_domain_disagrees_with_bio',
+              },
             },
           });
 
@@ -390,7 +401,13 @@ async function applyUnifiedEnrichment(
       await proposeEntityUpdate(
         orgId, 'contact', contactId, field, change.proposed,
         'enrichment', 0.85, env,
-        { source_description: `Enrichment re-run (sources: ${sources.join(', ')})` }
+        {
+          source_description: `Enrichment re-run (sources: ${sources.join(', ')})`,
+          // Wave 6: 'enrichment' resolves to CHANNEL.ENRICHMENT_AGGREGATED
+          // — single channel for the daily-cron aggregator, separate from
+          // any direct-source channels (LinkedIn, Pitchbook, etc.).
+          context: {},
+        }
       );
     }
     console.log(

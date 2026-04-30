@@ -180,6 +180,18 @@ export async function extractEnrichmentSignals(
         ? signal.value
         : JSON.stringify(signal.value);
 
+    // Wave 6: pick a primary observer for channel attribution. A
+    // conversation can appear in multiple inboxes; for now we attribute
+    // to the first participant user. Phase C may broaden this when
+    // multi-observer corroboration math matters.
+    let observerUserId: string | null = null;
+    try {
+      const parsed = JSON.parse(conversation.participant_user_ids || '[]');
+      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+        observerUserId = parsed[0];
+      }
+    } catch { /* leave null — resolveChannel falls back to 'unknown' */ }
+
     if (isProgressiveField(signal.entity_type, signal.field)) {
       await proposeEntityUpdate(
         orgId,
@@ -193,12 +205,27 @@ export async function extractEnrichmentSignals(
         {
           source_communication_id: conversation.id,
           source_description: 'llm_extraction',
+          context: { userId: observerUserId, conversationId: conversation.id },
         }
       );
     } else {
       const idempotencyKey = `${orgId}:${entityId}:${signal.field}:${hashShort(
         JSON.stringify(signal.value)
       )}`;
+      // Wave 6 payload contract: { value, metadata: { source_type,
+      // source_description, context } }. Non-progressive fields
+      // (synthetic LLM observations like personal_update,
+      // follow_up_commitment) don't have a "current_value" to compare —
+      // they're observations, not field overrides.
+      const proposedValue = JSON.stringify({
+        value: signal.value,
+        metadata: {
+          source_type: 'llm_extraction',
+          source_description: 'llm_extraction',
+          evidence: signal.evidence || null,
+          context: { userId: observerUserId, conversationId: conversation.id },
+        },
+      });
       await env.D1.prepare(
         `INSERT OR IGNORE INTO approval_queue (idempotency_key, org_id, entity_type, entity_id, change_type, field_name, proposed_value, source_communication_id, source_visibility, confidence, status)
          VALUES (?, ?, ?, ?, 'new_association', ?, ?, ?, ?, ?, 'pending')`
@@ -209,7 +236,7 @@ export async function extractEnrichmentSignals(
           signal.entity_type,
           entityId,
           signal.field,
-          JSON.stringify(signal.value),
+          proposedValue,
           conversation.id,
           conversation.source === 'outlook'
             ? 'private'

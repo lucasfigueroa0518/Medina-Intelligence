@@ -142,7 +142,8 @@ export async function stageAndCommitApprovals(
           if (item.bodyText && item.bodyText.length > 100) {
             await processEmailSignature(
               senderContactId, orgId, item.bodyText,
-              item.fromName || '', item.entityId, item.sentAt, env
+              item.fromName || '', item.entityId, item.sentAt, env,
+              item.userId ?? null
             );
           }
           // Apply display-name updates to every linked contact for which we have
@@ -165,7 +166,8 @@ export async function stageAndCommitApprovals(
             if (nameCandidate && nameCandidate.trim().split(/\s+/).length >= 2) {
               await processDisplayNameUpdate(
                 cid, orgId, nameCandidate,
-                item.entityId, item.sentAt, env
+                item.entityId, item.sentAt, env,
+                item.userId ?? null
               );
             }
           }

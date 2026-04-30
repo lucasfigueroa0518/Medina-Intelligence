@@ -3,6 +3,7 @@ import { hashShort } from './helpers';
 import { triggerContactEnrichment } from './enrichment';
 import { emitAudit } from './audit';
 import { updateEntityInIndex } from './entity-index';
+import type { ChannelContext } from './source-channels';
 
 interface FieldUpdate {
   field: string;
@@ -11,6 +12,10 @@ interface FieldUpdate {
   confidence: number;
   source_description?: string;
   source_communication_id?: string;
+  /** Channel attribution for the Wave 6 corroboration model. Optional
+   *  during Phase B rollout — sources that don't yet thread context
+   *  will hit resolveChannel's fallback path. */
+  context?: ChannelContext;
 }
 
 export type SourceType =
@@ -144,6 +149,11 @@ export async function proposeEntityUpdate(
     source_description?: string;
     source_communication_id?: string;
     policy?: UpdatePolicy;
+    /** Channel attribution for the Wave 6 corroboration model. The
+     *  evaluator (Phase C) reads this to call resolveChannel() and
+     *  decide if this proposal corroborates an existing pending value
+     *  or contributes a fresh channel. */
+    context?: ChannelContext;
   }
 ): Promise<'auto_applied' | 'proposed' | 'skipped'> {
   const allowed = fieldsForEntity(entityType);
@@ -209,6 +219,11 @@ export async function proposeEntityUpdate(
     current_value: currentValue,
     source_type: source,
     source_description: opts?.source_description || source,
+    // Wave 6: stash the raw context the evaluator will resolve into a
+    // channel string. Stored verbatim (not yet resolved) so a downstream
+    // re-evaluation can use updated channel taxonomy without rewriting
+    // historical rows.
+    context: opts?.context || null,
   };
 
   const proposedJson = JSON.stringify({ value: proposedValue.trim(), metadata: metadataObj });
@@ -260,6 +275,7 @@ export async function proposeMultipleUpdates(
         source_description: u.source_description,
         source_communication_id: u.source_communication_id,
         policy: opts?.policy,
+        context: u.context,
       }
     );
     result[outcome].push(u.field);
