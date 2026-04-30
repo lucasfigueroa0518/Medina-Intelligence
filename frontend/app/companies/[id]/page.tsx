@@ -11,6 +11,7 @@ import {
 import { TopBar } from '@/components/top-bar';
 import { TagPicker } from '@/components/tag-picker';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
+import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { api } from '@/lib/api';
 
 const STAGE_OPTIONS = [
@@ -90,6 +91,8 @@ export default function CompanyDetailPage() {
   const [docUploadOpen, setDocUploadOpen] = React.useState(false);
   const [docUploadFiles, setDocUploadFiles] = React.useState<File[]>([]);
   const docDropCounterRef = React.useRef(0);
+  // Wave 5 Phase G — preview modal state
+  const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     setLoading(true);
@@ -667,7 +670,9 @@ export default function CompanyDetailPage() {
           ) : (
             <div className="space-y-2">
               {documents.map((doc: any) => (
-                <div key={doc.id} className="flex items-center gap-4 rounded-xl p-4 transition-all hover:bg-white/[0.03]"
+                <div key={doc.id}
+                  onClick={() => setPreviewDocId(doc.id)}
+                  className="flex items-center gap-4 rounded-xl p-4 transition-all hover:bg-white/[0.05] cursor-pointer"
                   style={{ background: 'rgba(17,17,20,0.5)', border: '1px solid rgba(255,255,255,0.05)' }}>
                   <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
                     style={{ background: doc.source === 'email_attachment' ? 'rgba(59,130,246,0.12)' : 'rgba(139,92,246,0.12)' }}>
@@ -675,7 +680,7 @@ export default function CompanyDetailPage() {
                       ? <Paperclip size={16} className="text-blue-400" />
                       : <FileText size={16} className="text-purple-400" />}
                   </div>
-                  <Link href={`/documents/${doc.id}`} className="flex-1 min-w-0 group">
+                  <div className="flex-1 min-w-0 group">
                     <div className="flex items-center gap-2">
                       <span className="text-sm font-medium text-text-primary truncate group-hover:text-accent-magenta transition-colors">
                         {doc.title || doc.file_name}
@@ -713,8 +718,8 @@ export default function CompanyDetailPage() {
                         </span>
                       )}
                     </div>
-                  </Link>
-                  <button onClick={() => handleDocDelete(doc.id)}
+                  </div>
+                  <button onClick={e => { e.stopPropagation(); handleDocDelete(doc.id); }}
                     className="p-2 rounded-lg text-text-muted hover:text-semantic-error hover:bg-semantic-error/10 transition-colors shrink-0"
                     title="Delete document">
                     <Trash2 size={14} />
@@ -802,6 +807,11 @@ export default function CompanyDetailPage() {
         onUploaded={() => { setRefreshKey(k => k + 1); setToast('Documents uploaded'); }}
         initialFiles={docUploadFiles}
         companyId={id}
+      />
+
+      <DocumentPreviewModal
+        docId={previewDocId}
+        onClose={() => setPreviewDocId(null)}
       />
 
       {toast && (() => {

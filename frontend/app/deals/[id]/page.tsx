@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
+import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import {
   SentimentIndicator,
   TopicChips,
@@ -206,6 +207,8 @@ export default function DealDetailPage() {
   const [docDropOver, setDocDropOver] = React.useState(false);
   const [docUploadOpen, setDocUploadOpen] = React.useState(false);
   const [docUploadFiles, setDocUploadFiles] = React.useState<File[]>([]);
+  // Wave 5 Phase G — preview modal state
+  const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
   const docDropCounterRef = React.useRef(0);
 
   /* ── Contact search state (Theirs / Other side) ── */
@@ -1393,14 +1396,16 @@ export default function DealDetailPage() {
               ) : (
                 <div className="space-y-1.5">
                   {documents.map((doc: any) => (
-                    <div key={doc.id} className="flex items-center gap-2.5 py-2 px-2 -mx-2 rounded-lg transition-colors hover:bg-white/[0.03] group">
+                    <div key={doc.id}
+                      onClick={() => setPreviewDocId(doc.id)}
+                      className="flex items-center gap-2.5 py-2 px-2 -mx-2 rounded-lg transition-colors hover:bg-white/[0.05] group cursor-pointer">
                       <div className="w-7 h-7 rounded-md flex items-center justify-center shrink-0"
                         style={{ background: doc.source === 'email_attachment' ? 'rgba(59,130,246,0.12)' : 'rgba(139,92,246,0.12)' }}>
                         {doc.source === 'email_attachment'
                           ? <Paperclip size={12} className="text-blue-400" />
                           : <FileText size={12} className="text-purple-400" />}
                       </div>
-                      <Link href={`/documents/${doc.id}`} className="flex-1 min-w-0 group/link">
+                      <div className="flex-1 min-w-0 group/link">
                         <div className="text-xs font-medium text-text-primary truncate group-hover/link:text-accent-magenta transition-colors">
                           {doc.title || doc.file_name}
                         </div>
@@ -1412,8 +1417,8 @@ export default function DealDetailPage() {
                           {doc.file_size && <span className="text-[9px] text-text-muted">{fmtSize(doc.file_size)}</span>}
                           <span className="text-[9px] text-text-muted">{fmtRel(doc.created_at)}</span>
                         </div>
-                      </Link>
-                      <button onClick={() => handleDocDelete(doc.id)}
+                      </div>
+                      <button onClick={e => { e.stopPropagation(); handleDocDelete(doc.id); }}
                         className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-text-muted hover:text-semantic-error shrink-0"
                         title="Delete document">
                         <Trash2 size={11} />
@@ -1427,6 +1432,11 @@ export default function DealDetailPage() {
           </div>
         </div>
       </div>
+
+      <DocumentPreviewModal
+        docId={previewDocId}
+        onClose={() => setPreviewDocId(null)}
+      />
 
       <DocumentUploadModal
         open={docUploadOpen}

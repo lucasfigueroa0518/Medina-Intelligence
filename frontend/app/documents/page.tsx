@@ -10,6 +10,7 @@ import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { api } from '@/lib/api';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
+import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import {
   Search,
   X as XIcon,
@@ -245,6 +246,10 @@ function DocumentsPage() {
   const [uploadInitialFiles, setUploadInitialFiles] = React.useState<File[]>([]);
   const [pageDragOver, setPageDragOver] = React.useState(false);
   const dragCounterRef = React.useRef(0);
+  // Wave 5 Phase G — preview modal state. Row click opens in-context
+  // preview rather than full-page navigation; modal exposes "Open in
+  // detail page" for power users.
+  const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
 
   const [filterCounts, setFilterCounts] = React.useState<{
     source: Record<string, number>;
@@ -668,7 +673,7 @@ function DocumentsPage() {
             loading={loading}
             emptyMessage="No documents match your filters"
             getRowId={d => d.id}
-            onRowClick={d => router.push(`/documents/${d.id}`)}
+            onRowClick={d => setPreviewDocId(d.id)}
             sortKey={filters.sort}
             sortDir={filters.order}
             onSort={handleSort}
@@ -692,6 +697,11 @@ function DocumentsPage() {
         onClose={() => { setUploadOpen(false); setUploadInitialFiles([]); }}
         onUploaded={() => { loadDocuments(); api.getDocumentFilterCounts().then(setFilterCounts).catch(() => {}); }}
         initialFiles={uploadInitialFiles}
+      />
+
+      <DocumentPreviewModal
+        docId={previewDocId}
+        onClose={() => setPreviewDocId(null)}
       />
     </div>
   );
