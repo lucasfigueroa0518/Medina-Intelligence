@@ -133,8 +133,14 @@ function filtersToParams(f: FilterState): Record<string, string> {
   if (f.tags.length) p.tags = f.tags.join(',');
   if (f.has_followup_overdue) p.has_followup_overdue = 'true';
   if (f.in_active_deals) p.in_active_deals = 'true';
-  if (f.sort && f.sort !== DEFAULT_SORT) p.sort = f.sort;
-  if (f.order !== DEFAULT_ORDER) p.order = f.order;
+  // sort + order travel together. Stripping individually causes the backend's
+  // per-column defaultDir (CONTACT_SORT_MAP) to override the user's chosen
+  // order whenever it happens to coincide with DEFAULT_ORDER — arrow flips
+  // visually but rows don't reorder.
+  if (f.sort !== DEFAULT_SORT || f.order !== DEFAULT_ORDER) {
+    p.sort = f.sort;
+    p.order = f.order;
+  }
   return p;
 }
 
