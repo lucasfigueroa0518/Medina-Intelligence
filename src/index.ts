@@ -499,6 +499,23 @@ async function routeAuthenticated(
     return handleFireflyBackfill(request, ctx, env);
   }
 
+  // Progressive Firefly backfill (Phase F2) — owner-gated inside the
+  // handler. Registered here (above the /api/admin role check) only because
+  // sibling /api/admin/firefly-backfill is here for the same reason; the
+  // owner check inside the handler is what actually enforces authorization.
+  if (path === '/api/admin/firefly-progressive-backfill' && method === 'POST') {
+    const { handleFireflyProgressiveBackfill } = await import('./handlers/firefly-backfill');
+    return handleFireflyProgressiveBackfill(request, ctx, env);
+  }
+  if (path === '/api/admin/firefly-progressive-backfill' && method === 'GET') {
+    const { handleFireflyProgressiveBackfillStatus } = await import('./handlers/firefly-backfill');
+    return handleFireflyProgressiveBackfillStatus(request, ctx, env);
+  }
+  if (path === '/api/admin/firefly-progressive-backfill/cancel' && method === 'POST') {
+    const { handleFireflyProgressiveBackfillCancel } = await import('./handlers/firefly-backfill');
+    return handleFireflyProgressiveBackfillCancel(request, ctx, env);
+  }
+
   // Custom date-range ingestion trigger — any authenticated user
   if (path === '/api/admin/trigger-ingestion' && method === 'POST') {
     return Admin.triggerIngestion(request, ctx, env);
@@ -692,6 +709,16 @@ async function handleScheduled(
           const { driveAllActiveProgressive } = await import('./lib/progressive-backfill');
           try { await driveAllActiveProgressive(org.id, env); }
           catch (e) { console.error(`progressive backfill drive failed for ${org.id}:`, e); }
+        })());
+        // Firefly progressive backfill driver (Phase F2) — same cadence,
+        // sibling invocation. Independent from Outlook's driver: different
+        // tables, different per-tick budget, different pagination scheme.
+        // Sequential per user inside the helper for the same BGE rate-limit
+        // contention reason as Outlook's.
+        ctxExec.waitUntil((async () => {
+          const { driveAllActiveFireflyProgressive } = await import('./lib/firefly-progressive-backfill');
+          try { await driveAllActiveFireflyProgressive(org.id, env); }
+          catch (e) { console.error(`firefly progressive backfill drive failed for ${org.id}:`, e); }
         })());
       }
     } catch (e) {
