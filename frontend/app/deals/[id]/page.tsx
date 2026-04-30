@@ -5,7 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
   Mail, Calendar, FileText, Activity, Clock, Users, Building2,
-  Check, X as XIcon, Plus, ChevronDown, ChevronUp, Trash2,
+  Check, X as XIcon, Plus, ChevronDown, ChevronUp, ChevronRight, Trash2,
   DollarSign, Target, AlertCircle, CheckCircle2, MoreHorizontal,
   Sparkles, ArrowRight, Lock, Upload, Paperclip,
 } from 'lucide-react';
@@ -801,6 +801,14 @@ export default function DealDetailPage() {
               )}
             </GlassCard>
 
+            {/* CARD: Conversations (Day-5 Phase 3) — thread-grouped view of
+                emails tied to deal contacts. Distinct from the chronological
+                Activity Timeline above; this surfaces reply chains as
+                collapsible threads with subject + last-sender + message count
+                in the header, and expands to show every message inline with
+                the same canReadEmailContent gate the timeline uses. */}
+            <DealConversationsCard dealId={id} />
+
             {/* CARD: Action Items */}
             <GlassCard>
               <div className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display mb-3">Action Items</div>
@@ -1562,6 +1570,192 @@ function DetailMomentumSparkline({ buckets, trend }: {
       <polyline points={points} fill="none" stroke={color} strokeWidth={2}
         strokeLinejoin="round" strokeLinecap="round" />
     </svg>
+  );
+}
+
+/** Day-5 Phase 3: thread-grouped conversations card on the detail page.
+ *  Consumes GET /api/deals/:id/conversations. Threads collapsed by default;
+ *  click expands to show every message in the thread with body_preview
+ *  (when can_read_body) or a "—" placeholder (when redacted by ACL).
+ *
+ *  ACL behavior matches the existing Activity Timeline:
+ *    - Subject + last-sent-at + message_count visible regardless
+ *    - sender_name + sender_email + body_preview only when can_read_body
+ *    - Threads with can_read_any=false render the metadata but never the
+ *      body content
+ *
+ *  404 handling: if the worker is older than Phase 2 (endpoint not yet
+ *  deployed), the catch path falls through to "no conversations" empty
+ *  state. Better than a crash. Once the worker catches up, the card
+ *  populates on next refresh. */
+function DealConversationsCard({ dealId }: { dealId: string }) {
+  const [data, setData] = React.useState<{
+    threads: Array<{
+      external_thread_id: string | null;
+      subject: string;
+      last_sender_name: string | null;
+      last_sent_at: string;
+      message_count: number;
+      can_read_any: boolean;
+      participants: Array<{ contact_id: string | null; name: string | null; email: string | null }>;
+      messages: Array<{
+        id: string;
+        sender_name: string | null;
+        sender_email: string | null;
+        sent_at: string;
+        direction: string | null;
+        can_read_body: boolean;
+        body_preview: string | null;
+        has_attachments: boolean;
+      }>;
+    }>;
+    ungrouped_count: number;
+    truncated: boolean;
+  } | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [endpointMissing, setEndpointMissing] = React.useState(false);
+  const [expanded, setExpanded] = React.useState<Set<string>>(new Set());
+
+  React.useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setEndpointMissing(false);
+    api.getDealConversations(dealId)
+      .then(r => { if (alive) setData(r); })
+      .catch((e: any) => {
+        // 404 → worker hasn't deployed Phase 2 yet. Treat as "no data" rather
+        // than a hard error so the surrounding page renders normally.
+        if (alive && e?.status === 404) setEndpointMissing(true);
+      })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [dealId]);
+
+  function toggle(key: string) {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  const threads = data?.threads ?? [];
+
+  return (
+    <GlassCard>
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
+          Conversations
+        </span>
+        {threads.length > 0 && (
+          <span className="text-[10px] text-text-muted font-accent">
+            {threads.length} thread{threads.length === 1 ? '' : 's'}
+            {data?.truncated && ' (more available)'}
+          </span>
+        )}
+      </div>
+
+      {loading && (
+        <div className="text-sm text-text-muted py-4 text-center">Loading…</div>
+      )}
+
+      {!loading && endpointMissing && (
+        <div className="text-xs text-text-muted italic py-2">
+          Worker hasn't picked up the conversations endpoint yet — auto-recovers on next deploy.
+        </div>
+      )}
+
+      {!loading && !endpointMissing && threads.length === 0 && (
+        <div className="text-sm text-text-muted py-4 text-center">
+          No conversations linked to this deal yet.
+        </div>
+      )}
+
+      {!loading && threads.length > 0 && (
+        <div className="space-y-1.5">
+          {threads.map((thread, idx) => {
+            const key = thread.external_thread_id ?? `__ungrouped__:${idx}`;
+            const isOpen = expanded.has(key);
+            const headerSender = thread.last_sender_name ?? '—';
+            return (
+              <div
+                key={key}
+                className="rounded-lg overflow-hidden"
+                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
+              >
+                <button
+                  type="button"
+                  onClick={() => toggle(key)}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/[0.03] transition-colors"
+                >
+                  {isOpen
+                    ? <ChevronDown size={12} className="text-text-muted shrink-0" />
+                    : <ChevronRight size={12} className="text-text-muted shrink-0" />}
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-text-primary truncate">{thread.subject}</div>
+                    <div className="text-[10px] text-text-muted mt-0.5 flex items-center gap-2">
+                      <span>{headerSender}</span>
+                      <span>·</span>
+                      <span>{thread.message_count} message{thread.message_count === 1 ? '' : 's'}</span>
+                      <span>·</span>
+                      <span>{fmtRel(thread.last_sent_at)}</span>
+                      {!thread.can_read_any && (
+                        <>
+                          <span>·</span>
+                          <span className="inline-flex items-center gap-0.5 text-text-muted/60">
+                            <Lock size={9} /> redacted
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </button>
+
+                {isOpen && (
+                  <div className="border-t border-white/[0.04] px-3 py-2 space-y-2 bg-black/10">
+                    {thread.messages.map(msg => {
+                      const senderLabel = msg.can_read_body
+                        ? (msg.sender_name || msg.sender_email || 'Unknown')
+                        : '—';
+                      return (
+                        <div key={msg.id} className="text-xs">
+                          <div className="flex items-center gap-2 text-text-muted">
+                            <span className="font-medium text-text-secondary">{senderLabel}</span>
+                            <span className="text-[10px]">{fmtRel(msg.sent_at)}</span>
+                            {msg.has_attachments && (
+                              <span className="text-[9px] inline-flex items-center gap-0.5 text-text-muted/70">
+                                <FileText size={9} /> attachment
+                              </span>
+                            )}
+                            {!msg.can_read_body && (
+                              <span className="text-[9px] inline-flex items-center gap-0.5 text-text-muted/60">
+                                <Lock size={9} /> redacted
+                              </span>
+                            )}
+                          </div>
+                          {msg.can_read_body
+                            ? (msg.body_preview && (
+                                <div className="text-text-secondary mt-1 line-clamp-3 leading-snug">
+                                  {msg.body_preview}
+                                </div>
+                              ))
+                            : (
+                              <div className="text-text-muted/50 italic mt-1">
+                                You don't have access to this message body.
+                              </div>
+                            )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </GlassCard>
   );
 }
 

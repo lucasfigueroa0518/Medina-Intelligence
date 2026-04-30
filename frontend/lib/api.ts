@@ -182,6 +182,37 @@ export const api = {
     request<{ ok: boolean }>(`/deals/${id}`, { method: 'DELETE' }),
   getDealTimeline: (id: string) =>
     request<{ entries: any[] }>(`/deals/${id}/timeline`),
+  // Day-5 Phase-2: thread-grouped, ACL-aware conversation surfacing.
+  // Subject + metadata visible to anyone who can see the deal; body_preview
+  // + sender_name/email nulled when canReadEmailContent returns false for
+  // the requesting user. Mirrors getDealTimeline's redaction model.
+  getDealConversations: (id: string, limit?: number) => {
+    const q = typeof limit === 'number' ? `?limit=${limit}` : '';
+    return request<{
+      threads: Array<{
+        external_thread_id: string | null;
+        subject: string;
+        last_sender_name: string | null;
+        last_sent_at: string;
+        message_count: number;
+        can_read_any: boolean;
+        participants: Array<{ contact_id: string | null; name: string | null; email: string | null }>;
+        messages: Array<{
+          id: string;
+          sender_name: string | null;
+          sender_email: string | null;
+          sent_at: string;
+          direction: string | null;
+          can_read_body: boolean;
+          body_preview: string | null;
+          has_attachments: boolean;
+        }>;
+      }>;
+      ungrouped_count: number;
+      total_threads_seen: number;
+      truncated: boolean;
+    }>(`/deals/${id}/conversations${q}`);
+  },
   addDealContact: (dealId: string, data: { contact_id: string; role: string; side: string }) =>
     request<{ ok: boolean }>(`/deals/${dealId}/contacts`, { method: 'POST', body: JSON.stringify(data) }),
   removeDealContact: (dealId: string, contactId: string) =>
