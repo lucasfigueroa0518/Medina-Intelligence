@@ -126,6 +126,33 @@ export async function fetchSlackMessages(
         ).bind(orgId, c.id, c.name, c.is_member ? 1 : 0, c.is_private ? 1 : 0)
       )
     );
+
+    // Phase E: background classifier. For each visible channel, attempt
+    // to fuzzy-match channel name → open-deal company name. On match,
+    // insert slack_channel_deals + backfill last 60d into
+    // conversation_deals via inherited_channel. Idempotent (PKs collapse
+    // dupes), so running every sync is cheap-ish — Jaccard runs in-Worker
+    // against ≤200 open deals, no LLM calls. Best-effort; per-channel
+    // failure swallowed so a bad channel never blocks message ingestion.
+    try {
+      const { classifySlackChannelForDeals } = await import('../lib/deal-association');
+      let totalLinked = 0;
+      let totalBackfilled = 0;
+      for (const c of channels) {
+        try {
+          const r = await classifySlackChannelForDeals(c.id, c.name, orgId, env);
+          totalLinked += r.linked;
+          totalBackfilled += r.backfilled;
+        } catch (e) {
+          console.error(`[slack-classifier] failed for #${c.name} (${c.id}):`, e);
+        }
+      }
+      if (totalLinked > 0 || totalBackfilled > 0) {
+        console.log(`[slack-classifier] sweep: linked=${totalLinked} backfilled=${totalBackfilled} channels=${channels.length}`);
+      }
+    } catch (e) {
+      console.error('[slack-classifier] import failed:', e);
+    }
   }
 
   for (const channel of channels) {

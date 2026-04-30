@@ -162,6 +162,37 @@ export async function stageAndCommitApprovals(
         console.error(`[stage] applyHardSignalsToConversation failed for ${item.entityId}:`, e);
       }
 
+      // Phase E: inherited_channel. Slack-source conversations inherit
+      // any deal links pre-attached to their channel via the background
+      // classifier (slack_channel_deals). Channel id lives in the prefix
+      // of external_message_id ('<channelId>:<ts>' — see slack.ts). For
+      // non-slack sources this is a single trivial query that returns []
+      // because slack_channel_deals is keyed on slack channel ids.
+      if (item.source === 'slack' && item.externalId) {
+        try {
+          const colonIdx = item.externalId.indexOf(':');
+          const slackChannelId = colonIdx > 0 ? item.externalId.slice(0, colonIdx) : null;
+          if (slackChannelId) {
+            const { getDealsForSlackChannel, linkConversationToDeal } = await import('./deal-association');
+            const channelDeals = await getDealsForSlackChannel(slackChannelId, orgId, env);
+            let inheritedChannel = 0;
+            for (const cd of channelDeals) {
+              const r = await linkConversationToDeal(
+                item.entityId, cd.deal_id, 'inherited_channel', cd.confidence, orgId, env
+              );
+              if (r.inserted) inheritedChannel++;
+            }
+            if (inheritedChannel > 0) {
+              console.log(
+                `[stage] inherited_channel conversation=${item.entityId} channel=${slackChannelId} deals=${inheritedChannel}`
+              );
+            }
+          }
+        } catch (e) {
+          console.error(`[stage] inherited_channel hook failed for ${item.entityId}:`, e);
+        }
+      }
+
       // deal_intelligence event-driven invalidation. Fires when any of
       // this conversation's contacts is in any deal_contacts row — for
       // each affected (deal_id, user_id), checks canReadEmailContent
