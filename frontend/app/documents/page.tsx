@@ -9,6 +9,7 @@ import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { api } from '@/lib/api';
+import { DocumentUploadModal } from '@/components/document-upload-modal';
 import {
   Search,
   X as XIcon,
@@ -21,6 +22,7 @@ import {
   Upload,
   MessageSquare,
   Wand2,
+  Plus,
 } from 'lucide-react';
 
 interface Document {
@@ -43,26 +45,23 @@ interface Document {
 }
 
 // Source of truth: src/lib/document-intelligence.ts:184-190 (classifier
-// allowlist) + 'other' as a transitional bucket. The legacy 8-category list
-// (pitch_deck, financials, legal, memo, …) was a hold-over from the original
-// CHECK constraint that was dropped by migration 0048; the backend now
-// returns one of these 14 classifier categories. 'other' is kept as a 15th
-// filter option until the Wave 5 Phase D reclassify backfill drains the
-// 1,337 existing 'other' rows. Order mirrors the classifier prompt grouping.
-const DOCUMENT_TYPES = [
-  // Deal flow
-  'deal_pitch', 'deal_diligence', 'deal_terms', 'deal_financials',
-  // Fund operations
-  'fund_reporting', 'fund_legal', 'fund_admin',
-  // Relationships
-  'contact_data', 'correspondence', 'meeting_material',
-  // Market intelligence
-  'research', 'portfolio_update',
-  // General
-  'internal_ops', 'reference',
-  // Transitional — pre-Phase-D leftovers
-  'other',
+// allowlist) + 'other' as a transitional bucket. Wave 5 Phase F: rendered
+// in the filter rail as a 5+1 collapsible accordion (Deal / Fund /
+// Relationships / Market intel / General + Transitional 'other'). Lucas
+// approved the 5-bucket grouping in Phase 0; the original spec said 4 but
+// promoting research+portfolio_update to their own Market intel bucket
+// keeps that group distinct from internal General materials.
+const CATEGORY_BUCKETS: { label: string; children: string[] }[] = [
+  { label: 'Deal',          children: ['deal_pitch', 'deal_diligence', 'deal_terms', 'deal_financials'] },
+  { label: 'Fund',          children: ['fund_reporting', 'fund_legal', 'fund_admin'] },
+  { label: 'Relationships', children: ['contact_data', 'correspondence', 'meeting_material'] },
+  { label: 'Market intel',  children: ['research', 'portfolio_update'] },
+  { label: 'General',       children: ['internal_ops', 'reference'] },
+  { label: 'Transitional',  children: ['other'] },
 ];
+
+// Flat list for chip removal handlers + the FilterState shape.
+const DOCUMENT_TYPES = CATEGORY_BUCKETS.flatMap(b => b.children);
 
 // Wave 5 Phase E canonical 4-value source set. Migration 0068 backfilled
 // legacy 'upload'/'manual' rows to canonical names; persist-document no
@@ -239,6 +238,13 @@ function DocumentsPage() {
   const [total, setTotal] = React.useState(0);
   const [loading, setLoading] = React.useState(true);
   const [loadingMore, setLoadingMore] = React.useState(false);
+
+  // Upload modal — opened via TopBar button or page-level drag-drop.
+  // initialFiles seeds the queue from a drop hand-off.
+  const [uploadOpen, setUploadOpen] = React.useState(false);
+  const [uploadInitialFiles, setUploadInitialFiles] = React.useState<File[]>([]);
+  const [pageDragOver, setPageDragOver] = React.useState(false);
+  const dragCounterRef = React.useRef(0);
 
   const [filterCounts, setFilterCounts] = React.useState<{
     source: Record<string, number>;
@@ -477,24 +483,31 @@ function DocumentsPage() {
           {
             label: 'Document Type',
             defaultOpen: true,
-            children: DOCUMENT_TYPES.map(t => {
-              const count = filterCounts.document_type[t] || 0;
-              const active = filters.document_type.includes(t);
-              return (
-                <label key={t}
-                  className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors ${
-                    active ? 'bg-accent-magenta/10 text-text-primary' : count === 0 ? 'text-text-muted' : 'text-text-secondary hover:text-text-primary'
-                  }`}>
-                  <input type="checkbox" checked={active}
-                    onChange={e => setFilters(f => ({
+            children: (
+              <div className="space-y-3">
+                {CATEGORY_BUCKETS.map(bucket => (
+                  <BucketGroup
+                    key={bucket.label}
+                    label={bucket.label}
+                    children={bucket.children}
+                    counts={filterCounts.document_type}
+                    selected={filters.document_type}
+                    onToggle={(cat, on) => setFilters(f => ({
                       ...f,
-                      document_type: e.target.checked ? [...f.document_type, t] : f.document_type.filter(x => x !== t),
-                    }))} />
-                  <span className="capitalize flex-1">{t.replace(/_/g, ' ')}</span>
-                  <span className={`text-[10px] tabular-nums ${count === 0 ? 'text-text-muted/50' : 'text-text-muted'}`}>{count}</span>
-                </label>
-              );
-            }),
+                      document_type: on
+                        ? [...f.document_type, cat]
+                        : f.document_type.filter(x => x !== cat),
+                    }))}
+                    onToggleBucket={(children, on) => setFilters(f => ({
+                      ...f,
+                      document_type: on
+                        ? Array.from(new Set([...f.document_type, ...children]))
+                        : f.document_type.filter(x => !children.includes(x)),
+                    }))}
+                  />
+                ))}
+              </div>
+            ),
           },
           {
             label: 'Date Added',
@@ -548,7 +561,34 @@ function DocumentsPage() {
         activeCount={chips.length}
       />
 
-      <main className="flex-1 flex flex-col overflow-hidden">
+      <main
+        className="flex-1 flex flex-col overflow-hidden relative"
+        onDragEnter={e => {
+          if (!e.dataTransfer.types.includes('Files')) return;
+          e.preventDefault();
+          dragCounterRef.current++;
+          setPageDragOver(true);
+        }}
+        onDragOver={e => {
+          if (!e.dataTransfer.types.includes('Files')) return;
+          e.preventDefault();
+        }}
+        onDragLeave={() => {
+          dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+          if (dragCounterRef.current === 0) setPageDragOver(false);
+        }}
+        onDrop={e => {
+          if (!e.dataTransfer.types.includes('Files')) return;
+          e.preventDefault();
+          dragCounterRef.current = 0;
+          setPageDragOver(false);
+          const dropped = Array.from(e.dataTransfer.files);
+          if (dropped.length > 0) {
+            setUploadInitialFiles(dropped);
+            setUploadOpen(true);
+          }
+        }}
+      >
         <TopBar
           title="Documents"
           search={
@@ -567,9 +607,31 @@ function DocumentsPage() {
                 dir={filters.order}
                 onChange={(key, dir) => setFilters(f => ({ ...f, sort: key, order: dir }))}
               />
+              <button
+                onClick={() => { setUploadInitialFiles([]); setUploadOpen(true); }}
+                className="btn-primary flex items-center gap-1.5 text-sm"
+              >
+                <Plus size={14} /> Upload
+              </button>
             </div>
           }
         />
+
+        {/* Page-level drag-drop overlay — appears when files are dragged over /documents */}
+        {pageDragOver && (
+          <div className="absolute inset-0 z-40 flex items-center justify-center pointer-events-none"
+            style={{ background: 'rgba(217,70,168,0.08)', backdropFilter: 'blur(2px)', border: '2px dashed rgba(217,70,168,0.5)' }}>
+            <div className="px-6 py-4 rounded-xl bg-bg-elevated border border-border shadow-2xl">
+              <div className="flex items-center gap-3">
+                <Upload size={24} className="text-accent-magenta" />
+                <div>
+                  <div className="text-sm font-medium text-text-primary">Drop to upload</div>
+                  <div className="text-[11px] text-text-muted">Files will land in your Documents library</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="flex-1 p-6 overflow-auto">
           <QuickFilters<FilterState>
@@ -624,6 +686,85 @@ function DocumentsPage() {
           )}
         </div>
       </main>
+
+      <DocumentUploadModal
+        open={uploadOpen}
+        onClose={() => { setUploadOpen(false); setUploadInitialFiles([]); }}
+        onUploaded={() => { loadDocuments(); api.getDocumentFilterCounts().then(setFilterCounts).catch(() => {}); }}
+        initialFiles={uploadInitialFiles}
+      />
+    </div>
+  );
+}
+
+// Bucket-grouped category filter row: parent checkbox + expandable child
+// list. Parent state derives from children: 'all' (filled), 'partial'
+// (mixed), or 'none' (empty). Toggling parent flips all children at once.
+function BucketGroup({
+  label,
+  children,
+  counts,
+  selected,
+  onToggle,
+  onToggleBucket,
+}: {
+  label: string;
+  children: string[];
+  counts: Record<string, number>;
+  selected: string[];
+  onToggle: (cat: string, on: boolean) => void;
+  onToggleBucket: (children: string[], on: boolean) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const selectedInBucket = children.filter(c => selected.includes(c));
+  const state: 'all' | 'partial' | 'none' =
+    selectedInBucket.length === 0 ? 'none'
+    : selectedInBucket.length === children.length ? 'all'
+    : 'partial';
+  const total = children.reduce((sum, c) => sum + (counts[c] || 0), 0);
+  const checkboxRef = React.useRef<HTMLInputElement>(null);
+  React.useEffect(() => {
+    if (checkboxRef.current) checkboxRef.current.indeterminate = (state === 'partial');
+  }, [state]);
+  return (
+    <div>
+      <div className="flex items-center gap-2 text-sm">
+        <input
+          ref={checkboxRef}
+          type="checkbox"
+          checked={state === 'all'}
+          onChange={e => onToggleBucket(children, e.target.checked)}
+        />
+        <button
+          onClick={() => setOpen(o => !o)}
+          className="flex-1 flex items-center justify-between text-left text-text-secondary hover:text-text-primary"
+        >
+          <span className="font-medium">{label}</span>
+          <span className="flex items-center gap-1.5">
+            <span className="text-[10px] tabular-nums text-text-muted">{total}</span>
+            <span className="text-text-muted text-xs">{open ? '−' : '+'}</span>
+          </span>
+        </button>
+      </div>
+      {open && (
+        <div className="space-y-1 mt-1.5 ml-5">
+          {children.map(cat => {
+            const count = counts[cat] || 0;
+            const active = selected.includes(cat);
+            return (
+              <label key={cat}
+                className={`flex items-center gap-2 text-xs cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 transition-colors ${
+                  active ? 'bg-accent-magenta/10 text-text-primary' : count === 0 ? 'text-text-muted' : 'text-text-secondary hover:text-text-primary'
+                }`}>
+                <input type="checkbox" checked={active}
+                  onChange={e => onToggle(cat, e.target.checked)} />
+                <span className="capitalize flex-1">{cat.replace(/_/g, ' ')}</span>
+                <span className={`text-[10px] tabular-nums ${count === 0 ? 'text-text-muted/50' : 'text-text-muted'}`}>{count}</span>
+              </label>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
