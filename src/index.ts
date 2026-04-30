@@ -326,6 +326,8 @@ async function routeAuthenticated(
   if (m && method === 'GET') return Deals.getDealAssociations(m[1], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/timeline$/);
   if (m && method === 'GET') return Deals.getDealTimeline(request, m[1], ctx, env);
+  m = path.match(/^\/api\/deals\/([^/]+)\/conversations$/);
+  if (m && method === 'GET') return Deals.getDealConversations(request, m[1], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/contacts\/([^/]+)$/);
   if (m && method === 'DELETE') return Deals.removeDealContact(m[1], m[2], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/contacts$/);

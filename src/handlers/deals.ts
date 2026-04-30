@@ -43,11 +43,26 @@ export async function listDeals(
 
   const [result, countResult] = await Promise.all([
     env.D1.prepare(
+      // last_inferred_activity_date: query-time MAX from the same two-hop join
+      // getDealTimeline uses (deal_contacts → conversation_contacts →
+      // conversations). Fixes the staleness of deals.last_activity_date,
+      // which is only bumped by manual deal edits / Marty's agent-tools and
+      // does NOT update when an inbound conversation lands. The legacy
+      // last_activity_date column is left untouched on the wire (still in
+      // d.*) — frontend reads the new field with a fallback to the old one.
+      // See Day 4 Priority 6 audit, Section 1.3 finding.
       `SELECT d.*, co.name AS company_name, co.sector AS company_sector,
+              u.full_name AS owner_name, u.email AS owner_email,
               (SELECT COUNT(*) FROM deal_contacts dc WHERE dc.deal_id = d.id) AS contacts_count,
-              (SELECT COUNT(*) FROM deal_action_items dai WHERE dai.deal_id = d.id AND dai.status IN ('open','in_progress')) AS open_items_count
+              (SELECT COUNT(*) FROM deal_action_items dai WHERE dai.deal_id = d.id AND dai.status IN ('open','in_progress')) AS open_items_count,
+              (SELECT MAX(conv.sent_at)
+                 FROM deal_contacts dc
+                 JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+                 JOIN conversations conv ON cc.conversation_id = conv.id
+                WHERE dc.deal_id = d.id) AS last_inferred_activity_date
        FROM deals d
        LEFT JOIN companies co ON d.company_id = co.id
+       LEFT JOIN users u ON d.owner_id = u.id
        WHERE ${whereClause}
        ORDER BY d.expected_close ASC NULLS LAST
        LIMIT ? OFFSET ?`
@@ -166,8 +181,15 @@ export async function getDeal(
   env: Env
 ): Promise<Response> {
   const deal = await env.D1.prepare(
+    // See listDeals comment above re: last_inferred_activity_date — same
+    // two-hop join, surfaced alongside the legacy last_activity_date column.
     `SELECT d.*, co.name AS company_name, co.sector AS company_sector,
-            u.full_name AS owner_name
+            u.full_name AS owner_name, u.email AS owner_email,
+            (SELECT MAX(conv.sent_at)
+               FROM deal_contacts dc
+               JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+               JOIN conversations conv ON cc.conversation_id = conv.id
+              WHERE dc.deal_id = d.id) AS last_inferred_activity_date
      FROM deals d
      LEFT JOIN companies co ON d.company_id = co.id
      LEFT JOIN users u ON d.owner_id = u.id
@@ -596,6 +618,202 @@ export async function getDealTimeline(
     .slice(0, limit);
 
   return jsonResponse({ entries });
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/deals/:id/conversations  — Day-5 Phase 2
+// ---------------------------------------------------------------------------
+// Thread-grouped, ACL-aware conversation surfacing for the deal detail page.
+// The two-hop join (deal_contacts → conversation_contacts → conversations) is
+// the canonical linkage; this endpoint groups the result by
+// external_thread_id and applies the same canReadEmailContent gate that
+// getDealTimeline uses.
+//
+// ACL invariant (mirrors getDealTimeline + getContactTimeline):
+//   - Subject + sent_at + has_attachments + direction + thread metadata are
+//     visible to anyone who can see the deal (org members).
+//   - body_preview + sender_name + sender_email are nulled when
+//     canReadEmailContent returns false for the requesting user.
+//   - This is the codebase's established two-tier ACL: body-scoped
+//     redaction, not metadata-scoped.
+//
+// NULL external_thread_id rows surface as single-message "threads" of their
+// own — the ungrouped_count field on the response tells the caller how
+// many of those there are (pre-existing data quality artifact, not a bug
+// in this endpoint).
+
+export async function getDealConversations(
+  request: Request,
+  id: string,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const url = new URL(request.url);
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
+
+  // Verify deal exists + visible to caller. Same pattern as getDealTimeline.
+  const deal = await env.D1.prepare(
+    'SELECT id FROM deals WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(id, ctx.orgId).first();
+  if (!deal) return errorResponse('DEAL_NOT_FOUND', 404);
+
+  // Pull all linked conversations (the SQL deliberately fetches more rows
+  // than `limit` because limit applies to threads, not messages — we need
+  // to grab every message of the threads we'll ultimately return). The
+  // hard cap of `limit * 50` is a safety belt against pathological inboxes
+  // with thousand-message threads; cron-paced data growth in production
+  // makes this overhead negligible for normal threads.
+  const messageCap = limit * 50;
+
+  const [rows, sharingFlags] = await Promise.all([
+    env.D1.prepare(
+      `SELECT DISTINCT
+              conv.id, conv.external_thread_id, conv.subject, conv.sent_at,
+              conv.source, conv.body_preview, conv.participant_user_ids,
+              conv.is_campaign_email, conv.from_email, conv.from_contact_id,
+              conv.direction, conv.has_attachments
+         FROM deal_contacts dc
+         JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+         JOIN conversations conv       ON cc.conversation_id = conv.id
+        WHERE dc.deal_id = ? AND dc.org_id = ? AND conv.org_id = ?
+        ORDER BY conv.external_thread_id IS NULL,
+                 conv.external_thread_id ASC,
+                 conv.sent_at ASC
+        LIMIT ?`
+    ).bind(id, ctx.orgId, ctx.orgId, messageCap).all<{
+      id: string; external_thread_id: string | null; subject: string | null;
+      sent_at: string; source: string; body_preview: string | null;
+      participant_user_ids: string | null; is_campaign_email: number;
+      from_email: string | null; from_contact_id: string | null;
+      direction: string | null; has_attachments: number;
+    }>(),
+    getSharingFlags(ctx.orgId, env),
+  ]);
+
+  // Resolve from_contact_id → name (batched single round-trip).
+  const contactIds = Array.from(new Set(
+    rows.results.map(r => r.from_contact_id).filter((v): v is string => !!v)
+  ));
+  const contactNameById: Record<string, { name: string | null; email: string | null }> = {};
+  if (contactIds.length > 0) {
+    const placeholders = contactIds.map(() => '?').join(',');
+    const contactRows = await env.D1.prepare(
+      `SELECT id, full_name, email FROM contacts
+        WHERE id IN (${placeholders}) AND org_id = ? AND deleted_at IS NULL`
+    ).bind(...contactIds, ctx.orgId).all<{ id: string; full_name: string | null; email: string | null }>();
+    for (const r of contactRows.results) {
+      contactNameById[r.id] = { name: r.full_name, email: r.email };
+    }
+  }
+
+  // Group messages by external_thread_id. NULL → each row is its own thread.
+  type Msg = {
+    id: string;
+    sender_name: string | null;   // null when can_read_body=false (PII gate)
+    sender_email: string | null;  // null when can_read_body=false
+    sent_at: string;
+    direction: string | null;
+    can_read_body: boolean;
+    body_preview: string | null;  // null when can_read_body=false
+    has_attachments: boolean;
+  };
+  type Thread = {
+    external_thread_id: string | null;
+    subject: string;             // last message's subject (org-visible)
+    last_sender_name: string | null;
+    last_sent_at: string;
+    message_count: number;
+    can_read_any: boolean;       // true if any message in thread is body-readable
+    participants: Array<{ contact_id: string | null; name: string | null; email: string | null }>;
+    messages: Msg[];
+  };
+
+  const threadMap = new Map<string, Thread>();
+  // Use the row's id as a unique key when external_thread_id is null so
+  // single-message ungrouped rows each become their own thread.
+  let ungroupedCount = 0;
+
+  for (const r of rows.results) {
+    const canRead = canReadEmailContent(
+      {
+        source: r.source as 'outlook' | 'slack' | 'manual',
+        participant_user_ids: r.participant_user_ids ?? '[]',
+        is_campaign_email: r.is_campaign_email,
+      } as any,
+      ctx.userId,
+      ctx.userRole,
+      sharingFlags
+    );
+
+    const fromContact = r.from_contact_id ? contactNameById[r.from_contact_id] : undefined;
+    const senderName = fromContact?.name ?? null;
+    const senderEmail = fromContact?.email ?? r.from_email ?? null;
+
+    const msg: Msg = {
+      id: r.id,
+      sender_name: canRead ? senderName : null,
+      sender_email: canRead ? senderEmail : null,
+      sent_at: r.sent_at,
+      direction: r.direction,
+      can_read_body: canRead,
+      body_preview: canRead ? r.body_preview : null,
+      has_attachments: !!r.has_attachments,
+    };
+
+    const groupKey = r.external_thread_id ?? `__ungrouped__:${r.id}`;
+    if (r.external_thread_id == null) ungroupedCount++;
+
+    let thread = threadMap.get(groupKey);
+    if (!thread) {
+      thread = {
+        external_thread_id: r.external_thread_id,
+        subject: r.subject || '(no subject)',
+        last_sender_name: msg.sender_name,
+        last_sent_at: r.sent_at,
+        message_count: 0,
+        can_read_any: false,
+        participants: [],
+        messages: [],
+      };
+      threadMap.set(groupKey, thread);
+    }
+    thread.messages.push(msg);
+    thread.message_count++;
+    thread.can_read_any = thread.can_read_any || canRead;
+
+    // Latest message wins for thread-level fields. Rows are pre-sorted by
+    // sent_at ASC, so the last assignment per thread is the most recent.
+    if (r.sent_at >= thread.last_sent_at) {
+      thread.last_sent_at = r.sent_at;
+      thread.last_sender_name = msg.sender_name;
+      thread.subject = r.subject || thread.subject;
+    }
+
+    // Accumulate unique participants by contact_id (or email when no contact).
+    const partKey = r.from_contact_id ?? r.from_email ?? '';
+    if (partKey && !thread.participants.some(p =>
+      (p.contact_id && p.contact_id === r.from_contact_id) ||
+      (!p.contact_id && p.email === r.from_email)
+    )) {
+      thread.participants.push({
+        contact_id: r.from_contact_id ?? null,
+        name: fromContact?.name ?? null,
+        email: r.from_email ?? null,
+      });
+    }
+  }
+
+  // Sort threads DESC by last_sent_at, take first `limit`.
+  const threads = Array.from(threadMap.values())
+    .sort((a, b) => b.last_sent_at.localeCompare(a.last_sent_at))
+    .slice(0, limit);
+
+  return jsonResponse({
+    threads,
+    ungrouped_count: ungroupedCount,
+    total_threads_seen: threadMap.size,
+    truncated: threadMap.size > limit,
+  });
 }
 
 // ---------------------------------------------------------------------------

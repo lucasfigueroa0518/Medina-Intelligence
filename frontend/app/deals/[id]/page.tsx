@@ -5,7 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
   Mail, Calendar, FileText, Activity, Clock, Users, Building2,
-  Check, X as XIcon, Plus, ChevronDown, ChevronUp, Trash2,
+  Check, X as XIcon, Plus, ChevronDown, ChevronUp, ChevronRight, Trash2,
   DollarSign, Target, AlertCircle, CheckCircle2, MoreHorizontal,
   Sparkles, ArrowRight, Lock, Upload, Paperclip,
 } from 'lucide-react';
@@ -674,21 +674,31 @@ export default function DealDetailPage() {
             )}
           </div>
 
-          {/* Last Activity */}
-          <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
-            <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Last Activity</div>
-            <div className="flex items-center gap-2">
-              <span className="text-2xl font-semibold tabular-nums font-accent">
-                {deal.last_activity_date ? fmtRel(deal.last_activity_date) : '--'}
-              </span>
-              <Clock size={12} className="text-text-muted" />
-            </div>
-            {deal.last_activity_date && (
-              <div className="text-[9px] text-text-muted mt-1">
-                {new Date(deal.last_activity_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+          {/* Last Activity — Day-4 fix: prefer query-time inferred value
+              (deal_contacts → conversation_contacts → conversations MAX) over
+              the stale-by-design deals.last_activity_date column, which is
+              only bumped by manual deal edits. Fall back to the legacy
+              column then created_at so first-day deals don't render '--'. */}
+          {(() => {
+            const lastActivityIso: string | undefined =
+              (deal as any).last_inferred_activity_date ?? deal.last_activity_date ?? deal.created_at;
+            return (
+              <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Last Activity</div>
+                <div className="flex items-center gap-2">
+                  <span className="text-2xl font-semibold tabular-nums font-accent">
+                    {lastActivityIso ? fmtRel(lastActivityIso) : '--'}
+                  </span>
+                  <Clock size={12} className="text-text-muted" />
+                </div>
+                {lastActivityIso && (
+                  <div className="text-[9px] text-text-muted mt-1">
+                    {new Date(lastActivityIso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                  </div>
+                )}
               </div>
-            )}
-          </div>
+            );
+          })()}
 
           {/* Deal Age */}
           <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
@@ -742,6 +752,11 @@ export default function DealDetailPage() {
         </div>
       </div>
 
+      {/* ── INTELLIGENCE PULSE STRIP (NEW Day-5) ──
+          Reads from deal_intelligence (T3 evaluator wave). Empty-state today —
+          fills in when T3 ships per docs/deal-intelligence-contract.md. */}
+      <DealIntelligenceStrip deal={deal} />
+
       {/* ── MAIN CONTENT ── */}
       <div className="p-6 lg:p-8">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
@@ -791,6 +806,14 @@ export default function DealDetailPage() {
                 </button>
               )}
             </GlassCard>
+
+            {/* CARD: Conversations (Day-5 Phase 3) — thread-grouped view of
+                emails tied to deal contacts. Distinct from the chronological
+                Activity Timeline above; this surfaces reply chains as
+                collapsible threads with subject + last-sender + message count
+                in the header, and expands to show every message inline with
+                the same canReadEmailContent gate the timeline uses. */}
+            <DealConversationsCard dealId={id} />
 
             {/* CARD: Action Items */}
             <GlassCard>
@@ -1428,6 +1451,359 @@ export default function DealDetailPage() {
 }
 
 /* ───────── Sub-components ───────── */
+
+/** Day-5 Intelligence Pulse Strip. Reads from deal_intelligence (per-user
+ *  storage, populated by T3's evaluator wave per docs/deal-intelligence-contract.md).
+ *  Today this renders entirely as empty-state messaging — the contract is
+ *  signed but no schema migration has landed yet, so the read shape is
+ *  reserved on the deal object as `deal.deal_intelligence`. When T3 ships,
+ *  the consumer handler joins the row in and the strip lights up.
+ *
+ *  Per-user is the load-bearing security invariant — sentiment / topics /
+ *  risk are derived from conversation bodies the user can read, and a global
+ *  row would leak content across canReadEmailContent boundaries. */
+function DealIntelligenceStrip({ deal }: { deal: any }) {
+  const di = (deal && deal.deal_intelligence) || {};
+  const parseJson = (v: unknown): any[] => {
+    if (Array.isArray(v)) return v;
+    if (typeof v !== 'string') return [];
+    try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; }
+  };
+  const sentimentScore: number | null = typeof di.sentiment_score === 'number' ? di.sentiment_score : null;
+  const sentimentDirection: 'improving' | 'stable' | 'declining' | null = di.sentiment_direction ?? null;
+  const topics: string[] = parseJson(di.active_topics).filter((s: unknown): s is string => typeof s === 'string');
+  const riskCount: number = Number.isFinite(di.risk_signal_count) ? Number(di.risk_signal_count) : 0;
+  const riskExamples: Array<{ text: string; source_id?: string; source_type?: string; sent_at?: string }> =
+    parseJson(di.risk_signal_examples).filter((e: any) => e && typeof e === 'object' && typeof e.text === 'string');
+  const momentumTrend: 'increasing' | 'decreasing' | 'stable' | null = di.momentum_trend ?? null;
+  const momentumBuckets: Array<{ week_start: string; count: number }> =
+    parseJson(di.momentum_buckets).filter((b: any) =>
+      b && typeof b === 'object' && typeof b.week_start === 'string' && Number.isFinite(b.count)
+    );
+
+  return (
+    <div className="border-b border-border">
+      <div className="px-8 py-4 flex items-center gap-3">
+        <span className="text-[10px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
+          Intelligence
+        </span>
+        <span className="text-[9px] text-text-muted/60 italic">
+          {Object.keys(di).length === 0
+            ? 'awaiting evaluator (T3 Wave 6) — data lands automatically'
+            : `last computed ${di.last_computed_at ? fmtRel(di.last_computed_at) : '—'}`}
+        </span>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
+        {/* Sentiment */}
+        <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
+          <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Sentiment</div>
+          {sentimentScore === null && sentimentDirection === null ? (
+            <div className="text-xs text-text-muted italic">Insufficient data yet</div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span
+                className="text-2xl font-semibold tabular-nums font-accent"
+                style={{
+                  color:
+                    sentimentDirection === 'improving' ? '#22C55E' :
+                    sentimentDirection === 'declining' ? '#EF4444' : '#A1A1AA',
+                }}
+              >
+                {sentimentScore !== null
+                  ? `${sentimentScore >= 0 ? '+' : ''}${sentimentScore.toFixed(2)}`
+                  : '—'}
+              </span>
+              {sentimentDirection && (
+                <span className="text-[10px] text-text-muted capitalize">{sentimentDirection}</span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Active Topics */}
+        <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
+          <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Active Topics</div>
+          {topics.length === 0 ? (
+            <div className="text-xs text-text-muted italic">No active topics extracted</div>
+          ) : (
+            <div className="flex flex-wrap gap-1">
+              {topics.slice(0, 5).map((t, i) => (
+                <span
+                  key={`${t}-${i}`}
+                  className="text-[10px] font-accent px-1.5 py-0.5 rounded"
+                  style={{ background: 'rgba(139,92,246,0.10)', color: '#A78BFA' }}
+                >
+                  #{t}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Risk Signals */}
+        <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
+          <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Risk Signals</div>
+          {riskCount === 0 ? (
+            <div className="text-xs text-text-muted italic">No risk signals detected</div>
+          ) : (
+            <div>
+              <div className="flex items-baseline gap-2">
+                <span className="text-2xl font-semibold tabular-nums font-accent text-red-400">
+                  {riskCount}
+                </span>
+                <span className="text-[10px] text-text-muted">
+                  signal{riskCount === 1 ? '' : 's'}
+                </span>
+              </div>
+              {riskExamples.length > 0 && (
+                <div className="text-[10px] text-text-muted mt-1 truncate" title={riskExamples[0].text}>
+                  ↳ {riskExamples[0].text}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Momentum */}
+        <div className="px-5 py-4">
+          <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Momentum</div>
+          {momentumBuckets.length === 0 ? (
+            <div className="text-xs text-text-muted italic">No conversation activity yet</div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <DetailMomentumSparkline buckets={momentumBuckets} trend={momentumTrend} />
+              <span
+                className="text-[10px] capitalize"
+                style={{
+                  color:
+                    momentumTrend === 'increasing' ? '#22C55E' :
+                    momentumTrend === 'decreasing' ? '#EF4444' : '#A1A1AA',
+                }}
+              >
+                {momentumTrend ?? 'stable'}
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Larger sparkline for the detail page strip. Same shape as the board card
+ *  version but bigger (so the bucket-by-bucket trend reads). */
+function DetailMomentumSparkline({ buckets, trend }: {
+  buckets: Array<{ week_start: string; count: number }>;
+  trend: 'increasing' | 'decreasing' | 'stable' | null;
+}) {
+  const W = 80, H = 28, PAD = 3;
+  const color = trend === 'increasing' ? '#22C55E'
+    : trend === 'decreasing' ? '#EF4444'
+    : '#71717A';
+  const counts = buckets.map(b => b.count);
+  const maxC = Math.max(...counts, 1);
+  const stepX = (W - 2 * PAD) / Math.max(buckets.length - 1, 1);
+  const points = counts.map((c, i) => {
+    const x = PAD + i * stepX;
+    const y = H - PAD - ((c / maxC) * (H - 2 * PAD));
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const tooltip = buckets.map(b => `${b.week_start.slice(0, 10)}: ${b.count}`).join('\n');
+  return (
+    <svg width={W} height={H} className="shrink-0">
+      <title>{tooltip}</title>
+      <polyline points={points} fill="none" stroke={color} strokeWidth={2}
+        strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/** Day-5 Phase 3: thread-grouped conversations card on the detail page.
+ *  Consumes GET /api/deals/:id/conversations. Threads collapsed by default;
+ *  click expands to show every message in the thread with body_preview
+ *  (when can_read_body) or a "—" placeholder (when redacted by ACL).
+ *
+ *  ACL behavior matches the existing Activity Timeline:
+ *    - Subject + last-sent-at + message_count visible regardless
+ *    - sender_name + sender_email + body_preview only when can_read_body
+ *    - Threads with can_read_any=false render the metadata but never the
+ *      body content
+ *
+ *  404 handling: if the worker is older than Phase 2 (endpoint not yet
+ *  deployed), the catch path falls through to "no conversations" empty
+ *  state. Better than a crash. Once the worker catches up, the card
+ *  populates on next refresh. */
+function DealConversationsCard({ dealId }: { dealId: string }) {
+  const [data, setData] = React.useState<{
+    threads: Array<{
+      external_thread_id: string | null;
+      subject: string;
+      last_sender_name: string | null;
+      last_sent_at: string;
+      message_count: number;
+      can_read_any: boolean;
+      participants: Array<{ contact_id: string | null; name: string | null; email: string | null }>;
+      messages: Array<{
+        id: string;
+        sender_name: string | null;
+        sender_email: string | null;
+        sent_at: string;
+        direction: string | null;
+        can_read_body: boolean;
+        body_preview: string | null;
+        has_attachments: boolean;
+      }>;
+    }>;
+    ungrouped_count: number;
+    truncated: boolean;
+  } | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [endpointMissing, setEndpointMissing] = React.useState(false);
+  const [expanded, setExpanded] = React.useState<Set<string>>(new Set());
+
+  React.useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setEndpointMissing(false);
+    api.getDealConversations(dealId)
+      .then(r => { if (alive) setData(r); })
+      .catch((e: any) => {
+        // 404 → worker hasn't deployed Phase 2 yet. Treat as "no data" rather
+        // than a hard error so the surrounding page renders normally.
+        if (alive && e?.status === 404) setEndpointMissing(true);
+      })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [dealId]);
+
+  function toggle(key: string) {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  const threads = data?.threads ?? [];
+
+  return (
+    <GlassCard>
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
+          Conversations
+        </span>
+        {threads.length > 0 && (
+          <span className="text-[10px] text-text-muted font-accent">
+            {threads.length} thread{threads.length === 1 ? '' : 's'}
+            {data?.truncated && ' (more available)'}
+          </span>
+        )}
+      </div>
+
+      {loading && (
+        <div className="text-sm text-text-muted py-4 text-center">Loading…</div>
+      )}
+
+      {!loading && endpointMissing && (
+        <div className="text-xs text-text-muted italic py-2">
+          Worker hasn't picked up the conversations endpoint yet — auto-recovers on next deploy.
+        </div>
+      )}
+
+      {!loading && !endpointMissing && threads.length === 0 && (
+        <div className="text-sm text-text-muted py-4 text-center">
+          No conversations linked to this deal yet.
+        </div>
+      )}
+
+      {!loading && threads.length > 0 && (
+        <div className="space-y-1.5">
+          {threads.map((thread, idx) => {
+            const key = thread.external_thread_id ?? `__ungrouped__:${idx}`;
+            const isOpen = expanded.has(key);
+            const headerSender = thread.last_sender_name ?? '—';
+            return (
+              <div
+                key={key}
+                className="rounded-lg overflow-hidden"
+                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
+              >
+                <button
+                  type="button"
+                  onClick={() => toggle(key)}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/[0.03] transition-colors"
+                >
+                  {isOpen
+                    ? <ChevronDown size={12} className="text-text-muted shrink-0" />
+                    : <ChevronRight size={12} className="text-text-muted shrink-0" />}
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-text-primary truncate">{thread.subject}</div>
+                    <div className="text-[10px] text-text-muted mt-0.5 flex items-center gap-2">
+                      <span>{headerSender}</span>
+                      <span>·</span>
+                      <span>{thread.message_count} message{thread.message_count === 1 ? '' : 's'}</span>
+                      <span>·</span>
+                      <span>{fmtRel(thread.last_sent_at)}</span>
+                      {!thread.can_read_any && (
+                        <>
+                          <span>·</span>
+                          <span className="inline-flex items-center gap-0.5 text-text-muted/60">
+                            <Lock size={9} /> redacted
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </button>
+
+                {isOpen && (
+                  <div className="border-t border-white/[0.04] px-3 py-2 space-y-2 bg-black/10">
+                    {thread.messages.map(msg => {
+                      const senderLabel = msg.can_read_body
+                        ? (msg.sender_name || msg.sender_email || 'Unknown')
+                        : '—';
+                      return (
+                        <div key={msg.id} className="text-xs">
+                          <div className="flex items-center gap-2 text-text-muted">
+                            <span className="font-medium text-text-secondary">{senderLabel}</span>
+                            <span className="text-[10px]">{fmtRel(msg.sent_at)}</span>
+                            {msg.has_attachments && (
+                              <span className="text-[9px] inline-flex items-center gap-0.5 text-text-muted/70">
+                                <FileText size={9} /> attachment
+                              </span>
+                            )}
+                            {!msg.can_read_body && (
+                              <span className="text-[9px] inline-flex items-center gap-0.5 text-text-muted/60">
+                                <Lock size={9} /> redacted
+                              </span>
+                            )}
+                          </div>
+                          {msg.can_read_body
+                            ? (msg.body_preview && (
+                                <div className="text-text-secondary mt-1 line-clamp-3 leading-snug">
+                                  {msg.body_preview}
+                                </div>
+                              ))
+                            : (
+                              <div className="text-text-muted/50 italic mt-1">
+                                You don't have access to this message body.
+                              </div>
+                            )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </GlassCard>
+  );
+}
 
 function GlassCard({ children }: { children: React.ReactNode }) {
   return (
