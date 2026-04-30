@@ -12,7 +12,6 @@ import {
   type IntegrationRow,
   type IntegrationsStatusResponse,
   type UserProfile,
-  type FireflyBackfillResult,
   type SystemStatusResponse,
   type SystemStatusActiveTask,
   type SystemStatusRunHistoryEntry,
@@ -2975,16 +2974,11 @@ const FIREFLY_TROUBLESHOOTING: Array<{ q: string; a: React.ReactNode }> = [
   { q: 'Test event returns 401 Unauthorized', a: <>The signing secret doesn't match. Copy the secret from the setup guide above and paste it into Firefly's webhook Signing Secret field. Both values must be identical.</> },
   { q: 'Test event returns 200 but real meetings don\'t appear', a: <>Check that "Meeting Transcribed" is selected as a webhook event. Firefly only sends webhooks after the transcript is fully processed, which can take 5–15 minutes after a meeting ends.</> },
   { q: 'Meetings are being recorded but Firefly bot doesn\'t join', a: <>Go to Firefly Settings → Recording &amp; Privacy. Make sure "Auto-join" is enabled for your calendar. The Firefly bot needs calendar access to detect and join meetings.</> },
-  { q: 'How to import past meeting transcripts', a: <>Use the "Import Transcripts" button on the Firefly card to pull historical transcripts from Firefly's API. You'll need your Firefly API key from Settings → Developer settings.</> },
+  { q: 'How to import past meeting transcripts', a: <>Scroll up to the "Fireflies Historical Backfill" card. Pick a window (Last 30 / 60 / 90 / 180 days) or a custom date range, paste your Fireflies API key, and click Start. The backfill runs server-side across cron ticks and survives page refreshes.</> },
 ];
 
-const FIREFLY_TASK_NAME = 'Firefly transcript import';
-
 function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
-  const [showImport, setShowImport] = React.useState(false);
   const [guideOpen, setGuideOpen] = React.useState(false);
-  const { isRunning } = useBackgroundTasks();
-  const importRunning = isRunning(FIREFLY_TASK_NAME);
 
   return (
     <div>
@@ -2992,9 +2986,7 @@ function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
         name="Firefly AI"
         description="Meeting transcription + action items via webhook."
         row={row}
-        primaryLabel={importRunning ? 'Import in progress...' : 'Import Transcripts'}
-        onPrimaryClick={() => setShowImport(true)}
-        primaryDisabled={importRunning}
+        primaryLabel={null}
       />
       <button onClick={() => setGuideOpen(o => !o)} className="mt-2 flex items-center gap-1 text-xs text-text-muted hover:text-text-primary transition-colors">
         {guideOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
@@ -3006,7 +2998,6 @@ function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
           <div className="border-t border-border/50 pt-4"><FireflyTroubleshooting /></div>
         </div>
       </div>
-      {showImport && <FireflyImportModal onClose={() => setShowImport(false)} />}
     </div>
   );
 }
@@ -3112,96 +3103,6 @@ function FireflyTroubleshooting() {
   );
 }
 
-const FIREFLY_DATE_PRESETS: Array<{ label: string; days: number }> = [
-  { label: 'Last 7 days', days: 7 },
-  { label: 'Last 14 days', days: 14 },
-  { label: 'Last 30 days', days: 30 },
-  { label: 'Last 60 days', days: 60 },
-  { label: 'Last 90 days', days: 90 },
-];
-
-function FireflyImportModal({ onClose }: { onClose: () => void }) {
-  const [apiKey, setApiKey] = React.useState('');
-  const [startDate, setStartDate] = React.useState('');
-  const [endDate, setEndDate] = React.useState('');
-  const [error, setError] = React.useState<string | null>(null);
-  const { startTask } = useBackgroundTasks();
-
-  const applyPreset = (days: number) => {
-    const end = new Date();
-    const start = new Date(Date.now() - days * 86400000);
-    setStartDate(start.toISOString().slice(0, 10));
-    setEndDate(end.toISOString().slice(0, 10));
-  };
-
-  // Default to last 30 days on mount
-  React.useEffect(() => { applyPreset(30); }, []);
-
-  const submit = () => {
-    if (!apiKey.trim()) { setError('Enter your Firefly API key.'); return; }
-    if (!startDate) { setError('Start date is required.'); return; }
-
-    const opts = startDate ? { start_date: new Date(startDate).toISOString(), end_date: endDate ? new Date(endDate + 'T23:59:59Z').toISOString() : undefined } : undefined;
-    const promise = api.fireflyBackfill(apiKey.trim(), undefined, opts);
-    startTask(FIREFLY_TASK_NAME, promise, (r: FireflyBackfillResult) => {
-      const parts: string[] = [];
-      if (r.ingested > 0) parts.push(`Imported ${r.ingested} transcript${r.ingested === 1 ? '' : 's'}`);
-      if (r.skipped_duplicates > 0) parts.push(`${r.skipped_duplicates} skipped`);
-      if (r.failed > 0) parts.push(`${r.failed} failed`);
-      return parts.length > 0 ? parts.join(', ') : 'No new transcripts found';
-    });
-    onClose();
-  };
-
-  const matchedPreset = FIREFLY_DATE_PRESETS.find(p => {
-    const expectedStart = new Date(Date.now() - p.days * 86400000).toISOString().slice(0, 10);
-    return startDate === expectedStart;
-  });
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
-      <div className="card w-full max-w-md mx-4 p-6 space-y-4" onClick={e => e.stopPropagation()}>
-        <div className="flex items-start justify-between">
-          <div>
-            <div className="text-sm font-medium text-text-primary">Import Firefly transcripts</div>
-            <div className="text-xs text-text-secondary mt-0.5">Pull historical meeting transcripts from your Firefly account.</div>
-          </div>
-          <button onClick={onClose} className="text-text-muted hover:text-text-primary"><XIcon className="w-4 h-4" /></button>
-        </div>
-        <div>
-          <label className="text-xs text-text-secondary block mb-1">Firefly API key</label>
-          <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Paste your API key" className="input w-full text-sm" autoFocus />
-          <div className="text-xs text-text-muted mt-1">From <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span></div>
-        </div>
-        <div>
-          <label className="text-xs text-text-secondary block mb-1">Date range</label>
-          <div className="grid grid-cols-2 gap-3 mb-2">
-            <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} className="input text-sm w-full" />
-            <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} className="input text-sm w-full" />
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {FIREFLY_DATE_PRESETS.map(p => (
-              <button key={p.days} onClick={() => applyPreset(p.days)}
-                className="px-2 py-0.5 rounded text-[11px] transition-colors"
-                style={{
-                  background: matchedPreset?.days === p.days ? 'rgba(139,92,246,0.15)' : 'rgba(255,255,255,0.04)',
-                  border: `1px solid ${matchedPreset?.days === p.days ? 'rgba(139,92,246,0.3)' : 'rgba(255,255,255,0.06)'}`,
-                  color: matchedPreset?.days === p.days ? '#A78BFA' : undefined,
-                }}>
-                {p.label}
-              </button>
-            ))}
-          </div>
-        </div>
-        {error && <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">{error}</div>}
-        <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className="btn-ghost text-xs">Cancel</button>
-          <button onClick={submit} className="btn-primary text-xs" disabled={!apiKey.trim() || !startDate}>Import</button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 // ────────────────────────────────────────────────────────────────────────────
 // System Status tab — active tasks + run history + data completeness.

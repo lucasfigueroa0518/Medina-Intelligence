@@ -51,12 +51,13 @@ export interface TranscriptItem {
 
 export interface ProcessTranscriptContext {
   orgId: string;
-  /** Drives sync_jobs.workflow_type. Phase F adds the
-   * 'firefly-progressive-backfill-window' variant so progressive cron
-   * ticks produce per-window sync_jobs rows distinguishable from the
-   * legacy one-shot backfill (workflow_type='firefly-backfill') and the
-   * webhook ingest path (workflow_type='firefly-webhook'). */
-  sourcePath: 'firefly-webhook' | 'firefly-backfill' | 'firefly-progressive-backfill-window';
+  /** Drives sync_jobs.workflow_type. Two callers:
+   * - 'firefly-webhook': real-time webhook from Fireflies (processFireflyWebhook)
+   * - 'firefly-progressive-backfill-window': cron-driven historical backfill
+   *   (runFireflyWindowBackfill). The legacy 'firefly-backfill' synchronous
+   *   path was removed; historical sync_jobs rows with that workflow_type
+   *   remain in the DB for audit but no new writes occur with that value. */
+  sourcePath: 'firefly-webhook' | 'firefly-progressive-backfill-window';
 }
 
 export interface TranscriptStats {
@@ -147,9 +148,9 @@ function emptyStats(syncJobId: string): TranscriptStats {
  * sync_jobs lifecycle:
  *
  *   • One row per call. `workflow_type = ctx.sourcePath` ('firefly-webhook'
- *     or 'firefly-backfill'). Status starts 'running' and closes to one of
- *     'completed' (no errors), 'partial' (some errors but at least one item
- *     staged), or 'failed' (zero items staged).
+ *     or 'firefly-progressive-backfill-window'). Status starts 'running' and
+ *     closes to one of 'completed' (no errors), 'partial' (some errors but at
+ *     least one item staged), or 'failed' (zero items staged).
  *
  *   • Counter accumulation uses `json_patch` (single-call replacement) at
  *     close time rather than per-phase increments — the helper holds stats
