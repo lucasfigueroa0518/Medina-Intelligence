@@ -3,7 +3,7 @@
 import React from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2, Calendar, Mic } from 'lucide-react';
+import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2, Calendar, Mic, Lock, Unlock } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import {
   api,
@@ -1576,23 +1576,31 @@ function ApprovalQueueSection() {
   const [entities, setEntities] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [expandedIds, setExpandedIds] = React.useState<Set<string>>(new Set());
+  const [heldExpandedIds, setHeldExpandedIds] = React.useState<Set<string>>(new Set());
   const [entityTypeFilter, setEntityTypeFilter] = React.useState<string>('');
   const [toast, setToast] = React.useState<string | null>(null);
   const [showBulkConfirm, setShowBulkConfirm] = React.useState(false);
   const [bulkApproving, setBulkApproving] = React.useState(false);
   const [showDismissAllConfirm, setShowDismissAllConfirm] = React.useState(false);
   const [bulkDismissing, setBulkDismissing] = React.useState(false);
+  // Wave 6 UX — toggle for held-proposals visibility surface. When off
+  // (default), the queue shows only rows that crossed the 3-channel
+  // overwrite threshold (or 2-channel empty-fill). When on, also surface
+  // values the evaluator stashed in entity_field_state.pending_proposals
+  // — the "alternative values we've heard but haven't surfaced" pipeline.
+  const [showHeld, setShowHeld] = React.useState(false);
 
   const load = React.useCallback(async () => {
     setLoading(true);
     try {
       const params: Record<string, string> = {};
       if (entityTypeFilter) params.entity_type = entityTypeFilter;
+      if (showHeld) params.include_held = 'true';
       const res = await api.listApprovalQueueGrouped(params);
       setEntities(res.entities || []);
     } catch { /* ignore */ }
     setLoading(false);
-  }, [entityTypeFilter]);
+  }, [entityTypeFilter, showHeld]);
 
   React.useEffect(() => { load(); }, [load]);
 
@@ -1622,6 +1630,38 @@ function ApprovalQueueSection() {
   async function rejectAllEntity(entityType: string, entityId: string) {
     try { await api.rejectAllForEntity(entityType, entityId); load(); setToast('All dismissed'); } catch { setToast('Failed'); }
   }
+  async function approveHeld(entityType: string, entityId: string, fieldName: string, value: string) {
+    try {
+      await api.approveHeldProposal(entityType, entityId, fieldName, value);
+      load();
+      setToast('Held value applied');
+    } catch { setToast('Failed'); }
+  }
+  async function dismissHeld(entityType: string, entityId: string, fieldName: string, value: string) {
+    try {
+      await api.dismissHeldProposal(entityType, entityId, fieldName, value);
+      load();
+      setToast('Held value dismissed');
+    } catch { setToast('Failed'); }
+  }
+  async function toggleLock(entityType: string, entityId: string, fieldName: string, locked: boolean) {
+    try {
+      await api.toggleFieldLock(entityType, entityId, fieldName, locked);
+      load();
+      setToast(locked ? 'Field locked' : 'Field unlocked');
+    } catch (e: any) {
+      // Forbidden = caller isn't owner. Surface the role gate clearly.
+      const msg = String(e?.message || '');
+      setToast(msg.includes('403') ? 'Owner only' : 'Failed');
+    }
+  }
+  const toggleHeldExpand = (key: string) => {
+    setHeldExpandedIds(prev => {
+      const s = new Set(prev);
+      if (s.has(key)) s.delete(key); else s.add(key);
+      return s;
+    });
+  };
 
   async function handleBulkApproveAll() {
     setBulkApproving(true);
@@ -1708,6 +1748,22 @@ function ApprovalQueueSection() {
           {totalPending} pending update{totalPending !== 1 ? 's' : ''} across {entities.length} {entityTypeFilter || 'entit'}{entities.length !== 1 ? (entityTypeFilter ? 's' : 'ies') : (entityTypeFilter ? '' : 'y')}
         </div>
       )}
+
+      {/* Wave 6 — held-proposals visibility toggle. When on, surface
+          the channel-stash from entity_field_state.pending_proposals so
+          the user can see what the corroboration model is holding back. */}
+      <div className="flex items-center gap-2 mb-3 text-[11px] text-text-muted">
+        <label className="flex items-center gap-1.5 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={showHeld}
+            onChange={e => setShowHeld(e.target.checked)}
+            className="cursor-pointer"
+          />
+          Show held proposals
+        </label>
+        <span className="text-text-muted/60">— alternative values the corroboration model is holding silently (single-channel against existing). Approve to override; dismiss to mark recently-rejected.</span>
+      </div>
 
       {loading && entities.length === 0 ? (
         <div className="space-y-2">
@@ -1887,6 +1943,87 @@ function ApprovalQueueSection() {
                     style={{ borderTop: '1px solid rgba(255,255,255,0.03)' }}>
                     Show less <ChevronUp size={12} />
                   </button>
+                )}
+
+                {/* Wave 6 UX — held proposals subsection. Renders only
+                    when ?include_held=true brought rows back. Default
+                    collapsed; the user expands per entity to see the
+                    "alternatives we've heard but haven't surfaced". */}
+                {Array.isArray(entity.held_proposals) && entity.held_proposals.length > 0 && (
+                  <>
+                    <button
+                      onClick={() => toggleHeldExpand(key)}
+                      className="w-full px-4 py-2 text-[10px] uppercase tracking-wider text-text-muted/70 hover:text-text-secondary flex items-center justify-center gap-1 transition-colors"
+                      style={{ borderTop: '1px solid rgba(255,255,255,0.03)', background: 'rgba(255,255,255,0.015)' }}
+                    >
+                      {entity.held_proposals.length} held alternative{entity.held_proposals.length !== 1 ? 's' : ''}
+                      {heldExpandedIds.has(key) ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+                    </button>
+                    {heldExpandedIds.has(key) && (
+                      <div style={{ borderTop: '1px solid rgba(255,255,255,0.03)' }}>
+                        {entity.held_proposals.map((h: any, idx: number) => {
+                          const heldKey = `${key}:held:${h.field_name}:${idx}`;
+                          const isUrl = h.field_name?.includes('url');
+                          const currentDisplay = h.current_value ? cleanValue(h.current_value) : null;
+                          const proposedDisplay = cleanValue(h.value);
+                          return (
+                            <div
+                              key={heldKey}
+                              className="grid grid-cols-[100px_1fr_1fr_44px_84px] gap-x-2 items-center px-4 py-2 text-[11px]"
+                              style={{ borderBottom: '1px solid rgba(255,255,255,0.02)' }}
+                            >
+                              <span className="font-semibold text-purple-400/80 uppercase tracking-wider truncate">
+                                {humanField(h.field_name)}
+                              </span>
+                              <span className="text-text-muted truncate" title={Array.isArray(h.current_value_sources) ? h.current_value_sources.join(', ') : undefined}>
+                                {currentDisplay ? shortUrl(currentDisplay) : <span className="italic text-text-muted/50">empty</span>}
+                              </span>
+                              {isUrl ? (
+                                <a href={proposedDisplay} target="_blank" rel="noopener" className="text-text-secondary hover:text-accent-magenta hover:underline truncate">
+                                  {shortUrl(proposedDisplay)}
+                                </a>
+                              ) : (
+                                <span className="text-text-secondary truncate">{proposedDisplay}</span>
+                              )}
+                              <span className="text-[9px] text-text-muted/70 tabular-nums" title={Array.isArray(h.channels) ? h.channels.join(', ') : undefined}>
+                                {Array.isArray(h.channels) ? `${h.channels.length}ch` : ''}
+                              </span>
+                              <div className="flex items-center gap-1 justify-end">
+                                <button
+                                  onClick={() => toggleLock(entity.entity_type, entity.entity_id, h.field_name, !h.permanently_locked)}
+                                  className="w-6 h-6 rounded flex items-center justify-center hover:bg-amber-500/20 transition-colors"
+                                  style={{ background: h.permanently_locked ? 'rgba(245,158,11,0.18)' : 'rgba(255,255,255,0.03)' }}
+                                  title={h.permanently_locked
+                                    ? 'Field is permanently locked from automated proposals — click to unlock'
+                                    : 'Permanently lock this field from automated proposals (owner only)'}
+                                >
+                                  {h.permanently_locked
+                                    ? <Lock size={11} className="text-amber-400" />
+                                    : <Unlock size={11} className="text-text-muted/70" />}
+                                </button>
+                                <button
+                                  onClick={() => approveHeld(entity.entity_type, entity.entity_id, h.field_name, h.value)}
+                                  className="w-6 h-6 rounded flex items-center justify-center hover:bg-green-500/20 transition-colors"
+                                  style={{ background: 'rgba(34,197,94,0.06)' }}
+                                  title="Approve this held value (commits as human edit, resets corroboration)"
+                                >
+                                  <Check size={11} className="text-green-400/80" />
+                                </button>
+                                <button
+                                  onClick={() => dismissHeld(entity.entity_type, entity.entity_id, h.field_name, h.value)}
+                                  className="w-6 h-6 rounded flex items-center justify-center hover:bg-red-500/20 transition-colors"
+                                  style={{ background: 'rgba(255,255,255,0.03)' }}
+                                  title="Dismiss (90-day no-re-ask on this value)"
+                                >
+                                  <XIcon size={11} className="text-text-muted" />
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             );

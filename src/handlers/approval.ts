@@ -7,7 +7,15 @@ import { invalidateRagCache } from '../lib/cache';
 import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { commitProgressiveApproval, markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { triggerContactEnrichment } from '../lib/enrichment';
-import { recordRejection } from '../lib/proposal-evaluator';
+import { recordApproval, recordRejection } from '../lib/proposal-evaluator';
+
+// Wave 6 column-overwrite tables. Mirrors proposal-evaluator's tableForEntity
+// — kept here too to avoid a circular import via approval-evaluator helpers.
+function tableForEntity(t: 'contact' | 'company' | 'deal'): string {
+  if (t === 'contact') return 'contacts';
+  if (t === 'company') return 'companies';
+  return 'deals';
+}
 
 export async function listApprovalQueue(
   request: Request,
@@ -498,9 +506,404 @@ export async function listApprovalQueueGrouped(
         entity_name: row.entity_name,
         entity_avatar: row.entity_avatar,
         updates: [entry],
+        held_proposals: [],
       });
     }
   }
 
+  // Wave 6 UX surface — held proposals from entity_field_state.pending_proposals.
+  // These are values that have been observed but didn't meet the 3-channel
+  // overwrite threshold (or 2-channel empty-fill), so the evaluator stashed
+  // them silently. Surfacing them under ?include_held=true lets a user opt
+  // into seeing the pipeline of "alternative values we've heard but haven't
+  // surfaced." Same ACL as listApprovalQueueGrouped — members see their org's
+  // entities only (the entity-table joins below filter by org_id).
+  const includeHeld = url.searchParams.get('include_held') === 'true';
+  if (includeHeld) {
+    // Pull held proposals per entity type, joining through the entity table
+    // for org isolation. entity_field_state itself has no org column —
+    // mirrors progressive-enrichment.ts's per-table lookup pattern.
+    const heldQueries: Array<{ entityType: 'contact' | 'company' | 'deal'; sql: string }> = [
+      { entityType: 'contact',
+        sql: `SELECT efs.entity_type, efs.entity_id, efs.field_name, efs.current_value,
+                     efs.current_value_sources, efs.pending_proposals,
+                     efs.last_human_edit_at, efs.permanently_locked
+                FROM entity_field_state efs
+                JOIN contacts c ON c.id = efs.entity_id
+               WHERE efs.entity_type = 'contact'
+                 AND efs.pending_proposals != '{}'
+                 AND c.org_id = ? AND c.deleted_at IS NULL` },
+      { entityType: 'company',
+        sql: `SELECT efs.entity_type, efs.entity_id, efs.field_name, efs.current_value,
+                     efs.current_value_sources, efs.pending_proposals,
+                     efs.last_human_edit_at, efs.permanently_locked
+                FROM entity_field_state efs
+                JOIN companies c ON c.id = efs.entity_id
+               WHERE efs.entity_type = 'company'
+                 AND efs.pending_proposals != '{}'
+                 AND c.org_id = ? AND c.deleted_at IS NULL` },
+      { entityType: 'deal',
+        sql: `SELECT efs.entity_type, efs.entity_id, efs.field_name, efs.current_value,
+                     efs.current_value_sources, efs.pending_proposals,
+                     efs.last_human_edit_at, efs.permanently_locked
+                FROM entity_field_state efs
+                JOIN deals d ON d.id = efs.entity_id
+               WHERE efs.entity_type = 'deal'
+                 AND efs.pending_proposals != '{}'
+                 AND d.org_id = ? AND d.deleted_at IS NULL` },
+    ];
+
+    for (const q of heldQueries) {
+      if (entityTypeFilter && entityTypeFilter !== q.entityType) continue;
+
+      const heldRows = await env.D1.prepare(q.sql).bind(ctx.orgId).all<{
+        entity_type: string;
+        entity_id: string;
+        field_name: string;
+        current_value: string | null;
+        current_value_sources: string;
+        pending_proposals: string;
+        last_human_edit_at: string | null;
+        permanently_locked: number;
+      }>();
+
+      for (const hr of heldRows.results) {
+        let pending: Record<string, string[]> = {};
+        try {
+          const parsed = JSON.parse(hr.pending_proposals);
+          if (parsed && typeof parsed === 'object') {
+            for (const [k, v] of Object.entries(parsed)) {
+              if (Array.isArray(v)) pending[k] = v.filter(s => typeof s === 'string');
+            }
+          }
+        } catch { /* malformed pending_proposals — skip the row */ continue; }
+
+        let currentSources: string[] = [];
+        try {
+          const parsed = JSON.parse(hr.current_value_sources);
+          if (Array.isArray(parsed)) currentSources = parsed.filter(s => typeof s === 'string');
+        } catch { /* default to [] */ }
+
+        const key = `${hr.entity_type}:${hr.entity_id}`;
+        if (!grouped.has(key)) {
+          // No active queue rows for this entity, but we have held proposals
+          // — surface anyway. Need a lookup for entity_name + avatar.
+          const entityRow = await env.D1.prepare(
+            hr.entity_type === 'contact'
+              ? 'SELECT full_name as name, avatar_url FROM contacts WHERE id = ?'
+              : hr.entity_type === 'company'
+              ? 'SELECT name, NULL as avatar_url FROM companies WHERE id = ?'
+              : 'SELECT title as name, NULL as avatar_url FROM deals WHERE id = ?'
+          ).bind(hr.entity_id).first<{ name: string | null; avatar_url: string | null }>();
+
+          grouped.set(key, {
+            entity_type: hr.entity_type,
+            entity_id: hr.entity_id,
+            entity_name: entityRow?.name || null,
+            entity_avatar: entityRow?.avatar_url || null,
+            updates: [],
+            held_proposals: [],
+          });
+        }
+
+        const entityEntry = grouped.get(key);
+        for (const [value, channels] of Object.entries(pending)) {
+          entityEntry.held_proposals.push({
+            field_name: hr.field_name,
+            value,
+            channels,
+            current_value: hr.current_value,
+            current_value_sources: currentSources,
+            last_human_edit_at: hr.last_human_edit_at,
+            permanently_locked: hr.permanently_locked === 1,
+          });
+        }
+      }
+    }
+  }
+
   return jsonResponse({ entities: Array.from(grouped.values()) });
+}
+
+// Wave 6 UX — approve a held proposal. Held proposals live in
+// entity_field_state.pending_proposals (not approval_queue); approving
+// commits the value as if it were a fresh human edit per the locked spec.
+// recordApproval handles the entity_field_state side: resets
+// current_value_sources to [manual_edit_<userId>], clears pending_proposals,
+// stamps last_human_edit_at. We additionally write the value to the entity
+// table since recordApproval expects the entity table to already reflect
+// the new value (mirrors the markFieldsHumanEdited flow).
+export async function approveHeldProposal(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    entity_type: 'contact' | 'company' | 'deal';
+    entity_id: string;
+    field_name: string;
+    value: string;
+  }>(request);
+  if (!body?.entity_type || !body?.entity_id || !body?.field_name || body?.value === undefined) {
+    return errorResponse('VALIDATION_ERROR', 400);
+  }
+  if (body.entity_type !== 'contact' && body.entity_type !== 'company' && body.entity_type !== 'deal') {
+    return errorResponse('VALIDATION_ERROR', 400, 'entity_type must be contact|company|deal');
+  }
+
+  // Verify the held proposal exists for this org/entity/field/value before
+  // writing anything. Prevents the endpoint being abused to set arbitrary
+  // values on entities the caller has no claim to.
+  const stateRow = await env.D1.prepare(
+    `SELECT pending_proposals FROM entity_field_state
+       WHERE entity_type = ? AND entity_id = ? AND field_name = ?`
+  ).bind(body.entity_type, body.entity_id, body.field_name)
+   .first<{ pending_proposals: string }>();
+
+  if (!stateRow) {
+    return errorResponse('NOT_FOUND', 404, 'No field state row for this entity/field');
+  }
+  let pending: Record<string, string[]> = {};
+  try {
+    const parsed = JSON.parse(stateRow.pending_proposals);
+    if (parsed && typeof parsed === 'object') {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (Array.isArray(v)) pending[k] = v.filter(s => typeof s === 'string');
+      }
+    }
+  } catch { /* treat as empty */ }
+  if (!pending[body.value]) {
+    return errorResponse('NOT_FOUND', 404, 'No held proposal for this value');
+  }
+
+  // Org-isolation check via entity table.
+  const table = tableForEntity(body.entity_type);
+  const ownerCheck = await env.D1.prepare(
+    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(body.entity_id, ctx.orgId).first<{ id: string }>();
+  if (!ownerCheck) {
+    return errorResponse('NOT_FOUND', 404, 'Entity not in your org');
+  }
+
+  // Write to entity table.
+  await env.D1.prepare(
+    `UPDATE ${table} SET ${body.field_name} = ?,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(body.value, body.entity_id).run();
+
+  // recordApproval syncs entity_field_state — resets corroboration history
+  // per the locked spec. current_value_sources becomes
+  // [manual_edit_<userId>], pending_proposals clears entirely (any other
+  // held alternatives for this field are dropped — the human just decided).
+  await recordApproval({
+    orgId: ctx.orgId,
+    entityType: body.entity_type,
+    entityId: body.entity_id,
+    fieldName: body.field_name,
+    approvedValue: body.value,
+    userId: ctx.userId,
+  }, env);
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'approve',
+    entity_type: body.entity_type,
+    entity_id: body.entity_id,
+    after_data: { field: body.field_name, value: body.value, source: 'held_proposal_approve' },
+    created_at: new Date().toISOString(),
+  });
+
+  await invalidateRagCache(ctx.orgId, env);
+  return jsonResponse({ ok: true });
+}
+
+// Wave 6 UX — dismiss a held proposal. Removes the value from
+// pending_proposals and stamps it into rejected_values so the evaluator's
+// 90-day no-re-ask rule auto-rejects re-proposals of the same value.
+// Does NOT change current_value or current_value_sources — dismissing a
+// held alternative leaves current alone.
+export async function dismissHeldProposal(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    entity_type: 'contact' | 'company' | 'deal';
+    entity_id: string;
+    field_name: string;
+    value: string;
+  }>(request);
+  if (!body?.entity_type || !body?.entity_id || !body?.field_name || body?.value === undefined) {
+    return errorResponse('VALIDATION_ERROR', 400);
+  }
+  if (body.entity_type !== 'contact' && body.entity_type !== 'company' && body.entity_type !== 'deal') {
+    return errorResponse('VALIDATION_ERROR', 400);
+  }
+
+  // Org-isolation check.
+  const table = tableForEntity(body.entity_type);
+  const ownerCheck = await env.D1.prepare(
+    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(body.entity_id, ctx.orgId).first<{ id: string }>();
+  if (!ownerCheck) {
+    return errorResponse('NOT_FOUND', 404, 'Entity not in your org');
+  }
+
+  await recordRejection({
+    orgId: ctx.orgId,
+    entityType: body.entity_type,
+    entityId: body.entity_id,
+    fieldName: body.field_name,
+    rejectedValue: body.value,
+  }, env);
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'reject',
+    entity_type: body.entity_type,
+    entity_id: body.entity_id,
+    after_data: { field: body.field_name, value: body.value, source: 'held_proposal_dismiss' },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ ok: true });
+}
+
+// Wave 6 UX — toggle permanently_locked on a single field. When locked,
+// the evaluator's permanent-lock check returns REJECT regardless of
+// corroboration count or human-edit recency. Owner-only — locking is an
+// administrative action, not a user-level edit.
+export async function toggleFieldLock(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('FORBIDDEN', 403, 'owner role required');
+  }
+  const body = await parseJsonBody<{
+    entity_type: 'contact' | 'company' | 'deal';
+    entity_id: string;
+    field_name: string;
+    locked: boolean;
+  }>(request);
+  if (
+    !body?.entity_type || !body?.entity_id || !body?.field_name ||
+    typeof body?.locked !== 'boolean'
+  ) {
+    return errorResponse('VALIDATION_ERROR', 400);
+  }
+  if (body.entity_type !== 'contact' && body.entity_type !== 'company' && body.entity_type !== 'deal') {
+    return errorResponse('VALIDATION_ERROR', 400);
+  }
+
+  // Org-isolation check.
+  const table = tableForEntity(body.entity_type);
+  const ownerCheck = await env.D1.prepare(
+    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(body.entity_id, ctx.orgId).first<{ id: string }>();
+  if (!ownerCheck) {
+    return errorResponse('NOT_FOUND', 404, 'Entity not in your org');
+  }
+
+  // Upsert the field state row with the new lock value. If no row exists
+  // (the field has never been touched by a Wave 6 evaluator-routed
+  // proposal), seed one with the current entity-table value as
+  // current_value and ['historical_unknown'] sources — same shape as
+  // Phase A backfill.
+  const existing = await env.D1.prepare(
+    `SELECT id FROM entity_field_state
+       WHERE entity_type = ? AND entity_id = ? AND field_name = ?`
+  ).bind(body.entity_type, body.entity_id, body.field_name).first<{ id: string }>();
+
+  if (existing) {
+    await env.D1.prepare(
+      `UPDATE entity_field_state
+          SET permanently_locked = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(body.locked ? 1 : 0, existing.id).run();
+  } else {
+    // Cold path. Read entity-table value to seed the field state row.
+    const liveRow = await env.D1.prepare(
+      `SELECT ${body.field_name} as v FROM ${table} WHERE id = ?`
+    ).bind(body.entity_id).first<{ v: unknown }>().catch(() => null);
+    const currentValue =
+      liveRow?.v == null ? null :
+      typeof liveRow.v === 'string' ? liveRow.v :
+      String(liveRow.v);
+    const sources = currentValue && currentValue.trim() !== ''
+      ? '["historical_unknown"]'
+      : '[]';
+    await env.D1.prepare(
+      `INSERT INTO entity_field_state
+         (entity_type, entity_id, field_name, current_value,
+          current_value_sources, permanently_locked)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(
+      body.entity_type, body.entity_id, body.field_name,
+      currentValue, sources, body.locked ? 1 : 0
+    ).run();
+  }
+
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'update',
+    entity_type: body.entity_type,
+    entity_id: body.entity_id,
+    after_data: { field: body.field_name, permanently_locked: body.locked, source: 'field_lock_toggle' },
+    created_at: new Date().toISOString(),
+  });
+
+  return jsonResponse({ ok: true, field_name: body.field_name, locked: body.locked });
+}
+
+// Wave 6 UX — surface per-field locks for a single entity. Used by the
+// detail-page lock-icon UI so it can render the closed-padlock badge for
+// fields that are currently locked. Returns one row per (field_name,
+// permanently_locked) so the UI can map field → lock state.
+export async function listFieldLocks(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const url = new URL(request.url);
+  const entityType = url.searchParams.get('entity_type');
+  const entityId = url.searchParams.get('entity_id');
+  if (!entityType || !entityId) {
+    return errorResponse('VALIDATION_ERROR', 400, 'entity_type and entity_id required');
+  }
+  if (entityType !== 'contact' && entityType !== 'company' && entityType !== 'deal') {
+    return errorResponse('VALIDATION_ERROR', 400);
+  }
+
+  const table = tableForEntity(entityType);
+  const ownerCheck = await env.D1.prepare(
+    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(entityId, ctx.orgId).first<{ id: string }>();
+  if (!ownerCheck) {
+    return errorResponse('NOT_FOUND', 404, 'Entity not in your org');
+  }
+
+  const rows = await env.D1.prepare(
+    `SELECT field_name, permanently_locked, last_human_edit_at
+       FROM entity_field_state
+       WHERE entity_type = ? AND entity_id = ?`
+  ).bind(entityType, entityId).all<{
+    field_name: string;
+    permanently_locked: number;
+    last_human_edit_at: string | null;
+  }>();
+
+  return jsonResponse({
+    fields: rows.results.map(r => ({
+      field_name: r.field_name,
+      permanently_locked: r.permanently_locked === 1,
+      last_human_edit_at: r.last_human_edit_at,
+    })),
+  });
 }
