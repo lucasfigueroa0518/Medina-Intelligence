@@ -3,6 +3,20 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+# Wave 5.6: ship the vendored pdfjs serverless bundle (src/lib/pdfjs-
+# vendor/pdfjs.mjs, ~1.6 MB raw, ~400-500 KB compressed) as an
+# unprocessed Worker additional module. Without this, esbuild
+# transforms the single-line Rollup output and breaks pdfjs's static-
+# class-block semantics ("Ch is not a constructor" / "Object.
+# defineProperty called on non-object" / "Cannot set properties of
+# undefined"). The rules block matches the vendored file and preserves
+# it verbatim in the Worker bundle.
+find_additional_modules = true
+[[rules]]
+type = "ESModule"
+globs = ["lib/pdfjs-vendor/**/*.mjs"]
+fallthrough = true
+
 [vars]
 ENVIRONMENT = "production"
 CLOUDFLARE_ACCOUNT_ID = "ad54df3fe69483d2c0b69be1b72864e8"

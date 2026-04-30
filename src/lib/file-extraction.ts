@@ -11,26 +11,72 @@
 // parser to fail. The "Unsupported file type" branch still returns '' (it's
 // a known case, not an error).
 
-// Wave 5.6 (A safety-net): PDF extraction is currently disabled in
-// production. Both unpdf@1.6.2 and direct pdfjs-dist@5.7.284 fail under
-// esbuild + wrangler bundling — esbuild cannot preserve pdfjs's static-
-// class-block semantics, mangling identifiers and breaking polyfill setup
-// at module-init. Tracked as Wave 5.6 follow-up; needs either (a) Rollup-
-// pre-bundled artifact shipped as a Worker module, replicating what unpdf
-// does internally, or (b) external extraction service. Phase A's failure-
-// visibility infrastructure ensures every PDF now lands processing_status=
-// 'failed' with a clear, stable error_message so users see the limitation
-// rather than confusing parser internals like "Ch is not a constructor".
+// Wave 5.6: PDF extraction restored. Strategy after the unpdf and
+// pdfjs-dist direct attempts both broke under esbuild's transformation:
+// vendor unpdf's already-rolled pdfjs serverless bundle as a separate
+// Worker additional module. wrangler.toml's `find_additional_modules`
+// + `[[rules]] type = "ESModule"` ships the file as-is — esbuild does
+// not transform it. The bundle is self-contained: DOMMatrix polyfill,
+// fake-worker setup, and pdfjs internals all in correct init order.
+// We skip the unpdf wrapper (which has its own `import('unpdf/pdfjs')`
+// line that esbuild would follow and re-process the bundle) and call
+// the vendored exports directly.
+//
+// Lazy-import pattern: the dynamic `import('./pdfjs-vendor/pdfjs.mjs')`
+// fires on first PDF only, NOT at module init. This keeps cold-starts
+// fast and isolates any future bundle issues to PDF requests.
+let pdfjsCache: any = null;
+async function getPdfjs(): Promise<any> {
+  if (!pdfjsCache) {
+    // Variable import path — esbuild cannot statically resolve, so it
+    // does NOT bundle the target inline. The Worker runtime resolves
+    // the path at request time, hitting the file shipped as additional
+    // module by wrangler.toml's [[rules]] block. This is the load-
+    // bearing trick: prior attempts used a literal string here, which
+    // esbuild followed and re-bundled, mangling pdfjs's class identifiers.
+    // Workers runtime resolves additional-module IDs relative to bundle
+    // root (= base_dir = src/), not relative to the importing file. So
+    // even though file-extraction.ts lives in src/lib/, the import path
+    // for the additional module is its path FROM src/.
+    const vendoredPath = 'lib/pdfjs-vendor/pdfjs.mjs';
+    pdfjsCache = await import(vendoredPath);
+  }
+  return pdfjsCache;
+}
 
 export async function extractTextFromFile(file: File): Promise<string> {
   const mimeType = file.type.toLowerCase();
   const fileName = file.name.toLowerCase();
 
   if (mimeType === 'application/pdf' || fileName.endsWith('.pdf')) {
-    // Phase A's catch-and-stamp infra still runs against this throw —
-    // the row lands processing_status='failed' with this stable message.
-    // Stable string > confusing parser internals while we scope Wave 5.6.
-    throw new Error('PDF extraction not yet supported in Workers runtime — Wave 5.6 follow-up');
+    try {
+      const buffer = await file.arrayBuffer();
+      const pdfjs = await getPdfjs();
+      const loadingTask = pdfjs.getDocument({
+        data: new Uint8Array(buffer),
+        // Disable everything that would touch network, fonts, or eval —
+        // we run headless inside a Worker and only want the text layer.
+        isEvalSupported: false,
+        disableFontFace: true,
+        useSystemFonts: false,
+        useWorkerFetch: false,
+        disableAutoFetch: true,
+        disableStream: true,
+        verbosity: 0,
+      });
+      const doc = await loadingTask.promise;
+      const parts: string[] = [];
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const content = await page.getTextContent();
+        parts.push(content.items.map((it: any) => it.str || '').join(' '));
+        try { page.cleanup?.(); } catch { /* best-effort */ }
+      }
+      try { await doc.destroy?.(); } catch { /* best-effort */ }
+      return parts.join('\n\n');
+    } catch (e: any) {
+      throw new Error(`PDF extraction failed: ${e?.message || e}`);
+    }
   }
 
   if (

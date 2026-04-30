@@ -19,6 +19,7 @@
     "jszip": "^3.10.1",
     "mammoth": "^1.8.0",
     "papaparse": "^5.5.3",
+    "unpdf": "^1.6.2",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
