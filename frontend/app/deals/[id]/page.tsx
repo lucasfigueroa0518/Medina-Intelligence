@@ -7,7 +7,7 @@ import {
   Mail, Calendar, FileText, Activity, Clock, Users, Building2,
   Check, X as XIcon, Plus, ChevronDown, ChevronUp, Trash2,
   DollarSign, Target, AlertCircle, CheckCircle2, MoreHorizontal,
-  Sparkles, ArrowRight, Lock,
+  Sparkles, ArrowRight, Lock, Upload, Paperclip,
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { api } from '@/lib/api';
@@ -187,6 +187,13 @@ export default function DealDetailPage() {
   const [newNote, setNewNote] = React.useState('');
   const [addingNote, setAddingNote] = React.useState(false);
 
+  /* ── Documents state — same pattern as contacts/[id] Documents tab ── */
+  const [documents, setDocuments] = React.useState<any[]>([]);
+  const [docsLoading, setDocsLoading] = React.useState(false);
+  const [uploading, setUploading] = React.useState(false);
+  const [uploadVisibility, setUploadVisibility] = React.useState<'private' | 'org_wide'>('private');
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
+
   /* ── Contact search state (Theirs / Other side) ── */
   const [contactQuery, setContactQuery] = React.useState('');
   const [contactResults, setContactResults] = React.useState<any[]>([]);
@@ -227,6 +234,34 @@ export default function DealDetailPage() {
     const t = setTimeout(() => setToast(null), 3500);
     return () => clearTimeout(t);
   }, [toast]);
+
+  /* ── Documents fetch ── */
+  React.useEffect(() => {
+    setDocsLoading(true);
+    api.listDocuments({ deal_id: id }).then(r => setDocuments(r.documents || []))
+      .catch(() => setDocuments([]))
+      .finally(() => setDocsLoading(false));
+  }, [id, refreshKey]);
+
+  async function handleDocUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const res = await api.uploadDocument(file, { deal_id: id, visibility: uploadVisibility });
+      setToast(res.duplicate ? 'Duplicate document — already exists' : 'Document uploaded');
+      setRefreshKey(k => k + 1);
+    } catch (err: any) { setToast(`Upload failed: ${err.message}`); }
+    finally { setUploading(false); if (fileInputRef.current) fileInputRef.current.value = ''; }
+  }
+
+  async function handleDocDelete(docId: string) {
+    try {
+      await api.deleteDocument(docId);
+      setDocuments(prev => prev.filter(d => d.id !== docId));
+      setToast('Document deleted');
+    } catch { setToast('Delete failed'); }
+  }
 
   /* ── Contact search debounce ── */
   React.useEffect(() => {
@@ -1228,6 +1263,85 @@ export default function DealDetailPage() {
                 </div>
               </div>
             </GlassCard>
+
+            {/* CARD: Documents */}
+            <GlassCard>
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display flex items-center gap-1.5">
+                  <FileText size={11} /> Documents
+                  {documents.length > 0 && (
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold tabular-nums normal-case tracking-normal"
+                      style={{ background: 'rgba(217,70,168,0.12)', color: '#D946A8' }}>
+                      {documents.length}
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <select
+                    value={uploadVisibility}
+                    onChange={e => setUploadVisibility(e.target.value as 'private' | 'org_wide')}
+                    disabled={uploading}
+                    className="bg-bg-inset border border-border text-text-secondary text-[10px] px-1.5 py-1 rounded disabled:opacity-50"
+                    title="Who can read this document"
+                  >
+                    <option value="private">Private</option>
+                    <option value="org_wide">Org-wide</option>
+                  </select>
+                  <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium cursor-pointer transition-colors ${
+                    uploading ? 'opacity-50 pointer-events-none' : 'hover:bg-white/[0.06]'
+                  }`}
+                    style={{ background: 'rgba(217,70,168,0.12)', color: '#D946A8', border: '1px solid rgba(217,70,168,0.2)' }}>
+                    <Upload size={11} />
+                    {uploading ? 'Uploading...' : 'Upload'}
+                    <input ref={fileInputRef} type="file" className="hidden" onChange={handleDocUpload} disabled={uploading} />
+                  </label>
+                </div>
+              </div>
+              {docsLoading ? (
+                <div className="space-y-2">
+                  {Array.from({ length: 2 }).map((_, i) => (
+                    <div key={i} className="h-12 bg-bg-surface animate-pulse rounded-lg" />
+                  ))}
+                </div>
+              ) : documents.length === 0 ? (
+                <div className="text-center py-6">
+                  <FileText size={22} className="mx-auto text-text-muted/30 mb-2" />
+                  <div className="text-text-muted text-xs">No documents linked to this deal yet</div>
+                  <div className="text-text-muted/60 text-[10px] mt-1">Upload a document or it will appear here when MARTy or the system links one</div>
+                </div>
+              ) : (
+                <div className="space-y-1.5">
+                  {documents.map((doc: any) => (
+                    <div key={doc.id} className="flex items-center gap-2.5 py-2 px-2 -mx-2 rounded-lg transition-colors hover:bg-white/[0.03] group">
+                      <div className="w-7 h-7 rounded-md flex items-center justify-center shrink-0"
+                        style={{ background: doc.source === 'email_attachment' ? 'rgba(59,130,246,0.12)' : 'rgba(139,92,246,0.12)' }}>
+                        {doc.source === 'email_attachment'
+                          ? <Paperclip size={12} className="text-blue-400" />
+                          : <FileText size={12} className="text-purple-400" />}
+                      </div>
+                      <Link href={`/documents/${doc.id}`} className="flex-1 min-w-0 group/link">
+                        <div className="text-xs font-medium text-text-primary truncate group-hover/link:text-accent-magenta transition-colors">
+                          {doc.title || doc.file_name}
+                        </div>
+                        <div className="flex items-center gap-1.5 mt-0.5">
+                          <span className="px-1 py-0.5 rounded text-[8px] font-semibold uppercase tracking-wider"
+                            style={{ background: 'rgba(255,255,255,0.05)', color: '#A1A1AA' }}>
+                            {(doc.document_type || 'other').replace(/_/g, ' ')}
+                          </span>
+                          {doc.file_size && <span className="text-[9px] text-text-muted">{fmtSize(doc.file_size)}</span>}
+                          <span className="text-[9px] text-text-muted">{fmtRel(doc.created_at)}</span>
+                        </div>
+                      </Link>
+                      <button onClick={() => handleDocDelete(doc.id)}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-text-muted hover:text-semantic-error shrink-0"
+                        title="Delete document">
+                        <Trash2 size={11} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </GlassCard>
           </div>
         </div>
       </div>
@@ -1517,6 +1631,12 @@ function fmtCurrency(val: number): string {
   if (val >= 1_000_000) return `$${(val / 1_000_000).toFixed(1)}M`;
   if (val >= 1_000) return `$${(val / 1_000).toFixed(0)}K`;
   return `$${val.toLocaleString()}`;
+}
+
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function hexToRgba(hex: string, alpha: number): string {

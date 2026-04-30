@@ -10,6 +10,7 @@ import {
   Mail,
   Shield,
   Upload,
+  FileText,
   Settings as SettingsIcon,
   LogOut,
   type LucideIcon,
@@ -34,6 +35,7 @@ const NAV_LINKS: NavLink[] = [
   { label: 'Campaigns', icon: Mail, route: '/campaigns' },
   { label: 'Admin', icon: Shield, route: '/admin', requireAdmin: true },
   { label: 'Imports', icon: Upload, route: '/imports' },
+  { label: 'Documents', icon: FileText, route: '/documents' },
   { label: 'Settings', icon: SettingsIcon, route: '/settings' },
 ];
 

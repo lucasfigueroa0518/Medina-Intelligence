@@ -1,9 +1,10 @@
 'use client';
 
 import React from 'react';
-import { X, ExternalLink, AlertCircle, Loader2, FileText } from 'lucide-react';
+import { X, ExternalLink, FileText } from 'lucide-react';
 import { api, type ChatUploadSummary } from '@/lib/api';
 import { formatBytes } from './chat-upload-pill';
+import { FilePreview } from './file-preview';
 
 export function UploadPreviewModal({
   upload,
@@ -71,11 +72,9 @@ export function UploadPreviewModal({
         </header>
         <div className="flex-1 overflow-hidden p-3">
           {isPdf ? (
-            <iframe src={contentUrl} title={upload.filename} className="w-full h-full rounded-md bg-white" />
+            <FilePreview kind="pdf" src={contentUrl} fileName={upload.filename} />
           ) : isImage ? (
-            <div className="w-full h-full flex items-center justify-center bg-black/40 rounded-md overflow-hidden">
-              <img src={contentUrl} alt={upload.filename} className="max-w-full max-h-full object-contain" />
-            </div>
+            <FilePreview kind="image" src={contentUrl} fileName={upload.filename} />
           ) : (
             <ExtractedTextPreview uploadId={upload.id} extractionStatus={upload.extraction_status} />
           )}
@@ -113,30 +112,13 @@ function ExtractedTextPreview({ uploadId, extractionStatus }: { uploadId: string
     return () => { alive = false; };
   }, [uploadId]);
 
-  if (loading) {
-    return (
-      <div className="w-full h-full flex items-center justify-center text-text-muted text-xs">
-        <Loader2 size={16} className="animate-spin mr-2" /> Loading preview…
-      </div>
-    );
-  }
-  if (error) {
-    return (
-      <div className="w-full h-full flex items-center justify-center text-semantic-error text-xs">
-        <AlertCircle size={14} className="mr-2" /> {error}
-      </div>
-    );
-  }
-  if (!text) {
-    return (
-      <div className="w-full h-full flex items-center justify-center text-text-muted text-xs">
-        {extractionStatus === 'failed' ? 'Could not extract text from this file.' : 'No text content available.'}
-      </div>
-    );
-  }
   return (
-    <pre className="w-full h-full overflow-auto bg-bg-root rounded-md p-4 text-xs text-text-secondary whitespace-pre-wrap font-mono">
-      {text}
-    </pre>
+    <FilePreview
+      kind="text"
+      text={text || undefined}
+      loading={loading}
+      error={error}
+      emptyMessage={extractionStatus === 'failed' ? 'Could not extract text from this file.' : 'No text content available.'}
+    />
   );
 }

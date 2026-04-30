@@ -448,8 +448,23 @@ export const api = {
   // Documents
   listDocuments: (params?: Record<string, string>) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ documents: any[] }>(`/documents${q}`);
+    return request<{
+      documents: any[];
+      total: number;
+      limit: number;
+      offset: number;
+      has_more: boolean;
+    }>(`/documents${q}`);
   },
+  getDocument: (id: string) =>
+    request<{ document: any; downloadUrl: string }>(`/documents/${id}`),
+  getDocumentFilterCounts: () =>
+    request<{
+      source: Record<string, number>;
+      document_type: Record<string, number>;
+      date_bucket: { last_7d: number; last_30d: number; older: number };
+      mine: number;
+    }>('/documents/filter-counts'),
   uploadDocument: (
     file: File,
     data: {

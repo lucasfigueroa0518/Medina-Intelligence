@@ -408,6 +408,9 @@ async function routeAuthenticated(
     if (method === 'GET') return Documents.listDocuments(request, ctx, env);
     if (method === 'POST') return Documents.uploadDocument(request, ctx, env, ctxExec);
   }
+  if (path === '/api/documents/filter-counts' && method === 'GET') {
+    return Documents.getDocumentFilterCounts(ctx, env);
+  }
   m = path.match(/^\/api\/documents\/([^/]+)$/);
   if (m) {
     if (method === 'GET') return Documents.getDocument(m[1], ctx, env);
