@@ -871,7 +871,16 @@ async function embedSingleItem(
     if (!obj) return 'missing';
     const buffer = await obj.arrayBuffer();
     const file = new File([buffer], row.title, { type: '' });
-    const text = await extractTextFromFile(file);
+    // Wave 5 Phase A: extractTextFromFile now re-throws on parser error.
+    // Treat self-heal extraction failure as 'missing' (can't reconstruct
+    // chunks) rather than letting it crash the cron run.
+    let text: string;
+    try {
+      text = await extractTextFromFile(file);
+    } catch (e: any) {
+      console.error(`[self-heal] extract failed for doc ${entityId}:`, e?.message || e);
+      return 'missing';
+    }
     if (!text || text.trim().length < 10) return 'missing';
 
     const entries = await chunkEmbedAndPersistAll(text, {

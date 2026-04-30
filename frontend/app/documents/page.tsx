@@ -342,12 +342,19 @@ function DocumentsPage() {
       accessor: row => {
         const badge = mimeBadge(row.mime_type);
         const Icon = badge.icon;
+        const failed = row.processing_status === 'failed';
         return (
           <div className="flex items-center gap-2.5 min-w-0">
-            <Icon size={16} className="shrink-0 text-text-muted" />
-            <span className="truncate" title={row.title || row.file_name || ''}>
+            <Icon size={16} className={`shrink-0 ${failed ? 'text-semantic-error/70' : 'text-text-muted'}`} />
+            <span className={`truncate ${failed ? 'text-text-secondary' : ''}`} title={row.title || row.file_name || ''}>
               {row.title || row.file_name || '(untitled)'}
             </span>
+            {failed && (
+              <span className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium font-accent uppercase tracking-wider"
+                style={{ background: 'rgba(239,68,68,0.12)', color: '#FCA5A5' }}>
+                Failed
+              </span>
+            )}
           </div>
         );
       },

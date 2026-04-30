@@ -67,6 +67,11 @@ export interface PersistDocumentInput {
   parentDocumentId?: string;
   /** Extracted text from a prior step. If provided, finalize() skips extraction. */
   preExtractedText?: string;
+  /** Caller pre-extracted and the parser threw. finalize() will skip extract +
+   *  classify + embed and stamp processing_status='failed' with this message in
+   *  documents.error_message. Wave 5 Phase A — closes the silent-fail class on
+   *  email_attachment / chat_upload / intelligent_import pre-extract sites. */
+  extractionError?: string;
 
   /** Default true. When false, dedup-on-hash is bypassed and a new row is always created. */
   dedupOnContentHash?: boolean;
@@ -265,6 +270,7 @@ export async function persistDocument(
   const fileForFinalize = input.file;
   const userProvidedType = input.documentType;
   const preExtractedText = input.preExtractedText;
+  const extractionError = input.extractionError;
   const wantEmbed = input.embed !== false;
   const links = input.links;
   const visibility = input.visibility;
@@ -277,9 +283,44 @@ export async function persistDocument(
         `UPDATE documents SET processing_status = 'processing' WHERE id = ?`
       ).bind(documentId).run();
 
-      const text = preExtractedText !== undefined
-        ? preExtractedText
-        : await extractTextFromFile(fileForFinalize);
+      // Wave 5 Phase A: caller pre-extract failed — persist as failed, skip
+      // classify + embed. Without this branch the row would silently land
+      // `'completed'` with empty preview + `'other'` category (the
+      // 695-PDF silent-fail class).
+      if (extractionError !== undefined) {
+        await env.D1.prepare(
+          `UPDATE documents
+              SET processing_status = 'failed',
+                  error_message = ?,
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?`
+        ).bind(extractionError.slice(0, 500), documentId).run();
+        return;
+      }
+
+      // Extract — only when caller didn't pre-extract. Throws here are
+      // caught locally so we mark `'failed'` + populate error_message,
+      // rather than letting the outer catch confuse extract failures with
+      // classify/embed failures.
+      let text: string;
+      if (preExtractedText !== undefined) {
+        text = preExtractedText;
+      } else {
+        try {
+          text = await extractTextFromFile(fileForFinalize);
+        } catch (e: any) {
+          const msg = String(e?.message || e).slice(0, 500);
+          console.error(`[persistDocument:finalize] extract failed for ${documentId}: ${msg}`);
+          await env.D1.prepare(
+            `UPDATE documents
+                SET processing_status = 'failed',
+                    error_message = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE id = ?`
+          ).bind(msg, documentId).run();
+          return;
+        }
+      }
       const preview = text.slice(0, 500);
 
       let finalType = userProvidedType || 'other';
@@ -333,10 +374,15 @@ export async function persistDocument(
           WHERE id = ?`
       ).bind(finalType, preview, documentId).run();
     } catch (e: any) {
-      console.error(`[persistDocument:finalize] failed for ${documentId}:`, e?.message || e);
+      const msg = String(e?.message || e).slice(0, 500);
+      console.error(`[persistDocument:finalize] failed for ${documentId}: ${msg}`);
       await env.D1.prepare(
-        `UPDATE documents SET processing_status = 'failed' WHERE id = ?`
-      ).bind(documentId).run().catch(() => undefined);
+        `UPDATE documents
+            SET processing_status = 'failed',
+                error_message = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`
+      ).bind(msg, documentId).run().catch(() => undefined);
     }
   };
 

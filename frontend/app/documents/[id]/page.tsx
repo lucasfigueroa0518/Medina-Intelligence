@@ -23,6 +23,7 @@ type Doc = {
   document_type: string | null;
   source: string | null;
   processing_status: string | null;
+  error_message: string | null;
   extracted_text_preview: string | null;
   contact_id: string | null;
   company_id: string | null;
@@ -201,7 +202,23 @@ export default function DocumentDetailPage() {
         </button>
       </div>
 
-      {doc.processing_status && doc.processing_status !== 'completed' && (
+      {doc.processing_status === 'failed' && (
+        <div className="mb-6 px-3 py-2.5 rounded-lg border text-xs"
+          style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.25)', color: '#FCA5A5' }}>
+          <div className="flex items-start gap-2">
+            <AlertCircle size={14} className="shrink-0 mt-px" />
+            <div className="min-w-0">
+              <div className="font-medium">Extraction failed</div>
+              {doc.error_message && (
+                <div className="text-[11px] mt-0.5 break-words" style={{ color: '#FECACA' }}>
+                  {doc.error_message}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {doc.processing_status && doc.processing_status !== 'completed' && doc.processing_status !== 'failed' && (
         <div className="mb-6 px-3 py-2 rounded-lg bg-white/[0.03] border border-white/10 text-xs text-text-muted">
           Processing status: <span className="text-text-secondary">{doc.processing_status}</span>
         </div>

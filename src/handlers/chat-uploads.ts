@@ -148,6 +148,7 @@ async function processUpload(args: ProcessArgs): Promise<void> {
 
   let extractedText = '';
   let preview: string | null = null;
+  let extractionError: string | undefined;
 
   if (extractable) {
     try {
@@ -163,8 +164,9 @@ async function processUpload(args: ProcessArgs): Promise<void> {
                                   extracted_text = ?, preview_text = ?
          WHERE id = ?`
       ).bind(extractedText, preview, id).run();
-    } catch (e) {
-      console.error(`[chat-uploads] extraction failed for ${id}:`, e);
+    } catch (e: any) {
+      extractionError = String(e?.message || e);
+      console.error(`[chat-uploads] extraction failed for ${id}:`, extractionError);
       await env.D1.prepare(
         `UPDATE chat_uploads SET extraction_status = 'failed' WHERE id = ?`
       ).bind(id).run().catch(() => {});
@@ -206,6 +208,7 @@ async function processUpload(args: ProcessArgs): Promise<void> {
       links: [],
       documentType: classifiedType,
       preExtractedText: extractedText,
+      extractionError,
       embed: true,
     }, env);
     await persisted.finalize();

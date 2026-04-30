@@ -628,15 +628,20 @@ export async function processIntelligentImport(
     }
   };
 
-  // Try to extract text. If extraction fails or yields nothing, we still
-  // ingest the file — it just lands as `reference` with no entity payload.
+  // Try to extract text. If the parser throws, persist as `'failed'` with
+  // the error captured in documents.error_message — Wave 5 Phase A closes
+  // the silent-fail class. Empty-but-no-throw text is still ingested as
+  // `reference` with no entity payload (legitimate case for image-only
+  // PDFs etc).
   let text = '';
   let extractionFailed = false;
+  let extractionError: string | undefined;
   try {
     text = await extractTextFromFile(file);
   } catch (e: any) {
     extractionFailed = true;
-    errors.push(`Text extraction: ${e?.message || e}`);
+    extractionError = String(e?.message || e);
+    errors.push(`Text extraction: ${extractionError}`);
   }
   const hasUsableText = !!text && text.trim().length >= 20;
   if (!hasUsableText) extractionFailed = true;
@@ -672,6 +677,7 @@ export async function processIntelligentImport(
     links: [],  // intelligent_import creates entities; back-linking is a future feature
     documentType: category,
     preExtractedText: text,
+    extractionError,
     embed: true,
   }, env);
   const documentId = persisted.documentId;

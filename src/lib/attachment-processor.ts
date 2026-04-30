@@ -121,9 +121,19 @@ export async function processEmailAttachments(
       const file = new File([buffer], att.name, { type: att.contentType });
 
       // Pre-extract + pre-classify so finalize() doesn't redo the work.
-      // classifyDocument needs the text; if extraction yielded nothing, we
-      // keep 'other' as the category and skip the LLM call.
-      const text = await extractTextFromFile(file);
+      // Wave 5 Phase A: extraction throws are now propagated through to
+      // persistDocument via `extractionError`. The row still lands in
+      // documents (visibility for the user) but with status='failed' +
+      // error_message — closing the silent-fail class on email-attachment
+      // PDFs that pre-Phase-A landed as 'completed' with empty preview.
+      let text = '';
+      let extractionError: string | undefined;
+      try {
+        text = await extractTextFromFile(file);
+      } catch (e: any) {
+        extractionError = String(e?.message || e);
+        result.errors.push(`Extract "${att.name}": ${extractionError}`);
+      }
       let docCategory = 'other';
       if (text.length > 20) {
         try {
@@ -146,6 +156,7 @@ export async function processEmailAttachments(
         links,
         documentType: docCategory,
         preExtractedText: text,
+        extractionError,
         embed: true,
       }, env);
 
