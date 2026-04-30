@@ -230,6 +230,21 @@ export async function createDeal(
   } catch (e) {
     console.error(`[deals] embed failed for new deal ${id}:`, e);
   }
+  // Day-5 hotfix: auto-populate deal_contacts from contacts already
+  // resolved to this deal's company. Closes the gap that left
+  // deal_intelligence compute starved (the two-hop join
+  // deal_contacts → conversation_contacts → conversations had no first
+  // hop). Best-effort; failures swallowed so deal creation always
+  // succeeds. See src/lib/deal-association.ts.
+  try {
+    const { linkContactsByCompanyMatch } = await import('../lib/deal-association');
+    const r = await linkContactsByCompanyMatch(id, ctx.orgId, env);
+    if (r.linked > 0) {
+      console.log(`[deals] auto-linked ${r.linked}/${r.matched_contact_count} contacts to new deal ${id}`);
+    }
+  } catch (e) {
+    console.error(`[deals] auto-link contacts failed for new deal ${id}:`, e);
+  }
   const created = await env.D1.prepare('SELECT * FROM deals WHERE id = ?').bind(id).first();
   return jsonResponse({ deal: created }, 201);
 }

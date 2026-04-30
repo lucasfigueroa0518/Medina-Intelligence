@@ -269,6 +269,18 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
     return commitProgressiveApproval(item, env);
   }
 
+  // Day-5 hotfix: create_deal proposals from src/lib/deal-detection.ts were
+  // landing in approval_queue but the commit path below gates on
+  // contact|company tables only — approving a create_deal silently
+  // no-op'd. Explains the 97.7% rejection rate against deal proposals
+  // (users figured out approval was useless and started rejecting). Fix:
+  // actually insert the deal + auto-link contacts (company match) + link
+  // the source-conversation's participants (the email that triggered
+  // detection is direct evidence of who's involved).
+  if (item.change_type === 'create_deal') {
+    return commitCreateDealApproval(item, env);
+  }
+
   let value: string;
   try {
     const parsed = JSON.parse(item.proposed_value);
@@ -303,6 +315,110 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
   } catch (e) {
     console.error('Commit approval failed:', e);
   }
+  return {};
+}
+
+/** Commit a create_deal approval. Inserts a deals row from the proposed
+ *  payload, then auto-links contacts at the company AND the source
+ *  conversation's participants. Idempotent on the deal insert via the
+ *  approval_queue's idempotency_key. */
+async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich?: boolean }> {
+  // Proposed value shape per src/lib/deal-detection.ts:103-113:
+  //   { company_id, title, stage, amount, our_allocation, lead_source,
+  //     evidence, source_communication_id, source_sent_at }
+  let payload: any;
+  try {
+    payload = JSON.parse(item.proposed_value);
+  } catch (e) {
+    console.error('[commit-create-deal] payload parse failed:', e);
+    return {};
+  }
+  if (!payload?.company_id || !payload?.title) {
+    console.error('[commit-create-deal] missing required fields company_id/title');
+    return {};
+  }
+
+  // The deal-detection proposal's stage values come from a 5-categorical
+  // prompt set ('prospect','qualified','diligence','term_sheet','closing')
+  // but the deals table CHECK accepts 8 stages. Map the LLM-side stages
+  // to the table-side stages so the INSERT doesn't violate the constraint.
+  const STAGE_MAP: Record<string, string> = {
+    prospect: 'prospect',
+    qualified: 'first_contact',
+    diligence: 'due_diligence',
+    term_sheet: 'term_sheet',
+    closing: 'closing',
+  };
+  const stage = STAGE_MAP[payload.stage] || 'prospect';
+
+  const dealId = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  // Verify company still exists in the org. The proposal could be days
+  // old; if the company was soft-deleted in between, fail loudly rather
+  // than insert a deal pointing at a tombstone.
+  const company = await env.D1.prepare(
+    `SELECT id FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(payload.company_id, item.org_id).first();
+  if (!company) {
+    console.error(`[commit-create-deal] company ${payload.company_id} not found in org ${item.org_id}`);
+    return {};
+  }
+
+  try {
+    await env.D1.prepare(
+      `INSERT INTO deals
+         (id, org_id, company_id, owner_id, title, stage, amount, currency,
+          probability, our_allocation, lead_source,
+          stage_changed_at, last_activity_date, days_in_stage,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, 0, ?, ?)`
+    )
+      .bind(
+        dealId,
+        item.org_id,
+        payload.company_id,
+        item.resolved_by || null,                 // approver becomes owner
+        String(payload.title).slice(0, 120),
+        stage,
+        Number.isFinite(payload.amount) ? payload.amount : null,
+        Math.min(Math.max(Number(item.confidence) || 0, 0), 1),  // confidence as initial probability proxy
+        Number.isFinite(payload.our_allocation) ? payload.our_allocation : null,
+        payload.lead_source || null,
+        now, now, now, now
+      )
+      .run();
+  } catch (e) {
+    console.error(`[commit-create-deal] deal insert failed:`, e);
+    return {};
+  }
+
+  // Auto-link contacts via two evidence paths. Both idempotent.
+  try {
+    const { linkContactsByCompanyMatch, linkConversationParticipantsToDeal }
+      = await import('../lib/deal-association');
+    const companyMatch = await linkContactsByCompanyMatch(dealId, item.org_id, env);
+    let sourceMatch = { linked: 0, participant_count: 0 };
+    if (payload.source_communication_id) {
+      sourceMatch = await linkConversationParticipantsToDeal(
+        dealId, payload.source_communication_id, item.org_id, env
+      );
+    }
+    console.log(
+      `[commit-create-deal] deal=${dealId} company-link=${companyMatch.linked}/${companyMatch.matched_contact_count} source-link=${sourceMatch.linked}/${sourceMatch.participant_count}`
+    );
+  } catch (e) {
+    console.error(`[commit-create-deal] auto-link failed for ${dealId}:`, e);
+  }
+
+  // Embed the new deal so MARTy + RAG can surface it. Best-effort.
+  try {
+    const { embedDeal } = await import('../lib/embedding');
+    await embedDeal(dealId, item.org_id, env);
+  } catch (e) {
+    console.error(`[commit-create-deal] embed failed for ${dealId}:`, e);
+  }
+
   return {};
 }
 
