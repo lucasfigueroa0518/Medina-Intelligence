@@ -15,6 +15,7 @@ import {
   cancelFireflyProgressiveBackfill,
   getFireflyProgressiveStatus,
   listFireflyProgressiveBackfills,
+  MAX_BACKFILL_DAYS,
 } from '../lib/firefly-progressive-backfill';
 
 interface ProgressiveBody {
@@ -77,8 +78,12 @@ export async function handleFireflyProgressiveBackfill(
   }
 
   if (hasDaysBack) {
-    if (body.days_back! < 1 || body.days_back! > 730) {
-      return errorResponse('VALIDATION_ERROR', 400, 'days_back must be 1..730');
+    if (body.days_back! < 1 || body.days_back! > MAX_BACKFILL_DAYS) {
+      return errorResponse(
+        'VALIDATION_ERROR',
+        400,
+        `days_back must be 1..${MAX_BACKFILL_DAYS}; for longer pulls split into multiple requests`
+      );
     }
     const result = await createFireflyProgressiveBackfill(
       ctx.orgId, body.user_id, body.days_back!, windowSize, apiKey, env
@@ -100,6 +105,7 @@ export async function handleFireflyProgressiveBackfill(
         days_back: body.days_back,
         window_size_days: windowSize,
         total_windows: result.total_windows,
+        scheduled_days_count: result.scheduled_days_count,
       },
       created_at: new Date().toISOString(),
     });
@@ -110,6 +116,7 @@ export async function handleFireflyProgressiveBackfill(
       days_back: body.days_back,
       window_size_days: windowSize,
       total_windows: result.total_windows,
+      scheduled_days_count: result.scheduled_days_count,
     });
   }
 
@@ -140,6 +147,7 @@ export async function handleFireflyProgressiveBackfill(
       end_date: body.end_date,
       window_size_days: windowSize,
       total_windows: result.total_windows,
+      scheduled_days_count: result.scheduled_days_count,
     },
     created_at: new Date().toISOString(),
   });
@@ -150,6 +158,7 @@ export async function handleFireflyProgressiveBackfill(
     start_date: body.start_date,
     end_date: body.end_date,
     window_size_days: windowSize,
+    scheduled_days_count: result.scheduled_days_count,
     total_windows: result.total_windows,
   });
 }
