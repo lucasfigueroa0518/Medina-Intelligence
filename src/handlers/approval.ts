@@ -458,6 +458,35 @@ export async function listApprovalQueueGrouped(
       source_description: metadata?.source_description || row.change_type,
       created_at: row.created_at,
       change_type: row.change_type,
+      // Wave 6 corroboration packet — present when the row was produced
+      // by evaluateProposal's QUEUE path. Older rows or non-evaluator
+      // sources won't have it; UI renders gracefully when absent.
+      current_value_sources: Array.isArray(metadata?.current_value_sources)
+        ? metadata.current_value_sources
+        : null,
+      proposed_value_sources: Array.isArray(metadata?.proposed_value_sources)
+        ? metadata.proposed_value_sources
+        : null,
+      corroboration_count: typeof metadata?.corroboration_count === 'number'
+        ? metadata.corroboration_count
+        : null,
+      // ReverseContact unverified payloads carry their candidate-fields
+      // map here; the UI renders a structured field-list instead of a
+      // raw JSON blob (Phase B normalized this).
+      candidate_fields:
+        metadata?.candidate_fields && typeof metadata.candidate_fields === 'object'
+          ? metadata.candidate_fields
+          : null,
+      identity_score: typeof metadata?.identity_score === 'number'
+        ? metadata.identity_score
+        : null,
+      identity_details: Array.isArray(metadata?.identity_details)
+        ? metadata.identity_details
+        : null,
+      // LinkedIn discovery alternatives (Phase B normalized).
+      alternatives: Array.isArray(metadata?.alternatives)
+        ? metadata.alternatives
+        : null,
     };
 
     if (grouped.has(key)) {
