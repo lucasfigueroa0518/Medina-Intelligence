@@ -11,6 +11,7 @@ import {
 import { TopBar } from '@/components/top-bar';
 import { TagPicker } from '@/components/tag-picker';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
+import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
 
 const STAGE_OPTIONS = [
@@ -347,6 +348,10 @@ export default function CompanyDetailPage() {
       </div>
 
       <div className="p-8 space-y-6">
+        {/* Q12 — synthetic observations from LLM extraction over
+            conversations the user can read. Self-contained: hides
+            itself when there's nothing to show. */}
+        <RecentObservations entityType="company" entityId={id} />
         {/* Description Card */}
         <div className="relative rounded-xl p-5 transition-all duration-200 hover:border-white/[0.1]"
           style={{ background: 'rgba(17,17,20,0.65)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.05)' }}>

@@ -1399,6 +1399,23 @@ function ApprovalQueueSection() {
       setToast('Held value dismissed');
     } catch { setToast('Failed'); }
   }
+  // Q11 — held DELETION proposals. Backend overload of the same
+  // endpoints with is_deletion=true; frontend uses a separate API
+  // helper for clarity at the call site.
+  async function approveHeldDeletion(entityType: string, entityId: string, fieldName: string) {
+    try {
+      await api.approveHeldDeletion(entityType, entityId, fieldName);
+      load();
+      setToast('Field cleared');
+    } catch { setToast('Failed'); }
+  }
+  async function dismissHeldDeletion(entityType: string, entityId: string, fieldName: string) {
+    try {
+      await api.dismissHeldDeletion(entityType, entityId, fieldName);
+      load();
+      setToast('Deletion dismissed');
+    } catch { setToast('Failed'); }
+  }
   async function toggleLock(entityType: string, entityId: string, fieldName: string, locked: boolean) {
     try {
       await api.toggleFieldLock(entityType, entityId, fieldName, locked);
@@ -1720,7 +1737,11 @@ function ApprovalQueueSection() {
                           const heldKey = `${key}:held:${h.field_name}:${idx}`;
                           const isUrl = h.field_name?.includes('url');
                           const currentDisplay = h.current_value ? cleanValue(h.current_value) : null;
-                          const proposedDisplay = cleanValue(h.value);
+                          // Q11 — deletion held proposal renders the
+                          // proposed-cell as "(clear this field)"
+                          // instead of a value swap.
+                          const isDeletion = h.is_deletion === true;
+                          const proposedDisplay = isDeletion ? '' : cleanValue(h.value);
                           return (
                             <div
                               key={heldKey}
@@ -1733,7 +1754,11 @@ function ApprovalQueueSection() {
                               <span className="text-text-muted truncate" title={Array.isArray(h.current_value_sources) ? h.current_value_sources.join(', ') : undefined}>
                                 {currentDisplay ? shortUrl(currentDisplay) : <span className="italic text-text-muted/50">empty</span>}
                               </span>
-                              {isUrl ? (
+                              {isDeletion ? (
+                                <span className="text-rose-400/85 italic truncate" title="A channel is proposing this field be cleared">
+                                  clear this field
+                                </span>
+                              ) : isUrl ? (
                                 <a href={proposedDisplay} target="_blank" rel="noopener" className="text-text-secondary hover:text-accent-magenta hover:underline truncate">
                                   {shortUrl(proposedDisplay)}
                                 </a>
@@ -1757,18 +1782,26 @@ function ApprovalQueueSection() {
                                     : <Unlock size={11} className="text-text-muted/70" />}
                                 </button>
                                 <button
-                                  onClick={() => approveHeld(entity.entity_type, entity.entity_id, h.field_name, h.value)}
+                                  onClick={() => isDeletion
+                                    ? approveHeldDeletion(entity.entity_type, entity.entity_id, h.field_name)
+                                    : approveHeld(entity.entity_type, entity.entity_id, h.field_name, h.value)}
                                   className="w-6 h-6 rounded flex items-center justify-center hover:bg-green-500/20 transition-colors"
                                   style={{ background: 'rgba(34,197,94,0.06)' }}
-                                  title="Approve this held value (commits as human edit, resets corroboration)"
+                                  title={isDeletion
+                                    ? 'Clear this field (commits as human edit, resets corroboration)'
+                                    : 'Approve this held value (commits as human edit, resets corroboration)'}
                                 >
                                   <Check size={11} className="text-green-400/80" />
                                 </button>
                                 <button
-                                  onClick={() => dismissHeld(entity.entity_type, entity.entity_id, h.field_name, h.value)}
+                                  onClick={() => isDeletion
+                                    ? dismissHeldDeletion(entity.entity_type, entity.entity_id, h.field_name)
+                                    : dismissHeld(entity.entity_type, entity.entity_id, h.field_name, h.value)}
                                   className="w-6 h-6 rounded flex items-center justify-center hover:bg-red-500/20 transition-colors"
                                   style={{ background: 'rgba(255,255,255,0.03)' }}
-                                  title="Dismiss (90-day no-re-ask on this value)"
+                                  title={isDeletion
+                                    ? 'Dismiss (90-day no-re-ask on deletion of this field)'
+                                    : 'Dismiss (90-day no-re-ask on this value)'}
                                 >
                                   <XIcon size={11} className="text-text-muted" />
                                 </button>

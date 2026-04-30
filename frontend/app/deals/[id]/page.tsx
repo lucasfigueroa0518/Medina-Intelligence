@@ -19,6 +19,7 @@ import {
   IntelligenceFreshnessIndicator,
 } from '@/components/deal-intelligence';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
+import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
 
 /* ───────── Stage configuration ───────── */
@@ -780,6 +781,12 @@ export default function DealDetailPage() {
 
       {/* ── MAIN CONTENT ── */}
       <div className="p-6 lg:p-8">
+        {/* Q12 — synthetic observations span full width above the
+            two-column layout. Self-contained: hides itself when
+            there's nothing to show. */}
+        <div className="mb-5">
+          <RecentObservations entityType="deal" entityId={id} />
+        </div>
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
 
           {/* ═══ LEFT COLUMN (60%) ═══ */}
