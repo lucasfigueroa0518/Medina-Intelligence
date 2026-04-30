@@ -728,14 +728,29 @@ async function handleScheduled(
           id: `ingestion-${org.id}-${Date.now()}`,
           params: { org_id: org.id },
         });
-        // Hourly self-heal pass — catches any conversations / events / docs
-        // that landed in D1 but never got embedded (e.g. from the inline
-        // historical backfill path which doesn't have detect-embed-gaps).
-        // waitUntil so it doesn't block cron dispatch for other orgs.
+        // Hourly self-heal — split into two PARALLEL waitUntil blocks.
+        //
+        // Both `backfillUnembeddedConversations` and `processEmbedRetryQueue`
+        // do BGE-rate-limited embedding (10 RPS) with ~5s wallclock per
+        // conversation. Sequenced inside one waitUntil, the first call (200
+        // conversations × ~5s) consumes the entire ~30s wallclock budget
+        // before the second can start — leaving embed_retry_queue completely
+        // un-drained. Audit 2026-04-30 found 7,754 conversation rows with
+        // sum_attempts=0 across 2+ days; processEmbedRetryQueue was never
+        // reaching them despite being wired into the hourly cron.
+        //
+        // Splitting into separate ctxExec.waitUntil calls gives each its own
+        // ~30s wallclock allocation. The two paths target disjoint row sets
+        // (backfill works on conversations missing from vector_entity_index;
+        // queue works on rows already enqueued for retry), so racing them is
+        // safe and idempotent.
         ctxExec.waitUntil((async () => {
-          const { backfillUnembeddedConversations, processEmbedRetryQueue } = await import('./lib/daily-cron');
+          const { backfillUnembeddedConversations } = await import('./lib/daily-cron');
           try { await backfillUnembeddedConversations(org.id, env); }
           catch (e) { console.error(`hourly self-heal: backfillUnembedded failed for ${org.id}:`, e); }
+        })());
+        ctxExec.waitUntil((async () => {
+          const { processEmbedRetryQueue } = await import('./lib/daily-cron');
           try { await processEmbedRetryQueue(org.id, env); }
           catch (e) { console.error(`hourly self-heal: processEmbedRetryQueue failed for ${org.id}:`, e); }
         })());
