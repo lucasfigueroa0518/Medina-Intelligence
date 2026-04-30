@@ -7,7 +7,7 @@ import { invalidateRagCache } from '../lib/cache';
 import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { commitProgressiveApproval, markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { triggerContactEnrichment } from '../lib/enrichment';
-import { recordApproval, recordRejection } from '../lib/proposal-evaluator';
+import { recordApproval, recordApprovalOfDeletion, recordRejection } from '../lib/proposal-evaluator';
 
 // Wave 6 column-overwrite tables. Mirrors proposal-evaluator's tableForEntity
 // — kept here too to avoid a circular import via approval-evaluator helpers.
@@ -269,6 +269,18 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
     return commitProgressiveApproval(item, env);
   }
 
+  // Day-5 hotfix: create_deal proposals from src/lib/deal-detection.ts were
+  // landing in approval_queue but the commit path below gates on
+  // contact|company tables only — approving a create_deal silently
+  // no-op'd. Explains the 97.7% rejection rate against deal proposals
+  // (users figured out approval was useless and started rejecting). Fix:
+  // actually insert the deal + auto-link contacts (company match) + link
+  // the source-conversation's participants (the email that triggered
+  // detection is direct evidence of who's involved).
+  if (item.change_type === 'create_deal') {
+    return commitCreateDealApproval(item, env);
+  }
+
   let value: string;
   try {
     const parsed = JSON.parse(item.proposed_value);
@@ -303,6 +315,110 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
   } catch (e) {
     console.error('Commit approval failed:', e);
   }
+  return {};
+}
+
+/** Commit a create_deal approval. Inserts a deals row from the proposed
+ *  payload, then auto-links contacts at the company AND the source
+ *  conversation's participants. Idempotent on the deal insert via the
+ *  approval_queue's idempotency_key. */
+async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich?: boolean }> {
+  // Proposed value shape per src/lib/deal-detection.ts:103-113:
+  //   { company_id, title, stage, amount, our_allocation, lead_source,
+  //     evidence, source_communication_id, source_sent_at }
+  let payload: any;
+  try {
+    payload = JSON.parse(item.proposed_value);
+  } catch (e) {
+    console.error('[commit-create-deal] payload parse failed:', e);
+    return {};
+  }
+  if (!payload?.company_id || !payload?.title) {
+    console.error('[commit-create-deal] missing required fields company_id/title');
+    return {};
+  }
+
+  // The deal-detection proposal's stage values come from a 5-categorical
+  // prompt set ('prospect','qualified','diligence','term_sheet','closing')
+  // but the deals table CHECK accepts 8 stages. Map the LLM-side stages
+  // to the table-side stages so the INSERT doesn't violate the constraint.
+  const STAGE_MAP: Record<string, string> = {
+    prospect: 'prospect',
+    qualified: 'first_contact',
+    diligence: 'due_diligence',
+    term_sheet: 'term_sheet',
+    closing: 'closing',
+  };
+  const stage = STAGE_MAP[payload.stage] || 'prospect';
+
+  const dealId = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  // Verify company still exists in the org. The proposal could be days
+  // old; if the company was soft-deleted in between, fail loudly rather
+  // than insert a deal pointing at a tombstone.
+  const company = await env.D1.prepare(
+    `SELECT id FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(payload.company_id, item.org_id).first();
+  if (!company) {
+    console.error(`[commit-create-deal] company ${payload.company_id} not found in org ${item.org_id}`);
+    return {};
+  }
+
+  try {
+    await env.D1.prepare(
+      `INSERT INTO deals
+         (id, org_id, company_id, owner_id, title, stage, amount, currency,
+          probability, our_allocation, lead_source,
+          stage_changed_at, last_activity_date, days_in_stage,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, 0, ?, ?)`
+    )
+      .bind(
+        dealId,
+        item.org_id,
+        payload.company_id,
+        item.resolved_by || null,                 // approver becomes owner
+        String(payload.title).slice(0, 120),
+        stage,
+        Number.isFinite(payload.amount) ? payload.amount : null,
+        Math.min(Math.max(Number(item.confidence) || 0, 0), 1),  // confidence as initial probability proxy
+        Number.isFinite(payload.our_allocation) ? payload.our_allocation : null,
+        payload.lead_source || null,
+        now, now, now, now
+      )
+      .run();
+  } catch (e) {
+    console.error(`[commit-create-deal] deal insert failed:`, e);
+    return {};
+  }
+
+  // Auto-link contacts via two evidence paths. Both idempotent.
+  try {
+    const { linkContactsByCompanyMatch, linkConversationParticipantsToDeal }
+      = await import('../lib/deal-association');
+    const companyMatch = await linkContactsByCompanyMatch(dealId, item.org_id, env);
+    let sourceMatch = { linked: 0, participant_count: 0 };
+    if (payload.source_communication_id) {
+      sourceMatch = await linkConversationParticipantsToDeal(
+        dealId, payload.source_communication_id, item.org_id, env
+      );
+    }
+    console.log(
+      `[commit-create-deal] deal=${dealId} company-link=${companyMatch.linked}/${companyMatch.matched_contact_count} source-link=${sourceMatch.linked}/${sourceMatch.participant_count}`
+    );
+  } catch (e) {
+    console.error(`[commit-create-deal] auto-link failed for ${dealId}:`, e);
+  }
+
+  // Embed the new deal so MARTy + RAG can surface it. Best-effort.
+  try {
+    const { embedDeal } = await import('../lib/embedding');
+    await embedDeal(dealId, item.org_id, env);
+  } catch (e) {
+    console.error(`[commit-create-deal] embed failed for ${dealId}:`, e);
+  }
+
   return {};
 }
 
@@ -524,32 +640,38 @@ export async function listApprovalQueueGrouped(
     // for org isolation. entity_field_state itself has no org column —
     // mirrors progressive-enrichment.ts's per-table lookup pattern.
     const heldQueries: Array<{ entityType: 'contact' | 'company' | 'deal'; sql: string }> = [
+      // Q11: include rows that have either pending_proposals OR
+      // pending_deletions populated, so held deletions surface in the
+      // same UX as held overwrites.
       { entityType: 'contact',
         sql: `SELECT efs.entity_type, efs.entity_id, efs.field_name, efs.current_value,
                      efs.current_value_sources, efs.pending_proposals,
+                     efs.pending_deletions,
                      efs.last_human_edit_at, efs.permanently_locked
                 FROM entity_field_state efs
                 JOIN contacts c ON c.id = efs.entity_id
                WHERE efs.entity_type = 'contact'
-                 AND efs.pending_proposals != '{}'
+                 AND (efs.pending_proposals != '{}' OR efs.pending_deletions != '[]')
                  AND c.org_id = ? AND c.deleted_at IS NULL` },
       { entityType: 'company',
         sql: `SELECT efs.entity_type, efs.entity_id, efs.field_name, efs.current_value,
                      efs.current_value_sources, efs.pending_proposals,
+                     efs.pending_deletions,
                      efs.last_human_edit_at, efs.permanently_locked
                 FROM entity_field_state efs
                 JOIN companies c ON c.id = efs.entity_id
                WHERE efs.entity_type = 'company'
-                 AND efs.pending_proposals != '{}'
+                 AND (efs.pending_proposals != '{}' OR efs.pending_deletions != '[]')
                  AND c.org_id = ? AND c.deleted_at IS NULL` },
       { entityType: 'deal',
         sql: `SELECT efs.entity_type, efs.entity_id, efs.field_name, efs.current_value,
                      efs.current_value_sources, efs.pending_proposals,
+                     efs.pending_deletions,
                      efs.last_human_edit_at, efs.permanently_locked
                 FROM entity_field_state efs
                 JOIN deals d ON d.id = efs.entity_id
                WHERE efs.entity_type = 'deal'
-                 AND efs.pending_proposals != '{}'
+                 AND (efs.pending_proposals != '{}' OR efs.pending_deletions != '[]')
                  AND d.org_id = ? AND d.deleted_at IS NULL` },
     ];
 
@@ -563,6 +685,7 @@ export async function listApprovalQueueGrouped(
         current_value: string | null;
         current_value_sources: string;
         pending_proposals: string;
+        pending_deletions: string;
         last_human_edit_at: string | null;
         permanently_locked: number;
       }>();
@@ -576,7 +699,17 @@ export async function listApprovalQueueGrouped(
               if (Array.isArray(v)) pending[k] = v.filter(s => typeof s === 'string');
             }
           }
-        } catch { /* malformed pending_proposals — skip the row */ continue; }
+        } catch { /* malformed pending_proposals — fall through */ }
+
+        let pendingDeletions: string[] = [];
+        try {
+          const parsed = JSON.parse(hr.pending_deletions);
+          if (Array.isArray(parsed)) pendingDeletions = parsed.filter(s => typeof s === 'string');
+        } catch { /* default empty */ }
+
+        // Skip if both are empty (the WHERE clause should prevent this,
+        // but malformed JSON is a possible cause for landing here).
+        if (Object.keys(pending).length === 0 && pendingDeletions.length === 0) continue;
 
         let currentSources: string[] = [];
         try {
@@ -607,6 +740,7 @@ export async function listApprovalQueueGrouped(
         }
 
         const entityEntry = grouped.get(key);
+        // Held overwrite proposals — one entry per (value, channels[]).
         for (const [value, channels] of Object.entries(pending)) {
           entityEntry.held_proposals.push({
             field_name: hr.field_name,
@@ -616,6 +750,22 @@ export async function listApprovalQueueGrouped(
             current_value_sources: currentSources,
             last_human_edit_at: hr.last_human_edit_at,
             permanently_locked: hr.permanently_locked === 1,
+            is_deletion: false,
+          });
+        }
+        // Q11 — held deletion proposals. Surface as a single entry per
+        // field with is_deletion=true so the UI renders "Proposed:
+        // clear this field" instead of a value swap. value is null.
+        if (pendingDeletions.length > 0) {
+          entityEntry.held_proposals.push({
+            field_name: hr.field_name,
+            value: null,
+            channels: pendingDeletions,
+            current_value: hr.current_value,
+            current_value_sources: currentSources,
+            last_human_edit_at: hr.last_human_edit_at,
+            permanently_locked: hr.permanently_locked === 1,
+            is_deletion: true,
           });
         }
       }
@@ -642,15 +792,87 @@ export async function approveHeldProposal(
     entity_type: 'contact' | 'company' | 'deal';
     entity_id: string;
     field_name: string;
-    value: string;
+    /** Required for value-overwrite approvals; ignored when
+     *  is_deletion=true (deletion has no proposed_value). */
+    value?: string;
+    /** Q11: when true, this is approval of a held DELETION. The entity
+     *  field gets set to NULL and entity_field_state's
+     *  current_value/sources reset accordingly. */
+    is_deletion?: boolean;
   }>(request);
-  if (!body?.entity_type || !body?.entity_id || !body?.field_name || body?.value === undefined) {
+  if (!body?.entity_type || !body?.entity_id || !body?.field_name) {
     return errorResponse('VALIDATION_ERROR', 400);
   }
   if (body.entity_type !== 'contact' && body.entity_type !== 'company' && body.entity_type !== 'deal') {
     return errorResponse('VALIDATION_ERROR', 400, 'entity_type must be contact|company|deal');
   }
+  const isDeletion = body.is_deletion === true;
+  if (!isDeletion && body.value === undefined) {
+    return errorResponse('VALIDATION_ERROR', 400, 'value required unless is_deletion=true');
+  }
 
+  // Org-isolation check via entity table.
+  const table = tableForEntity(body.entity_type);
+  const ownerCheck = await env.D1.prepare(
+    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(body.entity_id, ctx.orgId).first<{ id: string }>();
+  if (!ownerCheck) {
+    return errorResponse('NOT_FOUND', 404, 'Entity not in your org');
+  }
+
+  if (isDeletion) {
+    // Verify a held deletion exists before writing anything.
+    const stateRow = await env.D1.prepare(
+      `SELECT pending_deletions FROM entity_field_state
+         WHERE entity_type = ? AND entity_id = ? AND field_name = ?`
+    ).bind(body.entity_type, body.entity_id, body.field_name)
+     .first<{ pending_deletions: string }>();
+    if (!stateRow) {
+      return errorResponse('NOT_FOUND', 404, 'No field state row for this entity/field');
+    }
+    let deletions: string[] = [];
+    try {
+      const parsed = JSON.parse(stateRow.pending_deletions);
+      if (Array.isArray(parsed)) deletions = parsed.filter(s => typeof s === 'string');
+    } catch { /* treat as empty */ }
+    if (deletions.length === 0) {
+      return errorResponse('NOT_FOUND', 404, 'No held deletion for this field');
+    }
+
+    // Set entity field to NULL.
+    await env.D1.prepare(
+      `UPDATE ${table} SET ${body.field_name} = NULL,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(body.entity_id).run();
+
+    // recordApprovalOfDeletion clears pending_proposals + pending_deletions,
+    // resets current_value_sources to [manual_edit_<userId>], stamps
+    // last_human_edit_at — so future automated proposals (overwrites OR
+    // re-proposed deletions) are gated by the 180-day human-edit lock.
+    await recordApprovalOfDeletion({
+      orgId: ctx.orgId,
+      entityType: body.entity_type,
+      entityId: body.entity_id,
+      fieldName: body.field_name,
+      userId: ctx.userId,
+    }, env);
+
+    await emitAudit(env, {
+      org_id: ctx.orgId,
+      user_id: ctx.userId,
+      action: 'approve',
+      entity_type: body.entity_type,
+      entity_id: body.entity_id,
+      after_data: { field: body.field_name, source: 'held_deletion_approve' },
+      created_at: new Date().toISOString(),
+    });
+
+    await invalidateRagCache(ctx.orgId, env);
+    return jsonResponse({ ok: true, deletion: true });
+  }
+
+  // ── overwrite path (existing Wave 6 UX) ──────────────────────────
   // Verify the held proposal exists for this org/entity/field/value before
   // writing anything. Prevents the endpoint being abused to set arbitrary
   // values on entities the caller has no claim to.
@@ -672,17 +894,8 @@ export async function approveHeldProposal(
       }
     }
   } catch { /* treat as empty */ }
-  if (!pending[body.value]) {
+  if (!pending[body.value!]) {
     return errorResponse('NOT_FOUND', 404, 'No held proposal for this value');
-  }
-
-  // Org-isolation check via entity table.
-  const table = tableForEntity(body.entity_type);
-  const ownerCheck = await env.D1.prepare(
-    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-  ).bind(body.entity_id, ctx.orgId).first<{ id: string }>();
-  if (!ownerCheck) {
-    return errorResponse('NOT_FOUND', 404, 'Entity not in your org');
   }
 
   // Write to entity table.
@@ -701,7 +914,7 @@ export async function approveHeldProposal(
     entityType: body.entity_type,
     entityId: body.entity_id,
     fieldName: body.field_name,
-    approvedValue: body.value,
+    approvedValue: body.value!,
     userId: ctx.userId,
   }, env);
 
@@ -733,13 +946,21 @@ export async function dismissHeldProposal(
     entity_type: 'contact' | 'company' | 'deal';
     entity_id: string;
     field_name: string;
-    value: string;
+    value?: string;
+    /** Q11: when true, dismiss a held DELETION (stamp __DELETE__
+     *  sentinel in rejected_values, clear pending_deletions). 90-day
+     *  no-re-ask then suppresses repeat deletion proposals. */
+    is_deletion?: boolean;
   }>(request);
-  if (!body?.entity_type || !body?.entity_id || !body?.field_name || body?.value === undefined) {
+  if (!body?.entity_type || !body?.entity_id || !body?.field_name) {
     return errorResponse('VALIDATION_ERROR', 400);
   }
   if (body.entity_type !== 'contact' && body.entity_type !== 'company' && body.entity_type !== 'deal') {
     return errorResponse('VALIDATION_ERROR', 400);
+  }
+  const isDeletion = body.is_deletion === true;
+  if (!isDeletion && body.value === undefined) {
+    return errorResponse('VALIDATION_ERROR', 400, 'value required unless is_deletion=true');
   }
 
   // Org-isolation check.
@@ -756,7 +977,8 @@ export async function dismissHeldProposal(
     entityType: body.entity_type,
     entityId: body.entity_id,
     fieldName: body.field_name,
-    rejectedValue: body.value,
+    rejectedValue: body.value ?? '',
+    isDeletion,
   }, env);
 
   await emitAudit(env, {
@@ -765,11 +987,14 @@ export async function dismissHeldProposal(
     action: 'reject',
     entity_type: body.entity_type,
     entity_id: body.entity_id,
-    after_data: { field: body.field_name, value: body.value, source: 'held_proposal_dismiss' },
+    after_data: {
+      field: body.field_name,
+      ...(isDeletion ? { source: 'held_deletion_dismiss' } : { value: body.value, source: 'held_proposal_dismiss' }),
+    },
     created_at: new Date().toISOString(),
   });
 
-  return jsonResponse({ ok: true });
+  return jsonResponse({ ok: true, deletion: isDeletion });
 }
 
 // Wave 6 UX — toggle permanently_locked on a single field. When locked,

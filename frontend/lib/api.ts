@@ -367,6 +367,43 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ entity_type: entityType, entity_id: entityId, field_name: fieldName, locked }),
     }),
+  // Q11 — held DELETION (clear-this-field) approve/dismiss. Backend
+  // overload of the same endpoints with is_deletion=true.
+  approveHeldDeletion: (entityType: string, entityId: string, fieldName: string) =>
+    request<{ ok: boolean; deletion: true }>('/approval-queue/held/approve', {
+      method: 'POST',
+      body: JSON.stringify({
+        entity_type: entityType, entity_id: entityId, field_name: fieldName,
+        is_deletion: true,
+      }),
+    }),
+  dismissHeldDeletion: (entityType: string, entityId: string, fieldName: string) =>
+    request<{ ok: boolean; deletion: true }>('/approval-queue/held/dismiss', {
+      method: 'POST',
+      body: JSON.stringify({
+        entity_type: entityType, entity_id: entityId, field_name: fieldName,
+        is_deletion: true,
+      }),
+    }),
+  // Q12 — synthetic observations (separate table, not approval_queue).
+  listEntityObservations: (entityType: string, entityId: string) =>
+    request<{
+      observations: Array<{
+        id: string;
+        observation_type: string;
+        observation_value: string;
+        channels: string[];
+        confidence: number;
+        evidence: string | null;
+        source_communication_id: string | null;
+        first_observed_at: string;
+        last_observed_at: string;
+      }>;
+    }>(`/entities/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}/observations`),
+  dismissObservation: (observationId: string) =>
+    request<{ ok: boolean }>(`/observations/${encodeURIComponent(observationId)}/dismiss`, {
+      method: 'POST',
+    }),
   getContactPendingUpdates: (id: string) =>
     request<{ updates: any[] }>(`/contacts/${id}/pending-updates`),
 
@@ -448,12 +485,6 @@ export const api = {
   getSyncConfig: () => request<{ config: { sync_history_days: number } }>('/sync/config'),
   updateSyncConfig: (data: { sync_history_days: number }) =>
     request<{ ok: boolean }>('/sync/config', { method: 'PATCH', body: JSON.stringify(data) }),
-
-  // Backfill
-  startBackfill: (data: { user_id?: string; days_back?: number; start_date?: string; end_date?: string }) =>
-    request<{ ok: boolean; progress: any }>('/admin/backfill-email', { method: 'POST', body: JSON.stringify(data) }),
-  getBackfillProgress: () =>
-    request<{ progress: any }>('/admin/backfill-progress'),
 
   // Progressive backfill (server-side, multi-window, cron-driven)
   startProgressiveBackfill: (data: { user_id?: string; days_back?: 30 | 60 | 90 | 180; start_date?: string; end_date?: string }) =>

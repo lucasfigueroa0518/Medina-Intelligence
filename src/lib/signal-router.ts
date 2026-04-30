@@ -3,6 +3,7 @@ import type { ChunkMetadata } from '../types/interfaces';
 import type { TranscriptSignals, ContactSignal, CompanySignal, DealSignal, RelationshipSignal } from './transcript-extraction';
 import { hashShort } from './helpers';
 import { chunkEmbedAndPersistAll } from './embedding';
+import { recordSyntheticObservation } from './synthetic-observations';
 
 interface RoutedSignalResult {
   contact_signals_routed: number;
@@ -126,7 +127,20 @@ async function routeContactSignal(
   if (!contactId) return false;
 
   if (signal.field === 'follow_up_commitment' || signal.field === 'personal_update') {
-    await stageSignalInApprovalQueue(orgId, 'contact', contactId, signal.field, signal.value, signal.confidence, eventId, env);
+    // Q12 — synthetic observation. Lands in synthetic_observations
+    // (append-with-merge), not approval_queue. Channel:
+    // 'transcript_mention' (resolved by source-channels.ts).
+    await recordSyntheticObservation({
+      orgId,
+      entityType: 'contact',
+      entityId: contactId,
+      observationType: signal.field,
+      observationValue: typeof signal.value === 'string' ? signal.value : JSON.stringify(signal.value),
+      source: 'transcript_mention',
+      context: { conversationId: eventId },
+      confidence: signal.confidence,
+      sourceCommunicationId: eventId,
+    }, env);
     return true;
   }
 
@@ -202,14 +216,22 @@ async function routeRelationshipSignal(
 
   if (!contactId) return false;
 
-  await stageSignalInApprovalQueue(
-    orgId, 'contact', contactId,
-    `relationship_${signal.signal_type}`,
-    { ...signal, people: signal.people_involved },
-    signal.confidence,
-    eventId,
-    env
-  );
+  // Q12 — relationship_* signals are observation-class. Land them in
+  // synthetic_observations instead of approval_queue. observationValue
+  // serializes the structured signal so the UI can render the
+  // people_involved + signal_type detail back out.
+  const obsType = `relationship_${signal.signal_type}`;
+  await recordSyntheticObservation({
+    orgId,
+    entityType: 'contact',
+    entityId: contactId,
+    observationType: obsType,
+    observationValue: JSON.stringify({ ...signal, people: signal.people_involved }),
+    source: 'transcript_mention',
+    context: { conversationId: eventId },
+    confidence: signal.confidence,
+    sourceCommunicationId: eventId,
+  }, env);
   return true;
 }
 

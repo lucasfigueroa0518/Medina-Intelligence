@@ -15,6 +15,7 @@ import { CompanySearchField } from '@/components/company-search-field';
 import { TagPicker } from '@/components/tag-picker';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
+import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
 
 type Tab = 'overview' | 'timeline' | 'associations' | 'documents' | 'deals';
@@ -506,6 +507,10 @@ export default function ContactDetailPage() {
       <div className="p-6 lg:p-8">
         {activeTab === 'overview' && (
           <div className="space-y-5">
+            {/* Q12 — synthetic observations from LLM extraction over
+                conversations the user can read. Self-contained: hides
+                itself when there's nothing to show. */}
+            <RecentObservations entityType="contact" entityId={id} />
             {/* Pending Suggestions Banner */}
             {pendingUpdates.length > 0 && !editMode && (
               <div className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(245,158,11,0.25)', background: 'rgba(245,158,11,0.04)' }}>

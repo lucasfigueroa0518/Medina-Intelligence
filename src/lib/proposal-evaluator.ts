@@ -62,7 +62,8 @@ export type Disposition = 'apply' | 'reject' | 'hold' | 'queue';
 export type ApplyMode =
   | 'silent_corroboration'   // current_value matched, channel appended
   | 'fill_empty'             // current was empty, promoted to current
-  | 'overwrite_corroborated';// pending value crossed threshold, promoted
+  | 'overwrite_corroborated' // pending value crossed threshold, promoted
+  | 'delete_corroborated';   // Q11: deletion crossed threshold, queued for review
 
 export interface ProposalInput {
   orgId: string;
@@ -72,8 +73,15 @@ export interface ProposalInput {
   /** Already a string — caller is responsible for serializing complex
    *  values consistently (the corroboration map keys on this string,
    *  so {a:1, b:2} and {b:2, a:1} are the same proposal only if the
-   *  caller normalizes before invoking). */
+   *  caller normalizes before invoking).
+   *  Ignored when proposedDeletion=true. */
   proposedValue: string;
+  /** Q11: when true, this is a deletion proposal — the channel is
+   *  arguing the field should be cleared (set to NULL). Same
+   *  corroboration math (3 channels to QUEUE), reuses pending_deletions
+   *  on entity_field_state, reuses rejected_values[__DELETE__] for the
+   *  90-day no-re-ask. proposedValue is ignored when this flag is set. */
+  proposedDeletion?: boolean;
   /** Raw source identifier — resolveChannel maps it to a canonical
    *  channel string. */
   source: string;
@@ -105,10 +113,19 @@ interface FieldStateRow {
   current_value: string | null;
   current_value_sources: string;     // JSON array
   pending_proposals: string;         // JSON object
+  pending_deletions: string;         // JSON array (Q11)
   rejected_values: string;           // JSON object
   last_human_edit_at: string | null;
   permanently_locked: number;
 }
+
+// Q11 — sentinel key in rejected_values{} marking "this field's
+// deletion was dismissed within the 90-day no-re-ask window." Reused
+// instead of adding a separate rejected_deletions column because the
+// 90-day rule is symmetric across overwrites and deletions, and the
+// existing rejected_values shape already carries timestamp values.
+const DELETION_SENTINEL = '__DELETE__';
+export { DELETION_SENTINEL };
 
 function tableForEntity(t: 'contact' | 'company' | 'deal'): string {
   if (t === 'contact') return 'contacts';
@@ -153,7 +170,7 @@ async function loadOrInit(
 ): Promise<FieldStateRow> {
   const existing = await env.D1.prepare(
     `SELECT id, current_value, current_value_sources, pending_proposals,
-            rejected_values, last_human_edit_at, permanently_locked
+            pending_deletions, rejected_values, last_human_edit_at, permanently_locked
        FROM entity_field_state
        WHERE entity_type = ? AND entity_id = ? AND field_name = ?`
   ).bind(input.entityType, input.entityId, input.fieldName)
@@ -192,7 +209,7 @@ async function loadOrInit(
   // Re-read so we get the auto-generated id and any defaults.
   const fresh = await env.D1.prepare(
     `SELECT id, current_value, current_value_sources, pending_proposals,
-            rejected_values, last_human_edit_at, permanently_locked
+            pending_deletions, rejected_values, last_human_edit_at, permanently_locked
        FROM entity_field_state
        WHERE entity_type = ? AND entity_id = ? AND field_name = ?`
   ).bind(input.entityType, input.entityId, input.fieldName)
@@ -207,6 +224,7 @@ async function loadOrInit(
       current_value: currentValue,
       current_value_sources: sources,
       pending_proposals: '{}',
+      pending_deletions: '[]',
       rejected_values: '{}',
       last_human_edit_at: null,
       permanently_locked: 0,
@@ -222,8 +240,14 @@ interface DecisionContext {
   state: FieldStateRow;
   currentSources: string[];
   pending: Record<string, string[]>;
+  pendingDeletions: string[];
   rejected: Record<string, string>;
   proposedValue: string;
+  /** Q11: when true, decideDisposition takes the deletion branch
+   *  (uses pending_deletions[] not pending_proposals{}, checks the
+   *  __DELETE__ key in rejected_values, and resolves to QUEUE at 3+
+   *  channels — same threshold as overwrite). */
+  proposedDeletion: boolean;
 }
 
 function isWithinDays(iso: string | null, days: number): boolean {
@@ -242,22 +266,58 @@ export function decideDisposition(ctx: DecisionContext): {
   reason: string;
   applyMode?: ApplyMode;
 } {
-  const { channel, state, currentSources, pending, rejected, proposedValue } = ctx;
+  const { channel, state, currentSources, pending, pendingDeletions, rejected, proposedValue, proposedDeletion } = ctx;
 
-  // 2. Permanent lock.
+  // 2. Permanent lock — applies to overwrites AND deletions.
   if (state.permanently_locked === 1) {
     return { disposition: 'reject', reason: 'permanently_locked' };
   }
 
   // 3. Human-edit lock (180-day window).
   if (isWithinDays(state.last_human_edit_at, HUMAN_EDIT_LOCK_DAYS)) {
+    if (proposedDeletion) {
+      // Deletion against a recently-human-edited value: HOLD silently
+      // (channel is preserved in pending_deletions but no surface).
+      // No "identical to current" shortcut — deletions don't compete
+      // with current_value the way overwrites do.
+      return { disposition: 'hold', reason: 'human_edit_lock_deletion' };
+    }
     if (state.current_value === proposedValue) {
       return { disposition: 'reject', reason: 'human_edit_lock_identical' };
     }
     return { disposition: 'hold', reason: 'human_edit_lock_differing' };
   }
 
-  // 4. Recent-rejection (90-day no-re-ask).
+  // ── Q11: deletion branch ──────────────────────────────────────────
+  if (proposedDeletion) {
+    // Recent-rejection of THIS field's deletion (90-day no-re-ask).
+    const deletionRejectedAt = rejected[DELETION_SENTINEL];
+    if (deletionRejectedAt && isWithinDays(deletionRejectedAt, RECENT_REJECTION_DAYS)) {
+      return { disposition: 'reject', reason: 'recently_rejected_deletion' };
+    }
+    // Nothing to delete — current is already empty.
+    if (state.current_value === null || state.current_value.trim() === '') {
+      return { disposition: 'reject', reason: 'deletion_against_empty_current' };
+    }
+    // Channel can't self-corroborate.
+    if (pendingDeletions.includes(channel)) {
+      return { disposition: 'reject', reason: 'channel_already_corroborates_deletion' };
+    }
+    const distinctAfter = pendingDeletions.length + 1;
+    if (distinctAfter >= CORROBORATION_TO_OVERWRITE) {
+      return {
+        disposition: 'queue',
+        reason: 'deletion_corroborated_pending_human_review',
+        applyMode: 'delete_corroborated',
+      };
+    }
+    return {
+      disposition: 'hold',
+      reason: `awaiting_deletion_corroboration_${distinctAfter}_of_${CORROBORATION_TO_OVERWRITE}`,
+    };
+  }
+
+  // 4. Recent-rejection (90-day no-re-ask) — overwrite path.
   const rejectedAt = rejected[proposedValue];
   if (rejectedAt && isWithinDays(rejectedAt, RECENT_REJECTION_DAYS)) {
     return { disposition: 'reject', reason: 'recently_rejected' };
@@ -365,6 +425,23 @@ async function applyHold(
   ).bind(JSON.stringify(next), state.id).run();
 }
 
+// Q11 — deletion HOLD: append channel to pending_deletions[]. Mirrors
+// applyHold for the overwrite case but writes a different column.
+async function applyHoldDeletion(
+  state: FieldStateRow,
+  pendingDeletions: string[],
+  channel: string,
+  env: Env
+): Promise<void> {
+  const updated = Array.from(new Set([...pendingDeletions, channel]));
+  await env.D1.prepare(
+    `UPDATE entity_field_state
+        SET pending_deletions = ?,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(JSON.stringify(updated), state.id).run();
+}
+
 async function applyQueue(
   input: ProposalInput,
   state: FieldStateRow,
@@ -441,6 +518,76 @@ async function applyQueue(
   }
 }
 
+// Q11 — deletion QUEUE: same state mutation as deletion HOLD (append
+// channel to pending_deletions[]) plus an approval_queue insert. The
+// proposed_value envelope carries `proposed_deletion: true` so the UI
+// can render "Proposed: clear this field" instead of a value swap. The
+// idempotency key uses the DELETION_SENTINEL so deletion proposals
+// don't collide with overwrite proposals for the same field.
+async function applyQueueDeletion(
+  input: ProposalInput,
+  state: FieldStateRow,
+  pendingDeletions: string[],
+  currentSources: string[],
+  channel: string,
+  env: Env
+): Promise<void> {
+  await applyHoldDeletion(state, pendingDeletions, channel, env);
+
+  const channelsForDeletion = Array.from(new Set([...pendingDeletions, channel]));
+  const proposedJson = JSON.stringify({
+    value: null, // signals deletion to the UI
+    metadata: {
+      current_value: state.current_value,
+      proposed_deletion: true,
+      source_type: input.source,
+      source_description: input.sourceDescription || `${input.source}: proposes clearing this field`,
+      context: input.context,
+      current_value_sources: currentSources,
+      proposed_value_sources: channelsForDeletion,
+      corroboration_count: channelsForDeletion.length,
+    },
+  });
+
+  const existingRow = await env.D1.prepare(
+    `SELECT id FROM approval_queue
+       WHERE org_id = ? AND entity_type = ? AND entity_id = ?
+         AND field_name = ? AND status = 'pending'
+         AND json_extract(proposed_value, '$.metadata.proposed_deletion') = 1`
+  ).bind(input.orgId, input.entityType, input.entityId, input.fieldName)
+   .first<{ id: string }>();
+
+  if (existingRow) {
+    await env.D1.prepare(
+      `UPDATE approval_queue
+          SET proposed_value = ?,
+              confidence = MAX(confidence, ?),
+              source_communication_id = COALESCE(?, source_communication_id),
+              created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(
+      proposedJson, input.confidence,
+      input.sourceCommunicationId || null,
+      existingRow.id
+    ).run();
+  } else {
+    const idempotencyKey = `${input.orgId}:efs:${input.entityType}:${input.entityId}:${input.fieldName}:${DELETION_SENTINEL}`;
+    await env.D1.prepare(
+      `INSERT OR IGNORE INTO approval_queue
+         (idempotency_key, org_id, entity_type, entity_id, change_type,
+          field_name, proposed_value, source_communication_id,
+          source_visibility, confidence, status)
+       VALUES (?, ?, ?, ?, 'progressive_deletion', ?, ?, ?, ?, ?, 'pending')`
+    ).bind(
+      idempotencyKey, input.orgId, input.entityType, input.entityId,
+      input.fieldName, proposedJson,
+      input.sourceCommunicationId || null,
+      input.sourceVisibility || 'org_wide',
+      input.confidence
+    ).run();
+  }
+}
+
 // ───────────────────────── public entrypoint ─────────────────────────
 
 /**
@@ -462,6 +609,7 @@ export async function evaluateProposal(
   const state = await loadOrInit(input, env);
   const currentSources = parseStringArray(state.current_value_sources);
   const pending = parsePendingMap(state.pending_proposals);
+  const pendingDeletions = parseStringArray(state.pending_deletions);
   const rejected = parseRejectedMap(state.rejected_values);
 
   const decision = decideDisposition({
@@ -469,8 +617,10 @@ export async function evaluateProposal(
     state,
     currentSources,
     pending,
+    pendingDeletions,
     rejected,
     proposedValue: input.proposedValue,
+    proposedDeletion: input.proposedDeletion === true,
   });
 
   // 2-7 in decideDisposition. Now commit the state changes.
@@ -497,11 +647,19 @@ export async function evaluateProposal(
       break;
 
     case 'hold':
-      await applyHold(state, pending, input.proposedValue, channel, env);
+      if (input.proposedDeletion === true) {
+        await applyHoldDeletion(state, pendingDeletions, channel, env);
+      } else {
+        await applyHold(state, pending, input.proposedValue, channel, env);
+      }
       break;
 
     case 'queue':
-      await applyQueue(input, state, pending, currentSources, channel, env);
+      if (input.proposedDeletion === true) {
+        await applyQueueDeletion(input, state, pendingDeletions, currentSources, channel, env);
+      } else {
+        await applyQueue(input, state, pending, currentSources, channel, env);
+      }
       break;
   }
 
@@ -547,18 +705,61 @@ export async function recordApproval(
   await env.D1.prepare(
     `INSERT INTO entity_field_state
        (entity_type, entity_id, field_name, current_value,
-        current_value_sources, pending_proposals, rejected_values,
-        last_human_edit_at)
-     VALUES (?, ?, ?, ?, ?, '{}', '{}', ?)
+        current_value_sources, pending_proposals, pending_deletions,
+        rejected_values, last_human_edit_at)
+     VALUES (?, ?, ?, ?, ?, '{}', '[]', '{}', ?)
      ON CONFLICT(entity_type, entity_id, field_name) DO UPDATE SET
        current_value = excluded.current_value,
        current_value_sources = excluded.current_value_sources,
        pending_proposals = '{}',
+       pending_deletions = '[]',
        last_human_edit_at = excluded.last_human_edit_at,
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
   ).bind(
     params.entityType, params.entityId, params.fieldName,
     params.approvedValue,
+    JSON.stringify([channel]),
+    now
+  ).run();
+}
+
+/**
+ * Q11 — called when a human APPROVES a held DELETION proposal. The
+ * entity table is set to NULL (deletion semantics), entity_field_state's
+ * current_value goes to NULL, current_value_sources is reset to
+ * [manual_edit_<userId>] (the human is the new sole "source" of the
+ * cleared state), pending_proposals AND pending_deletions both clear,
+ * last_human_edit_at stamps now. This makes the human's deletion the
+ * canonical state and gates future automated proposals via the 180-day
+ * human-edit lock the same way an overwrite-approval would.
+ */
+export async function recordApprovalOfDeletion(
+  params: {
+    orgId: string;
+    entityType: 'contact' | 'company' | 'deal';
+    entityId: string;
+    fieldName: string;
+    userId: string | null;
+  },
+  env: Env
+): Promise<void> {
+  const channel = resolveChannel('manual_edit', { userId: params.userId });
+  const now = new Date().toISOString();
+  await env.D1.prepare(
+    `INSERT INTO entity_field_state
+       (entity_type, entity_id, field_name, current_value,
+        current_value_sources, pending_proposals, pending_deletions,
+        rejected_values, last_human_edit_at)
+     VALUES (?, ?, ?, NULL, ?, '{}', '[]', '{}', ?)
+     ON CONFLICT(entity_type, entity_id, field_name) DO UPDATE SET
+       current_value = NULL,
+       current_value_sources = excluded.current_value_sources,
+       pending_proposals = '{}',
+       pending_deletions = '[]',
+       last_human_edit_at = excluded.last_human_edit_at,
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(
+    params.entityType, params.entityId, params.fieldName,
     JSON.stringify([channel]),
     now
   ).run();
@@ -577,19 +778,45 @@ export async function recordRejection(
     entityId: string;
     fieldName: string;
     rejectedValue: string;
+    /** Q11: when true, this is a deletion-rejection. Stamps the
+     *  __DELETE__ sentinel in rejected_values and clears
+     *  pending_deletions. The 90-day no-re-ask rule then suppresses
+     *  future deletion proposals for this field. */
+    isDeletion?: boolean;
   },
   env: Env
 ): Promise<void> {
   const state = await env.D1.prepare(
-    `SELECT id, pending_proposals, rejected_values FROM entity_field_state
+    `SELECT id, pending_proposals, pending_deletions, rejected_values
+       FROM entity_field_state
        WHERE entity_type = ? AND entity_id = ? AND field_name = ?`
   ).bind(params.entityType, params.entityId, params.fieldName)
-   .first<{ id: string; pending_proposals: string; rejected_values: string }>();
+   .first<{
+     id: string;
+     pending_proposals: string;
+     pending_deletions: string;
+     rejected_values: string;
+   }>();
 
   if (!state) return; // No state row → nothing to record. Resolution still happens in approval_queue.
 
   const pending = parsePendingMap(state.pending_proposals);
+  const pendingDeletions = parseStringArray(state.pending_deletions);
   const rejected = parseRejectedMap(state.rejected_values);
+
+  if (params.isDeletion) {
+    // Drop all channels from pending_deletions and stamp the sentinel.
+    rejected[DELETION_SENTINEL] = new Date().toISOString();
+    await env.D1.prepare(
+      `UPDATE entity_field_state
+          SET pending_deletions = '[]',
+              rejected_values = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(JSON.stringify(rejected), state.id).run();
+    void pendingDeletions; // referenced for shape symmetry; we always wipe
+    return;
+  }
 
   delete pending[params.rejectedValue];
   rejected[params.rejectedValue] = new Date().toISOString();

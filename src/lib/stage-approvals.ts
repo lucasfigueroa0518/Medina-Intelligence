@@ -113,6 +113,31 @@ export async function stageAndCommitApprovals(
         if (result.meta?.changes) newlyLinked.push(cid);
       }
 
+      // Day-5 hotfix: propagate newly-linked conversation contacts to any
+      // open deals at the contact's company. Closes the gap that left
+      // deal_intelligence compute starved (deal_contacts only auto-populated
+      // at deal creation time, but post-creation conversations from new
+      // contacts at the same company never wired into existing deals).
+      // Best-effort; per-contact failure swallowed so ingestion never blocks.
+      // Idempotent (UNIQUE(deal_id, contact_id) drops dupes).
+      if (newlyLinked.length > 0) {
+        try {
+          const { propagateContactToOpenDeals } = await import('./deal-association');
+          for (const cid of newlyLinked) {
+            try {
+              const r = await propagateContactToOpenDeals(cid, orgId, env);
+              if (r.linked > 0) {
+                console.log(`[stage] auto-linked contact ${cid} to ${r.linked}/${r.deal_count} open deals`);
+              }
+            } catch (e) {
+              console.error(`[stage] propagateContactToOpenDeals failed for ${cid}:`, e);
+            }
+          }
+        } catch (e) {
+          console.error('[stage] deal-association import failed:', e);
+        }
+      }
+
       // deal_intelligence event-driven invalidation. Fires when any of
       // this conversation's contacts is in any deal_contacts row — for
       // each affected (deal_id, user_id), checks canReadEmailContent

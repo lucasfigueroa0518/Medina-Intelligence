@@ -23,6 +23,72 @@ import type { Env } from '../types/env';
 import { encryptToken, decryptToken } from './encryption';
 import { runFireflyWindowBackfill } from './firefly-ingest';
 
+// Multi-day scheduling tunables.
+//
+// MAX_BACKFILL_DAYS: hard cap on total date span per parent. Pulls beyond
+// this need to be split into multiple parents. 180 matches the existing
+// frontend dropdown ceiling and Tony's largest historical request — no
+// regression vs current behavior. The goal of the cap is to bound how many
+// days a single parent can stay 'active' across the multi-day scheduler.
+export const MAX_BACKFILL_DAYS = 180;
+
+// WINDOWS_PER_DAY: target windows scheduled to run on the same UTC day.
+// Each window does ~5-15 transcripts depending on density; 4 windows × ~10
+// transcripts ≈ 40 transcripts/day, comfortably under Fireflies' observed
+// daily quota for a single user. Tuned conservatively so the first
+// real-world hit informs daily_quota_target on the parent.
+export const WINDOWS_PER_DAY = 4;
+
+// LOCK_DURATION_MS: per-window concurrency lock duration. Two cron ticks
+// firing within the same minute (the every-minute progressive cron + a
+// secondary scheduled ingestion that imports './lib/firefly-progressive-backfill'
+// could race on the same in_progress window. Audit 2026-04-30 confirmed
+// this caused counter drift (window 4: persisted+dup+failed=27 vs
+// last_skip=13). 5 min is well above the per-tick wallclock cap (25s) so
+// a winning tick fully owns the window for its execution; expired locks
+// are reclaimable by the next tick if a worker died mid-flight.
+export const LOCK_DURATION_MS = 5 * 60 * 1000;
+
+// On rate-limit pause: defer the window until the next UTC midnight (the
+// observed Fireflies daily-quota reset boundary per the
+// "Please retry after Fri, 01 May 2026 00:00:01 GMT (UTC)" response). The
+// driver will not re-pick a deferred window until earliest_run_at is reached.
+function nextUtcMidnightIso(): string {
+  const now = new Date();
+  const tomorrow = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 1, 0, 0
+  ));
+  return tomorrow.toISOString();
+}
+
+function utcDateString(d: Date = new Date()): string {
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Increment per-user daily quota counters. Idempotent on (user_id,
+ * quota_date) via ON CONFLICT. Called from the driver on each Fireflies
+ * page fetch so we have visibility into per-user API usage trending toward
+ * the daily limit.
+ */
+async function recordFireflyApiCall(
+  userId: string,
+  env: Env,
+  rateLimited: boolean = false
+): Promise<void> {
+  const date = utcDateString();
+  await env.D1.prepare(
+    `INSERT INTO firefly_user_quotas (user_id, quota_date, api_calls_used, backfill_calls, rate_limited_at)
+     VALUES (?, ?, 1, 1, ?)
+     ON CONFLICT(user_id, quota_date) DO UPDATE SET
+       api_calls_used = api_calls_used + 1,
+       backfill_calls = backfill_calls + 1,
+       rate_limited_at = COALESCE(excluded.rate_limited_at, rate_limited_at)`
+  ).bind(userId, date, rateLimited ? new Date().toISOString() : null).run().catch(e => {
+    console.error(`[firefly-quota] insert failed for ${userId}:`, e?.message || e);
+  });
+}
+
 export interface FireflyProgressiveBackfillJob {
   id: string;
   org_id: string;
@@ -30,10 +96,13 @@ export interface FireflyProgressiveBackfillJob {
   api_key_encrypted: string;
   window_size_days: number;
   total_windows: number;
-  status: 'active' | 'completed' | 'cancelled';
+  status: 'active' | 'completed' | 'partially_completed' | 'cancelled';
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  scheduled_days_count: number;
+  current_day_index: number;
+  daily_quota_target: number | null;
 }
 
 export interface FireflyProgressiveBackfillWindow {
@@ -51,6 +120,9 @@ export interface FireflyProgressiveBackfillWindow {
   started_at: string | null;
   completed_at: string | null;
   last_error: string | null;
+  scheduled_for_day: number;
+  earliest_run_at: string | null;
+  lock_expires_at: string | null;
 }
 
 /**
@@ -67,9 +139,12 @@ export async function createFireflyProgressiveBackfill(
   windowSizeDays: number,
   fireflyApiKey: string,
   env: Env
-): Promise<{ created: boolean; parent_id?: string; total_windows?: number; reason?: string }> {
+): Promise<{ created: boolean; parent_id?: string; total_windows?: number; scheduled_days_count?: number; reason?: string }> {
   if (totalDays <= 0 || windowSizeDays <= 0 || windowSizeDays > totalDays) {
     return { created: false, reason: 'invalid totalDays / windowSizeDays' };
+  }
+  if (totalDays > MAX_BACKFILL_DAYS) {
+    return { created: false, reason: `date span exceeds the ${MAX_BACKFILL_DAYS}-day cap; split into multiple requests` };
   }
   if (!fireflyApiKey || fireflyApiKey.trim().length === 0) {
     return { created: false, reason: 'firefly_api_key required' };
@@ -84,37 +159,45 @@ export async function createFireflyProgressiveBackfill(
   }
 
   const totalWindows = Math.ceil(totalDays / windowSizeDays);
+  const scheduledDaysCount = Math.max(1, Math.ceil(totalWindows / WINDOWS_PER_DAY));
   const apiKeyEncrypted = await encryptToken({ api_key: fireflyApiKey.trim() }, env);
 
   const insertedParent = await env.D1.prepare(
     `INSERT INTO firefly_progressive_backfill_jobs
-       (org_id, user_id, api_key_encrypted, window_size_days, total_windows, status)
-     VALUES (?, ?, ?, ?, ?, 'active')
+       (org_id, user_id, api_key_encrypted, window_size_days, total_windows, status, scheduled_days_count)
+     VALUES (?, ?, ?, ?, ?, 'active', ?)
      RETURNING id`
-  ).bind(orgId, userId, apiKeyEncrypted, windowSizeDays, totalWindows).first<{ id: string }>();
+  ).bind(orgId, userId, apiKeyEncrypted, windowSizeDays, totalWindows, scheduledDaysCount).first<{ id: string }>();
   if (!insertedParent) {
     return { created: false, reason: 'parent insert failed' };
   }
   const parentId = insertedParent.id;
 
   // Newest-first windows anchored on `now`. Window i covers
-  // [now - (i+1)*windowSizeDays, now - i*windowSizeDays).
+  // [now - (i+1)*windowSizeDays, now - i*windowSizeDays). scheduled_for_day
+  // distributes WINDOWS_PER_DAY windows per UTC day; earliest_run_at is
+  // null for day 0 (run immediately) and (parent.created_at + day*24h) for
+  // later days. The driver gates on earliest_run_at <= now when picking.
   const now = Date.now();
   const stmts = [];
   for (let i = 0; i < totalWindows; i++) {
     const end = new Date(now - i * windowSizeDays * 86400000).toISOString();
     const start = new Date(now - (i + 1) * windowSizeDays * 86400000).toISOString();
+    const scheduledForDay = Math.floor(i / WINDOWS_PER_DAY);
+    const earliestRunAt = scheduledForDay === 0
+      ? null
+      : new Date(now + scheduledForDay * 86400000).toISOString();
     stmts.push(
       env.D1.prepare(
         `INSERT INTO firefly_progressive_backfill_windows
-           (parent_id, window_index, start_date, end_date, status)
-         VALUES (?, ?, ?, ?, 'pending')`
-      ).bind(parentId, i, start, end)
+           (parent_id, window_index, start_date, end_date, status, scheduled_for_day, earliest_run_at)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+      ).bind(parentId, i, start, end, scheduledForDay, earliestRunAt)
     );
   }
   await env.D1.batch(stmts);
 
-  return { created: true, parent_id: parentId, total_windows: totalWindows };
+  return { created: true, parent_id: parentId, total_windows: totalWindows, scheduled_days_count: scheduledDaysCount };
 }
 
 /**
@@ -131,7 +214,7 @@ export async function createFireflyProgressiveBackfillRange(
   windowSizeDays: number,
   fireflyApiKey: string,
   env: Env
-): Promise<{ created: boolean; parent_id?: string; total_windows?: number; reason?: string }> {
+): Promise<{ created: boolean; parent_id?: string; total_windows?: number; scheduled_days_count?: number; reason?: string }> {
   const start = new Date(startDate);
   const end = new Date(endDate);
   if (isNaN(start.getTime()) || isNaN(end.getTime())) {
@@ -147,10 +230,11 @@ export async function createFireflyProgressiveBackfillRange(
     return { created: false, reason: 'firefly_api_key required' };
   }
   const totalDays = Math.ceil((end.getTime() - start.getTime()) / 86400000);
-  if (totalDays > 730) {
-    return { created: false, reason: 'date range exceeds 730 days' };
+  if (totalDays > MAX_BACKFILL_DAYS) {
+    return { created: false, reason: `date span exceeds the ${MAX_BACKFILL_DAYS}-day cap; split into multiple requests` };
   }
   const totalWindows = Math.ceil(totalDays / windowSizeDays);
+  const scheduledDaysCount = Math.max(1, Math.ceil(totalWindows / WINDOWS_PER_DAY));
 
   const existing = await env.D1.prepare(
     `SELECT id FROM firefly_progressive_backfill_jobs
@@ -164,10 +248,10 @@ export async function createFireflyProgressiveBackfillRange(
 
   const insertedParent = await env.D1.prepare(
     `INSERT INTO firefly_progressive_backfill_jobs
-       (org_id, user_id, api_key_encrypted, window_size_days, total_windows, status)
-     VALUES (?, ?, ?, ?, ?, 'active')
+       (org_id, user_id, api_key_encrypted, window_size_days, total_windows, status, scheduled_days_count)
+     VALUES (?, ?, ?, ?, ?, 'active', ?)
      RETURNING id`
-  ).bind(orgId, userId, apiKeyEncrypted, windowSizeDays, totalWindows).first<{ id: string }>();
+  ).bind(orgId, userId, apiKeyEncrypted, windowSizeDays, totalWindows, scheduledDaysCount).first<{ id: string }>();
   if (!insertedParent) {
     return { created: false, reason: 'parent insert failed' };
   }
@@ -176,20 +260,25 @@ export async function createFireflyProgressiveBackfillRange(
   const stmts = [];
   const endMs = end.getTime();
   const startMs = start.getTime();
+  const nowMs = Date.now();
   for (let i = 0; i < totalWindows; i++) {
     const winEndMs = endMs - i * windowSizeDays * 86400000;
     const winStartMs = Math.max(startMs, endMs - (i + 1) * windowSizeDays * 86400000);
+    const scheduledForDay = Math.floor(i / WINDOWS_PER_DAY);
+    const earliestRunAt = scheduledForDay === 0
+      ? null
+      : new Date(nowMs + scheduledForDay * 86400000).toISOString();
     stmts.push(
       env.D1.prepare(
         `INSERT INTO firefly_progressive_backfill_windows
-           (parent_id, window_index, start_date, end_date, status)
-         VALUES (?, ?, ?, ?, 'pending')`
-      ).bind(parentId, i, new Date(winStartMs).toISOString(), new Date(winEndMs).toISOString())
+           (parent_id, window_index, start_date, end_date, status, scheduled_for_day, earliest_run_at)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+      ).bind(parentId, i, new Date(winStartMs).toISOString(), new Date(winEndMs).toISOString(), scheduledForDay, earliestRunAt)
     );
   }
   await env.D1.batch(stmts);
 
-  return { created: true, parent_id: parentId, total_windows: totalWindows };
+  return { created: true, parent_id: parentId, total_windows: totalWindows, scheduled_days_count: scheduledDaysCount };
 }
 
 /**
@@ -231,21 +320,54 @@ export async function cancelFireflyProgressiveBackfill(
 }
 
 /**
- * One cron tick of work for one user: advance their currently-active
- * window by a single paginated batch. Idempotent — safe to call repeatedly.
+ * Finalize a parent's status. If any window ended in 'failed' (terminal,
+ * non-rate-limit), parent flips to 'partially_completed' so the failures
+ * are visible. If all completed, parent → 'completed'. In either case the
+ * api_key is nuked. Called from the driver when no pickable window remains
+ * AND no future-scheduled window is waiting for its earliest_run_at.
+ */
+async function finalizeParent(parentId: string, env: Env): Promise<'completed' | 'partially_completed'> {
+  const counts = await env.D1.prepare(
+    `SELECT
+        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
+       FROM firefly_progressive_backfill_windows WHERE parent_id = ?`
+  ).bind(parentId).first<{ failed: number; completed: number }>();
+  const finalStatus: 'completed' | 'partially_completed' =
+    (counts?.failed ?? 0) > 0 ? 'partially_completed' : 'completed';
+  await env.D1.prepare(
+    `UPDATE firefly_progressive_backfill_jobs
+        SET status = ?,
+            api_key_encrypted = '',
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(finalStatus, parentId).run();
+  return finalStatus;
+}
+
+/**
+ * One cron tick of work for one user: claim and advance the next pickable
+ * window. Multi-day-aware (defers to earliest_run_at) and concurrency-safe
+ * (lock_expires_at gates two-tick races).
  *
- * Sequence (mirrors driveProgressiveBackfill in progressive-backfill.ts):
+ * Sequence:
  *   1. Find this user's active parent. If none, return.
- *   2. Find the lowest-indexed window that's still pending or in_progress.
- *      If none, mark parent completed AND nuke api_key_encrypted.
- *   3. Decrypt api_key. If decrypt fails (key was nuked or corrupted),
- *      mark window failed with a clear error.
- *   4. If window is pending, transition to in_progress.
- *   5. Call runFireflyWindowBackfill with the window's date range and
- *      last_skip resume cursor. Cron tick is wall-clock-bounded
- *      internally (FIREFLY_MAX_RUNTIME_MS = 25s).
- *   6. Update window with new last_skip + counters. If returned
- *      'completed', stamp completed_at. Otherwise leave as in_progress.
+ *   2. Atomically claim the lowest-indexed pickable window — pending OR
+ *      in_progress, with earliest_run_at <= now AND lock_expires_at expired.
+ *      The atomic claim is a single UPDATE ... RETURNING so two cron ticks
+ *      can't both pick the same row. If the claim returns no row, either
+ *      the parent has no work for this UTC day (some windows scheduled for
+ *      tomorrow) or another tick already owns the next window.
+ *   3. Decrypt api_key. If decrypt fails, mark window failed.
+ *   4. Call runFireflyWindowBackfill with the window's date range +
+ *      last_skip resume cursor.
+ *   5. Update window with new last_skip + counters. On rate-limit-pause,
+ *      defer to next UTC midnight. On completed, stamp completed_at. On
+ *      terminal failure, stamp completed_at AND last_error. Always clear
+ *      lock_expires_at on exit so the next tick can re-pick if applicable.
+ *   6. If no pickable window remains AND no window is waiting for a future
+ *      earliest_run_at, finalize the parent.
  */
 export async function driveFireflyProgressiveBackfill(
   orgId: string,
@@ -259,39 +381,64 @@ export async function driveFireflyProgressiveBackfill(
   ).bind(orgId, userId).first<{ id: string; api_key_encrypted: string; total_windows: number }>();
   if (!parent) return { advanced: false, note: 'no active firefly parent' };
 
-  const win = await env.D1.prepare(
-    `SELECT id, window_index, start_date, end_date, status, last_skip
-       FROM firefly_progressive_backfill_windows
-      WHERE parent_id = ? AND status IN ('pending','in_progress')
-      ORDER BY window_index ASC LIMIT 1`
-  ).bind(parent.id).first<{
+  // Atomic claim. lockUntil = now+5min. The UPDATE ... RETURNING returns
+  // the claimed row only if it was previously unclaimed (lock expired or
+  // null) AND eligible (earliest_run_at <= now). Two simultaneous ticks
+  // can't both claim — SQLite's UPDATE is row-locked.
+  const nowIso = new Date().toISOString();
+  const lockUntilIso = new Date(Date.now() + LOCK_DURATION_MS).toISOString();
+  const claimed = await env.D1.prepare(
+    `UPDATE firefly_progressive_backfill_windows
+        SET lock_expires_at = ?,
+            status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END,
+            started_at = COALESCE(started_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      WHERE id = (
+        SELECT id FROM firefly_progressive_backfill_windows
+         WHERE parent_id = ?
+           AND status IN ('pending','in_progress')
+           AND (earliest_run_at IS NULL OR earliest_run_at <= ?)
+           AND (lock_expires_at IS NULL OR lock_expires_at < ?)
+         ORDER BY window_index ASC LIMIT 1
+      )
+      RETURNING id, window_index, start_date, end_date, status, last_skip`
+  ).bind(lockUntilIso, parent.id, nowIso, nowIso).first<{
     id: string; window_index: number; start_date: string; end_date: string;
     status: string; last_skip: number;
   }>();
 
-  if (!win) {
-    // All windows done — finalize parent + nuke api_key.
-    await env.D1.prepare(
-      `UPDATE firefly_progressive_backfill_jobs
-          SET status = 'completed',
-              api_key_encrypted = '',
-              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ?`
-    ).bind(parent.id).run();
-    return { advanced: false, note: 'firefly parent completed' };
+  if (!claimed) {
+    // No pickable window. If there's a window waiting for a future day,
+    // stay 'active' and let the next cron tick try again. Otherwise
+    // finalize the parent (api_key nuked, status partially_completed if
+    // any windows failed, else completed).
+    const futureWindow = await env.D1.prepare(
+      `SELECT 1 FROM firefly_progressive_backfill_windows
+         WHERE parent_id = ?
+           AND status IN ('pending','in_progress')
+           AND earliest_run_at IS NOT NULL
+           AND earliest_run_at > ?
+         LIMIT 1`
+    ).bind(parent.id, nowIso).first();
+    if (futureWindow) {
+      return { advanced: false, note: 'all today\'s windows done; future windows scheduled for later UTC days' };
+    }
+    const finalStatus = await finalizeParent(parent.id, env);
+    return { advanced: false, note: `firefly parent ${finalStatus}` };
   }
+
+  const win = claimed;
 
   if (!parent.api_key_encrypted) {
     // Already nuked. Should never happen for an active parent — if it
     // does, the parent should have been moved to completed/cancelled,
     // not left active. Mark window failed and surface so an operator
-    // can notice the inconsistency.
+    // can notice the inconsistency. Clear lock so we don't hold it.
     await env.D1.prepare(
       `UPDATE firefly_progressive_backfill_windows
           SET status = 'failed',
               last_error = 'api_key_encrypted is empty; parent may be in inconsistent state',
-              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              lock_expires_at = NULL
         WHERE id = ?`
     ).bind(win.id).run();
     return { advanced: true, window_index: win.window_index, status: 'failed', note: 'empty api_key' };
@@ -306,19 +453,17 @@ export async function driveFireflyProgressiveBackfill(
     const msg = `decrypt failed: ${String(e?.message || e).slice(0, 200)}`;
     await env.D1.prepare(
       `UPDATE firefly_progressive_backfill_windows
-          SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              lock_expires_at = NULL
         WHERE id = ?`
     ).bind(msg, win.id).run();
     return { advanced: true, window_index: win.window_index, status: 'failed', note: msg };
   }
 
-  if (win.status === 'pending') {
-    await env.D1.prepare(
-      `UPDATE firefly_progressive_backfill_windows
-          SET status = 'in_progress', started_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ?`
-    ).bind(win.id).run();
-  }
+  // Per-tick API call accounting on the user's daily quota row. The driver
+  // doesn't pre-gate on quota — it lets the rate-limit response be the
+  // signal — but the counter is useful for trending + observability.
+  await recordFireflyApiCall(userId, env, false);
 
   let result;
   try {
@@ -338,7 +483,8 @@ export async function driveFireflyProgressiveBackfill(
     const msg = String(e?.message || e).slice(0, 500);
     await env.D1.prepare(
       `UPDATE firefly_progressive_backfill_windows
-          SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              lock_expires_at = NULL
         WHERE id = ?`
     ).bind(msg, win.id).run();
     return { advanced: true, window_index: win.window_index, status: 'failed', note: msg };
@@ -354,7 +500,8 @@ export async function driveFireflyProgressiveBackfill(
               transcripts_persisted = transcripts_persisted + ?,
               transcripts_skipped_duplicate = transcripts_skipped_duplicate + ?,
               transcripts_failed = transcripts_failed + ?,
-              last_error = ?
+              last_error = ?,
+              lock_expires_at = NULL
         WHERE id = ?`
     ).bind(
       result.last_skip,
@@ -387,7 +534,8 @@ export async function driveFireflyProgressiveBackfill(
               transcripts_persisted = transcripts_persisted + ?,
               transcripts_skipped_duplicate = transcripts_skipped_duplicate + ?,
               transcripts_failed = transcripts_failed + ?,
-              last_error = ?
+              last_error = ?,
+              lock_expires_at = NULL
         WHERE id = ?`
     ).bind(
       result.last_skip,
@@ -401,15 +549,33 @@ export async function driveFireflyProgressiveBackfill(
     return { advanced: true, window_index: win.window_index, status: 'failed', note: result.reason };
   }
 
-  // Paused — leave window as in_progress for next tick. Persist updated
-  // last_skip so the resume cursor advances.
+  // Paused — keep status='in_progress' so a future tick can resume.
+  // If the pause was caused by the Fireflies daily quota
+  // (FIREFLY_RATE_LIMITED → 'firefly_rate_limit' reason), defer to next
+  // UTC midnight via earliest_run_at — the daily quota resets there per
+  // the observed "Please retry after Fri, 01 May 2026 00:00:01 GMT (UTC)"
+  // response. Other pause reasons (wallclock_cap, transcript_count_cap)
+  // mean the Worker hit its per-tick budget and the next minute's cron
+  // tick should resume immediately, so leave earliest_run_at unchanged.
+  // ALWAYS clear lock_expires_at so the next eligible tick can re-claim.
+  const isRateLimitPause =
+    result.reason === 'firefly_rate_limit' ||
+    /rate.?limit/i.test(result.reason || '');
+  const newEarliestRunAt = isRateLimitPause ? nextUtcMidnightIso() : null;
+
+  if (isRateLimitPause) {
+    await recordFireflyApiCall(userId, env, true);
+  }
+
   await env.D1.prepare(
     `UPDATE firefly_progressive_backfill_windows
         SET last_skip = ?,
             transcripts_fetched = transcripts_fetched + ?,
             transcripts_persisted = transcripts_persisted + ?,
             transcripts_skipped_duplicate = transcripts_skipped_duplicate + ?,
-            transcripts_failed = transcripts_failed + ?
+            transcripts_failed = transcripts_failed + ?,
+            lock_expires_at = NULL,
+            earliest_run_at = COALESCE(?, earliest_run_at)
       WHERE id = ?`
   ).bind(
     result.last_skip,
@@ -417,6 +583,7 @@ export async function driveFireflyProgressiveBackfill(
     result.ingested,
     result.duplicates,
     result.failed,
+    newEarliestRunAt,
     win.id
   ).run();
 
@@ -430,7 +597,9 @@ export async function driveFireflyProgressiveBackfill(
     advanced: true,
     window_index: win.window_index,
     status: result.status,
-    note: `paused at skip=${result.last_skip} (${result.reason || 'budget cap'})`,
+    note: isRateLimitPause
+      ? `rate-limited; deferred to ${newEarliestRunAt}`
+      : `paused at skip=${result.last_skip} (${result.reason || 'budget cap'})`,
   };
 }
 
