@@ -64,7 +64,12 @@ async function resolveSpeakerToContact(
 
 async function stageSignalInApprovalQueue(
   orgId: string,
-  entityType: 'contact' | 'company',
+  // Widened 2026-04-30 to include 'deal' for routeDealSignal. Previously
+  // deal-related rows were staged with entity_type='company', entity_id=deal.id
+  // — internally inconsistent (the type said "company row" but the id was a
+  // deal). Approval-queue consumers that dispatch on entity_type couldn't
+  // route correctly. Matches deal-detection.ts's convention.
+  entityType: 'contact' | 'company' | 'deal',
   entityId: string,
   field: string,
   value: unknown,
@@ -195,8 +200,14 @@ async function routeDealSignal(
   ).bind(companyId, orgId).first<{ id: string }>();
 
   if (deal) {
-    await stageSignalInApprovalQueue(orgId, 'company', deal.id, `deal_${signal.signal_type}`, signal.value, signal.confidence, eventId, env);
+    // Deal exists → stage as a deal-typed proposal so approval-queue dispatch
+    // can route correctly. Pre-fix used 'company' here with entity_id=deal.id
+    // (internally inconsistent).
+    await stageSignalInApprovalQueue(orgId, 'deal', deal.id, `deal_${signal.signal_type}`, signal.value, signal.confidence, eventId, env);
   } else {
+    // No deal exists yet — signal still applies to the company. Keep as
+    // company-typed; consumers can choose to escalate to a create_deal
+    // proposal later if confidence + corroboration warrant it.
     await stageSignalInApprovalQueue(orgId, 'company', companyId, `deal_${signal.signal_type}`, signal.value, signal.confidence, eventId, env);
   }
   return true;
