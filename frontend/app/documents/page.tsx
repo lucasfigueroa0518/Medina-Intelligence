@@ -343,16 +343,24 @@ function DocumentsPage() {
         const badge = mimeBadge(row.mime_type);
         const Icon = badge.icon;
         const failed = row.processing_status === 'failed';
+        const excluded = row.processing_status === 'excluded';
+        const dimmed = failed || excluded;
         return (
           <div className="flex items-center gap-2.5 min-w-0">
-            <Icon size={16} className={`shrink-0 ${failed ? 'text-semantic-error/70' : 'text-text-muted'}`} />
-            <span className={`truncate ${failed ? 'text-text-secondary' : ''}`} title={row.title || row.file_name || ''}>
+            <Icon size={16} className={`shrink-0 ${failed ? 'text-semantic-error/70' : excluded ? 'text-text-muted/50' : 'text-text-muted'}`} />
+            <span className={`truncate ${dimmed ? 'text-text-secondary' : ''}`} title={row.title || row.file_name || ''}>
               {row.title || row.file_name || '(untitled)'}
             </span>
             {failed && (
               <span className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium font-accent uppercase tracking-wider"
                 style={{ background: 'rgba(239,68,68,0.12)', color: '#FCA5A5' }}>
                 Failed
+              </span>
+            )}
+            {excluded && (
+              <span className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium font-accent uppercase tracking-wider"
+                style={{ background: 'rgba(148,163,184,0.14)', color: '#94A3B8' }}>
+                Excluded
               </span>
             )}
           </div>

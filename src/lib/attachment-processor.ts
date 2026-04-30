@@ -6,6 +6,7 @@ import { extractTextFromFile } from './file-extraction';
 import { classifyDocument } from './document-intelligence';
 import { emitAudit } from './audit';
 import { persistDocument, type DocumentLink } from './persist-document';
+import { isDenylisted } from './document-denylist';
 
 const MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024;
 
@@ -73,6 +74,45 @@ export async function processEmailAttachments(
   let attachmentCount = 0;
 
   for (const att of item.attachments) {
+    // Denylist check — runs before the size check + Graph fetch. Calendar
+    // invites, signature images, S/MIME wrappers, "unavailable" placeholders.
+    // We still write a row (for audit + entity-view visibility) but with
+    // r2_key='' and processing_status='excluded'. Mirrors the oversize-skip
+    // pattern below.
+    const deny = isDenylisted(att.contentType, att.name);
+    if (deny.excluded) {
+      const docId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      await env.D1.prepare(
+        `INSERT INTO documents
+           (id, org_id, title, document_type, source, r2_key, file_name, file_size, mime_type,
+            contact_id, company_id, conversation_id, processing_status, error_message,
+            visibility, participant_user_ids, created_at, updated_at)
+         VALUES (?, ?, ?, 'other', 'email_attachment', '', ?, ?, ?, ?, ?, ?, 'excluded', ?,
+                 'private', ?, ?, ?)`
+      ).bind(
+        docId, orgId, att.name, att.name, att.size, att.contentType,
+        contactId, companyId, conversationId,
+        deny.reason || 'denylisted',
+        participantUserIds ? JSON.stringify(participantUserIds) : null,
+        now, now
+      ).run();
+      if (links.length > 0) {
+        await env.D1.batch(
+          links.map(link =>
+            env.D1.prepare(
+              `INSERT OR IGNORE INTO document_links
+                 (id, document_id, org_id, entity_type, entity_id, link_kind, link_source, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(crypto.randomUUID(), docId, orgId, link.entityType, link.entityId, link.linkKind, link.linkSource, now)
+          )
+        );
+      }
+      result.documents_skipped++;
+      attachmentCount++;
+      continue;
+    }
+
     if (att.size > MAX_ATTACHMENT_SIZE) {
       // Oversize path: we never fetched the bytes, so persistDocument can't
       // be used. Open-code the skipped row + matching document_links so the
