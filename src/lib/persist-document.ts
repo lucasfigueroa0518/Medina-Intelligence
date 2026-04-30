@@ -23,10 +23,13 @@ import { classifyDocument } from './document-intelligence';
 import { classifyByFilename } from './document-filename-classifier';
 import { chunkEmbedAndPersistAll } from './embedding';
 
+// Wave 5 Phase E canonicalized to 4 active values. Legacy 'upload' and
+// 'manual' strings are migrated to canonical names by 0068 backfill.
+// 'drive_import' and 'meeting_transcript' have no callers yet but are
+// reserved for future ingest pipelines (cheap to keep in the type).
 export type DocumentSource =
   | 'email_attachment'
   | 'manual_upload'
-  | 'upload'                 // legacy alias for manual_upload (kept so existing rows match)
   | 'intelligent_import'
   | 'chat_upload'
   | 'drive_import'
@@ -212,9 +215,10 @@ export async function persistDocument(
     ? JSON.stringify(input.participantUserIds)
     : null;
 
-  // Normalize legacy 'manual_upload' to 'upload' so `source` matches existing
-  // rows produced by the manual handler — keeps cross-pipeline filters simple.
-  const sourceValue = input.source === 'manual_upload' ? 'upload' : input.source;
+  // Wave 5 Phase E: source is stored verbatim. The legacy
+  // `manual_upload → upload` normalization is gone; existing rows in the
+  // 'upload' / 'manual' state are migrated to canonical names by 0068.
+  const sourceValue = input.source;
 
   try {
     await env.D1.prepare(

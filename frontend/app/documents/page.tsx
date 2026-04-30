@@ -64,34 +64,29 @@ const DOCUMENT_TYPES = [
   'other',
 ];
 
-// Sources that the backend stamps onto documents. The migration history
-// added email_attachment / chat_upload / intelligent_import / manual_upload
-// alongside the original 'upload' / 'manual'.
+// Wave 5 Phase E canonical 4-value source set. Migration 0068 backfilled
+// legacy 'upload'/'manual' rows to canonical names; persist-document no
+// longer normalizes manual_upload → upload. Unknown sources still render
+// safely via the `?? s` fallback at the row accessor.
 const SOURCES = [
   'email_attachment',
   'manual_upload',
-  'upload',
   'chat_upload',
   'intelligent_import',
-  'manual',
 ];
 
 const SOURCE_LABEL: Record<string, string> = {
   email_attachment:    'Email',
   manual_upload:       'Upload',
-  upload:              'Upload',
   chat_upload:         'Chat',
   intelligent_import:  'Smart Import',
-  manual:              'Manual',
 };
 
 const SOURCE_PILL: Record<string, { bg: string; text: string; icon: typeof Mail }> = {
   email_attachment:    { bg: 'rgba(168,85,247,0.14)', text: '#C084FC', icon: Mail },
   manual_upload:       { bg: 'rgba(34,197,94,0.12)',  text: '#4ADE80', icon: Upload },
-  upload:              { bg: 'rgba(34,197,94,0.12)',  text: '#4ADE80', icon: Upload },
   chat_upload:         { bg: 'rgba(245,158,11,0.12)', text: '#FBBF24', icon: MessageSquare },
   intelligent_import:  { bg: 'rgba(217,70,168,0.12)', text: '#D946A8', icon: Wand2 },
-  manual:              { bg: 'rgba(148,163,184,0.14)',text: '#94A3B8', icon: Upload },
 };
 
 const SORT_OPTIONS: SortOption[] = [
