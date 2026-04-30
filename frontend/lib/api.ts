@@ -449,12 +449,6 @@ export const api = {
   updateSyncConfig: (data: { sync_history_days: number }) =>
     request<{ ok: boolean }>('/sync/config', { method: 'PATCH', body: JSON.stringify(data) }),
 
-  // Backfill
-  startBackfill: (data: { user_id?: string; days_back?: number; start_date?: string; end_date?: string }) =>
-    request<{ ok: boolean; progress: any }>('/admin/backfill-email', { method: 'POST', body: JSON.stringify(data) }),
-  getBackfillProgress: () =>
-    request<{ progress: any }>('/admin/backfill-progress'),
-
   // Progressive backfill (server-side, multi-window, cron-driven)
   startProgressiveBackfill: (data: { user_id?: string; days_back?: 30 | 60 | 90 | 180; start_date?: string; end_date?: string }) =>
     request<{
