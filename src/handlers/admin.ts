@@ -1516,6 +1516,7 @@ export async function reclassifyDocuments(
     mime_type_filter?: string;
     dry_run?: boolean;
     concurrency?: number;
+    document_ids?: string[];
   }>(request) || {};
 
   // Hard caps — exceed these and we risk CF subrequest cap or 30s CPU.
@@ -1528,15 +1529,32 @@ export async function reclassifyDocuments(
   const mimeTypeFilter = body.mime_type_filter;
   const dryRun = body.dry_run === true;
 
+  // Wave 5.5: explicit document_ids targeting. Used by the Phase D
+  // 20-sample validation gate and post-incident spot-checks. Bypasses
+  // document_type / mime_type filters — caller is asserting "process
+  // these specific IDs regardless of their current category."
+  const documentIds = Array.isArray(body.document_ids)
+    ? body.document_ids.filter((s: unknown): s is string => typeof s === 'string' && s.length > 0)
+    : undefined;
+
+  if (documentIds && documentIds.length > maxBatch) {
+    return errorResponse('VALIDATION_ERROR', 400,
+      `document_ids length (${documentIds.length}) exceeds batch cap (${maxBatch}). Split into multiple calls.`);
+  }
+
   const { runReclassifyBatch, countReclassifyCandidates } = await import('../lib/reclassify-orchestrator');
 
-  const totalBefore = await countReclassifyCandidates(
-    ctx.orgId, documentTypeFilter, mimeTypeFilter, env
-  );
+  // When document_ids is targeted, the candidate pool IS those IDs. Skip
+  // the count query — irrelevant + the IDs may not match the type filter
+  // anyway. After the run, rows_remaining=0 (the explicit list is fully
+  // processed in one call since length is capped at batchSize).
+  const totalBefore = documentIds
+    ? documentIds.length
+    : await countReclassifyCandidates(ctx.orgId, documentTypeFilter, mimeTypeFilter, env);
 
   if (totalBefore === 0) {
     return jsonResponse({
-      message: 'No documents match the filter',
+      message: documentIds ? 'document_ids was empty' : 'No documents match the filter',
       dry_run: dryRun,
       rows_processed: 0,
       rows_remaining: 0,
@@ -1555,13 +1573,18 @@ export async function reclassifyDocuments(
     documentTypeFilter,
     mimeTypeFilter,
     dryRun,
+    documentIds,
   }, env);
 
-  // Re-count after writes — dry_run keeps the count stable. Reclassifies
-  // out of the filter set (e.g. 'other' → 'deal_pitch') reduce remaining.
+  // Re-count after writes — dry_run keeps the count stable. document_ids
+  // path: caller targeted a finite list, so rows_remaining=0 once
+  // processed (or whatever didn't hit the safety floor: deleted_at /
+  // excluded / wrong-org). Drain path: re-run the count.
   const rowsRemaining = dryRun
     ? totalBefore
-    : await countReclassifyCandidates(ctx.orgId, documentTypeFilter, mimeTypeFilter, env);
+    : documentIds
+      ? Math.max(0, documentIds.length - result.rows_processed)
+      : await countReclassifyCandidates(ctx.orgId, documentTypeFilter, mimeTypeFilter, env);
 
   return jsonResponse({
     dry_run: dryRun,

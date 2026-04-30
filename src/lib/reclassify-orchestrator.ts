@@ -61,6 +61,13 @@ interface BatchOpts {
   documentTypeFilter: string;
   mimeTypeFilter?: string;
   dryRun: boolean;
+  // Wave 5.5: optional explicit ID targeting. When provided, the orchestrator
+  // processes ONLY these IDs (still gated on org_id + deleted_at + non-excluded
+  // for safety) and ignores documentTypeFilter / mimeTypeFilter — the caller
+  // is asserting "I want to see what the pipeline does with THESE docs."
+  // Use case: 20-sample validation gate with deterministic axis coverage,
+  // post-incident spot-checks, MARTy-citation re-runs.
+  documentIds?: string[];
 }
 
 export async function countReclassifyCandidates(
@@ -83,30 +90,46 @@ export async function countReclassifyCandidates(
 }
 
 async function pickBatch(
-  orgId: string,
-  documentTypeFilter: string,
-  mimeTypeFilter: string | undefined,
-  batchSize: number,
+  opts: BatchOpts,
   env: Env
 ): Promise<ReclassifyRow[]> {
+  // Wave 5.5: explicit ID-targeting branch. Bypasses document_type +
+  // mime_type predicates so callers can validate or spot-check arbitrary
+  // rows regardless of their current category. The org_id +
+  // deleted_at + non-excluded predicates remain (safety floor).
+  if (opts.documentIds && opts.documentIds.length > 0) {
+    const placeholders = opts.documentIds.map(() => '?').join(',');
+    const sql = `SELECT id, r2_key, file_name, mime_type, document_type, extracted_text_preview
+                   FROM documents
+                  WHERE org_id = ? AND deleted_at IS NULL
+                    AND processing_status != 'excluded'
+                    AND id IN (${placeholders})
+                  ORDER BY id ASC
+                  LIMIT ?`;
+    const result = await env.D1.prepare(sql)
+      .bind(opts.orgId, ...opts.documentIds, opts.batchSize)
+      .all<ReclassifyRow>();
+    return result.results || [];
+  }
+
   let sql = `SELECT id, r2_key, file_name, mime_type, document_type, extracted_text_preview
                FROM documents
               WHERE org_id = ? AND deleted_at IS NULL
                 AND processing_status != 'excluded'
                 AND document_type = ?`;
-  const binds: unknown[] = [orgId, documentTypeFilter];
-  if (mimeTypeFilter) {
+  const binds: unknown[] = [opts.orgId, opts.documentTypeFilter];
+  if (opts.mimeTypeFilter) {
     sql += ` AND mime_type LIKE ?`;
-    binds.push(`${mimeTypeFilter}%`);
+    binds.push(`${opts.mimeTypeFilter}%`);
   }
   sql += ` ORDER BY created_at ASC LIMIT ?`;
-  binds.push(batchSize);
+  binds.push(opts.batchSize);
   const result = await env.D1.prepare(sql).bind(...binds).all<ReclassifyRow>();
   return result.results || [];
 }
 
 export async function runReclassifyBatch(opts: BatchOpts, env: Env): Promise<ReclassifyResult> {
-  const rows = await pickBatch(opts.orgId, opts.documentTypeFilter, opts.mimeTypeFilter, opts.batchSize, env);
+  const rows = await pickBatch(opts, env);
   const result: ReclassifyResult = {
     rows_processed: 0,
     rows_reclassified: 0,
