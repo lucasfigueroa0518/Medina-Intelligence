@@ -281,6 +281,15 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
     return commitCreateDealApproval(item, env);
   }
 
+  // Phase C/D: 'link_to_deal' proposals from medium-confidence detection
+  // (LLM 0.7-0.9). Approving inserts the appropriate junction row
+  // (conversation_deals or event_deals depending on entity_type) with
+  // source='approval_committed', confidence=1.0 (human ack overrides LLM
+  // confidence).
+  if (item.change_type === 'link_to_deal') {
+    return commitLinkToDealApproval(item, env);
+  }
+
   let value: string;
   try {
     const parsed = JSON.parse(item.proposed_value);
@@ -404,6 +413,25 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
         dealId, payload.source_communication_id, item.org_id, env
       );
     }
+
+    // Phase C: also write a direct junction row from the source
+    // communication to the new deal. source_kind tells us which table.
+    // Defaults to 'conversation' for back-compat with proposals that
+    // pre-date Phase C (didn't include source_kind in the payload).
+    if (payload.source_communication_id) {
+      const kind = payload.source_kind === 'event' ? 'event' : 'conversation';
+      try {
+        const { linkConversationToDeal, linkEventToDeal } = await import('../lib/deal-association');
+        if (kind === 'event') {
+          await linkEventToDeal(payload.source_communication_id, dealId, 'approval_committed', 1.0, item.org_id, env, item.resolved_by ?? undefined);
+        } else {
+          await linkConversationToDeal(payload.source_communication_id, dealId, 'approval_committed', 1.0, item.org_id, env, item.resolved_by ?? undefined);
+        }
+      } catch (e) {
+        console.error(`[commit-create-deal] direct ${kind}_deals link failed for ${dealId}:`, e);
+      }
+    }
+
     console.log(
       `[commit-create-deal] deal=${dealId} company-link=${companyMatch.linked}/${companyMatch.matched_contact_count} source-link=${sourceMatch.linked}/${sourceMatch.participant_count}`
     );
@@ -419,6 +447,40 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
     console.error(`[commit-create-deal] embed failed for ${dealId}:`, e);
   }
 
+  return {};
+}
+
+/** Commit a 'link_to_deal' approval (Phase C/D medium-confidence path).
+ *  Inserts conversation_deals or event_deals depending on entity_type.
+ *  source='approval_committed', confidence=1.0 (human ack overrides LLM). */
+async function commitLinkToDealApproval(item: any, env: Env): Promise<{ reEnrich?: boolean }> {
+  let payload: any;
+  try {
+    payload = JSON.parse(item.proposed_value);
+  } catch (e) {
+    console.error('[commit-link-to-deal] payload parse failed:', e);
+    return {};
+  }
+  const dealId = payload?.deal_id;
+  if (!dealId) {
+    console.error('[commit-link-to-deal] missing deal_id in payload');
+    return {};
+  }
+
+  const kind: 'conversation' | 'event' =
+    item.entity_type === 'event' ? 'event' : 'conversation';
+
+  try {
+    const { linkConversationToDeal, linkEventToDeal } = await import('../lib/deal-association');
+    if (kind === 'event') {
+      await linkEventToDeal(item.entity_id, dealId, 'approval_committed', 1.0, item.org_id, env, item.resolved_by ?? undefined);
+    } else {
+      await linkConversationToDeal(item.entity_id, dealId, 'approval_committed', 1.0, item.org_id, env, item.resolved_by ?? undefined);
+    }
+    console.log(`[commit-link-to-deal] linked ${kind}=${item.entity_id} → deal=${dealId}`);
+  } catch (e) {
+    console.error(`[commit-link-to-deal] insert failed for ${kind}=${item.entity_id} → deal=${dealId}:`, e);
+  }
   return {};
 }
 

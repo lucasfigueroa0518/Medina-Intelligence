@@ -202,3 +202,146 @@ export async function recoverDealContactLinks(
     per_deal: perDeal,
   };
 }
+
+// ─── Phase B/C/D direct-link helpers ─────────────────────────────────────
+//
+// conversation_deals + event_deals are the first-class deal pointers
+// (migration 0071). These helpers wrap the INSERT OR IGNORE +
+// deal_intelligence invalidation in one place so all callers (Phase C
+// meeting-detection, Phase D confidence-ladder, Phase E Slack
+// auto-link, Phase F manual UI) share consistent semantics.
+
+/** Find an open deal for a company. Used by detection paths to decide
+ *  "link to existing deal" vs "stage create_deal proposal." Returns the
+ *  most-recently-touched open deal, or null. Mirrors the lookup pattern
+ *  in src/lib/signal-router.ts:191. */
+export async function findOpenDealForCompany(
+  companyId: string,
+  orgId: string,
+  env: Env
+): Promise<{ id: string; title: string } | null> {
+  return env.D1.prepare(
+    `SELECT id, title FROM deals
+       WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
+         AND stage NOT IN ('closed_won', 'closed_lost')
+       ORDER BY updated_at DESC LIMIT 1`
+  ).bind(companyId, orgId).first<{ id: string; title: string }>();
+}
+
+/** Insert a conversation_deals row + invalidate the deal's intelligence
+ *  cache so a fresh recompute picks up the new evidence. Idempotent
+ *  (UNIQUE(conversation_id, deal_id)). Source enum: see migration 0071
+ *  comment block. */
+export async function linkConversationToDeal(
+  conversationId: string,
+  dealId: string,
+  source: string,
+  confidence: number,
+  orgId: string,
+  env: Env,
+  createdBy?: string
+): Promise<{ inserted: boolean }> {
+  const result = await env.D1.prepare(
+    `INSERT OR IGNORE INTO conversation_deals
+       (conversation_id, deal_id, confidence, source, created_by)
+     VALUES (?, ?, ?, ?, ?)`
+  ).bind(conversationId, dealId, confidence, source, createdBy ?? null).run();
+  const inserted = (result.meta?.changes ?? 0) > 0;
+  if (inserted) {
+    await invalidateDealIntelligence(dealId, orgId, env);
+  }
+  return { inserted };
+}
+
+/** Insert an event_deals row + invalidate. Same shape as
+ *  linkConversationToDeal. */
+export async function linkEventToDeal(
+  eventId: string,
+  dealId: string,
+  source: string,
+  confidence: number,
+  orgId: string,
+  env: Env,
+  createdBy?: string
+): Promise<{ inserted: boolean }> {
+  const result = await env.D1.prepare(
+    `INSERT OR IGNORE INTO event_deals
+       (event_id, deal_id, confidence, source, created_by)
+     VALUES (?, ?, ?, ?, ?)`
+  ).bind(eventId, dealId, confidence, source, createdBy ?? null).run();
+  const inserted = (result.meta?.changes ?? 0) > 0;
+  if (inserted) {
+    await invalidateDealIntelligence(dealId, orgId, env);
+  }
+  return { inserted };
+}
+
+/** Stage an approval_queue row proposing to link a conversation OR event
+ *  to a deal. Used by medium-confidence paths (LLM 0.7-0.9). On approve,
+ *  commitApproval (Phase C/D) inserts the appropriate junction row.
+ *
+ *  Idempotency key keys on (orgId, sourceId, dealId) so the same proposal
+ *  can't pile up across detection cycles. */
+export async function proposeLinkToDeal(opts: {
+  kind: 'conversation' | 'event';
+  sourceId: string;
+  dealId: string;
+  orgId: string;
+  confidence: number;
+  /** The conversation/event id that produced the signal (for sourcing). */
+  sourceCommunicationId: string;
+  visibility?: 'private' | 'org_wide' | 'confidential';
+}, env: Env): Promise<{ inserted: boolean }> {
+  const idempotencyKey = `${opts.orgId}:link-to-deal:${opts.kind}:${opts.sourceId}:${opts.dealId}`;
+  const proposedValue = JSON.stringify({
+    deal_id: opts.dealId,
+    source: 'approval_committed',
+    confidence: opts.confidence,
+  });
+  const result = await env.D1.prepare(
+    `INSERT OR IGNORE INTO approval_queue
+       (idempotency_key, org_id, entity_type, entity_id, change_type, field_name,
+        proposed_value, source_communication_id, source_visibility, confidence, status)
+     VALUES (?, ?, ?, ?, 'link_to_deal', 'deal_id', ?, ?, ?, ?, 'pending')`
+  ).bind(
+    idempotencyKey,
+    opts.orgId,
+    opts.kind,                              // entity_type='conversation' | 'event'
+    opts.sourceId,
+    proposedValue,
+    opts.sourceCommunicationId,
+    opts.visibility || 'org_wide',
+    opts.confidence
+  ).run();
+  return { inserted: (result.meta?.changes ?? 0) > 0 };
+}
+
+/** Broadcast invalidate all deal_intelligence rows for a deal. Per-user
+ *  ACL filtering still applies during the next recompute (compute calls
+ *  filterConversationsByAcl), so over-invalidating is safe — at worst we
+ *  spend an LLM call to produce the same output for users whose readable
+ *  set didn't change.
+ *
+ *  Why broadcast vs the precision-filter pattern in
+ *  invalidateForConversation: a new direct link doesn't carry the
+ *  conversation's ACL fields handy at the link-write site, and the new
+ *  link could span events (which use event_attendees, not
+ *  participant_user_ids). Broadcast keeps the helper simple and the
+ *  guardrail satisfied — recompute on next tick or read. */
+async function invalidateDealIntelligence(
+  dealId: string,
+  orgId: string,
+  env: Env
+): Promise<void> {
+  try {
+    await env.D1.prepare(
+      `UPDATE deal_intelligence
+          SET invalidated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE deal_id = ? AND user_id IN (
+          SELECT id FROM users WHERE org_id = ? AND deleted_at IS NULL
+        )`
+    ).bind(dealId, orgId).run();
+  } catch (e) {
+    console.error(`[deal-association] invalidate failed for deal=${dealId}:`, e);
+  }
+}
