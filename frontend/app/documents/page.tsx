@@ -168,8 +168,15 @@ function filtersToParams(f: FilterState): Record<string, string> {
   if (f.company_id) p.company_id = f.company_id;
   if (f.deal_id) p.deal_id = f.deal_id;
   if (f.mine) p.mine = 'true';
-  if (f.sort && f.sort !== DEFAULT_SORT) p.sort = f.sort;
-  if (f.order !== DEFAULT_ORDER) p.order = f.order;
+  // sort + order travel together. Backend documents handler currently uses a
+  // single global 'desc' fallback (no per-column defaultDir), so the strip
+  // pattern is latent here today — but the moment per-column defaults are
+  // added, stripping individually would silently override the user's chosen
+  // direction. Keep them paired to match contacts + companies behavior.
+  if (f.sort !== DEFAULT_SORT || f.order !== DEFAULT_ORDER) {
+    p.sort = f.sort;
+    p.order = f.order;
+  }
   return p;
 }
 
