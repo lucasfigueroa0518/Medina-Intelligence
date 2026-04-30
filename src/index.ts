@@ -578,10 +578,6 @@ async function routeAuthenticated(
       return Admin.clearRateLimit(request, ctx, env);
     if (path === '/api/admin/trigger-sync' && method === 'POST')
       return Admin.triggerSync(request, ctx, env);
-    if (path === '/api/admin/backfill-email' && method === 'POST')
-      return Admin.backfillEmail(request, ctx, env);
-    if (path === '/api/admin/backfill-progress' && method === 'GET')
-      return Admin.getBackfillProgress(ctx, env);
     if (path === '/api/admin/repair-vectorize-participants' && method === 'POST')
       return Admin.repairVectorizeParticipantIds(request, ctx, env);
     if (path === '/api/admin/repair-acl-metadata' && method === 'POST')

@@ -585,66 +585,6 @@ export async function triggerSync(
   });
 }
 
-export async function backfillEmail(
-  request: Request,
-  ctx: AuthContext,
-  env: Env
-): Promise<Response> {
-  const body = await parseJsonBody<{
-    user_id?: string;
-    days_back?: number;
-    start_date?: string;
-    end_date?: string;
-  }>(request);
-  const userId = body?.user_id || ctx.userId;
-  const daysBack = body?.days_back || 365;
-
-  if (!body?.start_date && (daysBack < 1 || daysBack > 730)) {
-    return errorResponse('VALIDATION_ERROR', 400, 'days_back must be between 1 and 730');
-  }
-
-  if (body?.start_date && isNaN(Date.parse(body.start_date))) {
-    return errorResponse('VALIDATION_ERROR', 400, 'start_date must be a valid ISO 8601 date');
-  }
-  if (body?.end_date && isNaN(Date.parse(body.end_date))) {
-    return errorResponse('VALIDATION_ERROR', 400, 'end_date must be a valid ISO 8601 date');
-  }
-
-  const user = await env.D1.prepare(
-    'SELECT id FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(userId, ctx.orgId).first();
-  if (!user) return errorResponse('USER_NOT_FOUND', 404, 'User not found in your org');
-
-  // Overlap prevention: check if a backfill is already running for this user
-  const existing = await env.KV.get<BackfillProgress>(
-    `backfill_progress:${userId}`,
-    'json'
-  );
-  if (existing && existing.status === 'in_progress') {
-    return errorResponse('INGESTION_IN_PROGRESS', 409, 'An ingestion is already in progress. Wait for it to complete or let it timeout.');
-  }
-
-  const progress = await runHistoricalBackfill(userId, ctx.orgId, daysBack, env, {
-    start_date: body?.start_date,
-    end_date: body?.end_date,
-  });
-
-  return jsonResponse({ ok: true, progress });
-}
-
-export async function getBackfillProgress(
-  ctx: AuthContext,
-  env: Env
-): Promise<Response> {
-  const userId = ctx.userId;
-  const progress = await env.KV.get<BackfillProgress>(
-    `backfill_progress:${userId}`,
-    'json'
-  );
-
-  return jsonResponse({ progress: progress || null });
-}
-
 export async function getSyncConfig(
   ctx: AuthContext,
   env: Env

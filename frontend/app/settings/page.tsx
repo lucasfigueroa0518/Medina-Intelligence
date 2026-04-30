@@ -387,18 +387,7 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
   const [syncDays, setSyncDays] = React.useState<number>(30);
   const [configLoaded, setConfigLoaded] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
-  const [backfillProgress, setBackfillProgress] = React.useState<any>(null);
-  const [backfillLoading, setBackfillLoading] = React.useState(false);
-  const [confirmOpen, setConfirmOpen] = React.useState(false);
-  const [dateRangeOpen, setDateRangeOpen] = React.useState(false);
-  const [backfillDays, setBackfillDays] = React.useState(365);
   const [toast, setToast] = React.useState<string | null>(null);
-  // Legacy guard: when the new progressive backfill (server-driven, multi-window)
-  // has an active parent for this user, suppress this section's auto-resume
-  // useEffect so the two paths don't fight each other (one tries to advance via
-  // /admin/backfill-email page-batches while the other advances via the */2
-  // cron driver). The progressive section above takes over the UX entirely.
-  const [hasActiveProgressive, setHasActiveProgressive] = React.useState(false);
 
   React.useEffect(() => {
     api.getSyncConfig()
@@ -409,89 +398,7 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
         setConfigLoaded(true);
       })
       .catch(() => setConfigLoaded(true));
-
-    api.getBackfillProgress()
-      .then(d => setBackfillProgress(d.progress))
-      .catch(() => {});
-
-    api.getProgressiveBackfillProgress()
-      .then(d => setHasActiveProgressive(d.parent?.status === 'active'))
-      .catch(() => {});
   }, []);
-
-  React.useEffect(() => {
-    if (!backfillProgress || backfillProgress.status !== 'in_progress') return;
-    const interval = setInterval(() => {
-      api.getBackfillProgress()
-        .then(d => {
-          setBackfillProgress(d.progress);
-          if (d.progress?.status !== 'in_progress') clearInterval(interval);
-        })
-        .catch(() => {});
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [backfillProgress?.status]);
-
-  // Auto-resume on paused. The inline historical backfill paginates ~10 pages
-  // / ~25s per call then returns paused with last_page_url. Without auto-resume
-  // the user has to click Resume after every page batch, which feels stuck.
-  // Hard cap at MAX_AUTO_RESUMES to prevent runaway loops if the backfill is
-  // genuinely failing every page (also surfaced via failed status).
-  //
-  // Bail out entirely when the new progressive backfill is active — the two
-  // paths share KV state (`backfill_progress:${userId}`) and both manipulate
-  // the same Outlook delta token, so concurrent advancement causes
-  // double-fetching / token desync. The progressive UI above is now the
-  // primary path; this useEffect stays for users who haven't started a
-  // progressive job yet (legacy admin curl + this useEffect remain functional).
-  const [autoResumeCount, setAutoResumeCount] = React.useState(0);
-  const MAX_AUTO_RESUMES = 50; // 50 × 500 = 25,000 emails ceiling
-  React.useEffect(() => {
-    if (hasActiveProgressive) return;
-    if (backfillProgress?.status !== 'paused') return;
-    if (autoResumeCount >= MAX_AUTO_RESUMES) return;
-    const t = setTimeout(() => {
-      setAutoResumeCount(n => n + 1);
-      resumeBackfill();
-    }, 1500);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backfillProgress?.status, backfillProgress?.total_fetched, autoResumeCount, hasActiveProgressive]);
-  // Reset auto-resume counter on a fresh backfill start or completion
-  React.useEffect(() => {
-    if (backfillProgress?.status === 'completed' || !backfillProgress) {
-      setAutoResumeCount(0);
-    }
-  }, [backfillProgress?.status]);
-
-  // Elapsed time ticker for the in-flight banner
-  const [tick, setTick] = React.useState(0);
-  React.useEffect(() => {
-    if (backfillProgress?.status !== 'in_progress' && backfillProgress?.status !== 'paused') return;
-    const id = setInterval(() => setTick(t => t + 1), 1000);
-    return () => clearInterval(id);
-  }, [backfillProgress?.status]);
-  function elapsedSinceStart(): string {
-    if (!backfillProgress?.started_at) return '';
-    const ms = Date.now() - new Date(backfillProgress.started_at).getTime();
-    const s = Math.max(0, Math.floor(ms / 1000));
-    if (s < 60) return `${s}s`;
-    const m = Math.floor(s / 60);
-    const r = s % 60;
-    return `${m}m ${r}s`;
-  }
-  function formatDateRange(): string {
-    const start = backfillProgress?.target_start_date
-      ? new Date(backfillProgress.target_start_date).toISOString().slice(0, 10)
-      : null;
-    const end = backfillProgress?.target_end_date
-      ? new Date(backfillProgress.target_end_date).toISOString().slice(0, 10)
-      : null;
-    if (start && end) return `${start} → ${end}`;
-    if (start) return `since ${start}`;
-    return '';
-  }
-  void tick; // keep referenced for re-render
 
   React.useEffect(() => {
     if (!toast) return;
@@ -509,32 +416,11 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
     setSaving(false);
   }
 
-  async function startBackfill() {
-    setConfirmOpen(false);
-    setBackfillLoading(true);
-    try {
-      const res = await api.startBackfill({ days_back: backfillDays });
-      setBackfillProgress(res.progress);
-      if (res.progress.status === 'in_progress') {
-        setToast('Backfill started — importing emails in batches');
-      } else if (res.progress.status === 'completed') {
-        setToast(`Backfill complete — ${res.progress.total_fetched} emails imported`);
-      }
-    } catch { setToast('Failed to start backfill'); }
-    setBackfillLoading(false);
-  }
-
-  async function resumeBackfill() {
-    setBackfillLoading(true);
-    try {
-      const res = await api.startBackfill({ days_back: backfillDays });
-      setBackfillProgress(res.progress);
-    } catch { setToast('Failed to resume'); }
-    setBackfillLoading(false);
-  }
-
-  const isRunning = backfillProgress?.status === 'in_progress';
-  const isPaused = backfillProgress?.status === 'paused';
+  // Reference isOutlookConnected to keep the prop on the type signature even
+  // though the section's only remaining surface (Sync History dropdown)
+  // applies whether or not the user is currently connected — the value picks
+  // up on first connect.
+  void isOutlookConnected;
 
   return (
     <div className="card">
@@ -543,153 +429,23 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
         <div className="font-medium">Email Sync</div>
       </div>
 
-      <div className="space-y-5">
-        <div>
-          <div className="text-xs text-text-muted mb-2">Sync History</div>
-          <div className="text-xs text-text-secondary mb-2">
-            When connecting Outlook for the first time, how far back should we import emails?
-          </div>
-          <select
-            value={syncDays}
-            onChange={e => handleSyncDaysChange(Number(e.target.value))}
-            disabled={saving || !configLoaded}
-            className="input text-sm py-1.5 px-3 w-72"
-          >
-            {SYNC_OPTIONS.map(o => (
-              <option key={o.value} value={o.value}>{o.label}</option>
-            ))}
-          </select>
-          {saving && <span className="text-[10px] text-text-muted ml-2">Saving...</span>}
+      <div>
+        <div className="text-xs text-text-muted mb-2">Sync History</div>
+        <div className="text-xs text-text-secondary mb-2">
+          When connecting Outlook for the first time, how far back should we import emails?
         </div>
-
-        {isOutlookConnected && (
-          <div className="border-t border-border/50 pt-4">
-            <div className="text-xs text-text-muted mb-2">Historical Backfill</div>
-
-            {isRunning ? (
-              <div className="flex items-center gap-3 py-3 px-4 rounded-lg" style={{ background: 'rgba(139,92,246,0.06)', border: '1px solid rgba(139,92,246,0.15)' }}>
-                <Loader2 size={16} className="text-accent-purple animate-spin" />
-                <div className="flex-1">
-                  <div className="text-sm text-text-primary">
-                    Importing — {backfillProgress.total_fetched} emails so far
-                    {formatDateRange() && <span className="text-text-muted text-xs ml-2">({formatDateRange()})</span>}
-                  </div>
-                  <div className="text-[10px] text-text-muted mt-0.5">
-                    Elapsed {elapsedSinceStart()} · Page batches resume automatically · Status refreshes every 5s
-                  </div>
-                </div>
-              </div>
-            ) : isPaused ? (
-              <div className="space-y-2">
-                <div className="flex items-center gap-3 py-3 px-4 rounded-lg" style={{ background: 'rgba(139,92,246,0.06)', border: '1px solid rgba(139,92,246,0.15)' }}>
-                  <Loader2 size={16} className="text-accent-purple animate-spin" />
-                  <div className="flex-1">
-                    <div className="text-sm text-text-primary">
-                      Importing — {backfillProgress.total_fetched} emails so far
-                      {formatDateRange() && <span className="text-text-muted text-xs ml-2">({formatDateRange()})</span>}
-                    </div>
-                    <div className="text-[10px] text-text-muted mt-0.5">
-                      Elapsed {elapsedSinceStart()} · Auto-resuming page {autoResumeCount + 1}
-                      {autoResumeCount >= MAX_AUTO_RESUMES && ' · Cap reached, click Resume to continue'}
-                    </div>
-                  </div>
-                  {autoResumeCount >= MAX_AUTO_RESUMES && (
-                    <button onClick={() => { setAutoResumeCount(0); resumeBackfill(); }} disabled={backfillLoading} className="btn-secondary text-xs py-1">
-                      {backfillLoading ? 'Resuming...' : 'Resume'}
-                    </button>
-                  )}
-                </div>
-              </div>
-            ) : backfillProgress?.status === 'completed' ? (
-              <div className="flex items-center gap-3 py-3 px-4 rounded-lg" style={{ background: 'rgba(34,197,94,0.06)', border: '1px solid rgba(34,197,94,0.15)' }}>
-                <Check size={16} className="text-green-400" />
-                <div className="flex-1">
-                  <div className="text-sm text-text-primary">
-                    Backfill complete — {backfillProgress.total_fetched} emails imported
-                  </div>
-                  <div className="text-[10px] text-text-muted mt-0.5">
-                    Completed {formatRelative(backfillProgress.updated_at)}
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div>
-                <div className="text-xs text-text-secondary mb-3">
-                  Import older emails that were sent before your initial sync window. This runs in the background.
-                </div>
-                <div className="flex items-center gap-2">
-                  <button onClick={() => setConfirmOpen(true)} className="btn-secondary text-xs py-1.5 flex items-center gap-2">
-                    <Clock size={13} />
-                    Import Older Emails
-                  </button>
-                  <button onClick={() => setDateRangeOpen(true)} className="btn-secondary text-xs py-1.5 flex items-center gap-2">
-                    <Calendar size={13} />
-                    Import by Date Range
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {backfillProgress?.status === 'failed' && (
-              <div className="flex items-center gap-3 py-3 px-4 rounded-lg mt-2" style={{ background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.15)' }}>
-                <XIcon size={16} className="text-red-400" />
-                <div className="flex-1">
-                  <div className="text-sm text-text-primary">Backfill failed</div>
-                  <div className="text-[10px] text-text-muted">{backfillProgress.error}</div>
-                </div>
-                <button onClick={resumeBackfill} disabled={backfillLoading} className="btn-secondary text-xs py-1">
-                  Retry
-                </button>
-              </div>
-            )}
-          </div>
-        )}
+        <select
+          value={syncDays}
+          onChange={e => handleSyncDaysChange(Number(e.target.value))}
+          disabled={saving || !configLoaded}
+          className="input text-sm py-1.5 px-3 w-72"
+        >
+          {SYNC_OPTIONS.map(o => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
+        {saving && <span className="text-[10px] text-text-muted ml-2">Saving...</span>}
       </div>
-
-      {confirmOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
-          onClick={() => setConfirmOpen(false)}>
-          <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
-            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
-            onClick={e => e.stopPropagation()}>
-            <div className="text-lg font-medium text-text-primary mb-2">Import Older Emails</div>
-            <div className="text-sm text-text-secondary mb-4">
-              This will fetch emails older than your current sync window. Choose how far back to go:
-            </div>
-            <select
-              value={backfillDays}
-              onChange={e => setBackfillDays(Number(e.target.value))}
-              className="input text-sm py-1.5 px-3 w-full mb-4"
-            >
-              <option value={90}>Last 3 months</option>
-              <option value={180}>Last 6 months</option>
-              <option value={365}>Last year</option>
-              <option value={730}>Last 2 years</option>
-            </select>
-            <div className="text-xs text-text-muted mb-4">
-              Emails will be imported in batches of 50. For large inboxes this may take several minutes.
-              You can close this page — the import continues in the background and resumes automatically if interrupted.
-            </div>
-            <div className="flex justify-end gap-3">
-              <button className="btn-ghost" onClick={() => setConfirmOpen(false)}>Cancel</button>
-              <button className="btn-primary" onClick={startBackfill} disabled={backfillLoading}>
-                {backfillLoading ? 'Starting...' : 'Start Import'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {dateRangeOpen && (
-        <EmailDateRangeModal
-          onClose={() => setDateRangeOpen(false)}
-          onStarted={(progress) => {
-            setDateRangeOpen(false);
-            setBackfillProgress(progress);
-            setToast('Date range import started');
-          }}
-        />
-      )}
 
       {toast && (
         <div className="fixed bottom-6 right-6 z-[60] rounded-xl shadow-2xl px-5 py-3"
@@ -2846,124 +2602,6 @@ function formatRelative(iso: string): string {
   const d = Math.floor(h / 24);
   return `${d}d ago`;
 }
-
-// ─── Date Range Helpers ─────────────────────────────────────────────────────
-
-const EMAIL_DATE_PRESETS: Array<{ label: string; start: string; end: string }> = (() => {
-  const now = new Date();
-  const y = now.getFullYear();
-  return [
-    { label: 'Last 90 days', start: new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) },
-    { label: 'Last 6 months', start: new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) },
-    { label: 'Last year', start: new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) },
-    { label: `Q1 ${y}`, start: `${y}-01-01`, end: `${y}-03-31` },
-    { label: `Q2 ${y}`, start: `${y}-04-01`, end: `${y}-06-30` },
-    { label: `Q3 ${y - 1}`, start: `${y - 1}-07-01`, end: `${y - 1}-09-30` },
-    { label: `Q4 ${y - 1}`, start: `${y - 1}-10-01`, end: `${y - 1}-12-31` },
-  ];
-})();
-
-function EmailDateRangeModal({ onClose, onStarted }: { onClose: () => void; onStarted: (progress: any) => void }) {
-  const [startDate, setStartDate] = React.useState('');
-  const [endDate, setEndDate] = React.useState('');
-  const [loading, setLoading] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-  const { startTask } = useBackgroundTasks();
-
-  const applyPreset = (p: { start: string; end: string }) => {
-    setStartDate(p.start);
-    setEndDate(p.end);
-  };
-
-  const submit = async () => {
-    if (!startDate) { setError('Start date is required'); return; }
-    setError(null);
-    setLoading(true);
-    try {
-      const res = await api.triggerIngestion({
-        start_date: new Date(startDate).toISOString(),
-        end_date: endDate ? new Date(endDate + 'T23:59:59Z').toISOString() : undefined,
-      });
-      if (res.progress) {
-        onStarted(res.progress);
-      } else {
-        onStarted({ status: 'in_progress', total_fetched: 0 });
-      }
-    } catch (e: any) {
-      if (e?.status === 409) {
-        setError('An ingestion is already in progress. Wait for it to complete.');
-      } else {
-        setError(e?.message || 'Failed to start import');
-      }
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
-      onClick={onClose}>
-      <div className="rounded-2xl w-full max-w-md shadow-2xl p-6"
-        style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
-        onClick={e => e.stopPropagation()}>
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-10 h-10 rounded-full bg-brand-gradient flex items-center justify-center">
-            <Calendar size={20} className="text-white" />
-          </div>
-          <div>
-            <div className="text-lg font-medium text-text-primary">Import by Date Range</div>
-            <div className="text-xs text-text-muted">Pull emails from a specific time period</div>
-          </div>
-        </div>
-
-        <div className="space-y-4">
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-xs text-text-muted block mb-1">Start date</label>
-              <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
-                className="input text-sm w-full" />
-            </div>
-            <div>
-              <label className="text-xs text-text-muted block mb-1">End date</label>
-              <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
-                className="input text-sm w-full" />
-            </div>
-          </div>
-
-          <div>
-            <div className="text-[10px] text-text-muted uppercase tracking-wider mb-2">Quick select</div>
-            <div className="flex flex-wrap gap-1.5">
-              {EMAIL_DATE_PRESETS.map(p => (
-                <button key={p.label} onClick={() => applyPreset(p)}
-                  className="px-2.5 py-1 rounded-lg text-[11px] transition-colors"
-                  style={{
-                    background: startDate === p.start && endDate === p.end ? 'rgba(139,92,246,0.15)' : 'rgba(255,255,255,0.04)',
-                    border: `1px solid ${startDate === p.start && endDate === p.end ? 'rgba(139,92,246,0.3)' : 'rgba(255,255,255,0.06)'}`,
-                    color: startDate === p.start && endDate === p.end ? '#A78BFA' : undefined,
-                  }}>
-                  {p.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="text-xs text-text-muted bg-bg-input/50 rounded-lg px-3 py-2">
-            Large date ranges may take several minutes. You can continue using the platform while the import runs in the background.
-          </div>
-
-          {error && <div className="text-xs text-semantic-error bg-semantic-error/10 border-l-2 border-semantic-error px-2 py-1 rounded">{error}</div>}
-        </div>
-
-        <div className="flex justify-end gap-3 mt-5">
-          <button className="btn-ghost text-sm" onClick={onClose}>Cancel</button>
-          <button className="btn-primary text-sm" onClick={submit} disabled={loading || !startDate}>
-            {loading ? 'Starting...' : 'Start Import'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 
 // ─── Firefly Card ─────────���───────────────────────────────────���──────────────
 
