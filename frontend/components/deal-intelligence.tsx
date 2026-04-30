@@ -6,11 +6,17 @@
 // All components default to clean empty-state rendering when intelligence is
 // null / fields are absent — so calling them with a fresh useDealIntelligence
 // state on a deal with no computed row produces sensible UI (gray sentiment
-// dash, hidden topic / risk chips, flat sparkline).
+// dash, hidden topic / risk chips, "no momentum" indicator).
 //
-// Per Lucas's "computed-cached state, frontend reads, never writes" lock:
-// these components have no edit affordances. RiskFlag's popover lists
-// signals but doesn't expose dismiss / override.
+// Per the architectural lock — "computed-cached state, frontend reads, never
+// writes" — these components have no edit affordances. RiskFlag's popover
+// lists signals but doesn't expose dismiss / override. If a user disagrees
+// with computed intelligence, they edit underlying data (conversations or
+// the deal record), which fires T3's invalidation hook → recompute.
+//
+// Field names match T3's actual schema (PR #15, migration 0069):
+// sentiment + sentiment_score, topics, risk_signals (with severity in-band),
+// momentum + momentum_score, conversation_count, computed_at, is_stale.
 
 'use client';
 
@@ -20,25 +26,26 @@ import type { DealIntelligence } from '@/lib/use-deal-intelligence';
 
 /* ─── Sentiment ───────────────────────────────────────────────────────── */
 
-/** Single visual: directional arrow + signed score, color-tiered.
- *  Tiers (per Lucas's spec):
- *    score > 0.3        → positive (green) "positive trajectory"
- *    -0.3 ≤ score ≤ 0.3 → neutral (gray)
- *    score < -0.3       → negative (red) "concerning trajectory"
- *    null               → empty-state gray dash
- *  Direction (improving/stable/declining) overrides arrow shape; tier
- *  drives color. When direction is null but score is present, color from
- *  score, arrow from "→ steady" fallback. */
+/** Single visual: arrow + signed score, color-tiered.
+ *  Tiers (from categorical `sentiment` column, with score as tiebreaker):
+ *    sentiment='positive' → green "positive trajectory"
+ *    sentiment='neutral'  → gray "neutral / steady"
+ *    sentiment='negative' → red "concerning trajectory"
+ *    sentiment=null       → empty-state gray dash
+ *
+ *  When sentiment is null but sentiment_score is present (rare given T3's
+ *  contract — they're produced together), we tier by score: >0.3 positive,
+ *  <-0.3 negative, otherwise neutral. */
 export function SentimentIndicator({
   intelligence, size = 'compact',
 }: {
   intelligence: DealIntelligence | null;
   size?: 'compact' | 'detail';
 }) {
+  const sentiment = intelligence?.sentiment ?? null;
   const score = intelligence?.sentiment_score ?? null;
-  const direction = intelligence?.sentiment_direction ?? null;
 
-  if (score === null && direction === null) {
+  if (sentiment === null && score === null) {
     return (
       <span
         className={`inline-flex items-center gap-1 ${size === 'detail' ? 'text-xs' : 'text-[10px]'} text-text-muted font-accent`}
@@ -50,32 +57,29 @@ export function SentimentIndicator({
     );
   }
 
-  // Tier color from score; falls back to direction-only when score is null.
+  // Tier from categorical sentiment first; fall back to score thresholds.
   const tier: 'positive' | 'neutral' | 'negative' =
-    score !== null
-      ? (score > 0.3 ? 'positive' : score < -0.3 ? 'negative' : 'neutral')
-      : (direction === 'improving' ? 'positive' : direction === 'declining' ? 'negative' : 'neutral');
+    sentiment === 'positive' ? 'positive'
+      : sentiment === 'negative' ? 'negative'
+      : sentiment === 'neutral' ? 'neutral'
+      : score !== null && score > 0.3 ? 'positive'
+      : score !== null && score < -0.3 ? 'negative'
+      : 'neutral';
 
   const color = tier === 'positive' ? '#22C55E'
     : tier === 'negative' ? '#EF4444'
     : '#A1A1AA';
 
-  const arrow = direction === 'improving' ? '↑'
-    : direction === 'declining' ? '↓'
-    : '→';
+  const arrow = tier === 'positive' ? '↑' : tier === 'negative' ? '↓' : '→';
 
   const tooltip = `Sentiment: ${
     tier === 'positive' ? 'positive trajectory' :
     tier === 'negative' ? 'concerning trajectory' :
-    'steady'
-  }${score !== null ? ` · score ${score >= 0 ? '+' : ''}${score.toFixed(2)}` : ''}${
-    direction ? ` · ${direction}` : ''
-  }`;
+    'neutral'
+  }${score !== null ? ` · score ${score >= 0 ? '+' : ''}${score.toFixed(2)}` : ''}`;
 
   const scoreLabel = score === null ? '' : ` ${score >= 0 ? '+' : ''}${score.toFixed(2)}`;
 
-  // The "glow" for positive/negative is a soft text-shadow at detail size;
-  // compact size keeps it as a pure color chip for density.
   return (
     <span
       className={`inline-flex items-center gap-0.5 font-accent font-semibold ${size === 'detail' ? 'text-base' : 'text-[10px]'}`}
@@ -93,15 +97,15 @@ export function SentimentIndicator({
 /* ─── Topic Chips ────────────────────────────────────────────────────── */
 
 /** Lavender chips, max 5 visible (compact: max 2 + overflow count).
- *  Hidden entirely when active_topics is empty. Truncates gracefully —
- *  the overflow chip's title attribute lists the hidden topics. */
+ *  Hidden entirely when topics array is empty. T3 caps the array at 8 in
+ *  the prompt design; we surface up to 5 in detail size before overflow. */
 export function TopicChips({
   intelligence, size = 'compact',
 }: {
   intelligence: DealIntelligence | null;
   size?: 'compact' | 'detail';
 }) {
-  const topics = intelligence?.active_topics ?? [];
+  const topics = intelligence?.topics ?? [];
   if (topics.length === 0) return null;
 
   const visibleCap = size === 'detail' ? 5 : 2;
@@ -134,18 +138,16 @@ export function TopicChips({
 
 /* ─── Risk Flag ──────────────────────────────────────────────────────── */
 
-/** Single icon + count when risk_signal_count > 0. Click opens a popover
- *  listing each example with severity color. Hidden entirely when count
- *  is 0.
+/** Single icon + count when risk_signals.length > 0. Click opens a popover
+ *  listing each signal with severity color + detail text. Hidden entirely
+ *  when count is 0.
  *
- *  Severity colors per Lucas's spec:
+ *  Severity colors (from T3's prompt design, severity is in-band):
  *    critical → red
- *    warning  → amber (default for unclassified)
+ *    warning  → amber
  *    info     → gray
  *
- *  The badge color follows the highest severity present in the examples
- *  array; if no severity is set on any example, falls back to amber
- *  ("warning"). */
+ *  Badge tint follows the highest severity present in the array. */
 export function RiskFlag({
   intelligence, size = 'compact',
 }: {
@@ -156,7 +158,6 @@ export function RiskFlag({
   const popoverRef = React.useRef<HTMLDivElement>(null);
   const buttonRef = React.useRef<HTMLButtonElement>(null);
 
-  // Close popover on outside click. Lightweight; the popover is short-lived.
   React.useEffect(() => {
     if (!open) return;
     function onClick(e: MouseEvent) {
@@ -169,12 +170,12 @@ export function RiskFlag({
     return () => document.removeEventListener('mousedown', onClick);
   }, [open]);
 
-  const count = intelligence?.risk_signal_count ?? 0;
-  const examples = intelligence?.risk_signal_examples ?? [];
+  const signals = intelligence?.risk_signals ?? [];
+  const count = signals.length;
   if (count === 0) return null;
 
-  // Highest-severity badge color drives the chip's tint.
-  const severities = examples.map(e => e.severity ?? 'warning');
+  // Highest severity drives badge color.
+  const severities = signals.map(s => s.severity);
   const hasCritical = severities.includes('critical');
   const hasWarning = severities.includes('warning');
   const badgeColor = hasCritical ? '#EF4444'
@@ -198,39 +199,39 @@ export function RiskFlag({
         {count} risk{count === 1 ? '' : 's'}
       </button>
 
-      {open && examples.length > 0 && (
+      {open && (
         <div
           ref={popoverRef}
-          className="absolute z-30 mt-1.5 left-0 rounded-lg shadow-xl p-3 min-w-[280px] max-w-[400px]"
+          className="absolute z-30 mt-1.5 left-0 rounded-lg shadow-xl p-3 min-w-[280px] max-w-[420px]"
           style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
           onClick={e => e.stopPropagation()}
         >
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">
             {count} risk signal{count === 1 ? '' : 's'}
-            {count > examples.length && ` (${examples.length} shown)`}
           </div>
           <div className="space-y-2">
-            {examples.map((ex, i) => {
-              const sev = ex.severity ?? 'warning';
-              const dotColor = sev === 'critical' ? '#EF4444'
-                : sev === 'warning' ? '#F59E0B'
+            {signals.map((s, i) => {
+              const dotColor = s.severity === 'critical' ? '#EF4444'
+                : s.severity === 'warning' ? '#F59E0B'
                 : '#A1A1AA';
               return (
                 <div key={i} className="flex items-start gap-2 text-xs">
                   <span
                     className="w-1.5 h-1.5 rounded-full mt-1.5 shrink-0"
                     style={{ background: dotColor }}
-                    title={sev}
+                    title={s.severity}
                   />
                   <div className="flex-1 min-w-0">
-                    <div className="text-text-primary leading-snug">{ex.text}</div>
-                    {ex.sent_at && (
-                      <div className="text-[10px] text-text-muted mt-0.5">
-                        {new Date(ex.sent_at).toLocaleDateString('en-US', {
-                          month: 'short', day: 'numeric', year: 'numeric',
-                        })}
-                      </div>
-                    )}
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className="text-[10px] uppercase tracking-wider font-accent"
+                        style={{ color: dotColor }}
+                      >
+                        {s.severity}
+                      </span>
+                      <span className="text-[10px] text-text-muted">{s.type}</span>
+                    </div>
+                    <div className="text-text-primary leading-snug mt-0.5">{s.detail}</div>
                   </div>
                 </div>
               );
@@ -242,87 +243,64 @@ export function RiskFlag({
   );
 }
 
-/* ─── Momentum Sparkline ────────────────────────────────────────────── */
+/* ─── Momentum ──────────────────────────────────────────────────────── */
 
-/** 4-week sparkline + directional arrow.
+/** Directional indicator from T3's 4-categorical momentum:
+ *    accelerating → ↗ green
+ *    steady       → → gray
+ *    stalled      → → amber (visually distinct from steady — same arrow,
+ *                            warning color signals "should be moving but
+ *                            isn't")
+ *    declining    → ↘ red
+ *    null         → dashed flat baseline (insufficient data)
  *
- *  Empty state (no buckets, no trend): dashed flat baseline at midpoint
- *  so card layout stays stable when data lands.
- *
- *  Directional arrow (per Lucas's spec):
- *    increasing → ↗ accelerating (green)
- *    stable     → → steady (gray)
- *    decreasing → ↘ stalled / ↓ declining (red)
- *      (single 'decreasing' covers both visual states; we use ↘ as the
- *       neutral down indicator since the schema doesn't differentiate
- *       stalled-vs-declining)
- *    null       → no arrow, dashed flat baseline */
+ *  T3's schema doesn't return week-by-week buckets, so this is an
+ *  arrow + label rather than a sparkline. momentum_score adjusts
+ *  intensity (deeper color when more extreme); compact mode skips score
+ *  for density. */
 export function MomentumSparkline({
   intelligence, size = 'compact',
 }: {
   intelligence: DealIntelligence | null;
   size?: 'compact' | 'detail';
 }) {
-  const buckets = intelligence?.momentum_buckets ?? [];
-  const trend = intelligence?.momentum_trend ?? null;
+  const momentum = intelligence?.momentum ?? null;
+  const score = intelligence?.momentum_score ?? null;
+  const W = size === 'detail' ? 32 : 18;
+  const H = size === 'detail' ? 18 : 14;
 
-  const W = size === 'detail' ? 80 : 40;
-  const H = size === 'detail' ? 28 : 14;
-  const PAD = size === 'detail' ? 3 : 2;
-
-  const color = trend === 'increasing' ? '#22C55E'
-    : trend === 'decreasing' ? '#EF4444'
-    : '#71717A';
-
-  const tooltip = buckets.length === 0
-    ? 'Momentum: insufficient data yet'
-    : `Momentum: ${trend ?? 'unknown'}` + (buckets.length > 0
-      ? '\n' + buckets.map(b => `${b.week_start.slice(0, 10)}: ${b.count}`).join('\n')
-      : '');
-
-  const arrow = trend === 'increasing' ? '↗'
-    : trend === 'decreasing' ? '↘'
-    : trend === 'stable' ? '→'
-    : '';
-
-  // Empty state: dashed flat baseline. Card height never shifts.
-  if (buckets.length === 0) {
+  if (momentum === null) {
     return (
-      <span className="inline-flex items-center gap-1">
+      <span className="inline-flex items-center gap-1" title="Momentum: insufficient data yet">
         <svg width={W} height={H} className="shrink-0">
-          <title>{tooltip}</title>
-          <line x1={PAD} y1={H / 2} x2={W - PAD} y2={H / 2}
+          <line x1={2} y1={H / 2} x2={W - 2} y2={H / 2}
             stroke="#71717A" strokeWidth={1} strokeDasharray="2 2" opacity={0.4} />
         </svg>
       </span>
     );
   }
 
-  const counts = buckets.map(b => b.count);
-  const maxC = Math.max(...counts, 1);
-  const stepX = (W - 2 * PAD) / Math.max(buckets.length - 1, 1);
-  const points = counts.map((c, i) => {
-    const x = PAD + i * stepX;
-    const y = H - PAD - ((c / maxC) * (H - 2 * PAD));
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(' ');
+  const config: Record<NonNullable<DealIntelligence['momentum']>, { arrow: string; color: string; label: string }> = {
+    accelerating: { arrow: '↗', color: '#22C55E', label: 'accelerating' },
+    steady:       { arrow: '→', color: '#A1A1AA', label: 'steady' },
+    stalled:      { arrow: '→', color: '#F59E0B', label: 'stalled' },
+    declining:    { arrow: '↘', color: '#EF4444', label: 'declining' },
+  };
+  const { arrow, color, label } = config[momentum];
+
+  const tooltip = `Momentum: ${label}${
+    score !== null ? ` · score ${score >= 0 ? '+' : ''}${score.toFixed(2)}` : ''
+  }`;
 
   return (
-    <span className="inline-flex items-center gap-1">
-      <svg width={W} height={H} className="shrink-0">
-        <title>{tooltip}</title>
-        <polyline points={points} fill="none" stroke={color}
-          strokeWidth={size === 'detail' ? 2 : 1.5}
-          strokeLinejoin="round" strokeLinecap="round" />
-      </svg>
-      {arrow && (
-        <span
-          className={`font-accent font-semibold ${size === 'detail' ? 'text-sm' : 'text-[10px]'}`}
-          style={{ color }}
-          aria-label={trend ?? 'momentum'}
-        >
-          {arrow}
-        </span>
+    <span
+      className={`inline-flex items-center gap-1 font-accent font-semibold ${size === 'detail' ? 'text-base' : 'text-[10px]'}`}
+      style={{ color }}
+      title={tooltip}
+    >
+      {arrow}
+      {size === 'detail' && (
+        <span className="text-[10px] capitalize text-text-muted">{label}</span>
       )}
     </span>
   );
@@ -332,16 +310,13 @@ export function MomentumSparkline({
 
 /** Small "computed N min ago" + refresh icon.
  *
- *  is_stale=true on the response means "row served but background recompute
- *  is queued" — show subtle indicator (pulsing refresh icon) but don't
- *  block UI on stale-read. Click triggers manual refresh; T3's endpoint
- *  may not honor force-refresh in v1 (refresh just re-fetches; if the
- *  backend hasn't recomputed yet, we'll see is_stale=true again — that's
- *  fine, the user knows they tried).
+ *  is_stale=true on the response means "row served from cache, recompute
+ *  queued via ctxExec.waitUntil" — show subtle indicator (pulsing refresh
+ *  icon) but don't block UI. Click triggers manual refresh; if backend
+ *  hasn't recomputed yet, we'll see is_stale=true again — that's fine.
  *
- *  When last_computed_at is null (no row exists yet), the indicator shows
- *  "—" with a "no data yet" tooltip and does NOT show a refresh icon
- *  (nothing to refresh). */
+ *  When intelligence is null (404 from endpoint, no row exists), shows
+ *  "— not computed" with no refresh icon (nothing to refresh). */
 export function IntelligenceFreshnessIndicator({
   intelligence, onRefresh, size = 'compact',
 }: {
@@ -349,22 +324,24 @@ export function IntelligenceFreshnessIndicator({
   onRefresh?: () => void;
   size?: 'compact' | 'detail';
 }) {
-  const computedAt = intelligence?.last_computed_at ?? null;
+  const computedAt = intelligence?.computed_at ?? null;
   const isStale = !!intelligence?.is_stale;
-
-  const relativeLabel = computedAt ? fmtRelative(computedAt) : null;
 
   const fontClass = size === 'detail' ? 'text-xs' : 'text-[9px]';
   const iconSize = size === 'detail' ? 11 : 9;
 
-  if (!relativeLabel) {
+  if (!computedAt) {
     return (
-      <span className={`inline-flex items-center gap-1 ${fontClass} text-text-muted/60 italic`}
-        title="No intelligence computed yet">
+      <span
+        className={`inline-flex items-center gap-1 ${fontClass} text-text-muted/60 italic`}
+        title="No intelligence computed yet"
+      >
         — not computed
       </span>
     );
   }
+
+  const relativeLabel = fmtRelative(computedAt);
 
   return (
     <span

@@ -1487,15 +1487,20 @@ export default function DealDetailPage() {
 function DealIntelligenceStrip({ deal }: { deal: any }) {
   const { intelligence, refresh } = useDealIntelligence(deal?.id ?? null);
 
+  // hasAnyData drives the header's "awaiting evaluator" hint vs the
+  // freshness indicator. T3's contract returns intelligence !== null even
+  // when all signal fields are empty (the "no readable conversations" path
+  // gives all nulls/empties + computed_at populated). So we treat presence
+  // of computed_at as the primary "data has flowed at least once" signal,
+  // independent of whether actual signals were extracted.
   const hasAnyData =
     intelligence !== null && (
+      intelligence.computed_at !== null ||
+      intelligence.sentiment !== null ||
       intelligence.sentiment_score !== null ||
-      intelligence.sentiment_direction !== null ||
-      intelligence.active_topics.length > 0 ||
-      intelligence.risk_signal_count > 0 ||
-      intelligence.momentum_buckets.length > 0 ||
-      intelligence.momentum_trend !== null ||
-      intelligence.last_computed_at !== null
+      intelligence.topics.length > 0 ||
+      intelligence.risk_signals.length > 0 ||
+      intelligence.momentum !== null
     );
 
   return (
@@ -1521,15 +1526,14 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
         {/* Sentiment */}
         <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Sentiment</div>
-          {(intelligence?.sentiment_score === null || intelligence?.sentiment_score === undefined) &&
-           (intelligence?.sentiment_direction === null || intelligence?.sentiment_direction === undefined) ? (
+          {intelligence?.sentiment === null && intelligence?.sentiment_score === null ? (
             <div className="text-xs text-text-muted italic">Insufficient data yet</div>
           ) : (
             <div className="flex items-center gap-2">
               <SentimentIndicator intelligence={intelligence} size="detail" />
-              {intelligence?.sentiment_direction && (
+              {intelligence?.sentiment && (
                 <span className="text-[10px] text-text-muted capitalize">
-                  {intelligence.sentiment_direction}
+                  {intelligence.sentiment}
                 </span>
               )}
             </div>
@@ -1539,7 +1543,7 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
         {/* Active Topics */}
         <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Active Topics</div>
-          {(intelligence?.active_topics ?? []).length === 0 ? (
+          {(intelligence?.topics ?? []).length === 0 ? (
             <div className="text-xs text-text-muted italic">No active topics extracted</div>
           ) : (
             <TopicChips intelligence={intelligence} size="detail" />
@@ -1549,7 +1553,7 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
         {/* Risk Signals */}
         <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Risk Signals</div>
-          {(intelligence?.risk_signal_count ?? 0) === 0 ? (
+          {(intelligence?.risk_signals ?? []).length === 0 ? (
             <div className="text-xs text-text-muted italic">No risk signals detected</div>
           ) : (
             <RiskFlag intelligence={intelligence} size="detail" />
@@ -1559,8 +1563,12 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
         {/* Momentum */}
         <div className="px-5 py-4">
           <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Momentum</div>
-          {(intelligence?.momentum_buckets ?? []).length === 0 ? (
-            <div className="text-xs text-text-muted italic">No conversation activity yet</div>
+          {intelligence?.momentum === null ? (
+            <div className="text-xs text-text-muted italic">
+              {intelligence?.conversation_count === 0
+                ? 'No conversation activity yet'
+                : 'Insufficient signal yet'}
+            </div>
           ) : (
             <MomentumSparkline intelligence={intelligence} size="detail" />
           )}
