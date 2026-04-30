@@ -678,18 +678,10 @@ export default function DealDetailPage() {
               (deal_contacts → conversation_contacts → conversations MAX) over
               the stale-by-design deals.last_activity_date column, which is
               only bumped by manual deal edits. Fall back to the legacy
-              column then created_at so first-day deals don't render '--'.
-              Day-5 Phase D: when last_inferred_activity_sender / _subject
-              are populated, show a "by [sender] · [subject]" subtitle line
-              so "what got touched" is glanceable. */}
+              column then created_at so first-day deals don't render '--'. */}
           {(() => {
             const lastActivityIso: string | undefined =
               (deal as any).last_inferred_activity_date ?? deal.last_activity_date ?? deal.created_at;
-            const inferredSender = (deal as any).last_inferred_activity_sender as string | undefined;
-            const inferredSubject = (deal as any).last_inferred_activity_subject as string | undefined;
-            const subtitle = inferredSender && inferredSubject
-              ? `${inferredSender} · ${inferredSubject}`
-              : inferredSender || inferredSubject || null;
             return (
               <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
                 <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Last Activity</div>
@@ -702,11 +694,6 @@ export default function DealDetailPage() {
                 {lastActivityIso && (
                   <div className="text-[9px] text-text-muted mt-1">
                     {new Date(lastActivityIso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                  </div>
-                )}
-                {subtitle && (
-                  <div className="text-[10px] text-text-secondary mt-1.5 truncate" title={subtitle}>
-                    {subtitle}
                   </div>
                 )}
               </div>
@@ -1659,8 +1646,6 @@ function DealConversationsCard({ dealId }: { dealId: string }) {
       participants: Array<{ contact_id: string | null; name: string | null; email: string | null }>;
       messages: Array<{
         id: string;
-        external_message_id: string | null;
-        source: string;
         sender_name: string | null;
         sender_email: string | null;
         sent_at: string;
@@ -1806,25 +1791,6 @@ function DealConversationsCard({ dealId }: { dealId: string }) {
                                 You don't have access to this message body.
                               </div>
                             )}
-                          {/* Day-5 Phase D: Open-in-Outlook deep-link. Only for
-                              source='outlook' messages with a non-null
-                              external_message_id. Outlook web's deeplink
-                              endpoint takes the URL-encoded Graph message id;
-                              clicking opens the message in the user's signed-in
-                              Outlook session (no extra auth flow). For non-
-                              outlook sources (slack / manual / firefly
-                              transcripts) we hide the link entirely. */}
-                          {msg.source === 'outlook' && msg.external_message_id && msg.can_read_body && (
-                            <a
-                              href={`https://outlook.office.com/mail/deeplink/read/${encodeURIComponent(msg.external_message_id)}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              onClick={e => e.stopPropagation()}
-                              className="inline-flex items-center gap-1 text-[10px] text-accent-magenta hover:text-accent-purple mt-1.5 transition-colors"
-                            >
-                              <ArrowRight size={10} /> Open in Outlook
-                            </a>
-                          )}
                         </div>
                       );
                     })}
