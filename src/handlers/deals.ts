@@ -16,9 +16,18 @@ export async function listDeals(
   env: Env
 ): Promise<Response> {
   const url = new URL(request.url);
-  const stage = url.searchParams.get('stage');
+  // Stage supports multi-select via repeated ?stage=X&stage=Y. Single ?stage=X
+  // still works for backward compat with existing callers (deal-detail page).
+  const stageParams = url.searchParams.getAll('stage').filter(Boolean);
   const companyId = url.searchParams.get('company_id');
-  const ownerId = url.searchParams.get('owner_id');
+  // owner_id supports multi-select + the special sentinel `unassigned` which
+  // matches owner_id IS NULL. Both shapes are useful for the board filter UI.
+  const ownerParams = url.searchParams.getAll('owner_id').filter(Boolean);
+  const instrumentParams = url.searchParams.getAll('instrument_type').filter(Boolean);
+  const leadSourceParams = url.searchParams.getAll('lead_source').filter(Boolean);
+  const minAmountRaw = url.searchParams.get('min_amount');
+  const maxAmountRaw = url.searchParams.get('max_amount');
+  const hasMemo = url.searchParams.get('has_memo');  // 'true' / 'false' / null
 
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
   const offset = parseInt(url.searchParams.get('offset') || '0', 10);
@@ -26,17 +35,52 @@ export async function listDeals(
   const where: string[] = ['d.org_id = ?', 'd.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
 
-  if (stage) {
-    where.push('d.stage = ?');
-    binds.push(stage);
+  if (stageParams.length > 0) {
+    where.push(`d.stage IN (${stageParams.map(() => '?').join(',')})`);
+    binds.push(...stageParams);
   }
   if (companyId) {
     where.push('d.company_id = ?');
     binds.push(companyId);
   }
-  if (ownerId) {
-    where.push('d.owner_id = ?');
-    binds.push(ownerId);
+  // owner_id: 'unassigned' sentinel maps to IS NULL; otherwise IN (...).
+  // Both can be combined: ?owner_id=unassigned&owner_id=<uuid> means
+  // unassigned OR owned-by-uuid.
+  if (ownerParams.length > 0) {
+    const wantsUnassigned = ownerParams.includes('unassigned');
+    const realOwners = ownerParams.filter(o => o !== 'unassigned');
+    const clauses: string[] = [];
+    if (wantsUnassigned) clauses.push('d.owner_id IS NULL');
+    if (realOwners.length > 0) {
+      clauses.push(`d.owner_id IN (${realOwners.map(() => '?').join(',')})`);
+      binds.push(...realOwners);
+    }
+    if (clauses.length > 0) where.push(`(${clauses.join(' OR ')})`);
+  }
+  if (instrumentParams.length > 0) {
+    where.push(`d.instrument_type IN (${instrumentParams.map(() => '?').join(',')})`);
+    binds.push(...instrumentParams);
+  }
+  // lead_source is a freeform TEXT column — exact match only (no LIKE), since
+  // freeform values may collide unpredictably.
+  if (leadSourceParams.length > 0) {
+    where.push(`d.lead_source IN (${leadSourceParams.map(() => '?').join(',')})`);
+    binds.push(...leadSourceParams);
+  }
+  // amount range — filter on `amount` (deal size). NULL amounts are excluded
+  // when either bound is set since "min_amount=1000000" implies "exists".
+  if (minAmountRaw !== null) {
+    const v = Number(minAmountRaw);
+    if (Number.isFinite(v)) { where.push('d.amount IS NOT NULL AND d.amount >= ?'); binds.push(v); }
+  }
+  if (maxAmountRaw !== null) {
+    const v = Number(maxAmountRaw);
+    if (Number.isFinite(v)) { where.push('d.amount IS NOT NULL AND d.amount <= ?'); binds.push(v); }
+  }
+  if (hasMemo === 'true') {
+    where.push("d.deal_memo_r2_key IS NOT NULL AND d.deal_memo_r2_key != ''");
+  } else if (hasMemo === 'false') {
+    where.push("(d.deal_memo_r2_key IS NULL OR d.deal_memo_r2_key = '')");
   }
 
   const whereClause = where.join(' AND ');
@@ -51,6 +95,11 @@ export async function listDeals(
       // last_activity_date column is left untouched on the wire (still in
       // d.*) — frontend reads the new field with a fallback to the old one.
       // See Day 4 Priority 6 audit, Section 1.3 finding.
+      // Day-5 Phase D: also surface the most-recent linked conversation's
+      // subject + sender for the "Last touched by [name]" subtitle on the
+      // detail page's Last Activity tile. Correlated subqueries reuse the
+      // same two-hop join that powers last_inferred_activity_date so the
+      // subject + sender are guaranteed to match the timestamp.
       `SELECT d.*, co.name AS company_name, co.sector AS company_sector,
               u.full_name AS owner_name, u.email AS owner_email,
               (SELECT COUNT(*) FROM deal_contacts dc WHERE dc.deal_id = d.id) AS contacts_count,
@@ -59,7 +108,20 @@ export async function listDeals(
                  FROM deal_contacts dc
                  JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
                  JOIN conversations conv ON cc.conversation_id = conv.id
-                WHERE dc.deal_id = d.id) AS last_inferred_activity_date
+                WHERE dc.deal_id = d.id) AS last_inferred_activity_date,
+              (SELECT conv.subject
+                 FROM deal_contacts dc
+                 JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+                 JOIN conversations conv ON cc.conversation_id = conv.id
+                WHERE dc.deal_id = d.id
+                ORDER BY conv.sent_at DESC LIMIT 1) AS last_inferred_activity_subject,
+              (SELECT COALESCE(c.full_name, conv.from_email)
+                 FROM deal_contacts dc
+                 JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+                 JOIN conversations conv ON cc.conversation_id = conv.id
+                 LEFT JOIN contacts c ON conv.from_contact_id = c.id
+                WHERE dc.deal_id = d.id
+                ORDER BY conv.sent_at DESC LIMIT 1) AS last_inferred_activity_sender
        FROM deals d
        LEFT JOIN companies co ON d.company_id = co.id
        LEFT JOIN users u ON d.owner_id = u.id
@@ -189,7 +251,20 @@ export async function getDeal(
                FROM deal_contacts dc
                JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
                JOIN conversations conv ON cc.conversation_id = conv.id
-              WHERE dc.deal_id = d.id) AS last_inferred_activity_date
+              WHERE dc.deal_id = d.id) AS last_inferred_activity_date,
+            (SELECT conv.subject
+               FROM deal_contacts dc
+               JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+               JOIN conversations conv ON cc.conversation_id = conv.id
+              WHERE dc.deal_id = d.id
+              ORDER BY conv.sent_at DESC LIMIT 1) AS last_inferred_activity_subject,
+            (SELECT COALESCE(c2.full_name, conv.from_email)
+               FROM deal_contacts dc
+               JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+               JOIN conversations conv ON cc.conversation_id = conv.id
+               LEFT JOIN contacts c2 ON conv.from_contact_id = c2.id
+              WHERE dc.deal_id = d.id
+              ORDER BY conv.sent_at DESC LIMIT 1) AS last_inferred_activity_sender
      FROM deals d
      LEFT JOIN companies co ON d.company_id = co.id
      LEFT JOIN users u ON d.owner_id = u.id
@@ -398,6 +473,166 @@ export async function updateDeal(
   }
 
   return jsonResponse({ deal: after });
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/deals/bulk-update — Day-5 Phase C
+// ---------------------------------------------------------------------------
+// Body: { deal_ids: string[], updates: { stage?, owner_id?, ... }, archive?: boolean }
+//
+// Applies the same field whitelist as updateDeal to every deal_id that
+// belongs to the caller's org. archive=true is a sugar for soft-delete
+// (sets deleted_at=now) — distinct from setting stage='closed_lost' which
+// keeps the row visible on the board's Closed Lost column.
+//
+// ACL matches updateDeal: any authenticated user in the org can update any
+// deal in the org. Per-deal id ownership check is implicit in the WHERE
+// org_id=? clause; ids that don't belong to this org are silently dropped.
+//
+// Stage transitions on bulk path get the same stage_changed_at + days_in_stage
+// reset as single-deal updateDeal. last_activity_date bumped on every update.
+// Audit row emitted per deal. Re-embedding skipped — bulk operations are
+// stage / ownership / archive shifts and don't change embedding-meaningful
+// content (title/notes/thesis_fit). If a future bulk path needs content
+// updates, add reembedDeal calls per deal then.
+
+const BULK_ALLOWED_FIELDS = [
+  'stage', 'owner_id', 'instrument_type', 'lead_source', 'thesis_fit',
+  'expected_close', 'actual_close_date', 'probability',
+];
+
+export async function bulkUpdateDeals(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    deal_ids?: unknown;
+    updates?: Record<string, unknown>;
+    archive?: boolean;
+  }>(request);
+  if (!body) return errorResponse('VALIDATION_ERROR', 400, 'body required');
+
+  const dealIds = Array.isArray(body.deal_ids)
+    ? body.deal_ids.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : [];
+  if (dealIds.length === 0) {
+    return errorResponse('VALIDATION_ERROR', 400, 'deal_ids must be a non-empty array of strings');
+  }
+  if (dealIds.length > 100) {
+    return errorResponse('VALIDATION_ERROR', 400, 'bulk update capped at 100 deal_ids per call');
+  }
+
+  const archive = body.archive === true;
+  const updates = body.updates && typeof body.updates === 'object' ? body.updates : {};
+
+  if (!archive && Object.keys(updates).length === 0) {
+    return errorResponse('VALIDATION_ERROR', 400, 'either archive=true or updates with at least one field is required');
+  }
+
+  // Whitelist + validate update fields. Soft-delete via archive=true bypasses
+  // the field whitelist (it's a separate operation).
+  const filteredUpdates: Record<string, unknown> = {};
+  if (!archive) {
+    for (const k of BULK_ALLOWED_FIELDS) {
+      if (k in updates) filteredUpdates[k] = (updates as any)[k];
+    }
+    if (Object.keys(filteredUpdates).length === 0) {
+      return errorResponse('VALIDATION_ERROR', 400, `updates must include at least one of: ${BULK_ALLOWED_FIELDS.join(', ')}`);
+    }
+  }
+
+  // Fetch all matching deals in one round-trip. Org-scoped + not-deleted.
+  // Ids that don't belong to this org or are already deleted are silently
+  // dropped — no leak (we never reveal whether the id exists).
+  const placeholders = dealIds.map(() => '?').join(',');
+  const beforeRows = await env.D1.prepare(
+    `SELECT * FROM deals WHERE id IN (${placeholders}) AND org_id = ? AND deleted_at IS NULL`
+  ).bind(...dealIds, ctx.orgId).all<any>();
+  const beforeById = new Map<string, any>(beforeRows.results.map(r => [r.id, r]));
+  const matchedIds = Array.from(beforeById.keys());
+
+  if (matchedIds.length === 0) {
+    return jsonResponse({ ok: true, updated_count: 0, skipped_ids: dealIds, archived: archive });
+  }
+
+  // Build the per-deal UPDATE statements. Stage changes need stage_changed_at
+  // + days_in_stage reset on a per-deal basis (since each deal may transition
+  // from a different prior stage), so we issue one UPDATE per deal in a
+  // batch. D1's batch() commits them atomically per call.
+  const stmts: D1PreparedStatement[] = [];
+  const auditEntries: Array<{ id: string; before: any; after_partial: Record<string, unknown>; metadata: Record<string, unknown> }> = [];
+
+  for (const id of matchedIds) {
+    const before = beforeById.get(id);
+
+    if (archive) {
+      stmts.push(env.D1.prepare(
+        `UPDATE deals SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+      ).bind(id));
+      auditEntries.push({
+        id, before,
+        after_partial: { deleted_at: new Date().toISOString() },
+        metadata: { bulk: true, action: 'archive' },
+      });
+      continue;
+    }
+
+    const setFragments: string[] = [];
+    const binds: unknown[] = [];
+    const stageChanged = 'stage' in filteredUpdates && filteredUpdates.stage !== before.stage;
+
+    for (const [k, v] of Object.entries(filteredUpdates)) {
+      setFragments.push(`${k} = ?`);
+      binds.push(v);
+    }
+
+    if (stageChanged) {
+      setFragments.push(`stage_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+      setFragments.push('days_in_stage = 0');
+    }
+    setFragments.push(`last_activity_date = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+    setFragments.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+
+    stmts.push(env.D1.prepare(
+      `UPDATE deals SET ${setFragments.join(', ')} WHERE id = ?`
+    ).bind(...binds, id));
+
+    auditEntries.push({
+      id, before,
+      after_partial: { ...filteredUpdates },
+      metadata: stageChanged
+        ? { bulk: true, old_stage: before.stage, new_stage: filteredUpdates.stage }
+        : { bulk: true },
+    });
+  }
+
+  await env.D1.batch(stmts);
+
+  // Emit one audit row per affected deal. Failures here are non-fatal —
+  // the underlying update already committed, audit is best-effort observability.
+  await Promise.all(auditEntries.map(e => emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: archive ? 'soft_delete' : 'update',
+    entity_type: 'deal',
+    entity_id: e.id,
+    before_data: e.before,
+    after_data: { ...e.before, ...e.after_partial },
+    metadata: e.metadata,
+    created_at: new Date().toISOString(),
+  }).catch(err => {
+    console.error(`[bulk-update] audit emit failed for deal ${e.id}:`, err);
+  })));
+
+  await invalidateRagCache(ctx.orgId, env);
+
+  return jsonResponse({
+    ok: true,
+    updated_count: matchedIds.length,
+    skipped_ids: dealIds.filter(id => !beforeById.has(id)),
+    archived: archive,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +903,8 @@ export async function getDealConversations(
   const [rows, sharingFlags] = await Promise.all([
     env.D1.prepare(
       `SELECT DISTINCT
-              conv.id, conv.external_thread_id, conv.subject, conv.sent_at,
+              conv.id, conv.external_thread_id, conv.external_message_id,
+              conv.subject, conv.sent_at,
               conv.source, conv.body_preview, conv.participant_user_ids,
               conv.is_campaign_email, conv.from_email, conv.from_contact_id,
               conv.direction, conv.has_attachments
@@ -681,7 +917,8 @@ export async function getDealConversations(
                  conv.sent_at ASC
         LIMIT ?`
     ).bind(id, ctx.orgId, ctx.orgId, messageCap).all<{
-      id: string; external_thread_id: string | null; subject: string | null;
+      id: string; external_thread_id: string | null;
+      external_message_id: string | null; subject: string | null;
       sent_at: string; source: string; body_preview: string | null;
       participant_user_ids: string | null; is_campaign_email: number;
       from_email: string | null; from_contact_id: string | null;
@@ -709,6 +946,8 @@ export async function getDealConversations(
   // Group messages by external_thread_id. NULL → each row is its own thread.
   type Msg = {
     id: string;
+    external_message_id: string | null;  // for "Open in Outlook" deep-link
+    source: string;                       // 'outlook' / 'slack' / 'manual'
     sender_name: string | null;   // null when can_read_body=false (PII gate)
     sender_email: string | null;  // null when can_read_body=false
     sent_at: string;
@@ -751,6 +990,8 @@ export async function getDealConversations(
 
     const msg: Msg = {
       id: r.id,
+      external_message_id: r.external_message_id,
+      source: r.source,
       sender_name: canRead ? senderName : null,
       sender_email: canRead ? senderEmail : null,
       sent_at: r.sent_at,
