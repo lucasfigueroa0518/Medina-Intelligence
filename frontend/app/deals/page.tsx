@@ -2,6 +2,7 @@
 
 import React from 'react';
 import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
 import { CompanySearchField } from '@/components/company-search-field';
 import { api } from '@/lib/api';
@@ -12,6 +13,7 @@ import {
   AlertCircle,
   ChevronLeft,
   ChevronRight,
+  Filter,
 } from 'lucide-react';
 
 type DealStage =
@@ -59,6 +61,8 @@ const EMPTY_FORM: CreateDealForm = {
 };
 
 export default function DealsPage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const [deals, setDeals] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [modalOpen, setModalOpen] = React.useState(false);
@@ -69,6 +73,60 @@ export default function DealsPage() {
   const [dragDealId, setDragDealId] = React.useState<string | null>(null);
   const [dragOverStage, setDragOverStage] = React.useState<string | null>(null);
   const [refreshKey, setRefreshKey] = React.useState(0);
+  const [filterPanelOpen, setFilterPanelOpen] = React.useState(false);
+
+  /* ── Day-5 Phase A: filter state. URL is the source of truth — values
+       persist across refresh and share-links. Filter row updates the URL,
+       the listDeals fetch reads from URL, refetch chained on URL changes. */
+  const filters = React.useMemo(() => ({
+    stage: searchParams.getAll('stage').filter(Boolean),
+    owner_id: searchParams.getAll('owner_id').filter(Boolean),
+    instrument_type: searchParams.getAll('instrument_type').filter(Boolean),
+    lead_source: searchParams.getAll('lead_source').filter(Boolean),
+    min_amount: searchParams.get('min_amount') ?? '',
+    max_amount: searchParams.get('max_amount') ?? '',
+    has_memo: searchParams.get('has_memo') ?? '',  // '' | 'true' | 'false'
+  }), [searchParams]);
+
+  const filterCount =
+    filters.stage.length +
+    filters.owner_id.length +
+    filters.instrument_type.length +
+    filters.lead_source.length +
+    (filters.min_amount ? 1 : 0) +
+    (filters.max_amount ? 1 : 0) +
+    (filters.has_memo ? 1 : 0);
+
+  function updateFilters(mut: (sp: URLSearchParams) => void) {
+    const next = new URLSearchParams(searchParams.toString());
+    mut(next);
+    const qs = next.toString();
+    router.replace(qs ? `?${qs}` : '?', { scroll: false });
+  }
+
+  function toggleArrayFilter(key: string, value: string) {
+    updateFilters(sp => {
+      const cur = sp.getAll(key);
+      sp.delete(key);
+      if (cur.includes(value)) {
+        for (const v of cur) if (v !== value) sp.append(key, v);
+      } else {
+        for (const v of cur) sp.append(key, v);
+        sp.append(key, value);
+      }
+    });
+  }
+
+  function setScalarFilter(key: string, value: string | null) {
+    updateFilters(sp => {
+      sp.delete(key);
+      if (value !== null && value !== '') sp.append(key, value);
+    });
+  }
+
+  function clearAllFilters() {
+    router.replace('?', { scroll: false });
+  }
 
   /* ── Horizontal scroll state ── */
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -101,13 +159,15 @@ export default function DealsPage() {
     el.scrollBy({ left: dir === 'left' ? -300 : 300, behavior: 'smooth' });
   }
 
-  /* ── Data loading ── */
-
+  /* ── Data loading ── refetch when filters change OR refreshKey bumps. */
   React.useEffect(() => {
-    api.listDeals()
+    setLoading(true);
+    api.listDeals(searchParams)
       .then(d => setDeals(d.deals))
       .finally(() => setLoading(false));
-  }, [refreshKey]);
+    // searchParams from useSearchParams is reactive; this effect fires
+    // every time the URL filter set changes.
+  }, [refreshKey, searchParams]);
 
   React.useEffect(() => {
     api.listUsers().then(u => setUsers(u.users || []));
@@ -224,12 +284,35 @@ export default function DealsPage() {
                 <span className="text-xl font-bold text-semantic-success">{formatCurrency(totalPipeline)}</span>
               </span>
             )}
+            <button
+              onClick={() => setFilterPanelOpen(o => !o)}
+              className={`btn-ghost flex items-center gap-2 text-xs py-1.5 ${filterCount > 0 ? 'text-accent-magenta' : ''}`}
+              title="Filters"
+            >
+              <Filter size={14} />
+              {filterCount > 0 ? `Filters (${filterCount})` : 'Filters'}
+            </button>
             <button className="btn-primary flex items-center gap-2" onClick={openModal}>
               <Plus size={16} /> Add Deal
             </button>
           </div>
         }
       />
+
+      {/* ── Day-5 Phase A: filter panel. URL-state-driven; refresh / share-link
+           preserves selections. Multi-select chips for stage/owner/instrument/
+           lead-source. Range inputs for amount. Tri-state for has_memo. ── */}
+      {filterPanelOpen && (
+        <DealFiltersPanel
+          filters={filters}
+          users={users}
+          allDeals={deals}
+          onToggle={toggleArrayFilter}
+          onSetScalar={setScalarFilter}
+          onClearAll={clearAllFilters}
+          onClose={() => setFilterPanelOpen(false)}
+        />
+      )}
 
       {/* ── Pipeline board with scroll arrows ── */}
       <div className="flex-1 relative">
@@ -723,4 +806,251 @@ function formatCurrency(v: number): string {
   if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
   if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}K`;
   return `$${v}`;
+}
+
+/* ── Day-5 Phase A: filter panel ── */
+
+const FILTER_INSTRUMENT_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'safe', label: 'SAFE' },
+  { value: 'convertible_note', label: 'Convertible Note' },
+  { value: 'equity', label: 'Equity' },
+  { value: 'debt', label: 'Debt' },
+  { value: 'other', label: 'Other' },
+];
+
+interface FiltersShape {
+  stage: string[];
+  owner_id: string[];
+  instrument_type: string[];
+  lead_source: string[];
+  min_amount: string;
+  max_amount: string;
+  has_memo: string;
+}
+
+function DealFiltersPanel({
+  filters, users, allDeals, onToggle, onSetScalar, onClearAll, onClose,
+}: {
+  filters: FiltersShape;
+  users: any[];
+  allDeals: any[];
+  onToggle: (key: string, value: string) => void;
+  onSetScalar: (key: string, value: string | null) => void;
+  onClearAll: () => void;
+  onClose: () => void;
+}) {
+  // Distinct lead_source values from currently-loaded deals (cheap; no need
+  // for a separate /distinct-lead-sources endpoint with current data volume).
+  // 0% population today means this list is empty; we surface a freeform input
+  // alongside the chip list so users can filter ahead of data.
+  const distinctLeadSources = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const d of allDeals) {
+      const ls = (d.lead_source ?? '').trim();
+      if (ls) set.add(ls);
+    }
+    return Array.from(set).sort();
+  }, [allDeals]);
+  const [leadSourceInput, setLeadSourceInput] = React.useState('');
+
+  return (
+    <div
+      className="border-b border-border px-6 py-4"
+      style={{ background: 'rgba(17,17,20,0.55)' }}
+    >
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
+          Filters
+        </span>
+        <div className="flex items-center gap-3">
+          <button onClick={onClearAll} className="btn-ghost text-xs py-1">Clear all</button>
+          <button onClick={onClose} className="btn-ghost text-xs py-1 flex items-center gap-1">
+            <XIcon size={12} /> Close
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {/* Stage (multi) */}
+        <FilterColumn label="Stage">
+          <ChipRow>
+            {STAGES.map(s => (
+              <FilterChip
+                key={s.key}
+                label={s.label}
+                active={filters.stage.includes(s.key)}
+                onClick={() => onToggle('stage', s.key)}
+                color={s.color}
+              />
+            ))}
+          </ChipRow>
+        </FilterColumn>
+
+        {/* Owner (multi + Unassigned sentinel) */}
+        <FilterColumn label="Owner">
+          <ChipRow>
+            <FilterChip
+              label="Unassigned"
+              active={filters.owner_id.includes('unassigned')}
+              onClick={() => onToggle('owner_id', 'unassigned')}
+            />
+            {users.map(u => (
+              <FilterChip
+                key={u.id}
+                label={u.full_name || u.email}
+                active={filters.owner_id.includes(u.id)}
+                onClick={() => onToggle('owner_id', u.id)}
+              />
+            ))}
+          </ChipRow>
+        </FilterColumn>
+
+        {/* Instrument */}
+        <FilterColumn label="Instrument">
+          <ChipRow>
+            {FILTER_INSTRUMENT_OPTIONS.map(opt => (
+              <FilterChip
+                key={opt.value}
+                label={opt.label}
+                active={filters.instrument_type.includes(opt.value)}
+                onClick={() => onToggle('instrument_type', opt.value)}
+              />
+            ))}
+          </ChipRow>
+        </FilterColumn>
+
+        {/* Lead source — distinct values from current data + freeform add */}
+        <FilterColumn label="Lead Source">
+          <div className="space-y-2">
+            <ChipRow>
+              {distinctLeadSources.length === 0 && filters.lead_source.length === 0 && (
+                <span className="text-[10px] text-text-muted/70 italic">
+                  No lead_source values populated yet
+                </span>
+              )}
+              {distinctLeadSources.map(ls => (
+                <FilterChip
+                  key={ls}
+                  label={ls}
+                  active={filters.lead_source.includes(ls)}
+                  onClick={() => onToggle('lead_source', ls)}
+                />
+              ))}
+              {filters.lead_source.filter(ls => !distinctLeadSources.includes(ls)).map(ls => (
+                <FilterChip
+                  key={`extra-${ls}`}
+                  label={ls}
+                  active={true}
+                  onClick={() => onToggle('lead_source', ls)}
+                />
+              ))}
+            </ChipRow>
+            <div className="flex gap-1.5">
+              <input
+                type="text"
+                value={leadSourceInput}
+                onChange={e => setLeadSourceInput(e.target.value)}
+                placeholder="Add filter value..."
+                className="input text-xs py-1 px-2 flex-1 min-w-0"
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && leadSourceInput.trim()) {
+                    onToggle('lead_source', leadSourceInput.trim());
+                    setLeadSourceInput('');
+                  }
+                }}
+              />
+              <button
+                onClick={() => {
+                  if (leadSourceInput.trim()) {
+                    onToggle('lead_source', leadSourceInput.trim());
+                    setLeadSourceInput('');
+                  }
+                }}
+                className="btn-secondary text-xs py-1 px-2"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        </FilterColumn>
+
+        {/* Has Memo (tri-state) */}
+        <FilterColumn label="Memo">
+          <ChipRow>
+            <FilterChip
+              label="Has memo"
+              active={filters.has_memo === 'true'}
+              onClick={() => onSetScalar('has_memo', filters.has_memo === 'true' ? null : 'true')}
+            />
+            <FilterChip
+              label="No memo"
+              active={filters.has_memo === 'false'}
+              onClick={() => onSetScalar('has_memo', filters.has_memo === 'false' ? null : 'false')}
+            />
+          </ChipRow>
+        </FilterColumn>
+
+        {/* Amount range */}
+        <FilterColumn label="Amount range">
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              value={filters.min_amount}
+              onChange={e => onSetScalar('min_amount', e.target.value || null)}
+              placeholder="Min"
+              className="input text-xs py-1 px-2 w-28"
+            />
+            <span className="text-text-muted text-xs">to</span>
+            <input
+              type="number"
+              value={filters.max_amount}
+              onChange={e => onSetScalar('max_amount', e.target.value || null)}
+              placeholder="Max"
+              className="input text-xs py-1 px-2 w-28"
+            />
+          </div>
+        </FilterColumn>
+      </div>
+    </div>
+  );
+}
+
+function FilterColumn({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-1.5">{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function ChipRow({ children }: { children: React.ReactNode }) {
+  return <div className="flex flex-wrap gap-1">{children}</div>;
+}
+
+function FilterChip({ label, active, onClick, color }: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  color?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="text-[10px] font-accent px-2 py-0.5 rounded transition-colors"
+      style={{
+        background: active
+          ? (color ? `${color}30` : 'rgba(217,70,168,0.20)')
+          : 'rgba(255,255,255,0.04)',
+        color: active
+          ? (color || '#F0ABFC')
+          : 'rgba(255,255,255,0.65)',
+        border: active
+          ? `1px solid ${color ? color + '50' : 'rgba(217,70,168,0.40)'}`
+          : '1px solid rgba(255,255,255,0.08)',
+      }}
+    >
+      {label}
+    </button>
+  );
 }

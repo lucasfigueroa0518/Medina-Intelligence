@@ -16,9 +16,18 @@ export async function listDeals(
   env: Env
 ): Promise<Response> {
   const url = new URL(request.url);
-  const stage = url.searchParams.get('stage');
+  // Stage supports multi-select via repeated ?stage=X&stage=Y. Single ?stage=X
+  // still works for backward compat with existing callers (deal-detail page).
+  const stageParams = url.searchParams.getAll('stage').filter(Boolean);
   const companyId = url.searchParams.get('company_id');
-  const ownerId = url.searchParams.get('owner_id');
+  // owner_id supports multi-select + the special sentinel `unassigned` which
+  // matches owner_id IS NULL. Both shapes are useful for the board filter UI.
+  const ownerParams = url.searchParams.getAll('owner_id').filter(Boolean);
+  const instrumentParams = url.searchParams.getAll('instrument_type').filter(Boolean);
+  const leadSourceParams = url.searchParams.getAll('lead_source').filter(Boolean);
+  const minAmountRaw = url.searchParams.get('min_amount');
+  const maxAmountRaw = url.searchParams.get('max_amount');
+  const hasMemo = url.searchParams.get('has_memo');  // 'true' / 'false' / null
 
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
   const offset = parseInt(url.searchParams.get('offset') || '0', 10);
@@ -26,17 +35,52 @@ export async function listDeals(
   const where: string[] = ['d.org_id = ?', 'd.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
 
-  if (stage) {
-    where.push('d.stage = ?');
-    binds.push(stage);
+  if (stageParams.length > 0) {
+    where.push(`d.stage IN (${stageParams.map(() => '?').join(',')})`);
+    binds.push(...stageParams);
   }
   if (companyId) {
     where.push('d.company_id = ?');
     binds.push(companyId);
   }
-  if (ownerId) {
-    where.push('d.owner_id = ?');
-    binds.push(ownerId);
+  // owner_id: 'unassigned' sentinel maps to IS NULL; otherwise IN (...).
+  // Both can be combined: ?owner_id=unassigned&owner_id=<uuid> means
+  // unassigned OR owned-by-uuid.
+  if (ownerParams.length > 0) {
+    const wantsUnassigned = ownerParams.includes('unassigned');
+    const realOwners = ownerParams.filter(o => o !== 'unassigned');
+    const clauses: string[] = [];
+    if (wantsUnassigned) clauses.push('d.owner_id IS NULL');
+    if (realOwners.length > 0) {
+      clauses.push(`d.owner_id IN (${realOwners.map(() => '?').join(',')})`);
+      binds.push(...realOwners);
+    }
+    if (clauses.length > 0) where.push(`(${clauses.join(' OR ')})`);
+  }
+  if (instrumentParams.length > 0) {
+    where.push(`d.instrument_type IN (${instrumentParams.map(() => '?').join(',')})`);
+    binds.push(...instrumentParams);
+  }
+  // lead_source is a freeform TEXT column — exact match only (no LIKE), since
+  // freeform values may collide unpredictably.
+  if (leadSourceParams.length > 0) {
+    where.push(`d.lead_source IN (${leadSourceParams.map(() => '?').join(',')})`);
+    binds.push(...leadSourceParams);
+  }
+  // amount range — filter on `amount` (deal size). NULL amounts are excluded
+  // when either bound is set since "min_amount=1000000" implies "exists".
+  if (minAmountRaw !== null) {
+    const v = Number(minAmountRaw);
+    if (Number.isFinite(v)) { where.push('d.amount IS NOT NULL AND d.amount >= ?'); binds.push(v); }
+  }
+  if (maxAmountRaw !== null) {
+    const v = Number(maxAmountRaw);
+    if (Number.isFinite(v)) { where.push('d.amount IS NOT NULL AND d.amount <= ?'); binds.push(v); }
+  }
+  if (hasMemo === 'true') {
+    where.push("d.deal_memo_r2_key IS NOT NULL AND d.deal_memo_r2_key != ''");
+  } else if (hasMemo === 'false') {
+    where.push("(d.deal_memo_r2_key IS NULL OR d.deal_memo_r2_key = '')");
   }
 
   const whereClause = where.join(' AND ');
