@@ -749,13 +749,29 @@ export async function fetchOutlookCalendarDelta(
     const start = new Date(Date.now() - 30 * 86400000).toISOString();
     const end = new Date(Date.now() + 90 * 86400000).toISOString();
 
-    const deltaKey = `calendar_delta:${user.id}`;
-    const storedDelta = await env.KV.get(deltaKey);
-    let url: string = storedDelta
-      ? storedDelta
-      : `https://graph.microsoft.com/v1.0/me/calendarView/delta?startDateTime=${encodeURIComponent(
-          start
-        )}&endDateTime=${encodeURIComponent(end)}&$top=50`;
+    // Calendar sync via non-delta /me/calendarView. We previously used
+    // /me/calendarView/delta with a calendar_delta:<user_id> KV cursor, but
+    // production audit 2026-04-30 found `fetched_calendar=0` on every recent
+    // run with no KV delta tokens stored for any user, despite the diagnostic
+    // /api/admin/diagnose-calendar-sync (which uses non-delta) returning real
+    // events for the same user with the same token (Tony: 10 events in the
+    // 30-day window). The /delta variant was returning empty value[] on the
+    // bootstrap call without surfacing 410/400 — silent zero. Switching to
+    // non-delta:
+    //   • bootstraps reliably from token alone (no KV state required)
+    //   • paginates via @odata.nextLink (same control flow as before)
+    //   • drops @odata.deltaLink handling since there's no delta cursor
+    //   • costs an extra full fetch per hour vs incremental — at ~10 events/
+    //     user-month for our workload this is well under the 8000-call/10-min
+    //     soft limit checkGraphRateLimit enforces
+    //   • upsertOutlookEvent's ON CONFLICT(outlook_event_id) DO UPDATE makes
+    //     re-fetching every hour idempotent, no duplicate rows
+    //   • tradeoff: deletions in Outlook aren't reflected (no tombstones).
+    //     Acceptable for now; can layer a soft-delete pass later if needed.
+    let url: string =
+      `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${encodeURIComponent(
+        start
+      )}&endDateTime=${encodeURIComponent(end)}&$top=50`;
 
     const events: OutlookCalendarEvent[] = [];
 
@@ -776,17 +792,7 @@ export async function fetchOutlookCalendarDelta(
 
         if (!resp.ok) {
           const status = resp.status;
-          // 410 Gone is the documented signal for "delta token expired";
-          // however Microsoft Graph also returns 400 with errors like
-          // "Resync required" or "Bad delta link" when the delta is stale,
-          // so treat 400 the same way: discard delta, log, retry next run
-          // with a fresh full sync. Audit 2026-04-28: Lucas, Alvaro, and
-          // Tony all sat with broken deltas for >24h because we only handled
-          // 410.
-          if (status === 410 || status === 400) {
-            await env.KV.delete(deltaKey);
-            console.warn(`[outlook] Calendar delta token rejected (HTTP ${status}) for user ${user.id}, cleared for full re-sync`);
-          } else if (status === 401) {
+          if (status === 401) {
             await recordTokenFailure(user.id, 'outlook', env);
           }
           result.errors.push({ user_id: user.id, error: `graph_api_error`, http_status: status });
@@ -796,20 +802,10 @@ export async function fetchOutlookCalendarDelta(
         const data = (await resp.json()) as {
           value: OutlookCalendarEvent[];
           '@odata.nextLink'?: string;
-          '@odata.deltaLink'?: string;
         };
         events.push(...(data.value || []));
 
-        if (data['@odata.nextLink']) {
-          url = data['@odata.nextLink'];
-        } else {
-          if (data['@odata.deltaLink']) {
-            await env.KV.put(deltaKey, data['@odata.deltaLink'], {
-              expirationTtl: 2592000, // 30 days
-            });
-          }
-          url = '';
-        }
+        url = data['@odata.nextLink'] || '';
       }
     } catch (e) {
       console.error(`Outlook calendar sync error for user ${user.id}:`, e);
