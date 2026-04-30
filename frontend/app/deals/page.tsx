@@ -14,6 +14,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Filter,
+  Check,
+  Trash2,
 } from 'lucide-react';
 
 type DealStage =
@@ -74,6 +76,77 @@ export default function DealsPage() {
   const [dragOverStage, setDragOverStage] = React.useState<string | null>(null);
   const [refreshKey, setRefreshKey] = React.useState(0);
   const [filterPanelOpen, setFilterPanelOpen] = React.useState(false);
+  /* Day-5 Phase C: bulk selection state. Set of selected deal IDs; cleared
+     on every fresh data load (deals re-fetched after a filter / sort change
+     would otherwise leave stale selection refs around). */
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  const [bulkConfirmArchive, setBulkConfirmArchive] = React.useState(false);
+
+  function toggleSelected(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function clearSelection() {
+    setSelectedIds(new Set());
+  }
+
+  async function bulkSetStage(stage: string) {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    try {
+      const r = await api.bulkUpdateDeals({
+        deal_ids: Array.from(selectedIds),
+        updates: { stage },
+      });
+      setToast(`${r.updated_count} deal${r.updated_count === 1 ? '' : 's'} moved to ${STAGES.find(s => s.key === stage)?.label || stage}`);
+      clearSelection();
+      setRefreshKey(k => k + 1);
+    } catch (e: any) {
+      setToast(`Bulk update failed: ${e?.message || 'unknown'}`);
+    }
+    setBulkBusy(false);
+  }
+  async function bulkSetOwner(ownerId: string | null) {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    try {
+      const r = await api.bulkUpdateDeals({
+        deal_ids: Array.from(selectedIds),
+        updates: { owner_id: ownerId },
+      });
+      const label = ownerId
+        ? (users.find(u => u.id === ownerId)?.full_name || users.find(u => u.id === ownerId)?.email || 'user')
+        : 'unassigned';
+      setToast(`${r.updated_count} deal${r.updated_count === 1 ? '' : 's'} → ${label}`);
+      clearSelection();
+      setRefreshKey(k => k + 1);
+    } catch (e: any) {
+      setToast(`Bulk reassign failed: ${e?.message || 'unknown'}`);
+    }
+    setBulkBusy(false);
+  }
+  async function bulkArchive() {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    try {
+      const r = await api.bulkUpdateDeals({
+        deal_ids: Array.from(selectedIds),
+        archive: true,
+      });
+      setToast(`${r.updated_count} deal${r.updated_count === 1 ? '' : 's'} archived`);
+      clearSelection();
+      setBulkConfirmArchive(false);
+      setRefreshKey(k => k + 1);
+    } catch (e: any) {
+      setToast(`Bulk archive failed: ${e?.message || 'unknown'}`);
+    }
+    setBulkBusy(false);
+  }
 
   /* ── Day-5 Phase A: filter state. URL is the source of truth — values
        persist across refresh and share-links. Filter row updates the URL,
@@ -412,6 +485,8 @@ export default function DealsPage() {
                           isDragging={dragDealId === deal.id}
                           onDragStart={handleDragStart}
                           onDragEnd={handleDragEnd}
+                          selected={selectedIds.has(deal.id)}
+                          onToggleSelect={() => toggleSelected(deal.id)}
                         />
                       ))}
                     </div>
@@ -439,6 +514,53 @@ export default function DealsPage() {
           background: rgba(255,255,255,0.22);
         }
       `}} />
+
+      {/* ── Day-5 Phase C: bulk action bar. Floats at the bottom when 1+
+          deals are selected. Stays out of the way otherwise. ── */}
+      {selectedIds.size > 0 && (
+        <BulkActionBar
+          selectedCount={selectedIds.size}
+          users={users}
+          busy={bulkBusy}
+          onSetStage={bulkSetStage}
+          onSetOwner={bulkSetOwner}
+          onArchive={() => setBulkConfirmArchive(true)}
+          onClear={clearSelection}
+        />
+      )}
+
+      {bulkConfirmArchive && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+          onClick={() => !bulkBusy && setBulkConfirmArchive(false)}
+        >
+          <div
+            className="bg-bg-elevated rounded-2xl w-full max-w-sm shadow-2xl border border-border p-6"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="text-lg font-medium text-text-primary mb-2">
+              Archive {selectedIds.size} deal{selectedIds.size === 1 ? '' : 's'}?
+            </div>
+            <div className="text-sm text-text-secondary mb-4">
+              Archived deals are soft-deleted (hidden from the board) but kept in the database
+              for audit / restore. This is reversible — contact an admin to recover if needed.
+            </div>
+            <div className="flex justify-end gap-3">
+              <button className="btn-ghost" onClick={() => setBulkConfirmArchive(false)} disabled={bulkBusy}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                style={{ background: '#DC2626', borderColor: '#DC2626' }}
+                onClick={bulkArchive}
+                disabled={bulkBusy}
+              >
+                {bulkBusy ? 'Archiving...' : 'Archive'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Create Deal Modal ── */}
       {modalOpen && (
@@ -595,12 +717,14 @@ function readDealIntelligence(deal: any): DealIntelligence {
   };
 }
 
-function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
+function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd, selected, onToggleSelect }: {
   deal: any;
   stageColor: string;
   isDragging: boolean;
   onDragStart: (e: React.DragEvent, id: string) => void;
   onDragEnd: () => void;
+  selected: boolean;
+  onToggleSelect: () => void;
 }) {
   const daysInStage = deal.stage_changed_at
     ? Math.floor((Date.now() - new Date(deal.stage_changed_at).getTime()) / 86_400_000)
@@ -645,11 +769,25 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
         onDragEnd={onDragEnd}
         className={`card cursor-grab active:cursor-grabbing hover:border-border-hover transition-all group ${
           isDragging ? 'opacity-40 scale-95' : ''
-        }`}
+        } ${selected ? 'ring-2 ring-accent-magenta/40' : ''}`}
         style={{ borderLeft: `3px solid ${stageColor}20` }}
       >
-        {/* Top row: grip + title + company */}
+        {/* Top row: select checkbox + grip + title + company. Checkbox click
+            stops propagation so it never navigates to detail. */}
         <div className="flex items-start gap-1.5">
+          <button
+            type="button"
+            onClick={e => { e.preventDefault(); e.stopPropagation(); onToggleSelect(); }}
+            className={`shrink-0 mt-0.5 w-3.5 h-3.5 rounded flex items-center justify-center transition-all ${
+              selected
+                ? 'bg-accent-magenta border-accent-magenta'
+                : 'border border-white/15 opacity-0 group-hover:opacity-100 hover:border-white/40'
+            }`}
+            title={selected ? 'Deselect' : 'Select for bulk action'}
+            style={{ borderWidth: 1 }}
+          >
+            {selected && <Check size={10} className="text-white" />}
+          </button>
           <GripVertical
             size={14}
             className="text-text-muted/30 shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
@@ -881,6 +1019,135 @@ function formatCurrency(v: number): string {
   if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
   if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}K`;
   return `$${v}`;
+}
+
+/* ── Day-5 Phase C: bulk action bar ── */
+
+function BulkActionBar({
+  selectedCount, users, busy, onSetStage, onSetOwner, onArchive, onClear,
+}: {
+  selectedCount: number;
+  users: any[];
+  busy: boolean;
+  onSetStage: (stage: string) => void;
+  onSetOwner: (ownerId: string | null) => void;
+  onArchive: () => void;
+  onClear: () => void;
+}) {
+  const [stagePickerOpen, setStagePickerOpen] = React.useState(false);
+  const [ownerPickerOpen, setOwnerPickerOpen] = React.useState(false);
+
+  // Close pickers on outside click. Lightweight — both are simple dropdowns
+  // and don't justify a portal / focus-trap.
+  React.useEffect(() => {
+    if (!stagePickerOpen && !ownerPickerOpen) return;
+    function onClick(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (!target.closest('[data-bulk-picker]')) {
+        setStagePickerOpen(false);
+        setOwnerPickerOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [stagePickerOpen, ownerPickerOpen]);
+
+  return (
+    <div
+      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 rounded-xl shadow-2xl px-4 py-3 flex items-center gap-3"
+      style={{
+        background: '#1A1A1F',
+        border: '1px solid rgba(217,70,168,0.30)',
+        borderLeft: '3px solid #D946A8',
+      }}
+    >
+      <span className="text-sm text-text-primary font-medium">
+        {selectedCount} selected
+      </span>
+
+      <div className="w-px h-5 bg-white/10" />
+
+      {/* Set stage */}
+      <div className="relative" data-bulk-picker>
+        <button
+          onClick={() => { setStagePickerOpen(o => !o); setOwnerPickerOpen(false); }}
+          disabled={busy}
+          className="btn-secondary text-xs py-1 disabled:opacity-50"
+        >
+          Set stage…
+        </button>
+        {stagePickerOpen && (
+          <div
+            className="absolute bottom-full left-0 mb-2 rounded-lg shadow-xl py-1 min-w-[180px]"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+          >
+            {STAGES.map(s => (
+              <button
+                key={s.key}
+                onClick={() => { onSetStage(s.key); setStagePickerOpen(false); }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text-primary hover:bg-white/[0.04] text-left"
+              >
+                <span className="w-2 h-2 rounded-full shrink-0" style={{ background: s.color }} />
+                {s.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Reassign owner */}
+      <div className="relative" data-bulk-picker>
+        <button
+          onClick={() => { setOwnerPickerOpen(o => !o); setStagePickerOpen(false); }}
+          disabled={busy}
+          className="btn-secondary text-xs py-1 disabled:opacity-50"
+        >
+          Reassign…
+        </button>
+        {ownerPickerOpen && (
+          <div
+            className="absolute bottom-full left-0 mb-2 rounded-lg shadow-xl py-1 min-w-[200px] max-h-64 overflow-y-auto"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+          >
+            <button
+              onClick={() => { onSetOwner(null); setOwnerPickerOpen(false); }}
+              className="w-full px-3 py-1.5 text-xs text-text-muted hover:bg-white/[0.04] text-left italic"
+            >
+              Unassigned
+            </button>
+            {users.map(u => (
+              <button
+                key={u.id}
+                onClick={() => { onSetOwner(u.id); setOwnerPickerOpen(false); }}
+                className="w-full px-3 py-1.5 text-xs text-text-primary hover:bg-white/[0.04] text-left"
+              >
+                {u.full_name || u.email}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Archive */}
+      <button
+        onClick={onArchive}
+        disabled={busy}
+        className="btn-ghost text-xs py-1 flex items-center gap-1 text-red-400 hover:text-red-300 disabled:opacity-50"
+      >
+        <Trash2 size={12} /> Archive
+      </button>
+
+      <div className="w-px h-5 bg-white/10" />
+
+      <button
+        onClick={onClear}
+        disabled={busy}
+        className="btn-ghost text-xs py-1 disabled:opacity-50"
+      >
+        Clear
+      </button>
+    </div>
+  );
 }
 
 /* ── Day-5 Phase A: filter panel ── */

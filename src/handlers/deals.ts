@@ -445,6 +445,166 @@ export async function updateDeal(
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/deals/bulk-update — Day-5 Phase C
+// ---------------------------------------------------------------------------
+// Body: { deal_ids: string[], updates: { stage?, owner_id?, ... }, archive?: boolean }
+//
+// Applies the same field whitelist as updateDeal to every deal_id that
+// belongs to the caller's org. archive=true is a sugar for soft-delete
+// (sets deleted_at=now) — distinct from setting stage='closed_lost' which
+// keeps the row visible on the board's Closed Lost column.
+//
+// ACL matches updateDeal: any authenticated user in the org can update any
+// deal in the org. Per-deal id ownership check is implicit in the WHERE
+// org_id=? clause; ids that don't belong to this org are silently dropped.
+//
+// Stage transitions on bulk path get the same stage_changed_at + days_in_stage
+// reset as single-deal updateDeal. last_activity_date bumped on every update.
+// Audit row emitted per deal. Re-embedding skipped — bulk operations are
+// stage / ownership / archive shifts and don't change embedding-meaningful
+// content (title/notes/thesis_fit). If a future bulk path needs content
+// updates, add reembedDeal calls per deal then.
+
+const BULK_ALLOWED_FIELDS = [
+  'stage', 'owner_id', 'instrument_type', 'lead_source', 'thesis_fit',
+  'expected_close', 'actual_close_date', 'probability',
+];
+
+export async function bulkUpdateDeals(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    deal_ids?: unknown;
+    updates?: Record<string, unknown>;
+    archive?: boolean;
+  }>(request);
+  if (!body) return errorResponse('VALIDATION_ERROR', 400, 'body required');
+
+  const dealIds = Array.isArray(body.deal_ids)
+    ? body.deal_ids.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : [];
+  if (dealIds.length === 0) {
+    return errorResponse('VALIDATION_ERROR', 400, 'deal_ids must be a non-empty array of strings');
+  }
+  if (dealIds.length > 100) {
+    return errorResponse('VALIDATION_ERROR', 400, 'bulk update capped at 100 deal_ids per call');
+  }
+
+  const archive = body.archive === true;
+  const updates = body.updates && typeof body.updates === 'object' ? body.updates : {};
+
+  if (!archive && Object.keys(updates).length === 0) {
+    return errorResponse('VALIDATION_ERROR', 400, 'either archive=true or updates with at least one field is required');
+  }
+
+  // Whitelist + validate update fields. Soft-delete via archive=true bypasses
+  // the field whitelist (it's a separate operation).
+  const filteredUpdates: Record<string, unknown> = {};
+  if (!archive) {
+    for (const k of BULK_ALLOWED_FIELDS) {
+      if (k in updates) filteredUpdates[k] = (updates as any)[k];
+    }
+    if (Object.keys(filteredUpdates).length === 0) {
+      return errorResponse('VALIDATION_ERROR', 400, `updates must include at least one of: ${BULK_ALLOWED_FIELDS.join(', ')}`);
+    }
+  }
+
+  // Fetch all matching deals in one round-trip. Org-scoped + not-deleted.
+  // Ids that don't belong to this org or are already deleted are silently
+  // dropped — no leak (we never reveal whether the id exists).
+  const placeholders = dealIds.map(() => '?').join(',');
+  const beforeRows = await env.D1.prepare(
+    `SELECT * FROM deals WHERE id IN (${placeholders}) AND org_id = ? AND deleted_at IS NULL`
+  ).bind(...dealIds, ctx.orgId).all<any>();
+  const beforeById = new Map<string, any>(beforeRows.results.map(r => [r.id, r]));
+  const matchedIds = Array.from(beforeById.keys());
+
+  if (matchedIds.length === 0) {
+    return jsonResponse({ ok: true, updated_count: 0, skipped_ids: dealIds, archived: archive });
+  }
+
+  // Build the per-deal UPDATE statements. Stage changes need stage_changed_at
+  // + days_in_stage reset on a per-deal basis (since each deal may transition
+  // from a different prior stage), so we issue one UPDATE per deal in a
+  // batch. D1's batch() commits them atomically per call.
+  const stmts: D1PreparedStatement[] = [];
+  const auditEntries: Array<{ id: string; before: any; after_partial: Record<string, unknown>; metadata: Record<string, unknown> }> = [];
+
+  for (const id of matchedIds) {
+    const before = beforeById.get(id);
+
+    if (archive) {
+      stmts.push(env.D1.prepare(
+        `UPDATE deals SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+      ).bind(id));
+      auditEntries.push({
+        id, before,
+        after_partial: { deleted_at: new Date().toISOString() },
+        metadata: { bulk: true, action: 'archive' },
+      });
+      continue;
+    }
+
+    const setFragments: string[] = [];
+    const binds: unknown[] = [];
+    const stageChanged = 'stage' in filteredUpdates && filteredUpdates.stage !== before.stage;
+
+    for (const [k, v] of Object.entries(filteredUpdates)) {
+      setFragments.push(`${k} = ?`);
+      binds.push(v);
+    }
+
+    if (stageChanged) {
+      setFragments.push(`stage_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+      setFragments.push('days_in_stage = 0');
+    }
+    setFragments.push(`last_activity_date = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+    setFragments.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+
+    stmts.push(env.D1.prepare(
+      `UPDATE deals SET ${setFragments.join(', ')} WHERE id = ?`
+    ).bind(...binds, id));
+
+    auditEntries.push({
+      id, before,
+      after_partial: { ...filteredUpdates },
+      metadata: stageChanged
+        ? { bulk: true, old_stage: before.stage, new_stage: filteredUpdates.stage }
+        : { bulk: true },
+    });
+  }
+
+  await env.D1.batch(stmts);
+
+  // Emit one audit row per affected deal. Failures here are non-fatal —
+  // the underlying update already committed, audit is best-effort observability.
+  await Promise.all(auditEntries.map(e => emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: archive ? 'soft_delete' : 'update',
+    entity_type: 'deal',
+    entity_id: e.id,
+    before_data: e.before,
+    after_data: { ...e.before, ...e.after_partial },
+    metadata: e.metadata,
+    created_at: new Date().toISOString(),
+  }).catch(err => {
+    console.error(`[bulk-update] audit emit failed for deal ${e.id}:`, err);
+  })));
+
+  await invalidateRagCache(ctx.orgId, env);
+
+  return jsonResponse({
+    ok: true,
+    updated_count: matchedIds.length,
+    skipped_ids: dealIds.filter(id => !beforeById.has(id)),
+    archived: archive,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // DELETE /api/deals/:id  (soft delete)
 // ---------------------------------------------------------------------------
 

@@ -190,6 +190,16 @@ export const api = {
     request<{ deal: any }>('/deals', { method: 'POST', body: JSON.stringify(data) }),
   updateDeal: (id: string, data: any) =>
     request<{ deal: any }>(`/deals/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  // Day-5 Phase C: bulk update / bulk archive. Backend caps at 100 ids per
+  // call. archive=true sets deleted_at=now (soft delete); otherwise the
+  // updates object is field-whitelisted server-side (stage / owner_id /
+  // instrument_type / lead_source / thesis_fit / expected_close /
+  // actual_close_date / probability).
+  bulkUpdateDeals: (data: { deal_ids: string[]; updates?: Record<string, unknown>; archive?: boolean }) =>
+    request<{ ok: boolean; updated_count: number; skipped_ids: string[]; archived: boolean }>(
+      '/deals/bulk-update',
+      { method: 'POST', body: JSON.stringify(data) }
+    ),
   getDeal: (id: string) =>
     request<{ deal: any; contacts: { theirs: any[]; ours: any[]; other: any[] }; action_items: any[]; notes: any[]; company: any; users: any[] }>(`/deals/${id}`),
   deleteDeal: (id: string) =>

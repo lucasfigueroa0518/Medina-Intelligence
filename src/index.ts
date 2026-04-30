@@ -322,6 +322,12 @@ async function routeAuthenticated(
     if (method === 'GET') return Deals.listDeals(request, ctx, env);
     if (method === 'POST') return Deals.createDeal(request, ctx, env);
   }
+  // Day-5 Phase C bulk operations endpoint. Note: registered before the
+  // /api/deals/:id pattern below since '/bulk-update' would otherwise be
+  // captured as a single-deal id.
+  if (path === '/api/deals/bulk-update' && method === 'POST') {
+    return Deals.bulkUpdateDeals(request, ctx, env);
+  }
   m = path.match(/^\/api\/deals\/([^/]+)\/associations$/);
   if (m && method === 'GET') return Deals.getDealAssociations(m[1], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/timeline$/);
