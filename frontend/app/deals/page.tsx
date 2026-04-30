@@ -12,7 +12,6 @@ import {
   AlertCircle,
   ChevronLeft,
   ChevronRight,
-  Users,
 } from 'lucide-react';
 
 type DealStage =
@@ -463,6 +462,39 @@ export default function DealsPage() {
 
 /* ── Deal Card ── */
 
+// Deal Intelligence shape — populated by T3's Wave-6 evaluator into the
+// deal_intelligence table per docs/deal-intelligence-contract.md. Backend
+// hasn't joined this in yet (depends on T3 schema ack), so today every card
+// renders empty-state for the four fields. When T3 ships, listDeals' SELECT
+// will start returning these fields and the card lights up automatically.
+interface DealIntelligence {
+  sentiment_score: number | null;             // -1..+1
+  sentiment_direction: 'improving' | 'stable' | 'declining' | null;
+  active_topics: string[];                    // [] when none
+  risk_signal_count: number;                  // 0 when none
+  momentum_trend: 'increasing' | 'decreasing' | 'stable' | null;
+  momentum_buckets: Array<{ week_start: string; count: number }>;  // [] when none
+}
+
+function readDealIntelligence(deal: any): DealIntelligence {
+  const di = deal.deal_intelligence || {};
+  const parseJson = (v: unknown): any[] => {
+    if (Array.isArray(v)) return v;
+    if (typeof v !== 'string') return [];
+    try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; }
+  };
+  return {
+    sentiment_score: typeof di.sentiment_score === 'number' ? di.sentiment_score : null,
+    sentiment_direction: di.sentiment_direction ?? null,
+    active_topics: parseJson(di.active_topics).filter((s: unknown): s is string => typeof s === 'string'),
+    risk_signal_count: Number.isFinite(di.risk_signal_count) ? Number(di.risk_signal_count) : 0,
+    momentum_trend: di.momentum_trend ?? null,
+    momentum_buckets: parseJson(di.momentum_buckets).filter((b: any) =>
+      b && typeof b === 'object' && typeof b.week_start === 'string' && Number.isFinite(b.count)
+    ),
+  };
+}
+
 function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
   deal: any;
   stageColor: string;
@@ -475,11 +507,11 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
     : deal.days_in_stage || 0;
 
   // Day-4 fix: deals.last_activity_date is stale-by-design (only bumped by
-  // manual deal edits, NOT by inbound conversations). Backend now also returns
+  // manual deal edits, NOT by inbound conversations). Backend also returns
   // last_inferred_activity_date computed at query time from the
   // deal_contacts → conversation_contacts → conversations join. Prefer the
-  // inferred value; fall back to the legacy column then created_at so we never
-  // render NaN on first-day deals.
+  // inferred value; fall back to the legacy column then created_at so we
+  // never render NaN on first-day deals.
   const lastActivityIso: string | undefined =
     deal.last_inferred_activity_date ?? deal.last_activity_date ?? deal.created_at;
   const lastActivity = lastActivityIso
@@ -496,16 +528,14 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
     return !deal.title.toLowerCase().includes(deal.company_name.toLowerCase());
   })();
 
-  /* AI probability badge: show when probability is NOT manually set */
-  const isAiProbability = (() => {
-    try {
-      const sm = typeof deal.source_metadata === 'string'
-        ? JSON.parse(deal.source_metadata)
-        : deal.source_metadata;
-      if (!sm?.probability) return true;
-      return sm.probability.source !== 'manual';
-    } catch { return true; }
-  })();
+  /* Day-5 redesign: card DNA shifts from stats-clutter to intelligence-feed.
+     PR #2's owner avatar / lead_source badge / expected_close tag were
+     intentionally not carried forward. Probability %, open_items_count, and
+     contacts_count are also removed as clutter under the new framing. The
+     card now surfaces sentiment / topics / risk / momentum from
+     deal_intelligence (T3 evaluator wave) — empty-state today, fills in
+     when T3 lands. See docs/deal-intelligence-contract.md. */
+  const intel = readDealIntelligence(deal);
 
   return (
     <Link href={`/deals/${deal.id}`}>
@@ -541,54 +571,150 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
           </div>
         )}
 
-        {/* Bottom row: activity dot, days badge, people count, probability */}
-        <div className="flex items-center justify-between mt-2.5">
-          <div className="flex items-center gap-2">
-            {/* Activity dot (green/yellow/gray, no label) */}
-            <div
-              className="w-1.5 h-1.5 rounded-full"
-              style={{ background: activityColor }}
-              title={`Last activity: ${Math.floor(lastActivity)}d ago`}
-            />
+        {/* Sentiment + momentum row — always renders, neutral when empty.
+            Always-rendered so the card height stays stable when data lands. */}
+        <div className="flex items-center gap-2 mt-2.5">
+          <MomentumSparkline buckets={intel.momentum_buckets} trend={intel.momentum_trend} />
+          <SentimentIndicator score={intel.sentiment_score} direction={intel.sentiment_direction} />
+        </div>
 
-            {/* Days in stage badge */}
-            {daysInStage > 0 && (
-              <span className="text-[10px] text-text-muted font-accent font-semibold">{daysInStage}d</span>
-            )}
-
-            {/* Open items */}
-            {deal.open_items_count > 0 && (
-              <span className="flex items-center gap-0.5 text-[10px] text-semantic-warning font-accent">
-                <AlertCircle size={10} />
-                {deal.open_items_count}
+        {/* Topic chips — hidden entirely when empty. */}
+        {intel.active_topics.length > 0 && (
+          <div className="flex flex-wrap gap-1 mt-1.5">
+            {intel.active_topics.slice(0, 2).map((topic, i) => (
+              <span
+                key={`${topic}-${i}`}
+                className="text-[10px] text-text-muted font-accent px-1.5 py-0.5 rounded"
+                style={{ background: 'rgba(139,92,246,0.08)', color: '#A78BFA' }}
+              >
+                #{topic}
+              </span>
+            ))}
+            {intel.active_topics.length > 2 && (
+              <span
+                className="text-[10px] text-text-muted font-accent px-1.5 py-0.5 rounded"
+                style={{ background: 'rgba(255,255,255,0.04)' }}
+                title={intel.active_topics.slice(2).map(t => `#${t}`).join(' ')}
+              >
+                +{intel.active_topics.length - 2}
               </span>
             )}
           </div>
+        )}
 
-          <div className="flex items-center gap-2">
-            {/* People count */}
-            {deal.contacts_count > 0 && (
-              <span className="flex items-center gap-0.5 text-[10px] text-text-muted font-accent">
-                <Users size={10} />
-                {deal.contacts_count}
-              </span>
-            )}
-
-            {/* Probability */}
-            {deal.probability > 0 && (
-              <span className="flex items-center gap-1 text-[10px] text-text-muted font-accent font-semibold">
-                {(deal.probability * 100).toFixed(0)}%
-                {isAiProbability && (
-                  <span className="text-[8px] font-bold px-1 py-px rounded bg-amber-500/15 text-amber-400 leading-none font-accent">
-                    AI
-                  </span>
-                )}
-              </span>
-            )}
+        {/* Risk flag — hidden entirely when count is 0. */}
+        {intel.risk_signal_count > 0 && (
+          <div className="mt-1.5">
+            <span
+              className="inline-flex items-center gap-1 text-[10px] font-accent font-semibold px-1.5 py-0.5 rounded"
+              style={{ background: 'rgba(239,68,68,0.10)', color: '#F87171' }}
+              title={`${intel.risk_signal_count} risk signal${intel.risk_signal_count === 1 ? '' : 's'} detected`}
+            >
+              <AlertCircle size={10} />
+              {intel.risk_signal_count} risk{intel.risk_signal_count === 1 ? '' : 's'}
+            </span>
           </div>
+        )}
+
+        {/* Bottom row: activity dot + days-in-stage. Stripped of probability,
+            open_items_count, contacts_count per Day-5 reframe. */}
+        <div className="flex items-center gap-2 mt-2.5">
+          <div
+            className="w-1.5 h-1.5 rounded-full"
+            style={{ background: activityColor }}
+            title={`Last activity: ${Math.floor(lastActivity)}d ago`}
+          />
+          {daysInStage > 0 && (
+            <span className="text-[10px] text-text-muted font-accent font-semibold">{daysInStage}d in stage</span>
+          )}
+          <span className="text-[10px] text-text-muted font-accent">
+            · {Math.floor(lastActivity)}d ago
+          </span>
         </div>
       </div>
     </Link>
+  );
+}
+
+/** Inline 4-week sparkline. Empty state: flat baseline at midpoint so the
+ *  card layout stays stable. Color follows momentum_trend (green up, red
+ *  down, neutral gray for stable / null). */
+function MomentumSparkline({ buckets, trend }: {
+  buckets: Array<{ week_start: string; count: number }>;
+  trend: 'increasing' | 'decreasing' | 'stable' | null;
+}) {
+  const W = 40, H = 14, PAD = 2;
+  const color = trend === 'increasing' ? '#22C55E'
+    : trend === 'decreasing' ? '#EF4444'
+    : '#71717A';
+  const tooltip = buckets.length === 0
+    ? 'Momentum: insufficient data yet'
+    : `Momentum: ${trend ?? 'unknown'} (${buckets.length} weeks)`;
+
+  // Empty state: flat horizontal baseline at midpoint. Card never shifts.
+  if (buckets.length === 0) {
+    return (
+      <svg width={W} height={H} className="shrink-0">
+        <title>{tooltip}</title>
+        <line x1={PAD} y1={H / 2} x2={W - PAD} y2={H / 2}
+          stroke="#71717A" strokeWidth={1} strokeDasharray="2 2" opacity={0.4} />
+      </svg>
+    );
+  }
+
+  const counts = buckets.map(b => b.count);
+  const maxC = Math.max(...counts, 1);
+  const stepX = (W - 2 * PAD) / Math.max(buckets.length - 1, 1);
+  const points = counts.map((c, i) => {
+    const x = PAD + i * stepX;
+    const y = H - PAD - ((c / maxC) * (H - 2 * PAD));
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  return (
+    <svg width={W} height={H} className="shrink-0">
+      <title>{tooltip}</title>
+      <polyline points={points} fill="none" stroke={color} strokeWidth={1.5}
+        strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/** Sentiment indicator. Single visual: directional arrow + colored chip.
+ *  Empty state: neutral gray dash. */
+function SentimentIndicator({ score, direction }: {
+  score: number | null;
+  direction: 'improving' | 'stable' | 'declining' | null;
+}) {
+  // Empty state when score is null AND direction is null.
+  if (score === null && direction === null) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[10px] text-text-muted font-accent"
+        title="Sentiment: insufficient data yet"
+      >
+        <span className="w-1.5 h-1.5 rounded-full" style={{ background: '#71717A' }} />
+        —
+      </span>
+    );
+  }
+
+  const dirLabel = direction === 'improving' ? '↑'
+    : direction === 'declining' ? '↓'
+    : '→';
+  const color = direction === 'improving' ? '#22C55E'
+    : direction === 'declining' ? '#EF4444'
+    : '#A1A1AA';
+  const scoreLabel = score === null ? '' : ` ${score >= 0 ? '+' : ''}${score.toFixed(2)}`;
+
+  return (
+    <span
+      className="inline-flex items-center gap-0.5 text-[10px] font-accent font-semibold"
+      style={{ color }}
+      title={`Sentiment: ${direction ?? 'unknown'}${scoreLabel}`}
+    >
+      {dirLabel}{scoreLabel}
+    </span>
   );
 }
 
