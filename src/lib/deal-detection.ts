@@ -46,10 +46,13 @@ const DEAL_KEYWORDS = [
   'definitive agreement',
 ];
 
-// Cheap pre-filter to avoid burning Claude budget on every email.
+// Cheap pre-filter to avoid burning Claude budget on every item. Phase C
+// (2026-04-30): widened to include `calendar_event` so meeting transcripts
+// flow through the same detection pipeline as emails. Slack messages and
+// news items still excluded — they're noisier signal.
 function looksLikeDealCandidate(item: ClassifiedItem): boolean {
   if (!item.companyId) return false;
-  if (item.type !== 'email') return false;
+  if (item.type !== 'email' && item.type !== 'calendar_event') return false;
   const haystack = `${item.subject || ''}\n${item.bodyText || ''}\n${item.bodyPreview || ''}`.toLowerCase();
   if (haystack.length < 80) return false;
   return DEAL_KEYWORDS.some(kw => haystack.includes(kw));
@@ -94,7 +97,61 @@ export async function detectAndStageDealSignals(
     if (signal.confidence < 0.7) continue;
     if (!signal.title || !signal.stage) continue;
 
-    // Resolve the company name for the staged title fallback
+    // Phase C: when a deal already exists for this company, treat the
+    // signal as a LINK candidate (not a new-deal candidate). For
+    // transcripts (item.type='calendar_event') the link target is
+    // event_deals; for emails it's conversation_deals.
+    //   confidence ≥ 0.9 → auto-link directly via junction
+    //   0.7 ≤ confidence < 0.9 → propose via approval_queue 'link_to_deal'
+    // Pre-existing item.type='email' behavior preserved when no deal
+    // exists yet (still stages create_deal as before).
+    const {
+      findOpenDealForCompany,
+      linkConversationToDeal,
+      linkEventToDeal,
+      proposeLinkToDeal,
+    } = await import('./deal-association');
+
+    const existingDeal = await findOpenDealForCompany(item.companyId!, orgId, env);
+    if (existingDeal) {
+      const kind: 'conversation' | 'event' =
+        item.type === 'calendar_event' ? 'event' : 'conversation';
+      if (signal.confidence >= 0.9) {
+        const r = kind === 'event'
+          ? await linkEventToDeal(item.entityId, existingDeal.id, 'llm_classification', signal.confidence, orgId, env)
+          : await linkConversationToDeal(item.entityId, existingDeal.id, 'llm_classification', signal.confidence, orgId, env);
+        if (r.inserted) {
+          staged++;
+          console.log(
+            `[deal-detect] auto-linked ${kind}=${item.entityId} → deal=${existingDeal.id} (${existingDeal.title}) confidence=${signal.confidence}`
+          );
+        }
+      } else {
+        const r = await proposeLinkToDeal(
+          {
+            kind,
+            sourceId: item.entityId,
+            dealId: existingDeal.id,
+            orgId,
+            confidence: signal.confidence,
+            sourceCommunicationId: item.entityId,
+            visibility: item.visibility,
+          },
+          env
+        );
+        if (r.inserted) {
+          staged++;
+          console.log(
+            `[deal-detect] proposed link ${kind}=${item.entityId} → deal=${existingDeal.id} confidence=${signal.confidence}`
+          );
+        }
+      }
+      continue;
+    }
+
+    // No existing deal for this company — stage create_deal proposal as
+    // before (works for both emails and transcripts now that the
+    // pre-filter allows calendar_event).
     const company = await env.D1.prepare(
       'SELECT name FROM companies WHERE id = ? AND org_id = ?'
     ).bind(item.companyId!, orgId).first<{ name: string }>();
@@ -110,9 +167,13 @@ export async function detectAndStageDealSignals(
       evidence: signal.evidence?.slice(0, 500),
       source_communication_id: item.entityId,
       source_sent_at: item.sentAt,
+      // Phase C: tells commitCreateDealApproval which junction to write
+      // when the proposal is accepted. Defaults to conversation for
+      // back-compat with pre-Phase-C proposals.
+      source_kind: item.type === 'calendar_event' ? 'event' : 'conversation',
     });
 
-    // No per-cycle component — same source email must collapse across cycles.
+    // No per-cycle component — same source email/transcript must collapse across cycles.
     const idempotencyKey = `${orgId}:deal:${item.companyId}:${hashShort(item.entityId)}`;
 
     const result = await env.D1.prepare(
@@ -135,7 +196,7 @@ export async function detectAndStageDealSignals(
     if (result.meta?.changes) {
       staged++;
       console.log(
-        `[deal-detect] staged deal "${dealTitle}" company=${item.companyId} stage=${signal.stage} confidence=${signal.confidence}`
+        `[deal-detect] staged create_deal "${dealTitle}" from ${item.type}=${item.entityId} company=${item.companyId} stage=${signal.stage} confidence=${signal.confidence}`
       );
     }
   }
