@@ -474,8 +474,16 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
     ? Math.floor((Date.now() - new Date(deal.stage_changed_at).getTime()) / 86_400_000)
     : deal.days_in_stage || 0;
 
-  const lastActivity = deal.last_activity_date
-    ? (Date.now() - new Date(deal.last_activity_date).getTime()) / 86_400_000
+  // Day-4 fix: deals.last_activity_date is stale-by-design (only bumped by
+  // manual deal edits, NOT by inbound conversations). Backend now also returns
+  // last_inferred_activity_date computed at query time from the
+  // deal_contacts → conversation_contacts → conversations join. Prefer the
+  // inferred value; fall back to the legacy column then created_at so we never
+  // render NaN on first-day deals.
+  const lastActivityIso: string | undefined =
+    deal.last_inferred_activity_date ?? deal.last_activity_date ?? deal.created_at;
+  const lastActivity = lastActivityIso
+    ? (Date.now() - new Date(lastActivityIso).getTime()) / 86_400_000
     : 999;
   const activityColor = lastActivity <= 2 ? '#22C55E' : lastActivity <= 7 ? '#EAB308' : '#71717A';
 

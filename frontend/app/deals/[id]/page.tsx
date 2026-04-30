@@ -668,21 +668,31 @@ export default function DealDetailPage() {
             )}
           </div>
 
-          {/* Last Activity */}
-          <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
-            <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Last Activity</div>
-            <div className="flex items-center gap-2">
-              <span className="text-2xl font-semibold tabular-nums font-accent">
-                {deal.last_activity_date ? fmtRel(deal.last_activity_date) : '--'}
-              </span>
-              <Clock size={12} className="text-text-muted" />
-            </div>
-            {deal.last_activity_date && (
-              <div className="text-[9px] text-text-muted mt-1">
-                {new Date(deal.last_activity_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+          {/* Last Activity — Day-4 fix: prefer query-time inferred value
+              (deal_contacts → conversation_contacts → conversations MAX) over
+              the stale-by-design deals.last_activity_date column, which is
+              only bumped by manual deal edits. Fall back to the legacy
+              column then created_at so first-day deals don't render '--'. */}
+          {(() => {
+            const lastActivityIso: string | undefined =
+              (deal as any).last_inferred_activity_date ?? deal.last_activity_date ?? deal.created_at;
+            return (
+              <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Last Activity</div>
+                <div className="flex items-center gap-2">
+                  <span className="text-2xl font-semibold tabular-nums font-accent">
+                    {lastActivityIso ? fmtRel(lastActivityIso) : '--'}
+                  </span>
+                  <Clock size={12} className="text-text-muted" />
+                </div>
+                {lastActivityIso && (
+                  <div className="text-[9px] text-text-muted mt-1">
+                    {new Date(lastActivityIso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                  </div>
+                )}
               </div>
-            )}
-          </div>
+            );
+          })()}
 
           {/* Deal Age */}
           <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
