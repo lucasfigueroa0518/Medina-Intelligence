@@ -13,6 +13,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Users,
+  Calendar,
 } from 'lucide-react';
 
 type DealStage =
@@ -507,6 +508,48 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
     } catch { return true; }
   })();
 
+  /* Day-4 Change 3: lead_source badge — only render when populated. */
+  const leadSource = typeof deal.lead_source === 'string' ? deal.lead_source.trim() : '';
+  const leadSourceShort = leadSource.length > 20 ? leadSource.slice(0, 19) + '…' : leadSource;
+
+  /* Day-4 Change 4: expected_close tag — only render when set AND within 30
+     days. Past-due rendered as red "Overdue [date]". 7-14d amber, <7d red,
+     >14d (still ≤30d) neutral gray. */
+  const expectedClose = (() => {
+    if (!deal.expected_close) return null;
+    const closeMs = new Date(deal.expected_close).getTime();
+    if (!Number.isFinite(closeMs)) return null;
+    const daysUntil = Math.floor((closeMs - Date.now()) / 86_400_000);
+    if (daysUntil > 30) return null;
+    const dateLabel = new Date(deal.expected_close).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    if (daysUntil < 0) return { label: `Overdue ${dateLabel}`, color: '#EF4444', bg: 'rgba(239,68,68,0.12)' };
+    if (daysUntil < 7)  return { label: `Closes ${dateLabel}`, color: '#EF4444', bg: 'rgba(239,68,68,0.12)' };
+    if (daysUntil <= 14) return { label: `Closes ${dateLabel}`, color: '#F59E0B', bg: 'rgba(245,158,11,0.12)' };
+    return { label: `Closes ${dateLabel}`, color: '#A1A1AA', bg: 'rgba(161,161,170,0.10)' };
+  })();
+
+  /* Day-4 Change 2: owner avatar — initial circle keyed off owner_name (or
+     owner_email's first letter as fallback). Color is a deterministic hash of
+     owner_id over a small palette so the same owner gets the same hue
+     everywhere. Detail page uses brand-gradient avatars; on the dense board
+     card a flat color reads cleaner against the surrounding chip clutter. */
+  const ownerInitial = (() => {
+    const name = (deal.owner_name || '').trim();
+    if (name) return name.charAt(0).toUpperCase();
+    const email = (deal.owner_email || '').trim();
+    if (email) return email.charAt(0).toUpperCase();
+    return '';
+  })();
+  const ownerColor = (() => {
+    if (!deal.owner_id) return null;
+    const palette = ['#8B5CF6', '#06B6D4', '#22C55E', '#F97316', '#EAB308', '#EC4899', '#3B82F6'];
+    let h = 0;
+    const id = String(deal.owner_id);
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+    return palette[Math.abs(h) % palette.length];
+  })();
+  const ownerTooltip = deal.owner_name || deal.owner_email || 'Unassigned';
+
   return (
     <Link href={`/deals/${deal.id}`}>
       <div
@@ -541,6 +584,19 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
           </div>
         )}
 
+        {/* Day-4 Change 3: lead_source badge — neutral, lowercase, truncated */}
+        {leadSourceShort && (
+          <div className="mt-1.5">
+            <span
+              className="inline-block text-[10px] text-text-muted lowercase font-accent px-1.5 py-0.5 rounded"
+              style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.06)' }}
+              title={leadSource}
+            >
+              {leadSourceShort}
+            </span>
+          </div>
+        )}
+
         {/* Bottom row: activity dot, days badge, people count, probability */}
         <div className="flex items-center justify-between mt-2.5">
           <div className="flex items-center gap-2">
@@ -561,6 +617,18 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
               <span className="flex items-center gap-0.5 text-[10px] text-semantic-warning font-accent">
                 <AlertCircle size={10} />
                 {deal.open_items_count}
+              </span>
+            )}
+
+            {/* Day-4 Change 4: expected_close tag — only when within 30d */}
+            {expectedClose && (
+              <span
+                className="flex items-center gap-0.5 text-[10px] font-accent font-semibold px-1 py-px rounded"
+                style={{ color: expectedClose.color, background: expectedClose.bg }}
+                title={`Expected close: ${new Date(deal.expected_close).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`}
+              >
+                <Calendar size={10} />
+                {expectedClose.label}
               </span>
             )}
           </div>
@@ -584,6 +652,24 @@ function DealCard({ deal, stageColor, isDragging, onDragStart, onDragEnd }: {
                   </span>
                 )}
               </span>
+            )}
+
+            {/* Day-4 Change 2: owner avatar — initial circle (deterministic
+                color hash). Dashed empty circle when unassigned. */}
+            {ownerColor && ownerInitial ? (
+              <span
+                className="inline-flex items-center justify-center rounded-full text-[9px] font-semibold text-white shrink-0"
+                style={{ width: 16, height: 16, background: ownerColor }}
+                title={ownerTooltip}
+              >
+                {ownerInitial}
+              </span>
+            ) : (
+              <span
+                className="inline-flex items-center justify-center rounded-full shrink-0"
+                style={{ width: 16, height: 16, border: '1px dashed rgba(255,255,255,0.2)' }}
+                title="Unassigned"
+              />
             )}
           </div>
         </div>
