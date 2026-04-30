@@ -6,6 +6,46 @@ import { findDuplicateCompany } from './discovery';
 import { updateEntityInIndex } from './entity-index';
 import { canReadEmailContent, getSharingFlags } from './helpers';
 
+// ACL redaction: nulls fields whose value may have been derived from private
+// conversation content (LLM-extracted topics, auto-populated deal notes,
+// raw-data R2 keys). Owner gets the full row. Membership-aware filtering of
+// conversation rows happens via canReadEmailContent in the conversation
+// tools — this helper handles entity-level fields that aren't conversation
+// rows but still expose synthesized email/meeting context.
+//
+// Mutates `entity` in place and returns it for ergonomic chaining. Safe
+// because callers are working with freshly-allocated D1 row objects.
+const CONTACT_REDACTED_FIELDS = [
+  'topics_of_interest',
+  'pain_points',
+  'investment_thesis_tags',
+  'next_followup_note',
+  // Defense-in-depth: R2 keys aren't fetchable through the agent tools
+  // today, but a future read-blob tool would expose them. Strip now.
+  'r2_key',
+  'linkedin_data_r2_key',
+  'pitchbook_data_r2_key',
+  'web_enrichment_r2_key',
+] as const;
+const DEAL_REDACTED_FIELDS = [
+  'notes',           // auto-populated with email/conversation evidence (cleanup.ts)
+  'thesis_fit',      // LLM-derived from communications
+  'deal_memo_r2_key', // defense-in-depth
+] as const;
+
+function redactSensitiveFields<T extends Record<string, any>>(
+  entity: T,
+  userRole: string,
+  entityType: 'contact' | 'deal',
+): T {
+  if (userRole === 'owner') return entity;
+  const fields = entityType === 'contact' ? CONTACT_REDACTED_FIELDS : DEAL_REDACTED_FIELDS;
+  for (const f of fields) {
+    if (f in entity) entity[f as keyof T] = null as T[keyof T];
+  }
+  return entity;
+}
+
 // ---------------------------------------------------------------------------
 // READ TOOLS
 // ---------------------------------------------------------------------------
@@ -222,7 +262,9 @@ export async function searchCompanies(
   return { companies: result.results, count: result.results.length };
 }
 
-// ACL: entity-level CRM data only — see searchContacts comment.
+// ACL redaction: For non-owner users, fields derived from private conversation
+// content (e.g., LLM-extracted topics_of_interest, deal notes) are nulled.
+// See helpers.ts canReadEmailContent for the conversation-row equivalent.
 export async function searchDeals(
   ctx: AuthContext,
   input: { keyword?: string; stage?: string; company_id?: string; limit?: number },
@@ -259,24 +301,31 @@ export async function searchDeals(
      ORDER BY d.expected_close ASC NULLS LAST LIMIT ?`
   ).bind(...binds, limit).all();
 
-  return { deals: result.results, count: result.results.length };
+  const deals = (result.results as any[]).map(d =>
+    redactSensitiveFields(d, ctx.userRole, 'deal')
+  );
+
+  return { deals, count: deals.length };
 }
 
-// ACL: recent_conversations is filtered to rows the requesting user can read
-// per canReadEmailContent. Owner role bypasses per existing helpers.ts policy.
-// Other fields (contact, tags, deals, associations) are entity-level CRM data
-// and remain org-wide visible.
+// ACL redaction: For non-owner users, contact-level fields derived from
+// private conversation content (LLM-extracted topics_of_interest, pain_points,
+// investment_thesis_tags, manual next_followup_note, raw-data R2 keys) are
+// nulled. recent_conversations is row-filtered via canReadEmailContent —
+// strictly more secure than nulling body_preview alone, since the existence
+// + subject of a private email is also sensitive. Owner role bypasses both.
 export async function getContactDetail(
   ctx: AuthContext,
   contactId: string,
   env: Env
 ): Promise<any> {
-  const contact = await env.D1.prepare(
+  const contactRow = await env.D1.prepare(
     `SELECT c.*, co.name AS company_name
      FROM contacts c LEFT JOIN companies co ON c.company_id = co.id
      WHERE c.id = ? AND c.org_id = ? AND c.deleted_at IS NULL`
   ).bind(contactId, ctx.orgId).first();
-  if (!contact) return { error: 'Contact not found' };
+  if (!contactRow) return { error: 'Contact not found' };
+  const contact = redactSensitiveFields(contactRow as Record<string, any>, ctx.userRole, 'contact');
 
   const [tags, recentConvosRaw, deals, associations, sharingFlags] = await Promise.all([
     env.D1.prepare(
@@ -375,20 +424,26 @@ export async function getCompanyDetail(
   };
 }
 
-// ACL: entity-level CRM data only — see searchContacts comment.
+// ACL redaction: For non-owner users, deal-level fields derived from private
+// conversation content (auto-populated `notes` evidence, LLM-derived
+// `thesis_fit`, raw-memo R2 key) are nulled. The user-authored deal_notes
+// and deal_action_items sub-arrays remain visible — they're explicit human
+// entries, not auto-extracted summaries (revisit in a follow-up if needed).
+// Owner role bypasses.
 export async function getDealDetail(
   ctx: AuthContext,
   dealId: string,
   env: Env
 ): Promise<any> {
-  const deal = await env.D1.prepare(
+  const dealRow = await env.D1.prepare(
     `SELECT d.*, co.name AS company_name, co.sector AS company_sector, u.full_name AS owner_name
      FROM deals d
      LEFT JOIN companies co ON d.company_id = co.id
      LEFT JOIN users u ON d.owner_id = u.id
      WHERE d.id = ? AND d.org_id = ? AND d.deleted_at IS NULL`
   ).bind(dealId, ctx.orgId).first();
-  if (!deal) return { error: 'Deal not found' };
+  if (!dealRow) return { error: 'Deal not found' };
+  const deal = redactSensitiveFields(dealRow as Record<string, any>, ctx.userRole, 'deal');
 
   const [contacts, actionItems, notes] = await Promise.all([
     env.D1.prepare(
