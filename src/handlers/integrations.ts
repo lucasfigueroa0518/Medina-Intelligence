@@ -170,15 +170,34 @@ export async function getIntegrationsStatus(
   };
 
   // --- Firefly: webhook URL is derived from the request host ---
+  // Status reflects actual delivery activity, not just "we have an endpoint".
+  // Pre-cleanup the status was hardcoded to 'webhook_ready' which was a UI
+  // lie — it stayed green even when zero webhooks had ever arrived. We now
+  // probe sync_jobs for firefly-webhook rows: presence ⇒ Fireflies has
+  // successfully delivered to us; absence ⇒ webhook is configured on our
+  // side but Fireflies isn't (yet) firing into it.
   const requestUrl = new URL(request.url);
   const webhookUrl = `${requestUrl.origin}/webhooks/firefly`;
-  const firefly: IntegrationRow = {
-    status: 'webhook_ready',
-    label: 'Webhook ready',
-    detail:
-      'Configure the Firefly dashboard to POST meeting-completion events to the webhook URL below.',
-    webhook_url: webhookUrl,
-  };
+  const lastWebhook = await env.D1.prepare(
+    `SELECT MAX(completed_at) AS last_at FROM sync_jobs
+       WHERE org_id = ? AND workflow_type = 'firefly-webhook' AND status = 'completed'`
+  ).bind(ctx.orgId).first<{ last_at: string | null }>();
+  const firefly: IntegrationRow = lastWebhook?.last_at
+    ? {
+        status: 'webhook_ready',
+        label: 'Receiving deliveries',
+        detail: `Last meeting received ${new Date(lastWebhook.last_at).toLocaleString()}.`,
+        last_sync: lastWebhook.last_at,
+        webhook_url: webhookUrl,
+      }
+    : {
+        status: 'webhook_ready',
+        label: 'Awaiting first delivery',
+        detail:
+          'Webhook endpoint configured on our side. If Fireflies is set up but no meetings have arrived, verify the signing secret + webhook URL in the Fireflies dashboard match the values in the setup guide below.',
+        last_sync: null,
+        webhook_url: webhookUrl,
+      };
 
   const body: IntegrationsStatusResponse = {
     outlook,

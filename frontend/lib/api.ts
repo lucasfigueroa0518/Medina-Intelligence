@@ -582,11 +582,6 @@ export const api = {
   getSettingsSystemStatus: () => request<SystemStatusResponse>('/settings/system-status'),
   getFireflyWebhookSecret: () =>
     request<{ secret: string }>('/integrations/firefly/webhook-secret'),
-  fireflyBackfill: (apiKey: string, days?: number, opts?: { start_date?: string; end_date?: string }) =>
-    request<FireflyBackfillResult>('/admin/firefly-backfill', {
-      method: 'POST',
-      body: JSON.stringify({ api_key: apiKey, ...(opts?.start_date ? opts : { days: days ?? 30 }) }),
-    }),
 
   // Documents
   listDocuments: (params?: Record<string, string>) => {
@@ -800,16 +795,6 @@ export interface SystemStatusResponse {
     connected_users: CompletenessMetric & { names_missing: string[] };
   };
   generated_at: string;
-}
-
-export interface FireflyBackfillResult {
-  total_found: number;
-  ingested: number;
-  skipped_duplicates: number;
-  failed: number;
-  errors: Array<{ transcript_id: string; title: string; error: string }>;
-  partial?: boolean;
-  partial_reason?: string;
 }
 
 export async function streamAgentQuery(

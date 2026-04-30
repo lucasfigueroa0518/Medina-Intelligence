@@ -56,7 +56,7 @@ export interface FireflyTranscript {
   sentences: Array<{ speaker_name: string; text: string; start_time: number }> | null;
 }
 
-export type FireflySourcePath = 'firefly-backfill' | 'firefly-progressive-backfill-window';
+export type FireflySourcePath = 'firefly-progressive-backfill-window';
 export type IngestOutcome = 'ingested' | 'duplicate' | 'failed';
 
 export interface RunFireflyWindowResult {
@@ -115,6 +115,13 @@ export async function fetchTranscriptBatch(
   if (data.errors?.length) {
     const msg = data.errors.map(e => e.message).join('; ');
     if (/auth|api key|unauthor/i.test(msg)) throw new Error('FIREFLY_AUTH_FAILED');
+    // Fireflies returns rate-limit as HTTP 200 + errors[].message ("Too many
+    // requests. Please retry after ..."), NOT as HTTP 429. Route through the
+    // same paused-resumes-later path the status-code check above would have.
+    // Without this, rate-limited windows mark themselves 'failed' and require
+    // manual SQL recovery; with this, they pause and the next cron tick (after
+    // Fireflies' daily quota resets at 00:00 UTC) resumes from last_skip.
+    if (/too many requests|rate.?limit/i.test(msg)) throw new Error('FIREFLY_RATE_LIMITED');
     throw new Error(`FIREFLY_GRAPHQL_ERROR: ${msg.slice(0, 200)}`);
   }
 
