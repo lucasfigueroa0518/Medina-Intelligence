@@ -1,15 +1,19 @@
 import type { Env } from '../types/env';
+import type { AuthContext } from '../types/interfaces';
 import { emitAudit } from './audit';
 import { invalidateRagCache } from './cache';
 import { findDuplicateCompany } from './discovery';
 import { updateEntityInIndex } from './entity-index';
+import { canReadEmailContent, getSharingFlags } from './helpers';
 
 // ---------------------------------------------------------------------------
 // READ TOOLS
 // ---------------------------------------------------------------------------
 
+// ACL: filtered to rows the requesting user can read per canReadEmailContent.
+// Owner role bypasses per existing helpers.ts policy.
 export async function searchConversations(
-  orgId: string,
+  ctx: AuthContext,
   input: {
     keyword?: string;
     source?: string;
@@ -21,7 +25,7 @@ export async function searchConversations(
   env: Env
 ): Promise<any> {
   const where: string[] = ['c.org_id = ?'];
-  const binds: unknown[] = [orgId];
+  const binds: unknown[] = [ctx.orgId];
 
   if (input.source && input.source !== 'all') {
     where.push('c.source = ?');
@@ -49,20 +53,45 @@ export async function searchConversations(
   }
 
   const limit = Math.min(input.limit || 20, 50);
+  // Over-fetch so post-filter list still approximates `limit`. Capped at 100
+  // to keep the work bounded when most rows are visible to the requester.
+  const fetchLimit = Math.min(limit * 2, 100);
 
-  const result = await env.D1.prepare(
-    `SELECT c.id, c.subject, c.from_email, c.direction, c.source, c.sent_at,
-            c.body_preview, c.body_r2_key, c.sentiment, c.topics, c.action_items,
-            c.to_emails, c.cc_emails, c.from_contact_id,
-            fc.full_name AS from_name
-     FROM conversations c
-     LEFT JOIN contacts fc ON c.from_contact_id = fc.id
-     WHERE ${where.join(' AND ')}
-     ORDER BY c.sent_at DESC
-     LIMIT ?`
-  ).bind(...binds, limit).all();
+  const [result, sharingFlags] = await Promise.all([
+    env.D1.prepare(
+      `SELECT c.id, c.subject, c.from_email, c.direction, c.source, c.sent_at,
+              c.body_preview, c.body_r2_key, c.sentiment, c.topics, c.action_items,
+              c.to_emails, c.cc_emails, c.from_contact_id,
+              c.participant_user_ids, c.is_campaign_email,
+              fc.full_name AS from_name
+       FROM conversations c
+       LEFT JOIN contacts fc ON c.from_contact_id = fc.id
+       WHERE ${where.join(' AND ')}
+       ORDER BY c.sent_at DESC
+       LIMIT ?`
+    ).bind(...binds, fetchLimit).all(),
+    getSharingFlags(ctx.orgId, env),
+  ]);
 
-  const conversations = result.results as any[];
+  const conversations = (result.results as any[])
+    .filter(c =>
+      canReadEmailContent(
+        {
+          source: c.source,
+          participant_user_ids: c.participant_user_ids,
+          is_campaign_email: c.is_campaign_email,
+        },
+        ctx.userId,
+        ctx.userRole,
+        sharingFlags
+      )
+    )
+    .slice(0, limit);
+
+  for (const c of conversations) {
+    delete c.participant_user_ids;
+    delete c.is_campaign_email;
+  }
 
   if (conversations.length > 0) {
     const ids = conversations.map(c => c.id);
@@ -102,13 +131,17 @@ export async function searchConversations(
   return { conversations, count: conversations.length };
 }
 
+// ACL: returns entity-level CRM fields only (no email/conversation bodies).
+// Per VC platform policy contacts are org-wide visible; the privacy boundary
+// is conversation content, enforced by canReadEmailContent in tools that
+// surface bodies. Owner role bypasses per existing helpers.ts policy.
 export async function searchContacts(
-  orgId: string,
+  ctx: AuthContext,
   input: { keyword?: string; contact_type?: string; has_followup_overdue?: boolean; limit?: number },
   env: Env
 ): Promise<any> {
   const where: string[] = ['c.org_id = ?', 'c.deleted_at IS NULL'];
-  const binds: unknown[] = [orgId];
+  const binds: unknown[] = [ctx.orgId];
 
   if (input.keyword) {
     where.push('(c.full_name LIKE ? OR c.email LIKE ? OR co.name LIKE ?)');
@@ -154,13 +187,14 @@ export async function searchContacts(
   return { contacts, count: contacts.length };
 }
 
+// ACL: entity-level CRM data only — see searchContacts comment.
 export async function searchCompanies(
-  orgId: string,
+  ctx: AuthContext,
   input: { keyword?: string; company_type?: string; sector?: string; limit?: number },
   env: Env
 ): Promise<any> {
   const where: string[] = ['org_id = ?', 'deleted_at IS NULL'];
-  const binds: unknown[] = [orgId];
+  const binds: unknown[] = [ctx.orgId];
 
   if (input.keyword) {
     where.push('(name LIKE ? OR domain LIKE ? OR description LIKE ?)');
@@ -188,13 +222,14 @@ export async function searchCompanies(
   return { companies: result.results, count: result.results.length };
 }
 
+// ACL: entity-level CRM data only — see searchContacts comment.
 export async function searchDeals(
-  orgId: string,
+  ctx: AuthContext,
   input: { keyword?: string; stage?: string; company_id?: string; limit?: number },
   env: Env
 ): Promise<any> {
   const where: string[] = ['d.org_id = ?', 'd.deleted_at IS NULL'];
-  const binds: unknown[] = [orgId];
+  const binds: unknown[] = [ctx.orgId];
 
   if (input.keyword) {
     where.push('(d.title LIKE ? OR co.name LIKE ?)');
@@ -227,8 +262,12 @@ export async function searchDeals(
   return { deals: result.results, count: result.results.length };
 }
 
+// ACL: recent_conversations is filtered to rows the requesting user can read
+// per canReadEmailContent. Owner role bypasses per existing helpers.ts policy.
+// Other fields (contact, tags, deals, associations) are entity-level CRM data
+// and remain org-wide visible.
 export async function getContactDetail(
-  orgId: string,
+  ctx: AuthContext,
   contactId: string,
   env: Env
 ): Promise<any> {
@@ -236,18 +275,19 @@ export async function getContactDetail(
     `SELECT c.*, co.name AS company_name
      FROM contacts c LEFT JOIN companies co ON c.company_id = co.id
      WHERE c.id = ? AND c.org_id = ? AND c.deleted_at IS NULL`
-  ).bind(contactId, orgId).first();
+  ).bind(contactId, ctx.orgId).first();
   if (!contact) return { error: 'Contact not found' };
 
-  const [tags, recentConvos, deals, associations] = await Promise.all([
+  const [tags, recentConvosRaw, deals, associations, sharingFlags] = await Promise.all([
     env.D1.prepare(
       'SELECT t.id, t.name, t.color FROM contact_tags ct JOIN tags t ON ct.tag_id = t.id WHERE ct.contact_id = ?'
     ).bind(contactId).all(),
     env.D1.prepare(
-      `SELECT id, subject, sent_at, source, direction, sentiment, body_preview
+      `SELECT id, subject, sent_at, source, direction, sentiment, body_preview,
+              participant_user_ids, is_campaign_email
        FROM conversations WHERE from_contact_id = ? AND org_id = ?
-       ORDER BY sent_at DESC LIMIT 10`
-    ).bind(contactId, orgId).all(),
+       ORDER BY sent_at DESC LIMIT 20`
+    ).bind(contactId, ctx.orgId).all(),
     env.D1.prepare(
       `SELECT d.id, d.title, d.stage, d.amount, d.valuation, dc.role, dc.side
        FROM deal_contacts dc JOIN deals d ON dc.deal_id = d.id
@@ -263,25 +303,47 @@ export async function getContactDetail(
        FROM entity_associations ea
        WHERE (ea.entity_a_type = 'contact' AND ea.entity_a_id = ?) OR (ea.entity_b_type = 'contact' AND ea.entity_b_id = ?)`
     ).bind(contactId, contactId, contactId, contactId).all(),
+    getSharingFlags(ctx.orgId, env),
   ]);
+
+  const recentConvos = (recentConvosRaw.results as any[])
+    .filter(c =>
+      canReadEmailContent(
+        {
+          source: c.source,
+          participant_user_ids: c.participant_user_ids,
+          is_campaign_email: c.is_campaign_email,
+        },
+        ctx.userId,
+        ctx.userRole,
+        sharingFlags
+      )
+    )
+    .slice(0, 10);
+
+  for (const c of recentConvos) {
+    delete c.participant_user_ids;
+    delete c.is_campaign_email;
+  }
 
   return {
     contact,
     tags: tags.results,
-    recent_conversations: recentConvos.results,
+    recent_conversations: recentConvos,
     deals: deals.results,
     associations: associations.results,
   };
 }
 
+// ACL: entity-level CRM data only — see searchContacts comment.
 export async function getCompanyDetail(
-  orgId: string,
+  ctx: AuthContext,
   companyId: string,
   env: Env
 ): Promise<any> {
   const company = await env.D1.prepare(
     'SELECT * FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(companyId, orgId).first();
+  ).bind(companyId, ctx.orgId).first();
   if (!company) return { error: 'Company not found' };
 
   const [contacts, deals, tags, news] = await Promise.all([
@@ -289,12 +351,12 @@ export async function getCompanyDetail(
       `SELECT id, full_name, email, job_title, contact_type, last_contact_date, total_interactions
        FROM contacts WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
        ORDER BY total_interactions DESC LIMIT 20`
-    ).bind(companyId, orgId).all(),
+    ).bind(companyId, ctx.orgId).all(),
     env.D1.prepare(
       `SELECT id, title, stage, amount, valuation, probability, expected_close, days_in_stage
        FROM deals WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
        ORDER BY created_at DESC`
-    ).bind(companyId, orgId).all(),
+    ).bind(companyId, ctx.orgId).all(),
     env.D1.prepare(
       'SELECT t.id, t.name, t.color FROM company_tags ct JOIN tags t ON ct.tag_id = t.id WHERE ct.company_id = ?'
     ).bind(companyId).all(),
@@ -313,8 +375,9 @@ export async function getCompanyDetail(
   };
 }
 
+// ACL: entity-level CRM data only — see searchContacts comment.
 export async function getDealDetail(
-  orgId: string,
+  ctx: AuthContext,
   dealId: string,
   env: Env
 ): Promise<any> {
@@ -324,7 +387,7 @@ export async function getDealDetail(
      LEFT JOIN companies co ON d.company_id = co.id
      LEFT JOIN users u ON d.owner_id = u.id
      WHERE d.id = ? AND d.org_id = ? AND d.deleted_at IS NULL`
-  ).bind(dealId, orgId).first();
+  ).bind(dealId, ctx.orgId).first();
   if (!deal) return { error: 'Deal not found' };
 
   const [contacts, actionItems, notes] = await Promise.all([
