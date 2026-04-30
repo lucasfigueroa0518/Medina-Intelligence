@@ -441,6 +441,16 @@ async function routeAuthenticated(
   if (path === '/api/approval-queue' && method === 'GET') {
     return Approval.listApprovalQueue(request, ctx, env);
   }
+  // Wave 6 UX — held-proposal endpoints MUST come before the regex
+  // approve/reject routes below, otherwise the dynamic-id matcher
+  // captures "held" as an id and short-circuits to approveItem with
+  // an APPROVAL_ALREADY_RESOLVED error.
+  if (path === '/api/approval-queue/held/approve' && method === 'POST') {
+    return Approval.approveHeldProposal(request, ctx, env);
+  }
+  if (path === '/api/approval-queue/held/dismiss' && method === 'POST') {
+    return Approval.dismissHeldProposal(request, ctx, env);
+  }
   m = path.match(/^\/api\/approval-queue\/([^/]+)\/approve$/);
   if (m && method === 'POST') return Approval.approveItem(m[1], ctx, env);
   m = path.match(/^\/api\/approval-queue\/([^/]+)\/reject$/);
