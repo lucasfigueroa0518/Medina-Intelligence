@@ -467,6 +467,25 @@ export async function processTranscriptItems(
           e?.message || e
         );
       }
+
+      // Phase D: medium-signal meeting heuristic — events with
+      // internal+external attendees, ≥30min duration, attendees match
+      // a deal_contact → propose link_to_deal in approval_queue. Best-
+      // effort; failures swallowed.
+      try {
+        const { applyMeetingHeuristicToEvent } = await import('./deal-association');
+        const r = await applyMeetingHeuristicToEvent(canonicalId, ctx.orgId, env);
+        if (r.proposed > 0) {
+          console.log(
+            `[process-transcript] meeting-heuristic proposed ${r.proposed} link_to_deal for event=${canonicalId}`
+          );
+        }
+      } catch (e: any) {
+        console.error(
+          `[process-transcript] meeting heuristic failed event=${canonicalId}:`,
+          e?.message || e
+        );
+      }
     }
 
     // ── PHASE 3 — Signal extraction on canonical event ids (no race). ──
