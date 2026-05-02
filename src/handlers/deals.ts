@@ -217,13 +217,23 @@ export async function createDeal(
     'amount', 'valuation', 'our_allocation', 'instrument_type',
     'lead_source', 'thesis_fit', 'expected_close', 'probability', 'stage',
   ] as const;
-  const sourceMetadata: Record<string, { source: string; set_by: string; set_at: string }> = {};
+  const sourceMetadata: Record<string, any> = {};
   for (const field of provenanceFields) {
     const val = field === 'stage' ? (body.stage || 'prospect') : body[field];
     if (val != null) {
       sourceMetadata[field] = { source: 'manual', set_by: ctx.userId, set_at: now };
     }
   }
+  // Phase F: origin trace. Manual creation has no source_communication_id;
+  // the Origin line renders "Created manually by [user] on [date]" from
+  // these fields.
+  sourceMetadata.origin = {
+    source_kind: 'manual',
+    source_communication_id: null,
+    approved_by: ctx.userId,
+    approved_at: now,
+    confidence: 1.0,
+  };
   await env.D1.prepare(
     `UPDATE deals SET source_metadata = ? WHERE id = ?`
   ).bind(JSON.stringify(sourceMetadata), id).run();
@@ -356,8 +366,15 @@ export async function getDeal(
     (contactsByGroup[side] || contactsByGroup.other).push(c);
   }
 
+  // Phase F: parse source_metadata.origin and resolve to a structured
+  // field on the response. Frontend renders the "Origin: ..." line from
+  // this. When origin is missing (legacy deals) we surface origin: null
+  // and the frontend falls back to "not recorded".
+  const origin = await resolveDealOrigin(deal as any, ctx, env);
+
   return jsonResponse({
     deal,
+    origin,
     contacts: contactsByGroup,
     action_items: actionItems.results,
     notes: notes.results,
@@ -365,6 +382,101 @@ export async function getDeal(
     company: { id: (deal as any).company_id, name: (deal as any).company_name, sector: (deal as any).company_sector },
     users: usersResult.results,
   });
+}
+
+/** Phase F: hydrate the origin field on a deal response. Looks at
+ *  deal.source_metadata.origin (set by createDeal + commitCreateDealApproval)
+ *  and joins to the source conversation/event so the UI can render
+ *  subject + sent_at + sender + approver name without a second round-trip.
+ *
+ *  Returns null when the deal predates origin tracking (legacy deals
+ *  whose source_metadata has no origin key). The frontend renders
+ *  "Origin: not recorded" in that case.
+ *
+ *  ACL: when the source is a conversation the caller can't read,
+ *  surface the origin metadata (kind/date/approver/confidence) but
+ *  null out subject + sender so we don't leak content. */
+async function resolveDealOrigin(
+  deal: any,
+  ctx: AuthContext,
+  env: Env
+): Promise<{
+  source_kind: 'conversation' | 'event' | 'manual';
+  source_communication_id: string | null;
+  source_subject: string | null;
+  source_sent_at: string | null;
+  source_sender: string | null;
+  approved_by: string | null;
+  approved_by_name: string | null;
+  approved_at: string | null;
+  confidence: number | null;
+  evidence: string | null;
+  can_read_source: boolean;
+} | null> {
+  let sm: any = null;
+  try {
+    sm = typeof deal?.source_metadata === 'string'
+      ? JSON.parse(deal.source_metadata)
+      : deal?.source_metadata;
+  } catch { sm = null; }
+  const origin = sm?.origin;
+  if (!origin || typeof origin !== 'object') return null;
+
+  let subject: string | null = null;
+  let sentAt: string | null = origin.source_sent_at ?? null;
+  let sender: string | null = null;
+  let canRead = true;
+
+  if (origin.source_kind === 'conversation' && origin.source_communication_id) {
+    const conv = await env.D1.prepare(
+      `SELECT subject, sent_at, from_email, from_name, source, participant_user_ids, is_campaign_email
+         FROM conversations
+        WHERE id = ? AND org_id = ?`
+    ).bind(origin.source_communication_id, ctx.orgId).first<any>();
+    if (conv) {
+      const sharingFlags = await getSharingFlags(ctx.orgId, env);
+      canRead = canReadEmailContent(
+        { source: conv.source, participant_user_ids: conv.participant_user_ids, is_campaign_email: conv.is_campaign_email } as any,
+        ctx.userId, ctx.userRole, sharingFlags
+      );
+      sentAt = conv.sent_at ?? sentAt;
+      if (canRead) {
+        subject = conv.subject ?? null;
+        sender = conv.from_name || conv.from_email || null;
+      }
+    }
+  } else if (origin.source_kind === 'event' && origin.source_communication_id) {
+    const ev = await env.D1.prepare(
+      `SELECT title, start_time FROM events
+        WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    ).bind(origin.source_communication_id, ctx.orgId).first<{ title: string; start_time: string }>();
+    if (ev) {
+      subject = ev.title;
+      sentAt = ev.start_time;
+    }
+  }
+
+  let approverName: string | null = null;
+  if (origin.approved_by) {
+    const u = await env.D1.prepare(
+      `SELECT full_name, email FROM users WHERE id = ?`
+    ).bind(origin.approved_by).first<{ full_name: string | null; email: string | null }>();
+    approverName = u?.full_name || u?.email || null;
+  }
+
+  return {
+    source_kind: (origin.source_kind === 'event' || origin.source_kind === 'conversation') ? origin.source_kind : 'manual',
+    source_communication_id: origin.source_communication_id ?? null,
+    source_subject: subject,
+    source_sent_at: sentAt,
+    source_sender: sender,
+    approved_by: origin.approved_by ?? null,
+    approved_by_name: approverName,
+    approved_at: origin.approved_at ?? null,
+    confidence: typeof origin.confidence === 'number' ? origin.confidence : null,
+    evidence: typeof origin.evidence === 'string' ? origin.evidence : null,
+    can_read_source: canRead,
+  };
 }
 
 // ---------------------------------------------------------------------------

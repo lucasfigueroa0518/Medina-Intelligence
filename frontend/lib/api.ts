@@ -267,6 +267,103 @@ export const api = {
   },
   addDealContact: (dealId: string, data: { contact_id: string; role: string; side: string }) =>
     request<{ ok: boolean }>(`/deals/${dealId}/contacts`, { method: 'POST', body: JSON.stringify(data) }),
+
+  // Phase F — evidence trail. Returns conversation_deals + event_deals +
+  // slack_channel_deals joined to source records, ACL-filtered, reverse-chron.
+  getDealEvidence: (id: string) =>
+    request<{
+      deal_id: string;
+      evidence: Array<
+        | {
+            type: 'conversation';
+            id: string;
+            conversation_id: string;
+            subject: string | null;
+            sent_at: string;
+            from_email: string | null;
+            from_name: string | null;
+            body_preview: string | null;
+            source: string;
+            confidence: number;
+            linked_at: string;
+            created_by: string | null;
+            created_by_name: string | null;
+            can_read_body: boolean;
+          }
+        | {
+            type: 'event';
+            id: string;
+            event_id: string;
+            title: string;
+            start_time: string;
+            end_time: string | null;
+            event_type: string | null;
+            source: string;
+            confidence: number;
+            linked_at: string;
+            created_by: string | null;
+            created_by_name: string | null;
+          }
+        | {
+            type: 'slack_channel';
+            id: string;
+            channel_id: string;
+            channel_name: string | null;
+            is_member: boolean;
+            source: string;
+            confidence: number;
+            linked_at: string;
+            created_by: string | null;
+            created_by_name: string | null;
+          }
+      >;
+      counts: { conversations: number; events: number; slack_channels: number; total: number };
+    }>(`/deals/${id}/evidence`),
+
+  getDealEvidenceCandidates: (dealId: string, opts: { q?: string; type?: 'conversation' | 'event' | 'slack_channel' | 'all'; limit?: number } = {}) => {
+    const sp = new URLSearchParams();
+    if (opts.q) sp.set('q', opts.q);
+    if (opts.type) sp.set('type', opts.type);
+    if (opts.limit) sp.set('limit', String(opts.limit));
+    const qs = sp.toString() ? `?${sp.toString()}` : '';
+    return request<{
+      candidates: Array<
+        | { type: 'conversation'; id: string; subject: string; sent_at: string; from_name: string | null; body_preview: string | null; can_read_body: boolean }
+        | { type: 'event'; id: string; title: string; start_time: string; event_type: string | null }
+        | { type: 'slack_channel'; id: string; channel_name: string | null; is_member: boolean }
+      >;
+    }>(`/deals/${dealId}/evidence/candidates${qs}`);
+  },
+  linkConversationToDealEvidence: (dealId: string, conversationId: string) =>
+    request<{ inserted: boolean; source: 'manual' }>(
+      `/deals/${dealId}/evidence/conversation`,
+      { method: 'POST', body: JSON.stringify({ conversation_id: conversationId }) }
+    ),
+  unlinkConversationFromDealEvidence: (dealId: string, conversationId: string) =>
+    request<{ removed: number }>(
+      `/deals/${dealId}/evidence/conversation/${conversationId}`,
+      { method: 'DELETE' }
+    ),
+  linkEventToDealEvidence: (dealId: string, eventId: string) =>
+    request<{ inserted: boolean; source: 'manual' }>(
+      `/deals/${dealId}/evidence/event`,
+      { method: 'POST', body: JSON.stringify({ event_id: eventId }) }
+    ),
+  unlinkEventFromDealEvidence: (dealId: string, eventId: string) =>
+    request<{ removed: number }>(
+      `/deals/${dealId}/evidence/event/${eventId}`,
+      { method: 'DELETE' }
+    ),
+  linkSlackChannelToDealEvidence: (dealId: string, channelId: string, backfill = true) =>
+    request<{ inserted: boolean; has_channel: boolean; backfilled: number; source: 'manual' }>(
+      `/deals/${dealId}/evidence/slack-channel`,
+      { method: 'POST', body: JSON.stringify({ channel_id: channelId, backfill }) }
+    ),
+  unlinkSlackChannelFromDealEvidence: (dealId: string, channelId: string) =>
+    request<{ removed: number }>(
+      `/deals/${dealId}/evidence/slack-channel/${channelId}`,
+      { method: 'DELETE' }
+    ),
   removeDealContact: (dealId: string, contactId: string) =>
     request<{ ok: boolean }>(`/deals/${dealId}/contacts/${contactId}`, { method: 'DELETE' }),
   createDealActionItem: (dealId: string, data: { description: string; assignee_id: string | null; due_date: string | null }) =>
