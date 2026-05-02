@@ -107,6 +107,62 @@ function tableForEntity(t: EntityType): string {
   return 'deals';
 }
 
+// ── Phase 3: agent_writes audit hook ────────────────────────────────
+//
+// Every accepted write produces one row per field. Failures here NEVER
+// fail the user-facing write — log errors are swallowed so a transient
+// D1 hiccup on the audit table doesn't block the actual edit.
+//
+// Wired into: updateEntityFieldsCommon, updateDealFields,
+// deleteEntityField, createContactRecord, createCompanyRecord,
+// createDealRecord. UI handlers and MARTy tools both flow through here
+// (origin distinguishes them).
+
+type AgentWriteAction = 'update' | 'delete_field' | 'create_entity';
+
+async function logAgentWrite(
+  env: Env,
+  ctx: WriteContext,
+  args: {
+    entity_type: EntityType;
+    entity_id: string;
+    field_name: string | null;
+    action: AgentWriteAction;
+    before_value?: unknown;
+    after_value?: unknown;
+  }
+): Promise<void> {
+  try {
+    await env.D1.prepare(
+      `INSERT INTO agent_writes (
+        id, org_id, user_id, origin, entity_type, entity_id,
+        field_name, action, before_value, after_value, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      crypto.randomUUID(),
+      ctx.orgId,
+      ctx.userId,
+      ctx.origin,
+      args.entity_type,
+      args.entity_id,
+      args.field_name,
+      args.action,
+      args.before_value === undefined ? null : JSON.stringify(args.before_value),
+      args.after_value === undefined ? null : JSON.stringify(args.after_value),
+      new Date().toISOString()
+    ).run();
+  } catch (err) {
+    console.error('[entity-writes] logAgentWrite failed', {
+      origin: ctx.origin,
+      entity_type: args.entity_type,
+      entity_id: args.entity_id,
+      field_name: args.field_name,
+      action: args.action,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 function writableSetFor(t: EntityType): Set<string> {
   if (t === 'contact') return CONTACT_WRITABLE;
   if (t === 'company') return COMPANY_WRITABLE;
@@ -328,6 +384,18 @@ async function updateEntityFieldsCommon(
     created_at: new Date().toISOString(),
   });
 
+  // Per-field agent_writes rows (Phase 3). One row per accepted field.
+  for (const field of changedFields) {
+    await logAgentWrite(env, ctx, {
+      entity_type: entityType,
+      entity_id: entityId,
+      field_name: field,
+      action: 'update',
+      before_value: (before as any)[field],
+      after_value: passingFields[field],
+    });
+  }
+
   await invalidateRagCache(ctx.orgId, env);
 
   return {
@@ -466,6 +534,17 @@ export async function updateDealFields(
     created_at: new Date().toISOString(),
   });
 
+  for (const field of changedFields) {
+    await logAgentWrite(env, ctx, {
+      entity_type: 'deal',
+      entity_id: dealId,
+      field_name: field,
+      action: 'update',
+      before_value: (before as any)[field],
+      after_value: passingFields[field],
+    });
+  }
+
   await invalidateRagCache(ctx.orgId, env);
 
   return {
@@ -566,6 +645,15 @@ export async function deleteEntityField(
     created_at: new Date().toISOString(),
   });
 
+  await logAgentWrite(env, ctx, {
+    entity_type: entityType,
+    entity_id: entityId,
+    field_name: fieldName,
+    action: 'delete_field',
+    before_value: beforeVal,
+    after_value: null,
+  });
+
   await invalidateRagCache(ctx.orgId, env);
 
   return {
@@ -640,6 +728,14 @@ export async function createContactRecord(
     created_at: now,
   });
 
+  await logAgentWrite(env, ctx, {
+    entity_type: 'contact',
+    entity_id: id,
+    field_name: null,
+    action: 'create_entity',
+    after_value: input,
+  });
+
   await invalidateRagCache(ctx.orgId, env);
 
   return { ok: true, id };
@@ -687,6 +783,14 @@ export async function createCompanyRecord(
     after_data: { id, name: input.name },
     metadata: { origin: ctx.origin },
     created_at: now,
+  });
+
+  await logAgentWrite(env, ctx, {
+    entity_type: 'company',
+    entity_id: id,
+    field_name: null,
+    action: 'create_entity',
+    after_value: input,
   });
 
   await invalidateRagCache(ctx.orgId, env);
@@ -797,6 +901,14 @@ export async function createDealRecord(
     after_data: { id, title, stage: input.stage || 'prospect' },
     metadata: { origin: ctx.origin },
     created_at: now,
+  });
+
+  await logAgentWrite(env, ctx, {
+    entity_type: 'deal',
+    entity_id: id,
+    field_name: null,
+    action: 'create_entity',
+    after_value: { ...input, title, stage: input.stage || 'prospect' },
   });
 
   await invalidateRagCache(ctx.orgId, env);
