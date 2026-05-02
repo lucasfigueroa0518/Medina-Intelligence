@@ -659,6 +659,13 @@ async function routeAuthenticated(
       return handleMergeCompanies(request, ctx, env);
     }
 
+    // Wave 4 — re-run hard-signal scan over existing conversations to
+    // populate conversation_deals junctions for the timeline.
+    if (path === '/api/admin/backfill-deal-timeline-junctions' && method === 'POST') {
+      const { handleBackfillDealTimeline } = await import('./handlers/backfill-deal-timeline');
+      return handleBackfillDealTimeline(request, ctx, env);
+    }
+
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')

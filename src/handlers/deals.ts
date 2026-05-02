@@ -774,30 +774,41 @@ export async function getDealTimeline(
   if (!deal) return errorResponse('DEAL_NOT_FOUND', 404);
 
   const [conversations, events, notes, auditEntries, sharingFlags] = await Promise.all([
-    // Conversations involving deal contacts
+    // Wave 4: timeline reads from conversation_deals junction (Phase B+)
+    // exclusively — contact-overlap noise (every email any deal contact
+    // ever participated in) is excluded entirely. Junctions are populated
+    // by hard signals (inherited_thread + auto_high), Phase C LLM
+    // detection auto-link, approval-committed source-communication, and
+    // Phase E inherited_channel for Slack.
+    //
+    // Existing deals with sparse junctions populate over time as new
+    // conversations arrive; the admin endpoint
+    // POST /api/admin/backfill-deal-timeline-junctions primes existing
+    // conversations by re-running applyHardSignalsToConversation.
     env.D1.prepare(
-      `SELECT DISTINCT conv.id, conv.subject AS title, conv.sent_at AS timestamp,
+      `SELECT conv.id, conv.subject AS title, conv.sent_at AS timestamp,
               'conversation' AS type, conv.source AS subtype, conv.body_preview,
-              conv.source AS conv_source, conv.participant_user_ids, conv.is_campaign_email
-       FROM deal_contacts dc
-       JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
-       JOIN conversations conv ON cc.conversation_id = conv.id
-       WHERE dc.deal_id = ? AND dc.org_id = ? AND conv.org_id = ?
-       ORDER BY conv.sent_at DESC
-       LIMIT ?`
-    ).bind(id, ctx.orgId, ctx.orgId, limit).all(),
+              conv.source AS conv_source, conv.participant_user_ids,
+              conv.is_campaign_email, conv.external_thread_id,
+              cd.source AS link_source, cd.confidence AS link_confidence
+         FROM conversation_deals cd
+         JOIN conversations conv ON conv.id = cd.conversation_id
+        WHERE cd.deal_id = ? AND conv.org_id = ?
+        ORDER BY conv.sent_at DESC
+        LIMIT ?`
+    ).bind(id, ctx.orgId, limit).all(),
 
-    // Events involving deal contacts
+    // Events: junction-only via event_deals.
     env.D1.prepare(
-      `SELECT DISTINCT e.id, e.title, e.start_time AS timestamp,
-              'event' AS type, e.event_type AS subtype
-       FROM deal_contacts dc
-       JOIN event_attendees ea ON dc.contact_id = ea.contact_id
-       JOIN events e ON ea.event_id = e.id
-       WHERE dc.deal_id = ? AND dc.org_id = ? AND e.org_id = ? AND e.deleted_at IS NULL
-       ORDER BY e.start_time DESC
-       LIMIT ?`
-    ).bind(id, ctx.orgId, ctx.orgId, limit).all(),
+      `SELECT e.id, e.title, e.start_time AS timestamp,
+              'event' AS type, e.event_type AS subtype,
+              ed.source AS link_source, ed.confidence AS link_confidence
+         FROM event_deals ed
+         JOIN events e ON e.id = ed.event_id
+        WHERE ed.deal_id = ? AND e.org_id = ? AND e.deleted_at IS NULL
+        ORDER BY e.start_time DESC
+        LIMIT ?`
+    ).bind(id, ctx.orgId, limit).all(),
 
     // Deal notes
     env.D1.prepare(
@@ -876,9 +887,42 @@ export async function getDealTimeline(
     };
   });
 
+  // Wave 4B: dedup conversations by external_thread_id — keep the most
+  // recent message per thread + a count. Conversations without a thread
+  // id (slack messages, manual) pass through untouched.
+  const threadGroups = new Map<string, any>();
+  const standaloneConvs: any[] = [];
+  for (const c of conversationsWithAccess) {
+    const tid = c.external_thread_id;
+    if (!tid) { standaloneConvs.push(c); continue; }
+    const existing = threadGroups.get(tid);
+    if (!existing || String(c.timestamp) > String(existing.timestamp)) {
+      threadGroups.set(tid, { ...c, thread_count: (existing?.thread_count ?? 0) + 1 });
+    } else {
+      existing.thread_count = (existing.thread_count ?? 1) + 1;
+    }
+  }
+  const dedupedConvs = [...threadGroups.values(), ...standaloneConvs];
+
+  // Wave 4B: dedup recurring events by (lower(title), DATE(start_time)).
+  // No series_master_id column on events, so collapse same-day-same-title
+  // occurrences (Outlook recurrings often appear N times/day across
+  // attendee chains; the dedup tightens them to one row + count).
+  const eventGroups = new Map<string, any>();
+  for (const e of (events.results as any[])) {
+    const key = `${(e.title || '').toLowerCase()}|${(e.timestamp || '').slice(0, 10)}`;
+    const existing = eventGroups.get(key);
+    if (!existing || String(e.timestamp) > String(existing.timestamp)) {
+      eventGroups.set(key, { ...e, occurrence_count: (existing?.occurrence_count ?? 0) + 1 });
+    } else {
+      existing.occurrence_count = (existing.occurrence_count ?? 1) + 1;
+    }
+  }
+  const dedupedEvents = [...eventGroups.values()];
+
   const entries = [
-    ...conversationsWithAccess,
-    ...events.results,
+    ...dedupedConvs,
+    ...dedupedEvents,
     ...notes.results,
     ...parsedAudit,
   ]

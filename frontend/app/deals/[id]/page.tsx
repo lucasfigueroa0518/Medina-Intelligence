@@ -1877,6 +1877,17 @@ function TimelineRow({ entry }: { entry: any }) {
   const isRestrictedEmail =
     entry.type === 'conversation' && entry.canReadContent === false;
 
+  // Wave 4: opacity gradient — items >30 days old fade to .55, >90 days
+  // to .35. Recent activity dominates visually.
+  const ageMs = (() => {
+    const ts = entry.timestamp || entry.date || entry.created_at;
+    if (!ts) return 0;
+    const t = Date.parse(String(ts));
+    return Number.isFinite(t) ? Date.now() - t : 0;
+  })();
+  const DAY = 86400000;
+  const ageOpacity = ageMs > 90 * DAY ? 0.45 : ageMs > 30 * DAY ? 0.7 : 1;
+
   const iconMap: Record<string, React.ReactNode> = {
     conversation: isRestrictedEmail
       ? <Lock size={14} className="text-text-muted" />
@@ -1901,13 +1912,24 @@ function TimelineRow({ entry }: { entry: any }) {
   if (!description || !timestamp) return null;
 
   return (
-    <div className="flex items-start gap-3 py-2.5 px-3 -mx-3 rounded-lg transition-colors hover:bg-white/[0.02]">
+    <div
+      className="flex items-start gap-3 py-2.5 px-3 -mx-3 rounded-lg transition-colors hover:bg-white/[0.02]"
+      style={{ opacity: ageOpacity }}
+    >
       <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 mt-0.5"
         style={{ background: 'rgba(255,255,255,0.04)' }}>
         {icon}
       </div>
       <div className="flex-1 min-w-0">
-        <div className="text-sm text-text-primary truncate">{description}</div>
+        <div className="text-sm text-text-primary truncate">
+          {description}
+          {entry.thread_count && entry.thread_count > 1 && (
+            <span className="ml-2 text-[10px] text-text-muted">+ {entry.thread_count - 1} more in thread</span>
+          )}
+          {entry.occurrence_count && entry.occurrence_count > 1 && (
+            <span className="ml-2 text-[10px] text-text-muted">+ {entry.occurrence_count - 1} more occurrences</span>
+          )}
+        </div>
         {isStageChange && (
           <div className="flex items-center gap-1.5 mt-1 text-[10px] text-text-muted">
             <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
