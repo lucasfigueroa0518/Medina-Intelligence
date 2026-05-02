@@ -338,6 +338,48 @@ async function routeAuthenticated(
   if (m && method === 'GET') return Deals.getDealConversations(request, m[1], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/intelligence$/);
   if (m && method === 'GET') return Deals.getDealIntelligence(m[1], ctx, env, ctxExec);
+
+  // Phase F — evidence trail (read) + manual link/unlink (write).
+  m = path.match(/^\/api\/deals\/([^/]+)\/evidence$/);
+  if (m && method === 'GET') {
+    const { getDealEvidence } = await import('./handlers/deal-evidence');
+    return getDealEvidence(m[1], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/evidence\/candidates$/);
+  if (m && method === 'GET') {
+    const { getDealEvidenceCandidates } = await import('./handlers/deal-evidence');
+    return getDealEvidenceCandidates(request, m[1], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/evidence\/conversation\/([^/]+)$/);
+  if (m && method === 'DELETE') {
+    const { unlinkConversationFromDeal } = await import('./handlers/deal-evidence-manual');
+    return unlinkConversationFromDeal(m[1], m[2], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/evidence\/conversation$/);
+  if (m && method === 'POST') {
+    const { linkConversationToDealEndpoint } = await import('./handlers/deal-evidence-manual');
+    return linkConversationToDealEndpoint(request, m[1], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/evidence\/event\/([^/]+)$/);
+  if (m && method === 'DELETE') {
+    const { unlinkEventFromDeal } = await import('./handlers/deal-evidence-manual');
+    return unlinkEventFromDeal(m[1], m[2], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/evidence\/event$/);
+  if (m && method === 'POST') {
+    const { linkEventToDealEndpoint } = await import('./handlers/deal-evidence-manual');
+    return linkEventToDealEndpoint(request, m[1], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/evidence\/slack-channel\/([^/]+)$/);
+  if (m && method === 'DELETE') {
+    const { unlinkSlackChannelFromDeal } = await import('./handlers/deal-evidence-manual');
+    return unlinkSlackChannelFromDeal(m[1], m[2], ctx, env);
+  }
+  m = path.match(/^\/api\/deals\/([^/]+)\/evidence\/slack-channel$/);
+  if (m && method === 'POST') {
+    const { linkSlackChannelToDealEndpoint } = await import('./handlers/deal-evidence-manual');
+    return linkSlackChannelToDealEndpoint(request, m[1], ctx, env);
+  }
   m = path.match(/^\/api\/deals\/([^/]+)\/contacts\/([^/]+)$/);
   if (m && method === 'DELETE') return Deals.removeDealContact(m[1], m[2], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/contacts$/);

@@ -7,7 +7,7 @@ import {
   Mail, Calendar, FileText, Activity, Clock, Users, Building2,
   Check, X as XIcon, Plus, ChevronDown, ChevronUp, ChevronRight, Trash2,
   DollarSign, Target, AlertCircle, CheckCircle2, MoreHorizontal,
-  Sparkles, ArrowRight, Lock, Upload, Paperclip,
+  Sparkles, ArrowRight, Lock, Upload, Paperclip, ExternalLink,
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
@@ -22,6 +22,7 @@ import {
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
+import { DealOriginLine, DealEvidencePanel, CitationChip } from '@/components/deal-evidence';
 
 /* ───────── Stage configuration ───────── */
 
@@ -161,6 +162,7 @@ export default function DealDetailPage() {
 
   /* ── Core state ── */
   const [deal, setDeal] = React.useState<any>(null);
+  const [origin, setOrigin] = React.useState<any>(null);
   const [contacts, setContacts] = React.useState<{ theirs: any[]; ours: any[]; other: any[] }>({ theirs: [], ours: [], other: [] });
   const [actionItems, setActionItems] = React.useState<any[]>([]);
   const [notes, setNotes] = React.useState<any[]>([]);
@@ -240,6 +242,7 @@ export default function DealDetailPage() {
       api.getDealTimeline(id).catch(() => ({ entries: [] })),
     ]).then(([d, t]) => {
       setDeal(d.deal);
+      setOrigin((d as any).origin || null);
       setContacts(d.contacts || { theirs: [], ours: [], other: [] });
       setActionItems(d.action_items || []);
       setNotes(d.notes || []);
@@ -663,6 +666,12 @@ export default function DealDetailPage() {
                 <Users size={11} /> Owned by {deal.owner_name}
               </div>
             )}
+            {/* Phase F: Origin line — pulls from deal.source_metadata.origin
+                via the resolveDealOrigin server hydration. Renders "not
+                recorded" when missing. */}
+            <div className="mt-2">
+              <DealOriginLine origin={origin} />
+            </div>
           </div>
         </div>
       </div>
@@ -870,6 +879,18 @@ export default function DealDetailPage() {
                 in the header, and expands to show every message inline with
                 the same canReadEmailContent gate the timeline uses. */}
             <DealConversationsCard dealId={id} />
+
+            {/* Phase F: Evidence panel — full linkage trail for the deal.
+                Reverse-chron feed of every conversation/event/Slack channel
+                that's been auto-linked, manually linked, or inferred via
+                fallback, with citation chips + remove buttons. The
+                "show your work" rationale behind the Intelligence Brief. */}
+            <GlassCard>
+              <div className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display mb-3 flex items-center gap-1.5">
+                <ExternalLink size={11} /> Evidence
+              </div>
+              <DealEvidencePanel dealId={id} />
+            </GlassCard>
 
             {/* CARD: Action Items */}
             <GlassCard>

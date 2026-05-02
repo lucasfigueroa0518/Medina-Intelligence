@@ -444,6 +444,31 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
     return {};
   }
 
+  // Phase F: stamp origin trace on deal.source_metadata. Captures the
+  // single conversation/event that triggered the create_deal proposal +
+  // who approved it + when. The Origin line on the deal page reads
+  // back from this. Best-effort — if the JSON write fails the deal is
+  // still valid, we just lose the surface for "Created from email X".
+  try {
+    const originMeta = {
+      origin: {
+        source_kind: payload.source_kind === 'event' ? 'event' : 'conversation',
+        source_communication_id: payload.source_communication_id ?? null,
+        source_sent_at: payload.source_sent_at ?? null,
+        approved_by: item.resolved_by ?? null,
+        approved_at: now,
+        confidence: Math.min(Math.max(Number(item.confidence) || 0, 0), 1),
+        evidence: typeof payload.evidence === 'string' ? payload.evidence.slice(0, 500) : null,
+      },
+    };
+    await env.D1.prepare(
+      `UPDATE deals SET source_metadata = json_patch(coalesce(source_metadata, '{}'), ?)
+        WHERE id = ?`
+    ).bind(JSON.stringify(originMeta), dealId).run();
+  } catch (e) {
+    console.error(`[commit-create-deal] origin stamp failed for ${dealId}:`, e);
+  }
+
   // Auto-link contacts via two evidence paths. Both idempotent.
   try {
     const { linkContactsByCompanyMatch, linkConversationParticipantsToDeal }
