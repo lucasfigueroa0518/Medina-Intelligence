@@ -5,7 +5,7 @@ import { invalidateRagCache } from './cache';
 import { findDuplicateCompany } from './discovery';
 import { updateEntityInIndex } from './entity-index';
 import { canReadEmailContent, getSharingFlags } from './helpers';
-import { isCompanyInternal } from './internal-entity';
+import { isCompanyInternal, assertNoOpenDealForCompany, OpenDealConflictError } from './internal-entity';
 
 // ACL redaction: nulls fields whose value may have been derived from private
 // conversation content (LLM-extracted topics, auto-populated deal notes,
@@ -719,6 +719,16 @@ export async function createDealTool(
       error: 'Cannot create deal for internal entity. A deal represents a startup Medina is evaluating for investment.',
       code: 'INTERNAL_ENTITY_NOT_DEAL_ELIGIBLE',
     };
+  }
+
+  // Wave 2: refuse to create a second open deal at the same company.
+  try {
+    await assertNoOpenDealForCompany(companyId, orgId, env);
+  } catch (e) {
+    if (e instanceof OpenDealConflictError) {
+      return { error: e.message, code: e.code, existing_deal_id: e.existingDealId };
+    }
+    throw e;
   }
 
   const id = crypto.randomUUID();

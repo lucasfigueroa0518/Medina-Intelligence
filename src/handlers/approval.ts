@@ -383,6 +383,39 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
     return {};
   }
 
+  // Wave 2: silently skip if an open deal already exists for this
+  // company. The proposal is moot — the source communication should
+  // link to the existing deal via Phase B junctions, not create a
+  // duplicate.
+  const existingOpen = await env.D1.prepare(
+    `SELECT id, title FROM deals
+       WHERE org_id = ? AND company_id = ?
+         AND deleted_at IS NULL
+         AND stage NOT IN ('closed_won','closed_lost')
+       LIMIT 1`
+  ).bind(item.org_id, payload.company_id).first<{ id: string; title: string }>();
+  if (existingOpen) {
+    console.warn(
+      `[commit-create-deal] skipping — open deal already exists for company=${payload.company_id} existing="${existingOpen.title}"`
+    );
+    // Best-effort: redirect the source communication to the existing
+    // deal so the signal isn't lost.
+    if (payload.source_communication_id) {
+      try {
+        const { linkConversationToDeal, linkEventToDeal } = await import('../lib/deal-association');
+        const kind = payload.source_kind === 'event' ? 'event' : 'conversation';
+        if (kind === 'event') {
+          await linkEventToDeal(payload.source_communication_id, existingOpen.id, 'approval_committed', 1.0, item.org_id, env, item.resolved_by ?? undefined);
+        } else {
+          await linkConversationToDeal(payload.source_communication_id, existingOpen.id, 'approval_committed', 1.0, item.org_id, env, item.resolved_by ?? undefined);
+        }
+      } catch (e) {
+        console.error(`[commit-create-deal] redirect-to-existing link failed:`, e);
+      }
+    }
+    return {};
+  }
+
   try {
     await env.D1.prepare(
       `INSERT INTO deals
