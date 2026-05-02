@@ -620,6 +620,10 @@ async function routeAuthenticated(
       const { handleClearCalendarDelta } = await import('./handlers/firefly-reconcile');
       return handleClearCalendarDelta(request, ctx, env);
     }
+    if (path === '/api/admin/backfill-slack-channel-history' && method === 'POST') {
+      const { handleBackfillSlackChannelHistory } = await import('./handlers/slack-backfill');
+      return handleBackfillSlackChannelHistory(request, ctx, env);
+    }
     if (path === '/api/admin/backfill-unembedded' && method === 'POST')
       return Admin.backfillUnembedded(request, ctx, env);
     if (path === '/api/admin/backfill-attachments' && method === 'POST')

@@ -267,10 +267,20 @@ async function buildSlackIntegrationRow(orgId: string, env: Env): Promise<Integr
   }
 
   if (!auth.ok) {
+    // Layer in the sustained-failure counter that fetchSlackMessages
+    // bumps whenever auth.test returns non-ok during the hourly cron.
+    // Differentiates a fresh hiccup ("just now, 1 failure") from a
+    // sustained outage ("broken for 12 hours, 12 failures") so the
+    // operator can prioritize correctly.
+    const sustained = await env.KV.get(`slack_token_failed:${orgId}`);
+    const consecutive = sustained ? parseInt(sustained, 10) : 0;
+    const sustainedNote = consecutive > 1
+      ? ` (${consecutive} consecutive cron failures)`
+      : '';
     return {
       status: 'auth_failed',
       label: 'Authentication failed',
-      detail: `Slack API rejected the bot token (${auth.error}). Reinstall the Slack app or run \`wrangler secret put SLACK_BOT_TOKEN\`.`,
+      detail: `Slack API rejected the bot token (${auth.error})${sustainedNote}. Reinstall the Slack app or run \`wrangler secret put SLACK_BOT_TOKEN\`.`,
       team_name: null,
       bot_user_id: null,
       channels_visible: 0,
