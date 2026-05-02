@@ -9,6 +9,7 @@ import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { isDocumentAccessibleToUser } from '../lib/document-acl';
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
+import { updateContactFields } from '../lib/entity-writes';
 
 // --- GET /api/contacts ---
 
@@ -525,91 +526,31 @@ export async function updateContact(
   const body = await parseJsonBody<any>(request);
   if (!body) return errorResponse('VALIDATION_ERROR', 400);
 
-  const before = await env.D1.prepare(
-    'SELECT * FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(id, ctx.orgId).first();
-  if (!before) return errorResponse('CONTACT_NOT_FOUND', 404);
+  // Phase 1 refactor: all write logic, lock checks, audit, and
+  // entity_field_state sync now lives in src/lib/entity-writes.ts.
+  // Same code path that MARTy's update_contact_field tool will call
+  // in Phase 2 — single source of truth for human-edit semantics.
+  const result = await updateContactFields(id, body, {
+    orgId: ctx.orgId,
+    userId: ctx.userId,
+    userRole: ctx.userRole,
+    origin: 'manual_ui',
+  }, env);
 
-  const allowed = [
-    'full_name',
-    'email',
-    'phone',
-    'linkedin_url',
-    'twitter_url',
-    'contact_type',
-    'relationship_status',
-    'company_id',
-    'job_title',
-    'next_followup_date',
-    'next_followup_note',
-    'investment_amount',
-    'fund_commitment',
-    'bio_summary',
-    'topics_of_interest',
-    'pain_points',
-    'investment_thesis_tags',
-    'custom_fields',
-    'location',
-    'introduced_via',
-    'investment_focus',
-    'check_size_range',
-    'fund_name',
-    'commitment_status',
-    'engagement_status',
-    'relationship_owner_id',
-  ];
-
-  const updates: string[] = [];
-  const binds: unknown[] = [];
-  const changedFields: string[] = [];
-  for (const k of allowed) {
-    if (k in body) {
-      updates.push(`${k} = ?`);
-      binds.push(body[k]);
-      const beforeVal = (before as any)[k];
-      const beforeNorm = beforeVal == null ? '' : String(beforeVal).trim();
-      const afterNorm = body[k] == null ? '' : String(body[k]).trim();
-      if (beforeNorm !== afterNorm) changedFields.push(k);
-    }
+  if (!result.ok && result.error) {
+    return errorResponse(result.error.code, result.error.status, result.error.message);
   }
 
-  if ('engagement_status' in body) {
-    updates.push('engagement_status_manual = ?');
-    binds.push(1);
+  // Surface per-field rejections (lock violations, unknown fields) so
+  // the UI can render "this field couldn't be updated because…"
+  // alongside the successful subset. Backward-compat: when nothing
+  // was rejected, the response body is identical to the pre-refactor
+  // shape ({ contact }).
+  const responseBody: Record<string, unknown> = { contact: result.after };
+  if (result.rejected.length > 0) {
+    responseBody.rejected_fields = result.rejected;
   }
-  if ('relationship_owner_id' in body) {
-    updates.push('relationship_owner_manual = ?');
-    binds.push(1);
-  }
-
-  if (updates.length === 0) return jsonResponse({ contact: before });
-
-  updates.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
-
-  await env.D1.prepare(
-    `UPDATE contacts SET ${updates.join(', ')} WHERE id = ?`
-  ).bind(...binds, id).run();
-
-  if (changedFields.length > 0) {
-    await markFieldsHumanEdited(ctx.orgId, 'contact', id, changedFields, ctx.userId, env)
-      .catch(e => console.error('[contacts] markFieldsHumanEdited failed:', e));
-  }
-
-  const after = await env.D1.prepare('SELECT * FROM contacts WHERE id = ?').bind(id).first();
-
-  await emitAudit(env, {
-    org_id: ctx.orgId,
-    user_id: ctx.userId,
-    action: 'update',
-    entity_type: 'contact',
-    entity_id: id,
-    before_data: before,
-    after_data: after,
-    created_at: new Date().toISOString(),
-  });
-
-  await invalidateRagCache(ctx.orgId, env);
-  return jsonResponse({ contact: after });
+  return jsonResponse(responseBody);
 }
 
 // --- DELETE /api/contacts/:id ---
