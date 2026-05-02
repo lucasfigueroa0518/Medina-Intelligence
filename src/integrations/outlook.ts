@@ -746,7 +746,17 @@ export async function fetchOutlookCalendarDelta(
       continue;
     }
 
-    const start = new Date(Date.now() - 30 * 86400000).toISOString();
+    // Past window widened from 30d → 120d so Phase F-ingested Firefly
+    // transcripts dated before 2026-04-01 (Tony's pre-April backfill) have
+    // matching Outlook events to reconcile against. The Firefly→Outlook
+    // matcher (reconcileFireflyToOutlook) needs both sides present; with
+    // a 30-day Outlook window, ~43 of Tony's pending Firefly events were
+    // permanently un-reconcilable simply because we never fetched the
+    // matching calendar entry. 120 days covers his earliest backfilled
+    // transcripts (oldest ≈ 2026-01-30) with a small buffer; the 200-channel
+    // upper bound on /me/calendarView pagination doesn't kick in for the
+    // observed event volume (~10/30d for Tony => ~40/120d, two pages max).
+    const start = new Date(Date.now() - 120 * 86400000).toISOString();
     const end = new Date(Date.now() + 90 * 86400000).toISOString();
 
     // Calendar sync via non-delta /me/calendarView. We previously used
