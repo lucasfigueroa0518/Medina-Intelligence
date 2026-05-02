@@ -666,6 +666,14 @@ async function routeAuthenticated(
       return handleBackfillDealTimeline(request, ctx, env);
     }
 
+    // Wave 5 — re-classify every deal_contacts.side via the new
+    // domain-based rule. Picks up Medina-side participants who were
+    // marked 'theirs' under the old default.
+    if (path === '/api/admin/reclassify-deal-contact-sides' && method === 'POST') {
+      const { handleReclassifyDealContactSides } = await import('./handlers/reclassify-deal-contact-sides');
+      return handleReclassifyDealContactSides(request, ctx, env);
+    }
+
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')

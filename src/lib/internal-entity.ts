@@ -52,13 +52,26 @@ export async function resolveInternalDomains(
   cache?: Map<string, Set<string>>
 ): Promise<Set<string>> {
   if (cache?.has(orgId)) return cache.get(orgId)!;
-  const rows = await env.D1.prepare(
+  const userRows = await env.D1.prepare(
     `SELECT DISTINCT lower(substr(email, instr(email,'@')+1)) AS domain
        FROM users
       WHERE org_id = ? AND deleted_at IS NULL`
   ).bind(orgId).all<{ domain: string }>();
+  // Wave 5: also include domains of every company flagged is_internal_entity.
+  // Picks up Medina Capital / Gryphon / JFG without hard-coding their
+  // domains here — Wave 1 backfill already flagged them, and the column
+  // is the source of truth.
+  const companyRows = await env.D1.prepare(
+    `SELECT DISTINCT lower(domain) AS domain
+       FROM companies
+      WHERE org_id = ? AND is_internal_entity = 1
+        AND domain IS NOT NULL AND domain != ''`
+  ).bind(orgId).all<{ domain: string }>();
   const set = new Set<string>();
-  for (const r of rows.results) {
+  for (const r of userRows.results) {
+    if (r.domain) set.add(r.domain);
+  }
+  for (const r of companyRows.results) {
     if (r.domain) set.add(r.domain);
   }
   for (const d of KNOWN_INTERNAL_DOMAINS) set.add(d);
@@ -176,4 +189,63 @@ export async function classifyCompanyInternal(
     return { changed: true, is_internal: target === 1 };
   }
   return { changed: false, is_internal: target === 1 };
+}
+
+// ─── Wave 5: deal_contacts.side classification ─────────────────────────
+//
+// A contact's side relative to a specific deal:
+//   • 'ours'  — contact's email domain is in the org's internal-domain set
+//               (user emails ∪ KNOWN_INTERNAL_DOMAINS ∪ companies flagged
+//               is_internal_entity). Captures Medina-side participants
+//               regardless of whether they have a user account yet.
+//   • 'theirs'— contact.company_id matches deal.company_id (they work at
+//               the company being evaluated).
+//   • 'other' — everything else (co-investors, lawyers, advisors, external
+//               referrers).
+//
+// Used by deal_contacts insert paths (auto-link helpers, manual UI add,
+// approval-commit) and the Wave 5 backfill admin endpoint.
+
+export type DealContactSide = 'ours' | 'theirs' | 'other';
+
+/** Classify a single contact's side for a single deal. Cheap — one row
+ *  fetch per contact + reuses the resolveInternalDomains cache. */
+export async function classifyContactSide(
+  contactId: string,
+  dealCompanyId: string | null,
+  orgId: string,
+  env: Env,
+  domainCache?: Map<string, Set<string>>
+): Promise<DealContactSide> {
+  const contact = await env.D1.prepare(
+    `SELECT email, company_id FROM contacts
+       WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(contactId, orgId).first<{ email: string | null; company_id: string | null }>();
+  if (!contact) return 'other';
+
+  const internalDomains = await resolveInternalDomains(orgId, env, domainCache);
+  const emailLower = (contact.email || '').toLowerCase();
+  const at = emailLower.indexOf('@');
+  const domain = at >= 0 ? emailLower.slice(at + 1) : '';
+
+  if (domain && internalDomains.has(domain)) return 'ours';
+  if (dealCompanyId && contact.company_id === dealCompanyId) return 'theirs';
+  return 'other';
+}
+
+/** Sync version when caller already has the contact's email + company_id +
+ *  the deal company_id + the resolved domain set. Used by hot batch paths
+ *  to avoid N+1 lookups. */
+export function classifyContactSideSync(
+  contactEmail: string | null,
+  contactCompanyId: string | null,
+  dealCompanyId: string | null,
+  internalDomains: Set<string>
+): DealContactSide {
+  const emailLower = (contactEmail || '').toLowerCase();
+  const at = emailLower.indexOf('@');
+  const domain = at >= 0 ? emailLower.slice(at + 1) : '';
+  if (domain && internalDomains.has(domain)) return 'ours';
+  if (dealCompanyId && contactCompanyId === dealCompanyId) return 'theirs';
+  return 'other';
 }
