@@ -6,6 +6,7 @@ import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { computeDealIntelligence, readDealIntelligence } from '../lib/deal-intelligence';
+import { assertExternalCompanyForDeal, InternalDealError } from '../lib/internal-entity';
 
 // ---------------------------------------------------------------------------
 // GET /api/deals
@@ -156,6 +157,16 @@ export async function createDeal(
   const body = await parseJsonBody<any>(request);
   if (!body?.title || !body?.company_id)
     return errorResponse('VALIDATION_ERROR', 400, 'title and company_id required');
+
+  // Wave 1: deal target must be an external (non-internal) company.
+  try {
+    await assertExternalCompanyForDeal(body.company_id, ctx.orgId, env);
+  } catch (e) {
+    if (e instanceof InternalDealError) {
+      return errorResponse(e.code, 400, e.message);
+    }
+    throw e;
+  }
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();

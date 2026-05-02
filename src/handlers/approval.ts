@@ -367,10 +367,19 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
   // old; if the company was soft-deleted in between, fail loudly rather
   // than insert a deal pointing at a tombstone.
   const company = await env.D1.prepare(
-    `SELECT id FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-  ).bind(payload.company_id, item.org_id).first();
+    `SELECT id, is_internal_entity FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(payload.company_id, item.org_id).first<{ id: string; is_internal_entity: number }>();
   if (!company) {
     console.error(`[commit-create-deal] company ${payload.company_id} not found in org ${item.org_id}`);
+    return {};
+  }
+  // Wave 1: refuse to commit deal proposals on internal entities. Old
+  // proposals from before the rule landed will be skipped silently —
+  // they should also be cleaned out of approval_queue (admin sweep).
+  if (company.is_internal_entity === 1) {
+    console.warn(
+      `[commit-create-deal] skipping internal-entity proposal company=${payload.company_id} title=${String(payload.title).slice(0, 60)}`
+    );
     return {};
   }
 

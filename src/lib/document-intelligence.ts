@@ -3,6 +3,7 @@ import type { ChunkMetadata } from '../types/interfaces';
 import { callClaude } from './claude';
 import { jaroWinkler, scoreSimilarity } from './dedup';
 import { proposeMultipleUpdates, type SourceType } from './progressive-enrichment';
+import { isCompanyInternal } from './internal-entity';
 import { findOrCreateCompanyByDomain } from './discovery';
 import { updateEntityInIndex } from './entity-index';
 import { chunkEmbedAndPersistAll } from './embedding';
@@ -589,6 +590,12 @@ async function routeDeal(
   let companyId: string | null = null;
   if (extracted.company_name) {
     companyId = companyLookup.get(extracted.company_name.toLowerCase()) || null;
+  }
+
+  // Wave 1: refuse to import deals targeting internal Medina-side entities.
+  if (companyId && await isCompanyInternal(companyId, orgId, env)) {
+    console.warn(`[doc-intel] skipping deal import targeting internal company ${companyId}: ${extracted.name}`);
+    return { created: false, id: '' };
   }
 
   const dealId = crypto.randomUUID();

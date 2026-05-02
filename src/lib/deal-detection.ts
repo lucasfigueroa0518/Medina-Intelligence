@@ -63,7 +63,29 @@ export async function detectAndStageDealSignals(
   orgId: string,
   env: Env
 ): Promise<number> {
-  const candidates = items.filter(looksLikeDealCandidate);
+  let candidates = items.filter(looksLikeDealCandidate);
+  if (candidates.length === 0) return 0;
+
+  // Wave 1: drop candidates whose target company is an internal Medina-side
+  // entity. Otherwise the LLM keeps generating create_deal proposals for
+  // Medina's own LP raises / fund closes — those are not deals.
+  const candidateCompanyIds = Array.from(new Set(candidates.map(c => c.companyId!).filter(Boolean)));
+  if (candidateCompanyIds.length > 0) {
+    const placeholders = candidateCompanyIds.map(() => '?').join(',');
+    const rows = await env.D1.prepare(
+      `SELECT id FROM companies
+         WHERE org_id = ? AND id IN (${placeholders}) AND is_internal_entity = 1`
+    ).bind(orgId, ...candidateCompanyIds).all<{ id: string }>();
+    if (rows.results.length > 0) {
+      const internalSet = new Set(rows.results.map(r => r.id));
+      const before = candidates.length;
+      candidates = candidates.filter(c => !internalSet.has(c.companyId!));
+      const skipped = before - candidates.length;
+      if (skipped > 0) {
+        console.log(`[deal-detect] skipped ${skipped} candidates targeting internal entities`);
+      }
+    }
+  }
   if (candidates.length === 0) return 0;
 
   // Cap LLM calls per ingestion cycle so a noisy batch can't eat the budget.
