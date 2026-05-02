@@ -6,6 +6,13 @@ import { findDuplicateCompany } from './discovery';
 import { updateEntityInIndex } from './entity-index';
 import { canReadEmailContent, getSharingFlags } from './helpers';
 import { isCompanyInternal, assertNoOpenDealForCompany, OpenDealConflictError } from './internal-entity';
+import {
+  updateContactFields, updateCompanyFields, updateDealFields,
+  deleteEntityField,
+  createContactRecord, createCompanyRecord, createDealRecord,
+  type WriteContext,
+} from './entity-writes';
+import { linkConversationToDeal, linkEventToDeal } from './deal-association';
 
 // ACL redaction: nulls fields whose value may have been derived from private
 // conversation content (LLM-extracted topics, auto-populated deal notes,
@@ -475,8 +482,7 @@ export async function getDealDetail(
 // ---------------------------------------------------------------------------
 
 export async function createContactTool(
-  orgId: string,
-  userId: string,
+  ctx: AuthContext,
   input: {
     full_name: string; email?: string; phone?: string;
     contact_type?: string; company_name?: string; job_title?: string;
@@ -484,132 +490,116 @@ export async function createContactTool(
   },
   env: Env
 ): Promise<any> {
+  // MARTy-side conveniences kept at the tool layer (entity-writes
+  // takes structured input; dedup + company-name → company-id
+  // resolution is tool ergonomics, not a write-path concern).
   let companyId: string | null = null;
   if (input.company_name) {
-    const existingCompany = await findDuplicateCompany(input.company_name, null, orgId, env);
+    const existingCompany = await findDuplicateCompany(input.company_name, null, ctx.orgId, env);
     if (existingCompany) {
       companyId = existingCompany;
     } else {
-      companyId = crypto.randomUUID();
-      const now = new Date().toISOString();
-      await env.D1.prepare(
-        `INSERT INTO companies (id, org_id, name, company_type, created_at, updated_at)
-         VALUES (?, ?, ?, 'other', ?, ?)`
-      ).bind(companyId, orgId, input.company_name, now, now).run();
-      try { await updateEntityInIndex(orgId, 'company', companyId, env); } catch {}
+      // Auto-create a placeholder company for the contact's
+      // affiliation. Routes through createCompanyRecord so the new
+      // company gets the same audit + invalidation hooks.
+      const created = await createCompanyRecord(
+        { name: input.company_name, company_type: 'other' },
+        { orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty' },
+        env
+      );
+      if (created.ok && created.id) {
+        companyId = created.id;
+        try { await updateEntityInIndex(ctx.orgId, 'company', companyId, env); } catch {}
+      }
     }
   }
 
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const contactType = input.contact_type || 'individual';
   const normalizedEmail = input.email?.toLowerCase().trim() || null;
 
-  // Dedup by email
+  // Dedup by email — return existing without creating.
   if (normalizedEmail) {
     const byEmail = await env.D1.prepare(
       'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(orgId, normalizedEmail).first<{ id: string }>();
+    ).bind(ctx.orgId, normalizedEmail).first<{ id: string }>();
     if (byEmail) {
       return { success: true, contact_id: byEmail.id, message: `Contact "${input.full_name}" already exists`, deduplicated: true };
     }
   }
-
-  // Dedup by name + company when no email provided
+  // Dedup by name + company when no email provided.
   if (!normalizedEmail && companyId) {
     const byNameCompany = await env.D1.prepare(
       'SELECT id FROM contacts WHERE org_id = ? AND LOWER(full_name) = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(orgId, input.full_name.trim().toLowerCase(), companyId).first<{ id: string }>();
+    ).bind(ctx.orgId, input.full_name.trim().toLowerCase(), companyId).first<{ id: string }>();
     if (byNameCompany) {
       return { success: true, contact_id: byNameCompany.id, message: `Contact "${input.full_name}" already exists`, deduplicated: true };
     }
   }
 
-  const result = await env.D1.prepare(
-    `INSERT OR IGNORE INTO contacts
-       (id, org_id, full_name, email, phone, linkedin_url, contact_type,
-        company_id, job_title, bio_summary, source, source_confidence, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', 1.0, ?, ?)`
-  ).bind(
-    id, orgId, input.full_name.trim(),
-    normalizedEmail,
-    input.phone || null, input.linkedin_url || null,
-    contactType, companyId, input.job_title || null,
-    input.notes || null, now, now
-  ).run();
-
-  if (!result.meta?.changes) {
-    const raced = await env.D1.prepare(
-      'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(orgId, normalizedEmail || '').first<{ id: string }>();
-    if (raced) return { success: true, contact_id: raced.id, message: `Contact "${input.full_name}" already exists`, deduplicated: true };
-    return { error: 'Failed to create contact' };
+  // Actual write through entity-writes — same audit + invalidation as
+  // manual UI create.
+  const result = await createContactRecord(
+    {
+      full_name: input.full_name,
+      email: normalizedEmail,
+      phone: input.phone || null,
+      linkedin_url: input.linkedin_url || null,
+      contact_type: input.contact_type || null,
+      company_id: companyId,
+      job_title: input.job_title || null,
+      bio_summary: input.notes || null,
+    },
+    { orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty' },
+    env
+  );
+  if (!result.ok || !result.id) {
+    return { error: result.error?.message || 'Failed to create contact', code: result.error?.code };
   }
-
-  await emitAudit(env, {
-    org_id: orgId, user_id: userId, action: 'create',
-    entity_type: 'contact', entity_id: id,
-    after_data: { id, full_name: input.full_name, source: 'manual' },
-    created_at: now,
-  });
-  try { await updateEntityInIndex(orgId, 'contact', id, env); } catch {}
-  await invalidateRagCache(orgId, env);
-
-  return { success: true, contact_id: id, message: `Created contact "${input.full_name}"` };
+  try { await updateEntityInIndex(ctx.orgId, 'contact', result.id, env); } catch {}
+  return { success: true, contact_id: result.id, message: `Created contact "${input.full_name}"` };
 }
 
 export async function updateContactTool(
-  orgId: string,
-  userId: string,
+  ctx: AuthContext,
   input: { contact_id: string; fields: Record<string, any> },
   env: Env
 ): Promise<any> {
-  const contact = await env.D1.prepare(
-    'SELECT id, full_name FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(input.contact_id, orgId).first<{ id: string; full_name: string }>();
-  if (!contact) return { error: 'Contact not found' };
-
-  const allowed = new Set([
-    'full_name', 'email', 'phone', 'linkedin_url', 'contact_type', 'job_title',
-    'bio_summary', 'company_id', 'relationship_status', 'engagement_status',
-    'next_followup_date', 'topics_of_interest', 'pain_points', 'location',
-    'investment_focus', 'check_size_range', 'communication_channel_preference',
-  ]);
-
-  const updates: string[] = [];
-  const binds: unknown[] = [];
-  const changedFields: string[] = [];
-
-  for (const [key, value] of Object.entries(input.fields)) {
-    if (!allowed.has(key)) continue;
-    updates.push(`${key} = ?`);
-    binds.push(value);
-    changedFields.push(key);
+  // Routes through src/lib/entity-writes.ts so MARTy writes get the
+  // same lock checks (permanent_lock, 180-day human-edit lock with
+  // same-user exception), the same entity_field_state state-sync, and
+  // the same audit row shape that manual UI edits get. origin='marty'
+  // tags the write in the audit metadata.
+  const wctx: WriteContext = {
+    orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty',
+  };
+  const result = await updateContactFields(input.contact_id, input.fields, wctx, env);
+  if (!result.ok && result.error) {
+    return { error: result.error.message, code: result.error.code };
   }
-
-  if (updates.length === 0) return { error: 'No valid fields to update' };
-
-  updates.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')");
-  binds.push(input.contact_id, orgId);
-
-  await env.D1.prepare(
-    `UPDATE contacts SET ${updates.join(', ')} WHERE id = ? AND org_id = ?`
-  ).bind(...binds).run();
-
-  await emitAudit(env, {
-    org_id: orgId, user_id: userId, action: 'update',
-    entity_type: 'contact', entity_id: input.contact_id,
-    after_data: input.fields,
-    created_at: new Date().toISOString(),
-  });
-  await invalidateRagCache(orgId, env);
-
-  return { success: true, message: `Updated ${changedFields.join(', ')} on "${contact.full_name}"` };
+  const appliedFields = Object.keys(result.applied);
+  // Compose a MARTy-readable confirmation. Surface per-field
+  // rejections so the agent can narrate "I updated X but couldn't
+  // change Y because…" — locked spec for clear refusal patterns.
+  const lines: string[] = [];
+  if (appliedFields.length > 0) {
+    const after = (result.after as any) || {};
+    lines.push(`Updated ${appliedFields.join(', ')} on "${after.full_name || input.contact_id}".`);
+  }
+  if (result.rejected.length > 0) {
+    for (const r of result.rejected) {
+      lines.push(`Could not update ${r.field_name}: ${r.detail || r.reason}.`);
+    }
+  }
+  if (lines.length === 0) lines.push('No fields needed updating (all values already match).');
+  return {
+    success: appliedFields.length > 0 || result.rejected.length === 0,
+    message: lines.join(' '),
+    applied: result.applied,
+    rejected: result.rejected,
+  };
 }
 
 export async function createCompanyTool(
-  orgId: string,
-  userId: string,
+  ctx: AuthContext,
   input: { name: string; domain?: string; website?: string; sector?: string; company_type?: string; location?: string; description?: string },
   env: Env
 ): Promise<any> {
@@ -617,86 +607,62 @@ export async function createCompanyTool(
     ? input.website.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].trim()
     : null);
 
-  const existing = await findDuplicateCompany(input.name, domain, orgId, env);
+  const existing = await findDuplicateCompany(input.name, domain, ctx.orgId, env);
   if (existing) {
     return { success: true, company_id: existing, message: `Company "${input.name}" already exists`, deduplicated: true };
   }
 
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-
-  await env.D1.prepare(
-    `INSERT INTO companies (id, org_id, name, domain, website, sector, company_type, description, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
-    id, orgId, input.name.trim(),
-    domain || null, input.website || null,
-    input.sector || null, input.company_type || 'other',
-    input.description || null, now, now
-  ).run();
-
-  await emitAudit(env, {
-    org_id: orgId, user_id: userId, action: 'create',
-    entity_type: 'company', entity_id: id,
-    after_data: { id, name: input.name, source: 'manual' },
-    created_at: now,
-  });
-  try { await updateEntityInIndex(orgId, 'company', id, env); } catch {}
-  await invalidateRagCache(orgId, env);
-
-  return { success: true, company_id: id, message: `Created company "${input.name}"` };
+  const result = await createCompanyRecord(
+    {
+      name: input.name,
+      domain: domain || null,
+      website: input.website || null,
+      description: input.description || null,
+      sector: input.sector || null,
+      company_type: input.company_type || 'other',
+    },
+    { orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty' },
+    env
+  );
+  if (!result.ok || !result.id) {
+    return { error: result.error?.message || 'Failed to create company', code: result.error?.code };
+  }
+  try { await updateEntityInIndex(ctx.orgId, 'company', result.id, env); } catch {}
+  return { success: true, company_id: result.id, message: `Created company "${input.name}"` };
 }
 
 export async function updateCompanyTool(
-  orgId: string,
-  userId: string,
+  ctx: AuthContext,
   input: { company_id: string; fields: Record<string, any> },
   env: Env
 ): Promise<any> {
-  const company = await env.D1.prepare(
-    'SELECT id, name FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(input.company_id, orgId).first<{ id: string; name: string }>();
-  if (!company) return { error: 'Company not found' };
-
-  const allowed = new Set([
-    'name', 'domain', 'website', 'sector', 'company_type',
-    'description', 'stage', 'investment_status', 'current_valuation',
-  ]);
-
-  const updates: string[] = [];
-  const binds: unknown[] = [];
-  const changedFields: string[] = [];
-
-  for (const [key, value] of Object.entries(input.fields)) {
-    if (!allowed.has(key)) continue;
-    updates.push(`${key} = ?`);
-    binds.push(value);
-    changedFields.push(key);
+  const wctx: WriteContext = {
+    orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty',
+  };
+  const result = await updateCompanyFields(input.company_id, input.fields, wctx, env);
+  if (!result.ok && result.error) {
+    return { error: result.error.message, code: result.error.code };
   }
-
-  if (updates.length === 0) return { error: 'No valid fields to update' };
-
-  updates.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')");
-  binds.push(input.company_id, orgId);
-
-  await env.D1.prepare(
-    `UPDATE companies SET ${updates.join(', ')} WHERE id = ? AND org_id = ?`
-  ).bind(...binds).run();
-
-  await emitAudit(env, {
-    org_id: orgId, user_id: userId, action: 'update',
-    entity_type: 'company', entity_id: input.company_id,
-    after_data: input.fields,
-    created_at: new Date().toISOString(),
-  });
-  await invalidateRagCache(orgId, env);
-
-  return { success: true, message: `Updated ${changedFields.join(', ')} on "${company.name}"` };
+  const appliedFields = Object.keys(result.applied);
+  const after = (result.after as any) || {};
+  const lines: string[] = [];
+  if (appliedFields.length > 0) {
+    lines.push(`Updated ${appliedFields.join(', ')} on "${after.name || input.company_id}".`);
+  }
+  for (const r of result.rejected) {
+    lines.push(`Could not update ${r.field_name}: ${r.detail || r.reason}.`);
+  }
+  if (lines.length === 0) lines.push('No fields needed updating (all values already match).');
+  return {
+    success: appliedFields.length > 0 || result.rejected.length === 0,
+    message: lines.join(' '),
+    applied: result.applied,
+    rejected: result.rejected,
+  };
 }
 
 export async function createDealTool(
-  orgId: string,
-  userId: string,
+  ctx: AuthContext,
   input: {
     title: string; company_name?: string; company_id?: string;
     stage?: string; amount?: number; valuation?: number;
@@ -704,120 +670,70 @@ export async function createDealTool(
   },
   env: Env
 ): Promise<any> {
+  // Tool-layer convenience: resolve company_name → company_id.
   let companyId = input.company_id || null;
   if (!companyId && input.company_name) {
     const existing = await env.D1.prepare(
       'SELECT id FROM companies WHERE org_id = ? AND name LIKE ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(orgId, input.company_name).first<{ id: string }>();
+    ).bind(ctx.orgId, input.company_name).first<{ id: string }>();
     if (existing) companyId = existing.id;
   }
   if (!companyId) return { error: 'company_id or company_name matching an existing company is required' };
 
-  // Wave 1: refuse to create deals on internal Medina-side entities.
-  if (await isCompanyInternal(companyId, orgId, env)) {
-    return {
-      error: 'Cannot create deal for internal entity. A deal represents a startup Medina is evaluating for investment.',
-      code: 'INTERNAL_ENTITY_NOT_DEAL_ELIGIBLE',
-    };
+  // createDealRecord handles Wave 1 (assertExternalCompanyForDeal) +
+  // Wave 2 (assertNoOpenDealForCompany) guards inline; embed-deal too.
+  const result = await createDealRecord(
+    {
+      company_id: companyId,
+      title: input.title,
+      stage: input.stage || 'prospect',
+      amount: input.amount ?? null,
+      valuation: input.valuation ?? null,
+      notes: input.description || null,
+      expected_close: input.expected_close || null,
+    },
+    { orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty' },
+    env
+  );
+  if (!result.ok || !result.id) {
+    return { error: result.error?.message || 'Failed to create deal', code: result.error?.code };
   }
-
-  // Wave 2: refuse to create a second open deal at the same company.
-  try {
-    await assertNoOpenDealForCompany(companyId, orgId, env);
-  } catch (e) {
-    if (e instanceof OpenDealConflictError) {
-      return { error: e.message, code: e.code, existing_deal_id: e.existingDealId };
-    }
-    throw e;
-  }
-
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const stage = input.stage || 'prospect';
-
-  await env.D1.prepare(
-    `INSERT INTO deals
-       (id, org_id, company_id, owner_id, title, stage, amount, currency,
-        valuation, notes, probability,
-        stage_changed_at, last_activity_date, days_in_stage,
-        expected_close, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, 0, ?, ?, 0, ?, ?, ?)`
-  ).bind(
-    id, orgId, companyId, userId, input.title.trim(),
-    stage, input.amount ?? null, input.valuation ?? null,
-    input.description || null, now, now,
-    input.expected_close || null, now, now
-  ).run();
-
-  const sourceMetadata: Record<string, any> = {};
-  if (input.stage) sourceMetadata.stage = { source: 'manual', set_by: userId, set_at: now };
-  if (input.amount) sourceMetadata.amount = { source: 'manual', set_by: userId, set_at: now };
-  if (Object.keys(sourceMetadata).length > 0) {
-    await env.D1.prepare('UPDATE deals SET source_metadata = ? WHERE id = ?')
-      .bind(JSON.stringify(sourceMetadata), id).run();
-  }
-
-  await emitAudit(env, {
-    org_id: orgId, user_id: userId, action: 'create',
-    entity_type: 'deal', entity_id: id,
-    after_data: { id, title: input.title, stage, source: 'manual' },
-    created_at: now,
-  });
-  await invalidateRagCache(orgId, env);
-
-  return { success: true, deal_id: id, message: `Created deal "${input.title}"` };
+  return { success: true, deal_id: result.id, message: `Created deal "${input.title}"` };
 }
 
 export async function updateDealTool(
-  orgId: string,
-  userId: string,
+  ctx: AuthContext,
   input: { deal_id: string; fields: Record<string, any> },
   env: Env
 ): Promise<any> {
-  const deal = await env.D1.prepare(
-    'SELECT id, title, stage FROM deals WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(input.deal_id, orgId).first<{ id: string; title: string; stage: string }>();
-  if (!deal) return { error: 'Deal not found' };
-
-  const allowed = new Set([
-    'title', 'stage', 'amount', 'valuation', 'probability', 'expected_close',
-    'notes', 'our_allocation', 'instrument_type', 'lead_source', 'thesis_fit', 'currency',
-  ]);
-
-  const updates: string[] = [];
-  const binds: unknown[] = [];
-  const changedFields: string[] = [];
-
-  for (const [key, value] of Object.entries(input.fields)) {
-    if (!allowed.has(key)) continue;
-    updates.push(`${key} = ?`);
-    binds.push(value);
-    changedFields.push(key);
+  const wctx: WriteContext = {
+    orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty',
+  };
+  const result = await updateDealFields(input.deal_id, input.fields, wctx, env);
+  if (!result.ok && result.error) {
+    return { error: result.error.message, code: result.error.code };
   }
-
-  if (updates.length === 0) return { error: 'No valid fields to update' };
-
-  if (input.fields.stage && input.fields.stage !== deal.stage) {
-    updates.push("stage_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')");
-    updates.push('days_in_stage = 0');
+  const appliedFields = Object.keys(result.applied);
+  const after = (result.after as any) || {};
+  const lines: string[] = [];
+  if (appliedFields.length > 0) {
+    lines.push(`Updated ${appliedFields.join(', ')} on "${after.title || input.deal_id}".`);
   }
-  updates.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')");
-  updates.push("last_activity_date = strftime('%Y-%m-%dT%H:%M:%fZ','now')");
-  binds.push(input.deal_id, orgId);
-
+  for (const r of result.rejected) {
+    lines.push(`Could not update ${r.field_name}: ${r.detail || r.reason}.`);
+  }
+  if (lines.length === 0) lines.push('No fields needed updating (all values already match).');
+  // last_activity_date bump — same as the manual UI handler does after
+  // updateDealFields. Keeps deal cards sorted by recency.
   await env.D1.prepare(
-    `UPDATE deals SET ${updates.join(', ')} WHERE id = ? AND org_id = ?`
-  ).bind(...binds).run();
-
-  await emitAudit(env, {
-    org_id: orgId, user_id: userId, action: 'update',
-    entity_type: 'deal', entity_id: input.deal_id,
-    after_data: input.fields,
-    created_at: new Date().toISOString(),
-  });
-  await invalidateRagCache(orgId, env);
-
-  return { success: true, message: `Updated ${changedFields.join(', ')} on "${deal.title}"` };
+    `UPDATE deals SET last_activity_date = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+  ).bind(input.deal_id).run();
+  return {
+    success: appliedFields.length > 0 || result.rejected.length === 0,
+    message: lines.join(' '),
+    applied: result.applied,
+    rejected: result.rejected,
+  };
 }
 
 export async function addNoteTool(
@@ -973,4 +889,462 @@ export async function deleteEntityTool(
   await invalidateRagCache(orgId, env);
 
   return { success: true, message: `Deleted ${input.entity_type} "${input.entity_id}"` };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Phase 2 — additional MARTy write tools
+// ────────────────────────────────────────────────────────────────────
+
+// Field deletions — set the entity column to NULL. User explicitly
+// asked via natural-language ("clear Tony's email") so this is direct
+// (no held-proposal queue). Routes through entity-writes.ts which
+// performs the lock-check and uses recordApprovalOfDeletion for the
+// entity_field_state side. Confirms back to MARTy what got cleared
+// (or what got refused, with the reason).
+
+export async function deleteContactFieldTool(
+  ctx: AuthContext,
+  input: { contact_id: string; field_name: string },
+  env: Env
+): Promise<any> {
+  const result = await deleteEntityField(
+    'contact', input.contact_id, input.field_name,
+    { orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty' },
+    env
+  );
+  if (!result.ok && result.error) {
+    return { error: result.error.message, code: result.error.code };
+  }
+  if (result.applied[input.field_name] === null) {
+    const after = (result.after as any) || {};
+    return { success: true, message: `Cleared ${input.field_name} on "${after.full_name || input.contact_id}".` };
+  }
+  return { success: true, message: `${input.field_name} was already empty — nothing to clear.` };
+}
+
+export async function deleteCompanyFieldTool(
+  ctx: AuthContext,
+  input: { company_id: string; field_name: string },
+  env: Env
+): Promise<any> {
+  const result = await deleteEntityField(
+    'company', input.company_id, input.field_name,
+    { orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty' },
+    env
+  );
+  if (!result.ok && result.error) return { error: result.error.message, code: result.error.code };
+  const after = (result.after as any) || {};
+  return result.applied[input.field_name] === null
+    ? { success: true, message: `Cleared ${input.field_name} on "${after.name || input.company_id}".` }
+    : { success: true, message: `${input.field_name} was already empty.` };
+}
+
+export async function deleteDealFieldTool(
+  ctx: AuthContext,
+  input: { deal_id: string; field_name: string },
+  env: Env
+): Promise<any> {
+  const result = await deleteEntityField(
+    'deal', input.deal_id, input.field_name,
+    { orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole, origin: 'marty' },
+    env
+  );
+  if (!result.ok && result.error) return { error: result.error.message, code: result.error.code };
+  const after = (result.after as any) || {};
+  return result.applied[input.field_name] === null
+    ? { success: true, message: `Cleared ${input.field_name} on "${after.title || input.deal_id}".` }
+    : { success: true, message: `${input.field_name} was already empty.` };
+}
+
+// Conversation/event ↔ deal linkage. Uses the conversation_deals /
+// event_deals junctions from T1's Phase B (migration 0071). MARTy-
+// driven links land with source='manual' so they take precedence over
+// auto/inherited links in fetchDealConversations and trigger
+// invalidateDealIntelligence (linkConversationToDeal does this).
+
+async function verifyDealInOrg(dealId: string, orgId: string, env: Env): Promise<boolean> {
+  const row = await env.D1.prepare(
+    'SELECT 1 FROM deals WHERE id = ? AND org_id = ? AND deleted_at IS NULL LIMIT 1'
+  ).bind(dealId, orgId).first();
+  return !!row;
+}
+
+async function verifyConversationInOrg(conversationId: string, orgId: string, env: Env): Promise<boolean> {
+  const row = await env.D1.prepare(
+    'SELECT 1 FROM conversations WHERE id = ? AND org_id = ? LIMIT 1'
+  ).bind(conversationId, orgId).first();
+  return !!row;
+}
+
+async function verifyEventInOrg(eventId: string, orgId: string, env: Env): Promise<boolean> {
+  const row = await env.D1.prepare(
+    'SELECT 1 FROM events WHERE id = ? AND org_id = ? LIMIT 1'
+  ).bind(eventId, orgId).first();
+  return !!row;
+}
+
+export async function linkConversationToDealTool(
+  ctx: AuthContext,
+  input: { conversation_id: string; deal_id: string },
+  env: Env
+): Promise<any> {
+  if (!(await verifyConversationInOrg(input.conversation_id, ctx.orgId, env))) {
+    return { error: 'Conversation not found in your org' };
+  }
+  if (!(await verifyDealInOrg(input.deal_id, ctx.orgId, env))) {
+    return { error: 'Deal not found in your org' };
+  }
+  const result = await linkConversationToDeal(
+    input.conversation_id, input.deal_id,
+    'manual', 1.0, ctx.orgId, env, ctx.userId
+  );
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId, action: 'update',
+    entity_type: 'deal', entity_id: input.deal_id,
+    after_data: { conversation_id: input.conversation_id, source: 'manual' },
+    metadata: { origin: 'marty', subaction: 'link_conversation' },
+    created_at: new Date().toISOString(),
+  });
+  return result.inserted
+    ? { success: true, message: `Linked conversation to deal.` }
+    : { success: true, message: `Conversation was already linked to this deal.`, deduplicated: true };
+}
+
+export async function linkEventToDealTool(
+  ctx: AuthContext,
+  input: { event_id: string; deal_id: string },
+  env: Env
+): Promise<any> {
+  if (!(await verifyEventInOrg(input.event_id, ctx.orgId, env))) {
+    return { error: 'Event not found in your org' };
+  }
+  if (!(await verifyDealInOrg(input.deal_id, ctx.orgId, env))) {
+    return { error: 'Deal not found in your org' };
+  }
+  const result = await linkEventToDeal(
+    input.event_id, input.deal_id,
+    'manual', 1.0, ctx.orgId, env, ctx.userId
+  );
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId, action: 'update',
+    entity_type: 'deal', entity_id: input.deal_id,
+    after_data: { event_id: input.event_id, source: 'manual' },
+    metadata: { origin: 'marty', subaction: 'link_event' },
+    created_at: new Date().toISOString(),
+  });
+  return result.inserted
+    ? { success: true, message: `Linked meeting to deal.` }
+    : { success: true, message: `Meeting was already linked to this deal.`, deduplicated: true };
+}
+
+export async function unlinkConversationFromDealTool(
+  ctx: AuthContext,
+  input: { conversation_id: string; deal_id: string },
+  env: Env
+): Promise<any> {
+  if (!(await verifyDealInOrg(input.deal_id, ctx.orgId, env))) {
+    return { error: 'Deal not found in your org' };
+  }
+  const result = await env.D1.prepare(
+    'DELETE FROM conversation_deals WHERE conversation_id = ? AND deal_id = ?'
+  ).bind(input.conversation_id, input.deal_id).run();
+  if ((result.meta?.changes ?? 0) === 0) {
+    return { success: true, message: `Conversation was not linked to this deal.` };
+  }
+  // Invalidate deal_intelligence — fewer linked conversations may
+  // shift sentiment/topics. Mirrors the link path's invalidation
+  // (deal-association.ts's internal invalidateDealIntelligence — not
+  // exported there; inlined here so we don't reach into module privates).
+  try {
+    await env.D1.prepare(
+      `UPDATE deal_intelligence
+          SET invalidated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE deal_id = ? AND user_id IN (
+          SELECT id FROM users WHERE org_id = ? AND deleted_at IS NULL
+        )`
+    ).bind(input.deal_id, ctx.orgId).run();
+  } catch { /* best-effort */ }
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId, action: 'update',
+    entity_type: 'deal', entity_id: input.deal_id,
+    after_data: { conversation_id: input.conversation_id },
+    metadata: { origin: 'marty', subaction: 'unlink_conversation' },
+    created_at: new Date().toISOString(),
+  });
+  return { success: true, message: `Unlinked conversation from deal.` };
+}
+
+export async function unlinkEventFromDealTool(
+  ctx: AuthContext,
+  input: { event_id: string; deal_id: string },
+  env: Env
+): Promise<any> {
+  if (!(await verifyDealInOrg(input.deal_id, ctx.orgId, env))) {
+    return { error: 'Deal not found in your org' };
+  }
+  const result = await env.D1.prepare(
+    'DELETE FROM event_deals WHERE event_id = ? AND deal_id = ?'
+  ).bind(input.event_id, input.deal_id).run();
+  if ((result.meta?.changes ?? 0) === 0) {
+    return { success: true, message: `Meeting was not linked to this deal.` };
+  }
+  // Invalidate deal_intelligence (mirrors the conversation-unlink path
+  // — invalidateDealIntelligence isn't exported from deal-association.ts).
+  try {
+    await env.D1.prepare(
+      `UPDATE deal_intelligence
+          SET invalidated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE deal_id = ? AND user_id IN (
+          SELECT id FROM users WHERE org_id = ? AND deleted_at IS NULL
+        )`
+    ).bind(input.deal_id, ctx.orgId).run();
+  } catch { /* best-effort */ }
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId, action: 'update',
+    entity_type: 'deal', entity_id: input.deal_id,
+    after_data: { event_id: input.event_id },
+    metadata: { origin: 'marty', subaction: 'unlink_event' },
+    created_at: new Date().toISOString(),
+  });
+  return { success: true, message: `Unlinked meeting from deal.` };
+}
+
+// Contact ↔ deal membership. deal_contacts is the canonical "who's
+// involved in this deal" table. side = 'us' | 'them' (the existing
+// addDealContact handler validates this); role is freeform.
+
+export async function addContactToDealTool(
+  ctx: AuthContext,
+  input: { deal_id: string; contact_id: string; role?: string; side?: 'us' | 'them' },
+  env: Env
+): Promise<any> {
+  if (!(await verifyDealInOrg(input.deal_id, ctx.orgId, env))) {
+    return { error: 'Deal not found in your org' };
+  }
+  const contact = await env.D1.prepare(
+    'SELECT id, full_name FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL LIMIT 1'
+  ).bind(input.contact_id, ctx.orgId).first<{ id: string; full_name: string }>();
+  if (!contact) return { error: 'Contact not found in your org' };
+
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const result = await env.D1.prepare(
+    `INSERT OR IGNORE INTO deal_contacts (id, org_id, deal_id, contact_id, role, side, added_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    id, ctx.orgId, input.deal_id, input.contact_id,
+    input.role || null, input.side || 'them', now
+  ).run();
+  if ((result.meta?.changes ?? 0) === 0) {
+    return { success: true, message: `${contact.full_name} is already linked to this deal.`, deduplicated: true };
+  }
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId, action: 'update',
+    entity_type: 'deal', entity_id: input.deal_id,
+    after_data: { contact_id: input.contact_id, role: input.role, side: input.side || 'them' },
+    metadata: { origin: 'marty', subaction: 'add_contact' },
+    created_at: now,
+  });
+  return { success: true, message: `Added ${contact.full_name} to the deal.` };
+}
+
+export async function removeContactFromDealTool(
+  ctx: AuthContext,
+  input: { deal_id: string; contact_id: string },
+  env: Env
+): Promise<any> {
+  if (!(await verifyDealInOrg(input.deal_id, ctx.orgId, env))) {
+    return { error: 'Deal not found in your org' };
+  }
+  const result = await env.D1.prepare(
+    'DELETE FROM deal_contacts WHERE deal_id = ? AND contact_id = ? AND org_id = ?'
+  ).bind(input.deal_id, input.contact_id, ctx.orgId).run();
+  if ((result.meta?.changes ?? 0) === 0) {
+    return { success: true, message: `Contact was not linked to this deal.` };
+  }
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId, action: 'update',
+    entity_type: 'deal', entity_id: input.deal_id,
+    after_data: { contact_id: input.contact_id },
+    metadata: { origin: 'marty', subaction: 'remove_contact' },
+    created_at: new Date().toISOString(),
+  });
+  return { success: true, message: `Removed contact from deal.` };
+}
+
+// Observation + held-proposal + field-lock tools — wrap the existing
+// handler functions from Q11/Q12 wave + Wave 6 UX. MARTy can dismiss
+// noise observations, accept/reject held proposals, and lock fields
+// without the user opening Settings.
+
+export async function dismissObservationTool(
+  ctx: AuthContext,
+  input: { observation_id: string },
+  env: Env
+): Promise<any> {
+  const { dismissObservation } = await import('./synthetic-observations');
+  const result = await dismissObservation(input.observation_id, ctx.userId, ctx.orgId, env);
+  return result.ok
+    ? { success: true, message: 'Observation dismissed.' }
+    : { error: 'Observation not found or already dismissed' };
+}
+
+export async function approveHeldProposalTool(
+  ctx: AuthContext,
+  input: {
+    entity_type: 'contact' | 'company' | 'deal';
+    entity_id: string;
+    field_name: string;
+    value?: string;
+    is_deletion?: boolean;
+  },
+  env: Env
+): Promise<any> {
+  // Reuse the existing approval.ts logic by reproducing its body via
+  // the same helpers — recordApproval / recordApprovalOfDeletion.
+  // Lock check IS performed (via the entity table read inside
+  // checkFieldWritability) since the held-approval is a human edit
+  // and gets stamped as one. Behaviorally equivalent to the user
+  // clicking Approve in the held-proposals UI.
+  const { recordApproval, recordApprovalOfDeletion } = await import('./proposal-evaluator');
+  const { invalidateRagCache } = await import('./cache');
+  const tableMap: Record<string, string> = { contact: 'contacts', company: 'companies', deal: 'deals' };
+  const table = tableMap[input.entity_type];
+  if (!table) return { error: 'invalid entity_type' };
+  const ownerCheck = await env.D1.prepare(
+    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(input.entity_id, ctx.orgId).first<{ id: string }>();
+  if (!ownerCheck) return { error: 'Entity not in your org' };
+  if (input.is_deletion === true) {
+    await env.D1.prepare(
+      `UPDATE ${table} SET ${input.field_name} = NULL,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(input.entity_id).run();
+    await recordApprovalOfDeletion({
+      orgId: ctx.orgId, entityType: input.entity_type,
+      entityId: input.entity_id, fieldName: input.field_name, userId: ctx.userId,
+    }, env);
+    await invalidateRagCache(ctx.orgId, env);
+    return { success: true, message: `Cleared ${input.field_name} (held deletion approved).` };
+  }
+  if (input.value === undefined) {
+    return { error: 'value required when is_deletion is not true' };
+  }
+  await env.D1.prepare(
+    `UPDATE ${table} SET ${input.field_name} = ?,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(input.value, input.entity_id).run();
+  await recordApproval({
+    orgId: ctx.orgId, entityType: input.entity_type,
+    entityId: input.entity_id, fieldName: input.field_name,
+    approvedValue: input.value, userId: ctx.userId,
+  }, env);
+  await invalidateRagCache(ctx.orgId, env);
+  return { success: true, message: `Approved held value for ${input.field_name}.` };
+}
+
+export async function dismissHeldProposalTool(
+  ctx: AuthContext,
+  input: {
+    entity_type: 'contact' | 'company' | 'deal';
+    entity_id: string;
+    field_name: string;
+    value?: string;
+    is_deletion?: boolean;
+  },
+  env: Env
+): Promise<any> {
+  const { recordRejection } = await import('./proposal-evaluator');
+  const tableMap: Record<string, string> = { contact: 'contacts', company: 'companies', deal: 'deals' };
+  const table = tableMap[input.entity_type];
+  if (!table) return { error: 'invalid entity_type' };
+  const ownerCheck = await env.D1.prepare(
+    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(input.entity_id, ctx.orgId).first<{ id: string }>();
+  if (!ownerCheck) return { error: 'Entity not in your org' };
+  await recordRejection({
+    orgId: ctx.orgId, entityType: input.entity_type,
+    entityId: input.entity_id, fieldName: input.field_name,
+    rejectedValue: input.value ?? '',
+    isDeletion: input.is_deletion === true,
+  }, env);
+  return {
+    success: true,
+    message: input.is_deletion === true
+      ? `Dismissed held deletion of ${input.field_name} (90-day no-re-ask).`
+      : `Dismissed held value for ${input.field_name} (90-day no-re-ask).`,
+  };
+}
+
+export async function lockFieldPermanentlyTool(
+  ctx: AuthContext,
+  input: { entity_type: 'contact' | 'company' | 'deal'; entity_id: string; field_name: string },
+  env: Env
+): Promise<any> {
+  return setFieldLockHelper(ctx, input.entity_type, input.entity_id, input.field_name, true, env);
+}
+
+export async function unlockFieldTool(
+  ctx: AuthContext,
+  input: { entity_type: 'contact' | 'company' | 'deal'; entity_id: string; field_name: string },
+  env: Env
+): Promise<any> {
+  return setFieldLockHelper(ctx, input.entity_type, input.entity_id, input.field_name, false, env);
+}
+
+async function setFieldLockHelper(
+  ctx: AuthContext,
+  entityType: 'contact' | 'company' | 'deal',
+  entityId: string,
+  fieldName: string,
+  locked: boolean,
+  env: Env
+): Promise<any> {
+  if (ctx.userRole !== 'owner') return { error: 'Owner role required to lock/unlock fields.' };
+  const tableMap: Record<string, string> = { contact: 'contacts', company: 'companies', deal: 'deals' };
+  const table = tableMap[entityType];
+  const ownerCheck = await env.D1.prepare(
+    `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(entityId, ctx.orgId).first<{ id: string }>();
+  if (!ownerCheck) return { error: 'Entity not in your org' };
+  const existing = await env.D1.prepare(
+    `SELECT id FROM entity_field_state WHERE entity_type = ? AND entity_id = ? AND field_name = ?`
+  ).bind(entityType, entityId, fieldName).first<{ id: string }>();
+  if (existing) {
+    await env.D1.prepare(
+      `UPDATE entity_field_state SET permanently_locked = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(locked ? 1 : 0, existing.id).run();
+  } else {
+    // Cold path — seed from entity table.
+    const liveRow = await env.D1.prepare(
+      `SELECT ${fieldName} as v FROM ${table} WHERE id = ?`
+    ).bind(entityId).first<{ v: unknown }>().catch(() => null);
+    const currentValue = liveRow?.v == null ? null
+      : typeof liveRow.v === 'string' ? liveRow.v
+      : String(liveRow.v);
+    const sources = currentValue && currentValue.trim() !== '' ? '["historical_unknown"]' : '[]';
+    await env.D1.prepare(
+      `INSERT INTO entity_field_state
+         (entity_type, entity_id, field_name, current_value,
+          current_value_sources, permanently_locked)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(entityType, entityId, fieldName, currentValue, sources, locked ? 1 : 0).run();
+  }
+  await emitAudit(env, {
+    org_id: ctx.orgId, user_id: ctx.userId, action: 'update',
+    entity_type: entityType, entity_id: entityId,
+    after_data: { field: fieldName, permanently_locked: locked },
+    metadata: { origin: 'marty', source: 'field_lock_toggle' },
+    created_at: new Date().toISOString(),
+  });
+  return {
+    success: true,
+    message: locked
+      ? `Locked ${fieldName} on ${entityType} from automated proposals.`
+      : `Unlocked ${fieldName} on ${entityType} (automated proposals can resume).`,
+  };
 }
