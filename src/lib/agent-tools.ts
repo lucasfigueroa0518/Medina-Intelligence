@@ -5,6 +5,7 @@ import { invalidateRagCache } from './cache';
 import { findDuplicateCompany } from './discovery';
 import { updateEntityInIndex } from './entity-index';
 import { canReadEmailContent, getSharingFlags } from './helpers';
+import { isCompanyInternal } from './internal-entity';
 
 // ACL redaction: nulls fields whose value may have been derived from private
 // conversation content (LLM-extracted topics, auto-populated deal notes,
@@ -711,6 +712,14 @@ export async function createDealTool(
     if (existing) companyId = existing.id;
   }
   if (!companyId) return { error: 'company_id or company_name matching an existing company is required' };
+
+  // Wave 1: refuse to create deals on internal Medina-side entities.
+  if (await isCompanyInternal(companyId, orgId, env)) {
+    return {
+      error: 'Cannot create deal for internal entity. A deal represents a startup Medina is evaluating for investment.',
+      code: 'INTERNAL_ENTITY_NOT_DEAL_ELIGIBLE',
+    };
+  }
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();

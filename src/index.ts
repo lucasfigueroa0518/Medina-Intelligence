@@ -643,6 +643,12 @@ async function routeAuthenticated(
     if (path === '/api/admin/sweep-approval-queue' && method === 'POST')
       return sweepApprovalQueue(request, ctx, env);
 
+    // Wave 1 — re-classify internal entities + soft-delete illegitimate deals.
+    if (path === '/api/admin/reclassify-internal-deals' && method === 'POST') {
+      const { handleReclassifyInternalDeals } = await import('./handlers/reclassify-internal-deals');
+      return handleReclassifyInternalDeals(request, ctx, env);
+    }
+
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')
