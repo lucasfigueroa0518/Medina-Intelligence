@@ -41,6 +41,45 @@ const SKIP_SUBTYPES = new Set([
 
 const SLACK_MAX_RETRIES = 2;
 
+// Per-tick wallclock budget for fetchSlackMessages. The function walks ALL
+// visible channels × paginated history since each channel's last marker. With
+// 16+ channels and a busy active workspace, an unbounded run can blow past
+// the Cloudflare Worker 30s wallclock cap mid-pagination — partial data lands
+// in conversations but the per-channel KV markers don't advance, leaving the
+// next tick to refetch the same range. Bounding here keeps each tick within
+// budget; the per-channel marker only advances on a clean pass with messages,
+// so unfinished channels resume from the same `oldest` next tick. Phase E's
+// 60-day backfill relies on `external_message_id LIKE '<channelId>:%'` over
+// the full historical set, which means we need to actually GET those rows
+// into conversations — exiting cleanly here is what makes that work.
+export const SLACK_MAX_RUNTIME_MS = 25_000;
+
+// KV counter for consecutive Slack auth failures (mirrors the
+// token_failed:{user_id}:outlook pattern). Bumped on every auth.test
+// non-ok response; cleared on success. integrations.ts already surfaces
+// the live auth.test result on settings page load; this counter surfaces
+// SUSTAINED failures ("the token has been broken for N hours") without
+// round-tripping to Slack on every Settings render.
+const SLACK_AUTH_FAIL_KEY_PREFIX = 'slack_token_failed:';
+const SLACK_AUTH_FAIL_TTL_SECONDS = 7 * 86400; // 7 days
+
+async function recordSlackAuthFailure(orgId: string, env: Env): Promise<number> {
+  const key = `${SLACK_AUTH_FAIL_KEY_PREFIX}${orgId}`;
+  const raw = await env.KV.get(key);
+  const prev = raw ? parseInt(raw, 10) : 0;
+  const next = (Number.isFinite(prev) ? prev : 0) + 1;
+  await env.KV.put(
+    key,
+    String(next),
+    { expirationTtl: SLACK_AUTH_FAIL_TTL_SECONDS }
+  );
+  return next;
+}
+
+async function clearSlackAuthFailures(orgId: string, env: Env): Promise<void> {
+  await env.KV.delete(`${SLACK_AUTH_FAIL_KEY_PREFIX}${orgId}`);
+}
+
 async function slackFetchWithRetry(
   url: string,
   headers: Record<string, string>,
@@ -68,6 +107,7 @@ export async function fetchSlackMessages(
   orgId: string,
   env: Env
 ): Promise<SlackFetchResult> {
+  const startedAt = Date.now();
   const messages: ClassifiableItem[] = [];
   const errors: SlackChannelError[] = [];
 
@@ -87,7 +127,21 @@ export async function fetchSlackMessages(
   );
   const authData = (await authResp.json()) as { ok: boolean; error?: string; team?: string; user?: string };
   console.log(`[slack] auth.test: ok=${authData.ok} team=${authData.team || 'n/a'} user=${authData.user || 'n/a'} error=${authData.error || 'none'}`);
-  if (!authData.ok) return { messages, errors, channels_visible: 0 };
+  if (!authData.ok) {
+    // Sustained-failure counter: surfaces "token has been broken for N
+    // consecutive checks" without round-tripping Slack on every Settings
+    // render. Bot tokens don't expire automatically but CAN be revoked
+    // (workspace owner removes the app, scope is reduced, etc.) — this
+    // surface gives the Settings card a way to differentiate a transient
+    // hiccup from a sustained outage. integrations.ts can read this KV
+    // counter and reflect it in the IntegrationRow.detail.
+    const count = await recordSlackAuthFailure(orgId, env);
+    console.error(`[slack] auth.test failed (${authData.error || 'unknown'}); consecutive_failures=${count}`);
+    return { messages, errors, channels_visible: 0 };
+  }
+  // Clear the counter on success — sustained-failure window resets the
+  // moment the token starts working again.
+  await clearSlackAuthFailures(orgId, env);
 
   const channelsResp = await slackFetchWithRetry(
     'https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200',
@@ -155,7 +209,18 @@ export async function fetchSlackMessages(
     }
   }
 
+  let budgetExhausted = false;
+
   for (const channel of channels) {
+    if (Date.now() - startedAt > SLACK_MAX_RUNTIME_MS) {
+      budgetExhausted = true;
+      console.warn(
+        `[slack] wallclock budget exhausted at channel #${channel.name}; ` +
+        `${messages.length} messages collected so far, remaining channels resume next tick`
+      );
+      break;
+    }
+
     // Per-channel marker so a newly-invited channel backfills from oldest=0
     // instead of inheriting the org-wide "last sync = now" and missing every
     // message that pre-dates the invite.
@@ -166,6 +231,19 @@ export async function fetchSlackMessages(
     let channelHadError = false;
 
     do {
+      if (Date.now() - startedAt > SLACK_MAX_RUNTIME_MS) {
+        // Mid-channel budget exhaustion. Don't advance the marker for this
+        // channel — next tick re-fetches from the same `channelLastSync`.
+        // Phase E's backfill query relies on completeness, so it's better
+        // to refetch some messages than to skip a chunk silently.
+        budgetExhausted = true;
+        channelHadError = true; // suppresses marker advance below
+        console.warn(
+          `[slack] wallclock budget exhausted mid-pagination of #${channel.name}; ` +
+          `marker preserved for resume next tick`
+        );
+        break;
+      }
       const params = new URLSearchParams({
         channel: channel.id,
         oldest: channelLastSync,
@@ -290,10 +368,137 @@ export async function fetchSlackMessages(
   }
 
   console.log(
-    `[slack] fetch complete: ${messages.length} messages from ${channels.length} channels, ${errors.length} channel errors`
+    `[slack] fetch complete: ${messages.length} messages from ${channels.length} channels, ${errors.length} channel errors` +
+    (budgetExhausted ? ` (budget_exhausted=true; some channels will resume next tick)` : '')
   );
 
   return { messages, errors, channels_visible: channels.length };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Per-channel admin force-resync. Lets ops force a deeper backfill for a
+// specific channel than the per-channel KV marker would naturally yield —
+// useful when a channel's been around longer than we have message coverage
+// for (Phase E's 60-day backfillSlackChannelToDeal needs the conversations
+// in DB to actually land deal links). days_back=null means "from oldest"
+// (Slack's default). Wallclock-budgeted just like the regular sync.
+// ────────────────────────────────────────────────────────────────────────────
+
+export interface SlackChannelBackfillResult {
+  channel_id: string;
+  channel_name: string | null;
+  messages_fetched: number;
+  pages: number;
+  cursor_remaining: boolean;
+  error: string | null;
+  budget_exhausted: boolean;
+}
+
+export async function backfillSlackChannelHistory(
+  orgId: string,
+  channelId: string,
+  daysBack: number | null,
+  env: Env
+): Promise<SlackChannelBackfillResult> {
+  const startedAt = Date.now();
+  const result: SlackChannelBackfillResult = {
+    channel_id: channelId,
+    channel_name: null,
+    messages_fetched: 0,
+    pages: 0,
+    cursor_remaining: false,
+    error: null,
+    budget_exhausted: false,
+  };
+
+  let botToken: string;
+  try {
+    botToken = await getDecryptedSlackBotToken(orgId, env);
+  } catch (e: any) {
+    result.error = `token_resolution: ${String(e?.message || e).slice(0, 200)}`;
+    return result;
+  }
+  const authHeaders = { Authorization: `Bearer ${botToken}` };
+
+  // Resolve channel_name from slack_channels for log readability and the
+  // ClassifiableItem.subject downstream. If the channel isn't in our table
+  // (rare — bot would normally see it via conversations.list), we still
+  // fetch but stamp channel_name as the channel_id.
+  const channelRow = await env.D1.prepare(
+    `SELECT channel_name, is_private FROM slack_channels WHERE org_id = ? AND channel_id = ?`
+  ).bind(orgId, channelId).first<{ channel_name: string | null; is_private: number }>();
+  result.channel_name = channelRow?.channel_name || channelId;
+  const isPrivate = channelRow?.is_private === 1;
+
+  const oldest = daysBack !== null && daysBack > 0
+    ? String(Math.floor((Date.now() - daysBack * 86400000) / 1000))
+    : '0';
+
+  const messages: ClassifiableItem[] = [];
+  let cursor: string | undefined;
+
+  while (true) {
+    if (Date.now() - startedAt > SLACK_MAX_RUNTIME_MS) {
+      result.budget_exhausted = true;
+      result.cursor_remaining = !!cursor;
+      break;
+    }
+    const params = new URLSearchParams({
+      channel: channelId,
+      oldest,
+      limit: '200',
+      ...(cursor ? { cursor } : {}),
+    });
+    const resp = await slackFetchWithRetry(
+      `https://slack.com/api/conversations.history?${params}`,
+      authHeaders, `conversations.history backfill #${result.channel_name}`,
+    );
+    const data = (await resp.json()) as {
+      ok: boolean;
+      messages?: SlackMessage[];
+      response_metadata?: { next_cursor?: string };
+      error?: string;
+    };
+    result.pages++;
+    if (!data.ok) {
+      result.error = data.error || 'unknown';
+      break;
+    }
+    for (const msg of data.messages || []) {
+      if (msg.subtype && SKIP_SUBTYPES.has(msg.subtype)) continue;
+      if (!msg.user) continue;
+      const userEmail = await resolveSlackUserEmail(msg.user, botToken, env);
+      if (!userEmail) continue;
+      messages.push({
+        type: 'slack_message',
+        source: 'slack',
+        externalId: `${channelId}:${msg.ts}`,
+        threadId: msg.thread_ts || msg.ts,
+        subject: `#${result.channel_name}`,
+        bodyText: msg.text,
+        bodyPreview: msg.text.substring(0, 500),
+        fromEmail: userEmail,
+        fromName: msg.user,
+        toEmails: [],
+        ccEmails: [],
+        sentAt: new Date(parseFloat(msg.ts) * 1000).toISOString(),
+        direction: 'internal',
+        userId: null,
+        orgId,
+        visibility: isPrivate ? 'confidential' : 'org_wide',
+      });
+    }
+    result.messages_fetched += messages.length - result.messages_fetched;
+    cursor = data.response_metadata?.next_cursor;
+    if (!cursor) break;
+  }
+
+  // Caller (admin handler) is responsible for routing `messages` through
+  // classifyAndDeduplicate → stage-approvals just like the regular cron
+  // path. Returning the messages list rather than persisting here keeps
+  // the ingestion semantics in one place (classification.ts).
+  (result as SlackChannelBackfillResult & { _messages: ClassifiableItem[] })._messages = messages;
+  return result;
 }
 
 export async function resolveSlackUserEmail(
