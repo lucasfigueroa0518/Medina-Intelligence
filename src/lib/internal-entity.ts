@@ -109,6 +109,41 @@ export async function assertExternalCompanyForDeal(
   }
 }
 
+/** Wave 2 — refuse to create a second open deal at the same company.
+ *  Surfaces a structured 409 before the partial UNIQUE INDEX
+ *  uniq_deals_open_per_company throws an opaque constraint error.
+ *  excludeDealId lets the validator be re-used during stage updates. */
+export class OpenDealConflictError extends Error {
+  status = 409;
+  code = 'OPEN_DEAL_ALREADY_EXISTS';
+  constructor(public companyId: string, public existingDealId: string, public existingTitle: string) {
+    super(
+      `An open deal already exists for this company ("${existingTitle}", id ${existingDealId}). ` +
+      `Close the existing deal (closed_won or closed_lost) before creating a new one, ` +
+      `or update the existing deal in place.`
+    );
+  }
+}
+
+export async function assertNoOpenDealForCompany(
+  companyId: string,
+  orgId: string,
+  env: Env,
+  excludeDealId?: string
+): Promise<void> {
+  const existing = await env.D1.prepare(
+    `SELECT id, title FROM deals
+       WHERE org_id = ? AND company_id = ?
+         AND deleted_at IS NULL
+         AND stage NOT IN ('closed_won','closed_lost')
+         AND id != ?
+       LIMIT 1`
+  ).bind(orgId, companyId, excludeDealId || '').first<{ id: string; title: string }>();
+  if (existing) {
+    throw new OpenDealConflictError(companyId, existing.id, existing.title);
+  }
+}
+
 /** Re-classify a single company against the rule. Returns whether the
  *  flag changed. Idempotent. Used at company create time + admin recovery. */
 export async function classifyCompanyInternal(

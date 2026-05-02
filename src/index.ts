@@ -649,6 +649,12 @@ async function routeAuthenticated(
       return handleReclassifyInternalDeals(request, ctx, env);
     }
 
+    // Wave 2 — explicit company merge (loser → survivor). Owner-only.
+    if (path === '/api/admin/merge-companies' && method === 'POST') {
+      const { handleMergeCompanies } = await import('./handlers/merge-companies');
+      return handleMergeCompanies(request, ctx, env);
+    }
+
     if (path === '/api/admin/companies/rename-placeholders' && method === 'POST')
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')

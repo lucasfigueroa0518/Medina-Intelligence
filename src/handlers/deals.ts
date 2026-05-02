@@ -6,7 +6,12 @@ import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { computeDealIntelligence, readDealIntelligence } from '../lib/deal-intelligence';
-import { assertExternalCompanyForDeal, InternalDealError } from '../lib/internal-entity';
+import {
+  assertExternalCompanyForDeal,
+  InternalDealError,
+  assertNoOpenDealForCompany,
+  OpenDealConflictError,
+} from '../lib/internal-entity';
 
 // ---------------------------------------------------------------------------
 // GET /api/deals
@@ -159,12 +164,13 @@ export async function createDeal(
     return errorResponse('VALIDATION_ERROR', 400, 'title and company_id required');
 
   // Wave 1: deal target must be an external (non-internal) company.
+  // Wave 2: at most one open deal per company.
   try {
     await assertExternalCompanyForDeal(body.company_id, ctx.orgId, env);
+    await assertNoOpenDealForCompany(body.company_id, ctx.orgId, env);
   } catch (e) {
-    if (e instanceof InternalDealError) {
-      return errorResponse(e.code, 400, e.message);
-    }
+    if (e instanceof InternalDealError) return errorResponse(e.code, 400, e.message);
+    if (e instanceof OpenDealConflictError) return errorResponse(e.code, 409, e.message);
     throw e;
   }
 
