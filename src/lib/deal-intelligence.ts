@@ -54,6 +54,9 @@ export interface DealIntelligence {
   momentum: Momentum;
   momentum_score: number | null;
   conversation_count: number;
+  /** Wave 3 — 2-3 sentence recency-biased prose summary. Null when there
+   *  is no readable signal (mirrors null sentiment/momentum behavior). */
+  brief_summary: string | null;
   computed_at: string;
   is_stale: boolean;
 }
@@ -68,6 +71,7 @@ interface RawRow {
   momentum: string | null;
   momentum_score: number | null;
   conversation_count: number;
+  brief_summary: string | null;
   computed_at: string;
   invalidated_at: string | null;
 }
@@ -94,6 +98,7 @@ function shapeRow(row: RawRow): DealIntelligence {
     momentum: (row.momentum as Momentum) ?? null,
     momentum_score: row.momentum_score,
     conversation_count: row.conversation_count,
+    brief_summary: row.brief_summary,
     computed_at: row.computed_at,
     is_stale: stale,
   };
@@ -220,7 +225,8 @@ You MUST return valid JSON matching this exact shape:
   "topics": string[] (deal-relevant nouns, max 8, e.g. "term sheet revision", "valuation discussion", "due diligence", NOT generic like "meeting" or "email"),
   "risk_signals": Array<{type: string, severity: "info"|"warning"|"critical", detail: string}> (max 6, each MUST cite specific evidence: "contact X has not responded in 14 days", NOT "communication issues"),
   "momentum": "accelerating" | "steady" | "stalled" | "declining" | null,
-  "momentum_score": number between -1.0 and 1.0 | null
+  "momentum_score": number between -1.0 and 1.0 | null,
+  "brief_summary": string | null (2-3 sentences, ≤500 chars, recency-biased "State of the Union")
 }
 
 Rules:
@@ -228,6 +234,7 @@ Rules:
 - Topics must be deal-flow specific (legal, financial, diligence, scheduling for a closing milestone, etc.). Avoid generic conversation labels.
 - Risk signals must cite concrete evidence from the conversation timeline. Quote partial dates, names, or quoted phrases from the messages.
 - Momentum considers: message frequency trend, sentiment trajectory, decision-maker engagement (are senior contacts replying?). "accelerating" = increasing frequency + positive sentiment + decision-maker active. "stalled" = declining frequency for 14+ days. "declining" = active negative sentiment or explicit rejection language.
+- brief_summary is a 2-3 sentence prose recap. Weight the LAST 14 DAYS of activity heavily — older context only matters when nothing recent is happening. Lead with what's currently happening or what's blocked, not historical narrative. Reference specific people/decisions/milestones from the messages. Never start with "This deal..." — start with the active subject. ≤500 chars total. null when there is no readable signal.
 
 Return JSON ONLY. No prose, no markdown fences.`;
 
@@ -238,6 +245,7 @@ interface ClaudeIntelligence {
   risk_signals: RiskSignal[];
   momentum: Momentum;
   momentum_score: number | null;
+  brief_summary: string | null;
 }
 
 function parseClaudeIntelligence(raw: string): ClaudeIntelligence | null {
@@ -263,6 +271,9 @@ function parseClaudeIntelligence(raw: string): ClaudeIntelligence | null {
         : [],
       momentum: momentum as Momentum,
       momentum_score: typeof parsed.momentum_score === 'number' ? parsed.momentum_score : null,
+      brief_summary: typeof parsed.brief_summary === 'string' && parsed.brief_summary.trim().length > 0
+        ? parsed.brief_summary.trim().slice(0, 500)
+        : null,
     };
   } catch { return null; }
 }
@@ -364,6 +375,7 @@ export async function computeDealIntelligence(
       topics: [], risk_signals: [],
       momentum: null, momentum_score: null,
       conversation_count: 0,
+      brief_summary: null,
     }, env);
     return { reason: 'no_readable_conversations', intelligence: shapeRow(await readRow(dealId, userId, env)) };
   }
@@ -372,8 +384,10 @@ export async function computeDealIntelligence(
 
   let raw: string;
   try {
+    // Wave 3: bumped max_tokens 800→1000 to accommodate the brief_summary
+    // field (~150 tokens of prose alongside the existing structured output).
     raw = await callClaude(
-      { system: SYSTEM_PROMPT, user: userPrompt, max_tokens: 800, orgId, model: COMPUTE_MODEL },
+      { system: SYSTEM_PROMPT, user: userPrompt, max_tokens: 1000, orgId, model: COMPUTE_MODEL },
       'low',
       env
     );
@@ -388,6 +402,7 @@ export async function computeDealIntelligence(
       topics: [], risk_signals: [],
       momentum: null, momentum_score: null,
       conversation_count: readable.length,
+      brief_summary: null,
     }, env);
     return { reason: 'compute_failed_returned_null', intelligence: shapeRow(await readRow(dealId, userId, env)) };
   }
@@ -401,6 +416,7 @@ export async function computeDealIntelligence(
       topics: [], risk_signals: [],
       momentum: null, momentum_score: null,
       conversation_count: readable.length,
+      brief_summary: null,
     }, env);
     return { reason: 'compute_failed_returned_null', intelligence: shapeRow(await readRow(dealId, userId, env)) };
   }
@@ -411,6 +427,7 @@ export async function computeDealIntelligence(
     topics: parsed.topics, risk_signals: parsed.risk_signals,
     momentum: parsed.momentum, momentum_score: parsed.momentum_score,
     conversation_count: readable.length,
+    brief_summary: parsed.brief_summary,
   }, env);
 
   return { reason: 'computed', intelligence: shapeRow(await readRow(dealId, userId, env)) };
@@ -426,6 +443,7 @@ interface UpsertInput {
   momentum: Momentum;
   momentum_score: number | null;
   conversation_count: number;
+  brief_summary: string | null;
 }
 
 async function upsertIntelligence(input: UpsertInput, env: Env): Promise<void> {
@@ -433,8 +451,8 @@ async function upsertIntelligence(input: UpsertInput, env: Env): Promise<void> {
   await env.D1.prepare(
     `INSERT INTO deal_intelligence
        (deal_id, user_id, sentiment, sentiment_score, topics, risk_signals,
-        momentum, momentum_score, conversation_count, computed_at, invalidated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        momentum, momentum_score, conversation_count, brief_summary, computed_at, invalidated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
      ON CONFLICT(deal_id, user_id) DO UPDATE SET
        sentiment = excluded.sentiment,
        sentiment_score = excluded.sentiment_score,
@@ -443,6 +461,7 @@ async function upsertIntelligence(input: UpsertInput, env: Env): Promise<void> {
        momentum = excluded.momentum,
        momentum_score = excluded.momentum_score,
        conversation_count = excluded.conversation_count,
+       brief_summary = excluded.brief_summary,
        computed_at = excluded.computed_at,
        invalidated_at = NULL`
   ).bind(
@@ -451,14 +470,17 @@ async function upsertIntelligence(input: UpsertInput, env: Env): Promise<void> {
     JSON.stringify(input.topics),
     JSON.stringify(input.risk_signals),
     input.momentum, input.momentum_score,
-    input.conversation_count, now
+    input.conversation_count,
+    input.brief_summary,
+    now
   ).run();
 }
 
 async function readRow(dealId: string, userId: string, env: Env): Promise<RawRow> {
   const row = await env.D1.prepare(
     `SELECT deal_id, user_id, sentiment, sentiment_score, topics, risk_signals,
-            momentum, momentum_score, conversation_count, computed_at, invalidated_at
+            momentum, momentum_score, conversation_count, brief_summary,
+            computed_at, invalidated_at
        FROM deal_intelligence
        WHERE deal_id = ? AND user_id = ?`
   ).bind(dealId, userId).first<RawRow>();
@@ -479,7 +501,8 @@ export async function readDealIntelligence(
 ): Promise<DealIntelligence | null> {
   const row = await env.D1.prepare(
     `SELECT deal_id, user_id, sentiment, sentiment_score, topics, risk_signals,
-            momentum, momentum_score, conversation_count, computed_at, invalidated_at
+            momentum, momentum_score, conversation_count, brief_summary,
+            computed_at, invalidated_at
        FROM deal_intelligence
        WHERE deal_id = ? AND user_id = ?`
   ).bind(dealId, userId).first<RawRow>();
