@@ -35,6 +35,7 @@
 // conversation between that contact and a user remain gated.
 
 import type { Env } from '../types/env';
+import { resolveInternalDomains, classifyContactSideSync } from './internal-entity';
 
 /** Insert deal_contacts rows for every contact whose company_id matches the
  *  given deal's company_id. Idempotent. Returns the count of newly-linked
@@ -50,26 +51,25 @@ export async function linkContactsByCompanyMatch(
   ).bind(dealId, orgId).first<{ company_id: string | null }>();
   if (!deal?.company_id) return { linked: 0, matched_contact_count: 0 };
 
-  // Find all contacts at the company.
+  // Find all contacts at the company. Wave 5: pull email so we can
+  // classify side per the new domain-based rule.
   const contacts = await env.D1.prepare(
-    `SELECT id FROM contacts
+    `SELECT id, email, company_id FROM contacts
        WHERE org_id = ? AND company_id = ? AND deleted_at IS NULL`
-  ).bind(orgId, deal.company_id).all<{ id: string }>();
-  const contactIds = contacts.results.map(c => c.id);
-  if (contactIds.length === 0) return { linked: 0, matched_contact_count: 0 };
+  ).bind(orgId, deal.company_id).all<{ id: string; email: string | null; company_id: string | null }>();
+  if (contacts.results.length === 0) return { linked: 0, matched_contact_count: 0 };
 
-  // INSERT OR IGNORE one row per contact. Default role='other', side='theirs'
-  // — the contact's at the deal's company, so they're on the founder/team
-  // side until a human re-classifies via the UI.
-  const stmts = contactIds.map(cid =>
-    env.D1.prepare(
+  const internalDomains = await resolveInternalDomains(orgId, env);
+  const stmts = contacts.results.map(c => {
+    const side = classifyContactSideSync(c.email, c.company_id, deal.company_id, internalDomains);
+    return env.D1.prepare(
       `INSERT OR IGNORE INTO deal_contacts (id, org_id, deal_id, contact_id, role, side, added_at)
-       VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'other', 'theirs', strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-    ).bind(orgId, dealId, cid)
-  );
+       VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'other', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+    ).bind(orgId, dealId, c.id, side);
+  });
   const results = await env.D1.batch(stmts);
   const linked = results.reduce((sum, r) => sum + (r.meta?.changes || 0), 0);
-  return { linked, matched_contact_count: contactIds.length };
+  return { linked, matched_contact_count: contacts.results.length };
 }
 
 /** Link every participant of the given conversation to the given deal.
@@ -82,25 +82,33 @@ export async function linkConversationParticipantsToDeal(
   orgId: string,
   env: Env
 ): Promise<{ linked: number; participant_count: number }> {
+  // Wave 5: pull email + company_id alongside id so side classification
+  // uses the new domain-based rule.
   const participants = await env.D1.prepare(
-    `SELECT DISTINCT cc.contact_id
+    `SELECT DISTINCT c.id AS contact_id, c.email, c.company_id
        FROM conversation_contacts cc
        JOIN contacts c ON c.id = cc.contact_id
       WHERE cc.conversation_id = ?
         AND c.org_id = ? AND c.deleted_at IS NULL`
-  ).bind(conversationId, orgId).all<{ contact_id: string }>();
-  const contactIds = participants.results.map(r => r.contact_id);
-  if (contactIds.length === 0) return { linked: 0, participant_count: 0 };
+  ).bind(conversationId, orgId).all<{ contact_id: string; email: string | null; company_id: string | null }>();
+  if (participants.results.length === 0) return { linked: 0, participant_count: 0 };
 
-  const stmts = contactIds.map(cid =>
-    env.D1.prepare(
+  const deal = await env.D1.prepare(
+    `SELECT company_id FROM deals WHERE id = ? AND org_id = ?`
+  ).bind(dealId, orgId).first<{ company_id: string | null }>();
+  const dealCompanyId = deal?.company_id ?? null;
+
+  const internalDomains = await resolveInternalDomains(orgId, env);
+  const stmts = participants.results.map(p => {
+    const side = classifyContactSideSync(p.email, p.company_id, dealCompanyId, internalDomains);
+    return env.D1.prepare(
       `INSERT OR IGNORE INTO deal_contacts (id, org_id, deal_id, contact_id, role, side, added_at)
-       VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'other', 'theirs', strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-    ).bind(orgId, dealId, cid)
-  );
+       VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'other', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+    ).bind(orgId, dealId, p.contact_id, side);
+  });
   const results = await env.D1.batch(stmts);
   const linked = results.reduce((sum, r) => sum + (r.meta?.changes || 0), 0);
-  return { linked, participant_count: contactIds.length };
+  return { linked, participant_count: participants.results.length };
 }
 
 /** Propagate: when a new conversation_contacts row was inserted for a
@@ -117,31 +125,33 @@ export async function propagateContactToOpenDeals(
   orgId: string,
   env: Env
 ): Promise<{ linked: number; deal_count: number }> {
+  // Wave 5: fetch email alongside company_id for side classification.
   const contact = await env.D1.prepare(
-    `SELECT company_id FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-  ).bind(contactId, orgId).first<{ company_id: string | null }>();
+    `SELECT email, company_id FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(contactId, orgId).first<{ email: string | null; company_id: string | null }>();
   if (!contact?.company_id) return { linked: 0, deal_count: 0 };
 
   // Find all open deals at that company. Closed deals (won/lost) skip the
   // auto-link — historical lookback isn't useful, and a contact joining
   // post-close doesn't represent a live signal.
   const deals = await env.D1.prepare(
-    `SELECT id FROM deals
+    `SELECT id, company_id FROM deals
        WHERE org_id = ? AND company_id = ? AND deleted_at IS NULL
          AND stage NOT IN ('closed_won','closed_lost')`
-  ).bind(orgId, contact.company_id).all<{ id: string }>();
-  const dealIds = deals.results.map(d => d.id);
-  if (dealIds.length === 0) return { linked: 0, deal_count: 0 };
+  ).bind(orgId, contact.company_id).all<{ id: string; company_id: string }>();
+  if (deals.results.length === 0) return { linked: 0, deal_count: 0 };
 
-  const stmts = dealIds.map(did =>
-    env.D1.prepare(
+  const internalDomains = await resolveInternalDomains(orgId, env);
+  const stmts = deals.results.map(d => {
+    const side = classifyContactSideSync(contact.email, contact.company_id, d.company_id, internalDomains);
+    return env.D1.prepare(
       `INSERT OR IGNORE INTO deal_contacts (id, org_id, deal_id, contact_id, role, side, added_at)
-       VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'other', 'theirs', strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-    ).bind(orgId, did, contactId)
-  );
+       VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'other', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+    ).bind(orgId, d.id, contactId, side);
+  });
   const results = await env.D1.batch(stmts);
   const linked = results.reduce((sum, r) => sum + (r.meta?.changes || 0), 0);
-  return { linked, deal_count: dealIds.length };
+  return { linked, deal_count: deals.results.length };
 }
 
 /** Org-wide one-time recovery: for every open deal, run linkContactsByCompanyMatch.

@@ -12,6 +12,7 @@ import {
   InternalDealError,
   assertNoOpenDealForCompany,
   OpenDealConflictError,
+  classifyContactSide,
 } from '../lib/internal-entity';
 
 // ---------------------------------------------------------------------------
@@ -1061,14 +1062,21 @@ export async function addDealContact(
   if (!body?.contact_id)
     return errorResponse('VALIDATION_ERROR', 400, 'contact_id is required');
 
-  // Verify deal exists
+  // Verify deal exists. Wave 5: pull company_id for auto-classifying side.
   const deal = await env.D1.prepare(
-    'SELECT id FROM deals WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(dealId, ctx.orgId).first();
+    'SELECT id, company_id FROM deals WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(dealId, ctx.orgId).first<{ id: string; company_id: string | null }>();
   if (!deal) return errorResponse('DEAL_NOT_FOUND', 404);
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+
+  // Wave 5: when caller didn't specify side, derive it from contact email
+  // domain → ours/theirs/other rule. Manual override (body.side present)
+  // wins so the UI can correct edge cases.
+  const side: string | null = body.side ?? (
+    await classifyContactSide(body.contact_id, deal.company_id, ctx.orgId, env)
+  );
 
   await env.D1.prepare(
     `INSERT INTO deal_contacts (id, org_id, deal_id, contact_id, role, side, added_at)
@@ -1080,7 +1088,7 @@ export async function addDealContact(
       dealId,
       body.contact_id,
       body.role ?? null,
-      body.side ?? null,
+      side,
       now
     )
     .run();
@@ -1102,7 +1110,7 @@ export async function addDealContact(
     created_at: now,
   });
 
-  return jsonResponse({ deal_contact: { id, deal_id: dealId, contact_id: body.contact_id, role: body.role, side: body.side } }, 201);
+  return jsonResponse({ deal_contact: { id, deal_id: dealId, contact_id: body.contact_id, role: body.role, side } }, 201);
 }
 
 // DELETE /api/deals/:dealId/contacts/:contactId
