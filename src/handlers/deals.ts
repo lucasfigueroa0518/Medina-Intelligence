@@ -6,6 +6,7 @@ import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
 import { computeDealIntelligence, readDealIntelligence } from '../lib/deal-intelligence';
+import { updateDealFields } from '../lib/entity-writes';
 import {
   assertExternalCompanyForDeal,
   InternalDealError,
@@ -378,124 +379,26 @@ export async function updateDeal(
   const body = await parseJsonBody<any>(request);
   if (!body) return errorResponse('VALIDATION_ERROR', 400);
 
-  const before = await env.D1.prepare(
-    'SELECT * FROM deals WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(id, ctx.orgId).first();
-  if (!before) return errorResponse('DEAL_NOT_FOUND', 404);
+  // Phase 1 refactor — entity-writes.ts:updateDealFields owns the
+  // lock checks, per-field provenance, stage_changed_at/days_in_stage
+  // transition, audit emission, and entity_field_state sync. Same
+  // path MARTy's update_deal_field tool will call in Phase 2.
+  const result = await updateDealFields(id, body, {
+    orgId: ctx.orgId,
+    userId: ctx.userId,
+    userRole: ctx.userRole,
+    origin: 'manual_ui',
+  }, env);
 
-  const allowed = [
-    'title',
-    'stage',
-    'amount',
-    'currency',
-    'probability',
-    'expected_close',
-    'notes',
-    'owner_id',
-    'custom_fields',
-    'valuation',
-    'our_allocation',
-    'instrument_type',
-    'actual_close_date',
-    'lead_source',
-    'thesis_fit',
-  ];
-
-  const updates: string[] = [];
-  const binds: unknown[] = [];
-
-  for (const k of allowed) {
-    if (k in body) {
-      updates.push(`${k} = ?`);
-      binds.push(body[k]);
-    }
+  if (!result.ok && result.error) {
+    return errorResponse(result.error.code, result.error.status, result.error.message);
   }
 
-  if (updates.length === 0) return jsonResponse({ deal: before });
-
-  // --- Per-field provenance tracking in source_metadata ---
-  const trackedFields = [
-    'amount', 'valuation', 'our_allocation', 'instrument_type',
-    'lead_source', 'thesis_fit', 'expected_close', 'probability', 'stage',
-  ];
-  const existingMeta: Record<string, any> = (() => {
-    try {
-      return JSON.parse((before as any).source_metadata || '{}');
-    } catch {
-      return {};
-    }
-  })();
-  const metaNow = new Date().toISOString();
-
-  for (const field of trackedFields) {
-    if (field in body && body[field] !== (before as any)[field]) {
-      const entry: Record<string, any> = {
-        source: body._source || 'manual',
-        set_by: ctx.userId,
-        set_at: metaNow,
-        source_id: body._source_id || null,
-      };
-      if (field === 'stage') {
-        entry.previous = (before as any).stage;
-      }
-      existingMeta[field] = entry;
-    }
-  }
-
-  updates.push('source_metadata = ?');
-  binds.push(JSON.stringify(existingMeta));
-
-  // Stage transition logic
-  const stageChanged =
-    'stage' in body && body.stage !== (before as any).stage;
-  let auditMetadata: Record<string, unknown> = {};
-
-  if (stageChanged) {
-    const oldStageChangedAt = (before as any).stage_changed_at;
-    let daysInOldStage = 0;
-    if (oldStageChangedAt) {
-      const elapsed = Date.now() - new Date(oldStageChangedAt).getTime();
-      daysInOldStage = Math.floor(elapsed / 86_400_000);
-    }
-
-    updates.push(`stage_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
-    updates.push('days_in_stage = 0');
-
-    auditMetadata = {
-      old_stage: (before as any).stage,
-      new_stage: body.stage,
-      days_in_old_stage: daysInOldStage,
-    };
-  }
-
-  updates.push(`last_activity_date = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
-  updates.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
-
-  await env.D1.prepare(
-    `UPDATE deals SET ${updates.join(', ')} WHERE id = ?`
-  ).bind(...binds, id).run();
-
-  const after = await env.D1.prepare('SELECT * FROM deals WHERE id = ?').bind(id).first();
-
-  await emitAudit(env, {
-    org_id: ctx.orgId,
-    user_id: ctx.userId,
-    action: 'update',
-    entity_type: 'deal',
-    entity_id: id,
-    before_data: before,
-    after_data: after,
-    metadata: auditMetadata,
-    created_at: new Date().toISOString(),
-  });
-
-  await invalidateRagCache(ctx.orgId, env);
-
-  // Re-embed when content-bearing fields change. Stage/amount don't change
-  // the embedding text materially but title/notes/thesis do; we re-embed on
-  // any of those to keep RAG fresh.
-  const contentFields = ['title', 'stage', 'notes', 'thesis_fit', 'amount', 'valuation', 'our_allocation', 'instrument_type'];
-  const contentChanged = contentFields.some(f => f in body && body[f] !== (before as any)[f]);
+  // Re-embed when content-bearing fields change. Kept here (not in
+  // entity-writes) so the lib stays leaf-of-leaf — embedding is a
+  // heavy import.
+  const contentFields = new Set(['title', 'stage', 'notes', 'thesis_fit', 'amount', 'valuation', 'our_allocation', 'instrument_type']);
+  const contentChanged = Object.keys(result.applied).some(f => contentFields.has(f));
   if (contentChanged) {
     try {
       const { reembedDeal } = await import('../lib/embedding');
@@ -505,7 +408,16 @@ export async function updateDeal(
     }
   }
 
-  return jsonResponse({ deal: after });
+  // last_activity_date bump — preserved from prior handler. The entity-
+  // writes lib doesn't touch this column; deal-specific bookkeeping
+  // stays with the deal handler.
+  await env.D1.prepare(
+    `UPDATE deals SET last_activity_date = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+  ).bind(id).run();
+
+  const responseBody: Record<string, unknown> = { deal: result.after };
+  if (result.rejected.length > 0) responseBody.rejected_fields = result.rejected;
+  return jsonResponse(responseBody);
 }
 
 // ---------------------------------------------------------------------------

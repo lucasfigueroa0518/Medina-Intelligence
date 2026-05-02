@@ -8,6 +8,7 @@ import { cleanupVectorsForEntity } from '../lib/merge';
 import { triggerCompanyEnrichment } from '../lib/enrichment';
 import { findDuplicateCompany } from '../lib/discovery';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
+import { updateCompanyFields } from '../lib/entity-writes';
 import { updateEntityInIndex } from '../lib/entity-index';
 
 // News-score buckets. The underlying scale is 0-10 (see lib/news-scoring).
@@ -389,71 +390,21 @@ export async function updateCompany(
   const body = await parseJsonBody<any>(request);
   if (!body) return errorResponse('VALIDATION_ERROR', 400);
 
-  const before = await env.D1.prepare(
-    'SELECT * FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(id, ctx.orgId).first();
-  if (!before) return errorResponse('COMPANY_NOT_FOUND', 404);
-
-  const allowed = [
-    'name',
-    'domain',
-    'website',
-    'logo_url',
-    'description',
-    'company_type',
-    'sector',
-    'stage',
-    'investment_status',
-    'investment_amount',
-    'investment_date',
-    'ownership_pct',
-    'current_valuation',
-    'currency',
-    'linkedin_url',
-    'custom_fields',
-  ];
-
-  const updates: string[] = [];
-  const binds: unknown[] = [];
-  const changedFields: string[] = [];
-  for (const k of allowed) {
-    if (k in body) {
-      updates.push(`${k} = ?`);
-      binds.push(body[k]);
-      // Only treat as a real edit if the value actually changed.
-      const beforeVal = (before as any)[k];
-      const beforeNorm = beforeVal == null ? '' : String(beforeVal).trim();
-      const afterNorm = body[k] == null ? '' : String(body[k]).trim();
-      if (beforeNorm !== afterNorm) changedFields.push(k);
-    }
+  // Phase 1 refactor — see contacts.ts:updateContact for the full
+  // rationale. Same single source of truth (src/lib/entity-writes.ts)
+  // that MARTy's update_company_field tool will call in Phase 2.
+  const result = await updateCompanyFields(id, body, {
+    orgId: ctx.orgId,
+    userId: ctx.userId,
+    userRole: ctx.userRole,
+    origin: 'manual_ui',
+  }, env);
+  if (!result.ok && result.error) {
+    return errorResponse(result.error.code, result.error.status, result.error.message);
   }
-  if (updates.length === 0) return jsonResponse({ company: before });
-
-  updates.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
-  await env.D1.prepare(
-    `UPDATE companies SET ${updates.join(', ')} WHERE id = ?`
-  ).bind(...binds, id).run();
-
-  if (changedFields.length > 0) {
-    await markFieldsHumanEdited(ctx.orgId, 'company', id, changedFields, ctx.userId, env)
-      .catch(e => console.error('[companies] markFieldsHumanEdited failed:', e));
-  }
-
-  const after = await env.D1.prepare('SELECT * FROM companies WHERE id = ?').bind(id).first();
-
-  await emitAudit(env, {
-    org_id: ctx.orgId,
-    user_id: ctx.userId,
-    action: 'update',
-    entity_type: 'company',
-    entity_id: id,
-    before_data: before,
-    after_data: after,
-    created_at: new Date().toISOString(),
-  });
-
-  await invalidateRagCache(ctx.orgId, env);
-  return jsonResponse({ company: after });
+  const responseBody: Record<string, unknown> = { company: result.after };
+  if (result.rejected.length > 0) responseBody.rejected_fields = result.rejected;
+  return jsonResponse(responseBody);
 }
 
 export async function deleteCompany(

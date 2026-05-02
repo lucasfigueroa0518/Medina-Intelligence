@@ -1,0 +1,25 @@
+-- MARTy write capability ("God Mode") — Phase 1 schema.
+--
+-- Adds last_human_edit_user_id to entity_field_state so the
+-- 180-day-human-edit-lock check can grant the SAME user permission to
+-- update their own prior edit. Per locked spec:
+--   "Refuse fields under 180-day human-edit lock UNLESS the user IS
+--    the human who set the lock (in which case they're updating their
+--    own prior edit — allow)"
+--
+-- This data was historically tracked on entity_field_provenance but
+-- never on entity_field_state. We add the column here so the
+-- lock-check (which reads entity_field_state for permanently_locked +
+-- last_human_edit_at) doesn't need a second JOIN to enforce the
+-- same-user exception.
+--
+-- markFieldsHumanEdited + recordApproval + recordApprovalOfDeletion
+-- (all in src/lib/progressive-enrichment.ts and
+-- src/lib/proposal-evaluator.ts) get a one-line update each to write
+-- the new column at human-edit time. Pre-existing rows have NULL —
+-- the lock-check treats NULL as "lock applies to everyone" which is
+-- safe-by-default (slightly stricter than necessary for those rows;
+-- they get re-stamped on the next human edit and become unlockable
+-- by the same user from then on).
+
+ALTER TABLE entity_field_state ADD COLUMN last_human_edit_user_id TEXT;

@@ -701,25 +701,29 @@ export async function recordApproval(
 
   // The entity table itself has already been updated by approval.ts's
   // commitApproval. We just sync entity_field_state and timestamp the
-  // human edit.
+  // human edit. last_human_edit_user_id is stamped so MARTy's
+  // 180-day-lock check (Phase 1 entity-writes.ts) can grant the SAME
+  // user permission to update their own prior edit.
   await env.D1.prepare(
     `INSERT INTO entity_field_state
        (entity_type, entity_id, field_name, current_value,
         current_value_sources, pending_proposals, pending_deletions,
-        rejected_values, last_human_edit_at)
-     VALUES (?, ?, ?, ?, ?, '{}', '[]', '{}', ?)
+        rejected_values, last_human_edit_at, last_human_edit_user_id)
+     VALUES (?, ?, ?, ?, ?, '{}', '[]', '{}', ?, ?)
      ON CONFLICT(entity_type, entity_id, field_name) DO UPDATE SET
        current_value = excluded.current_value,
        current_value_sources = excluded.current_value_sources,
        pending_proposals = '{}',
        pending_deletions = '[]',
        last_human_edit_at = excluded.last_human_edit_at,
+       last_human_edit_user_id = excluded.last_human_edit_user_id,
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
   ).bind(
     params.entityType, params.entityId, params.fieldName,
     params.approvedValue,
     JSON.stringify([channel]),
-    now
+    now,
+    params.userId
   ).run();
 }
 
@@ -749,19 +753,21 @@ export async function recordApprovalOfDeletion(
     `INSERT INTO entity_field_state
        (entity_type, entity_id, field_name, current_value,
         current_value_sources, pending_proposals, pending_deletions,
-        rejected_values, last_human_edit_at)
-     VALUES (?, ?, ?, NULL, ?, '{}', '[]', '{}', ?)
+        rejected_values, last_human_edit_at, last_human_edit_user_id)
+     VALUES (?, ?, ?, NULL, ?, '{}', '[]', '{}', ?, ?)
      ON CONFLICT(entity_type, entity_id, field_name) DO UPDATE SET
        current_value = NULL,
        current_value_sources = excluded.current_value_sources,
        pending_proposals = '{}',
        pending_deletions = '[]',
        last_human_edit_at = excluded.last_human_edit_at,
+       last_human_edit_user_id = excluded.last_human_edit_user_id,
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
   ).bind(
     params.entityType, params.entityId, params.fieldName,
     JSON.stringify([channel]),
-    now
+    now,
+    params.userId
   ).run();
 }
 
