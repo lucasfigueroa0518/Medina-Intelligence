@@ -187,6 +187,9 @@ export default function DealDetailPage() {
   const [timelineFilter, setTimelineFilter] = React.useState<TimelineFilter>('all');
   const [timelineLimit, setTimelineLimit] = React.useState(20);
   const [timelineLoading, setTimelineLoading] = React.useState(false);
+  // Wave 3: timeline collapsed by default — Intelligence Brief is the
+  // primary surface, timeline is supporting evidence.
+  const [timelineCollapsed, setTimelineCollapsed] = React.useState(true);
 
   /* ── Action items state ── */
   const [newItemDesc, setNewItemDesc] = React.useState('');
@@ -795,46 +798,68 @@ export default function DealDetailPage() {
           {/* ═══ LEFT COLUMN (60%) ═══ */}
           <div className="lg:col-span-7 space-y-5">
 
-            {/* CARD: Activity Timeline */}
+            {/* CARD: Activity Timeline — Wave 3: collapsed by default. The
+                Intelligence Brief above is the primary surface; the timeline
+                is supporting evidence the user can expand on demand. */}
             <GlassCard>
-              <div className="flex items-center justify-between mb-4">
-                <span className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">Activity Timeline</span>
-                <div className="flex gap-1">
-                  {(['all', 'emails', 'meetings', 'notes'] as TimelineFilter[]).map(f => (
+              <button
+                onClick={() => setTimelineCollapsed(c => !c)}
+                className="w-full flex items-center justify-between text-left group"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display group-hover:text-text-secondary transition-colors">Activity Timeline</span>
+                  {timelineCollapsed && filteredTimeline.length > 0 && (
+                    <span className="text-[10px] text-text-muted">
+                      {filteredTimeline.length} recent {filteredTimeline.length === 1 ? 'activity' : 'activities'} — expand to see
+                    </span>
+                  )}
+                </div>
+                {timelineCollapsed
+                  ? <ChevronDown size={14} className="text-text-muted group-hover:text-text-secondary transition-colors" />
+                  : <ChevronUp size={14} className="text-text-muted group-hover:text-text-secondary transition-colors" />}
+              </button>
+
+              {!timelineCollapsed && (
+                <>
+                  <div className="flex items-center justify-end mt-4 mb-3">
+                    <div className="flex gap-1">
+                      {(['all', 'emails', 'meetings', 'notes'] as TimelineFilter[]).map(f => (
+                        <button
+                          key={f}
+                          onClick={() => { setTimelineFilter(f); setTimelineLimit(20); }}
+                          className={`px-2.5 py-1 rounded-md text-[10px] font-medium capitalize transition-colors ${
+                            timelineFilter === f
+                              ? 'text-text-primary'
+                              : 'text-text-muted hover:text-text-secondary'
+                          }`}
+                          style={timelineFilter === f ? { background: 'rgba(255,255,255,0.06)' } : undefined}
+                        >
+                          {f}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {visibleTimeline.length === 0 ? (
+                    <div className="text-sm text-text-muted py-8 text-center">No activity yet</div>
+                  ) : (
+                    <div className="space-y-1">
+                      {visibleTimeline.map((entry, i) => (
+                        <TimelineRow key={entry.id || i} entry={entry} />
+                      ))}
+                    </div>
+                  )}
+
+                  {hasMore && (
                     <button
-                      key={f}
-                      onClick={() => { setTimelineFilter(f); setTimelineLimit(20); }}
-                      className={`px-2.5 py-1 rounded-md text-[10px] font-medium capitalize transition-colors ${
-                        timelineFilter === f
-                          ? 'text-text-primary'
-                          : 'text-text-muted hover:text-text-secondary'
-                      }`}
-                      style={timelineFilter === f ? { background: 'rgba(255,255,255,0.06)' } : undefined}
+                      onClick={handleLoadMore}
+                      disabled={timelineLoading}
+                      className="mt-4 text-xs text-accent-magenta hover:text-accent-purple transition-colors disabled:opacity-40"
                     >
-                      {f}
+                      {timelineLoading ? 'Loading...' : 'Load more'}
                     </button>
-                  ))}
-                </div>
-              </div>
-
-              {visibleTimeline.length === 0 ? (
-                <div className="text-sm text-text-muted py-8 text-center">No activity yet</div>
-              ) : (
-                <div className="space-y-1">
-                  {visibleTimeline.map((entry, i) => (
-                    <TimelineRow key={entry.id || i} entry={entry} />
-                  ))}
-                </div>
-              )}
-
-              {hasMore && (
-                <button
-                  onClick={handleLoadMore}
-                  disabled={timelineLoading}
-                  className="mt-4 text-xs text-accent-magenta hover:text-accent-purple transition-colors disabled:opacity-40"
-                >
-                  {timelineLoading ? 'Loading...' : 'Load more'}
-                </button>
+                  )}
+                </>
               )}
             </GlassCard>
 
@@ -1520,36 +1545,63 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
       intelligence.momentum !== null
     );
 
+  const briefSummary = intelligence?.brief_summary ?? null;
+
+  // Wave 3: Intelligence Brief is now the primary surface — full-width
+  // prominent card directly below the header. Activity timeline is
+  // collapsed below. The brief_summary prose ("State of the Union")
+  // leads, with the four signal cards below in an expanded grid.
   return (
-    <div className="border-b border-border">
-      <div className="px-8 py-4 flex items-center gap-3">
-        <span className="text-[10px] uppercase tracking-[0.14em] font-medium text-text-muted font-display">
-          Intelligence
-        </span>
-        {!hasAnyData ? (
-          <span className="text-[9px] text-text-muted/60 italic">
-            awaiting evaluator (T3 Wave 6) — data lands automatically
+    <div className="border-b border-border bg-white/[0.015]">
+      <div className="px-8 pt-6 pb-3 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <span className="text-[11px] uppercase tracking-[0.16em] font-medium text-text-secondary font-display">
+            Intelligence Brief
           </span>
-        ) : (
-          <IntelligenceFreshnessIndicator
-            intelligence={intelligence}
-            onRefresh={refresh}
-            size="detail"
-          />
+          {hasAnyData && (
+            <IntelligenceFreshnessIndicator
+              intelligence={intelligence}
+              onRefresh={refresh}
+              size="detail"
+            />
+          )}
+        </div>
+        {!hasAnyData && (
+          <span className="text-[10px] text-text-muted/60 italic">
+            awaiting first compute — data lands automatically
+          </span>
         )}
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
+      {/* State of the Union prose — recency-biased 2-3 sentence summary
+          generated by Haiku 4.5 on each compute. ACL-keyed per (deal,
+          user). */}
+      {briefSummary && (
+        <div className="px-8 pb-5">
+          <p className="text-[14px] leading-[1.55] text-text-primary font-light max-w-[68ch]">
+            {briefSummary}
+          </p>
+        </div>
+      )}
+      {!briefSummary && hasAnyData && intelligence?.conversation_count === 0 && (
+        <div className="px-8 pb-5">
+          <p className="text-[12px] text-text-muted italic">
+            No readable conversations yet. The brief populates once activity flows in.
+          </p>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 border-t border-white/[0.04]">
         {/* Sentiment */}
-        <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
-          <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Sentiment</div>
+        <div className="px-6 py-5 border-r border-b lg:border-b-0 border-white/[0.04]">
+          <div className="text-[10px] uppercase tracking-[0.14em] text-text-muted mb-3">Sentiment</div>
           {intelligence?.sentiment === null && intelligence?.sentiment_score === null ? (
             <div className="text-xs text-text-muted italic">Insufficient data yet</div>
           ) : (
             <div className="flex items-center gap-2">
               <SentimentIndicator intelligence={intelligence} size="detail" />
               {intelligence?.sentiment && (
-                <span className="text-[10px] text-text-muted capitalize">
+                <span className="text-[11px] text-text-muted capitalize">
                   {intelligence.sentiment}
                 </span>
               )}
@@ -1558,8 +1610,8 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
         </div>
 
         {/* Active Topics */}
-        <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
-          <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Active Topics</div>
+        <div className="px-6 py-5 border-r border-b lg:border-b-0 border-white/[0.04]">
+          <div className="text-[10px] uppercase tracking-[0.14em] text-text-muted mb-3">Active Topics</div>
           {(intelligence?.topics ?? []).length === 0 ? (
             <div className="text-xs text-text-muted italic">No active topics extracted</div>
           ) : (
@@ -1567,9 +1619,11 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
           )}
         </div>
 
-        {/* Risk Signals */}
-        <div className="px-5 py-4 border-r border-b lg:border-b-0 border-white/[0.04]">
-          <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Risk Signals</div>
+        {/* Risk Signals — Wave 3: render inline list rather than collapsed
+            popover. The popover RiskFlag still renders inline content via
+            its detail-size variant. */}
+        <div className="px-6 py-5 border-r border-b lg:border-b-0 border-white/[0.04]">
+          <div className="text-[10px] uppercase tracking-[0.14em] text-text-muted mb-3">Risk Signals</div>
           {(intelligence?.risk_signals ?? []).length === 0 ? (
             <div className="text-xs text-text-muted italic">No risk signals detected</div>
           ) : (
@@ -1578,8 +1632,8 @@ function DealIntelligenceStrip({ deal }: { deal: any }) {
         </div>
 
         {/* Momentum */}
-        <div className="px-5 py-4">
-          <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Momentum</div>
+        <div className="px-6 py-5">
+          <div className="text-[10px] uppercase tracking-[0.14em] text-text-muted mb-3">Momentum</div>
           {intelligence?.momentum === null ? (
             <div className="text-xs text-text-muted italic">
               {intelligence?.conversation_count === 0

@@ -228,6 +228,7 @@ export const api = {
       momentum: 'accelerating' | 'steady' | 'stalled' | 'declining' | null;
       momentum_score: number | null;
       conversation_count: number;
+      brief_summary: string | null;
       computed_at: string;
       is_stale: boolean;
     }>(`/deals/${id}/intelligence`),

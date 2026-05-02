@@ -48,6 +48,10 @@ export interface DealIntelligence {
   momentum_score: number | null;
   /** Number of readable conversations contributing to the compute. */
   conversation_count: number;
+  /** Wave 3 — 2-3 sentence prose "State of the Union" summary, recency-biased
+   *  (last 14 days dominate). Null when no signal. ACL-filtered the same way
+   *  as topics/risks — derived from the same readable conversation set. */
+  brief_summary: string | null;
   /** ISO timestamp of last successful compute. */
   computed_at: string;
   /** True when the row served is from cache and a background recompute is
