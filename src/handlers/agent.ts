@@ -19,6 +19,14 @@ import {
   createDealTool, updateDealTool,
   addNoteTool, addDealActionItemTool,
   applyTagTool, deleteEntityTool,
+  // Phase 2 — God Mode write tools
+  deleteContactFieldTool, deleteCompanyFieldTool, deleteDealFieldTool,
+  linkConversationToDealTool, linkEventToDealTool,
+  unlinkConversationFromDealTool, unlinkEventFromDealTool,
+  addContactToDealTool, removeContactFromDealTool,
+  dismissObservationTool,
+  approveHeldProposalTool, dismissHeldProposalTool,
+  lockFieldPermanentlyTool, unlockFieldTool,
 } from '../lib/agent-tools';
 import { webSearch, readUrl } from '../lib/agent-web-search';
 import {
@@ -296,6 +304,193 @@ const AGENT_TOOLS: ToolDefinition[] = [
       required: ['entity_type', 'entity_id'],
     },
   },
+
+  // ── Phase 2 (MARTy Write Capability) — additional write tools ──
+  // Field deletions: clears one column on an entity. Routes through
+  // entity-writes (lock checks + entity_field_state sync).
+  {
+    name: 'delete_contact_field',
+    description: 'Clear a single field on a contact (sets it to null). Use for "remove Tony\'s old phone" / "clear the location field". Refuses if the field is permanently locked or under a 180-day human-edit lock from another user.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        field_name: { type: 'string', description: 'e.g. phone, email, location, job_title, bio_summary' },
+      },
+      required: ['contact_id', 'field_name'],
+    },
+  },
+  {
+    name: 'delete_company_field',
+    description: 'Clear a single field on a company.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company_id: { type: 'string' },
+        field_name: { type: 'string' },
+      },
+      required: ['company_id', 'field_name'],
+    },
+  },
+  {
+    name: 'delete_deal_field',
+    description: 'Clear a single field on a deal.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string' },
+        field_name: { type: 'string' },
+      },
+      required: ['deal_id', 'field_name'],
+    },
+  },
+
+  // Conversation/event ↔ deal linkage — uses T1's Phase B junction tables.
+  {
+    name: 'link_conversation_to_deal',
+    description: 'Link an email/Slack/transcript conversation to a deal. Use when the user says things like "this thread is about the Acme deal" or "tag this conversation under <deal>".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        conversation_id: { type: 'string' },
+        deal_id: { type: 'string' },
+      },
+      required: ['conversation_id', 'deal_id'],
+    },
+  },
+  {
+    name: 'link_event_to_deal',
+    description: 'Link a calendar event/meeting to a deal.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        event_id: { type: 'string' },
+        deal_id: { type: 'string' },
+      },
+      required: ['event_id', 'deal_id'],
+    },
+  },
+  {
+    name: 'unlink_conversation_from_deal',
+    description: 'Remove a conversation\'s direct link to a deal. Confirm before executing — destructive operation.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        conversation_id: { type: 'string' },
+        deal_id: { type: 'string' },
+      },
+      required: ['conversation_id', 'deal_id'],
+    },
+  },
+  {
+    name: 'unlink_event_from_deal',
+    description: 'Remove an event\'s direct link to a deal. Confirm before executing — destructive operation.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        event_id: { type: 'string' },
+        deal_id: { type: 'string' },
+      },
+      required: ['event_id', 'deal_id'],
+    },
+  },
+
+  // Contact ↔ deal membership (deal_contacts table).
+  {
+    name: 'add_contact_to_deal',
+    description: 'Add a contact to a deal\'s contact list. side defaults to "them" (counterparty); use "us" for internal Medina contacts.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string' },
+        contact_id: { type: 'string' },
+        role: { type: 'string', description: 'e.g. CEO, GC, Lead Investor (optional)' },
+        side: { type: 'string', enum: ['us', 'them'], description: 'Default: "them"' },
+      },
+      required: ['deal_id', 'contact_id'],
+    },
+  },
+  {
+    name: 'remove_contact_from_deal',
+    description: 'Remove a contact from a deal\'s contact list. Confirm before executing — destructive operation.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string' },
+        contact_id: { type: 'string' },
+      },
+      required: ['deal_id', 'contact_id'],
+    },
+  },
+
+  // Observation + held-proposal + lock tools — extends Q11/Q12 + Wave 6 UX.
+  {
+    name: 'dismiss_observation',
+    description: 'Dismiss a synthetic observation (personal_update, follow_up_commitment, etc.) for an entity. Re-sightings clear the dismissal automatically.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        observation_id: { type: 'string' },
+      },
+      required: ['observation_id'],
+    },
+  },
+  {
+    name: 'approve_held_proposal',
+    description: 'Approve a held value or held deletion sitting in entity_field_state.pending_proposals/pending_deletions. Commits as a fresh human edit (resets corroboration history).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        entity_type: { type: 'string', enum: ['contact', 'company', 'deal'] },
+        entity_id: { type: 'string' },
+        field_name: { type: 'string' },
+        value: { type: 'string', description: 'Required unless is_deletion=true' },
+        is_deletion: { type: 'boolean', description: 'true = approve a held deletion (clears the field)' },
+      },
+      required: ['entity_type', 'entity_id', 'field_name'],
+    },
+  },
+  {
+    name: 'dismiss_held_proposal',
+    description: 'Dismiss a held value or held deletion. Stamps the value into rejected_values for the 90-day no-re-ask rule.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        entity_type: { type: 'string', enum: ['contact', 'company', 'deal'] },
+        entity_id: { type: 'string' },
+        field_name: { type: 'string' },
+        value: { type: 'string' },
+        is_deletion: { type: 'boolean' },
+      },
+      required: ['entity_type', 'entity_id', 'field_name'],
+    },
+  },
+  {
+    name: 'lock_field_permanently',
+    description: 'Permanently lock a field from automated proposals. Owner-only. Use when the user wants a curated value (manual_edit) protected from future LLM/enrichment overwrites indefinitely.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        entity_type: { type: 'string', enum: ['contact', 'company', 'deal'] },
+        entity_id: { type: 'string' },
+        field_name: { type: 'string' },
+      },
+      required: ['entity_type', 'entity_id', 'field_name'],
+    },
+  },
+  {
+    name: 'unlock_field',
+    description: 'Remove a permanent lock from a field. Owner-only. Re-enables automated proposals (still subject to the 180-day human-edit lock).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        entity_type: { type: 'string', enum: ['contact', 'company', 'deal'] },
+        entity_id: { type: 'string' },
+        field_name: { type: 'string' },
+      },
+      required: ['entity_type', 'entity_id', 'field_name'],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -318,15 +513,32 @@ async function executeTool(
     case 'get_deal_detail': return getDealDetail(ctx, toolInput.deal_id, env);
     case 'web_search': return webSearch(toolInput.query, toolInput.num_results, env);
     case 'read_url': return readUrl(toolInput.url);
-    case 'create_contact': return createContactTool(ctx.orgId, ctx.userId, toolInput, env);
-    case 'update_contact': return updateContactTool(ctx.orgId, ctx.userId, toolInput, env);
-    case 'create_company': return createCompanyTool(ctx.orgId, ctx.userId, toolInput, env);
-    case 'update_company': return updateCompanyTool(ctx.orgId, ctx.userId, toolInput, env);
-    case 'create_deal': return createDealTool(ctx.orgId, ctx.userId, toolInput, env);
-    case 'update_deal': return updateDealTool(ctx.orgId, ctx.userId, toolInput, env);
+    // Phase 1 refactor — these now take ctx (with userRole) so the
+    // entity-writes lock checks can enforce the same-user exception.
+    case 'create_contact': return createContactTool(ctx, toolInput, env);
+    case 'update_contact': return updateContactTool(ctx, toolInput, env);
+    case 'create_company': return createCompanyTool(ctx, toolInput, env);
+    case 'update_company': return updateCompanyTool(ctx, toolInput, env);
+    case 'create_deal': return createDealTool(ctx, toolInput, env);
+    case 'update_deal': return updateDealTool(ctx, toolInput, env);
     case 'add_note': return addNoteTool(ctx.orgId, ctx.userId, toolInput, env);
     case 'add_deal_action_item': return addDealActionItemTool(ctx.orgId, ctx.userId, toolInput, env);
     case 'apply_tag': return applyTagTool(ctx.orgId, toolInput, env);
+    // Phase 2 (God Mode) — additional write tools.
+    case 'delete_contact_field': return deleteContactFieldTool(ctx, toolInput, env);
+    case 'delete_company_field': return deleteCompanyFieldTool(ctx, toolInput, env);
+    case 'delete_deal_field': return deleteDealFieldTool(ctx, toolInput, env);
+    case 'link_conversation_to_deal': return linkConversationToDealTool(ctx, toolInput, env);
+    case 'link_event_to_deal': return linkEventToDealTool(ctx, toolInput, env);
+    case 'unlink_conversation_from_deal': return unlinkConversationFromDealTool(ctx, toolInput, env);
+    case 'unlink_event_from_deal': return unlinkEventFromDealTool(ctx, toolInput, env);
+    case 'add_contact_to_deal': return addContactToDealTool(ctx, toolInput, env);
+    case 'remove_contact_from_deal': return removeContactFromDealTool(ctx, toolInput, env);
+    case 'dismiss_observation': return dismissObservationTool(ctx, toolInput, env);
+    case 'approve_held_proposal': return approveHeldProposalTool(ctx, toolInput, env);
+    case 'dismiss_held_proposal': return dismissHeldProposalTool(ctx, toolInput, env);
+    case 'lock_field_permanently': return lockFieldPermanentlyTool(ctx, toolInput, env);
+    case 'unlock_field': return unlockFieldTool(ctx, toolInput, env);
     case 'delete_entity': return deleteEntityTool(ctx.orgId, ctx.userId, toolInput, env);
     default: return { error: `Unknown tool: ${toolName}` };
   }
