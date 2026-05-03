@@ -12,6 +12,21 @@ import { refreshOutlookToken, recordTokenFailure } from './oauth';
 import { upsertOutlookEvent } from '../lib/reconciliation';
 import { checkGraphRateLimit, recordGraphApiCall } from '../lib/rate-limit';
 
+// Per-HTTP-call timeout for Microsoft Graph. Naked `await fetch()` with no
+// signal can hang past the Workflow step budget when Graph is slow (504s,
+// regional issues, etc.). 30s is generous for a single page; the pagination
+// loop accumulates many pages so we also need a per-user wallclock budget
+// (CALENDAR_PER_USER_BUDGET_MS) to bound the outer loop.
+const GRAPH_REQUEST_TIMEOUT_MS = 30_000;
+
+// Per-user wallclock cap on the calendar pagination loop. With the 120-day
+// window a heavy-meeting user can paginate through 10+ pages. If any single
+// page is slow OR @odata.nextLink keeps coming back, this prevents one user
+// from monopolizing the fetch-core-sources step budget. Other users still
+// get their turn; the slow user's pull resumes on the next hourly run via
+// upsertOutlookEvent's ON CONFLICT idempotency.
+const CALENDAR_PER_USER_BUDGET_MS = 60_000;
+
 interface OutlookAttachment {
   id: string;
   name: string;
@@ -78,6 +93,7 @@ async function fetchFolderDelta(
 
     const resp = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(GRAPH_REQUEST_TIMEOUT_MS),
     });
     await recordGraphApiCall(orgId, env);
 
@@ -553,6 +569,7 @@ export async function runHistoricalBackfill(
 
     const resp = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(GRAPH_REQUEST_TIMEOUT_MS),
     });
     await recordGraphApiCall(orgId, env);
     pagesThisBatch++;
@@ -784,9 +801,19 @@ export async function fetchOutlookCalendarDelta(
       )}&endDateTime=${encodeURIComponent(end)}&$top=50`;
 
     const events: OutlookCalendarEvent[] = [];
+    const userStartedAt = Date.now();
 
     try {
       while (url) {
+        if (Date.now() - userStartedAt > CALENDAR_PER_USER_BUDGET_MS) {
+          // Per-user wallclock cap reached. Resume next run via @odata
+          // re-paginate from the start (idempotent upserts dedupe). Logged
+          // as a soft error so System Status shows the truncation; not a
+          // failure — the events fetched so far are committed below.
+          console.warn(`[outlook] calendar per-user budget exceeded for user ${user.id} after ${events.length} events, resuming next run`);
+          result.errors.push({ user_id: user.id, error: `per_user_budget_exceeded:${events.length}_events_so_far` });
+          break;
+        }
         if (!(await checkGraphRateLimit(orgId, env))) {
           console.log(`[outlook] Graph rate limit approaching for calendar sync, pausing`);
           break;
@@ -797,6 +824,7 @@ export async function fetchOutlookCalendarDelta(
             Authorization: `Bearer ${token}`,
             Prefer: 'odata.maxpagesize=50, outlook.timezone="UTC"',
           },
+          signal: AbortSignal.timeout(GRAPH_REQUEST_TIMEOUT_MS),
         });
         await recordGraphApiCall(orgId, env);
 

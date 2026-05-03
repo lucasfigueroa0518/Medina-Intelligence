@@ -130,8 +130,15 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         syncJobId,
         'fetch-core-sources',
         {
+          // Bumped 300s → 600s 2026-05-03. Three parallel upstream fetches
+          // (Outlook delta, Slack, Outlook calendar /calendarView 120-day)
+          // share this budget. Calendar alone can return 500+ events for a
+          // heavy-meeting user, paginated 50/page. Per-request 30s timeouts
+          // (outlook.ts GRAPH_REQUEST_TIMEOUT_MS) plus per-user 60s wallclock
+          // (CALENDAR_PER_USER_BUDGET_MS) bound the inner work; this outer
+          // ceiling is the safety net for parallel-fetch worst case.
           retries: { limit: 2, delay: '10 seconds' },
-          timeout: '300 seconds',
+          timeout: '600 seconds',
         },
         async (): Promise<CoreSourceBundle> => {
           const results = await Promise.allSettled([
