@@ -115,7 +115,30 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       jobCreated = true;
       syncJobId = newJobId;
 
-      // Step 2a: fetch email + slack + calendar (fast sources)
+      // Step 2a: fetch core sources — Outlook emails, Outlook calendar,
+      // and Slack each in their OWN step.do invocation.
+      //
+      // Why three steps instead of one Promise.allSettled (the prior shape):
+      // every step.do is a fresh CF Worker invocation with a fresh
+      // 1000-subrequest budget. The old single-step shape forced all three
+      // upstream fetches to share ONE budget. After PR #38 widened the
+      // calendar window to 120 days, the cumulative subrequests across the
+      // three sources blew past the cap — causing CF runtime to error the
+      // step with "Too many API requests by single Worker invocation"
+      // (Terminal 5 forensic 2026-05-03). The runtime error fired BEFORE
+      // any failure could propagate to sync_jobs, so D1 was left lying
+      // about run state for ~30 min.
+      //
+      // Splitting into three steps gives 3000 effective subrequests. Each
+      // upstream's failure is contained to its step (CF retries it with
+      // a fresh budget) — slack hiccups don't poison emails; an Outlook
+      // service incident doesn't take down slack. Sequential dispatch
+      // (vs. parallel via Promise.all of step.do) keeps trackedStep's
+      // current_step telemetry coherent and simplifies retry reasoning.
+      //
+      // CoreSourceBundle output shape is unchanged so downstream code
+      // (write-chunks-and-fanout, source_failures aggregation, etc.)
+      // requires no edits.
       interface CoreSourceBundle {
         outlook: ClassifiableItem[];
         slack: ClassifiableItem[];
@@ -123,70 +146,112 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         failures: Array<{ source: string; error: string }>;
       }
 
-      console.log('[IngestionWorkflow] step → fetch-core-sources');
-      const coreData: CoreSourceBundle = await trackedStep(
+      console.log('[IngestionWorkflow] step → fetch-outlook-emails');
+      const emailResult = await trackedStep(
         this.env,
         step,
         syncJobId,
-        'fetch-core-sources',
+        'fetch-outlook-emails',
         {
-          // Bumped 300s → 600s 2026-05-03. Three parallel upstream fetches
-          // (Outlook delta, Slack, Outlook calendar /calendarView 120-day)
-          // share this budget. Calendar alone can return 500+ events for a
-          // heavy-meeting user, paginated 50/page. Per-request 30s timeouts
-          // (outlook.ts GRAPH_REQUEST_TIMEOUT_MS) plus per-user 60s wallclock
-          // (CALENDAR_PER_USER_BUDGET_MS) bound the inner work; this outer
-          // ceiling is the safety net for parallel-fetch worst case.
+          // Email path is the most subrequest-heavy: multi-user delta loops
+          // × inbox + sent × per-page contact discovery. Own 1000-subreq
+          // budget gives it real headroom. 300s wallclock matches the
+          // previous shared cap; per-fetch AbortSignal + per-user wallclock
+          // (Phase 0a) bound the inner work.
           retries: { limit: 2, delay: '10 seconds' },
-          timeout: '600 seconds',
+          timeout: '300 seconds',
         },
-        async (): Promise<CoreSourceBundle> => {
-          const results = await Promise.allSettled([
-            fetchOutlookDelta(org_id!, this.env),
-            fetchSlackMessages(org_id!, this.env),
-            fetchOutlookCalendarDelta(org_id!, this.env),
-          ]);
-
-          const failures: Array<{ source: string; error: string }> = [];
-          const data: CoreSourceBundle = {
-            outlook: [] as ClassifiableItem[],
-            slack: [] as ClassifiableItem[],
-            calendar_events_upserted: 0,
-            failures,
-          };
-
-          if (results[0].status === 'fulfilled') {
-            data.outlook = (results[0] as PromiseFulfilledResult<ClassifiableItem[]>).value;
-          } else {
-            failures.push({ source: 'outlook', error: (results[0] as PromiseRejectedResult).reason?.message || 'unknown' });
+        async (): Promise<{ outlook: ClassifiableItem[]; failures: Array<{ source: string; error: string }> }> => {
+          try {
+            const items = await fetchOutlookDelta(org_id!, this.env);
+            return { outlook: items, failures: [] };
+          } catch (e: any) {
+            // Convert step-internal failure into a soft failures entry so
+            // the workflow continues to the next source. CF's retry config
+            // above handles transient "Too many API requests" with a fresh
+            // budget; a hard failure here lands as a recorded source error.
+            return {
+              outlook: [],
+              failures: [{ source: 'outlook', error: errMessage(e) }],
+            };
           }
-
-          if (results[1].status === 'fulfilled') {
-            const slackResult = (results[1] as PromiseFulfilledResult<{
-              messages: ClassifiableItem[];
-              errors: Array<{ channel_id: string; channel_name: string; error: string }>;
-            }>).value;
-            data.slack = slackResult.messages;
-            for (const e of slackResult.errors) {
-              failures.push({ source: `slack:#${e.channel_name}`, error: e.error });
-            }
-          } else {
-            failures.push({ source: 'slack', error: (results[1] as PromiseRejectedResult).reason?.message || 'unknown' });
-          }
-
-          if (results[2].status === 'fulfilled') {
-            const calResult = results[2].value;
-            data.calendar_events_upserted = calResult.events_upserted;
-            for (const e of calResult.errors) {
-              failures.push({ source: `calendar:${e.user_id}`, error: `${e.error}${e.http_status ? ` (HTTP ${e.http_status})` : ''}` });
-            }
-          } else {
-            failures.push({ source: 'calendar', error: (results[2] as PromiseRejectedResult).reason?.message || 'unknown' });
-          }
-
-          return data;
         }
       );
+
+      console.log('[IngestionWorkflow] step → fetch-outlook-calendar');
+      const calendarResult = await trackedStep(
+        this.env,
+        step,
+        syncJobId,
+        'fetch-outlook-calendar',
+        {
+          // Calendar 120-day window can return 500+ events for heavy-
+          // meeting users. Per-user 60s wallclock + per-fetch 30s timeout
+          // (Phase 0a) bound the inner work; this step gets its own
+          // 1000-subreq budget so calendar's volume can't starve emails.
+          retries: { limit: 2, delay: '10 seconds' },
+          timeout: '300 seconds',
+        },
+        async (): Promise<{ calendar_events_upserted: number; failures: Array<{ source: string; error: string }> }> => {
+          try {
+            const calResult = await fetchOutlookCalendarDelta(org_id!, this.env);
+            const failures = calResult.errors.map(e => ({
+              source: `calendar:${e.user_id}`,
+              error: `${e.error}${e.http_status ? ` (HTTP ${e.http_status})` : ''}`,
+            }));
+            return { calendar_events_upserted: calResult.events_upserted, failures };
+          } catch (e: any) {
+            return {
+              calendar_events_upserted: 0,
+              failures: [{ source: 'calendar', error: errMessage(e) }],
+            };
+          }
+        }
+      );
+
+      console.log('[IngestionWorkflow] step → fetch-slack-messages');
+      const slackResult = await trackedStep(
+        this.env,
+        step,
+        syncJobId,
+        'fetch-slack-messages',
+        {
+          // Slack already has a per-tick wallclock budget internal to
+          // fetchSlackMessages (commit 76edddc). Lighter timeout here
+          // since the inner function self-terminates well under 180s.
+          retries: { limit: 1, delay: '10 seconds' },
+          timeout: '180 seconds',
+        },
+        async (): Promise<{ slack: ClassifiableItem[]; failures: Array<{ source: string; error: string }> }> => {
+          try {
+            const result = await fetchSlackMessages(org_id!, this.env);
+            const failures = result.errors.map(e => ({
+              source: `slack:#${e.channel_name}`,
+              error: e.error,
+            }));
+            return { slack: result.messages, failures };
+          } catch (e: any) {
+            return {
+              slack: [],
+              failures: [{ source: 'slack', error: errMessage(e) }],
+            };
+          }
+        }
+      );
+
+      // Combine the three step results back into the existing
+      // CoreSourceBundle shape so downstream code (chunking, fanout,
+      // failure aggregation, telemetry) is unchanged.
+      const coreData: CoreSourceBundle = {
+        outlook: emailResult.outlook,
+        slack: slackResult.slack,
+        calendar_events_upserted: calendarResult.calendar_events_upserted,
+        failures: [
+          ...emailResult.failures,
+          ...calendarResult.failures,
+          ...slackResult.failures,
+        ],
+      };
 
       // Step 2b: fetch news. New design (audit 2026-04-28 Task 1): staleness
       // filter + hard cap (25/run) + parallel-per-company + per-company budget.
