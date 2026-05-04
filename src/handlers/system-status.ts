@@ -24,6 +24,7 @@ import {
   type StuckTaskRunRow,
   type BudgetSnapshotRow,
 } from '../lib/system-status';
+import type { FireflyKeyStatus } from '../lib/firefly-credentials';
 
 export interface SystemStatusActiveTask {
   type: string;                  // human-readable
@@ -69,6 +70,11 @@ export interface SystemStatusResponse {
   dead_letter: DeadLetterRow[];
   stuck_runs: StuckTaskRunRow[];
   budgets: BudgetSnapshotRow[];
+  // Phase 4 1b (2026-05-04): per-user Firefly credential metadata.
+  // No plaintext or ciphertext. Drives the Settings UI's "credentials
+  // section" disabled-state logic and gives operators visibility into
+  // which users have keys.
+  firefly_credentials: FireflyKeyStatus[];
   generated_at: string;
 }
 
@@ -243,6 +249,7 @@ export async function getSystemStatus(
     dead_letter: snapshot.dead_letter,
     stuck_runs: snapshot.stuck_runs,
     budgets: snapshot.budgets,
+    firefly_credentials: snapshot.firefly_credentials,
     generated_at: new Date().toISOString(),
   } satisfies SystemStatusResponse);
 }

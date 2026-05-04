@@ -140,10 +140,14 @@ export interface RevokeResult {
 }
 
 /**
- * Hard-delete the user's persistent credential. Used for both:
- *   • User-initiated revoke (DELETE /api/settings/firefly-credentials).
- *   • User-removal cascade (called from the user-removal handler when
- *     a user is removed from the org).
+ * Hard-delete the user's persistent credential. Called from the
+ * user-initiated revoke endpoint (DELETE /api/settings/firefly-
+ * credentials). User-removal cascade is NOT this function's
+ * responsibility — that's handled automatically by the migration
+ * 0082 FK ON DELETE CASCADE constraint, which fires whenever a user
+ * row is hard-deleted (no current code path writes that, but the
+ * cascade is in place for whenever a removal handler eventually
+ * gets built).
  *
  * Re-storing after revocation creates a fresh row with rotation_count
  * back to 0 — there's no soft-delete state to un-revoke. Per Lucas's

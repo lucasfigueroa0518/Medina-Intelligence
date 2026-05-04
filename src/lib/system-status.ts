@@ -15,6 +15,7 @@
 //                     watchdog itself runs separately (Phase 1).
 
 import type { Env } from '../types/env';
+import { listFireflyKeyStatuses, type FireflyKeyStatus } from './firefly-credentials';
 
 // ─── Pipeline health ─────────────────────────────────────────────────────
 
@@ -282,22 +283,28 @@ export interface SystemStatusSnapshot {
   dead_letter: DeadLetterRow[];
   stuck_runs: StuckTaskRunRow[];
   budgets: BudgetSnapshotRow[];
+  // Phase 4 1b (2026-05-04): per-user Firefly credential metadata.
+  // No plaintext, no ciphertext. Drives the Settings UI's
+  // "credentials section" and gives operators visibility into which
+  // users have keys (for "why is Tony's backfill failing?" forensics).
+  firefly_credentials: FireflyKeyStatus[];
 }
 
 /**
  * Single call returning everything the System Status panel needs. Future
- * route handler is a thin pass-through over this. ~6 D1 reads worst case;
+ * route handler is a thin pass-through over this. ~7 D1 reads worst case;
  * well under the per-invocation subrequest budget.
  */
 export async function getSystemStatusSnapshot(
   env: Env,
   orgId: string
 ): Promise<SystemStatusSnapshot> {
-  const [pipelines, dead_letter, stuck_runs, budgets] = await Promise.all([
+  const [pipelines, dead_letter, stuck_runs, budgets, firefly_credentials] = await Promise.all([
     getPipelineHealth(env, orgId),
     getDeadLetterItems(env, orgId),
     getStuckTaskRuns(env),
     getBudgetSnapshot(env, orgId),
+    listFireflyKeyStatuses(orgId, env),
   ]);
   return {
     generated_at: new Date().toISOString(),
@@ -305,5 +312,6 @@ export async function getSystemStatusSnapshot(
     dead_letter,
     stuck_runs,
     budgets,
+    firefly_credentials,
   };
 }
