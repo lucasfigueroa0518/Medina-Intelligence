@@ -511,11 +511,20 @@ export async function driveFireflyProgressiveBackfill(
     return { advanced: true, window_index: win.window_index, status: 'failed', note: msg };
   }
 
-  // Per-tick API call accounting on the user's daily quota row + the
-  // upstream_budget_ledger (Phase 3.4 hybrid dual-write). The pre-gate
-  // above (checkBudget) handles the proactive refuse-when-capped case;
-  // this fires post-claim to record usage of the now-attempted tick.
-  await recordFireflyApiCall(userId, env, false, orgId);
+  // Phase 3.4.1 (2026-05-04): per-tick API call accounting moved from
+  // pre-call (used to be HERE) to post-confirmed-success (in the
+  // 'completed' branch below). The pre-call recordUsage was hardcoded
+  // to reset `consecutive_429s = 0` every tick (per upstream-budget.ts
+  // "success ALWAYS resets the breaker counter" semantic), which made
+  // the CIRCUIT_TRIP_THRESHOLD = 3 structurally unreachable for
+  // sequential workloads like Firefly's per-tick driver: each
+  // rate-limited tick could only ever bump consecutive_429s to 1
+  // before the next tick reset it back to 0. Auto-tune-down was dead
+  // code; the pre-gate's circuit_open branch never fired. Terminal 5
+  // forensic 2026-05-04 confirmed the gap. Moving the call to post-
+  // success means: only confirmed Firefly successes reset the breaker
+  // counter; 3 consecutive rate-limited ticks (no successes between)
+  // can now trip the breaker, which is the documented contract.
 
   let result;
   try {
@@ -572,6 +581,14 @@ export async function driveFireflyProgressiveBackfill(
           SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         WHERE id = ?`
     ).bind(parent.id).run();
+
+    // Phase 3.4.1: post-success dual-write to firefly_user_quotas +
+    // upstream_budget_ledger. Fires ONLY on confirmed window completion
+    // so recordUsage's hardcoded `consecutive_429s = 0` reset doesn't
+    // pre-empt the breaker counter accumulation. 'failed' and 'paused'
+    // status branches deliberately do NOT call this — preserves correct
+    // breaker semantic where only successful ticks reset the counter.
+    await recordFireflyApiCall(userId, env, false, orgId);
 
     return { advanced: true, window_index: win.window_index, status: 'completed' };
   }
