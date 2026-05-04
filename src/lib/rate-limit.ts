@@ -1,5 +1,6 @@
 // TRD §5.3 — Claude + enrichment rate limiters
 import type { Env } from '../types/env';
+import { checkBudget, recordUsage } from './upstream-budget';
 
 interface ClaudeRateState {
   count: number;
@@ -206,28 +207,31 @@ export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number>
 }
 
 // --- Microsoft Graph API rate tracking (§6.1) ---
-
-interface GraphRateState {
-  count: number;
-  window_start: string;
-}
-
-const GRAPH_WINDOW_MS = 600_000; // 10 minutes
-const GRAPH_SOFT_LIMIT = 8000;   // 80% of 10K limit
+//
+// Phase 3.1 (2026-05-04): migrated from KV-backed counter to the
+// upstream_budget_ledger (Phase 0). Caller signatures unchanged so all
+// 14 existing call sites keep working without edits. Ledger gives us
+// cross-org visibility (System Status budgets section) plus circuit-
+// breaker auto-tune-down on repeated 429s. The Graph cap (8000 calls
+// per 10 min — 80% of Microsoft's 10K hard limit) is encoded as
+// `graph.ten_minute = 8000` in upstream-budget.ts DEFAULT_CAPS.
+//
+// The previous KV keys (`graph_rpm:<orgId>`) are abandoned — TTL was
+// 660s so they expire naturally within ~11 minutes after deploy. No
+// cleanup script needed; downstream callers don't read the KV state.
+//
+// 429 detection: the existing pre-check `checkGraphRateLimit` cannot
+// observe upstream 429s (it's just a counter). The actual 429 from
+// Microsoft Graph fires inside the fetch loop in src/integrations/
+// outlook.ts; that's where Phase 3.1 also adds `recordRateLimit`
+// calls so the ledger's circuit-breaker auto-tune-down rule fires.
 
 export async function checkGraphRateLimit(
   orgId: string,
   env: Env
 ): Promise<boolean> {
-  const key = `graph_rpm:${orgId}`;
-  const state = await env.KV.get<GraphRateState>(key, 'json');
-  const now = Date.now();
-
-  if (!state || now - new Date(state.window_start).getTime() >= GRAPH_WINDOW_MS) {
-    return true;
-  }
-
-  return state.count < GRAPH_SOFT_LIMIT;
+  const result = await checkBudget(env, orgId, null, 'graph', 'ten_minute');
+  return result.decision === 'ok';
 }
 
 export async function recordGraphApiCall(
@@ -235,18 +239,5 @@ export async function recordGraphApiCall(
   env: Env,
   count: number = 1
 ): Promise<void> {
-  const key = `graph_rpm:${orgId}`;
-  const state = await env.KV.get<GraphRateState>(key, 'json');
-  const now = Date.now();
-
-  if (!state || now - new Date(state.window_start).getTime() >= GRAPH_WINDOW_MS) {
-    await env.KV.put(key, JSON.stringify({
-      count,
-      window_start: new Date().toISOString(),
-    }), { expirationTtl: 660 });
-    return;
-  }
-
-  state.count += count;
-  await env.KV.put(key, JSON.stringify(state), { expirationTtl: 660 });
+  await recordUsage(env, orgId, null, 'graph', 'ten_minute', count);
 }

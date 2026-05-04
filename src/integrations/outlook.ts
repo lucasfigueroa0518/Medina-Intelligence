@@ -11,6 +11,7 @@ import { stripHtml, stripQuotedReplies } from '../lib/helpers';
 import { refreshOutlookToken, recordTokenFailure } from './oauth';
 import { upsertOutlookEvent } from '../lib/reconciliation';
 import { checkGraphRateLimit, recordGraphApiCall } from '../lib/rate-limit';
+import { recordRateLimit } from '../lib/upstream-budget';
 
 // Per-HTTP-call timeout for Microsoft Graph. Naked `await fetch()` with no
 // signal can hang past the Workflow step budget when Graph is slow (504s,
@@ -105,6 +106,10 @@ async function fetchFolderDelta(
         console.warn(`[outlook] Delta token expired (410) for ${config.folder} user ${userId}, cleared for full re-sync`);
       } else if (resp.status === 401) {
         await recordTokenFailure(userId, 'outlook', env);
+      } else if (resp.status === 429) {
+        // Phase 3.1: feed the upstream_budget_ledger circuit breaker.
+        // 3 consecutive 429s → cap drops 10%, circuit opens 30 min.
+        await recordRateLimit(env, orgId, null, 'graph', 'ten_minute');
       }
       break;
     }
@@ -576,6 +581,8 @@ export async function runHistoricalBackfill(
 
     if (!resp.ok) {
       if (resp.status === 401) await recordTokenFailure(userId, 'outlook', env);
+      // Phase 3.1: feed the ledger circuit breaker on 429s.
+      if (resp.status === 429) await recordRateLimit(env, orgId, null, 'graph', 'ten_minute');
       progress.status = 'failed';
       progress.error = `Graph API error: ${resp.status}`;
       progress.last_page_url = url;
@@ -832,6 +839,9 @@ export async function fetchOutlookCalendarDelta(
           const status = resp.status;
           if (status === 401) {
             await recordTokenFailure(user.id, 'outlook', env);
+          } else if (status === 429) {
+            // Phase 3.1: feed the ledger circuit breaker on 429s.
+            await recordRateLimit(env, orgId, null, 'graph', 'ten_minute');
           }
           result.errors.push({ user_id: user.id, error: `graph_api_error`, http_status: status });
           break;
