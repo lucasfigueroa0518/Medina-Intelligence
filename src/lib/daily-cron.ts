@@ -9,6 +9,8 @@ import { calculateAllRelationshipStatuses } from './relationship-status';
 import { calculateAllRelationshipOwners } from './relationship-owner';
 import { analyzeAllCommsPatterns } from './communication-patterns';
 import { renewExpiringSubscriptions } from './graph-subscriptions';
+import { withTaskRun } from './task-runs';
+import { checkBudget, recordUsage, recordRateLimit } from './upstream-budget';
 import { proposeMultipleUpdates } from './progressive-enrichment';
 import { callClaude } from './claude';
 import { rebuildEntityIndex } from './entity-index';
@@ -656,7 +658,8 @@ export async function backfillUnembeddedEntities(orgId: string, env: Env): Promi
   return stats;
 }
 
-// Embed retry queue processor (audit 2026-04-28 scale-up Fix 3).
+// Embed retry queue processor (audit 2026-04-28 scale-up Fix 3;
+// Phase 1 2026-05-04 wired into withTaskRun + upstream-budget ledger).
 //
 // Drains embed_retry_queue: conversations / events / documents that
 // detect-embed-gaps detected as missing from vector_entity_index after a
@@ -664,8 +667,32 @@ export async function backfillUnembeddedEntities(orgId: string, env: Env): Promi
 // entry is marked failed_permanent and surfaced in System Status.
 //
 // Called by the daily cron AND by POST /api/admin/process-embed-queue
-// for on-demand drains. The new BGE limiter (acquireEmbedSlot) keeps this
-// from re-creating the burst that put items in the queue in the first place.
+// for on-demand drains.
+//
+// Two layers of integration with Phase 0 helpers:
+//
+//   Layer A — sweep observability via withTaskRun:
+//     The whole drain runs inside withTaskRun(env, orgId,
+//     'embed_retry_drain', ...). One task_runs row per sweep with
+//     structured counts (items_processed, items_failed, items_skipped)
+//     plus metadata { succeeded, stale_reset, budget_skipped } for
+//     System Status reads. Heartbeat every HEARTBEAT_EVERY_N_ROWS
+//     items keeps the watchdog (Phase 1.1) from reaping a long drain.
+//
+//   Layer B — per-item BGE budget gating via checkBudget:
+//     Before each embedSingleItem call, checkBudget('bge', 'per_second')
+//     reads the upstream_budget_ledger. circuit_open → hard skip the
+//     row (counts as items_skipped; row stays pending; next tick
+//     retries when circuit closes). over_cap is treated as 'ok' here
+//     because acquireEmbedSlot inside bgeWithTimeout already handles
+//     the per-second wait via exponential backoff — only circuit_open
+//     is a meaningful hard skip at this layer. recordUsage on success;
+//     recordRateLimit on 429-style errors so the auto-tune-down rule
+//     (3 consecutive 429s → cap drops 10%, circuit opens 30 min) fires.
+//
+// Existing per-row state machine preserved exactly: status='in_progress'
+// lock during processing, attempts counter, failed_permanent at 3
+// attempts. All UPDATEs single-statement.
 export async function processEmbedRetryQueue(
   orgId: string,
   env: Env
@@ -673,77 +700,148 @@ export async function processEmbedRetryQueue(
   const MAX_PER_RUN = 200;
   const MAX_ATTEMPTS = 3;
   const STALE_AFTER_MINUTES = 10;
+  const HEARTBEAT_EVERY_N_ROWS = 25;
 
-  // Reset rows stuck in 'in_progress' from a prior drain that died mid-flight
-  // (Worker isolate eviction, ungraceful shutdown, or external script crash).
-  // Without this, a stalled row stays in_progress forever and never retries.
-  // STALE_AFTER_MINUTES gives a healthy drain plenty of time to finish a row;
-  // anything beyond that is genuinely stuck.
-  const staleReset = await env.D1.prepare(
-    `UPDATE embed_retry_queue
-        SET status = 'pending'
-      WHERE org_id = ?
-        AND status = 'in_progress'
-        AND (last_attempt_at IS NULL
-             OR last_attempt_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?))`
-  ).bind(orgId, `-${STALE_AFTER_MINUTES} minutes`).run();
-  const stale_reset = staleReset.meta.changes ?? 0;
-  if (stale_reset > 0) {
-    console.log(`[embed-retry-queue] reset ${stale_reset} stale in_progress rows for org ${orgId}`);
-  }
-
-  const queued = await env.D1.prepare(
-    `SELECT id, entity_id, source_table, attempts
-       FROM embed_retry_queue
-      WHERE org_id = ? AND status = 'pending' AND attempts < ?
-      ORDER BY created_at ASC
-      LIMIT ?`
-  ).bind(orgId, MAX_ATTEMPTS, MAX_PER_RUN).all<{
-    id: string; entity_id: string; source_table: string; attempts: number;
-  }>();
-
-  if (queued.results.length === 0) return { processed: 0, succeeded: 0, failed: 0, stale_reset };
-
-  let succeeded = 0;
-  let failed = 0;
-
-  for (const item of queued.results) {
-    await env.D1.prepare(
-      `UPDATE embed_retry_queue
-          SET status = 'in_progress',
-              attempts = attempts + 1,
-              last_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ?`
-    ).bind(item.id).run();
-
-    try {
-      const ok = await embedSingleItem(item.entity_id, item.source_table, orgId, env);
-      if (ok === 'missing') {
-        // Source row was deleted between enqueue and retry — clean up.
-        await env.D1.prepare(`DELETE FROM embed_retry_queue WHERE id = ?`).bind(item.id).run();
-      } else {
-        await env.D1.prepare(`DELETE FROM embed_retry_queue WHERE id = ?`).bind(item.id).run();
-        succeeded += 1;
+  const result = await withTaskRun<{ processed: number; succeeded: number; failed: number; stale_reset: number }>(
+    env,
+    orgId,
+    'embed_retry_drain',
+    async (ctx) => {
+      // Reset rows stuck in 'in_progress' from a prior drain that died mid-flight
+      // (Worker isolate eviction, ungraceful shutdown, or external script crash).
+      // Without this, a stalled row stays in_progress forever and never retries.
+      // STALE_AFTER_MINUTES gives a healthy drain plenty of time to finish a row;
+      // anything beyond that is genuinely stuck.
+      const staleReset = await env.D1.prepare(
+        `UPDATE embed_retry_queue
+            SET status = 'pending'
+          WHERE org_id = ?
+            AND status = 'in_progress'
+            AND (last_attempt_at IS NULL
+                 OR last_attempt_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?))`
+      ).bind(orgId, `-${STALE_AFTER_MINUTES} minutes`).run();
+      const stale_reset = staleReset.meta.changes ?? 0;
+      if (stale_reset > 0) {
+        console.log(`[embed-retry-queue] reset ${stale_reset} stale in_progress rows for org ${orgId}`);
       }
-    } catch (e: any) {
-      const errMsg = String(e?.message || e).slice(0, 500);
-      const newAttempts = item.attempts + 1;
-      const newStatus = newAttempts >= MAX_ATTEMPTS ? 'failed_permanent' : 'pending';
-      await env.D1.prepare(
-        `UPDATE embed_retry_queue SET status = ?, last_error = ? WHERE id = ?`
-      ).bind(newStatus, errMsg, item.id).run();
-      failed += 1;
+
+      const queued = await env.D1.prepare(
+        `SELECT id, entity_id, source_table, attempts
+           FROM embed_retry_queue
+          WHERE org_id = ? AND status = 'pending' AND attempts < ?
+          ORDER BY created_at ASC
+          LIMIT ?`
+      ).bind(orgId, MAX_ATTEMPTS, MAX_PER_RUN).all<{
+        id: string; entity_id: string; source_table: string; attempts: number;
+      }>();
+
+      if (queued.results.length === 0) {
+        ctx.report({ metadata: { stale_reset, succeeded: 0, budget_skipped: 0 } });
+        return { processed: 0, succeeded: 0, failed: 0, stale_reset };
+      }
+
+      let succeeded = 0;
+      let failed = 0;
+      let budget_skipped = 0;
+      let processedSinceHeartbeat = 0;
+
+      for (const item of queued.results) {
+        processedSinceHeartbeat++;
+        if (processedSinceHeartbeat >= HEARTBEAT_EVERY_N_ROWS) {
+          await ctx.heartbeat();
+          processedSinceHeartbeat = 0;
+        }
+
+        // Layer B: budget gate. acquireEmbedSlot inside bgeWithTimeout
+        // already handles per-second pacing for over_cap via backoff; only
+        // circuit_open is a hard skip here. The row stays pending — next
+        // tick will retry when the circuit closes (30 min default).
+        const budget = await checkBudget(env, orgId, null, 'bge', 'per_second');
+        if (budget.decision === 'circuit_open') {
+          budget_skipped++;
+          console.log(
+            `[embed-retry-queue] BGE circuit open until ${budget.circuit_open_until} — skipping ${item.id}; will retry next tick`
+          );
+          continue;
+        }
+
+        await env.D1.prepare(
+          `UPDATE embed_retry_queue
+              SET status = 'in_progress',
+                  attempts = attempts + 1,
+                  last_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?`
+        ).bind(item.id).run();
+
+        try {
+          const ok = await embedSingleItem(item.entity_id, item.source_table, orgId, env);
+          // Record usage on every BGE call attempt that didn't throw —
+          // bgeWithTimeout fired the actual embedding API, so the per-
+          // second bucket bumps regardless of whether the source row
+          // turned out 'missing' (deleted before retry) or genuinely
+          // 'embedded' / 'skipped'. Conservative attribution.
+          await recordUsage(env, orgId, null, 'bge', 'per_second');
+          if (ok === 'missing') {
+            // Source row was deleted between enqueue and retry — clean up.
+            await env.D1.prepare(`DELETE FROM embed_retry_queue WHERE id = ?`).bind(item.id).run();
+          } else {
+            await env.D1.prepare(`DELETE FROM embed_retry_queue WHERE id = ?`).bind(item.id).run();
+            succeeded += 1;
+          }
+        } catch (e: any) {
+          const errMsg = String(e?.message || e).slice(0, 500);
+          // Detect rate-limit-shaped errors so the ledger's circuit-
+          // breaker auto-tune-down learns. EMBED_RATE_LIMIT_TIMEOUT is
+          // thrown by acquireEmbedSlot when the per-second slot waits
+          // >30s; HTTP 429 / 'rate_limit' surface from CF Workers AI
+          // when BGE itself is overloaded. Either signal counts as a
+          // 429 against the bucket.
+          if (
+            errMsg.includes('EMBED_RATE_LIMIT_TIMEOUT') ||
+            errMsg.includes('429') ||
+            errMsg.includes('rate_limit')
+          ) {
+            await recordRateLimit(env, orgId, null, 'bge', 'per_second');
+          }
+          const newAttempts = item.attempts + 1;
+          const newStatus = newAttempts >= MAX_ATTEMPTS ? 'failed_permanent' : 'pending';
+          await env.D1.prepare(
+            `UPDATE embed_retry_queue SET status = ?, last_error = ? WHERE id = ?`
+          ).bind(newStatus, errMsg, item.id).run();
+          failed += 1;
+        }
+
+        // 100ms pacing — the limiter handles cross-org pacing, this just keeps
+        // a single drain from monopolizing the BGE slot.
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      console.log(
+        `[embed-retry-queue] org=${orgId} processed=${queued.results.length} succeeded=${succeeded} failed=${failed} budget_skipped=${budget_skipped}`
+      );
+
+      ctx.report({
+        items_processed: queued.results.length,
+        items_failed: failed,
+        items_skipped: budget_skipped,
+        metadata: { succeeded, stale_reset, budget_skipped },
+      });
+
+      return {
+        processed: queued.results.length,
+        succeeded,
+        failed,
+        stale_reset,
+      };
     }
-
-    // 100ms pacing — the limiter handles cross-org pacing, this just keeps
-    // a single drain from monopolizing the BGE slot.
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-
-  console.log(
-    `[embed-retry-queue] org=${orgId} processed=${queued.results.length} succeeded=${succeeded} failed=${failed}`
   );
-  return { processed: queued.results.length, succeeded, failed, stale_reset };
+
+  // Fallback when withTaskRun returned null (openTaskRun's D1 INSERT
+  // failed, or — vanishingly rare — an idempotency collision happened).
+  // Caller (cron try/catch + admin endpoint) is unaffected; the next
+  // tick re-runs and converges. Returning zero counts preserves the
+  // existing return-shape contract.
+  return result ?? { processed: 0, succeeded: 0, failed: 0, stale_reset: 0 };
 }
 
 // Re-embed a single item from its source table. Returns:

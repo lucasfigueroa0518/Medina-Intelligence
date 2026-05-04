@@ -1,10 +1,29 @@
 // GET /api/settings/system-status — single endpoint feeding the System Status
 // tab in Settings. All numbers come from direct D1 queries; no KV counters,
-// no estimates. Three sections in one response so the UI does one fetch.
+// no estimates.
+//
+// Phase 1 (2026-05-04) extension: response now also includes the Phase 0
+// observability surface — pipelines (per-task last-run + 24h roll-up),
+// dead_letter (failed_permanent + failed_24h items needing review),
+// stuck_runs (running task_runs with stale heartbeats — watchdog input),
+// and budgets (upstream-API utilization + circuit state). The four new
+// fields are sourced from getSystemStatusSnapshot in src/lib/system-status,
+// which itself fans out 4 D1 reads in parallel. Net cost grows from 10 to
+// 14 reads per call — all indexed, all bounded.
+//
+// Existing fields (active_tasks, run_history, completeness) are unchanged
+// — the UI keeps rendering them; new sections are additive.
 
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse } from './utils';
+import {
+  getSystemStatusSnapshot,
+  type PipelineHealthRow,
+  type DeadLetterRow,
+  type StuckTaskRunRow,
+  type BudgetSnapshotRow,
+} from '../lib/system-status';
 
 export interface SystemStatusActiveTask {
   type: string;                  // human-readable
@@ -45,6 +64,11 @@ export interface SystemStatusResponse {
     meeting_attendees: CompletenessMetric;
     connected_users: CompletenessMetric & { names_missing: string[] };
   };
+  // Phase 1 additions — observability surface from Phase 0 helpers.
+  pipelines: PipelineHealthRow[];
+  dead_letter: DeadLetterRow[];
+  stuck_runs: StuckTaskRunRow[];
+  budgets: BudgetSnapshotRow[];
   generated_at: string;
 }
 
@@ -135,15 +159,18 @@ export async function getSystemStatus(
     };
   });
 
-  // ── Completeness metrics: 10 D1 aggregates parallelized ─────────────────
-  // Each metric is a (current, total) pair from a single COUNT or pair of
-  // COUNTs. No estimation, no fallbacks.
+  // ── Completeness metrics + Phase 0 observability snapshot ─────────────
+  // Each completeness metric is a (current, total) pair from a single
+  // COUNT or pair of COUNTs. No estimation, no fallbacks.
+  // The snapshot adds 4 D1 reads (its own internal Promise.all) for the
+  // Phase 1 pipelines/dead_letter/stuck_runs/budgets sections.
   const [
     convoTotalRow, convoEmbeddedRow, convoLinkedRow,
     contactRow,
     companyRow,
     eventTotalRow, eventEmbeddedRow, attendeeRow,
     userRow, userMissingRows,
+    snapshot,
   ] = await Promise.all([
     // conversations table has no deleted_at column (verified against live
     // schema). All conversations rows are considered live.
@@ -187,6 +214,9 @@ export async function getSystemStatus(
         WHERE org_id = ? AND outlook_token IS NULL AND deleted_at IS NULL
         ORDER BY full_name`
     ).bind(orgId).all<{ full_name: string | null; email: string }>(),
+    // Phase 1: observability surface. Returns
+    // { pipelines, dead_letter, stuck_runs, budgets, generated_at }.
+    getSystemStatusSnapshot(env, orgId),
   ]);
 
   const completeness: SystemStatusResponse['completeness'] = {
@@ -209,6 +239,10 @@ export async function getSystemStatus(
     active_tasks,
     run_history,
     completeness,
+    pipelines: snapshot.pipelines,
+    dead_letter: snapshot.dead_letter,
+    stuck_runs: snapshot.stuck_runs,
+    budgets: snapshot.budgets,
     generated_at: new Date().toISOString(),
   } satisfies SystemStatusResponse);
 }

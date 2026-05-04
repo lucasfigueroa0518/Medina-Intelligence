@@ -881,6 +881,24 @@ async function handleScheduled(
             console.error(`hourly refresh: refreshStaleIntelligence failed for ${org.id}:`, e);
           }
         })());
+        // Phase 1 (2026-05-04): workflow-state reconciler. Polls CF
+        // Workflows REST API for stale running sync_jobs rows that have
+        // a captured cf_instance_id (currently ingestion-workflow only)
+        // and reconciles D1 to runtime truth — closes the orphan-row
+        // gap Terminal 5 caught where CF runtime errors a workflow with
+        // a hard error before user code can write closure. The
+        // reconciler self-wraps in withTaskRun (Phase 0); this caller
+        // just kicks it off as a sibling waitUntil so it gets its own
+        // ~30s wallclock allocation alongside the other hourly self-
+        // heal blocks. Per-tick subreq cost: ≤50 sync_jobs reads × ≤50
+        // CF API calls × ≤50 D1 UPDATEs + 1 task_runs row, well under
+        // any cap. Steady-state with the system healthy: no-op task_run
+        // with items_processed=0.
+        ctxExec.waitUntil((async () => {
+          const { reconcileWorkflowState } = await import('./lib/workflow-state-reconciler');
+          try { await reconcileWorkflowState(org.id, env); }
+          catch (e) { console.error(`hourly self-heal: reconcileWorkflowState failed for ${org.id}:`, e); }
+        })());
       } else if (cron === '5 * * * *') {
         // Enrichment
         await env.ENRICHMENT_WORKFLOW.create({
