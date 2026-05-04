@@ -37,6 +37,7 @@ import * as Users from './handlers/users';
 import * as Integrations from './handlers/integrations';
 import * as SystemStatusHandler from './handlers/system-status';
 import * as Backfill from './handlers/backfill';
+import * as FireflyCredentials from './handlers/firefly-credentials';
 
 import { handleAuditBatch } from './workers/audit-consumer';
 import { handleWebhookBatch } from './workers/webhook-consumer';
@@ -752,6 +753,17 @@ async function routeAuthenticated(
     return SystemStatusHandler.getSystemStatus(ctx, env);
   if (path === '/api/integrations/firefly/webhook-secret' && method === 'GET')
     return Integrations.getFireflyWebhookSecret(ctx, env);
+
+  // --- Settings → Firefly credential self-service (Phase 4 1b 2026-05-04) ---
+  // Auth-gated to caller's own user_id via ctx.userId — no admin override.
+  // Plaintext only flows IN (POST body); GET/DELETE responses contain
+  // metadata only.
+  if (path === '/api/settings/firefly-credentials' && method === 'POST')
+    return FireflyCredentials.storeMyFireflyCredential(request, ctx, env);
+  if (path === '/api/settings/firefly-credentials' && method === 'GET')
+    return FireflyCredentials.getMyFireflyCredential(request, ctx, env);
+  if (path === '/api/settings/firefly-credentials' && method === 'DELETE')
+    return FireflyCredentials.revokeMyFireflyCredential(request, ctx, env);
 
   // --- Imports ---
   if (path === '/api/imports/intelligent' && method === 'POST') {

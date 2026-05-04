@@ -843,7 +843,11 @@ function ProgressiveDateRangeModal({
 // Fireflies recovery in this wave, is Outlook-connected, so this list is a
 // fine proxy for "active org users" without adding a new backend endpoint.
 
-const FIREFLY_PROGRESSIVE_DAYS_OPTIONS: Array<30 | 60 | 90 | 180> = [30, 60, 90, 180];
+// Phase 4 1c (2026-05-04): dropped 180 — backend MAX_BACKFILL_DAYS is now
+// 120 (src/lib/firefly-progressive-backfill.ts); a 180-day request would
+// be rejected. Custom Date Range is the escape hatch for >90-day windows
+// up to the 120-day cap.
+const FIREFLY_PROGRESSIVE_DAYS_OPTIONS: Array<30 | 60 | 90> = [30, 60, 90];
 
 function FireflyHistoricalBackfillSection() {
   const [me, setMe] = React.useState<UserProfile | null>(null);
@@ -855,12 +859,28 @@ function FireflyHistoricalBackfillSection() {
     parent: any | null;
     windows: any[];
   } | null>(null);
-  const [days, setDays] = React.useState<30 | 60 | 90 | 180>(90);
+  const [days, setDays] = React.useState<30 | 60 | 90>(90);
   const [triggerOpen, setTriggerOpen] = React.useState(false);
   const [dateRangeOpen, setDateRangeOpen] = React.useState(false);
   const [cancelConfirmOpen, setCancelConfirmOpen] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [toast, setToast] = React.useState<string | null>(null);
+
+  // Phase 4 1c (2026-05-04): persistent credential state. Drives the
+  // Credentials sub-section UI and the disabled-state of all backfill
+  // buttons. Credential ownership is per-user — only the caller's own
+  // credential is queryable from here (backend auth-gates ctx.userId).
+  const [credStatus, setCredStatus] = React.useState<{
+    exists: boolean;
+    rotation_count: number;
+    last_used_at: string | null;
+    updated_at: string | null;
+  } | null>(null);
+  const [credLoading, setCredLoading] = React.useState(false);
+  const [credInput, setCredInput] = React.useState('');
+  const [credShowKey, setCredShowKey] = React.useState(false);
+  const [credEditOpen, setCredEditOpen] = React.useState(false);
+  const [credRevokeConfirmOpen, setCredRevokeConfirmOpen] = React.useState(false);
 
   const isOwner = me?.role === 'owner' || me?.role === 'super_admin';
 
@@ -901,13 +921,60 @@ function FireflyHistoricalBackfillSection() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  async function startDaysBackfill(daysBack: 30 | 60 | 90 | 180, fireflyApiKey: string) {
+  // Phase 4 1c: load persistent credential status on mount. Refresh after
+  // any credential mutation (save/rotate/revoke) so the UI's enabled-state
+  // and "rotated N times" text stay in sync.
+  const fetchCredStatus = React.useCallback(async () => {
+    try {
+      const r = await api.getMyFireflyCredential();
+      setCredStatus({
+        exists: r.status.exists,
+        rotation_count: r.status.rotation_count,
+        last_used_at: r.status.last_used_at,
+        updated_at: r.status.updated_at,
+      });
+    } catch { /* leave null — UI treats null as "loading" */ }
+  }, []);
+  React.useEffect(() => { fetchCredStatus(); }, [fetchCredStatus]);
+
+  async function saveCredential() {
+    const trimmed = credInput.trim();
+    if (!trimmed) { setToast('API key is required'); return; }
+    setCredLoading(true);
+    try {
+      const r = await api.storeMyFireflyCredential(trimmed);
+      setCredInput('');
+      setCredEditOpen(false);
+      setToast(r.stored === 'created' ? 'API key saved' : 'API key rotated');
+      await fetchCredStatus();
+    } catch (e: any) {
+      setToast(`Save failed: ${e?.message || 'unknown'}`);
+    }
+    setCredLoading(false);
+  }
+
+  async function revokeCredential() {
+    setCredLoading(true);
+    setCredRevokeConfirmOpen(false);
+    try {
+      await api.revokeMyFireflyCredential();
+      setToast('API key revoked');
+      await fetchCredStatus();
+    } catch (e: any) {
+      setToast(`Revoke failed: ${e?.message || 'unknown'}`);
+    }
+    setCredLoading(false);
+  }
+
+  // Phase 4 1c: fireflies_api_key is no longer collected per-trigger.
+  // Backend driver resolves the persistent credential row written by
+  // saveCredential above. Buttons disable when credStatus.exists is false.
+  async function startDaysBackfill(daysBack: 30 | 60 | 90) {
     if (!selectedUserId) return;
     setLoading(true);
     try {
       await api.startFireflyProgressiveBackfill({
         user_id: selectedUserId,
-        fireflies_api_key: fireflyApiKey,
         days_back: daysBack,
       });
       setTriggerOpen(false);
@@ -990,20 +1057,149 @@ function FireflyHistoricalBackfillSection() {
         </div>
       )}
 
+      {/* Phase 4 1c (2026-05-04): Credentials sub-section. Folded INTO
+          this card so the API key + the buttons that need it live
+          together, eliminating the prior dual-source-of-truth UX
+          (modals asking for a key the backend already has). */}
+      <div className="mb-4 rounded-lg p-3" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
+        <div className="flex items-center justify-between gap-3 mb-2">
+          <div className="text-xs font-medium text-text-secondary uppercase tracking-wide">Fireflies API key</div>
+          {credStatus?.exists && (
+            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold"
+              style={{ background: 'rgba(34,197,94,0.15)', color: '#86EFAC' }}>
+              SAVED
+            </span>
+          )}
+        </div>
+        {credStatus === null ? (
+          <div className="text-xs text-text-muted">Checking credential…</div>
+        ) : credStatus.exists ? (
+          <div>
+            <div className="text-xs text-text-secondary">
+              {credStatus.rotation_count > 0
+                ? `Rotated ${credStatus.rotation_count}× since first set.`
+                : 'Stored — encrypted at rest, used automatically by every backfill below.'}
+              {credStatus.last_used_at && (
+                <> Last used {new Date(credStatus.last_used_at).toISOString().slice(0, 10)}.</>
+              )}
+            </div>
+            <div className="flex gap-2 mt-2">
+              <button
+                onClick={() => { setCredInput(''); setCredEditOpen(true); }}
+                disabled={credLoading}
+                className="btn-ghost text-xs py-1.5"
+              >
+                Rotate
+              </button>
+              <button
+                onClick={() => setCredRevokeConfirmOpen(true)}
+                disabled={credLoading}
+                className="btn-ghost text-xs py-1.5 text-red-400 hover:text-red-300"
+              >
+                Revoke
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <div className="text-xs text-text-secondary mb-2">
+              Set once and reuse for every backfill. Encrypted at rest (AES-256-GCM); plaintext
+              never returned by any API. Get yours at <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span>.
+            </div>
+            {credEditOpen ? (
+              <div>
+                <div className="flex gap-2">
+                  <input
+                    type={credShowKey ? 'text' : 'password'}
+                    value={credInput}
+                    onChange={e => setCredInput(e.target.value)}
+                    placeholder="paste here"
+                    className="input text-sm py-1.5 px-3 flex-1 font-mono"
+                    autoFocus
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setCredShowKey(s => !s)}
+                    className="btn-ghost text-xs py-1.5 px-3"
+                  >
+                    {credShowKey ? 'Hide' : 'Show'}
+                  </button>
+                </div>
+                <div className="flex gap-2 mt-2">
+                  <button onClick={saveCredential} disabled={credLoading} className="btn-primary text-xs py-1.5">
+                    {credLoading ? 'Saving…' : 'Save key'}
+                  </button>
+                  <button onClick={() => { setCredEditOpen(false); setCredInput(''); }} disabled={credLoading} className="btn-ghost text-xs py-1.5">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => { setCredInput(''); setCredEditOpen(true); }}
+                className="btn-primary text-xs py-1.5"
+              >
+                Set up API key
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Rotate flow when credential already exists — shows the same input
+          but submits as a rotation rather than a fresh save. */}
+      {credEditOpen && credStatus?.exists && (
+        <div className="mb-4 rounded-lg p-3" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(139,92,246,0.3)' }}>
+          <div className="text-xs font-medium text-text-secondary uppercase tracking-wide mb-2">Rotate API key</div>
+          <div className="flex gap-2">
+            <input
+              type={credShowKey ? 'text' : 'password'}
+              value={credInput}
+              onChange={e => setCredInput(e.target.value)}
+              placeholder="paste new key"
+              className="input text-sm py-1.5 px-3 flex-1 font-mono"
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button
+              type="button"
+              onClick={() => setCredShowKey(s => !s)}
+              className="btn-ghost text-xs py-1.5 px-3"
+            >
+              {credShowKey ? 'Hide' : 'Show'}
+            </button>
+          </div>
+          <div className="flex gap-2 mt-2">
+            <button onClick={saveCredential} disabled={credLoading} className="btn-primary text-xs py-1.5">
+              {credLoading ? 'Rotating…' : 'Rotate'}
+            </button>
+            <button onClick={() => { setCredEditOpen(false); setCredInput(''); }} disabled={credLoading} className="btn-ghost text-xs py-1.5">
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {isIdle && (
         <div>
           <div className="text-xs text-text-secondary mb-3">
             Pull historical Fireflies meetings in the background. Runs server-side in
             10-day windows. Survives page refresh, paces itself across cron ticks.
-            Requires the user's Fireflies API key (one-time, encrypted, nuked at
-            completion).
+            {!credStatus?.exists && (
+              <span className="block mt-1 text-text-muted">
+                Save your API key above to enable backfills.
+              </span>
+            )}
           </div>
           <div className="flex flex-wrap gap-2">
             {FIREFLY_PROGRESSIVE_DAYS_OPTIONS.map(d => (
               <button
                 key={d}
                 onClick={() => { setDays(d); setTriggerOpen(true); }}
-                disabled={loading}
+                disabled={loading || !credStatus?.exists}
                 className="btn-secondary text-xs py-1.5 flex items-center gap-2"
               >
                 <Mic size={13} /> Last {d} days
@@ -1011,7 +1207,7 @@ function FireflyHistoricalBackfillSection() {
             ))}
             <button
               onClick={() => setDateRangeOpen(true)}
-              disabled={loading}
+              disabled={loading || !credStatus?.exists}
               className="btn-secondary text-xs py-1.5 flex items-center gap-2"
             >
               <Calendar size={13} /> Custom Date Range
@@ -1081,16 +1277,16 @@ function FireflyHistoricalBackfillSection() {
         </div>
       )}
 
-      {/* Trigger modal — pill-strip path passes days, Custom path passes
-          start/end dates. Both share the API key + submit handler via the
-          same modal component to keep the API-key UX consistent. */}
+      {/* Trigger modals — Phase 4 1c: API key is resolved server-side from
+          the persistent credential row. Modals are now confirmation-only;
+          neither collects a key. */}
       {triggerOpen && (
         <FireflyTriggerModal
           days={days}
           targetUserLabel={targetUserLabel}
           loading={loading}
           onClose={() => setTriggerOpen(false)}
-          onSubmit={(apiKey) => startDaysBackfill(days, apiKey)}
+          onSubmit={() => startDaysBackfill(days)}
         />
       )}
 
@@ -1107,6 +1303,31 @@ function FireflyHistoricalBackfillSection() {
         />
       )}
 
+      {credRevokeConfirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
+          onClick={() => setCredRevokeConfirmOpen(false)}>
+          <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
+            style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
+            onClick={e => e.stopPropagation()}>
+            <div className="text-lg font-medium text-text-primary mb-2">Revoke saved API key?</div>
+            <div className="text-sm text-text-secondary mb-4">
+              The encrypted key will be deleted from the server. Future backfills will
+              be disabled until you save a new key. Already-ingested transcripts are
+              kept. Any in-flight backfill will fail at its next window tick.
+            </div>
+            <div className="flex justify-end gap-3">
+              <button className="btn-ghost" onClick={() => setCredRevokeConfirmOpen(false)}>Keep saved</button>
+              <button className="btn-primary" disabled={credLoading}
+                style={{ background: '#DC2626', borderColor: '#DC2626' }}
+                onClick={revokeCredential}>
+                {credLoading ? 'Revoking…' : 'Revoke key'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {cancelConfirmOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
           style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
@@ -1117,9 +1338,8 @@ function FireflyHistoricalBackfillSection() {
             <div className="text-lg font-medium text-text-primary mb-2">Cancel the backfill?</div>
             <div className="text-sm text-text-secondary mb-4">
               Transcripts already ingested will be kept. Pending and in-progress
-              windows will be marked failed and the encrypted API key will be wiped.
-              You'll need to start a new backfill from scratch (and re-enter the
-              API key) to resume.
+              windows will be marked failed. Your saved API key stays put — you
+              can start a new backfill any time without re-entering it.
             </div>
             <div className="flex justify-end gap-3">
               <button className="btn-ghost" onClick={() => setCancelConfirmOpen(false)}>Keep running</button>
@@ -1143,6 +1363,10 @@ function FireflyHistoricalBackfillSection() {
   );
 }
 
+// Phase 4 1c (2026-05-04): API key input removed — backend resolves the
+// persistent credential row from user_firefly_credentials. Modal is now
+// purely a confirmation surface so the user gets one explicit "yes start
+// it" beat before committing the windowed work.
 function FireflyTriggerModal({
   days,
   targetUserLabel,
@@ -1150,30 +1374,12 @@ function FireflyTriggerModal({
   onClose,
   onSubmit,
 }: {
-  days: 30 | 60 | 90 | 180;
+  days: 30 | 60 | 90;
   targetUserLabel: string;
   loading: boolean;
   onClose: () => void;
-  onSubmit: (apiKey: string) => void;
+  onSubmit: () => void;
 }) {
-  const [apiKey, setApiKey] = React.useState('');
-  const [showKey, setShowKey] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-
-  function submit() {
-    setError(null);
-    const trimmed = apiKey.trim();
-    if (!trimmed) {
-      setError('Fireflies API key is required');
-      return;
-    }
-    // Pass the key up; clear local state immediately so the typed secret
-    // doesn't linger in the closed modal's component memory if the parent
-    // re-opens it.
-    onSubmit(trimmed);
-    setApiKey('');
-  }
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
       style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)' }}
@@ -1186,38 +1392,12 @@ function FireflyTriggerModal({
           Pull last <strong>{days}</strong> days of meetings for <strong>{targetUserLabel}</strong>.
           Runs in 10-day windows, server-side. No need to keep this tab open.
         </div>
-
-        <div className="mb-4">
-          <div className="text-xs text-text-muted mb-1">Fireflies API Key</div>
-          <div className="flex gap-2">
-            <input
-              type={showKey ? 'text' : 'password'}
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              placeholder="paste here"
-              className="input text-sm py-1.5 px-3 flex-1 font-mono"
-              autoFocus
-              autoComplete="off"
-              spellCheck={false}
-            />
-            <button
-              type="button"
-              onClick={() => setShowKey(s => !s)}
-              className="btn-ghost text-xs py-1.5 px-3"
-            >
-              {showKey ? 'Hide' : 'Show'}
-            </button>
-          </div>
-          <div className="text-[10px] text-text-muted mt-1.5">
-            Encrypted server-side and used only for this backfill, then wiped when it
-            completes or is cancelled. Get yours at <span className="text-text-secondary">app.fireflies.ai → Settings → Developer settings</span>.
-          </div>
+        <div className="text-xs text-text-muted mb-4">
+          Uses the saved Fireflies API key — no need to re-enter it.
         </div>
-
-        {error && <div className="text-xs text-red-400 mb-3">{error}</div>}
         <div className="flex justify-end gap-3">
           <button className="btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn-primary" disabled={loading} onClick={submit}>
+          <button className="btn-primary" disabled={loading} onClick={onSubmit}>
             {loading ? 'Starting...' : 'Start backfill'}
           </button>
         </div>
@@ -1226,6 +1406,8 @@ function FireflyTriggerModal({
   );
 }
 
+// Phase 4 1c (2026-05-04): API key input removed — backend resolves the
+// persistent credential row from user_firefly_credentials.
 function FireflyDateRangeModal({
   targetUserId,
   targetUserLabel,
@@ -1239,26 +1421,20 @@ function FireflyDateRangeModal({
 }) {
   const [startDate, setStartDate] = React.useState('');
   const [endDate, setEndDate] = React.useState('');
-  const [apiKey, setApiKey] = React.useState('');
-  const [showKey, setShowKey] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
   async function submit() {
     setError(null);
     if (!startDate || !endDate) { setError('Both dates are required'); return; }
-    const trimmedKey = apiKey.trim();
-    if (!trimmedKey) { setError('Fireflies API key is required'); return; }
     if (!targetUserId) { setError('No target user selected'); return; }
     setLoading(true);
     try {
       await api.startFireflyProgressiveBackfill({
         user_id: targetUserId,
-        fireflies_api_key: trimmedKey,
         start_date: new Date(startDate).toISOString(),
         end_date: new Date(endDate).toISOString(),
       });
-      setApiKey('');
       onStarted();
     } catch (e: any) {
       setError(e?.message || 'Failed to start');
@@ -1288,30 +1464,9 @@ function FireflyDateRangeModal({
             <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
               className="input text-sm w-full" />
           </div>
-          <div>
-            <div className="text-xs text-text-muted mb-1">Fireflies API Key</div>
-            <div className="flex gap-2">
-              <input
-                type={showKey ? 'text' : 'password'}
-                value={apiKey}
-                onChange={e => setApiKey(e.target.value)}
-                placeholder="paste here"
-                className="input text-sm py-1.5 px-3 flex-1 font-mono"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <button
-                type="button"
-                onClick={() => setShowKey(s => !s)}
-                className="btn-ghost text-xs py-1.5 px-3"
-              >
-                {showKey ? 'Hide' : 'Show'}
-              </button>
-            </div>
-            <div className="text-[10px] text-text-muted mt-1.5">
-              Encrypted and wiped at completion.
-            </div>
-          </div>
+        </div>
+        <div className="text-xs text-text-muted mb-4">
+          Uses the saved Fireflies API key — no need to re-enter it.
         </div>
         {error && <div className="text-xs text-red-400 mb-3">{error}</div>}
         <div className="flex justify-end gap-3">
