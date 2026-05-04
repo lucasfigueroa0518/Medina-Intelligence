@@ -7,10 +7,6 @@ import type { Env } from '../types/env';
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { invalidateRagCache } from '../lib/cache';
 import { reconcileOrphanContacts } from '../lib/contact-reconciliation';
-import { calculateAllRelationshipStatuses } from '../lib/relationship-status';
-import { calculateAllRelationshipOwners } from '../lib/relationship-owner';
-import { analyzeAllCommsPatterns } from '../lib/communication-patterns';
-import { recalculateAllAssociations } from '../lib/associations';
 import { emitAudit } from '../lib/audit';
 import { trackedStep } from '../lib/workflow-telemetry';
 
@@ -159,73 +155,32 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
         }
       );
 
-      // Audit 2026-04-28 root cause: the four calcs below previously ran in
-      // a single step.do() with no timeout and hit CF's default ~600s ceiling
-      // (job ac3d22bc). Each is now its own step with its own 300s budget and
-      // independent retry, so a slow/failed calc no longer blocks the others.
-      await trackedStep(
-        this.env,
-        step,
-        sync_job_id,
-        'calc-relationship-status',
-        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
-        async () => {
-          try {
-            const c = await calculateAllRelationshipStatuses(org_id, this.env);
-            console.log(`[IngestionFinalizerWorkflow] relationship statuses updated: ${c}`);
-          } catch (e) {
-            console.error('[IngestionFinalizerWorkflow] relationship-status calc failed:', errMessage(e));
-          }
-        }
-      );
-
-      await trackedStep(
-        this.env,
-        step,
-        sync_job_id,
-        'calc-contact-owners',
-        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
-        async () => {
-          try {
-            const c = await calculateAllRelationshipOwners(org_id, this.env);
-            console.log(`[IngestionFinalizerWorkflow] relationship owners updated: ${c}`);
-          } catch (e) {
-            console.error('[IngestionFinalizerWorkflow] relationship-owner calc failed:', errMessage(e));
-          }
-        }
-      );
-
-      await trackedStep(
-        this.env,
-        step,
-        sync_job_id,
-        'calc-comms-patterns',
-        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
-        async () => {
-          try {
-            const c = await analyzeAllCommsPatterns(org_id, this.env);
-            console.log(`[IngestionFinalizerWorkflow] comms patterns analyzed: ${c}`);
-          } catch (e) {
-            console.error('[IngestionFinalizerWorkflow] comms-patterns calc failed:', errMessage(e));
-          }
-        }
-      );
-
-      await trackedStep(
-        this.env,
-        step,
-        sync_job_id,
-        'calc-associations',
-        { timeout: '600 seconds', retries: { limit: 1, delay: '10 seconds' } },
-        async () => {
-          try {
-            await recalculateAllAssociations(org_id, this.env);
-            console.log(`[IngestionFinalizerWorkflow] entity associations recalculated`);
-          } catch (e) {
-            console.error('[IngestionFinalizerWorkflow] associations calc failed:', errMessage(e));
-          }
-        }
-      );
+      // Phase 0a-4 (2026-05-04): the four heavy org-wide bulk calcs
+      // (relationship status, owners, comms patterns, associations) were
+      // removed from this finalizer and migrated to daily-cron.
+      //
+      // Why: Terminal 5 forensic 2026-05-04 confirmed the finalizer was
+      // consistently hitting the 1000-subrequest CF cap during these
+      // calcs. recalculateAllAssociations alone iterates 500 contacts ×
+      // ~10 association upserts each = ~5,000 D1 writes — cumulative
+      // across the four calcs the finalizer routinely exceeded the
+      // workflow's subreq budget. The cap-hit failed the finalizer
+      // before mark-job-completed could run, leaving sync_jobs orphaned
+      // in 'running'. The next ingestion's check-concurrency then
+      // marked the orphan with a misleading "Timed out or interrupted
+      // by deploy" string (a relic from when deploy interrupts were
+      // the only orphan source — see ingestion.ts:93 fix in this PR).
+      //
+      // recalculateAllAssociations was already called from daily-cron
+      // (line 55); the other three are added alongside it. Trade-off
+      // accepted: these recomputes go from "after every ingestion"
+      // (hourly) to "once per day" (24h cron). For background analytics
+      // — relationship statuses, owners, comms patterns, associations —
+      // that's fine. None feed user-facing realtime UI; they update
+      // slow-changing entity-level fields.
+      //
+      // Net: finalizer wallclock drops from 30+ min worst case to
+      // <5 min, and sync_jobs no longer gets stuck on calc-* failures.
 
       await trackedStep(
         this.env,

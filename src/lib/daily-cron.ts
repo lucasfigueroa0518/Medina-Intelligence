@@ -5,6 +5,9 @@ import { promoteToStandalone, flagStaleOrphanedEvents } from './reconciliation';
 import { triggerContactEnrichment, triggerCompanyEnrichment, isDomainShapedName } from './enrichment';
 import { checkClaudeRateLimit } from './rate-limit';
 import { recalculateAllAssociations } from './associations';
+import { calculateAllRelationshipStatuses } from './relationship-status';
+import { calculateAllRelationshipOwners } from './relationship-owner';
+import { analyzeAllCommsPatterns } from './communication-patterns';
 import { renewExpiringSubscriptions } from './graph-subscriptions';
 import { proposeMultipleUpdates } from './progressive-enrichment';
 import { callClaude } from './claude';
@@ -53,6 +56,14 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await promoteToStandalone(orgId, env); } catch (e) { console.error('Standalone promotion:', e); }
   try { await flagStaleOrphanedEvents(orgId, env); } catch (e) { console.error('Orphan flagging:', e); }
   try { await recalculateAllAssociations(orgId, env); } catch (e) { console.error('Association recalc:', e); }
+  // Phase 0a-4 (2026-05-04): three org-wide bulk calcs migrated from
+  // ingestion-finalizer to daily-cron after Terminal 5 confirmed the
+  // finalizer was hitting the 1000-subreq cap consistently. Each is
+  // wrapped in its own try/catch — partial failure of one calc does
+  // not poison the rest, matching the established daily-cron pattern.
+  try { await calculateAllRelationshipStatuses(orgId, env); } catch (e) { console.error('Relationship status calc:', e); }
+  try { await calculateAllRelationshipOwners(orgId, env); } catch (e) { console.error('Relationship owner calc:', e); }
+  try { await analyzeAllCommsPatterns(orgId, env); } catch (e) { console.error('Comms patterns calc:', e); }
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
   try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
   try { await backfillUnembeddedEntities(orgId, env); } catch (e) { console.error('Entity backfill:', e); }

@@ -88,9 +88,18 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       console.log('[IngestionWorkflow] step → check-concurrency');
       // No telemetry on this step — sync_jobs.id doesn't exist yet.
       const newJobId = await step.do('check-concurrency', async () => {
+        // Phase 0a-4 (2026-05-04): orphan reconciliation message updated.
+        // The prior "Timed out or interrupted by deploy" string was accurate
+        // only when deploy interrupts were the dominant orphan source. Since
+        // PR #38 widened the calendar window, the dominant cause has actually
+        // been the finalizer hitting the CF 1000-subrequest cap on its bulk-
+        // calc steps and dying before mark-job-completed ran (Terminal 5
+        // forensic 2026-05-04). The string masked that root cause for an
+        // unknown duration. Updated to communicate the real failure modes
+        // observed in production.
         await this.env.D1.prepare(
           `UPDATE sync_jobs SET status = 'failed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                 error_message = COALESCE(error_message, 'Timed out or interrupted by deploy')
+                 error_message = COALESCE(error_message, 'orphaned: workflow terminated without writing closure (likely finalizer subrequest cap or runtime error); auto-reconciled by next check-concurrency')
            WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'running'
              AND (timeout_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
                   OR started_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-15 minutes'))`
