@@ -28,7 +28,8 @@ export type Upstream =
   | 'anthropic_sonnet'
   | 'bge'
   | 'gemini'
-  | 'slack';
+  | 'slack'
+  | 'cloudflare_api';
 
 export type BudgetWindow = 'per_second' | 'minute' | 'ten_minute' | 'hourly' | 'daily';
 
@@ -61,6 +62,13 @@ const DEFAULT_CAPS: Partial<Record<Upstream, Partial<Record<BudgetWindow, number
   bge: { per_second: 10 },
   gemini: { minute: 500 },
   slack: { minute: 50 },
+  // cloudflare_api.minute 200: CF's published platform limit is 1200
+  // requests / 5 minutes globally per account. We cap at 200/min as a
+  // conservative ceiling — the workflow-state reconciler sweeps ≤50
+  // rows/tick × 1 GET each = ≤50 calls/tick (hourly), so this is ~4x
+  // headroom. Any other consumer (future System Status route, manual
+  // diagnostic) shares the same bucket since CF's limit is account-wide.
+  cloudflare_api: { minute: 200 },
 };
 
 /** 30-minute circuit-open duration when 3 consecutive 429s trigger the

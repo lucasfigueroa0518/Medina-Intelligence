@@ -68,6 +68,14 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
     let jobCreated = false;
     let syncJobId: string | null = null;
 
+    // Phase 0 (2026-05-04): capture CF Workflows instance ID at the top
+    // of run() so the workflow-state reconciler can map sync_jobs rows
+    // to CF runtime state. event.instanceId is stable across the
+    // workflow's lifetime (including step retries), so we stash it once
+    // and write it into the sync_jobs INSERT during check-concurrency.
+    // Closure-captured into the step.do callback below.
+    const cfInstanceId = event.instanceId;
+
     try {
       if (!event || !event.payload) {
         throw new Error('IngestionWorkflow invoked with no event.payload');
@@ -78,7 +86,7 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
           `IngestionWorkflow invoked with invalid org_id: ${JSON.stringify(event.payload)}`
         );
       }
-      console.log(`[IngestionWorkflow] org_id=${org_id}`);
+      console.log(`[IngestionWorkflow] org_id=${org_id} cf_instance=${cfInstanceId}`);
 
       // Step 1: concurrency guard with timeout recovery.
       // Deploy-killed workflows leave orphan "running" rows. We use timeout_at
@@ -110,11 +118,16 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         ).bind(org_id!).first();
         if (running) return null;
 
+        // Phase 0 (2026-05-04): include cf_instance_id (closure-captured
+        // at top of run()) so the workflow-state reconciler can later
+        // map this row to CF runtime state if the workflow dies before
+        // writing closure (subreq cap, deploy interrupt, etc.). Column
+        // is nullable for backwards compat with pre-Phase-0 rows.
         const inserted = await this.env.D1.prepare(
-          `INSERT INTO sync_jobs (org_id, workflow_type, status, started_at, timeout_at)
-           VALUES (?, 'ingestion', 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 minutes'))
+          `INSERT INTO sync_jobs (org_id, workflow_type, status, started_at, timeout_at, cf_instance_id)
+           VALUES (?, 'ingestion', 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 minutes'), ?)
            RETURNING id`
-        ).bind(org_id!).first<{ id: string }>();
+        ).bind(org_id!, cfInstanceId).first<{ id: string }>();
         return inserted?.id ?? null;
       });
 
