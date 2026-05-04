@@ -282,8 +282,14 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
       };
 
       // Step 2b: fetch news. New design (audit 2026-04-28 Task 1): staleness
-      // filter + hard cap (25/run) + parallel-per-company + per-company budget.
-      // 25 companies in parallel × ~5–10s each = total wallclock well under 60s.
+      // filter + hard cap (25/run) + chunked-per-company-batch + per-company
+      // budget. Phase 3.2.1 (2026-05-04): switched from 25-wide parallel to
+      // 5-wide chunked dispatch with 1.5s inter-batch sleep (see
+      // news-search.ts NEWS_CHUNK_SIZE / NEWS_INTER_BATCH_DELAY_MS).
+      // Worst-case wallclock: 5 batches × 25s per-company budget + 4 × 1.5s
+      // inter-batch = ~131s. Bumped step timeout 60s → 180s for headroom
+      // around that worst case. Healthy steady-state stays well under 60s
+      // (5 batches × ~5-10s each + 6s sleeps = 35-60s).
       console.log('[IngestionWorkflow] step → fetch-news');
       const newsData = await trackedStep(
         this.env,
@@ -292,7 +298,7 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         'fetch-news',
         {
           retries: { limit: 1, delay: '10 seconds' },
-          timeout: '60 seconds',
+          timeout: '180 seconds',
         },
         async (): Promise<{
           news: ClassifiableItem[];

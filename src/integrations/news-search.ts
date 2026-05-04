@@ -7,7 +7,7 @@ import {
   checkEnrichmentRateLimit,
   recordEnrichmentRateLimit,
 } from '../lib/rate-limit';
-import { getOrgSettings } from '../lib/helpers';
+import { getOrgSettings, chunkArray } from '../lib/helpers';
 import { hashShort } from '../lib/helpers';
 import { scoreArticle } from '../lib/news-scoring';
 
@@ -170,6 +170,20 @@ interface CompanyRow {
 const MAX_PER_RUN = 25;
 const PER_COMPANY_BUDGET_MS = 25_000;
 
+// Phase 3.2.1 (2026-05-04): chunked dispatch to slip below Google
+// Gemini's per-second burst protection. Phase 3.2 surfaced that
+// firing 25 callGemini in parallel produced ~24× HTTP 429 in a
+// ~5-second window — the ledger circuit breaker tripped 8 times in
+// one hour and Gemini's cap drifted from 500 → 89 (~83% reduction)
+// over two hours of chronic pressure (Terminal 5 forensic 2026-05-04).
+// Chunking 5-wide with a 1.5s inter-batch sleep keeps the effective
+// per-second rate at ~5 calls/sec in worst-case synchronization
+// (5 companies × 1 query each in a tight burst), well below Google's
+// observed tolerance. fetchOneCompany's internal sequential query
+// loop continues unchanged inside each batch.
+const NEWS_CHUNK_SIZE = 5;
+const NEWS_INTER_BATCH_DELAY_MS = 1500;
+
 export async function fetchNewsForActiveCompanies(
   orgId: string,
   env: Env
@@ -208,21 +222,37 @@ export async function fetchNewsForActiveCompanies(
     return { items: [], telemetry: { ...zero, step_duration_ms: Date.now() - stepStart } };
   }
 
-  // Run all selected companies concurrently. Promise.allSettled means a
-  // single throw / rejection inside fetchOneCompany never poisons the batch.
-  const results = await Promise.allSettled(
-    companies.results.map(c => fetchOneCompany(c, orgId, env))
-  );
-
+  // Phase 3.2.1: chunked dispatch with inter-batch pacing. Replaces the
+  // prior 25-wide Promise.allSettled which triggered Google's per-second
+  // burst protection and drove chronic Gemini cap drift (see comment
+  // above). Per batch: NEWS_CHUNK_SIZE companies fire concurrently;
+  // sleep NEWS_INTER_BATCH_DELAY_MS between batches; aggregate results
+  // identically to before. fetchOneCompany semantics unchanged — one
+  // slow / failing company in a batch doesn't poison the batch
+  // (Promise.allSettled), and a slow batch doesn't poison subsequent
+  // batches (each batch awaits its own settle).
+  const chunks = chunkArray(companies.results, NEWS_CHUNK_SIZE);
   const items: ClassifiableItem[] = [];
   let succeeded = 0;
   let failed = 0;
-  for (const r of results) {
-    if (r.status === 'fulfilled' && r.value.ok) {
-      items.push(...r.value.items);
-      succeeded++;
-    } else {
-      failed++;
+
+  for (let batchIdx = 0; batchIdx < chunks.length; batchIdx++) {
+    const batch = chunks[batchIdx];
+    const batchResults = await Promise.allSettled(
+      batch.map(c => fetchOneCompany(c, orgId, env))
+    );
+    for (const r of batchResults) {
+      if (r.status === 'fulfilled' && r.value.ok) {
+        items.push(...r.value.items);
+        succeeded++;
+      } else {
+        failed++;
+      }
+    }
+    // Pace between batches to slip past Google's per-second burst
+    // protection. Skip after the last batch — no work follows.
+    if (batchIdx < chunks.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, NEWS_INTER_BATCH_DELAY_MS));
     }
   }
 
