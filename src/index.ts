@@ -850,15 +850,18 @@ async function handleScheduled(
         })());
         // Hourly contact + company embed backfill — backfillUnembeddedEntities
         // is the SOLE callsite of embedContactBio + embedCompanyDescription
-        // in the codebase (no other ingestion path embeds these). With the
-        // 0 0 * * * daily cron silently dead since 2026-04-28 (commit
-        // 58ea134's 4th-trigger registration broke CF dispatch), new
-        // contacts/companies created in the last 48+ hours have NO Vectorize
-        // entries — they're invisible to MARTy semantic search. Cost: ~120
-        // subreqs/hour worst case (20 contacts + 20 companies × ~3 each + 2
-        // SELECTs), well within the per-invocation cap. Separate waitUntil
-        // so it races concurrently with the embed self-heal + renewal blocks
-        // for the same subrequest-budget rationale documented above.
+        // in the codebase (no other ingestion path embeds these). Originally
+        // added when the 0 0 * * * daily cron went silent in 2026-04-28
+        // (commit 58ea134's 4th-trigger registration broke CF dispatch).
+        // Phase 2 (2026-05-04) folded daily into the minute-tick handler at
+        // 02:10 UTC, so daily entity backfill is healed — but this hourly
+        // backstop stays as a more-frequent self-heal: contacts/companies
+        // created in the last hour become MARTy-visible without waiting for
+        // the daily run. Cost: ~120 subreqs/hour worst case (20 contacts +
+        // 20 companies × ~3 each + 2 SELECTs), well within the per-
+        // invocation cap. Separate waitUntil so it races concurrently with
+        // the embed self-heal + renewal blocks for the same subrequest-
+        // budget rationale documented above.
         ctxExec.waitUntil((async () => {
           const { backfillUnembeddedEntities } = await import('./lib/daily-cron');
           try { await backfillUnembeddedEntities(org.id, env); }
@@ -899,15 +902,6 @@ async function handleScheduled(
           try { await reconcileWorkflowState(org.id, env); }
           catch (e) { console.error(`hourly self-heal: reconcileWorkflowState failed for ${org.id}:`, e); }
         })());
-      } else if (cron === '5 * * * *') {
-        // Enrichment
-        await env.ENRICHMENT_WORKFLOW.create({
-          id: `enrichment-${org.id}-${Date.now()}`,
-          params: { org_id: org.id },
-        });
-      } else if (cron === '0 0 * * *') {
-        // Daily cron — runs inline as a standard Worker
-        ctxExec.waitUntil(runDailyCron(org.id, env));
       } else if (cron === '* * * * *') {
         // Progressive backfill driver — advances each active parent's
         // current window by one paginated batch. Bumped 2026-04-29 from
@@ -928,6 +922,47 @@ async function handleScheduled(
           try { await driveAllActiveFireflyProgressive(org.id, env); }
           catch (e) { console.error(`firefly progressive backfill drive failed for ${org.id}:`, e); }
         })());
+
+        // Phase 2 (2026-05-04): cron consolidation 4 → 2. The dedicated
+        // `5 * * * *` and `0 0 * * *` triggers were removed from
+        // wrangler.toml to eliminate the 4-trigger CF dispatch fragility
+        // (commit 58ea134's 4th-trigger registration broke daily cron
+        // dispatch back on 2026-04-28). Their work is folded here under
+        // time-of-day gates, dispatched from the proven minute-tick.
+        //
+        // event.scheduledTime is the canonical CF-provided dispatch
+        // timestamp; Date.now() fallback is defensive — should always be
+        // present in a real scheduled invocation.
+        const dt = new Date(event.scheduledTime ?? Date.now());
+        const utcHour = dt.getUTCHours();
+        const utcMinute = dt.getUTCMinutes();
+
+        // Folded from `5 * * * *`: hourly enrichment workflow trigger.
+        // Shifted from minute :05 → :04 to spread load away from the
+        // hour-boundary stampede where the heavy `0 * * * *` cron also
+        // fires (ingestion master + 6 self-heal waitUntil blocks).
+        if (utcMinute === 4) {
+          await env.ENRICHMENT_WORKFLOW.create({
+            id: `enrichment-${org.id}-${Date.now()}`,
+            params: { org_id: org.id },
+          });
+        }
+
+        // Folded from `0 0 * * *`: daily cron at 02:10 UTC.
+        //   • Hour 02 (not 00): avoid hour-zero stampede where the
+        //     hourly heavy cron's 6 self-heal blocks already compete for
+        //     subrequest budget.
+        //   • Minute 10 (not 00): give the 02:00 hourly ingestion run
+        //     ~10 min to clear before daily's heavy bulk recomputes
+        //     (3 Phase 0a-4 calc functions + recalculateAllAssociations
+        //     + ~16 other operations) start consuming D1 throughput.
+        // Heals the "daily cron silently dead since 2026-04-28" concern
+        // by giving daily work a path that runs through the proven
+        // minute-tick dispatcher, regardless of whether the original
+        // dedicated `0 0 * * *` trigger had been firing.
+        if (utcHour === 2 && utcMinute === 10) {
+          ctxExec.waitUntil(runDailyCron(org.id, env));
+        }
       }
     } catch (e) {
       console.error(`Cron dispatch failed for org ${org.id}:`, e);

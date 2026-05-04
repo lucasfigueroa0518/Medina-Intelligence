@@ -97,11 +97,14 @@ class_name = "DailyCronWorkflow"
 
 # --- Cron Triggers ---
 
+# Phase 2 (2026-05-04): consolidated 4 cron triggers → 2.
+# Removed `5 * * * *` (enrichment) and `0 0 * * *` (daily cron) — both
+# folded into the minute-tick handler (src/index.ts) with time-of-day
+# gates. Eliminates the 4-trigger CF dispatch fragility that left the
+# daily cron silently dead since 2026-04-28.
 [triggers]
 crons = [
   "0 * * * *",
-  "5 * * * *",
-  "0 0 * * *",
   "* * * * *",
 ]
 
