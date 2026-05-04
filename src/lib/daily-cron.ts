@@ -701,6 +701,22 @@ export async function processEmbedRetryQueue(
   const MAX_ATTEMPTS = 3;
   const STALE_AFTER_MINUTES = 10;
   const HEARTBEAT_EVERY_N_ROWS = 25;
+  // Phase 1.1 (2026-05-04): per-item wallclock cap on embedSingleItem.
+  // extractTextFromFile (used by the documents source-table path) has no
+  // internal timeout for PDFs — Wave 5.6 restored pdfjs extraction in-
+  // worker, and a complex/malformed PDF can hang the whole drain
+  // indefinitely (Terminal 5 forensic 2026-05-04: LPA-signed.pdf hang
+  // blocked the entire drain at 17:00:59, no progress for 30 min until
+  // CF reaped the worker). 60s is generous: typical embedSingleItem
+  // returns <2s; legitimate big-PDF / DOCX extraction completes in
+  // 5-30s. On timeout: throws into the existing catch block →
+  // attempts++ → eventually failed_permanent at MAX_ATTEMPTS →
+  // surfaces in System Status dead_letter view (Phase 1).
+  //
+  // Mirrors the bgeWithTimeout pattern at src/lib/embedding.ts:140-161
+  // (Promise.race + clearTimeout in finally to avoid leaking timer
+  // handles on the success path).
+  const EMBED_ITEM_TIMEOUT_MS = 60_000;
 
   const result = await withTaskRun<{ processed: number; succeeded: number; failed: number; stale_reset: number }>(
     env,
@@ -774,7 +790,31 @@ export async function processEmbedRetryQueue(
         ).bind(item.id).run();
 
         try {
-          const ok = await embedSingleItem(item.entity_id, item.source_table, orgId, env);
+          // Per-item wallclock cap. Promise.race against a setTimeout
+          // bounds the worst-case extraction hang; clearTimeout in
+          // finally prevents timer-handle leaks on the success path.
+          // On timeout: throws 'EMBED_ITEM_TIMEOUT' into the catch
+          // block below — distinct from 'EMBED_RATE_LIMIT_TIMEOUT' and
+          // 429-shaped errors so the catch's substring detection does
+          // NOT mistakenly fire recordRateLimit. The hung underlying
+          // promise continues running in the background until the
+          // worker isolate is reaped — bounded by CF runtime.
+          let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(
+              () => reject(new Error('EMBED_ITEM_TIMEOUT after 60s')),
+              EMBED_ITEM_TIMEOUT_MS
+            );
+          });
+          let ok: 'embedded' | 'skipped' | 'missing';
+          try {
+            ok = await Promise.race([
+              embedSingleItem(item.entity_id, item.source_table, orgId, env),
+              timeoutPromise,
+            ]);
+          } finally {
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+          }
           // Record usage on every BGE call attempt that didn't throw —
           // bgeWithTimeout fired the actual embedding API, so the per-
           // second bucket bumps regardless of whether the source row
