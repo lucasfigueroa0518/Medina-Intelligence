@@ -22,6 +22,7 @@
 import type { Env } from '../types/env';
 import { encryptToken, decryptToken } from './encryption';
 import { runFireflyWindowBackfill } from './firefly-ingest';
+import { checkBudget, recordUsage, recordRateLimit } from './upstream-budget';
 
 // Multi-day scheduling tunables.
 //
@@ -70,11 +71,23 @@ function utcDateString(d: Date = new Date()): string {
  * quota_date) via ON CONFLICT. Called from the driver on each Fireflies
  * page fetch so we have visibility into per-user API usage trending toward
  * the daily limit.
+ *
+ * Phase 3.4 (2026-05-04) hybrid: ALSO dual-writes to the
+ * upstream_budget_ledger when `orgId` is provided. firefly_user_quotas
+ * stays as the per-user-daily authoritative store (it carries detail the
+ * ledger doesn't — backfill_calls vs webhook_deliveries vs daily_limit
+ * self-discovery); the ledger adds cross-org observability + circuit-
+ * breaker auto-tune-down. Both writes are independent (per-store
+ * catch-and-log) so a failure on one does not block the other.
+ *
+ * `orgId` is optional so future callers without an org context can
+ * keep using the function and only get the firefly_user_quotas write.
  */
 async function recordFireflyApiCall(
   userId: string,
   env: Env,
-  rateLimited: boolean = false
+  rateLimited: boolean = false,
+  orgId?: string,
 ): Promise<void> {
   const date = utcDateString();
   await env.D1.prepare(
@@ -87,6 +100,24 @@ async function recordFireflyApiCall(
   ).bind(userId, date, rateLimited ? new Date().toISOString() : null).run().catch(e => {
     console.error(`[firefly-quota] insert failed for ${userId}:`, e?.message || e);
   });
+
+  // Phase 3.4 hybrid dual-write to upstream_budget_ledger. Per-user
+  // (user_id is the actual user, NOT the '*' org-wide sentinel that
+  // graph/gemini/claude/bge use). On rate-limit: feed the circuit
+  // breaker (3 × 429 → cap drops 10%, circuit opens 30 min). On
+  // success: increment used. Catch-and-log so a ledger failure does
+  // not block the tick or shadow the firefly_user_quotas write above.
+  if (orgId) {
+    if (rateLimited) {
+      await recordRateLimit(env, orgId, userId, 'firefly', 'daily').catch(e => {
+        console.error(`[firefly-ledger] recordRateLimit failed for ${userId}:`, e?.message || e);
+      });
+    } else {
+      await recordUsage(env, orgId, userId, 'firefly', 'daily').catch(e => {
+        console.error(`[firefly-ledger] recordUsage failed for ${userId}:`, e?.message || e);
+      });
+    }
+  }
 }
 
 export interface FireflyProgressiveBackfillJob {
@@ -381,6 +412,26 @@ export async function driveFireflyProgressiveBackfill(
   ).bind(orgId, userId).first<{ id: string; api_key_encrypted: string; total_windows: number }>();
   if (!parent) return { advanced: false, note: 'no active firefly parent' };
 
+  // Phase 3.4 (2026-05-04) pre-gate: refuse the tick when the
+  // upstream_budget_ledger says this user is at cap or the circuit is
+  // open. Earlier than the claim so we don't even take a row lock when
+  // we know the work would be wasted. Per-window earliest_run_at
+  // deferral (the existing reactive path on line ~561+) is what bumps
+  // individual windows past UTC midnight on observed rate-limit; this
+  // pre-gate is the proactive layer that short-circuits all further
+  // attempts for this user during a circuit-open window. While circuit
+  // is open (30 min), each tick costs 2 D1 reads (parent SELECT + budget
+  // SELECT) and exits fast — bounded waste, self-healing.
+  const budget = await checkBudget(env, orgId, userId, 'firefly', 'daily');
+  if (budget.decision !== 'ok') {
+    return {
+      advanced: false,
+      note: `firefly ${budget.decision} for user ${userId} (used=${budget.used}/${budget.cap}${
+        budget.circuit_open_until ? `, circuit_open_until=${budget.circuit_open_until}` : ''
+      })`,
+    };
+  }
+
   // Atomic claim. lockUntil = now+5min. The UPDATE ... RETURNING returns
   // the claimed row only if it was previously unclaimed (lock expired or
   // null) AND eligible (earliest_run_at <= now). Two simultaneous ticks
@@ -460,10 +511,11 @@ export async function driveFireflyProgressiveBackfill(
     return { advanced: true, window_index: win.window_index, status: 'failed', note: msg };
   }
 
-  // Per-tick API call accounting on the user's daily quota row. The driver
-  // doesn't pre-gate on quota — it lets the rate-limit response be the
-  // signal — but the counter is useful for trending + observability.
-  await recordFireflyApiCall(userId, env, false);
+  // Per-tick API call accounting on the user's daily quota row + the
+  // upstream_budget_ledger (Phase 3.4 hybrid dual-write). The pre-gate
+  // above (checkBudget) handles the proactive refuse-when-capped case;
+  // this fires post-claim to record usage of the now-attempted tick.
+  await recordFireflyApiCall(userId, env, false, orgId);
 
   let result;
   try {
@@ -564,7 +616,12 @@ export async function driveFireflyProgressiveBackfill(
   const newEarliestRunAt = isRateLimitPause ? nextUtcMidnightIso() : null;
 
   if (isRateLimitPause) {
-    await recordFireflyApiCall(userId, env, true);
+    // Phase 3.4: dual-write the rate-limit signal to firefly_user_quotas
+    // AND upstream_budget_ledger. Three consecutive rate-limit ticks for
+    // a user → ledger trips circuit (cap −10%, 30-min cooldown), and the
+    // pre-gate above will short-circuit subsequent ticks until circuit
+    // closes or UTC midnight whichever comes first.
+    await recordFireflyApiCall(userId, env, true, orgId);
   }
 
   await env.D1.prepare(
