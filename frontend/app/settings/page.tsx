@@ -1408,6 +1408,28 @@ function FireflyTriggerModal({
 
 // Phase 4 1c (2026-05-04): API key input removed — backend resolves the
 // persistent credential row from user_firefly_credentials.
+// Phase 4 follow-up (2026-05-04): mirrors backend MAX_BACKFILL_DAYS in
+// src/lib/firefly-progressive-backfill.ts. Keep these in sync — the
+// backend cap is the source of truth; this client constant exists so
+// the UI can clamp before submit instead of surfacing a generic 409.
+const FIREFLY_MAX_BACKFILL_DAYS = 120;
+
+// Auto-clamp helpers. Both inputs use yyyy-mm-dd strings (the native
+// shape of <input type="date">), so we work in that space without going
+// through Date objects for arithmetic — UTC date strings + day offsets
+// dodge timezone surprises around DST boundaries.
+function shiftDateString(yyyymmdd: string, deltaDays: number): string {
+  const ms = Date.parse(yyyymmdd + 'T00:00:00Z');
+  if (isNaN(ms)) return '';
+  return new Date(ms + deltaDays * 86400000).toISOString().slice(0, 10);
+}
+function spanDays(startYmd: string, endYmd: string): number {
+  const a = Date.parse(startYmd + 'T00:00:00Z');
+  const b = Date.parse(endYmd + 'T00:00:00Z');
+  if (isNaN(a) || isNaN(b)) return 0;
+  return Math.ceil((b - a) / 86400000);
+}
+
 function FireflyDateRangeModal({
   targetUserId,
   targetUserLabel,
@@ -1423,11 +1445,52 @@ function FireflyDateRangeModal({
   const [endDate, setEndDate] = React.useState('');
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [clampedToast, setClampedToast] = React.useState<string | null>(null);
+
+  // Phase 4 follow-up: mirror backend's 120-day cap as an HTML5 input
+  // constraint AND an explicit auto-clamp on change. The HTML max/min
+  // attributes give immediate visual blocking on the date picker; the
+  // useEffect-style onChange handlers handle paste/keyboard entry that
+  // skirts the picker. Auto-clamp instead of validate-only per Lucas
+  // 2026-05-04 — friction-free UX, no resubmit cycle.
+  const endMaxFromStart = startDate ? shiftDateString(startDate, FIREFLY_MAX_BACKFILL_DAYS) : undefined;
+  const startMinFromEnd = endDate ? shiftDateString(endDate, -FIREFLY_MAX_BACKFILL_DAYS) : undefined;
+
+  function showClampedToast(msg: string) {
+    setClampedToast(msg);
+    window.setTimeout(() => setClampedToast(null), 2500);
+  }
+
+  function onStartDateChange(next: string) {
+    setStartDate(next);
+    // If existing end_date now puts us beyond the cap, pull end_date
+    // back to start + 120 days. User sees the clamp visibly + toast.
+    if (next && endDate && spanDays(next, endDate) > FIREFLY_MAX_BACKFILL_DAYS) {
+      const clamped = shiftDateString(next, FIREFLY_MAX_BACKFILL_DAYS);
+      setEndDate(clamped);
+      showClampedToast(`End date adjusted to maximum ${FIREFLY_MAX_BACKFILL_DAYS}-day window`);
+    }
+  }
+  function onEndDateChange(next: string) {
+    setEndDate(next);
+    if (next && startDate && spanDays(startDate, next) > FIREFLY_MAX_BACKFILL_DAYS) {
+      const clamped = shiftDateString(next, -FIREFLY_MAX_BACKFILL_DAYS);
+      setStartDate(clamped);
+      showClampedToast(`Start date adjusted to maximum ${FIREFLY_MAX_BACKFILL_DAYS}-day window`);
+    }
+  }
 
   async function submit() {
     setError(null);
     if (!startDate || !endDate) { setError('Both dates are required'); return; }
     if (!targetUserId) { setError('No target user selected'); return; }
+    // Defense in depth — auto-clamp covers the picker path; this catches
+    // any clamp bypass (paste, devtools, racy state) before hitting the
+    // 409 round-trip.
+    if (spanDays(startDate, endDate) > FIREFLY_MAX_BACKFILL_DAYS) {
+      setError(`Date range cannot exceed ${FIREFLY_MAX_BACKFILL_DAYS} days. Adjust the start or end date.`);
+      return;
+    }
     setLoading(true);
     try {
       await api.startFireflyProgressiveBackfill({
@@ -1456,18 +1519,38 @@ function FireflyDateRangeModal({
         <div className="space-y-3 mb-4">
           <div>
             <div className="text-xs text-text-muted mb-1">Start date</div>
-            <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
-              className="input text-sm w-full" />
+            <input
+              type="date"
+              value={startDate}
+              min={startMinFromEnd}
+              onChange={e => onStartDateChange(e.target.value)}
+              className="input text-sm w-full"
+            />
           </div>
           <div>
             <div className="text-xs text-text-muted mb-1">End date</div>
-            <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
-              className="input text-sm w-full" />
+            <input
+              type="date"
+              value={endDate}
+              max={endMaxFromStart}
+              onChange={e => onEndDateChange(e.target.value)}
+              className="input text-sm w-full"
+            />
+          </div>
+          <div className="text-[10px] text-text-muted">
+            Maximum {FIREFLY_MAX_BACKFILL_DAYS} days per backfill — split longer pulls into
+            multiple requests.
           </div>
         </div>
         <div className="text-xs text-text-muted mb-4">
           Uses the saved Fireflies API key — no need to re-enter it.
         </div>
+        {clampedToast && (
+          <div className="text-xs text-amber-300 mb-3"
+            style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', padding: '6px 10px', borderRadius: '6px' }}>
+            {clampedToast}
+          </div>
+        )}
         {error && <div className="text-xs text-red-400 mb-3">{error}</div>}
         <div className="flex justify-end gap-3">
           <button className="btn-ghost" onClick={onClose}>Cancel</button>

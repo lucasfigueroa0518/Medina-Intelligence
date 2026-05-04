@@ -51,10 +51,21 @@ export async function handleFireflyProgressiveBackfill(
   if (!body?.user_id) {
     return errorResponse('VALIDATION_ERROR', 400, 'user_id required');
   }
-  const apiKey = body.fireflies_api_key?.trim();
-  if (!apiKey) {
-    return errorResponse('MISSING_API_KEY', 400, 'fireflies_api_key required');
-  }
+
+  // Phase 4 fix (2026-05-04): the handler used to hard-reject when
+  // fireflies_api_key was missing — predates persistent credentials and
+  // gate-kept BEFORE the lib's getFireflyKeyStatus check ever ran. Now we
+  // forward whatever the body provided (undefined / '' / a real key) into
+  // the lib creators below; they handle resolution:
+  //   • non-empty key → auto-persist via storeFireflyKey + per-job copy
+  //   • empty/missing → existence-check getFireflyKeyStatus; if no row,
+  //                     lib returns {created:false, reason:'… set up
+  //                     Firefly credentials first'} which we surface as
+  //                     409 FIREFLY_PROGRESSIVE_BLOCKED below.
+  // Normalize '' → undefined so the lib's `?.trim() || ''` cleanly lands
+  // in the persistent-resolution branch.
+  const trimmedKey = body.fireflies_api_key?.trim();
+  const apiKey = trimmedKey ? trimmedKey : undefined;
 
   const userExists = await env.D1.prepare(
     'SELECT id FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
