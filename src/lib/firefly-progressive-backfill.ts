@@ -23,15 +23,23 @@ import type { Env } from '../types/env';
 import { encryptToken, decryptToken } from './encryption';
 import { runFireflyWindowBackfill } from './firefly-ingest';
 import { checkBudget, recordUsage, recordRateLimit } from './upstream-budget';
+import { getFireflyKey, storeFireflyKey, getFireflyKeyStatus } from './firefly-credentials';
 
 // Multi-day scheduling tunables.
 //
 // MAX_BACKFILL_DAYS: hard cap on total date span per parent. Pulls beyond
-// this need to be split into multiple parents. 180 matches the existing
-// frontend dropdown ceiling and Tony's largest historical request — no
-// regression vs current behavior. The goal of the cap is to bound how many
-// days a single parent can stay 'active' across the multi-day scheduler.
-export const MAX_BACKFILL_DAYS = 180;
+// this need to be split into multiple parents.
+//
+// Phase 4 (2026-05-04): reduced 180 → 120. The frontend Fireflies
+// Historical Backfill card now offers presets up to 120 days (the
+// 180-day button was dropped per the bundled UX redesign). Aligning
+// the backend cap with the frontend UX prevents the "you can request
+// 180 in JSON but the dropdown maxes at 120" mismatch. Q3 audit on
+// 2026-05-04 confirmed zero in-flight backfills with
+// scheduled_days_count > 120, so the change is safely "cap NEW
+// creates" with no migration logic needed for existing rows
+// (Option C from the Phase 4 plan).
+export const MAX_BACKFILL_DAYS = 120;
 
 // WINDOWS_PER_DAY: target windows scheduled to run on the same UTC day.
 // Each window does ~5-15 transcripts depending on density; 4 windows × ~10
@@ -157,18 +165,27 @@ export interface FireflyProgressiveBackfillWindow {
 }
 
 /**
- * Seed a new Firefly progressive backfill: encrypt the API key, INSERT
- * parent + N pending windows going BACKWARDS in time. Window 0 is the
- * most recent slice (now-windowSizeDays → now), window N-1 is the
+ * Seed a new Firefly progressive backfill: persist the API key (Phase 4),
+ * INSERT parent + N pending windows going BACKWARDS in time. Window 0 is
+ * the most recent slice (now-windowSizeDays → now), window N-1 is the
  * oldest. Refuses if the user has any other active parent (same
  * one-active-at-a-time invariant Outlook uses).
+ *
+ * Phase 4 (2026-05-04): `fireflyApiKey` is now optional.
+ *   • If provided: stored in user_firefly_credentials (persisted for
+ *     future runs) AND encrypted into the job row (legacy fallback for
+ *     this job specifically — defense-in-depth).
+ *   • If omitted: look up the user's persistent credential. If absent,
+ *     return an error prompting setup. The job's api_key_encrypted is
+ *     written as '' since the driver reads from the persistent table
+ *     anyway (the column is NOT NULL so we can't omit it).
  */
 export async function createFireflyProgressiveBackfill(
   orgId: string,
   userId: string,
   totalDays: number,
   windowSizeDays: number,
-  fireflyApiKey: string,
+  fireflyApiKey: string | null | undefined,
   env: Env
 ): Promise<{ created: boolean; parent_id?: string; total_windows?: number; scheduled_days_count?: number; reason?: string }> {
   if (totalDays <= 0 || windowSizeDays <= 0 || windowSizeDays > totalDays) {
@@ -177,8 +194,33 @@ export async function createFireflyProgressiveBackfill(
   if (totalDays > MAX_BACKFILL_DAYS) {
     return { created: false, reason: `date span exceeds the ${MAX_BACKFILL_DAYS}-day cap; split into multiple requests` };
   }
-  if (!fireflyApiKey || fireflyApiKey.trim().length === 0) {
-    return { created: false, reason: 'firefly_api_key required' };
+
+  // Phase 4: resolve the API key — either from request body (auto-persist)
+  // or from the user's stored credential. Either path produces a job row
+  // with non-null api_key_encrypted, so the legacy column constraint is
+  // satisfied without schema change.
+  const trimmed = fireflyApiKey?.trim() || '';
+  let apiKeyEncrypted: string;
+  if (trimmed.length > 0) {
+    // Provided: persist for future use AND encrypt into the job row
+    // (legacy backward-compat — driver reads from persistent first
+    // anyway, but the per-job copy is defense-in-depth in case the
+    // credentials table has decrypt issues mid-job).
+    await storeFireflyKey(userId, trimmed, env);
+    apiKeyEncrypted = await encryptToken({ api_key: trimmed }, env);
+  } else {
+    // Omitted: must already have a stored credential. Existence check
+    // (no plaintext fetch) — driver will fetch the plaintext at tick
+    // time. Job row's api_key_encrypted is set to '' as placeholder;
+    // the driver detects empty and skips the legacy fallback path.
+    const status = await getFireflyKeyStatus(userId, env);
+    if (!status.exists) {
+      return {
+        created: false,
+        reason: 'no firefly_api_key provided and no stored credential — set up Firefly credentials first',
+      };
+    }
+    apiKeyEncrypted = '';
   }
 
   const existing = await env.D1.prepare(
@@ -191,7 +233,6 @@ export async function createFireflyProgressiveBackfill(
 
   const totalWindows = Math.ceil(totalDays / windowSizeDays);
   const scheduledDaysCount = Math.max(1, Math.ceil(totalWindows / WINDOWS_PER_DAY));
-  const apiKeyEncrypted = await encryptToken({ api_key: fireflyApiKey.trim() }, env);
 
   const insertedParent = await env.D1.prepare(
     `INSERT INTO firefly_progressive_backfill_jobs
@@ -243,7 +284,7 @@ export async function createFireflyProgressiveBackfillRange(
   startDate: string,
   endDate: string,
   windowSizeDays: number,
-  fireflyApiKey: string,
+  fireflyApiKey: string | null | undefined,
   env: Env
 ): Promise<{ created: boolean; parent_id?: string; total_windows?: number; scheduled_days_count?: number; reason?: string }> {
   const start = new Date(startDate);
@@ -256,9 +297,6 @@ export async function createFireflyProgressiveBackfillRange(
   }
   if (windowSizeDays <= 0) {
     return { created: false, reason: 'invalid windowSizeDays' };
-  }
-  if (!fireflyApiKey || fireflyApiKey.trim().length === 0) {
-    return { created: false, reason: 'firefly_api_key required' };
   }
   const totalDays = Math.ceil((end.getTime() - start.getTime()) / 86400000);
   if (totalDays > MAX_BACKFILL_DAYS) {
@@ -275,7 +313,25 @@ export async function createFireflyProgressiveBackfillRange(
     return { created: false, reason: `User already has active firefly parent ${existing.id}` };
   }
 
-  const apiKeyEncrypted = await encryptToken({ api_key: fireflyApiKey.trim() }, env);
+  // Phase 4: same key resolution as the days_back variant — see that
+  // function's comments for full rationale (auto-persist when provided,
+  // require existing stored credential when omitted, '' placeholder
+  // when relying on persistent for backward-compat with NOT NULL column).
+  const trimmed = fireflyApiKey?.trim() || '';
+  let apiKeyEncrypted: string;
+  if (trimmed.length > 0) {
+    await storeFireflyKey(userId, trimmed, env);
+    apiKeyEncrypted = await encryptToken({ api_key: trimmed }, env);
+  } else {
+    const status = await getFireflyKeyStatus(userId, env);
+    if (!status.exists) {
+      return {
+        created: false,
+        reason: 'no firefly_api_key provided and no stored credential — set up Firefly credentials first',
+      };
+    }
+    apiKeyEncrypted = '';
+  }
 
   const insertedParent = await env.D1.prepare(
     `INSERT INTO firefly_progressive_backfill_jobs
@@ -479,29 +535,46 @@ export async function driveFireflyProgressiveBackfill(
 
   const win = claimed;
 
-  if (!parent.api_key_encrypted) {
-    // Already nuked. Should never happen for an active parent — if it
-    // does, the parent should have been moved to completed/cancelled,
-    // not left active. Mark window failed and surface so an operator
-    // can notice the inconsistency. Clear lock so we don't hold it.
-    await env.D1.prepare(
-      `UPDATE firefly_progressive_backfill_windows
-          SET status = 'failed',
-              last_error = 'api_key_encrypted is empty; parent may be in inconsistent state',
-              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-              lock_expires_at = NULL
-        WHERE id = ?`
-    ).bind(win.id).run();
-    return { advanced: true, window_index: win.window_index, status: 'failed', note: 'empty api_key' };
+  // Phase 4 (2026-05-04): two-tier API key resolution.
+  //   1. Primary: user_firefly_credentials (persistent, set once via
+  //      Settings UI / POST /api/settings/firefly-credentials). The
+  //      "set once, reuse forever" UX.
+  //   2. Fallback: parent.api_key_encrypted (legacy per-job storage
+  //      from before Phase 4). Empty-string '' is the Phase-4
+  //      placeholder for new jobs that rely on persistent only — the
+  //      decrypt path is skipped in that case. Once any pre-Phase-4
+  //      in-flight backfills drain, this fallback becomes dead code.
+  //
+  // Either source produces a usable plaintext key. If both fail, the
+  // window is marked failed with a descriptive error so the operator
+  // can prompt the user to (re)set credentials.
+  let apiKey: string | null = null;
+
+  // Primary: persistent credential.
+  try {
+    apiKey = await getFireflyKey(userId, env);
+  } catch (e) {
+    console.error('[firefly-driver] persistent key fetch error:', e instanceof Error ? e.message : e);
   }
 
-  let apiKey: string;
-  try {
-    const decrypted = await decryptToken(parent.api_key_encrypted, env);
-    apiKey = decrypted.api_key;
-    if (!apiKey) throw new Error('decrypted payload missing api_key field');
-  } catch (e: any) {
-    const msg = `decrypt failed: ${String(e?.message || e).slice(0, 200)}`;
+  // Fallback: legacy per-job key. Skipped when api_key_encrypted is ''
+  // (Phase 4 placeholder for new jobs that rely on persistent only) or
+  // null. The decrypt path mirrors the prior implementation exactly so
+  // pre-Phase-4 jobs continue to drain without regression.
+  if (!apiKey && parent.api_key_encrypted && parent.api_key_encrypted.length > 0) {
+    try {
+      const decrypted = await decryptToken(parent.api_key_encrypted, env);
+      apiKey = decrypted.api_key || null;
+    } catch (e) {
+      console.error('[firefly-driver] legacy per-job decrypt failed:', e instanceof Error ? e.message : e);
+      // Don't return yet — the persistent path may have surfaced a key
+      // (race), or operator may set fresh credentials before we hit the
+      // !apiKey check below.
+    }
+  }
+
+  if (!apiKey) {
+    const msg = 'no firefly key (persistent credential missing or decrypt-failed; legacy per-job key unavailable). User must set Firefly credentials.';
     await env.D1.prepare(
       `UPDATE firefly_progressive_backfill_windows
           SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
