@@ -674,15 +674,21 @@ export const api = {
       users: Array<{ id: string; email: string; full_name: string | null; role: string }>;
     }>('/backfill/eligible-users'),
 
-  // Progressive Firefly backfill (Phase F, owner-gated). API key is one-time
-  // per backfill — encrypted server-side, nuked when parent flips to
-  // completed/cancelled. Same shape as the Outlook progressive endpoints
-  // except days_back ∈ {30,60,90,180} instead of just {30,90,365} and the
-  // body includes fireflies_api_key.
+  // Progressive Firefly backfill (Phase F + Phase 4, owner-gated).
+  //
+  // Phase 4 (2026-05-04): fireflies_api_key is now OPTIONAL. When omitted,
+  // the driver resolves the user's persistent credential row from
+  // user_firefly_credentials (set via the /api/settings/firefly-credentials
+  // endpoints below). If a key IS supplied, it dual-writes — legacy per-job
+  // path AND persistent storage — for transition safety on in-flight jobs.
+  //
+  // days_back ∈ {30,60,90}. The 180-day option was dropped in Phase 4 sub-
+  // stage 1c (MAX_BACKFILL_DAYS lowered to 120 in src/lib/firefly-progressive
+  // -backfill.ts; 180 would now be rejected at the backend).
   startFireflyProgressiveBackfill: (data: {
     user_id: string;
-    fireflies_api_key: string;
-    days_back?: 30 | 60 | 90 | 180;
+    fireflies_api_key?: string;
+    days_back?: 30 | 60 | 90;
     start_date?: string;
     end_date?: string;
     window_size_days?: number;
@@ -756,6 +762,40 @@ export const api = {
   getSettingsSystemStatus: () => request<SystemStatusResponse>('/settings/system-status'),
   getFireflyWebhookSecret: () =>
     request<{ secret: string }>('/integrations/firefly/webhook-secret'),
+
+  // Phase 4 (2026-05-04): persistent per-user Firefly API key endpoints.
+  // All three are auth-gated to the caller's own user_id. Plaintext is
+  // ONLY accepted on POST and is NEVER returned by any of these calls.
+  getMyFireflyCredential: () =>
+    request<{
+      status: {
+        exists: boolean;
+        user_id: string;
+        created_at: string | null;
+        updated_at: string | null;
+        last_used_at: string | null;
+        rotation_count: number;
+      };
+    }>('/settings/firefly-credentials'),
+  storeMyFireflyCredential: (api_key: string) =>
+    request<{
+      stored: 'created' | 'rotated';
+      status: {
+        exists: boolean;
+        user_id: string;
+        created_at: string | null;
+        updated_at: string | null;
+        last_used_at: string | null;
+        rotation_count: number;
+      };
+    }>('/settings/firefly-credentials', {
+      method: 'POST',
+      body: JSON.stringify({ api_key }),
+    }),
+  revokeMyFireflyCredential: () =>
+    request<{ revoked: boolean }>('/settings/firefly-credentials', {
+      method: 'DELETE',
+    }),
 
   // Documents
   listDocuments: (params?: Record<string, string>) => {
