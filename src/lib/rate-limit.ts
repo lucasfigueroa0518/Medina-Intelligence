@@ -7,34 +7,43 @@ interface ClaudeRateState {
   resets_at: string;
 }
 
+// Phase 3.3 (2026-05-04): migrated from KV-backed counter to the
+// upstream_budget_ledger. Caller signature unchanged so all 26+ existing
+// call sites keep working without edits. Same migration shape as Graph
+// (3.1) and Gemini (3.2):
+//   • The ledger replaces the KV counter for the rate-limit-window
+//     accounting. The cap is sourced from DEFAULT_CAPS.claude.minute
+//     (= 60, matching the existing CLAUDE_MAX_RPM env-var default).
+//   • Priority is preserved via cap-math at the call site: 'high' uses
+//     full cap, 'low' uses cap minus a 1/3 reserve — same semantics as
+//     the prior KV implementation.
+//   • The check-and-increment behavior of the prior KV impl is preserved
+//     by calling recordUsage inline on a successful check. Callers don't
+//     need to add a separate record call.
+//   • 429 detection lands at the actual fetch site in src/lib/claude.ts
+//     (recordRateLimit invoked when Anthropic returns 429) — the prior
+//     KV impl could not observe upstream 429s; the ledger circuit
+//     breaker closes that gap.
+//   • The previous KV keys (`claude_rate:<orgId>`) are abandoned. TTL
+//     was 120s so they expire naturally within ~2 min after deploy.
+//   • Note: callClaudeStreaming intentionally NOT routed through this
+//     wrapper today (pre-existing gap, not a Phase 3.3 regression).
+//     Future phase can fold streaming through the same ledger.
 export async function checkClaudeRateLimit(
   env: Env,
   orgId: string,
   priority: 'high' | 'low'
 ): Promise<boolean> {
-  const key = `claude_rate:${orgId}`;
-  const state = await env.KV.get<ClaudeRateState>(key, 'json');
-  const now = new Date();
-
-  if (!state || new Date(state.resets_at) < now) {
-    await env.KV.put(
-      key,
-      JSON.stringify({ count: 1, resets_at: new Date(now.getTime() + 60000).toISOString() }),
-      { expirationTtl: 120 }
-    );
-    return true;
-  }
-
-  const MAX_RPM = parseInt(env.CLAUDE_MAX_RPM || '60', 10);
-  const RESERVE = Math.floor(MAX_RPM / 3);
-  const limit = priority === 'high' ? MAX_RPM : MAX_RPM - RESERVE;
-
-  if (state.count < limit) {
-    state.count++;
-    await env.KV.put(key, JSON.stringify(state), { expirationTtl: 120 });
-    return true;
-  }
-  return false;
+  const result = await checkBudget(env, orgId, null, 'claude', 'minute');
+  if (result.decision === 'circuit_open') return false;
+  const reserve = Math.floor(result.cap / 3);
+  const effectiveCap = priority === 'high' ? result.cap : result.cap - reserve;
+  if (result.used >= effectiveCap) return false;
+  // Pre-record to mirror the KV impl's check-and-increment behavior;
+  // existing callers expect a successful check to count toward the
+  // window total.
+  await recordUsage(env, orgId, null, 'claude', 'minute');
+  return true;
 }
 
 // --- Enrichment source cooldown (§5.3) ---

@@ -1,5 +1,6 @@
 import type { Env } from '../types/env';
 import { checkClaudeRateLimit } from './rate-limit';
+import { recordRateLimit } from './upstream-budget';
 
 interface ClaudeResponse {
   content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
@@ -67,7 +68,14 @@ export async function callClaude(
 
   if (!response.ok) {
     const errorBody = await response.text();
-    if (response.status === 429) throw new Error('CLAUDE_RATE_LIMITED');
+    if (response.status === 429) {
+      // Phase 3.3: feed the upstream_budget_ledger circuit breaker.
+      // 3 consecutive 429s → cap drops 10%, circuit opens 30 min.
+      // Pre-3.3 the KV-backed limiter could only observe its own
+      // counter; the ledger gives us upstream-driven evidence.
+      await recordRateLimit(env, orgId, null, 'claude', 'minute');
+      throw new Error('CLAUDE_RATE_LIMITED');
+    }
     throw new Error(`Claude API error ${response.status}: ${errorBody}`);
   }
 

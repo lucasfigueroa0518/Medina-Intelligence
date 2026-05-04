@@ -26,6 +26,7 @@ export type Upstream =
   | 'graph'
   | 'anthropic_haiku'
   | 'anthropic_sonnet'
+  | 'claude'
   | 'bge'
   | 'gemini'
   | 'slack'
@@ -59,6 +60,14 @@ const DEFAULT_CAPS: Partial<Record<Upstream, Partial<Record<BudgetWindow, number
   graph: { ten_minute: 8000 },
   anthropic_haiku: { minute: 50 },
   anthropic_sonnet: { minute: 30 },
+  // claude.minute 60: matches the existing CLAUDE_MAX_RPM default in
+  // src/lib/rate-limit.ts (line 28). Phase 3.3 (2026-05-04) routes
+  // checkClaudeRateLimit through this entry. Distinct from
+  // anthropic_haiku/anthropic_sonnet which are per-model granular
+  // entries reserved for future model-specific gating; the existing
+  // callClaude wrapper does not differentiate by model so it shares
+  // one bucket here.
+  claude: { minute: 60 },
   bge: { per_second: 10 },
   gemini: { minute: 500 },
   slack: { minute: 50 },
