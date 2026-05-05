@@ -362,13 +362,20 @@ async function processOneConversation(
         });
       }
 
-      // 3d. Queue embed for deferred processing. UNIQUE on (org, entity, source)
-      // means a re-run won't double-queue.
+      // 3d. Queue embed for deferred processing. Phase 6 1a (2026-05-05):
+      // routes to work_queue via enqueueWork. Idempotency_key mirrors the
+      // prior UNIQUE(org_id, entity_id, source_table) — a re-run with
+      // the same documentId collapses cleanly via partial UNIQUE on
+      // (domain, idempotency_key).
       try {
-        await env.D1.prepare(
-          `INSERT OR IGNORE INTO embed_retry_queue (org_id, entity_id, source_table, status)
-             VALUES (?, ?, 'documents', 'pending')`
-        ).bind(ctx.orgId, persisted.documentId).run();
+        const { enqueueWork } = await import('./work-queue');
+        await enqueueWork(env, ctx.orgId, 'embed_retry',
+          { entity_id: persisted.documentId, source_table: 'documents' },
+          {
+            upstream: 'bge',
+            idempotency_key: `${ctx.orgId}:${persisted.documentId}:documents`,
+          }
+        );
       } catch (e: any) {
         stats.errors.push({
           conversation_id: conversationId,

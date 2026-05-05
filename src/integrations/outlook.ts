@@ -702,10 +702,21 @@ export async function runHistoricalBackfill(
       console.warn(
         `[backfill] enqueueing ${gaps.results.length} embed gaps from inline backfill for retry`
       );
-      const enqueue = env.D1.prepare(
-        `INSERT OR IGNORE INTO embed_retry_queue (org_id, entity_id, source_table) VALUES (?, ?, 'conversations')`
-      );
-      await env.D1.batch(gaps.results.map(g => enqueue.bind(orgId, g.id)));
+      // Phase 6 1a (2026-05-05): write side routes to work_queue.
+      // Idempotency_key mirrors the prior UNIQUE(org_id, entity_id,
+      // source_table); 'conversations' is the only source from this
+      // backfill site (Outlook doesn't enqueue events or documents
+      // here — those come from the ingestion-finalizer gap detector).
+      const { enqueueWork } = await import('../lib/work-queue');
+      for (const g of gaps.results) {
+        await enqueueWork(env, orgId, 'embed_retry',
+          { entity_id: g.id, source_table: 'conversations' },
+          {
+            upstream: 'bge',
+            idempotency_key: `${orgId}:${g.id}:conversations`,
+          }
+        );
+      }
     }
   } catch (e) {
     // Self-heal best-effort — don't fail the backfill response on enqueue

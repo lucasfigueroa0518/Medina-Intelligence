@@ -118,9 +118,16 @@ export interface DeadLetterRow {
 
 /**
  * Aggregates anything an operator should review:
- *   - embed_retry_queue rows in 'failed_permanent'
  *   - task_runs in 'failed' status in the last 24h
  *   - work_queue rows in 'dead_letter' status (Phase 5 1b, 2026-05-05)
+ *
+ * Phase 6 1b (2026-05-05): the embed_retry_queue:failed_permanent branch
+ * was REMOVED. The embed_retry domain migrated onto work_queue in Phase
+ * 6 1a/1b — its dead-letter rows are now surfaced via the work_queue
+ * branch below as `work_queue:embed_retry`. The embed_retry_queue table
+ * + rows are preserved as a revert artifact (per Lucas 2026-05-05) but
+ * no longer surfaced here to prevent double-counting against the
+ * migrated work_queue rows.
  *
  * Phase 1 adds DLQ reads from `webhook-dlq` / `audit-log-dlq` (already
  * wired in wrangler.toml; they're CF Queues, not D1 — separate read API).
@@ -130,27 +137,6 @@ export async function getDeadLetterItems(
   orgId: string
 ): Promise<DeadLetterRow[]> {
   const rows: DeadLetterRow[] = [];
-
-  // embed_retry_queue: failed_permanent
-  const erq = await env.D1.prepare(
-    `SELECT source_table AS source,
-            COUNT(*) AS count,
-            MIN(created_at) AS oldest,
-            MAX(last_error) AS recent_error
-       FROM embed_retry_queue
-      WHERE org_id = ? AND status = 'failed_permanent'
-      GROUP BY source_table
-      ORDER BY count DESC`
-  ).bind(orgId).all<{ source: string; count: number; oldest: string | null; recent_error: string | null }>();
-  for (const r of erq.results) {
-    rows.push({
-      source: `embed_retry_queue:${r.source}`,
-      state: 'failed_permanent',
-      count: r.count,
-      oldest: r.oldest,
-      recent_error: r.recent_error,
-    });
-  }
 
   // task_runs: failed in last 24h, grouped by task
   const tr = await env.D1.prepare(

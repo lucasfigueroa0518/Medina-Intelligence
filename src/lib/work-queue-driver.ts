@@ -85,16 +85,23 @@ export { recordHeartbeat };
 
 // ─── Registry ───────────────────────────────────────────────────────
 
+import { embedRetryHandler } from './work-queue-handlers/embed-retry';
+
 /**
- * Phase 5 ships with an EMPTY registry. First domain pilots in Phase
- * 5.1+ append entries here. Order doesn't matter (each handler is
- * independent); SQLite serializes claim writes so two handlers in the
- * same tick can't race on the same row even hypothetically.
+ * Phase 5 shipped with an empty registry. Domain pilots append entries
+ * here. Order doesn't matter (each handler is independent); SQLite
+ * serializes claim writes so two handlers in the same tick can't race
+ * on the same row even hypothetically.
  *
- * Adding a handler is a one-liner:
- *   { domain: 'embed_retry', batchSize: 10, process: handleEmbedRetry }
+ * Phase 6 1a (2026-05-05): first pilot — embed_retry. Replaces the
+ * per-domain handcrafted drain at daily-cron.ts:processEmbedRetryQueue.
+ * Existing embed_retry_queue rows continue to drain via the old code
+ * path during the 1a→1b transition; Phase 6 1b removes that path and
+ * copies residual rows into work_queue via migration 0084.
  */
-export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [];
+export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
+  embedRetryHandler,
+];
 
 // ─── Driver ─────────────────────────────────────────────────────────
 

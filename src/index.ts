@@ -821,31 +821,24 @@ async function handleScheduled(
           id: `ingestion-${org.id}-${Date.now()}`,
           params: { org_id: org.id },
         });
-        // Hourly self-heal — split into two PARALLEL waitUntil blocks.
+        // Hourly self-heal — backfillUnembeddedConversations only.
         //
-        // Both `backfillUnembeddedConversations` and `processEmbedRetryQueue`
-        // do BGE-rate-limited embedding (10 RPS) with ~5s wallclock per
-        // conversation. Sequenced inside one waitUntil, the first call (200
-        // conversations × ~5s) consumes the entire ~30s wallclock budget
-        // before the second can start — leaving embed_retry_queue completely
-        // un-drained. Audit 2026-04-30 found 7,754 conversation rows with
-        // sum_attempts=0 across 2+ days; processEmbedRetryQueue was never
-        // reaching them despite being wired into the hourly cron.
+        // Phase 6 1b (2026-05-05): the sibling processEmbedRetryQueue
+        // hourly self-heal was removed. The embed_retry domain now drains
+        // every minute via Phase 5's WORK_QUEUE_HANDLERS at src/lib/work-
+        // queue-driver.ts. That cadence is 60× faster than the prior
+        // hourly self-heal AND the work_queue's bge-circuit filter prevents
+        // burst retries from compounding rate-limit incidents.
         //
-        // Splitting into separate ctxExec.waitUntil calls gives each its own
-        // ~30s wallclock allocation. The two paths target disjoint row sets
-        // (backfill works on conversations missing from vector_entity_index;
-        // queue works on rows already enqueued for retry), so racing them is
-        // safe and idempotent.
+        // backfillUnembeddedConversations stays here because it targets a
+        // disjoint row set: conversations missing from vector_entity_index
+        // that were NEVER enqueued (i.e. enqueue itself was the gap).
+        // The work_queue covers the enqueue-then-fail path; this covers
+        // the never-enqueued path. Both still needed.
         ctxExec.waitUntil((async () => {
           const { backfillUnembeddedConversations } = await import('./lib/daily-cron');
           try { await backfillUnembeddedConversations(org.id, env); }
           catch (e) { console.error(`hourly self-heal: backfillUnembedded failed for ${org.id}:`, e); }
-        })());
-        ctxExec.waitUntil((async () => {
-          const { processEmbedRetryQueue } = await import('./lib/daily-cron');
-          try { await processEmbedRetryQueue(org.id, env); }
-          catch (e) { console.error(`hourly self-heal: processEmbedRetryQueue failed for ${org.id}:`, e); }
         })());
         // Hourly Graph subscription renewal — back-stops the daily cron's
         // step 14, which has been observed not firing on its own schedule
