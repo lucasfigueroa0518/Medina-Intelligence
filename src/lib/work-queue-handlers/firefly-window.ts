@@ -196,6 +196,17 @@ export const fireflyWindowHandler: WorkQueueHandler = {
       // delta from this run (the runFireflyWindowBackfill returns
       // counts for THIS invocation, not cumulative). Legacy row's
       // counters add the deltas.
+      //
+      // Phase 7b (2026-05-05): correlated subquery filter on
+      // parent.status='active' protects against cancel-mid-handler.
+      // If operator cancelled the parent during runFireflyWindowBackfill
+      // (which runs tens of seconds), this UPDATE matches 0 rows —
+      // the cancel path's `status='failed'` write on the legacy window
+      // stands uncontested. recordFireflyApiCall(false) below still
+      // fires (Phase 3.4.1 invariant: ledger reflects API-call reality
+      // regardless of parent's terminal state). Driver's completeWork
+      // on the work_queue row proceeds normally; on the next tick the
+      // line-99 parent-status check short-circuits naturally.
       await env.D1.prepare(
         `UPDATE firefly_progressive_backfill_windows
             SET status = 'completed',
@@ -207,7 +218,8 @@ export const fireflyWindowHandler: WorkQueueHandler = {
                 transcripts_failed            = transcripts_failed + ?,
                 last_error = ?,
                 lock_expires_at = NULL
-          WHERE parent_id = ? AND window_index = ?`
+          WHERE parent_id = ? AND window_index = ?
+            AND (SELECT status FROM firefly_progressive_backfill_jobs WHERE id = parent_id) = 'active'`
       ).bind(
         result.last_skip,
         result.total_fetched,
@@ -237,6 +249,13 @@ export const fireflyWindowHandler: WorkQueueHandler = {
       // Hard window failure (e.g. transcripts repeatedly fail to
       // persist). Update legacy + counters, throw → driver's failWork
       // with 3-tier backoff or dead_letter at attempt >= 3.
+      //
+      // Phase 7b (2026-05-05): cancel-mid-handler guard via correlated
+      // subquery — see completed branch above for full rationale. If
+      // parent was cancelled, the UPDATE no-ops; throw still fires
+      // (driver's failWork applies the work_queue retry path); on the
+      // next tick the line-99 parent-status check short-circuits and
+      // the work_queue row collapses to 'completed' cleanly.
       await env.D1.prepare(
         `UPDATE firefly_progressive_backfill_windows
             SET status = 'failed',
@@ -248,7 +267,8 @@ export const fireflyWindowHandler: WorkQueueHandler = {
                 transcripts_failed            = transcripts_failed + ?,
                 last_error = ?,
                 lock_expires_at = NULL
-          WHERE parent_id = ? AND window_index = ?`
+          WHERE parent_id = ? AND window_index = ?
+            AND (SELECT status FROM firefly_progressive_backfill_jobs WHERE id = parent_id) = 'active'`
       ).bind(
         result.last_skip,
         result.total_fetched,
@@ -314,6 +334,14 @@ export const fireflyWindowHandler: WorkQueueHandler = {
     // alignment. recordFireflyApiCall(true) for rate-limit signaling
     // moves to AFTER both writes succeed so the breaker counter
     // reflects only confirmed-paused-and-checkpointed runs.
+    // Phase 7b (2026-05-05): cancel-mid-handler guard via correlated
+    // subquery — see completed branch above for full rationale. If
+    // parent was cancelled, the UPDATE no-ops; deferWork still moves
+    // the work_queue row back to 'pending' with deferred next_attempt_at.
+    // On the deferred re-claim, the line-99 parent-status check
+    // short-circuits and the work_queue row collapses to 'completed'.
+    // Net: one wasted claim cycle on the deferred next_attempt_at;
+    // no data corruption.
     await env.D1.prepare(
       `UPDATE firefly_progressive_backfill_windows
           SET last_skip = ?,
@@ -323,7 +351,8 @@ export const fireflyWindowHandler: WorkQueueHandler = {
               transcripts_failed            = transcripts_failed + ?,
               earliest_run_at = ?,
               lock_expires_at = NULL
-        WHERE parent_id = ? AND window_index = ?`
+        WHERE parent_id = ? AND window_index = ?
+          AND (SELECT status FROM firefly_progressive_backfill_jobs WHERE id = parent_id) = 'active'`
     ).bind(
       result.last_skip,
       result.total_fetched,

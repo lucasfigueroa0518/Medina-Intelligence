@@ -352,10 +352,26 @@ export interface FailOptions {
  * Otherwise schedules next_attempt_at via the three-tier backoff
  * (or `retryAfterMs` when supplied).
  *
- * The decision (retry vs. dead-letter) reads the existing attempt and
- * max_attempts in a single UPDATE…RETURNING so we don't race a
- * concurrent watchdog. Returns the resulting row so the caller can
- * decide whether to log "scheduled retry" vs. "dead-lettered".
+ * Returns the resulting row so the caller can decide whether to log
+ * "scheduled retry" vs. "dead-lettered".
+ *
+ * Phase 7b (2026-05-05): collapsed two conditional UPDATE branches
+ * into a single CASE-based UPDATE…RETURNING. The decision (dead_letter
+ * vs pending) is now computed against the row's CURRENT `attempt` at
+ * UPDATE time — atomic with the transition. Combined with the
+ * `WHERE status = 'in_progress'` filter (Phase 6.2 1a + 7a), this
+ * makes the SELECT-then-UPDATE race window benign:
+ *   • If watchdog reclaimed the row between failWork's narrow SELECT
+ *     and UPDATE, status is no longer 'in_progress' → UPDATE no-ops
+ *     → null returned. Watchdog's transition stands; no double-write.
+ *   • If no race, the CASE evaluates `attempt + 1 >= ?` against the
+ *     CURRENT row's attempt; identical outcome to the prior two-branch
+ *     code path under healthy operation.
+ *
+ * The narrow SELECT survives because the backoff schedule lookup
+ * `RETRY_BACKOFF_MS[Math.min(attempt, length-1)]` doesn't fit cleanly
+ * in SQL (no array primitive). It now reads only `attempt` and
+ * `max_attempts` instead of the full row.
  */
 export async function failWork(
   env: Env,
@@ -363,58 +379,53 @@ export async function failWork(
   errorMessage: string,
   opts: FailOptions = {}
 ): Promise<WorkQueueRow | null> {
-  // Two-step: read row to compute next_attempt_at deterministically,
-  // then UPDATE. We could do this in a single CASE expression but the
-  // backoff schedule lookup is easier in TypeScript than SQL, and the
-  // row is locked to this caller (status='in_progress', locked_until
-  // not yet expired by definition of being mid-handler) so there's no
-  // concurrent-update race against the watchdog within the lock TTL.
+  // Narrow SELECT: only the two columns we need to compute the backoff
+  // timestamp in JS. The full UPDATE decision logic now lives in the
+  // SQL CASE expressions below, so the row's attempt at UPDATE time
+  // (not SELECT time) drives the dead_letter-vs-pending choice.
   const row = await env.D1.prepare(
-    `SELECT * FROM work_queue WHERE id = ?`
-  ).bind(id).first<WorkQueueRow>();
+    `SELECT attempt, max_attempts FROM work_queue WHERE id = ?`
+  ).bind(id).first<{ attempt: number; max_attempts: number }>();
   if (!row) return null;
 
-  const nextAttempt = row.attempt + 1;
   const maxAttempts = opts.maxAttemptsOverride ?? row.max_attempts;
-
-  if (nextAttempt >= maxAttempts) {
-    // Dead-letter: terminal. last_error preserved for forensics. The
-    // operator resets to 'pending' via admin endpoint to reattempt
-    // (separate phase; no reset endpoint in 5).
-    //
-    // Phase 6.2 (2026-05-05): added `AND status = 'in_progress'` so a
-    // handler that already self-transitioned (deadLetterWork or
-    // deferWork before throwing) isn't re-mutated by this path.
-    const updated = await env.D1.prepare(
-      `UPDATE work_queue
-          SET status       = 'dead_letter',
-              attempt      = ?,
-              last_error   = ?,
-              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-              locked_until = NULL
-        WHERE id = ? AND status = 'in_progress'
-        RETURNING *`
-    ).bind(nextAttempt, errorMessage, id).first<WorkQueueRow>();
-    return updated ?? null;
-  }
-
-  // Compute backoff. attempt index 0 → first failure → RETRY_BACKOFF_MS[0]
-  // (= 5min). Cap at the last entry for safety if max_attempts somehow
-  // exceeds the schedule length.
   const backoffMs = opts.retryAfterMs
     ?? RETRY_BACKOFF_MS[Math.min(row.attempt, RETRY_BACKOFF_MS.length - 1)];
   const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString();
 
+  // Single atomic UPDATE. Three CASE expressions decide:
+  //   • status: dead_letter when (current attempt + 1) hits max, else pending
+  //   • completed_at: stamp now on dead_letter, preserve else
+  //   • next_attempt_at: NULL on dead_letter, scheduled timestamp else
+  // attempt always increments by 1. WHERE status='in_progress' is the
+  // guard against watchdog interleave.
   const updated = await env.D1.prepare(
     `UPDATE work_queue
-        SET status          = 'pending',
-            attempt         = ?,
-            last_error      = ?,
-            next_attempt_at = ?,
-            locked_until    = NULL
+        SET status = CASE
+              WHEN attempt + 1 >= ? THEN 'dead_letter'
+              ELSE 'pending'
+            END,
+            attempt = attempt + 1,
+            last_error = ?,
+            completed_at = CASE
+              WHEN attempt + 1 >= ? THEN strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              ELSE completed_at
+            END,
+            next_attempt_at = CASE
+              WHEN attempt + 1 >= ? THEN NULL
+              ELSE ?
+            END,
+            locked_until = NULL
       WHERE id = ? AND status = 'in_progress'
       RETURNING *`
-  ).bind(nextAttempt, errorMessage, nextAttemptAt, id).first<WorkQueueRow>();
+  ).bind(
+    maxAttempts,    // CASE: status
+    errorMessage,
+    maxAttempts,    // CASE: completed_at
+    maxAttempts,    // CASE: next_attempt_at
+    nextAttemptAt,  // ELSE arm of next_attempt_at CASE
+    id
+  ).first<WorkQueueRow>();
   return updated ?? null;
 }
 
