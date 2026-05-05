@@ -101,7 +101,7 @@ function weekStartUtc(d: Date): Date {
 }
 
 /** Compute the refresh interval for a window based on its proximity to now. */
-function refreshIntervalForWindow(windowStartIso: string): number {
+export function refreshIntervalForWindow(windowStartIso: string): number {
   const windowStartMs = Date.parse(windowStartIso);
   if (!Number.isFinite(windowStartMs)) return REFRESH_INTERVAL_OLDER_MS;
   const weeksFromNow = Math.abs((Date.now() - windowStartMs) / WEEK_MS);
@@ -132,7 +132,7 @@ interface WindowRow {
  * range. Idempotent — no-op for rows that already exist. New weeks are
  * picked up automatically as time advances.
  */
-async function ensureWindowRowsExist(
+export async function ensureWindowRowsExist(
   orgId: string,
   userId: string,
   env: Env
@@ -265,7 +265,7 @@ interface ApiCalendarEvent extends OutlookEventLike {
  * Per-fetch AbortSignal, paginate via @odata.nextLink. Returns the
  * collected events. Throws on hard failure (caller decides retry).
  */
-async function fetchEventsForWindow(
+export async function fetchEventsForWindow(
   token: string,
   userId: string,
   windowStart: string,
@@ -346,6 +346,28 @@ async function markWindowCompleted(
   ).bind(eventsUpserted, windowId).run();
 }
 
+/**
+ * Phase 6.1 (2026-05-05): slim cousin of markWindowCompleted that only
+ * touches the LONG-LIVED columns (last_synced_at + events_upserted).
+ * The per-cycle columns (status, attempts, last_error, next_attempt_at,
+ * locked_until) are now legacy — work_queue tracks per-cycle state on
+ * its own rows. Called by calendarRefreshHandler after a successful
+ * fetch+upsert pass.
+ */
+export async function recordCalendarSyncSuccess(
+  windowId: string,
+  eventsUpserted: number,
+  env: Env
+): Promise<void> {
+  await env.D1.prepare(
+    `UPDATE calendar_progressive_backfill_windows
+        SET last_synced_at  = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            events_upserted = events_upserted + ?,
+            updated_at      = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(eventsUpserted, windowId).run();
+}
+
 /** Mark window for retry or dead-letter based on attempts. */
 async function markWindowFailed(
   windowId: string,
@@ -388,16 +410,30 @@ async function markWindowFailed(
 // ─── Public driver ────────────────────────────────────────────────────────
 
 /**
- * Drive calendar progressive backfill for one org. For each active user:
- *   1. Bootstrap rows for any missing weeks (idempotent).
- *   2. Pick MAX_WINDOWS_PER_USER_PER_TICK pickable windows.
- *   3. For each: refresh OAuth token, claim row (atomic state
- *      transition to in_progress), fetch /calendarView for that week,
- *      upsert events idempotently, mark completed.
- *   4. On error: increment attempts, schedule retry or dead-letter.
+ * Phase 6.1 (2026-05-05): the inline pick-and-sync loop has been
+ * replaced by a work_queue handler running on the minute tick (see
+ * src/lib/work-queue-handlers/calendar-refresh.ts). This function
+ * now does ONLY bootstrap — it ensures one window row per
+ * (user × week) exists in calendar_progressive_backfill_windows.
+ * The actual fetch/upsert work is enqueued separately by
+ * enqueueCalendarRefreshes (called every minute tick) and processed
+ * by the calendar_refresh handler at minute cadence.
  *
- * Returns the same CalendarSyncResult shape as fetchOutlookCalendarDelta
- * so the calling step in ingestion.ts requires no other edits.
+ * Net behavior change: hourly drain → minute drain (~60× faster
+ * healing for never-synced + stale-completed paths). graph circuit-
+ * breaker still gates per-page fetches; bursts above the breaker's
+ * cap auto-defer until the circuit closes.
+ *
+ * Return shape preserved for the ingestion workflow's calendar step:
+ * events_upserted=0 because no sync happens here. errors[] surfaces
+ * only per-user bootstrap failures + token-failure threshold skips
+ * (those are detected pre-bootstrap to mirror prior behavior).
+ *
+ * The pickNextWindow / claimWindow / markWindowCompleted /
+ * markWindowFailed helpers below are kept in source as dead code —
+ * they're unused after Phase 6.1 but preserved for revert. Drop in
+ * Phase 6.x or 7 once work_queue calendar handler has handled real
+ * traffic for several days.
  */
 export async function driveCalendarProgressiveBackfill(
   orgId: string,
@@ -407,8 +443,12 @@ export async function driveCalendarProgressiveBackfill(
   const users = await getActiveUsersForOrg(orgId, env);
 
   for (const user of users) {
-    // Skip users whose Outlook tokens have failed too many times — same
-    // gate the prior fetchOutlookCalendarDelta uses.
+    // Skip users whose Outlook tokens have failed too many times.
+    // Preserved here (vs leaving to the handler) so a permanently-
+    // broken-token user doesn't churn through bootstrap → enqueue →
+    // handler-fail → dead_letter on every tick. The handler also
+    // checks via refreshOutlookToken's success flag, but heading off
+    // the enqueue saves cycles.
     const failState = await env.KV.get<{ count: number }>(
       `token_failed:${user.id}:outlook`,
       'json'
@@ -428,85 +468,92 @@ export async function driveCalendarProgressiveBackfill(
         user_id: user.id,
         error: `bootstrap_failed: ${e instanceof Error ? e.message : String(e)}`,
       });
-      continue;
-    }
-
-    // Per-user token refresh once; reused for both window processings.
-    const refreshResult = await refreshOutlookToken(user.id, orgId, env);
-    if (!refreshResult.success) {
-      result.errors.push({ user_id: user.id, error: 'token_refresh_failed' });
-      continue;
-    }
-    let token: string;
-    try {
-      token = await getDecryptedAccessToken(user.id, env);
-    } catch {
-      result.errors.push({ user_id: user.id, error: 'token_decrypt_failed' });
-      continue;
-    }
-
-    // Process up to MAX_WINDOWS_PER_USER_PER_TICK pickable windows.
-    let processedThisUser = 0;
-    while (processedThisUser < MAX_WINDOWS_PER_USER_PER_TICK) {
-      const window = await pickNextWindow(orgId, user.id, env);
-      if (!window) break;
-
-      // Atomic claim. Two drivers may have picked the same row; only
-      // one will win the UPDATE.
-      const expectedStatus = window.status === 'pending' ? 'pending' : 'completed';
-      const claimed = await claimWindow(window.id, expectedStatus, env);
-      if (!claimed) {
-        // Another driver claimed it; try the next pickable row.
-        continue;
-      }
-
-      try {
-        const events = await fetchEventsForWindow(
-          token,
-          user.id,
-          window.window_start,
-          window.window_end,
-          orgId,
-          env
-        );
-
-        let upsertedThisWindow = 0;
-        for (const event of events) {
-          try {
-            await upsertOutlookEvent(event, orgId, env);
-            upsertedThisWindow++;
-          } catch (e) {
-            // Per-event upsert failure isn't fatal for the window;
-            // log and continue. Phase 0 dead-letter telemetry will
-            // surface this when wired.
-            console.error(
-              `[calendar-progressive] upsert failed for event=${event.id} user=${user.id}:`,
-              e
-            );
-          }
-        }
-
-        await markWindowCompleted(window.id, upsertedThisWindow, env);
-        result.events_upserted += upsertedThisWindow;
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        const newAttempts = window.attempts + 1;
-        await markWindowFailed(window.id, newAttempts, msg, env);
-
-        const httpMatch = msg.match(/HTTP (\d+)/);
-        const httpStatus = httpMatch ? parseInt(httpMatch[1], 10) : undefined;
-        result.errors.push({
-          user_id: user.id,
-          error: newAttempts >= MAX_ATTEMPTS
-            ? `dead_letter: ${msg}`
-            : `transient_retrying: ${msg}`,
-          ...(httpStatus !== undefined ? { http_status: httpStatus } : {}),
-        });
-      }
-
-      processedThisUser++;
     }
   }
 
   return result;
+}
+
+// ─── Phase 6.1: minute-tick scheduler ─────────────────────────────────────
+
+interface CalendarScanRow {
+  id: string;
+  org_id: string;
+  user_id: string;
+  window_start: string;
+  window_end: string;
+  last_synced_at: string | null;
+}
+
+/**
+ * Scan calendar_progressive_backfill_windows for rows that need work
+ * and enqueue work_queue rows for each. Runs on every minute tick
+ * (called from src/index.ts before processWorkQueueTick).
+ *
+ * "Needs work" means:
+ *   • last_synced_at IS NULL (never synced) — initial sync
+ *   • last_synced_at + refreshIntervalForWindow(window_start) < now
+ *     (refresh stale per the per-window 4h/24h policy)
+ *
+ * Status is intentionally NOT in the predicate. Legacy 'failed' rows
+ * from the pre-Phase-6.1 era will re-enqueue here and either succeed
+ * (if the failure was transient) or fail through work_queue's three-
+ * tier retry into work_queue:dead_letter (where they surface in
+ * System Status). This is a deliberate self-healing improvement —
+ * code changes that fix the underlying bug now heal old failed rows
+ * automatically.
+ *
+ * Idempotency_key = `${user_id}:${window_start}:${last_synced_at ?? 'init'}`.
+ *   • Fresh enqueues with the same key collapse via partial UNIQUE
+ *     on (domain, idempotency_key) — concurrent staleness scans
+ *     from overlapping ticks don't double-enqueue.
+ *   • After the handler completes a refresh, recordCalendarSyncSuccess
+ *     bumps last_synced_at; the next staleness scan computes a NEW
+ *     key (different last_synced_at suffix), so a fresh refresh row
+ *     enqueues cleanly without colliding with the prior completed
+ *     work_queue row.
+ *
+ * Subrequest cost: 1 SELECT (returns ~30 rows × N users in this org)
+ * + up to N enqueueWork calls. Steady state (most rows fresh): just
+ * the SELECT. Initial bootstrap or after a refresh-interval boundary:
+ * up to ~30 enqueueWork calls per user. Stays under per-tick budget.
+ */
+export async function enqueueCalendarRefreshes(
+  orgId: string,
+  env: Env
+): Promise<{ enqueued: number; scanned: number }> {
+  const rows = await env.D1.prepare(
+    `SELECT id, org_id, user_id, window_start, window_end, last_synced_at
+       FROM calendar_progressive_backfill_windows
+      WHERE org_id = ?`
+  ).bind(orgId).all<CalendarScanRow>();
+
+  if (rows.results.length === 0) return { enqueued: 0, scanned: 0 };
+
+  const { enqueueWork } = await import('./work-queue');
+  const now = Date.now();
+  let enqueued = 0;
+
+  for (const row of rows.results) {
+    const needsWork =
+      row.last_synced_at === null ||
+      Date.parse(row.last_synced_at) + refreshIntervalForWindow(row.window_start) < now;
+    if (!needsWork) continue;
+
+    const idempotencyKey = `${row.user_id}:${row.window_start}:${row.last_synced_at ?? 'init'}`;
+    const result = await enqueueWork(env, row.org_id, 'calendar_refresh',
+      {
+        window_id: row.id,
+        user_id: row.user_id,
+        window_start: row.window_start,
+        window_end: row.window_end,
+      },
+      {
+        upstream: 'graph',
+        idempotency_key: idempotencyKey,
+      }
+    );
+    if (result.inserted) enqueued++;
+  }
+  return { enqueued, scanned: rows.results.length };
 }
