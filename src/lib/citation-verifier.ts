@@ -97,11 +97,13 @@ async function judgeClaim(
   orgId: string,
   env: Env
 ): Promise<VerificationResult> {
+  // Caller (verifySampleClaims) skips claims with no excerpt; defensive
+  // guard here in case judgeClaim gets called from another path.
   if (!claim.sourceExcerpt) {
     return {
       verdict: 'error',
       confidence: 0,
-      rationale: '(no source excerpt available — pre-Wave-4 source or hydration miss)',
+      rationale: '(no source excerpt — verifier should have skipped upstream)',
     };
   }
   try {
@@ -159,6 +161,15 @@ export async function verifySampleClaims(
   // call is one fetch to the Anthropic gateway. 8 × ~400ms = ~3s wall, all
   // in waitUntil() background — never blocks the user.
   for (const claim of sampled) {
+    // Skip claims whose source has no excerpt to verify against. Contact /
+    // company / some-document source types don't populate `excerpt` (only
+    // email / slack / meeting / news / hydrated-document do, per Wave 4
+    // Phase C). Without an excerpt the judge has nothing to compare the
+    // claim against — writing 'error' rows pollutes the verdict-rate
+    // metric. Pure skip is the right call: sources we can't verify
+    // shouldn't appear in the dataset at all.
+    if (!claim.sourceExcerpt) continue;
+
     const result = await judgeClaim(claim, orgId, env);
     try {
       await env.D1.prepare(
@@ -172,7 +183,7 @@ export async function verifySampleClaims(
         orgId,
         claim.sourceId,
         claim.claimText.slice(0, 1000),
-        claim.sourceExcerpt ? claim.sourceExcerpt.slice(0, 1500) : null,
+        claim.sourceExcerpt.slice(0, 1500),
         result.verdict,
         result.confidence,
         result.rationale,
