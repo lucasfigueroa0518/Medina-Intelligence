@@ -122,12 +122,25 @@ export async function enqueueWork(
   // ON CONFLICT only triggers when idempotency_key is NOT NULL (the
   // partial unique index doesn't apply to NULL-key rows). Using
   // RETURNING to grab the row id without a follow-up read.
+  //
+  // Phase 6.1.1 fix (2026-05-05): the conflict target MUST reproduce
+  // the partial index's WHERE clause (`WHERE idempotency_key IS NOT
+  // NULL`), otherwise SQLite throws `ON CONFLICT clause does not
+  // match any PRIMARY KEY or UNIQUE constraint`. This was latent in
+  // Phase 5 — embed_retry's 21 prod rows came via migration 0084's
+  // INSERT OR IGNORE (different code path; handles partial indexes
+  // implicitly). Phase 6.1's calendar scheduler was the first code
+  // path to actually exercise enqueueWork's ON CONFLICT in prod.
+  // For NULL-keyed inserts, the WHERE clause's truthiness fails so
+  // the conflict target doesn't apply and the INSERT proceeds — the
+  // exact behavior we want for the "every NULL-key insert produces
+  // a fresh row" contract above.
   const inserted = await env.D1.prepare(
     `INSERT INTO work_queue
        (org_id, domain, payload, upstream, idempotency_key, priority,
         max_attempts, next_attempt_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(domain, idempotency_key) DO NOTHING
+     ON CONFLICT(domain, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
      RETURNING id`
   ).bind(
     orgId, domain, payloadJson, upstream, idempotencyKey,
