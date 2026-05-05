@@ -267,7 +267,15 @@ export async function recordHeartbeat(
 
 // ─── completeWork ──────────────────────────────────────────────────
 
-/** Final-success transition. Idempotent — no-op if already completed. */
+/**
+ * Final-success transition. Phase 6.2 (2026-05-05): added
+ * `WHERE status = 'in_progress'` so a handler that manually
+ * transitioned the row out of in_progress (via deadLetterWork or
+ * deferWork) doesn't get overwritten by the driver's terminal
+ * completeWork call. Without the filter, the substrate's "Domain may
+ * have already transitioned via deadLetterWork" comment in the driver
+ * was aspirational, not enforced.
+ */
 export async function completeWork(env: Env, id: string): Promise<void> {
   await env.D1.prepare(
     `UPDATE work_queue
@@ -275,8 +283,44 @@ export async function completeWork(env: Env, id: string): Promise<void> {
             completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
             locked_until = NULL,
             last_error   = NULL
-      WHERE id = ?`
+      WHERE id = ? AND status = 'in_progress'`
   ).bind(id).run();
+}
+
+// ─── deferWork ─────────────────────────────────────────────────────
+
+/**
+ * Phase 6.2 (2026-05-05): defer a still-progressing row back to
+ * 'pending' with a future next_attempt_at, WITHOUT counting against
+ * the attempt budget. Use case: a domain handler that wants to
+ * checkpoint partial progress (via payloadJson) and schedule a
+ * specific resume time, distinct from the failure path's 3-tier
+ * backoff.
+ *
+ * Firefly's `paused` per-window state is the motivating example:
+ * Firefly API rate limit hit mid-window → defer to next UTC
+ * midnight, preserve `last_skip` resume cursor in payload, do NOT
+ * burn an attempt (rate-limit pauses can recur many times during
+ * a long backfill).
+ *
+ * The companion completeWork's `WHERE status = 'in_progress'`
+ * filter ensures the driver's terminal call after handler returns
+ * is a no-op — this row already moved back to 'pending'.
+ */
+export async function deferWork(
+  env: Env,
+  id: string,
+  nextAttemptAt: string,
+  payloadJson: string
+): Promise<void> {
+  await env.D1.prepare(
+    `UPDATE work_queue
+        SET status          = 'pending',
+            next_attempt_at = ?,
+            locked_until    = NULL,
+            payload         = ?
+      WHERE id = ? AND status = 'in_progress'`
+  ).bind(nextAttemptAt, payloadJson, id).run();
 }
 
 // ─── failWork ──────────────────────────────────────────────────────
@@ -323,6 +367,10 @@ export async function failWork(
     // Dead-letter: terminal. last_error preserved for forensics. The
     // operator resets to 'pending' via admin endpoint to reattempt
     // (separate phase; no reset endpoint in 5).
+    //
+    // Phase 6.2 (2026-05-05): added `AND status = 'in_progress'` so a
+    // handler that already self-transitioned (deadLetterWork or
+    // deferWork before throwing) isn't re-mutated by this path.
     const updated = await env.D1.prepare(
       `UPDATE work_queue
           SET status       = 'dead_letter',
@@ -330,7 +378,7 @@ export async function failWork(
               last_error   = ?,
               completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
               locked_until = NULL
-        WHERE id = ?
+        WHERE id = ? AND status = 'in_progress'
         RETURNING *`
     ).bind(nextAttempt, errorMessage, id).first<WorkQueueRow>();
     return updated ?? null;
@@ -350,7 +398,7 @@ export async function failWork(
             last_error      = ?,
             next_attempt_at = ?,
             locked_until    = NULL
-      WHERE id = ?
+      WHERE id = ? AND status = 'in_progress'
       RETURNING *`
   ).bind(nextAttempt, errorMessage, nextAttemptAt, id).first<WorkQueueRow>();
   return updated ?? null;
@@ -363,6 +411,10 @@ export async function failWork(
  * (e.g. malformed payload, unrecoverable upstream 4xx) that shouldn't
  * be retried regardless of attempt count. Sets status='dead_letter' and
  * preserves the error message.
+ *
+ * Phase 6.2 (2026-05-05): added `AND status = 'in_progress'` so this
+ * is idempotent if the row was already transitioned out (e.g. via the
+ * watchdog).
  */
 export async function deadLetterWork(
   env: Env,
@@ -376,7 +428,7 @@ export async function deadLetterWork(
             last_error   = ?,
             completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
             locked_until = NULL
-      WHERE id = ?`
+      WHERE id = ? AND status = 'in_progress'`
   ).bind(errorMessage, id).run();
 }
 
