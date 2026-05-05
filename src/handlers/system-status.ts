@@ -23,8 +23,10 @@ import {
   type DeadLetterRow,
   type StuckTaskRunRow,
   type BudgetSnapshotRow,
+  type StuckWorkQueueRow,
 } from '../lib/system-status';
 import type { FireflyKeyStatus } from '../lib/firefly-credentials';
+import type { WorkQueueDomainCount } from '../lib/work-queue';
 
 export interface SystemStatusActiveTask {
   type: string;                  // human-readable
@@ -75,6 +77,16 @@ export interface SystemStatusResponse {
   // section" disabled-state logic and gives operators visibility into
   // which users have keys.
   firefly_credentials: FireflyKeyStatus[];
+  // Phase 5 1b (2026-05-05): universal work_queue surface.
+  //   • work_queue_inventory — per-(domain,status) counts; drives the
+  //     Settings UI's "Work Queue" panel landing in 1c.
+  //   • stuck_work_queue — in_progress rows with stale heartbeat;
+  //     surfaced ahead of the watchdog sweep so degraded handlers
+  //     don't disappear silently into the retry loop.
+  // dead_letter already absorbs work_queue:dead_letter rows (no
+  // separate field needed; getDeadLetterItems handles the merge).
+  work_queue_inventory: WorkQueueDomainCount[];
+  stuck_work_queue: StuckWorkQueueRow[];
   generated_at: string;
 }
 
@@ -250,6 +262,8 @@ export async function getSystemStatus(
     stuck_runs: snapshot.stuck_runs,
     budgets: snapshot.budgets,
     firefly_credentials: snapshot.firefly_credentials,
+    work_queue_inventory: snapshot.work_queue_inventory,
+    stuck_work_queue: snapshot.stuck_work_queue,
     generated_at: new Date().toISOString(),
   } satisfies SystemStatusResponse);
 }

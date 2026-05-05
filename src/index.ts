@@ -935,6 +935,46 @@ async function handleScheduled(
           catch (e) { console.error(`firefly progressive backfill drive failed for ${org.id}:`, e); }
         })());
 
+        // Phase 5 1b (2026-05-05) — Universal Work Queue driver.
+        //
+        // Runs every minute tick. With Phase 5's empty handler registry
+        // this is a live skeleton: the watchdog sweep runs (cheap; one
+        // SELECT for in_progress + expired-lock rows; usually zero) and
+        // the per-handler loop is a no-op. First real work appears when
+        // Phase 5.1+ pilots a domain (e.g. embed_retry) by appending to
+        // WORK_QUEUE_HANDLERS in src/lib/work-queue-driver.ts.
+        //
+        // SUBREQUEST BUDGET when domains plug in:
+        //   • CF cap is 1000 subrequests per worker invocation. This
+        //     minute tick already spends ~5–10 subrequests on
+        //     enrichment + daily gates plus the two progressive-backfill
+        //     drivers above. Workflow creates and D1 reads here count
+        //     toward the same cap.
+        //   • Each registered domain handler must keep its per-tick
+        //     batch ≤ 10 items AND total subrequest spend ≤ ~50 to
+        //     leave headroom for sibling minute-tick work. Heavier
+        //     domains run on a less frequent cadence (handler.cadence
+        //     = 'hour' — advisory today; wired in 5.1+ when needed)
+        //     or chunk via next_attempt_at scheduling.
+        //   • The driver itself spends 1 D1 read (open-circuit set) +
+        //     1 UPDATE…RETURNING per domain claim + N writes per
+        //     processed item. Sweep is one SELECT plus one write per
+        //     reclaimed row. Stays well under the cap.
+        //
+        // waitUntil wraps the call so a slow tick doesn't block the
+        // sibling progressive drivers' completion. Errors are caught
+        // INSIDE processWorkQueueTick (per-handler isolation); the
+        // outer try/catch here is defensive against driver-level
+        // throws (e.g. import failure).
+        ctxExec.waitUntil((async () => {
+          try {
+            const { processWorkQueueTick } = await import('./lib/work-queue-driver');
+            await processWorkQueueTick(env);
+          } catch (e) {
+            console.error(`work-queue tick failed for ${org.id}:`, e);
+          }
+        })());
+
         // Phase 2 (2026-05-04): cron consolidation 4 → 2. The dedicated
         // `5 * * * *` and `0 0 * * *` triggers were removed from
         // wrangler.toml to eliminate the 4-trigger CF dispatch fragility
