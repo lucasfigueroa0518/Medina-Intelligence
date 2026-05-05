@@ -321,6 +321,15 @@ export async function retrieveContext(
 
   // Doc-type-aware secondary queries: if the query mentions specific
   // document types, run targeted filtered queries and merge results.
+  // Track which chunks came from targeted queries — downstream rerank
+  // bypasses the 0.20 recency floor for them and reserves dedicated
+  // slots so they're not crowded out by the broad query's higher-
+  // scoring semantic neighbors. Audit 2026-05-05 (post-chunk-1):
+  // Tony's "summarize recent slack conversations" query lost its 96
+  // Slack chunks because the broad-query email matches dominated the
+  // top-10 rerank window even when the targeted secondary query did
+  // surface real Slack content.
+  const targetedIds = new Set<string>();
   const docTypes = detectDocTypes(pq.originalQuery);
   if (docTypes.length > 0) {
     const seen = new Set(internalMatches.map(m => m.id));
@@ -339,6 +348,7 @@ export async function retrieveContext(
         if (!seen.has(m.id)) {
           seen.add(m.id);
           internalMatches.push(m);
+          targetedIds.add(m.id);
         }
       }
     }
@@ -370,7 +380,7 @@ export async function retrieveContext(
     .filter(m => m.score >= 0.55);
 
   const { chunks: hydrated } = await hydrateChunks(filtered.slice(0, hydrateLimit), env);
-  let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env);
+  let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env, targetedIds);
 
   const rerankedLimit = options.deepDive ? 20 : 10;
   if (pq.entityIds.length > 0) {
@@ -472,7 +482,16 @@ export async function crossEncoderRerank(
   chunks: HydratedChunk[],
   query: string,
   orgId: string,
-  env: Env
+  env: Env,
+  // Vector ids of chunks that came from the doc-type-targeted secondary
+  // query in retrieveContext (or from a recall() tool call with explicit
+  // source_types). Targeted chunks bypass the recency floor and get
+  // dedicated reserved slots in the final top-10. Without this, short
+  // Slack messages and the like get cut by the floor or crowded out by
+  // higher-scoring semantic-neighbor email matches in the broad query
+  // — the audit-2026-05-05 regression after chunk 1 shipped the floor.
+  // Pass undefined / empty Set when caller wants pre-2026-05-05 behavior.
+  targetedIds?: Set<string>
 ): Promise<HydratedChunk[]> {
   if (chunks.length <= 3) return chunks;
 
@@ -534,9 +553,42 @@ export async function crossEncoderRerank(
     // floor, most/all of those emails would have been cut and SOURCES
     // would be empty or near-empty — driving the model to the honest
     // "no Slack messages found" answer.
-    const finalChunks = recencyOn
-      ? scored.filter(s => s.score >= 0.20).slice(0, 10).map(x => x.chunk)
-      : scored.slice(0, 10).map(x => x.chunk);
+    //
+    // Audit 2026-05-05 (post-chunk-1): the 0.20 floor over-cut short-text
+    // sources (Slack messages). When the user explicitly asked for a
+    // source type, the targeted secondary query DID surface real Slack
+    // chunks but they scored low in cross-encoder rerank (short text vs
+    // verbose query) AND got cut by the floor. The fix splits scoring:
+    //   - Targeted chunks (came from a doc-type-filtered secondary query)
+    //     bypass the recency floor — the user asked for them by type;
+    //     they passed the cosine 0.55 cutoff already; that's enough.
+    //   - Broad chunks still hit the floor — anti-fabrication preserved
+    //     for queries where source-type wasn't explicit.
+    //   - Targeted chunks get dedicated reserved slots so they're not
+    //     crowded out by broad's higher-scoring semantic neighbors.
+    const TOTAL_SLOTS = 10;
+    const TARGETED_RESERVE = 5;
+    const targeted = targetedIds && targetedIds.size > 0
+      ? scored.filter(s => targetedIds.has((s.chunk as any).id))
+      : [];
+    const broad = targeted.length > 0
+      ? scored.filter(s => !targetedIds!.has((s.chunk as any).id))
+      : scored;
+    const broadFloored = recencyOn
+      ? broad.filter(s => s.score >= 0.20)
+      : broad;
+
+    let finalChunks: HydratedChunk[];
+    if (targeted.length > 0) {
+      const targetedTake = Math.min(targeted.length, TARGETED_RESERVE);
+      const broadTake = TOTAL_SLOTS - targetedTake;
+      finalChunks = [
+        ...targeted.slice(0, targetedTake).map(x => x.chunk),
+        ...broadFloored.slice(0, broadTake).map(x => x.chunk),
+      ];
+    } else {
+      finalChunks = broadFloored.slice(0, TOTAL_SLOTS).map(x => x.chunk);
+    }
 
     return finalChunks;
   } catch (e) {

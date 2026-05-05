@@ -1,5 +1,5 @@
 import type { Env } from '../types/env';
-import type { AuthContext } from '../types/interfaces';
+import type { AgentSession, AuthContext } from '../types/interfaces';
 import { emitAudit } from './audit';
 import { invalidateRagCache } from './cache';
 import { findDuplicateCompany } from './discovery';
@@ -13,6 +13,8 @@ import {
   type WriteContext,
 } from './entity-writes';
 import { linkConversationToDeal, linkEventToDeal } from './deal-association';
+import { preprocessQuery, retrieveContext } from './retrieval';
+import { buildSourcesAndContext } from './citations';
 
 // ACL redaction: nulls fields whose value may have been derived from private
 // conversation content (LLM-extracted topics, auto-populated deal notes,
@@ -314,6 +316,96 @@ export async function searchDeals(
   );
 
   return { deals, count: deals.length };
+}
+
+// recall — semantic retrieval tool exposed to MARTy for in-loop information
+// gathering. Routes through preprocessQuery + retrieveContext + the citations
+// hydrator, then optionally post-filters by source.type.
+//
+// Why a tool, when retrieveContext already runs pre-Claude in agent.ts:827?
+//
+// The pre-Claude run primes a single SOURCES list from the user's raw query.
+// When that fails to surface a source type the user explicitly asked about
+// (e.g. "summarize recent slack conversations" → broad query returns Slack-
+// themed emails, secondary doc-type query under-ranked), MARTy is stuck —
+// no way to retry with a different query phrasing or scope. This tool gives
+// Claude the iterative ability the prompt now requires:
+//   - Empty SOURCES for an asked-for type → call recall(query, source_types=[type])
+//   - Need to dig deeper on a specific entity → call recall("entity name", ...)
+//   - Cross-check before answering "no data" → call recall first
+//
+// Post-hydration filter on source.type is the structural-correctness lever:
+// even if Vectorize metadata-index drift hides pre-2026-04-27 vectors from
+// document_type-filtered queries, the broad query still returns chunks
+// whose D1 source is 'slack' / 'firefly' etc., and the post-hydration
+// filter rescues them. (Audit 2026-05-05 surfaced this drift class.)
+export async function recall(
+  ctx: AuthContext,
+  input: {
+    query: string;
+    source_types?: Array<'email' | 'slack' | 'meeting' | 'document'>;
+    limit?: number;
+  },
+  env: Env
+): Promise<any> {
+  if (!input.query || input.query.trim().length === 0) {
+    return { sources: [], count: 0, message: 'recall: query is required' };
+  }
+
+  // Minimal AgentSession for preprocessQuery / retrieveContext. The retrieval
+  // layer reads org_id, user_id, user_role; the rest is decorative. Synthesizing
+  // here avoids requiring callers (the agent dispatcher) to thread the live
+  // session through every tool call.
+  const session: AgentSession = {
+    id: `recall-${ctx.userId}-${Date.now()}`,
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    user_role: ctx.userRole,
+    turn_count: 0,
+    last_activity_at: new Date().toISOString(),
+    created_at: new Date().toISOString(),
+  };
+
+  const pq = await preprocessQuery(input.query, session, env, {});
+  const result = await retrieveContext(pq, env, {});
+
+  const { sources } = await buildSourcesAndContext(
+    result.internal,
+    result.news,
+    undefined,
+    ctx.orgId,
+    env,
+    input.query
+  );
+
+  // Post-hydration source-type filter — applied AFTER D1 enrichment
+  // (citations.ts maps row.source='slack' → source.type='slack'), so it
+  // bypasses any Vectorize metadata-index drift that would have hidden
+  // chunks from a document_type-filtered query. This is the structural
+  // immunity property the audit identified.
+  let filtered = sources;
+  if (input.source_types && input.source_types.length > 0) {
+    const wanted = new Set(input.source_types);
+    filtered = sources.filter(s => wanted.has(s.type as any));
+  }
+
+  const limit = Math.min(Math.max(input.limit ?? 20, 1), 50);
+  const trimmed = filtered.slice(0, limit);
+
+  return {
+    count: trimmed.length,
+    sources: trimmed.map(s => ({
+      type: s.type,
+      title: s.title,
+      subtitle: s.subtitle,
+      date: s.date,
+      excerpt: s.excerpt,
+      citation_marker: `[^${s.id}]`,
+    })),
+    note: filtered.length > limit
+      ? `Showing top ${limit} of ${filtered.length} matches.`
+      : undefined,
+  };
 }
 
 // ACL redaction: For non-owner users, contact-level fields derived from

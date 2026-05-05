@@ -14,6 +14,7 @@ import { estimateTokens, truncateToTokens } from '../lib/tokens';
 import { emitAudit } from '../lib/audit';
 import {
   searchContacts, searchCompanies, searchDeals, searchConversations,
+  recall,
   getContactDetail, getCompanyDetail, getDealDetail,
   createContactTool, updateContactTool,
   createCompanyTool, updateCompanyTool,
@@ -42,6 +43,25 @@ import {
 // ---------------------------------------------------------------------------
 
 const AGENT_TOOLS: ToolDefinition[] = [
+  // PRIMARY RETRIEVAL — call this FIRST for any content question
+  {
+    name: 'recall',
+    description: 'Semantic search across the firm intelligence — emails, Slack messages, meeting transcripts, documents, contacts, companies. THIS IS YOUR PRIMARY TOOL for any question about CRM content. Always call this FIRST when the user asks about communications, meetings, history, what was discussed, who said what, or any specific person/company/deal context. The pre-populated SOURCES list at the top of context is just the initial framing — call recall to dig deeper, retrieve a specific source type, or recover when SOURCES looks empty for an asked-for type. Examples: "what\'s been happening on Slack" → recall("recent slack activity", source_types=["slack"]). "summarize the NeuralSeek meeting" → recall("NeuralSeek meeting", source_types=["meeting"]). "find Patrick\'s pitch emails" → recall("Patrick Dyer pitch", source_types=["email"]).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural-language search query. Be specific.' },
+        source_types: {
+          type: 'array',
+          items: { type: 'string', enum: ['email', 'slack', 'meeting', 'document'] },
+          description: 'Filter to specific source types. Use this when the user asked about a specific channel (Slack, email, meetings, docs). Default: all types.',
+        },
+        limit: { type: 'number', description: 'Max results. Default 20, max 50.' },
+      },
+      required: ['query'],
+    },
+  },
+
   // READ TOOLS
   {
     name: 'search_contacts',
@@ -509,6 +529,7 @@ async function executeTool(
     case 'search_companies': return searchCompanies(ctx, toolInput, env);
     case 'search_deals': return searchDeals(ctx, toolInput, env);
     case 'search_conversations': return searchConversations(ctx, toolInput, env);
+    case 'recall': return recall(ctx, toolInput, env);
     case 'get_contact_detail': return getContactDetail(ctx, toolInput.contact_id, env);
     case 'get_company_detail': return getCompanyDetail(ctx, toolInput.company_id, env);
     case 'get_deal_detail': return getDealDetail(ctx, toolInput.deal_id, env);
