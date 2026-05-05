@@ -67,7 +67,13 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await calculateAllRelationshipOwners(orgId, env); } catch (e) { console.error('Relationship owner calc:', e); }
   try { await analyzeAllCommsPatterns(orgId, env); } catch (e) { console.error('Comms patterns calc:', e); }
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
-  try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
+  // Phase 8 1a (2026-05-05): backfillUnembeddedConversations replaced
+  // by enqueueBackfillConversations — inline embed loop migrated to
+  // work_queue domain='embed_retry' for ledger integration + idempotency.
+  // backfillUnembeddedEntities stays in-place (different handler shape:
+  // calls embedContactBio/embedCompanyDescription, not chunkEmbedAndPersistAll;
+  // backlog has been zero in production — not worth migrating).
+  try { await enqueueBackfillConversations(orgId, env); } catch (e) { console.error('Conversation embed enqueue:', e); }
   try { await backfillUnembeddedEntities(orgId, env); } catch (e) { console.error('Entity backfill:', e); }
   // Phase 7c (2026-05-05): backfillUnembeddedEvents removed from
   // daily-cron orchestration. T4's hotfix wired it both hourly
@@ -530,6 +536,133 @@ export async function checkWebhookHealth(orgId: string, env: Env): Promise<void>
   }
 }
 
+// Phase 8 1a (2026-05-05) — embed self-heal trio onto work_queue.
+//
+// enqueueBackfillConversations + enqueueBackfillEvents replace
+// backfillUnembeddedConversations + backfillUnembeddedEvents in the
+// hourly self-heal + daily-cron call sites. The legacy functions stay
+// exported for revert window (Phase 8 1b removes them after ~5 days
+// of stable operation) and as the manual-trigger admin endpoint
+// fallback (handlers/admin.ts:622 — separate scope; potential 1c/1b).
+//
+// Behavior shift:
+//   • OLD: scan NOT-EXISTS, fetch text inline, call chunkEmbedAndPersistAll,
+//          INSERT vector_entity_index. Bypasses upstream_budget_ledger
+//          (audit finding G). Hourly cadence (50/hr events, 200/hr conv).
+//   • NEW: scan NOT-EXISTS, enqueue per-row into work_queue (domain
+//          'embed_retry'). The existing embed_retry handler (Phase 6 1a)
+//          dispatches to embedSingleItem at minute-tick × batchSize=10
+//          → 14,400/day capacity. ledger integration via upstream='bge'
+//          on the row + claimNextBatch's open-circuit filter. Audit
+//          findings G + H both resolved.
+//
+// Idempotency: keys mirror Phase 6 1a's three existing enqueue sites
+// exactly (`${orgId}:${entity_id}:${source_table}`). Concurrent scans
+// (e.g. hourly + a hypothetical second trigger) collapse cleanly via
+// the partial UNIQUE on (domain, idempotency_key) — same gap detected
+// twice produces ONE work_queue row.
+//
+// embedSingleItem (events branch) was updated in 1a-i to mirror
+// backfillUnembeddedEvents's T4 ACL logic (transcript-backed events
+// with internal attendees → private + participant_user_ids). Without
+// this fix, Phase 8 would silently regress 71 Outlook-with-transcript
+// vectors from 'private' → 'org_wide' on re-embed.
+
+/**
+ * Phase 8 1a: scan conversations missing from vector_entity_index and
+ * enqueue per-row into work_queue (domain='embed_retry'). Best-effort
+ * per-row enqueue with try/catch — a partial scan failure doesn't
+ * abort the loop; next tick re-scans.
+ */
+export async function enqueueBackfillConversations(orgId: string, env: Env): Promise<number> {
+  const { enqueueWork } = await import('./work-queue');
+  const rows = await env.D1.prepare(
+    `SELECT c.id
+       FROM conversations c
+       WHERE c.org_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM vector_entity_index vei
+            WHERE vei.source_table = 'conversations'
+              AND vei.entity_id = c.id
+         )
+       ORDER BY c.sent_at DESC
+       LIMIT 200`
+  ).bind(orgId).all<{ id: string }>();
+  if (rows.results.length === 0) return 0;
+
+  let enqueued = 0;
+  for (const row of rows.results) {
+    try {
+      await enqueueWork(env, orgId, 'embed_retry',
+        { entity_id: row.id, source_table: 'conversations' },
+        {
+          upstream: 'bge',
+          idempotency_key: `${orgId}:${row.id}:conversations`,
+        }
+      );
+      enqueued++;
+    } catch (e) {
+      console.error(`[daily-cron:enqueueBackfillConversations] failed for ${row.id}:`, e instanceof Error ? e.message : e);
+    }
+  }
+  if (enqueued > 0) {
+    console.log(`[daily-cron] enqueued ${enqueued} conversation embed-retry rows for org ${orgId}`);
+  }
+  return enqueued;
+}
+
+/**
+ * Phase 8 1a: scan events missing from vector_entity_index and enqueue
+ * per-row. Mirror's enqueueBackfillConversations exactly with events as
+ * the source_table. The handler's events branch (embedSingleItem,
+ * updated 1a-i) handles the T4 ACL logic.
+ */
+export async function enqueueBackfillEvents(orgId: string, env: Env): Promise<number> {
+  const { enqueueWork } = await import('./work-queue');
+  const rows = await env.D1.prepare(
+    `SELECT id FROM events
+       WHERE org_id = ?
+         AND deleted_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM vector_entity_index vei
+            WHERE vei.source_table = 'events'
+              AND vei.entity_id = events.id
+              AND vei.org_id = events.org_id
+         )
+       ORDER BY start_time DESC
+       LIMIT 50`
+  ).bind(orgId).all<{ id: string }>();
+  if (rows.results.length === 0) return 0;
+
+  let enqueued = 0;
+  for (const row of rows.results) {
+    try {
+      await enqueueWork(env, orgId, 'embed_retry',
+        { entity_id: row.id, source_table: 'events' },
+        {
+          upstream: 'bge',
+          idempotency_key: `${orgId}:${row.id}:events`,
+        }
+      );
+      enqueued++;
+    } catch (e) {
+      console.error(`[daily-cron:enqueueBackfillEvents] failed for ${row.id}:`, e instanceof Error ? e.message : e);
+    }
+  }
+  if (enqueued > 0) {
+    console.log(`[daily-cron] enqueued ${enqueued} event embed-retry rows for org ${orgId}`);
+  }
+  return enqueued;
+}
+
+/**
+ * @deprecated Phase 8 1a (2026-05-05) — replaced by enqueueBackfillConversations.
+ * Inline embedding bypasses upstream_budget_ledger (audit finding G).
+ * Kept exported for revert window; deleted in 1b after ~5 days of
+ * stable operation. Manual-trigger admin endpoint at
+ * handlers/admin.ts:622 still calls this; that endpoint moves to the
+ * enqueuer pattern in 1b/1c.
+ */
 export async function backfillUnembeddedConversations(orgId: string, env: Env): Promise<number> {
   const { chunkEmbedAndPersistAll, resolvePrimaryEntityId } = await import('./embedding');
 
@@ -723,6 +856,12 @@ export async function backfillUnembeddedEntities(orgId: string, env: Env): Promi
 //
 // Drain projection: 1,069 stranded events / 50 per hour ≈ 22 hours to
 // fully clear. NOT EXISTS filter naturally advances each run.
+/**
+ * @deprecated Phase 8 1a (2026-05-05) — replaced by enqueueBackfillEvents.
+ * Inline embedding bypasses upstream_budget_ledger (audit finding G).
+ * Kept exported for revert window; deleted in 1b after ~5 days of
+ * stable operation.
+ */
 export async function backfillUnembeddedEvents(orgId: string, env: Env): Promise<number> {
   const { chunkEmbedAndPersistAll } = await import('./embedding');
 
@@ -1150,20 +1289,54 @@ export async function embedSingleItem(
     }>();
     if (!row) return 'missing';
 
-    let text = row.summary || row.title || '';
+    let text = '';
     let r2Key = '';
+    let isTranscript = false;
     if (row.transcript_r2_key) {
       const obj = await env.R2.get(row.transcript_r2_key);
       if (obj) {
         text = await obj.text();
         r2Key = row.transcript_r2_key;
+        isTranscript = true;
       }
+    }
+    if (!isTranscript) {
+      const titleText = (row.title || '').trim();
+      const summaryText = (row.summary || '').trim();
+      text = summaryText
+        ? (titleText ? `${titleText}\n\n${summaryText}` : summaryText)
+        : titleText;
     }
     if (!text || text.trim().length < 10) return 'missing';
 
+    // Phase 8 1a (2026-05-05): events ACL — mirror
+    // backfillUnembeddedEvents's T4 hotfix logic. Transcript-backed
+    // events with internal user attendees get visibility='private' +
+    // participant_user_ids; calendar-only events stay 'org_wide'. This
+    // closes the 71-Outlook-with-transcript subgap so reconciled
+    // events get the SAME ACL their Firefly twin would have. Pre-Phase-8,
+    // embedSingleItem hardcoded 'org_wide' for all events — meaning any
+    // event re-embedded via the embed_retry handler would silently
+    // regress its ACL. Phase 8's enqueuer migration depends on this
+    // correctness fix shipping in the same sub-stage.
+    let visibility: 'private' | 'org_wide' = 'org_wide';
+    let participantUserIds: string | undefined = undefined;
+    if (isTranscript) {
+      const attendees = await env.D1.prepare(
+        `SELECT user_id FROM event_attendees
+           WHERE event_id = ? AND user_id IS NOT NULL`
+      ).bind(row.id).all<{ user_id: string }>();
+      const internalIds = attendees.results.map(a => a.user_id).filter(Boolean);
+      if (internalIds.length > 0) {
+        visibility = 'private';
+        participantUserIds = internalIds.join(',');
+      }
+    }
+
     const entries = await chunkEmbedAndPersistAll(text, {
       org_id: orgId,
-      visibility: 'org_wide',
+      visibility,
+      participant_user_ids: participantUserIds,
       document_type: 'transcript',
       source_table: 'events',
       source_id: row.id,
