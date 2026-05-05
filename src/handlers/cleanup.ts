@@ -264,7 +264,14 @@ export async function cleanupD1Phase2(
   }
 
   // 2d — satellite cleanup for dangling docs (run BEFORE 2e and BEFORE Phase 4
-  //      so document_links / embed_retry_queue don't reference soon-deleted rows)
+  //      so document_links / embed_retry_queue / work_queue don't reference
+  //      soon-deleted rows)
+  //
+  // Phase 6 1b (2026-05-05): added a sibling DELETE against work_queue for
+  // the migrated embed_retry domain. The legacy embed_retry_queue DELETE is
+  // preserved (table kept around as revert artifact per Lucas 2026-05-05);
+  // both run, both contribute to stats. Once embed_retry_queue is dropped
+  // in Phase 6.x or 7, the legacy block deletes itself.
   {
     const r1 = await env.D1.prepare(
       `DELETE FROM document_links
@@ -283,8 +290,23 @@ export async function cleanupD1Phase2(
                AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = d.conversation_id)
           )`
     ).run();
+    // Same orphan filter, applied to the work_queue embed_retry domain.
+    // payload is JSON; json_extract pulls out source_table + entity_id.
+    // No index assist on json_extract here — acceptable for cleanup-tier
+    // work that runs once per cleanup invocation, not in a hot path.
+    const r3 = await env.D1.prepare(
+      `DELETE FROM work_queue
+        WHERE domain = 'embed_retry'
+          AND json_extract(payload, '$.source_table') = 'documents'
+          AND json_extract(payload, '$.entity_id') IN (
+            SELECT d.id FROM documents d
+             WHERE d.source = 'email_attachment'
+               AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = d.conversation_id)
+          )`
+    ).run();
     stats['2d_document_links_deleted'] = r1.meta.changes ?? 0;
     stats['2d_embed_retry_queue_deleted'] = r2.meta.changes ?? 0;
+    stats['2d_work_queue_embed_retry_deleted'] = r3.meta.changes ?? 0;
   }
 
   // 2e — chunked DELETE FROM vector_entity_index until changes=0.

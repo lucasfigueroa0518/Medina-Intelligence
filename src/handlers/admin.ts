@@ -9,7 +9,12 @@ import { runHistoricalBackfill, getUserSyncConfig, setUserSyncConfig, type Backf
 import { runDailyCron } from '../lib/daily-cron';
 import { triggerCompanyEnrichment, isDomainShapedName } from '../lib/enrichment';
 import { rebuildEntityIndex } from '../lib/entity-index';
-import { processEmbedRetryQueue } from '../lib/daily-cron';
+// Phase 6 1b (2026-05-05): processEmbedRetryQueue still exists in
+// daily-cron.ts as dead code preserved for the revert window, but the
+// admin endpoints no longer call it directly — they proxy to the
+// universal work-queue tick which iterates every registered domain
+// (currently only embed_retry; future pilots transparently included).
+import { processWorkQueueTick } from '../lib/work-queue-driver';
 import { parseParticipantUserIds } from '../lib/helpers';
 import {
   createProgressiveBackfill as libCreateProgressiveBackfill,
@@ -942,9 +947,16 @@ export async function invalidateStaleCalendarTokens(
 
 // On-demand embed retry queue drain (audit 2026-04-28 scale-up Fix 3).
 //
-// The daily cron also drains this queue, but during a bulk ingestion it's
-// useful to process it immediately rather than waiting overnight. Owner-only
-// because successive drains burn Workers AI quota.
+// Originally drained embed_retry_queue directly. Phase 6 1b (2026-05-05)
+// repurposed as a thin proxy to processWorkQueueTick — preserves the
+// operator surface for forced drains during bulk ingestion windows
+// (per Lucas 2026-05-05) while routing through the canonical Phase 5
+// driver. Now triggers EVERY registered domain handler in one tick,
+// not just embed_retry — future pilots are transparently included.
+//
+// The before/after snapshot now reads work_queue counts for the
+// embed_retry domain specifically so the response shape stays
+// recognizable to existing operator tooling.
 export async function processEmbedQueue(
   ctx: AuthContext,
   env: Env
@@ -953,22 +965,22 @@ export async function processEmbedQueue(
     return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can process the embed queue.');
   }
 
-  // Pre-drain snapshot for the response so the caller sees what was queued.
-  const before = await env.D1.prepare(
-    `SELECT status, COUNT(*) as n FROM embed_retry_queue WHERE org_id = ? GROUP BY status`
-  ).bind(ctx.orgId).all<{ status: string; n: number }>();
+  const beforeQuery = `SELECT status, COUNT(*) as n FROM work_queue
+                        WHERE org_id = ? AND domain = 'embed_retry'
+                        GROUP BY status`;
+  const before = await env.D1.prepare(beforeQuery).bind(ctx.orgId)
+    .all<{ status: string; n: number }>();
 
-  const result = await processEmbedRetryQueue(ctx.orgId, env);
+  const tick = await processWorkQueueTick(env);
 
-  const after = await env.D1.prepare(
-    `SELECT status, COUNT(*) as n FROM embed_retry_queue WHERE org_id = ? GROUP BY status`
-  ).bind(ctx.orgId).all<{ status: string; n: number }>();
+  const after = await env.D1.prepare(beforeQuery).bind(ctx.orgId)
+    .all<{ status: string; n: number }>();
 
   return jsonResponse({
     ok: true,
     before: Object.fromEntries(before.results.map(r => [r.status, r.n])),
     after: Object.fromEntries(after.results.map(r => [r.status, r.n])),
-    drain: result,
+    drain: tick,
   });
 }
 
@@ -1039,27 +1051,46 @@ export async function getProgressiveBackfillHandler(
 }
 
 // GET — for System Status to show pending / failed counts without a drain.
+//
+// Phase 6 1b (2026-05-05): repurposed to query work_queue WHERE
+// domain='embed_retry'. Response shape preserved for existing tooling.
+// The legacy 'failed_permanent' status maps to work_queue's 'dead_letter';
+// we surface the dead_letter rows under the legacy key for shape parity.
 export async function getEmbedQueueHealth(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
   const counts = await env.D1.prepare(
     `SELECT status, COUNT(*) as n,
-            ROUND(AVG(attempts), 2) as avg_attempts,
-            MAX(last_attempt_at) as latest_attempt
-       FROM embed_retry_queue WHERE org_id = ? GROUP BY status`
+            ROUND(AVG(attempt), 2) as avg_attempts,
+            MAX(heartbeat_at) as latest_attempt
+       FROM work_queue
+      WHERE org_id = ? AND domain = 'embed_retry'
+      GROUP BY status`
   ).bind(ctx.orgId).all<{ status: string; n: number; avg_attempts: number; latest_attempt: string | null }>();
 
   const failed = await env.D1.prepare(
-    `SELECT entity_id, source_table, attempts, last_error, last_attempt_at
-       FROM embed_retry_queue
-      WHERE org_id = ? AND status = 'failed_permanent'
-      ORDER BY last_attempt_at DESC LIMIT 50`
+    `SELECT json_extract(payload, '$.entity_id') AS entity_id,
+            json_extract(payload, '$.source_table') AS source_table,
+            attempt AS attempts,
+            last_error,
+            heartbeat_at AS last_attempt_at
+       FROM work_queue
+      WHERE org_id = ? AND domain = 'embed_retry' AND status = 'dead_letter'
+      ORDER BY heartbeat_at DESC LIMIT 50`
   ).bind(ctx.orgId).all();
 
+  // Map work_queue's 'dead_letter' status to the legacy 'failed_permanent'
+  // key in the response so existing operator tooling/dashboards still
+  // parse the JSON cleanly. Other statuses pass through.
+  const byStatus: Record<string, { count: number; avg_attempts: number; latest_attempt: string | null }> = {};
+  for (const r of counts.results) {
+    const key = r.status === 'dead_letter' ? 'failed_permanent' : r.status;
+    byStatus[key] = { count: r.n, avg_attempts: r.avg_attempts, latest_attempt: r.latest_attempt };
+  }
   return jsonResponse({
     ok: true,
-    by_status: Object.fromEntries(counts.results.map(r => [r.status, { count: r.n, avg_attempts: r.avg_attempts, latest_attempt: r.latest_attempt }])),
+    by_status: byStatus,
     failed_permanent: failed.results,
   });
 }

@@ -69,7 +69,13 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
   try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
   try { await backfillUnembeddedEntities(orgId, env); } catch (e) { console.error('Entity backfill:', e); }
-  try { await processEmbedRetryQueue(orgId, env); } catch (e) { console.error('Embed retry queue:', e); }
+  // Phase 6 1b (2026-05-05): processEmbedRetryQueue removed from daily
+  // orchestration. Replaced by Phase 5's minute-tick driver running the
+  // embed_retry domain handler via WORK_QUEUE_HANDLERS. The function body
+  // is preserved at line ~696 below for the revert window per Lucas
+  // 2026-05-05; it has zero callers post-1b (admin endpoints repurposed
+  // to processWorkQueueTick) but stays exported so a single-revert
+  // restores it without code-resurrection.
   try { await rebuildEntityIndex(orgId, env); } catch (e) { console.error('Entity index rebuild:', e); }
   try { await cleanupExpiredResetTokens(env); } catch (e) { console.error('Reset token cleanup:', e); }
   try { await detectIngestionDivergence(orgId, env); } catch (e) { console.error('Ingestion divergence:', e); }
