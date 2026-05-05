@@ -69,6 +69,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
   try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
   try { await backfillUnembeddedEntities(orgId, env); } catch (e) { console.error('Entity backfill:', e); }
+  try { await backfillUnembeddedEvents(orgId, env); } catch (e) { console.error('Event backfill:', e); }
   // Phase 6 1b (2026-05-05): processEmbedRetryQueue removed from daily
   // orchestration. Replaced by Phase 5's minute-tick driver running the
   // embed_retry domain handler via WORK_QUEUE_HANDLERS. The function body
@@ -662,6 +663,167 @@ export async function backfillUnembeddedEntities(orgId: string, env: Env): Promi
     console.log(`[daily-cron] entity backfill org=${orgId} contacts=${stats.contacts} companies=${stats.companies}`);
   }
   return stats;
+}
+
+// Backfill embeddings for events (calendar + transcripts) that have no
+// vector_entity_index coverage. Closes a structural gap surfaced by the
+// 2026-05-05 meeting-embed audit:
+//
+//   • upsertOutlookEvent (the SOLE Outlook calendar ingest path) writes
+//     the events row but never enqueues for embed. Both callers
+//     (calendar-progressive-backfill every-minute cron, syncOutlookCalendars
+//     hourly cron) end at upsertOutlookEvent and stop. Pre-this-function
+//     the only events that ever got embedded were Firefly meetings via
+//     processTranscriptItems (inline) — calendar-only Outlook events
+//     accumulated forever as silent RAG misses.
+//
+//   • The ingestion-finalizer detect-embed-gaps does enqueue events into
+//     work_queue, but only those with `created_at >= startedAt` of the
+//     CURRENT ingestion-workflow run. Events from calendar-progressive-
+//     backfill (separate cron) fall outside any finalizer's window.
+//
+//   • Audit numbers (2026-05-05): 1,069 of 1,122 Outlook events
+//     unembedded (95% gap). 998 with no transcript (just title/summary),
+//     71 with transcript that lost the embed step somewhere in
+//     reconciliation.
+//
+// This function mirrors backfillUnembeddedConversations: paginate by
+// LIMIT, fetch text (transcript R2 → fallback to title+summary), apply
+// per-attendee ACL when transcript-backed, chunk-embed, write
+// vector_entity_index rows. Per-row try/catch so one bad event doesn't
+// kill the loop.
+//
+// LIMIT 50: chosen lower than conversations' 200 because the 71
+// transcript-backed events have ~10-15 chunks each and could otherwise
+// blow the per-invocation subrequest cap. Mix realistically (mostly
+// 1-chunk calendar events plus occasional transcripts) → ~400-2400
+// subreqs/run, generally fits.
+//
+// ACL decision (per Wave 4 doctrine):
+//   • Transcript-backed event with internal attendees in event_attendees
+//     → visibility='private' + participant_user_ids
+//     (matches the metadata processTranscriptItems writes for fresh
+//     Firefly transcripts; closes the 71-Outlook-with-transcript subgap
+//     by giving them the SAME ACL their Firefly twin would have)
+//   • Otherwise (calendar-only or transcript with no internal attendees)
+//     → visibility='org_wide'
+//     (calendar metadata is org-wide-readable; better findable than
+//     invisible for the rare zero-internal-attendee transcript case)
+//
+// Drain projection: 1,069 stranded events / 50 per hour ≈ 22 hours to
+// fully clear. NOT EXISTS filter naturally advances each run.
+export async function backfillUnembeddedEvents(orgId: string, env: Env): Promise<number> {
+  const { chunkEmbedAndPersistAll } = await import('./embedding');
+
+  const rows = await env.D1.prepare(
+    `SELECT id, title, summary, transcript_r2_key, start_time
+       FROM events
+       WHERE org_id = ?
+         AND deleted_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM vector_entity_index vei
+            WHERE vei.source_table = 'events'
+              AND vei.entity_id = events.id
+              AND vei.org_id = events.org_id
+         )
+       ORDER BY start_time DESC
+       LIMIT 50`
+  ).bind(orgId).all<{
+    id: string;
+    title: string;
+    summary: string | null;
+    transcript_r2_key: string | null;
+    start_time: string;
+  }>();
+
+  if (rows.results.length === 0) return 0;
+
+  let embedded = 0;
+  for (const row of rows.results) {
+    try {
+      // Prefer transcript text when available; fall back to title+summary
+      // for calendar-only events. Mirrors embedSingleItem's events branch
+      // (daily-cron.ts ~line 990) for shape consistency.
+      let text = '';
+      let r2Key = '';
+      let isTranscript = false;
+
+      if (row.transcript_r2_key) {
+        const obj = await env.R2.get(row.transcript_r2_key);
+        if (obj) {
+          text = await obj.text();
+          r2Key = row.transcript_r2_key;
+          isTranscript = true;
+        }
+      }
+
+      if (!isTranscript) {
+        const titleText = (row.title || '').trim();
+        const summaryText = (row.summary || '').trim();
+        text = summaryText
+          ? (titleText ? `${titleText}\n\n${summaryText}` : summaryText)
+          : titleText;
+      }
+
+      // Skip rows with too little text — embedding noise. Threshold
+      // matches embedSingleItem's events branch.
+      if (!text || text.trim().length < 10) continue;
+
+      // ACL: per-attendee for transcript-backed events with internal
+      // user attendees; org_wide otherwise. Matches the metadata shape
+      // processTranscriptItems writes for fresh Firefly transcripts —
+      // critical for the 71-Outlook-with-transcript subgap so reconciled
+      // events get the same ACL their Firefly twin would have had.
+      let visibility: 'private' | 'org_wide' = 'org_wide';
+      let participantUserIds: string | undefined = undefined;
+
+      if (isTranscript) {
+        const attendees = await env.D1.prepare(
+          `SELECT user_id FROM event_attendees
+             WHERE event_id = ? AND user_id IS NOT NULL`
+        ).bind(row.id).all<{ user_id: string }>();
+        const internalIds = attendees.results
+          .map(a => a.user_id)
+          .filter(Boolean);
+        if (internalIds.length > 0) {
+          visibility = 'private';
+          participantUserIds = internalIds.join(',');
+        }
+      }
+
+      const entries = await chunkEmbedAndPersistAll(text, {
+        org_id: orgId,
+        visibility,
+        participant_user_ids: participantUserIds,
+        document_type: 'transcript',
+        source_table: 'events',
+        source_id: row.id,
+        r2_key: r2Key,
+        created_at: row.start_time,
+        primary_entity_id: row.id,
+        entity_name: row.title,
+        date: row.start_time,
+      }, env);
+
+      if (entries.length > 0) {
+        await env.D1.batch(
+          entries.map(e =>
+            env.D1.prepare(
+              'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+            ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+          )
+        );
+        embedded += 1;
+      }
+    } catch (e) {
+      console.error(`[daily-cron] embed backfill failed for event ${row.id}:`, e);
+    }
+  }
+
+  if (embedded > 0) {
+    console.log(`[daily-cron] backfilled ${embedded} unembedded events for org ${orgId}`);
+  }
+  return embedded;
 }
 
 // Embed retry queue processor (audit 2026-04-28 scale-up Fix 3;
