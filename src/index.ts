@@ -821,24 +821,31 @@ async function handleScheduled(
           id: `ingestion-${org.id}-${Date.now()}`,
           params: { org_id: org.id },
         });
-        // Hourly self-heal — backfillUnembeddedConversations only.
+        // Hourly self-heal — enqueueBackfillConversations.
         //
-        // Phase 6 1b (2026-05-05): the sibling processEmbedRetryQueue
-        // hourly self-heal was removed. The embed_retry domain now drains
-        // every minute via Phase 5's WORK_QUEUE_HANDLERS at src/lib/work-
-        // queue-driver.ts. That cadence is 60× faster than the prior
-        // hourly self-heal AND the work_queue's bge-circuit filter prevents
-        // burst retries from compounding rate-limit incidents.
+        // Phase 8 1a (2026-05-05): swapped from the inline-embed
+        // backfillUnembeddedConversations to the work_queue enqueuer.
+        // Same scan shape (NOT EXISTS in vector_entity_index, LIMIT 200);
+        // each detected gap now flows through work_queue domain
+        // 'embed_retry' instead of being embedded inline. Net effects:
+        //   • upstream_budget_ledger sees BGE traffic from this path
+        //     (audit finding G — bypassed pre-Phase-8)
+        //   • idempotency_key dedup makes this safe to run alongside
+        //     Phase 6 1a's three reactive enqueue sites (ingestion-
+        //     finalizer, outlook backfill, attachment orchestrator)
+        //   • drain cadence shifts from "200/hour inline" to "minute-tick
+        //     × batchSize=10 = 14,400/day" via the embed_retry handler
+        //   • 685-row backlog (live) drains in ~3.4 hours
         //
-        // backfillUnembeddedConversations stays here because it targets a
-        // disjoint row set: conversations missing from vector_entity_index
-        // that were NEVER enqueued (i.e. enqueue itself was the gap).
-        // The work_queue covers the enqueue-then-fail path; this covers
-        // the never-enqueued path. Both still needed.
+        // Disjoint-population rationale unchanged: this catches gaps that
+        // the reactive ingestion-finalizer enqueue MISSED (e.g. the
+        // calendar-progressive-backfill rows from a separate cron). The
+        // work_queue handler covers the enqueue-then-fail path; this
+        // covers the never-enqueued path. Both still needed.
         ctxExec.waitUntil((async () => {
-          const { backfillUnembeddedConversations } = await import('./lib/daily-cron');
-          try { await backfillUnembeddedConversations(org.id, env); }
-          catch (e) { console.error(`hourly self-heal: backfillUnembedded failed for ${org.id}:`, e); }
+          const { enqueueBackfillConversations } = await import('./lib/daily-cron');
+          try { await enqueueBackfillConversations(org.id, env); }
+          catch (e) { console.error(`hourly self-heal: enqueueBackfillConversations failed for ${org.id}:`, e); }
         })());
         // Hourly Graph subscription renewal — back-stops the daily cron's
         // step 14, which has been observed not firing on its own schedule
@@ -872,21 +879,30 @@ async function handleScheduled(
           try { await backfillUnembeddedEntities(org.id, env); }
           catch (e) { console.error(`hourly self-heal: backfillUnembeddedEntities failed for ${org.id}:`, e); }
         })());
-        // Hourly events embed backfill — closes the structural gap
-        // surfaced by the 2026-05-05 meeting-embed audit (1,069 of 1,122
-        // Outlook calendar events stranded unembedded; 95% gap).
-        // upsertOutlookEvent has no embed enqueue and the ingestion-
-        // finalizer's gap detector only sees events created within its
-        // own ingestion-workflow run window — calendar-progressive-
-        // backfill events fall outside. backfillUnembeddedEvents catches
-        // them on every hourly fire. LIMIT 50 + per-row try/catch keeps
-        // subrequest budget bounded; ~22 hours to drain the backlog.
-        // Sibling waitUntil so it races concurrently with the embed
-        // self-heal + renewal + entity backfill blocks above.
+        // Hourly events embed backfill — same migration as conversations
+        // above. T4's hotfix introduced the inline-embed pattern; Phase
+        // 8 1a routes through work_queue (domain='embed_retry') with
+        // ledger integration + idempotent concurrency. The enqueuer's
+        // SELECT shape (LIMIT 50, NOT EXISTS in vector_entity_index)
+        // matches the legacy backfillUnembeddedEvents exactly — only
+        // the per-row work changes (enqueueWork instead of inline
+        // chunkEmbedAndPersistAll + INSERT vector rows).
+        //
+        // Critical correctness: embedSingleItem's events branch was
+        // updated in Phase 8 1a-i to mirror backfillUnembeddedEvents's
+        // T4 ACL logic (transcript-backed events with internal user
+        // attendees → visibility='private' + participant_user_ids).
+        // Without that fix, the 71 Outlook-with-transcript subgap
+        // would silently regress on re-embed.
+        //
+        // 930-row backlog (live, audit'd 2026-05-05) drains in ~24
+        // hours at minute-tick × batchSize=10 capacity, subject to
+        // BGE rate limit (which the work_queue's open-circuit filter
+        // now properly engages with).
         ctxExec.waitUntil((async () => {
-          const { backfillUnembeddedEvents } = await import('./lib/daily-cron');
-          try { await backfillUnembeddedEvents(org.id, env); }
-          catch (e) { console.error(`hourly self-heal: backfillUnembeddedEvents failed for ${org.id}:`, e); }
+          const { enqueueBackfillEvents } = await import('./lib/daily-cron');
+          try { await enqueueBackfillEvents(org.id, env); }
+          catch (e) { console.error(`hourly self-heal: enqueueBackfillEvents failed for ${org.id}:`, e); }
         })());
         // deal_intelligence batch refresh — recompute the oldest 50
         // stale-or-invalidated rows for this org. Bounded subrequest
