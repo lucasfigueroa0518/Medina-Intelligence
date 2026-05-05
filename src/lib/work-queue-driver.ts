@@ -157,6 +157,7 @@ async function withHeartbeat<T>(
 
 import { embedRetryHandler } from './work-queue-handlers/embed-retry';
 import { calendarRefreshHandler } from './work-queue-handlers/calendar-refresh';
+import { fireflyWindowHandler } from './work-queue-handlers/firefly-window';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -172,10 +173,20 @@ import { calendarRefreshHandler } from './work-queue-handlers/calendar-refresh';
  * (now bootstrap-only). enqueueCalendarRefreshes runs on every minute
  * tick before processWorkQueueTick to populate the queue based on the
  * calendar table's per-window staleness state.
+ *
+ * Phase 6.2 1b (2026-05-05): third pilot — firefly_window. Replaces
+ * the inline pick-and-sync loop inside driveFireflyProgressiveBackfill
+ * (now a thin parent-status monitor + finalizer). Windows are dual-
+ * written into work_queue at parent-creation time (1a); migration
+ * 0086 reconciles the in-flight set; this registration activates
+ * processing. Handler uses Phase 6.2 1a's deferWork primitive for
+ * paused-state checkpoint-resume (rate-limit defers to next UTC
+ * midnight without consuming attempt budget).
  */
 export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   embedRetryHandler,
   calendarRefreshHandler,
+  fireflyWindowHandler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────

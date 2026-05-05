@@ -62,7 +62,7 @@ export const LOCK_DURATION_MS = 5 * 60 * 1000;
 // observed Fireflies daily-quota reset boundary per the
 // "Please retry after Fri, 01 May 2026 00:00:01 GMT (UTC)" response). The
 // driver will not re-pick a deferred window until earliest_run_at is reached.
-function nextUtcMidnightIso(): string {
+export function nextUtcMidnightIso(): string {
   const now = new Date();
   const tomorrow = new Date(Date.UTC(
     now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 1, 0, 0
@@ -91,7 +91,7 @@ function utcDateString(d: Date = new Date()): string {
  * `orgId` is optional so future callers without an org context can
  * keep using the function and only get the firefly_user_quotas write.
  */
-async function recordFireflyApiCall(
+export async function recordFireflyApiCall(
   userId: string,
   env: Env,
   rateLimited: boolean = false,
@@ -522,11 +522,19 @@ export async function cancelFireflyProgressiveBackfill(
  * AND no future-scheduled window is waiting for its earliest_run_at.
  */
 async function finalizeParent(parentId: string, env: Env): Promise<'completed' | 'partially_completed'> {
+  // Phase 6.2 1b (2026-05-05): count failed windows from work_queue
+  // (dead_letter status) instead of legacy table. The handler dual-
+  // writes the legacy 'failed' status for UI continuity, so either
+  // source would work — but work_queue is the authoritative state
+  // post-cutover. Counting from work_queue keeps the data flow
+  // consistent: handler-side updates → work_queue → finalization.
   const counts = await env.D1.prepare(
     `SELECT
-        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
-       FROM firefly_progressive_backfill_windows WHERE parent_id = ?`
+        SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS failed,
+        SUM(CASE WHEN status = 'completed'   THEN 1 ELSE 0 END) AS completed
+       FROM work_queue
+      WHERE domain = 'firefly_window'
+        AND json_extract(payload, '$.parent_id') = ?`
   ).bind(parentId).first<{ failed: number; completed: number }>();
   const finalStatus: 'completed' | 'partially_completed' =
     (counts?.failed ?? 0) > 0 ? 'partially_completed' : 'completed';
@@ -569,293 +577,57 @@ export async function driveFireflyProgressiveBackfill(
   userId: string,
   env: Env
 ): Promise<{ advanced: boolean; window_index?: number; status?: string; note?: string }> {
+  // Phase 6.2 1b (2026-05-05): the inline pick-and-sync loop has been
+  // replaced by the firefly_window handler running on Phase 5's
+  // minute-tick driver (src/lib/work-queue-handlers/firefly-window.ts).
+  // This function is now a thin parent-status monitor + finalizer:
+  //   1. Find the user's active parent (legacy table; canonical
+  //      orchestration journal post-Phase-6.2)
+  //   2. Count remaining work_queue rows for this parent
+  //   3. If zero → finalize parent (api_key nuke + status transition)
+  //   4. Otherwise → no-op for this parent, handler picks up next tick
+  //
+  // The legacy claim/dispatch/result-handling flow (~290 lines) has
+  // been deleted — all of it now lives in the handler. Token resolution,
+  // runFireflyWindowBackfill, recordFireflyApiCall (Phase 3.4.1
+  // post-success-gated), deferWork (Phase 6.2 1a primitive for paused-
+  // state checkpoint-resume) — all handler-side. This driver no longer
+  // consumes Firefly subreqs or touches user_firefly_credentials.
+  //
+  // Return shape preserved for driveAllActiveFireflyProgressive's
+  // logging path. `advanced` is now always false (this driver doesn't
+  // process windows; the handler does).
   const parent = await env.D1.prepare(
-    `SELECT id, api_key_encrypted, total_windows
-       FROM firefly_progressive_backfill_jobs
+    `SELECT id FROM firefly_progressive_backfill_jobs
        WHERE org_id = ? AND user_id = ? AND status = 'active' LIMIT 1`
-  ).bind(orgId, userId).first<{ id: string; api_key_encrypted: string; total_windows: number }>();
+  ).bind(orgId, userId).first<{ id: string }>();
   if (!parent) return { advanced: false, note: 'no active firefly parent' };
 
-  // Phase 3.4 (2026-05-04) pre-gate: refuse the tick when the
-  // upstream_budget_ledger says this user is at cap or the circuit is
-  // open. Earlier than the claim so we don't even take a row lock when
-  // we know the work would be wasted. Per-window earliest_run_at
-  // deferral (the existing reactive path on line ~561+) is what bumps
-  // individual windows past UTC midnight on observed rate-limit; this
-  // pre-gate is the proactive layer that short-circuits all further
-  // attempts for this user during a circuit-open window. While circuit
-  // is open (30 min), each tick costs 2 D1 reads (parent SELECT + budget
-  // SELECT) and exits fast — bounded waste, self-healing.
-  const budget = await checkBudget(env, orgId, userId, 'firefly', 'daily');
-  if (budget.decision !== 'ok') {
+  // Count remaining work_queue rows for this parent. Pending +
+  // in_progress are both "still has work to do." Paused windows are
+  // status='pending' (via deferWork) so they count here. dead_letter
+  // and completed don't count — both are terminal.
+  const remaining = await env.D1.prepare(
+    `SELECT COUNT(*) AS n FROM work_queue
+       WHERE domain = 'firefly_window'
+         AND status IN ('pending', 'in_progress')
+         AND json_extract(payload, '$.parent_id') = ?`
+  ).bind(parent.id).first<{ n: number }>();
+
+  if ((remaining?.n ?? 0) > 0) {
+    // Work still queued — handler will process next tick(s). No
+    // action here; parent stays 'active'.
     return {
       advanced: false,
-      note: `firefly ${budget.decision} for user ${userId} (used=${budget.used}/${budget.cap}${
-        budget.circuit_open_until ? `, circuit_open_until=${budget.circuit_open_until}` : ''
-      })`,
+      note: `${remaining?.n ?? 0} work_queue rows pending for parent ${parent.id}`,
     };
   }
 
-  // Atomic claim. lockUntil = now+5min. The UPDATE ... RETURNING returns
-  // the claimed row only if it was previously unclaimed (lock expired or
-  // null) AND eligible (earliest_run_at <= now). Two simultaneous ticks
-  // can't both claim — SQLite's UPDATE is row-locked.
-  const nowIso = new Date().toISOString();
-  const lockUntilIso = new Date(Date.now() + LOCK_DURATION_MS).toISOString();
-  const claimed = await env.D1.prepare(
-    `UPDATE firefly_progressive_backfill_windows
-        SET lock_expires_at = ?,
-            status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END,
-            started_at = COALESCE(started_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-      WHERE id = (
-        SELECT id FROM firefly_progressive_backfill_windows
-         WHERE parent_id = ?
-           AND status IN ('pending','in_progress')
-           AND (earliest_run_at IS NULL OR earliest_run_at <= ?)
-           AND (lock_expires_at IS NULL OR lock_expires_at < ?)
-         ORDER BY window_index ASC LIMIT 1
-      )
-      RETURNING id, window_index, start_date, end_date, status, last_skip`
-  ).bind(lockUntilIso, parent.id, nowIso, nowIso).first<{
-    id: string; window_index: number; start_date: string; end_date: string;
-    status: string; last_skip: number;
-  }>();
-
-  if (!claimed) {
-    // No pickable window. If there's a window waiting for a future day,
-    // stay 'active' and let the next cron tick try again. Otherwise
-    // finalize the parent (api_key nuked, status partially_completed if
-    // any windows failed, else completed).
-    const futureWindow = await env.D1.prepare(
-      `SELECT 1 FROM firefly_progressive_backfill_windows
-         WHERE parent_id = ?
-           AND status IN ('pending','in_progress')
-           AND earliest_run_at IS NOT NULL
-           AND earliest_run_at > ?
-         LIMIT 1`
-    ).bind(parent.id, nowIso).first();
-    if (futureWindow) {
-      return { advanced: false, note: 'all today\'s windows done; future windows scheduled for later UTC days' };
-    }
-    const finalStatus = await finalizeParent(parent.id, env);
-    return { advanced: false, note: `firefly parent ${finalStatus}` };
-  }
-
-  const win = claimed;
-
-  // Phase 4 (2026-05-04): two-tier API key resolution.
-  //   1. Primary: user_firefly_credentials (persistent, set once via
-  //      Settings UI / POST /api/settings/firefly-credentials). The
-  //      "set once, reuse forever" UX.
-  //   2. Fallback: parent.api_key_encrypted (legacy per-job storage
-  //      from before Phase 4). Empty-string '' is the Phase-4
-  //      placeholder for new jobs that rely on persistent only — the
-  //      decrypt path is skipped in that case. Once any pre-Phase-4
-  //      in-flight backfills drain, this fallback becomes dead code.
-  //
-  // Either source produces a usable plaintext key. If both fail, the
-  // window is marked failed with a descriptive error so the operator
-  // can prompt the user to (re)set credentials.
-  let apiKey: string | null = null;
-
-  // Primary: persistent credential.
-  try {
-    apiKey = await getFireflyKey(userId, env);
-  } catch (e) {
-    console.error('[firefly-driver] persistent key fetch error:', e instanceof Error ? e.message : e);
-  }
-
-  // Fallback: legacy per-job key. Skipped when api_key_encrypted is ''
-  // (Phase 4 placeholder for new jobs that rely on persistent only) or
-  // null. The decrypt path mirrors the prior implementation exactly so
-  // pre-Phase-4 jobs continue to drain without regression.
-  if (!apiKey && parent.api_key_encrypted && parent.api_key_encrypted.length > 0) {
-    try {
-      const decrypted = await decryptToken(parent.api_key_encrypted, env);
-      apiKey = decrypted.api_key || null;
-    } catch (e) {
-      console.error('[firefly-driver] legacy per-job decrypt failed:', e instanceof Error ? e.message : e);
-      // Don't return yet — the persistent path may have surfaced a key
-      // (race), or operator may set fresh credentials before we hit the
-      // !apiKey check below.
-    }
-  }
-
-  if (!apiKey) {
-    const msg = 'no firefly key (persistent credential missing or decrypt-failed; legacy per-job key unavailable). User must set Firefly credentials.';
-    await env.D1.prepare(
-      `UPDATE firefly_progressive_backfill_windows
-          SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-              lock_expires_at = NULL
-        WHERE id = ?`
-    ).bind(msg, win.id).run();
-    return { advanced: true, window_index: win.window_index, status: 'failed', note: msg };
-  }
-
-  // Phase 3.4.1 (2026-05-04): per-tick API call accounting moved from
-  // pre-call (used to be HERE) to post-confirmed-success (in the
-  // 'completed' branch below). The pre-call recordUsage was hardcoded
-  // to reset `consecutive_429s = 0` every tick (per upstream-budget.ts
-  // "success ALWAYS resets the breaker counter" semantic), which made
-  // the CIRCUIT_TRIP_THRESHOLD = 3 structurally unreachable for
-  // sequential workloads like Firefly's per-tick driver: each
-  // rate-limited tick could only ever bump consecutive_429s to 1
-  // before the next tick reset it back to 0. Auto-tune-down was dead
-  // code; the pre-gate's circuit_open branch never fired. Terminal 5
-  // forensic 2026-05-04 confirmed the gap. Moving the call to post-
-  // success means: only confirmed Firefly successes reset the breaker
-  // counter; 3 consecutive rate-limited ticks (no successes between)
-  // can now trip the breaker, which is the documented contract.
-
-  let result;
-  try {
-    result = await runFireflyWindowBackfill(
-      {
-        userId,
-        orgId,
-        fireflyApiKey: apiKey,
-        startDate: win.start_date,
-        endDate: win.end_date,
-        initialSkip: win.last_skip ?? 0,
-        progressiveWindowId: win.id,
-      },
-      env
-    );
-  } catch (e: any) {
-    const msg = String(e?.message || e).slice(0, 500);
-    await env.D1.prepare(
-      `UPDATE firefly_progressive_backfill_windows
-          SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-              lock_expires_at = NULL
-        WHERE id = ?`
-    ).bind(msg, win.id).run();
-    return { advanced: true, window_index: win.window_index, status: 'failed', note: msg };
-  }
-
-  if (result.status === 'completed') {
-    await env.D1.prepare(
-      `UPDATE firefly_progressive_backfill_windows
-          SET status = 'completed',
-              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-              last_skip = ?,
-              transcripts_fetched = transcripts_fetched + ?,
-              transcripts_persisted = transcripts_persisted + ?,
-              transcripts_skipped_duplicate = transcripts_skipped_duplicate + ?,
-              transcripts_failed = transcripts_failed + ?,
-              last_error = ?,
-              lock_expires_at = NULL
-        WHERE id = ?`
-    ).bind(
-      result.last_skip,
-      result.total_fetched,
-      result.ingested,
-      result.duplicates,
-      result.failed,
-      result.errors && result.errors.length > 0
-        ? `${result.errors.length} per-transcript errors (see sync_jobs.metadata.errors_sample)`
-        : null,
-      win.id
-    ).run();
-
-    await env.D1.prepare(
-      `UPDATE firefly_progressive_backfill_jobs
-          SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ?`
-    ).bind(parent.id).run();
-
-    // Phase 3.4.1: post-success dual-write to firefly_user_quotas +
-    // upstream_budget_ledger. Fires ONLY on confirmed window completion
-    // so recordUsage's hardcoded `consecutive_429s = 0` reset doesn't
-    // pre-empt the breaker counter accumulation. 'failed' and 'paused'
-    // status branches deliberately do NOT call this — preserves correct
-    // breaker semantic where only successful ticks reset the counter.
-    await recordFireflyApiCall(userId, env, false, orgId);
-
-    return { advanced: true, window_index: win.window_index, status: 'completed' };
-  }
-
-  if (result.status === 'failed') {
-    await env.D1.prepare(
-      `UPDATE firefly_progressive_backfill_windows
-          SET status = 'failed',
-              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-              last_skip = ?,
-              transcripts_fetched = transcripts_fetched + ?,
-              transcripts_persisted = transcripts_persisted + ?,
-              transcripts_skipped_duplicate = transcripts_skipped_duplicate + ?,
-              transcripts_failed = transcripts_failed + ?,
-              last_error = ?,
-              lock_expires_at = NULL
-        WHERE id = ?`
-    ).bind(
-      result.last_skip,
-      result.total_fetched,
-      result.ingested,
-      result.duplicates,
-      result.failed,
-      result.reason || 'window failed',
-      win.id
-    ).run();
-    return { advanced: true, window_index: win.window_index, status: 'failed', note: result.reason };
-  }
-
-  // Paused — keep status='in_progress' so a future tick can resume.
-  // If the pause was caused by the Fireflies daily quota
-  // (FIREFLY_RATE_LIMITED → 'firefly_rate_limit' reason), defer to next
-  // UTC midnight via earliest_run_at — the daily quota resets there per
-  // the observed "Please retry after Fri, 01 May 2026 00:00:01 GMT (UTC)"
-  // response. Other pause reasons (wallclock_cap, transcript_count_cap)
-  // mean the Worker hit its per-tick budget and the next minute's cron
-  // tick should resume immediately, so leave earliest_run_at unchanged.
-  // ALWAYS clear lock_expires_at so the next eligible tick can re-claim.
-  const isRateLimitPause =
-    result.reason === 'firefly_rate_limit' ||
-    /rate.?limit/i.test(result.reason || '');
-  const newEarliestRunAt = isRateLimitPause ? nextUtcMidnightIso() : null;
-
-  if (isRateLimitPause) {
-    // Phase 3.4: dual-write the rate-limit signal to firefly_user_quotas
-    // AND upstream_budget_ledger. Three consecutive rate-limit ticks for
-    // a user → ledger trips circuit (cap −10%, 30-min cooldown), and the
-    // pre-gate above will short-circuit subsequent ticks until circuit
-    // closes or UTC midnight whichever comes first.
-    await recordFireflyApiCall(userId, env, true, orgId);
-  }
-
-  await env.D1.prepare(
-    `UPDATE firefly_progressive_backfill_windows
-        SET last_skip = ?,
-            transcripts_fetched = transcripts_fetched + ?,
-            transcripts_persisted = transcripts_persisted + ?,
-            transcripts_skipped_duplicate = transcripts_skipped_duplicate + ?,
-            transcripts_failed = transcripts_failed + ?,
-            lock_expires_at = NULL,
-            earliest_run_at = COALESCE(?, earliest_run_at)
-      WHERE id = ?`
-  ).bind(
-    result.last_skip,
-    result.total_fetched,
-    result.ingested,
-    result.duplicates,
-    result.failed,
-    newEarliestRunAt,
-    win.id
-  ).run();
-
-  await env.D1.prepare(
-    `UPDATE firefly_progressive_backfill_jobs
-        SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE id = ?`
-  ).bind(parent.id).run();
-
-  return {
-    advanced: true,
-    window_index: win.window_index,
-    status: result.status,
-    note: isRateLimitPause
-      ? `rate-limited; deferred to ${newEarliestRunAt}`
-      : `paused at skip=${result.last_skip} (${result.reason || 'budget cap'})`,
-  };
+  // No remaining work — finalize. finalizeParent counts work_queue
+  // dead_letter rows to decide partially_completed vs completed,
+  // nukes api_key_encrypted, transitions parent.status.
+  const finalStatus = await finalizeParent(parent.id, env);
+  return { advanced: false, note: `firefly parent ${finalStatus}` };
 }
 
 /**
@@ -903,6 +675,15 @@ export async function getFireflyProgressiveStatus(
        ORDER BY window_index ASC`
   ).bind(parent.id).all<FireflyProgressiveBackfillWindow>();
 
+  // Phase 6.2 1b (2026-05-05): wire-collapse 'partially_completed' →
+  // 'completed' for frontend compatibility. The frontend's response
+  // type union (frontend/lib/api.ts) is {'active', 'completed',
+  // 'cancelled'}; 'partially_completed' was added in Phase 4 migration
+  // 0070 but never landed in production rows. Per-window 'failed'
+  // detail remains visible via the windows array, so failure forensics
+  // aren't lost — only the parent-level status pill is collapsed.
+  if (parent.status === 'partially_completed') parent.status = 'completed';
+
   return { parent, windows: windows.results };
 }
 
@@ -933,6 +714,9 @@ export async function listFireflyProgressiveBackfills(
       `SELECT * FROM firefly_progressive_backfill_windows
          WHERE parent_id = ? ORDER BY window_index ASC`
     ).bind(p.id).all<FireflyProgressiveBackfillWindow>();
+    // Phase 6.2 1b (2026-05-05): wire-collapse — see
+    // getFireflyProgressiveStatus for full rationale.
+    if (p.status === 'partially_completed') p.status = 'completed';
     out.push({ parent: p, user_email: u?.email ?? null, windows: w.results });
   }
   return out;
