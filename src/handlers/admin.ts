@@ -976,10 +976,16 @@ export async function processEmbedQueue(
   const after = await env.D1.prepare(beforeQuery).bind(ctx.orgId)
     .all<{ status: string; n: number }>();
 
+  // Phase 6.0.1 (2026-05-05): map work_queue's 'dead_letter' status to
+  // the legacy 'failed_permanent' key in the response so existing
+  // operator tooling/dashboards keep parsing cleanly. Mirrors the same
+  // mapping in getEmbedQueueHealth (1b shipped that one but missed
+  // this endpoint — Terminal 5 verification surfaced the gap).
+  const mapStatus = (s: string) => s === 'dead_letter' ? 'failed_permanent' : s;
   return jsonResponse({
     ok: true,
-    before: Object.fromEntries(before.results.map(r => [r.status, r.n])),
-    after: Object.fromEntries(after.results.map(r => [r.status, r.n])),
+    before: Object.fromEntries(before.results.map(r => [mapStatus(r.status), r.n])),
+    after: Object.fromEntries(after.results.map(r => [mapStatus(r.status), r.n])),
     drain: tick,
   });
 }

@@ -402,11 +402,18 @@ export async function sweepStaleClaims(env: Env): Promise<number> {
   // a CASE expression but cardinality stays tiny so per-row UPDATEs
   // are clearer for forensics (each row's attempt-counter motion is
   // a distinct write event).
-  const reason = 'reclaimed by watchdog after stale lock';
+  //
+  // Phase 6.0.1 (2026-05-05): last_error messages now carry the attempt
+  // count in `attempt N of M` form, with distinct prefixes for terminal
+  // (dead_letter) vs transient (pending-with-backoff) cases. Lets an
+  // operator scanning the DLQ distinguish at a glance whether a row hit
+  // max attempts or got reclaimed early — crucial when triaging a
+  // mixed-failure-mode backlog.
   let reset = 0;
   for (const c of candidates.results) {
     const nextAttempt = c.attempt + 1;
     if (nextAttempt >= c.max_attempts) {
+      const reason = `lock expired without completion (attempt ${nextAttempt} of ${c.max_attempts})`;
       await env.D1.prepare(
         `UPDATE work_queue
             SET status       = 'dead_letter',
@@ -417,6 +424,7 @@ export async function sweepStaleClaims(env: Env): Promise<number> {
           WHERE id = ? AND status = 'in_progress'`
       ).bind(nextAttempt, reason, c.id).run();
     } else {
+      const reason = `lock expired (attempt ${nextAttempt} of ${c.max_attempts}, retrying)`;
       const backoffMs = RETRY_BACKOFF_MS[Math.min(c.attempt, RETRY_BACKOFF_MS.length - 1)];
       const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString();
       await env.D1.prepare(
