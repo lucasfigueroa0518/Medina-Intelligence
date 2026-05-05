@@ -26,6 +26,14 @@ const DOC_TYPE_KEYWORDS: Record<string, string[]> = {
   email: ['email', 'emails', 'message', 'thread'],
   transcript: ['meeting', 'meetings', 'call', 'calls', 'transcript', 'discussion'],
   document: ['document', 'file', 'attachment', 'pdf', 'doc'],
+  // Slack messages get document_type='conversation' at ingestion (see
+  // daily-cron.ts:562-564). When the user explicitly asks about Slack we
+  // run a targeted Vectorize query filtered to document_type='conversation'
+  // so actual Slack chunks rank ahead of semantic-neighbor emails. Without
+  // this, recent Slack content lost to older topical emails (audit
+  // 2026-05-05). Keep this list TIGHT — adding 'message' here would over-
+  // trigger because most queries about emails also use that word.
+  conversation: ['slack', 'channel'],
 };
 
 function detectDocTypes(query: string): string[] {
@@ -417,15 +425,20 @@ export async function retrieveContext(
 // cues. Half-life of 90 days: today=1.0, 90d ago=0.5, 365d ago≈0.06. Only
 // activates for explicitly time-sensitive queries so neutral questions like
 // "what does this contract say about IP rights" stay age-agnostic.
-const RECENCY_KEYWORDS = [
-  'latest', 'recent', 'today', 'yesterday', 'this week', 'this month',
-  'now', 'currently', 'just', 'newest', 'most recent', 'happening',
-  'going on', 'lately', 'so far this', 'past few',
+//
+// Detection uses regex-or-substring patterns so "last 2 days", "past 48
+// hours", "last week" all fire (audit 2026-05-05: literal keyword list
+// missed "last 2 days" and stale content dominated the response).
+const RECENCY_REGEXES: RegExp[] = [
+  /\b(latest|recent|recently|today|yesterday|tonight|now|currently|newest|just|happening|lately|past few)\b/,
+  /\b(this|last|past|previous)\s+(day|days|week|weeks|month|months|year|years|hour|hours|minute|minutes)\b/,
+  /\b(last|past|previous)\s+\d+\s+(day|days|week|weeks|month|months|hour|hours|minute|minutes)\b/,
+  /\b(going on|so far this)\b/,
 ];
 
 function detectsRecencyIntent(query: string): boolean {
   const lower = query.toLowerCase();
-  return RECENCY_KEYWORDS.some(kw => lower.includes(kw));
+  return RECENCY_REGEXES.some(re => re.test(lower));
 }
 
 function recencyMultiplier(ageInDays: number): number {
@@ -503,7 +516,29 @@ export async function crossEncoderRerank(
     });
 
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, 10).map(x => x.chunk);
+
+    // Recency-aware floor — when the user asked about a time-bounded window
+    // ("last 2 days", "this week"), a chunk with strong topical match but
+    // 90+ days of age decay shouldn't surface. The 0.55 absolute floor at
+    // line 362 catches no-match content; this floor catches stale-match
+    // content that's only winning because there's nothing newer.
+    //
+    // Threshold 0.20: a chunk needs to combine some topical relevance AND
+    // reasonable recency to clear it. e.g. base=0.7 (strong match) + age=
+    // 110d (e^(-110/90)≈0.30) → adjusted=0.21 → barely passes. base=0.7 +
+    // age=180d (e^(-2)=0.135) → 0.094 → cut. base=0.4 + age=30d (e^(-0.33)=
+    // 0.72) → 0.288 → passes. Only fires when recency was detected.
+    //
+    // Audit 2026-05-05: Tony asked "Slack last 2 days," 10 emails (ages
+    // 30–180 days) returned, model fabricated Slack content. With this
+    // floor, most/all of those emails would have been cut and SOURCES
+    // would be empty or near-empty — driving the model to the honest
+    // "no Slack messages found" answer.
+    const finalChunks = recencyOn
+      ? scored.filter(s => s.score >= 0.20).slice(0, 10).map(x => x.chunk)
+      : scored.slice(0, 10).map(x => x.chunk);
+
+    return finalChunks;
   } catch (e) {
     console.error('[rerank] BGE reranker fallback:', e);
     return chunks.slice(0, 10);
