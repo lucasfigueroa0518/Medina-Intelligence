@@ -366,8 +366,32 @@ export async function recall(
     created_at: new Date().toISOString(),
   };
 
+  // Map source_types (agent-facing: email|slack|meeting|document) to
+  // document_type values (embedding metadata: email|conversation|transcript
+  // |document). Slack messages get ingested with document_type='conversation'
+  // (daily-cron.ts:562-564); Firefly transcripts with document_type=
+  // 'transcript' (process-transcript-items.ts:409). When source_types is
+  // set, recall passes the mapped values via forceDocTypes — retrieveContext
+  // then drives the targeted secondary Vectorize query for those types
+  // regardless of detectDocTypes's keyword inspection of the query string.
+  // (Audit 2026-05-05 stage-gate fail: TEST 1 broke because Claude called
+  // recall with source_types=['slack'] but a query lacking 'slack' keyword;
+  // detectDocTypes returned empty, no targeted query fired, broad query
+  // dominated with email matches, post-filter on type='slack' empty.)
+  const SOURCE_TYPE_TO_DOC_TYPE: Record<string, string> = {
+    email: 'email',
+    slack: 'conversation',
+    meeting: 'transcript',
+    document: 'document',
+  };
+  const forceDocTypes = (input.source_types || [])
+    .map(t => SOURCE_TYPE_TO_DOC_TYPE[t])
+    .filter((dt): dt is string => Boolean(dt));
+
   const pq = await preprocessQuery(input.query, session, env, {});
-  const result = await retrieveContext(pq, env, {});
+  const result = await retrieveContext(pq, env, {
+    forceDocTypes: forceDocTypes.length > 0 ? forceDocTypes : undefined,
+  });
 
   const { sources } = await buildSourcesAndContext(
     result.internal,

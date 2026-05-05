@@ -15,6 +15,15 @@ import { getEntityIndex } from './entity-index';
 
 export interface RetrievalOptions {
   deepDive?: boolean;
+  // When set, forces the doc-type-targeted secondary Vectorize query to fire
+  // for these document_type values regardless of detectDocTypes's keyword
+  // match on the query string. Used by the recall() agent tool: Claude can
+  // pass source_types=['slack'] with query="recent activity" — without this,
+  // detectDocTypes wouldn't match 'slack' in the query and the targeted
+  // query wouldn't run, defeating the whole point of the source_types arg.
+  // Values are document_type strings: 'email', 'conversation' (slack),
+  // 'transcript' (meetings), 'document'. (Audit 2026-05-05 root cause.)
+  forceDocTypes?: string[];
 }
 
 function isAggregationQuery(query: string): boolean {
@@ -330,7 +339,15 @@ export async function retrieveContext(
   // top-10 rerank window even when the targeted secondary query did
   // surface real Slack content.
   const targetedIds = new Set<string>();
-  const docTypes = detectDocTypes(pq.originalQuery);
+  // Caller-forced doc types take precedence over detectDocTypes's keyword
+  // inspection. recall(query, source_types=['slack']) maps source_types to
+  // document_type values and passes via forceDocTypes — guarantees the
+  // targeted secondary query fires even when the query string doesn't
+  // contain a doc-type keyword. Falls back to detectDocTypes when caller
+  // didn't specify (the existing path for direct user queries).
+  const docTypes = options.forceDocTypes && options.forceDocTypes.length > 0
+    ? options.forceDocTypes
+    : detectDocTypes(pq.originalQuery);
   if (docTypes.length > 0) {
     const seen = new Set(internalMatches.map(m => m.id));
     const docResults = await Promise.all(
