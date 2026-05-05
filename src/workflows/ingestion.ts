@@ -208,15 +208,19 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         syncJobId,
         'fetch-outlook-calendar',
         {
-          // Phase 0a-3: switched from all-at-once fetchOutlookCalendarDelta
-          // to driveCalendarProgressiveBackfill. The driver picks ≤2 stale
-          // weekly windows per user per tick (~8 windows × ~60 subreqs each
-          // worst case = ~480 subreqs/tick), well under the 1000-subreq CF
-          // cap. Full 120-day coverage converges over ~15 hours of hourly
-          // ticks via the calendar_progressive_backfill_windows table
-          // (migration 0080). 180s timeout is comfortable for the bounded
-          // per-tick work; CF retries with fresh budget on transient runtime
-          // errors.
+          // Phase 0a-3 → 6.1: this step used to inline-drive the per-window
+          // sync (driveCalendarProgressiveBackfill processed ≤2 stale weekly
+          // windows per user per tick during this step). Phase 6.1 cut that
+          // inline drain — driveCalendarProgressiveBackfill is now a
+          // bootstrap-only call (ensureWindowRowsExist for every active
+          // user). The actual fetch+upsert work is enqueued onto work_queue
+          // by enqueueCalendarRefreshes (called every minute tick from
+          // src/index.ts) and processed by the calendar_refresh handler at
+          // minute cadence — ~60× faster healing than the prior hourly
+          // bound. Subrequest cost of THIS step is now ~1 D1 batch per
+          // user (the INSERT OR IGNORE bootstrap); negligible. The 180s
+          // timeout / 2-retry policy is preserved as-is: the step rarely
+          // takes more than a few seconds now, but the budget is harmless.
           retries: { limit: 2, delay: '10 seconds' },
           timeout: '180 seconds',
         },

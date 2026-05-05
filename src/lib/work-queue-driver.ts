@@ -156,6 +156,7 @@ async function withHeartbeat<T>(
 // ─── Registry ───────────────────────────────────────────────────────
 
 import { embedRetryHandler } from './work-queue-handlers/embed-retry';
+import { calendarRefreshHandler } from './work-queue-handlers/calendar-refresh';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -165,12 +166,16 @@ import { embedRetryHandler } from './work-queue-handlers/embed-retry';
  *
  * Phase 6 1a (2026-05-05): first pilot — embed_retry. Replaces the
  * per-domain handcrafted drain at daily-cron.ts:processEmbedRetryQueue.
- * Existing embed_retry_queue rows continue to drain via the old code
- * path during the 1a→1b transition; Phase 6 1b removes that path and
- * copies residual rows into work_queue via migration 0084.
+ *
+ * Phase 6.1 (2026-05-05): second pilot — calendar_refresh. Replaces
+ * the inline pick-and-sync loop inside driveCalendarProgressiveBackfill
+ * (now bootstrap-only). enqueueCalendarRefreshes runs on every minute
+ * tick before processWorkQueueTick to populate the queue based on the
+ * calendar table's per-window staleness state.
  */
 export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   embedRetryHandler,
+  calendarRefreshHandler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────

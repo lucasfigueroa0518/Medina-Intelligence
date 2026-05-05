@@ -959,6 +959,31 @@ async function handleScheduled(
         // INSIDE processWorkQueueTick (per-handler isolation); the
         // outer try/catch here is defensive against driver-level
         // throws (e.g. import failure).
+        // Phase 6.1 (2026-05-05): calendar refresh scheduler.
+        //
+        // Runs BEFORE processWorkQueueTick in the same tick so freshly
+        // enqueued calendar refresh rows can be claimed and processed
+        // immediately. Scans calendar_progressive_backfill_windows
+        // for never-synced + stale-completed rows and enqueues
+        // work_queue rows with idempotency_key keyed on last_synced_at
+        // (so concurrent staleness scans collapse cleanly while a
+        // fresh refresh after sync completes generates a new key).
+        //
+        // Subrequest cost: 1 SELECT + up to ~30 enqueueWork calls per
+        // user worst case (full bootstrap). Steady state with most
+        // rows fresh: just the SELECT. Per-org scoped — runs once per
+        // org per minute tick alongside the existing progressive
+        // drivers. Errors caught here are non-fatal — the next tick
+        // re-tries the scan.
+        ctxExec.waitUntil((async () => {
+          try {
+            const { enqueueCalendarRefreshes } = await import('./lib/calendar-progressive-backfill');
+            await enqueueCalendarRefreshes(org.id, env);
+          } catch (e) {
+            console.error(`calendar-refresh enqueue failed for ${org.id}:`, e);
+          }
+        })());
+
         ctxExec.waitUntil((async () => {
           try {
             const { processWorkQueueTick } = await import('./lib/work-queue-driver');
