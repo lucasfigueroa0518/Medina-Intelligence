@@ -81,7 +81,10 @@ SELECT
   3,
   'firefly_api',
   p.id || ':' || w.window_index,
-  w.created_at
+  -- firefly_progressive_backfill_windows has no created_at column; use
+  -- the legacy started_at when present (window had a claim attempt)
+  -- else the parent's created_at as the lifecycle anchor.
+  COALESCE(w.started_at, p.created_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 FROM firefly_progressive_backfill_jobs p
 JOIN firefly_progressive_backfill_windows w ON w.parent_id = p.id
 WHERE p.status = 'active'
