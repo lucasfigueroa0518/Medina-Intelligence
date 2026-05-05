@@ -68,9 +68,17 @@ export interface WorkQueueHandler {
    * failWork (3-tier backoff or dead-letter). Returning cleanly
    * transitions via completeWork.
    *
-   * For long-running work, call recordHeartbeat(env, item.id) at sane
-   * intervals so the watchdog doesn't reclaim while you're making
-   * progress.
+   * Heartbeat: Phase 6.0.1 (2026-05-05) made auto-heartbeat the FLOOR.
+   * The driver wraps every handler invocation in withHeartbeat() so a
+   * background loop bumps heartbeat_at + locked_until on
+   * AUTO_HEARTBEAT_INTERVAL_MS cadence (60s default) for the duration
+   * of process(). Handlers DO NOT need to call recordHeartbeat for
+   * lock-keepalive purposes — the driver guarantees that.
+   *
+   * Handlers MAY still call recordHeartbeat(env, item.id) for FINER
+   * checkpointing (e.g. after each chunk in a multi-chunk job, to
+   * track within-item progress timestamps). That use is additive; the
+   * driver's automatic heartbeat is the safety floor.
    *
    * For fatal errors that should NOT retry, call deadLetterWork(env,
    * item.id, message) explicitly inside this function and return
@@ -82,6 +90,68 @@ export interface WorkQueueHandler {
 
 // Re-export so domain modules can rely on a single import surface.
 export { recordHeartbeat };
+
+// ─── Auto-heartbeat (Phase 6.0.1, 2026-05-05) ──────────────────────
+//
+// Default interval at which the driver bumps heartbeat_at + extends
+// locked_until during a handler's execution. Picked well below the
+// 5-min default lock TTL so even a delayed heartbeat (D1 hiccup,
+// unusual GC pause) keeps the lock alive. Fast handlers (<60s, e.g.
+// embed_retry's ~5s/item) will never trigger a heartbeat write —
+// the loop's first wait fires after the handler has already returned.
+const AUTO_HEARTBEAT_INTERVAL_MS = 60_000;
+
+/**
+ * Wrap a handler invocation with a periodic background heartbeat. The
+ * heartbeat loop runs on AUTO_HEARTBEAT_INTERVAL_MS cadence and stops
+ * cleanly when the wrapped function settles (via the `done` flag).
+ *
+ * Heartbeat failures are NON-fatal — logged + swallowed. The watchdog
+ * grace window (STALE_CLAIM_GRACE_MS in work-queue.ts) absorbs the
+ * occasional missed heartbeat, and `recordHeartbeat`'s WHERE clause
+ * filters status='in_progress' so a heartbeat firing AFTER the
+ * handler completes is a no-op (the row already moved to terminal).
+ *
+ * Why an interval loop instead of a single delayed bump:
+ *   • Embed handlers and similar bursty work usually finish before
+ *     60s, in which case zero heartbeats fire.
+ *   • Multi-step handlers (Firefly window pagination, calendar week
+ *     sync, enrichment chains) need keepalive across many minutes
+ *     of work — one heartbeat per minute over a 5-min handler is
+ *     fine.
+ *   • Async/await + setTimeout is the simplest portable primitive
+ *     in CF Workers; no setInterval lifecycle gotchas.
+ */
+async function withHeartbeat<T>(
+  env: Env,
+  itemId: string,
+  intervalMs: number,
+  fn: () => Promise<T>
+): Promise<T> {
+  let done = false;
+  // Background loop. Not awaited — it self-terminates on `done`.
+  // waitUntil holds the worker open long enough for the loop's
+  // tail to clear after the wrapped function returns.
+  (async () => {
+    while (!done) {
+      await new Promise(r => setTimeout(r, intervalMs));
+      if (done) return;
+      try {
+        await recordHeartbeat(env, itemId);
+      } catch (e) {
+        console.error(
+          `[work-queue] auto-heartbeat failed for ${itemId}:`,
+          e instanceof Error ? e.message : e
+        );
+      }
+    }
+  })();
+  try {
+    return await fn();
+  } finally {
+    done = true;
+  }
+}
 
 // ─── Registry ───────────────────────────────────────────────────────
 
@@ -181,7 +251,12 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
 
     for (const item of claimed) {
       try {
-        await handler.process(item, env);
+        // Phase 6.0.1: wrap handler in auto-heartbeat. Lock keepalive
+        // is the driver's responsibility; handlers no longer need to
+        // remember to call recordHeartbeat for that purpose. They MAY
+        // still call it for finer-grained checkpointing.
+        await withHeartbeat(env, item.id, AUTO_HEARTBEAT_INTERVAL_MS,
+          () => handler.process(item, env));
         // Domain may have already transitioned via deadLetterWork; the
         // completeWork UPDATE is no-op idempotent on terminal statuses
         // (the WHERE clause matches by id only — completed status
