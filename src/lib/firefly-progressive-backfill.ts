@@ -128,6 +128,79 @@ async function recordFireflyApiCall(
   }
 }
 
+// ─── Phase 6.2 1a: dual-write helper ──────────────────────────────────────
+
+/**
+ * Phase 6.2 1a (2026-05-05): write each window descriptor into work_queue
+ * (domain='firefly_window') alongside the legacy
+ * firefly_progressive_backfill_windows INSERT. During 1a the legacy
+ * driver is the authoritative drain — work_queue rows accumulate but
+ * aren't claimed because the firefly_window handler isn't registered
+ * in WORK_QUEUE_HANDLERS yet. 1b registers it, runs migration 0086
+ * (reconciles any drift between the two tables), and strips the legacy
+ * pick-and-sync.
+ *
+ * Idempotency_key = `${parent_id}:${window_index}` — domain context is
+ * already in the partial UNIQUE on (domain, idempotency_key) per Phase
+ * 5's substrate. Re-creating a parent (rare; normally blocked by the
+ * "already active" check) would collide cleanly. The (parent_id,
+ * window_index) tuple mirrors the legacy table's own UNIQUE constraint.
+ *
+ * Upstream tag = 'firefly_api' so the driver's claimNextBatch
+ * automatically defers all firefly_window claims when Phase 3.4.1's
+ * breaker trips.
+ *
+ * next_attempt_at = earliest_run_at when set; null otherwise. Matches
+ * the legacy table's gating semantics (Phase 4's multi-day spreading).
+ *
+ * Best-effort: errors logged but don't throw. If a row fails to land
+ * here, migration 0086 in 1b INSERT-OR-IGNOREs every legacy row whose
+ * (parent_id, window_index) doesn't already exist in work_queue. So a
+ * dual-write failure in 1a is recoverable, not lossy.
+ */
+async function dualWriteFireflyWindowsToWorkQueue(
+  env: Env,
+  parentId: string,
+  orgId: string,
+  userId: string,
+  windows: Array<{
+    window_index: number;
+    start_date: string;
+    end_date: string;
+    earliest_run_at: string | null;
+  }>
+): Promise<void> {
+  const { enqueueWork } = await import('./work-queue');
+  for (const w of windows) {
+    try {
+      await enqueueWork(env, orgId, 'firefly_window',
+        {
+          parent_id: parentId,
+          user_id: userId,
+          window_index: w.window_index,
+          start_date: w.start_date,
+          end_date: w.end_date,
+          last_skip: 0,
+          transcripts_fetched: 0,
+          transcripts_persisted: 0,
+          transcripts_skipped_duplicate: 0,
+          transcripts_failed: 0,
+        },
+        {
+          upstream: 'firefly_api',
+          idempotency_key: `${parentId}:${w.window_index}`,
+          next_attempt_at: w.earliest_run_at,
+        }
+      );
+    } catch (e) {
+      console.error(
+        `[firefly-progressive] dual-write to work_queue failed parent=${parentId} window_index=${w.window_index}:`,
+        e instanceof Error ? e.message : e
+      );
+    }
+  }
+}
+
 export interface FireflyProgressiveBackfillJob {
   id: string;
   org_id: string;
@@ -252,6 +325,18 @@ export async function createFireflyProgressiveBackfill(
   // later days. The driver gates on earliest_run_at <= now when picking.
   const now = Date.now();
   const stmts = [];
+  // Phase 6.2 1a (2026-05-05): collect window descriptors so we can
+  // dual-write into work_queue (domain='firefly_window') after the
+  // legacy batch lands. 1a's dual-write keeps the legacy driver as
+  // the authoritative drain — work_queue rows accumulate but are NOT
+  // claimed (handler unregistered until 1b). 1b registers the handler,
+  // strips the legacy pick-and-sync, and reconciles via migration 0086.
+  const windowDescriptors: Array<{
+    window_index: number;
+    start_date: string;
+    end_date: string;
+    earliest_run_at: string | null;
+  }> = [];
   for (let i = 0; i < totalWindows; i++) {
     const end = new Date(now - i * windowSizeDays * 86400000).toISOString();
     const start = new Date(now - (i + 1) * windowSizeDays * 86400000).toISOString();
@@ -266,8 +351,16 @@ export async function createFireflyProgressiveBackfill(
          VALUES (?, ?, ?, ?, 'pending', ?, ?)`
       ).bind(parentId, i, start, end, scheduledForDay, earliestRunAt)
     );
+    windowDescriptors.push({ window_index: i, start_date: start, end_date: end, earliest_run_at: earliestRunAt });
   }
   await env.D1.batch(stmts);
+
+  // Phase 6.2 1a (2026-05-05): dual-write into work_queue. Best-effort —
+  // failures here don't block parent creation. Migration 0086 (1b) will
+  // reconcile any windows the dual-write missed by INSERT-OR-IGNOREing
+  // every legacy row whose corresponding work_queue row doesn't already
+  // exist. So a failed dual-write is recoverable, not lossy.
+  await dualWriteFireflyWindowsToWorkQueue(env, parentId, orgId, userId, windowDescriptors);
 
   return { created: true, parent_id: parentId, total_windows: totalWindows, scheduled_days_count: scheduledDaysCount };
 }
@@ -348,6 +441,14 @@ export async function createFireflyProgressiveBackfillRange(
   const endMs = end.getTime();
   const startMs = start.getTime();
   const nowMs = Date.now();
+  // Phase 6.2 1a (2026-05-05): see sibling createFireflyProgressiveBackfill
+  // for full rationale on the dual-write pattern.
+  const windowDescriptors: Array<{
+    window_index: number;
+    start_date: string;
+    end_date: string;
+    earliest_run_at: string | null;
+  }> = [];
   for (let i = 0; i < totalWindows; i++) {
     const winEndMs = endMs - i * windowSizeDays * 86400000;
     const winStartMs = Math.max(startMs, endMs - (i + 1) * windowSizeDays * 86400000);
@@ -355,15 +456,22 @@ export async function createFireflyProgressiveBackfillRange(
     const earliestRunAt = scheduledForDay === 0
       ? null
       : new Date(nowMs + scheduledForDay * 86400000).toISOString();
+    const winStartIso = new Date(winStartMs).toISOString();
+    const winEndIso = new Date(winEndMs).toISOString();
     stmts.push(
       env.D1.prepare(
         `INSERT INTO firefly_progressive_backfill_windows
            (parent_id, window_index, start_date, end_date, status, scheduled_for_day, earliest_run_at)
          VALUES (?, ?, ?, ?, 'pending', ?, ?)`
-      ).bind(parentId, i, new Date(winStartMs).toISOString(), new Date(winEndMs).toISOString(), scheduledForDay, earliestRunAt)
+      ).bind(parentId, i, winStartIso, winEndIso, scheduledForDay, earliestRunAt)
     );
+    windowDescriptors.push({
+      window_index: i, start_date: winStartIso, end_date: winEndIso, earliest_run_at: earliestRunAt,
+    });
   }
   await env.D1.batch(stmts);
+
+  await dualWriteFireflyWindowsToWorkQueue(env, parentId, orgId, userId, windowDescriptors);
 
   return { created: true, parent_id: parentId, total_windows: totalWindows, scheduled_days_count: scheduledDaysCount };
 }
