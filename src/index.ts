@@ -872,6 +872,22 @@ async function handleScheduled(
           try { await backfillUnembeddedEntities(org.id, env); }
           catch (e) { console.error(`hourly self-heal: backfillUnembeddedEntities failed for ${org.id}:`, e); }
         })());
+        // Hourly events embed backfill — closes the structural gap
+        // surfaced by the 2026-05-05 meeting-embed audit (1,069 of 1,122
+        // Outlook calendar events stranded unembedded; 95% gap).
+        // upsertOutlookEvent has no embed enqueue and the ingestion-
+        // finalizer's gap detector only sees events created within its
+        // own ingestion-workflow run window — calendar-progressive-
+        // backfill events fall outside. backfillUnembeddedEvents catches
+        // them on every hourly fire. LIMIT 50 + per-row try/catch keeps
+        // subrequest budget bounded; ~22 hours to drain the backlog.
+        // Sibling waitUntil so it races concurrently with the embed
+        // self-heal + renewal + entity backfill blocks above.
+        ctxExec.waitUntil((async () => {
+          const { backfillUnembeddedEvents } = await import('./lib/daily-cron');
+          try { await backfillUnembeddedEvents(org.id, env); }
+          catch (e) { console.error(`hourly self-heal: backfillUnembeddedEvents failed for ${org.id}:`, e); }
+        })());
         // deal_intelligence batch refresh — recompute the oldest 50
         // stale-or-invalidated rows for this org. Bounded subrequest
         // budget by HOURLY_BATCH_LIMIT (1 Claude call + ~3 D1 calls per
