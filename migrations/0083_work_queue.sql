@@ -145,7 +145,14 @@ CREATE TABLE IF NOT EXISTS work_queue (
   started_at TEXT,
   completed_at TEXT,
 
-  FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE
+  -- BUG (fixed via 0085 hotfix on 2026-05-05): the original migration
+  -- referenced `orgs(id)` but production's table is named
+  -- `organizations`. SQLite's CREATE TABLE doesn't validate FK target
+  -- existence, so 0083 applied clean and the dangling FK stayed
+  -- latent until Phase 6's first INSERTs surfaced it. Source kept
+  -- corrected here so fresh-install deploys produce the correct
+  -- shape from the start; 0085 is the production-side rebuild.
+  FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
 );
 
 -- Idempotency: per-domain unique only when a key is supplied. SQLite
