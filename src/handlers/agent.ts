@@ -3,6 +3,7 @@ import type { AgentSession, AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { preprocessQuery, retrieveContext, TOKEN_BUDGET, type RetrievalOptions } from '../lib/retrieval';
 import { buildSourcesAndContext, type CitationSource } from '../lib/citations';
+import { verifySampleClaims } from '../lib/citation-verifier';
 import { callClaude, callClaudeStreaming } from '../lib/claude';
 import type { ToolDefinition } from '../lib/claude';
 import { extractTextFromFile } from '../lib/file-extraction';
@@ -1126,6 +1127,18 @@ export async function queryAgent(
         } catch (e) {
           console.error('[citations] metrics insert failed:', e);
         }
+      }
+
+      // Wave-fix Chunk 3 (5a) — sample claim-grounding verification.
+      // Fires async via ctxExec.waitUntil so the user-facing response is
+      // already complete by the time we call the judge model. 20% sample
+      // rate inside verifySampleClaims; if not sampled, function returns
+      // immediately. Operates on persistedContent (post-strip from Chunk 2)
+      // so we never verify claims attached to invalid markers.
+      if (assistantMessageId && persistedContent && sources.length > 0) {
+        ctxExec.waitUntil(
+          verifySampleClaims(assistantMessageId, ctx.orgId, persistedContent, sources, env)
+        );
       }
 
       // Update session
