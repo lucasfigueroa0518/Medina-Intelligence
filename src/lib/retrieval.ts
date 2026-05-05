@@ -392,9 +392,16 @@ export async function retrieveContext(
     }
   }
 
+  // Cosine cutoff is a noise gate for the broad query. Doc-type-targeted
+  // secondary matches have already been filtered by document_type at the
+  // Vectorize layer — the targeting itself is the discipline, so applying
+  // the global gate to them double-counts and silently drops legitimate
+  // chunks that score 0.40–0.55 (long transcripts, terse Slack messages).
+  // Same architectural shape as the recency-floor exemption in rerank:
+  // discipline applies to broad queries, exempts caller-targeted ones.
   const filtered = internalMatches
     .filter(pq.postRetrievalFilter)
-    .filter(m => m.score >= 0.55);
+    .filter(m => m.score >= 0.55 || targetedIds.has(m.id));
 
   const { chunks: hydrated } = await hydrateChunks(filtered.slice(0, hydrateLimit), env);
   let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env, targetedIds);
