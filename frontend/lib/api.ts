@@ -993,6 +993,21 @@ export interface CompletenessMetric {
   percentage: number;
 }
 
+// Phase 5 1c (2026-05-05): work_queue surface.
+export interface WorkQueueInventoryEntry {
+  domain: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'dead_letter';
+  count: number;
+}
+export interface StuckWorkQueueEntry {
+  id: string;
+  org_id: string;
+  domain: string;
+  started_at: string | null;
+  heartbeat_at: string | null;
+  silent_for_minutes: number;
+}
+
 export interface SystemStatusResponse {
   active_tasks: SystemStatusActiveTask[];
   run_history: SystemStatusRunHistoryEntry[];
@@ -1008,6 +1023,11 @@ export interface SystemStatusResponse {
     meeting_attendees: CompletenessMetric;
     connected_users: CompletenessMetric & { names_missing: string[] };
   };
+  // Phase 5 1c — universal work_queue surface. Empty until domain pilots
+  // (5.1+) plug in. Backend always returns these fields; frontend renders
+  // an empty-state card when registry is unpopulated.
+  work_queue_inventory: WorkQueueInventoryEntry[];
+  stuck_work_queue: StuckWorkQueueEntry[];
   generated_at: string;
 }
 

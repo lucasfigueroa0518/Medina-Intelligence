@@ -16,6 +16,8 @@ import {
   type SystemStatusActiveTask,
   type SystemStatusRunHistoryEntry,
   type CompletenessMetric,
+  type WorkQueueInventoryEntry,
+  type StuckWorkQueueEntry,
 } from '@/lib/api';
 import { useBackgroundTasks } from '@/components/background-task-indicator';
 
@@ -3052,6 +3054,124 @@ function SystemStatusSection() {
       <ActiveTasksCard tasks={data.active_tasks} />
       <RunHistoryCard rows={data.run_history} />
       <DataCompletenessCard c={data.completeness} />
+      <WorkQueueCard
+        inventory={data.work_queue_inventory}
+        stuck={data.stuck_work_queue}
+      />
+    </div>
+  );
+}
+
+// ── Section 4: Work Queue (Phase 5 1c, 2026-05-05) ──────────────────────
+//
+// Universal work_queue surface. Substrate ships in Phase 5; the registry
+// is empty today so this card renders an empty state on every org. First
+// pilot domain (Phase 5.1+, likely embed_retry) populates the inventory
+// rows; the card auto-renders the per-domain breakdown without needing
+// further frontend work — domain name is the row label.
+//
+// Reads `work_queue_inventory` (per-domain status counts) and
+// `stuck_work_queue` (in_progress rows with stale heartbeat). The
+// stuck list is rendered as a per-domain badge on the corresponding
+// inventory row, NOT as a separate sub-table — that keeps the panel
+// dense and operator-actionable: one row per domain, all signals
+// co-located.
+
+function WorkQueueCard({
+  inventory,
+  stuck,
+}: {
+  inventory: WorkQueueInventoryEntry[];
+  stuck: StuckWorkQueueEntry[];
+}) {
+  // Aggregate inventory by domain. The backend returns one row per
+  // (domain, status), so we collapse here for rendering.
+  const byDomain = React.useMemo(() => {
+    const m = new Map<string, {
+      pending: number;
+      in_progress: number;
+      completed: number;
+      failed: number;
+      dead_letter: number;
+    }>();
+    for (const r of inventory) {
+      const slot = m.get(r.domain) || { pending: 0, in_progress: 0, completed: 0, failed: 0, dead_letter: 0 };
+      slot[r.status] = r.count;
+      m.set(r.domain, slot);
+    }
+    return Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [inventory]);
+
+  // Stuck count per domain — surfaced as a red badge on the inventory row.
+  const stuckByDomain = React.useMemo(() => {
+    const m = new Map<string, number>();
+    for (const s of stuck) m.set(s.domain, (m.get(s.domain) || 0) + 1);
+    return m;
+  }, [stuck]);
+
+  const isEmpty = byDomain.length === 0;
+
+  return (
+    <div className="card p-5">
+      <div className="text-sm font-medium text-text-primary mb-3">Work Queue</div>
+      {isEmpty ? (
+        <div className="text-sm text-text-muted">
+          <span className="inline-block w-1.5 h-1.5 rounded-full bg-semantic-success mr-2 align-middle" />
+          No registered domains. The universal work queue substrate is live;
+          domain pilots will populate this panel as they come online.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-xs text-text-muted text-left">
+                <th className="pb-2 pr-4 font-medium">Domain</th>
+                <th className="pb-2 pr-4 font-medium text-right">Pending</th>
+                <th className="pb-2 pr-4 font-medium text-right">In progress</th>
+                <th className="pb-2 pr-4 font-medium text-right">Dead-letter</th>
+                <th className="pb-2 font-medium text-right">Stuck</th>
+              </tr>
+            </thead>
+            <tbody>
+              {byDomain.map(([domain, counts]) => {
+                const stuckN = stuckByDomain.get(domain) ?? 0;
+                return (
+                  <tr key={domain} className="border-t border-border/30">
+                    <td className="py-2 pr-4 font-mono text-xs text-text-primary">{domain}</td>
+                    <td className="py-2 pr-4 text-right tabular-nums text-text-primary">
+                      {counts.pending.toLocaleString()}
+                    </td>
+                    <td className="py-2 pr-4 text-right tabular-nums text-text-primary">
+                      {counts.in_progress.toLocaleString()}
+                    </td>
+                    <td className={`py-2 pr-4 text-right tabular-nums ${counts.dead_letter > 0 ? 'text-semantic-error font-medium' : 'text-text-muted'}`}>
+                      {counts.dead_letter.toLocaleString()}
+                    </td>
+                    <td className="py-2 text-right tabular-nums">
+                      {stuckN > 0 ? (
+                        <span className="inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold"
+                          style={{ background: 'rgba(245,158,11,0.15)', color: '#FCD34D' }}>
+                          {stuckN}
+                        </span>
+                      ) : (
+                        <span className="text-text-muted">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {stuck.length > 0 && (
+            <div className="text-[10px] text-text-muted mt-3">
+              Stuck = in-progress rows with no heartbeat for &gt;10 min. The
+              minute-tick watchdog reclaims these on the next sweep; if the
+              count persists across refreshes, the handler is genuinely
+              degraded and warrants investigation.
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

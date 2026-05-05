@@ -16,6 +16,7 @@
 
 import type { Env } from '../types/env';
 import { listFireflyKeyStatuses, type FireflyKeyStatus } from './firefly-credentials';
+import { countByDomain, type WorkQueueDomainCount } from './work-queue';
 
 // ─── Pipeline health ─────────────────────────────────────────────────────
 
@@ -119,10 +120,10 @@ export interface DeadLetterRow {
  * Aggregates anything an operator should review:
  *   - embed_retry_queue rows in 'failed_permanent'
  *   - task_runs in 'failed' status in the last 24h
+ *   - work_queue rows in 'dead_letter' status (Phase 5 1b, 2026-05-05)
  *
- * Phase 2+ will add work_queue dead-letter rows here. Phase 1 adds DLQ
- * reads from `webhook-dlq` / `audit-log-dlq` (already wired in
- * wrangler.toml; they're CF Queues, not D1 — separate read API).
+ * Phase 1 adds DLQ reads from `webhook-dlq` / `audit-log-dlq` (already
+ * wired in wrangler.toml; they're CF Queues, not D1 — separate read API).
  */
 export async function getDeadLetterItems(
   env: Env,
@@ -174,6 +175,31 @@ export async function getDeadLetterItems(
     });
   }
 
+  // Phase 5 1b: work_queue dead-letter rows, grouped by domain. Surfaces
+  // exhausted-retry items so an operator can investigate (last_error +
+  // oldest entry timestamp) before deciding to reset to 'pending' for
+  // re-attempt or hard-delete. No 24h window — dead-lettered rows
+  // accumulate until explicitly cleared.
+  const wq = await env.D1.prepare(
+    `SELECT domain,
+            COUNT(*) AS count,
+            MIN(created_at) AS oldest,
+            MAX(last_error) AS recent_error
+       FROM work_queue
+      WHERE org_id = ? AND status = 'dead_letter'
+      GROUP BY domain
+      ORDER BY count DESC`
+  ).bind(orgId).all<{ domain: string; count: number; oldest: string | null; recent_error: string | null }>();
+  for (const r of wq.results) {
+    rows.push({
+      source: `work_queue:${r.domain}`,
+      state: 'dead_letter',
+      count: r.count,
+      oldest: r.oldest,
+      recent_error: r.recent_error,
+    });
+  }
+
   return rows;
 }
 
@@ -210,6 +236,49 @@ export async function getStuckTaskRuns(
       ORDER BY COALESCE(heartbeat_at, started_at) ASC
       LIMIT ?`
   ).bind(cutoff, limit).all<StuckTaskRunRow>();
+  return result.results;
+}
+
+// ─── Stuck work_queue rows (Phase 5 1b) ─────────────────────────────────
+
+export interface StuckWorkQueueRow {
+  id: string;
+  org_id: string;
+  domain: string;
+  started_at: string | null;
+  heartbeat_at: string | null;
+  /** Minutes since last heartbeat (or started_at if never heartbeated). */
+  silent_for_minutes: number;
+}
+
+/**
+ * Find work_queue rows in 'in_progress' status whose heartbeat_at (or
+ * started_at if never heartbeated) is older than `staleAfterMinutes`
+ * minutes ago. The work_queue's own watchdog (sweepStaleClaims) reclaims
+ * these every minute-tick by resetting status to 'pending' OR flipping
+ * to 'dead_letter' if attempt >= max_attempts; this read surfaces them
+ * for operator visibility AHEAD of the sweep so genuinely-degraded
+ * handlers don't disappear silently into the retry loop.
+ *
+ * Distinct from getStuckTaskRuns — task_runs is per-cron-task whereas
+ * work_queue is per-item. Both surfaces matter; both are rendered in
+ * the Settings UI as separate panels.
+ */
+export async function getStuckWorkQueueRows(
+  env: Env,
+  staleAfterMinutes = 10,
+  limit = 100
+): Promise<StuckWorkQueueRow[]> {
+  const cutoff = `-${staleAfterMinutes} minutes`;
+  const result = await env.D1.prepare(
+    `SELECT id, org_id, domain, started_at, heartbeat_at,
+            CAST((julianday('now') - julianday(COALESCE(heartbeat_at, started_at))) * 1440 AS INTEGER) AS silent_for_minutes
+       FROM work_queue
+      WHERE status = 'in_progress'
+        AND COALESCE(heartbeat_at, started_at) < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)
+      ORDER BY COALESCE(heartbeat_at, started_at) ASC
+      LIMIT ?`
+  ).bind(cutoff, limit).all<StuckWorkQueueRow>();
   return result.results;
 }
 
@@ -288,23 +357,44 @@ export interface SystemStatusSnapshot {
   // "credentials section" and gives operators visibility into which
   // users have keys (for "why is Tony's backfill failing?" forensics).
   firefly_credentials: FireflyKeyStatus[];
+  // Phase 5 1b (2026-05-05): universal work_queue surface.
+  //   • work_queue_inventory: per (domain, status) counts for the
+  //     org. Drives the Settings UI's "Work Queue" panel (1c).
+  //   • stuck_work_queue: in_progress rows whose heartbeat is stale
+  //     past the threshold. Sibling to stuck_runs (task_runs scope)
+  //     but distinct surface — work_queue items are per-item, task_runs
+  //     is per-cron-task. Both rendered in the same UI section.
+  // dead_letter already absorbs work_queue:dead_letter rows via
+  // getDeadLetterItems; no separate field needed.
+  work_queue_inventory: WorkQueueDomainCount[];
+  stuck_work_queue: StuckWorkQueueRow[];
 }
 
 /**
  * Single call returning everything the System Status panel needs. Future
- * route handler is a thin pass-through over this. ~7 D1 reads worst case;
+ * route handler is a thin pass-through over this. ~9 D1 reads worst case;
  * well under the per-invocation subrequest budget.
  */
 export async function getSystemStatusSnapshot(
   env: Env,
   orgId: string
 ): Promise<SystemStatusSnapshot> {
-  const [pipelines, dead_letter, stuck_runs, budgets, firefly_credentials] = await Promise.all([
+  const [
+    pipelines,
+    dead_letter,
+    stuck_runs,
+    budgets,
+    firefly_credentials,
+    work_queue_inventory,
+    stuck_work_queue,
+  ] = await Promise.all([
     getPipelineHealth(env, orgId),
     getDeadLetterItems(env, orgId),
     getStuckTaskRuns(env),
     getBudgetSnapshot(env, orgId),
     listFireflyKeyStatuses(orgId, env),
+    countByDomain(env, orgId),
+    getStuckWorkQueueRows(env),
   ]);
   return {
     generated_at: new Date().toISOString(),
@@ -313,5 +403,7 @@ export async function getSystemStatusSnapshot(
     stuck_runs,
     budgets,
     firefly_credentials,
+    work_queue_inventory,
+    stuck_work_queue,
   };
 }
