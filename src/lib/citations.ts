@@ -469,12 +469,31 @@ export interface BuildSourcesResult {
   contextBlock: string;
 }
 
+// Detect which source type(s) the user is asking about. Used to emit
+// ALTERNATIVE-block sentinels when retrieval returned content of the wrong
+// type (e.g. user asked "Slack" but only emails came back). Returns the set
+// of explicitly-intended types — empty set = no specific type asked, all
+// types fair game.
+function detectIntendedSourceTypes(query: string): Set<CitationSourceType> {
+  const lower = query.toLowerCase();
+  const intended = new Set<CitationSourceType>();
+  if (/\b(slack|channel|dm)\b/.test(lower)) intended.add('slack');
+  // Only treat email as intended when "email" appears as a word; "thread" /
+  // "message" are too broad — users say "email thread" but also "Slack
+  // thread" / "any messages from X."
+  if (/\b(email|emails|inbox)\b/.test(lower)) intended.add('email');
+  if (/\b(meeting|meetings|transcript|call|calls)\b/.test(lower)) intended.add('meeting');
+  if (/\b(document|documents|doc|docs|pdf|attachment|file|files)\b/.test(lower)) intended.add('document');
+  return intended;
+}
+
 export async function buildSourcesAndContext(
   internal: HydratedChunk[],
   news: HydratedChunk[],
   uploadedDoc: string | undefined,
   orgId: string,
-  env: Env
+  env: Env,
+  query?: string
 ): Promise<BuildSourcesResult> {
   // Assign one source number per unique (source_table, source_id) — multiple
   // chunks from the same email/meeting collapse to a single citation.
@@ -499,6 +518,36 @@ export async function buildSourcesAndContext(
   // table for [^N] markers.
   let header = 'SOURCES (cite these by number using [^N] format — never with parentheticals):\n';
   for (const s of sources) header += formatSourceLine(s) + '\n';
+
+  // Wave-fix Chunk 2 sentinels. Two failure modes the prompt-only fix in
+  // Chunk 1 doesn't address structurally:
+  //   (3A) Empty SOURCES — retrieval returned nothing usable. Without an
+  //        explicit sentinel the model sees a bare "SOURCES:\n" header and
+  //        an empty CONTEXT block, then has to infer "no data" from
+  //        emptiness. Make it explicit.
+  //   (3C) Type-mismatch — user asked about Slack (or emails or meetings),
+  //        retrieval returned content of OTHER types. The model has real
+  //        numbered sources to cite but they don't answer the type-scoped
+  //        question. Surface the mismatch so the model leads with "I don't
+  //        have <type> on this; here's what I do have."
+  // Detection only fires when `query` is supplied (caller opts in).
+  if (sources.length === 0) {
+    header += '(no internal data matched this query — answer honestly with "I don\'t have data on that," or pivot to web_search/general knowledge if applicable.)\n';
+  } else if (query) {
+    const intended = detectIntendedSourceTypes(query);
+    if (intended.size > 0) {
+      const presentTypes = new Set(sources.map(s => s.type));
+      const missing = [...intended].filter(t => !presentTypes.has(t));
+      const presentList = [...presentTypes].filter(t => !intended.has(t));
+      if (missing.length > 0) {
+        const missingLabel = missing.map(t => t.toUpperCase()).join('/');
+        const presentLabel = presentList.length > 0
+          ? `the SOURCES below are all ${presentList.map(t => t.toUpperCase()).join('/')} content`
+          : 'no relevant content of any other type was found either';
+        header += `\nSOURCE-TYPE MISMATCH: the user asked about ${missingLabel} content but zero ${missingLabel} sources matched — ${presentLabel}. State this honestly: "No ${missing.join('/').toLowerCase()} messages/emails/etc on that." Then optionally surface the available content as adjacent context, framed clearly. Do NOT cite ${presentList.length > 0 ? presentList.map(t => t.toUpperCase()).join('/') : 'OTHER-TYPE'} sources to support claims about ${missingLabel}.\n`;
+      }
+    }
+  }
 
   // Body: each chunk prefixed with its source number so Claude can match it
   // back. Truncated to PER_CHUNK_MAX tokens, hard-capped at CONTEXT_TOKEN_BUDGET

@@ -907,12 +907,16 @@ export async function queryAgent(
   }
 
   // --- Assemble context with numbered sources ---
+  // Pass `query` so buildSourcesAndContext can emit Chunk 2 sentinels:
+  // empty-sources notice when retrieval is dry, and source-type-mismatch
+  // banner when user asked about (e.g.) Slack but only emails came back.
   const { sources, contextBlock } = await buildSourcesAndContext(
     internal,
     news,
     uploadedText,
     ctx.orgId,
-    env
+    env,
+    query
   );
 
   // --- Per-session attachment replay (Approach A + 50 MB cap) ---
@@ -1046,13 +1050,45 @@ export async function queryAgent(
       // so reloading the session keeps inline pills working. If the request
       // was cancelled mid-stream, mark it in metadata so the UI can render
       // a "Cancelled" badge on reload.
+      //
+      // Wave-fix Chunk 2 (4-II): strip invalid [^N] markers before persist.
+      // Audit 2026-05-05 caught the model emitting [^11] and [^12] when only
+      // 10 sources existed. The streaming client already saw those markers
+      // for a few hundred ms, but the persisted record (used on session
+      // reload, in audit logs, in screenshots) gets a clean version with
+      // the invalid markers replaced by an empty string. Count is recorded
+      // in metadata for UI badging + the existing marty_citation_metrics
+      // telemetry table.
       const cancelled = await wasCancelledIncludingKV(requestId, env);
-      const persistedContent = fullText || (cancelled ? '_(cancelled before MARTy started generating)_' : '');
+      const rawContent = fullText || (cancelled ? '_(cancelled before MARTy started generating)_' : '');
+      let strippedContent = rawContent;
+      let invalidCitationsStripped = 0;
+      if (rawContent && sources.length > 0) {
+        const validIds = new Set(sources.map(s => s.id));
+        strippedContent = rawContent.replace(/\[\^(\d+)\]/g, (match, num) => {
+          if (validIds.has(parseInt(num, 10))) return match;
+          invalidCitationsStripped++;
+          return '';
+        });
+      } else if (rawContent && sources.length === 0) {
+        // No sources at all — every [^N] marker is invalid. Strip them.
+        strippedContent = rawContent.replace(/\[\^(\d+)\]/g, () => {
+          invalidCitationsStripped++;
+          return '';
+        });
+      }
+
+      const persistedContent = strippedContent;
       let assistantMessageId: string | null = null;
       if (persistedContent) {
         assistantMessageId = crypto.randomUUID();
         const sourcesJson = sources.length > 0 ? JSON.stringify(sources) : null;
-        const metadataJson = cancelled ? JSON.stringify({ cancelled: true }) : null;
+        const metadataObj: Record<string, any> = {};
+        if (cancelled) metadataObj.cancelled = true;
+        if (invalidCitationsStripped > 0) {
+          metadataObj.invalid_citations_stripped = invalidCitationsStripped;
+        }
+        const metadataJson = Object.keys(metadataObj).length > 0 ? JSON.stringify(metadataObj) : null;
         await env.D1.prepare(
           `INSERT INTO agent_messages (id, session_id, turn_index, role, content, sources_json, metadata, created_at)
            VALUES (?, ?, ?, 'assistant', ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
