@@ -682,9 +682,27 @@ export async function getFireflyProgressiveStatus(
   // 0070 but never landed in production rows. Per-window 'failed'
   // detail remains visible via the windows array, so failure forensics
   // aren't lost — only the parent-level status pill is collapsed.
-  if (parent.status === 'partially_completed') parent.status = 'completed';
+  //
+  // Phase 7c (2026-05-05): refactored from in-place mutation
+  // (`parent.status = 'completed'`) to a returned-copy pattern so
+  // the deserialized DB row is left untouched. Callers receive a
+  // fresh object with the collapsed status field; downstream
+  // redaction in handlers/firefly-backfill.ts mutates its own
+  // copy, not this one.
+  return {
+    parent: { ...parent, status: collapseFireflyParentStatus(parent.status) },
+    windows: windows.results,
+  };
+}
 
-  return { parent, windows: windows.results };
+/** Phase 7c (2026-05-05): wire-collapse helper. Frontend type union
+ *  doesn't include 'partially_completed'; collapse to 'completed' for
+ *  shape parity. Per-window detail (windows[].status) preserves
+ *  failure forensics. */
+function collapseFireflyParentStatus(
+  s: FireflyProgressiveBackfillJob['status']
+): FireflyProgressiveBackfillJob['status'] {
+  return s === 'partially_completed' ? 'completed' : s;
 }
 
 /** Org-wide list. Mirrors listProgressiveBackfills. */
@@ -714,10 +732,13 @@ export async function listFireflyProgressiveBackfills(
       `SELECT * FROM firefly_progressive_backfill_windows
          WHERE parent_id = ? ORDER BY window_index ASC`
     ).bind(p.id).all<FireflyProgressiveBackfillWindow>();
-    // Phase 6.2 1b (2026-05-05): wire-collapse — see
-    // getFireflyProgressiveStatus for full rationale.
-    if (p.status === 'partially_completed') p.status = 'completed';
-    out.push({ parent: p, user_email: u?.email ?? null, windows: w.results });
+    // Phase 6.2 1b + 7c (2026-05-05): wire-collapse via returned copy;
+    // see getFireflyProgressiveStatus for full rationale.
+    out.push({
+      parent: { ...p, status: collapseFireflyParentStatus(p.status) },
+      user_email: u?.email ?? null,
+      windows: w.results,
+    });
   }
   return out;
 }
