@@ -285,19 +285,35 @@ export const fireflyWindowHandler: WorkQueueHandler = {
       transcripts_failed:            transcripts_failed            + result.failed,
     });
 
-    // deferWork transitions the work_queue row back to 'pending' with
-    // the deferred next_attempt_at, WITHOUT incrementing attempt
-    // (Phase 6.2 1a substrate enhancement). Rate-limit pauses can recur
-    // many times during a long backfill — must not consume retry
-    // budget. The driver's completeWork (filtered to in_progress) is
-    // a no-op once this transitions out of in_progress.
-    await deferWork(env, item.id, nextAttemptAt, updatedPayload);
-
-    // Update legacy window for UI continuity. Counters are bumped via
-    // delta. status stays 'in_progress' (legacy semantic for paused —
-    // distinguishes from terminal completed/failed). earliest_run_at
-    // mirrors the work_queue's next_attempt_at for both rate-limit
-    // (next UTC midnight) and immediate-resume cases.
+    // Phase 7a (2026-05-05): legacy-first, then deferWork.
+    //
+    // Original ordering had deferWork() first, then legacy UPDATE. If
+    // the legacy UPDATE failed (D1 transient, network), the work_queue
+    // row carried the new last_skip + counters in payload but the
+    // legacy table was frozen at the prior state. Operator UI reads
+    // from legacy → stale counters; eventual reclaim resumed from
+    // work_queue's new last_skip while UI lagged. The audit's P0
+    // dual-write-drift finding.
+    //
+    // Inverted order — legacy UPDATE FIRST. If legacy UPDATE fails,
+    // the await throws → driver's catch fires failWork (3-tier backoff
+    // or dead-letter at attempt >= 3). Trade-off: a transient D1
+    // failure on the paused path now consumes an attempt instead of
+    // producing silent UI drift. Acceptable: D1 transients are rare;
+    // visible failure is preferable to invisible drift; 3-attempt
+    // buffer before dead-letter gives the storage layer recovery
+    // room. If deferWork fails AFTER legacy is updated, watchdog
+    // reclaims (Phase 7a's 90s grace window absorbs CF jitter) and
+    // the next handler resumes from work_queue's last consistent
+    // state — INSERT OR IGNORE on transcripts saves us from
+    // re-persistence at the cost of duplicate BGE work over the
+    // partial range.
+    //
+    // The 'completed' and 'failed' branches above already follow this
+    // legacy-first pattern; this brings the 'paused' branch into
+    // alignment. recordFireflyApiCall(true) for rate-limit signaling
+    // moves to AFTER both writes succeed so the breaker counter
+    // reflects only confirmed-paused-and-checkpointed runs.
     await env.D1.prepare(
       `UPDATE firefly_progressive_backfill_windows
           SET last_skip = ?,
@@ -318,6 +334,14 @@ export const fireflyWindowHandler: WorkQueueHandler = {
       parent_id,
       window_index
     ).run();
+
+    // deferWork transitions the work_queue row back to 'pending' with
+    // the deferred next_attempt_at, WITHOUT incrementing attempt
+    // (Phase 6.2 1a substrate enhancement). Rate-limit pauses can recur
+    // many times during a long backfill — must not consume retry
+    // budget. The driver's completeWork (filtered to in_progress) is
+    // a no-op once this transitions out of in_progress.
+    await deferWork(env, item.id, nextAttemptAt, updatedPayload);
 
     if (isRateLimitPause) {
       // Phase 3.4.1 (preserved): rate-limit signal feeds the breaker.

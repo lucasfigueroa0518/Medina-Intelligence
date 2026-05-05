@@ -84,8 +84,22 @@ export interface EnqueueResult {
 
 /** Default lock TTL granted on claim. Keep in sync with handler timeouts. */
 export const DEFAULT_LOCK_TTL_MS = 5 * 60 * 1000;
-/** Stale threshold past locked_until before sweep reclaims. */
-export const STALE_CLAIM_GRACE_MS = 30 * 1000;
+/**
+ * Stale threshold past locked_until before sweep reclaims.
+ *
+ * Phase 7a (2026-05-05): raised 30s → 90s. The auto-heartbeat (Phase
+ * 6.0.1) interval is 60s; lock TTL is 5min. Under CF Worker GC jitter
+ * or scheduling latency, a single missed heartbeat tick can push the
+ * effective lock-extension cadence past 60s. With grace=30s, a
+ * 90-100s heartbeat slip combined with a near-expired locked_until
+ * could produce a premature reclaim while the handler is still
+ * mid-flight — the audit's P1 finding B. Raising to 90s absorbs one
+ * full missed heartbeat plus a margin without sacrificing watchdog
+ * timeliness for genuinely-crashed handlers (which would have
+ * stopped extending the lock entirely; effective reclaim still
+ * happens within ~6.5min of the original claim).
+ */
+export const STALE_CLAIM_GRACE_MS = 90 * 1000;
 /** Three-tier retry backoff schedule (ms). attempt index → wait. */
 export const RETRY_BACKOFF_MS = [5 * 60 * 1000, 30 * 60 * 1000];
 
