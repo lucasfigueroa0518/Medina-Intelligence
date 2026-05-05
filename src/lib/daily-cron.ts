@@ -888,7 +888,11 @@ export async function processEmbedRetryQueue(
 //   'embedded' — vectors written to vector_entity_index
 //   'skipped'  — item already has vectors (dedup guard hit), nothing to do
 //   'missing'  — source row gone (deleted since enqueue)
-async function embedSingleItem(
+// Exported in Phase 6 1a (2026-05-05) so the work_queue embed_retry
+// handler at src/lib/work-queue-handlers/embed-retry.ts can call it
+// directly. Function is otherwise unchanged from the prior in-house
+// drain — only the calling surface widened.
+export async function embedSingleItem(
   entityId: string,
   sourceTable: string,
   orgId: string,

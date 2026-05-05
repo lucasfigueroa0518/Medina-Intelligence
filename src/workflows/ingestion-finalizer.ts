@@ -124,15 +124,25 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
               `[IngestionFinalizerWorkflow] detect-embed-gaps: ${convoGaps.results.length} conv + ${eventGaps.results.length} events + ${docGaps.results.length} docs missing vectors — enqueueing`
             );
 
-            const stmts: D1PreparedStatement[] = [];
-            const enqueue = this.env.D1.prepare(
-              `INSERT OR IGNORE INTO embed_retry_queue (org_id, entity_id, source_table) VALUES (?, ?, ?)`
-            );
-            for (const g of convoGaps.results) stmts.push(enqueue.bind(org_id, g.id, 'conversations'));
-            for (const g of eventGaps.results) stmts.push(enqueue.bind(org_id, g.id, 'events'));
-            for (const g of docGaps.results) stmts.push(enqueue.bind(org_id, g.id, 'documents'));
-
-            if (stmts.length > 0) await this.env.D1.batch(stmts);
+            // Phase 6 1a (2026-05-05): write side now goes to work_queue
+            // via enqueueWork. Pre-existing embed_retry_queue rows continue
+            // to drain via daily-cron.processEmbedRetryQueue during the
+            // 1a→1b transition. Idempotency_key mirrors the prior table's
+            // UNIQUE(org_id, entity_id, source_table) so re-enqueue during
+            // drain collapses cleanly.
+            const { enqueueWork } = await import('../lib/work-queue');
+            const enqueueGap = async (entity_id: string, source_table: string) => {
+              await enqueueWork(this.env, org_id, 'embed_retry',
+                { entity_id, source_table },
+                {
+                  upstream: 'bge',
+                  idempotency_key: `${org_id}:${entity_id}:${source_table}`,
+                }
+              );
+            };
+            for (const g of convoGaps.results) await enqueueGap(g.id, 'conversations');
+            for (const g of eventGaps.results) await enqueueGap(g.id, 'events');
+            for (const g of docGaps.results) await enqueueGap(g.id, 'documents');
 
             await this.env.D1.prepare(
               `UPDATE sync_jobs SET metadata = json_set(
