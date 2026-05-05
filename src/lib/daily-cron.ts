@@ -69,7 +69,18 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await renewExpiringSubscriptions(env); } catch (e) { console.error('Graph subscription renewal:', e); }
   try { await backfillUnembeddedConversations(orgId, env); } catch (e) { console.error('Unembedded backfill:', e); }
   try { await backfillUnembeddedEntities(orgId, env); } catch (e) { console.error('Entity backfill:', e); }
-  try { await backfillUnembeddedEvents(orgId, env); } catch (e) { console.error('Event backfill:', e); }
+  // Phase 7c (2026-05-05): backfillUnembeddedEvents removed from
+  // daily-cron orchestration. T4's hotfix wired it both hourly
+  // (src/index.ts:887) AND here, but at 02:10 UTC the hourly run
+  // (02:00 + waitUntil) and the daily run could overlap in two
+  // concurrent Worker invocations both SELECTing the same 50
+  // unembedded events and embedding each twice — INSERT OR IGNORE
+  // saved DB integrity but BGE quota was wasted. Hourly cadence
+  // alone drains 50 events × 24 = 1200/day, well above the audit's
+  // 22-hour drain projection. The work_queue migration for the
+  // embed-self-heal trio (deferred separate workstream) is the
+  // proper home for budget-aware concurrency; until then, hourly-
+  // only is the lightest fix.
   // Phase 6 1b (2026-05-05): processEmbedRetryQueue removed from daily
   // orchestration. Replaced by Phase 5's minute-tick driver running the
   // embed_retry domain handler via WORK_QUEUE_HANDLERS. The function body

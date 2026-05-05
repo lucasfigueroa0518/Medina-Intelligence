@@ -115,6 +115,36 @@ export const fireflyWindowHandler: WorkQueueHandler = {
       // This is the cancel-propagation path: cancel updates only the
       // parent + legacy windows; orphaned work_queue rows for that
       // parent collapse cleanly here.
+      //
+      // Phase 7c (2026-05-05): mark the payload with
+      // `parent_terminal_at_claim` BEFORE returning so an operator
+      // running detailed forensics can distinguish rows that did
+      // actual work (no marker) from rows that collapsed because
+      // their parent was already terminal (marker present, value
+      // 'cancelled'/'completed'/'partially_completed'). The driver's
+      // completeWork still fires — UI/dashboard counts unchanged —
+      // but a curiosity query like
+      //   SELECT COUNT(*) FROM work_queue
+      //    WHERE domain='firefly_window' AND status='completed'
+      //      AND json_extract(payload, '$.parent_terminal_at_claim') IS NULL
+      // gives the true "actual work performed" count. Best-effort:
+      // a write failure here is logged and absorbed; the row still
+      // transitions to completed via the driver's terminal call so
+      // the forensic detail is the only thing lost.
+      try {
+        const markedPayload = JSON.stringify({
+          ...payload,
+          parent_terminal_at_claim: parent.status,
+        });
+        await env.D1.prepare(
+          `UPDATE work_queue SET payload = ? WHERE id = ?`
+        ).bind(markedPayload, item.id).run();
+      } catch (e) {
+        console.warn(
+          `[firefly-window] failed to write parent_terminal_at_claim marker for ${item.id}:`,
+          e instanceof Error ? e.message : e
+        );
+      }
       return;
     }
 
