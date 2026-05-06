@@ -45,12 +45,17 @@ import { handleDlqBatch, handleAuditDlqBatch } from './workers/dlq-consumer';
 
 import { runDailyCron } from './lib/daily-cron';
 
-export { IngestionWorkflow } from './workflows/ingestion';
-export { IngestionChunkWorkflow } from './workflows/ingestion-chunk';
-export { IngestionFinalizerWorkflow } from './workflows/ingestion-finalizer';
-export { EnrichmentWorkflow } from './workflows/enrichment';
-export { CampaignSendWorkflow } from './workflows/campaign-send';
-export { DailyCronWorkflow } from './workflows/daily-cron';
+// Phase 8 strip (2026-05-06): 6 Workflow class re-exports removed
+// from api Worker. Class ownership lives on medina-ventures-pipelines
+// (src/pipelines-index.ts re-exports from src/workflows/*.ts). The
+// workflow class definition files themselves stay untouched —
+// pipelines imports them, api just stops claiming ownership.
+//
+// Tomorrow's follow-up: add `[[services]] PIPELINES` service binding
+// to wrangler.toml + refactor admin.ts:465, admin.ts:543,
+// campaigns.ts:141 to trigger workflows via service binding instead
+// of direct env.<WORKFLOW>.create() (those bindings no longer exist
+// on api after this strip).
 
 // --- CORS helpers ---
 

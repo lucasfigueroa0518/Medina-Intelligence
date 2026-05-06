@@ -64,49 +64,38 @@ index_name = "medina-ventures-main"
 #     --property-name=<field> --type=string
 
 # --- Workflows ---
-
-[[workflows]]
-name = "ingestion-workflow"
-binding = "INGESTION_WORKFLOW"
-class_name = "IngestionWorkflow"
-
-[[workflows]]
-name = "ingestion-chunk-workflow"
-binding = "INGESTION_CHUNK_WORKFLOW"
-class_name = "IngestionChunkWorkflow"
-
-[[workflows]]
-name = "ingestion-finalizer-workflow"
-binding = "INGESTION_FINALIZER_WORKFLOW"
-class_name = "IngestionFinalizerWorkflow"
-
-[[workflows]]
-name = "enrichment-workflow"
-binding = "ENRICHMENT_WORKFLOW"
-class_name = "EnrichmentWorkflow"
-
-[[workflows]]
-name = "campaign-send-workflow"
-binding = "CAMPAIGN_WORKFLOW"
-class_name = "CampaignSendWorkflow"
-
-[[workflows]]
-name = "daily-cron-workflow"
-binding = "DAILY_CRON_WORKFLOW"
-class_name = "DailyCronWorkflow"
+#
+# Phase 8 strip (2026-05-06): 6 [[workflows]] declarations removed.
+# All workflow class ownership transferred to medina-ventures-pipelines
+# Worker (wrangler.pipelines.toml). api Worker no longer claims any
+# workflow class binding; on deploy, CF reconciles ownership to
+# pipelines (the only remaining declarer).
+#
+# Side effects on api Worker:
+#   • env.INGESTION_WORKFLOW / env.ENRICHMENT_WORKFLOW /
+#     env.CAMPAIGN_WORKFLOW / etc. bindings no longer exist on api
+#   • 3 endpoints break at runtime until follow-up service-binding
+#     refactor lands tomorrow:
+#       POST /api/admin/trigger-ingestion (admin.ts:465)
+#       POST /api/admin/trigger-sync     (admin.ts:543)
+#       POST /api/campaigns/:id/send     (campaigns.ts:141)
+#   • Tony/Alvaro hold campaign sends for ~45 min during this window
+#     (Slack coordination 2026-05-06)
+#
+# Tomorrow's follow-up: add `[[services]] PIPELINES` binding to this
+# config + small `triggerWorkflow` method on pipelines + refactor the
+# 3 sites to call via service binding. Restores admin + campaign send.
 
 # --- Cron Triggers ---
-
-# Phase 2 (2026-05-04): consolidated 4 cron triggers → 2.
-# Removed `5 * * * *` (enrichment) and `0 0 * * *` (daily cron) — both
-# folded into the minute-tick handler (src/index.ts) with time-of-day
-# gates. Eliminates the 4-trigger CF dispatch fragility that left the
-# daily cron silently dead since 2026-04-28.
-[triggers]
-crons = [
-  "0 * * * *",
-  "* * * * *",
-]
+#
+# Phase 8 strip (2026-05-06): [triggers] section removed. api Worker
+# no longer fires any cron. All scheduled work runs on pipelines
+# Worker (medina-ventures-pipelines, wrangler.pipelines.toml).
+#
+# Phase 2 (2026-05-04) historical context (preserved): consolidated 4
+# cron triggers → 2 by folding `5 * * * *` (enrichment) and
+# `0 0 * * *` (daily cron) into the minute-tick handler with
+# time-of-day gates.
 
 # --- Queues ---
 
