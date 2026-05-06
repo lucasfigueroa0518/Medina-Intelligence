@@ -324,7 +324,32 @@ function entityNameMatchesQuery(
   const normalized = normalizeEntityText(name);
   const compact = compactEntityText(name);
   if (!normalized || !compact) return false;
+  if (tokens.length === 1) {
+    return new Set(tokenizeEntityText(queryNormalized)).has(tokens[0]);
+  }
   return queryNormalized.includes(normalized) || queryCompact.includes(compact);
+}
+
+function findUnmatchedContactPhraseTokens(
+  queryTokens: string[],
+  contacts: Array<{ full_name: string }>,
+  contactTokenCounts: Map<string, number>
+): Set<string> {
+  const unmatched = new Set<string>();
+  for (let i = 0; i < queryTokens.length - 1; i++) {
+    const a = queryTokens[i];
+    const b = queryTokens[i + 1];
+    if (!contactTokenCounts.has(a) || !contactTokenCounts.has(b)) continue;
+    const hasContactWithBothTokens = contacts.some(contact => {
+      const contactTokens = new Set(tokenizeEntityText(contact.full_name));
+      return contactTokens.has(a) && contactTokens.has(b);
+    });
+    if (!hasContactWithBothTokens) {
+      unmatched.add(a);
+      unmatched.add(b);
+    }
+  }
+  return unmatched;
 }
 
 function hasEntityNameSignal(reasons: string[]): boolean {
@@ -557,11 +582,17 @@ export async function preprocessQuery(
       const scored: ScoredEntity[] = [];
       const queryNormalized = normalizeEntityText(query);
       const queryCompact = compactEntityText(query);
-      const queryTokens = new Set(tokenizeEntityText(query));
+      const queryTokenList = tokenizeEntityText(query);
+      const queryTokens = new Set(queryTokenList);
       const contactTokenCounts = countNameTokens(index.contacts, c => c.full_name);
       const companyTokenCounts = countNameTokens(index.companies, c => c.name);
       const hasExactContactNameMatch = index.contacts.some(c =>
         entityNameMatchesQuery(c.full_name, queryNormalized, queryCompact)
+      );
+      const unmatchedContactPhraseTokens = findUnmatchedContactPhraseTokens(
+        queryTokenList,
+        index.contacts,
+        contactTokenCounts
       );
 
       for (const c of index.contacts) {
@@ -578,7 +609,9 @@ export async function preprocessQuery(
         } else if (matchedNameTokens.length === 1 && !hasExactContactNameMatch) {
           const token = matchedNameTokens[0];
           const tokenCount = contactTokenCounts.get(token) || 0;
-          if (tokenCount === 1) {
+          if (unmatchedContactPhraseTokens.has(token)) {
+            reasons.push('suppressed_unmatched_name_phrase');
+          } else if (tokenCount === 1) {
             score += 0.55;
             reasons.push('unique_single_name_token');
           } else if (nameTokens.includes(token) && tokenCount <= MAX_AMBIGUOUS_CONTACT_NAME_TOKEN_MATCHES) {
@@ -601,6 +634,12 @@ export async function preprocessQuery(
             score += 0.15 * matched;
             reasons.push('bio_keywords');
           }
+        }
+        if (
+          unmatchedContactPhraseTokens.size > 0 &&
+          !hasContextualEntitySignal(reasons)
+        ) {
+          score = 0;
         }
         if (score > 0) {
           scored.push({
@@ -645,6 +684,12 @@ export async function preprocessQuery(
             score += 0.15 * matched;
             reasons.push('description_keywords');
           }
+        }
+        if (
+          unmatchedContactPhraseTokens.size > 0 &&
+          !hasContextualEntitySignal(reasons)
+        ) {
+          score = 0;
         }
         if (score > 0) {
           scored.push({
