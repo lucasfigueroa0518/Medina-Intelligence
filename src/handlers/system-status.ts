@@ -110,12 +110,42 @@ function metric(current: number, total: number): CompletenessMetric {
   return { current, total, percentage: pct(current, total) };
 }
 
+const SHORT_LIVED_BACKFILL_TICKS = [
+  'progressive-backfill-window',
+  'firefly-progressive-backfill-window',
+];
+
+async function reconcileStaleShortLivedSyncJobs(orgId: string, env: Env): Promise<number> {
+  const placeholders = SHORT_LIVED_BACKFILL_TICKS.map(() => '?').join(',');
+  const result = await env.D1.prepare(
+    `UPDATE sync_jobs
+        SET status = 'completed',
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            error_message = NULL
+      WHERE org_id = ?
+        AND status = 'running'
+        AND workflow_type IN (${placeholders})
+        AND started_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 minutes')`
+  ).bind(orgId, ...SHORT_LIVED_BACKFILL_TICKS).run();
+  return result.meta?.changes ?? 0;
+}
+
 export async function getSystemStatus(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
   const orgId = ctx.orgId;
   const nowMs = Date.now();
+
+  // Short-lived backfill ticks are expected to close themselves within
+  // ~45s. Older rows with status='running' are not real active work;
+  // they are orphaned telemetry from a Worker eviction or uncaught throw.
+  // Reconcile them before building the Active Work panel so users don't
+  // see hundreds of stale zero-record rows as "currently running".
+  const reconciledStaleSyncJobs = await reconcileStaleShortLivedSyncJobs(orgId, env);
+  if (reconciledStaleSyncJobs > 0) {
+    console.log(`[system-status] reconciled ${reconciledStaleSyncJobs} stale short-lived sync_jobs rows for org=${orgId}`);
+  }
 
   // ── Active tasks: sync_jobs WHERE status='running' ──────────────────────
   const runningRows = await env.D1.prepare(

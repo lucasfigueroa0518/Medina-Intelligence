@@ -275,11 +275,12 @@ export async function runFireflyWindowBackfill(
   ).bind(opts.userId, opts.orgId).first<{ email: string | null }>();
   const userEmail = userRow?.email ?? null;
 
+  const syncJobTimeoutAt = new Date(startedAt + 5 * 60_000).toISOString();
   await env.D1.prepare(
-    `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, metadata)
-     VALUES (?, ?, 'firefly-progressive-backfill-window', 'running', ?, ?)`
+    `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, timeout_at, metadata)
+     VALUES (?, ?, 'firefly-progressive-backfill-window', 'running', ?, ?, ?)`
   ).bind(
-    syncJobId, opts.orgId, new Date(startedAt).toISOString(),
+    syncJobId, opts.orgId, new Date(startedAt).toISOString(), syncJobTimeoutAt,
     JSON.stringify({
       user_id: opts.userId,
       user_email: userEmail,

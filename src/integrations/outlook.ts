@@ -448,11 +448,12 @@ export async function runHistoricalBackfill(
 
   const syncJobId = crypto.randomUUID();
   const syncJobStartedAt = new Date().toISOString();
+  const syncJobTimeoutAt = new Date(Date.now() + 5 * 60_000).toISOString();
   await env.D1.prepare(
-    `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, metadata)
-     VALUES (?, ?, 'progressive-backfill-window', 'running', ?, ?)`
+    `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, timeout_at, metadata)
+     VALUES (?, ?, 'progressive-backfill-window', 'running', ?, ?, ?)`
   ).bind(
-    syncJobId, orgId, syncJobStartedAt,
+    syncJobId, orgId, syncJobStartedAt, syncJobTimeoutAt,
     JSON.stringify({
       user_id: userId,
       user_email: userEmail,
