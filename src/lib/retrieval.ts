@@ -675,12 +675,22 @@ function plannedDocumentDocTypes(plan: EvidencePlan | null): string[] {
   return SAFE_DOCUMENT_TARGET_DOC_TYPES.filter(dt => dt !== 'reference' && dt !== 'meeting_material');
 }
 
+function expandForcedDocTypes(forcedDocTypes: string[], plan: EvidencePlan | null): string[] {
+  return uniqueStrings(
+    forcedDocTypes.flatMap(docType => {
+      if (docType !== 'document') return [docType];
+      const plannedDocuments = plannedDocumentDocTypes(plan);
+      return plannedDocuments.length > 0 ? plannedDocuments : SAFE_DOCUMENT_TARGET_DOC_TYPES;
+    })
+  );
+}
+
 function plannedDocTypes(
   detectedDocTypes: string[],
   plan: EvidencePlan | null,
   forcedDocTypes?: string[]
 ): string[] {
-  if (forcedDocTypes && forcedDocTypes.length > 0) return uniqueStrings(forcedDocTypes);
+  if (forcedDocTypes && forcedDocTypes.length > 0) return expandForcedDocTypes(forcedDocTypes, plan);
   const primaryFamilies = plan?.evidence_strategy.primary_families || [];
   const fromPlan = primaryFamilies.flatMap(family => {
     if (family === 'documents') return plannedDocumentDocTypes(plan);

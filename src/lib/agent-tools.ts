@@ -393,8 +393,8 @@ export async function recall(
   };
 
   // Map source_types (agent-facing: email|slack|meeting|document) to
-  // document_type values (embedding metadata: email|conversation|transcript
-  // |document). Slack messages get ingested with document_type='conversation'
+  // document_type values (embedding metadata: email|conversation|transcript)
+  // plus the document-family alias. Slack messages get ingested with document_type='conversation'
   // (daily-cron.ts:562-564); Firefly transcripts with document_type=
   // 'transcript' (process-transcript-items.ts:409). When source_types is
   // set, recall passes the mapped values via forceDocTypes — retrieveContext
