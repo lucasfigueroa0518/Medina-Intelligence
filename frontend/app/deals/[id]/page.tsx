@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
-import { api } from '@/lib/api';
+import { ApiError, api } from '@/lib/api';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 
 type DealStage = 'new' | 'talking' | 'due_diligence' | 'term_sheet' | 'closed';
@@ -76,6 +76,15 @@ function lastActivity(deal: any): string | null {
   return deal?.last_inferred_activity_date || deal?.evidence_last_seen_at || deal?.last_activity_date || deal?.updated_at || deal?.created_at || null;
 }
 
+function dealLoadMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 404) return 'Deal not found. It may have been deleted or moved.';
+    if (error.status >= 500) return 'Deal details are temporarily unavailable. Try again in a moment.';
+    return error.message || 'Deal could not be loaded.';
+  }
+  return 'Deal could not be loaded.';
+}
+
 function Section({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) {
   return (
     <section className="rounded-lg border border-border bg-bg-inset/70 p-5">
@@ -96,12 +105,17 @@ export default function DealDetailPage() {
   const [documents, setDocuments] = React.useState<any[]>([]);
   const [threads, setThreads] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
+  const [supportingLoading, setSupportingLoading] = React.useState(false);
+  const [dealLoadError, setDealLoadError] = React.useState<string | null>(null);
+  const [documentsError, setDocumentsError] = React.useState<string | null>(null);
+  const [threadsError, setThreadsError] = React.useState<string | null>(null);
   const [toast, setToast] = React.useState<string | null>(null);
   const [noteText, setNoteText] = React.useState('');
   const [savingNote, setSavingNote] = React.useState(false);
   const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const { intelligence, refresh } = useDealIntelligence(dealId);
+  const loadSeqRef = React.useRef(0);
 
   const deal = bundle?.deal;
   const contacts = bundle?.contacts || { theirs: [], ours: [], other: [] };
@@ -110,22 +124,58 @@ export default function DealDetailPage() {
 
   const load = React.useCallback(async () => {
     if (!dealId) return;
+    const seq = ++loadSeqRef.current;
     setLoading(true);
+    setSupportingLoading(false);
+    setDealLoadError(null);
+    setDocumentsError(null);
+    setThreadsError(null);
+    setDocuments([]);
+    setThreads([]);
     try {
-      const [dealRes, docRes, convoRes] = await Promise.all([
-        api.getDeal(dealId),
-        api.listDocuments({ deal_id: dealId, limit: '50' }),
-        api.getDealConversations(dealId, 20),
-      ]);
+      const dealRes = await api.getDeal(dealId);
+      if (seq !== loadSeqRef.current) return;
       setBundle(dealRes);
-      setDocuments(docRes.documents || []);
-      setThreads(convoRes.threads || []);
-    } finally {
+    } catch (e: any) {
+      if (seq !== loadSeqRef.current) return;
+      setBundle(null);
+      setDocuments([]);
+      setThreads([]);
+      setDealLoadError(dealLoadMessage(e));
       setLoading(false);
+      return;
+    } finally {
+      if (seq === loadSeqRef.current) setLoading(false);
     }
+
+    if (seq !== loadSeqRef.current) return;
+    setSupportingLoading(true);
+    const [docRes, convoRes] = await Promise.allSettled([
+      api.listDocuments({ deal_id: dealId, limit: '50' }),
+      api.getDealConversations(dealId, 20),
+    ]);
+
+    if (seq !== loadSeqRef.current) return;
+    if (docRes.status === 'fulfilled') {
+      setDocuments(docRes.value.documents || []);
+    } else {
+      setDocuments([]);
+      setDocumentsError(docRes.reason?.message || 'Documents are temporarily unavailable.');
+    }
+
+    if (convoRes.status === 'fulfilled') {
+      setThreads(convoRes.value.threads || []);
+    } else {
+      setThreads([]);
+      setThreadsError(convoRes.reason?.message || 'Firm sentiment is temporarily unavailable.');
+    }
+    setSupportingLoading(false);
   }, [dealId]);
 
-  React.useEffect(() => { void load(); }, [load]);
+  React.useEffect(() => {
+    void load();
+    return () => { loadSeqRef.current += 1; };
+  }, [load]);
 
   React.useEffect(() => {
     if (!toast) return;
@@ -215,7 +265,7 @@ export default function DealDetailPage() {
           <button onClick={() => router.push('/deals')} className="inline-flex items-center gap-2 text-sm text-muted hover:text-fg">
             <ArrowLeft size={16} /> Back to deals
           </button>
-          <p className="mt-8 text-muted">Deal not found.</p>
+          <p className="mt-8 text-muted">{dealLoadError || 'Deal not found.'}</p>
         </main>
       </div>
     );
@@ -278,7 +328,11 @@ export default function DealDetailPage() {
             <Section title="Firm Sentiment" icon={<MessageSquareText size={16} className="text-sky-300" />}>
               <p className="mb-4 text-sm text-muted">{sentimentLine}</p>
               <div className="max-h-[460px] space-y-3 overflow-y-auto pr-1">
-                {threads.length === 0 ? (
+                {threadsError ? (
+                  <p className="text-sm text-amber-200">{threadsError}</p>
+                ) : supportingLoading && threads.length === 0 ? (
+                  <p className="text-sm text-muted">Loading linked conversation window...</p>
+                ) : threads.length === 0 ? (
                   <p className="text-sm text-muted">No linked internal conversation window yet.</p>
                 ) : threads.map(thread => (
                   <div key={thread.external_thread_id || thread.messages?.[0]?.id || thread.subject} className="rounded-lg border border-border bg-bg-panel/60 p-3">
@@ -356,7 +410,11 @@ export default function DealDetailPage() {
 
             <Section title="Documents" icon={<FileText size={16} className="text-rose-300" />}>
               <div className="space-y-3">
-                {documents.length === 0 ? (
+                {documentsError ? (
+                  <p className="text-sm text-amber-200">{documentsError}</p>
+                ) : supportingLoading && documents.length === 0 ? (
+                  <p className="text-sm text-muted">Loading linked documents...</p>
+                ) : documents.length === 0 ? (
                   <p className="text-sm text-muted">No documents linked yet.</p>
                 ) : documents.map(doc => (
                   <div key={doc.id} className="rounded-md border border-border bg-bg-panel/50 p-3">
