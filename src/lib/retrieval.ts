@@ -93,6 +93,29 @@ function countTargetedIds(
   return chunks.filter(chunk => targetedIds.has(chunk.id as string)).length;
 }
 
+function targetedMembershipSample(
+  chunks: Array<{ id?: unknown }>,
+  targetedIds?: Set<string>
+): Record<string, unknown> {
+  const targetedIdSample = targetedIds && targetedIds.size > 0
+    ? [...targetedIds][0]
+    : undefined;
+  const hydratedTargetSample = targetedIdSample === undefined
+    ? undefined
+    : chunks.find(chunk =>
+        [...targetedIds!].some(targetedId => String(targetedId) === String(chunk.id))
+      );
+
+  return {
+    targeted_id_type: typeof targetedIdSample,
+    hydrated_target_id_type: typeof hydratedTargetSample?.id,
+    targeted_id_sample: targetedIdSample || null,
+    hydrated_target_id_sample: hydratedTargetSample?.id || null,
+    targeted_string_match_found: !!hydratedTargetSample,
+    sample_set_has: hydratedTargetSample ? targetedIds!.has(hydratedTargetSample.id as string) : null,
+  };
+}
+
 function summarizeMatches(
   matches: VectorMatch[],
   duplicateSet?: Set<string>,
@@ -682,6 +705,7 @@ export async function crossEncoderRerank(
       final_count: chunks.length,
       final_doc_type_counts: countByDocType(chunks),
       final_targeted_count: countTargetedIds(chunks, targetedIds),
+      ...targetedMembershipSample(chunks, targetedIds),
     });
     return chunks;
   }
@@ -699,6 +723,7 @@ export async function crossEncoderRerank(
       final_count: finalChunks.length,
       final_doc_type_counts: countByDocType(finalChunks),
       final_targeted_count: countTargetedIds(finalChunks, targetedIds),
+      ...targetedMembershipSample(chunks, targetedIds),
     });
     return finalChunks;
   }
@@ -733,6 +758,7 @@ export async function crossEncoderRerank(
         final_count: finalChunks.length,
         final_doc_type_counts: countByDocType(finalChunks),
         final_targeted_count: countTargetedIds(finalChunks, targetedIds),
+        ...targetedMembershipSample(chunks, targetedIds),
       });
       return finalChunks;
     }
@@ -822,9 +848,8 @@ export async function crossEncoderRerank(
       final_count: finalChunks.length,
       final_doc_type_counts: countByDocType(finalChunks),
       final_targeted_count: countTargetedIds(finalChunks, targetedIds),
-      targeted_id_type: typeof [...(targetedIds || new Set<string>())][0],
       hydrated_id_type_sample: typeof chunks[0]?.id,
-      sample_set_has: targetedIds && chunks[0] ? targetedIds.has(chunks[0].id) : null,
+      ...targetedMembershipSample(chunks, targetedIds),
     });
     return finalChunks;
   } catch (e) {
@@ -840,6 +865,7 @@ export async function crossEncoderRerank(
       final_count: finalChunks.length,
       final_doc_type_counts: countByDocType(finalChunks),
       final_targeted_count: countTargetedIds(finalChunks, targetedIds),
+      ...targetedMembershipSample(chunks, targetedIds),
     });
     return finalChunks;
   }
