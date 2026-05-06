@@ -1013,6 +1013,23 @@ export interface StuckWorkQueueEntry {
   silent_for_minutes: number;
 }
 
+export interface BudgetSnapshotRow {
+  org_id: string;
+  user_id: string;
+  upstream: string;
+  bucket_window: string;
+  bucket_start: string;
+  used: number;
+  cap: number;
+  utilization_pct: number;
+  circuit_open: boolean;
+  circuit_open_until: string | null;
+  consecutive_429s: number;
+  cap_lowered_count: number;
+  cap_lowered_at: string | null;
+  last_429_at: string | null;
+}
+
 export interface SystemStatusResponse {
   active_tasks: SystemStatusActiveTask[];
   run_history: SystemStatusRunHistoryEntry[];
@@ -1033,6 +1050,7 @@ export interface SystemStatusResponse {
   // an empty-state card when registry is unpopulated.
   work_queue_inventory: WorkQueueInventoryEntry[];
   stuck_work_queue: StuckWorkQueueEntry[];
+  budgets: BudgetSnapshotRow[];
   generated_at: string;
 }
 

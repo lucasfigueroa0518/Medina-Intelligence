@@ -18,6 +18,7 @@ import {
   type CompletenessMetric,
   type WorkQueueInventoryEntry,
   type StuckWorkQueueEntry,
+  type BudgetSnapshotRow,
 } from '@/lib/api';
 import { useBackgroundTasks } from '@/components/background-task-indicator';
 
@@ -3049,6 +3050,7 @@ function SystemStatusSection() {
 
   return (
     <div className="space-y-6">
+      <RateLimitIndicator budgets={data.budgets || []} />
       <ActiveTasksCard tasks={data.active_tasks} />
       <RunHistoryCard rows={data.run_history} />
       <DataCompletenessCard c={data.completeness} />
@@ -3176,26 +3178,182 @@ function WorkQueueCard({
 
 // ── Section 1: Active Tasks ──────────────────────────────────────────────
 
+function RateLimitIndicator({ budgets }: { budgets: BudgetSnapshotRow[] }) {
+  const limited = React.useMemo(() => {
+    const now = Date.now();
+    return budgets.filter(b => {
+      const openUntil = b.circuit_open_until ? new Date(b.circuit_open_until).getTime() : 0;
+      const circuitActuallyOpen = b.circuit_open === true && openUntil > now;
+      const hardCapHit = b.cap > 0 && b.used >= b.cap && b.consecutive_429s > 0;
+      return circuitActuallyOpen || hardCapHit;
+    });
+  }, [budgets]);
+
+  if (limited.length === 0) return null;
+  const primary = limited[0];
+  const resetText = primary.circuit_open_until ? ` until ${formatRelative(primary.circuit_open_until)}` : '';
+
+  return (
+    <div className="card p-4 border-semantic-warning/30 bg-semantic-warning/[0.04]">
+      <div className="flex items-start gap-3">
+        <Shield size={18} className="text-semantic-warning shrink-0 mt-0.5" />
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-text-primary">Upstream rate limit active</div>
+          <div className="text-xs text-text-secondary mt-1">
+            {primary.upstream} is limiting requests{resetText}. MARTy will recover automatically when the circuit closes.
+          </div>
+          {limited.length > 1 && (
+            <div className="text-[11px] text-text-muted mt-1">
+              {limited.length - 1} other upstream budget{limited.length === 2 ? '' : 's'} also constrained.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function friendlyTaskType(type: string): string {
+  const lower = type.toLowerCase();
+  if (lower.includes('webhook')) return 'Processing fresh Outlook updates';
+  if (lower.includes('progressive') || lower.includes('backfill')) return 'Backfilling historical data';
+  if (lower.includes('ingestion')) return 'Syncing email, calendar, Slack, and news';
+  if (lower.includes('enrich')) return 'Enriching CRM records';
+  if (lower.includes('embed')) return 'Indexing searchable knowledge';
+  if (lower.includes('news')) return 'Refreshing market news';
+  return type.replace(/[_-]+/g, ' ');
+}
+
+function summarizeActiveTasks(tasks: SystemStatusActiveTask[]) {
+  const grouped = new Map<string, {
+    label: string;
+    count: number;
+    processed: number;
+    longest: number;
+    latestStarted: string;
+  }>();
+  for (const t of tasks) {
+    const label = friendlyTaskType(t.type);
+    const existing = grouped.get(label) || {
+      label,
+      count: 0,
+      processed: 0,
+      longest: 0,
+      latestStarted: t.started_at,
+    };
+    existing.count += 1;
+    existing.processed += t.items_processed || 0;
+    existing.longest = Math.max(existing.longest, t.elapsed_seconds || 0);
+    if (new Date(t.started_at).getTime() > new Date(existing.latestStarted).getTime()) {
+      existing.latestStarted = t.started_at;
+    }
+    grouped.set(label, existing);
+  }
+  return Array.from(grouped.values()).sort((a, b) => b.longest - a.longest);
+}
+
 function ActiveTasksCard({ tasks }: { tasks: SystemStatusActiveTask[] }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const summaries = React.useMemo(() => summarizeActiveTasks(tasks), [tasks]);
+  const moving = summaries.filter(t => t.processed > 0);
+  const stalled = summaries.filter(t => t.processed === 0 && t.longest >= 30 * 60);
+  const warming = summaries.filter(t => t.processed === 0 && t.longest < 30 * 60);
+  const totalProcessed = moving.reduce((acc, t) => acc + t.processed, 0);
+  const visible = expanded ? [...moving, ...stalled, ...warming] : [...moving, ...stalled].slice(0, 3);
+  const hasDataMovingWork = moving.length > 0;
+  const zeroOnlyWork = tasks.length > 0 && !hasDataMovingWork;
+
   return (
     <div className="card p-5">
-      <div className="text-sm font-medium text-text-primary mb-3">Active Tasks</div>
+      <button
+        onClick={() => setExpanded(e => !e)}
+        className="w-full flex items-center justify-between gap-3 text-left"
+      >
+        <div>
+          <div className="text-sm font-medium text-text-primary">Active Work</div>
+          <div className="text-xs text-text-muted mt-0.5">
+            {tasks.length === 0
+              ? 'No active background jobs'
+              : hasDataMovingWork
+                ? `${totalProcessed.toLocaleString()} item${totalProcessed === 1 ? '' : 's'} moving now · ${tasks.length} background job${tasks.length === 1 ? '' : 's'} tracked`
+                : `No data-moving work right now · ${tasks.length} bookkeeping job${tasks.length === 1 ? '' : 's'} tracked`}
+          </div>
+        </div>
+        <span className="inline-flex items-center gap-2 text-xs text-text-muted">
+          {tasks.length > 0 && (
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-semantic-success animate-pulse" />
+          )}
+          {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </span>
+      </button>
       {tasks.length === 0 ? (
-        <div className="text-sm text-text-muted">
+        <div className="text-sm text-text-muted mt-3">
           <span className="inline-block w-1.5 h-1.5 rounded-full bg-semantic-success mr-2 align-middle" />
           No active tasks. Next email sync at <span className="text-text-primary">:00</span>, next enrichment at <span className="text-text-primary">:05</span>.
         </div>
       ) : (
-        <ul className="space-y-1.5">
-          {tasks.map((t, i) => (
-            <li key={i} className="text-sm text-text-primary flex items-center gap-2">
-              <span className="inline-block w-1.5 h-1.5 rounded-full bg-semantic-success animate-pulse" />
-              <span>
-                {t.type} in progress — {t.items_processed.toLocaleString()} item{t.items_processed === 1 ? '' : 's'} processed — started {formatDuration(t.elapsed_seconds)} ago
-              </span>
-            </li>
-          ))}
-        </ul>
+        <div className={`mt-4 overflow-hidden transition-all duration-200 ${expanded ? 'max-h-96 opacity-100' : 'max-h-32 opacity-100'}`}>
+          <div className="rounded-lg bg-white/[0.025] border border-white/[0.04] p-3 mb-3">
+            <div className="text-xs text-text-secondary leading-relaxed">
+              Active Work shows background jobs the system has marked as running. Zeros usually mean bookkeeping, startup, or a stale backfill window, not missing customer data. This panel highlights data that is actually moving and separates stale zero-work rows.
+            </div>
+          </div>
+
+          {zeroOnlyWork && (
+            <div className={`rounded-lg px-3 py-2 mb-3 border ${
+              stalled.length > 0
+                ? 'bg-semantic-warning/[0.06] border-semantic-warning/20'
+                : 'bg-white/[0.025] border-white/[0.04]'
+            }`}>
+              <div className="text-sm text-text-primary">
+                {stalled.length > 0 ? 'No records are moving; some job rows look stale.' : 'Background jobs are warming up.'}
+              </div>
+              <div className="text-[11px] text-text-muted mt-0.5">
+                {stalled.length > 0
+                  ? `${stalled.reduce((acc, t) => acc + t.count, 0).toLocaleString()} zero-work job row${stalled.reduce((acc, t) => acc + t.count, 0) === 1 ? '' : 's'} have been marked running for more than 30 minutes.`
+                  : `${warming.reduce((acc, t) => acc + t.count, 0).toLocaleString()} job row${warming.reduce((acc, t) => acc + t.count, 0) === 1 ? '' : 's'} have not reported processed items yet.`}
+              </div>
+            </div>
+          )}
+
+          <div className={`space-y-2 ${expanded ? 'max-h-56 overflow-y-auto pr-1' : ''}`}>
+            {visible.map(t => {
+              const isStalled = t.processed === 0 && t.longest >= 30 * 60;
+              const isWarming = t.processed === 0 && !isStalled;
+              return (
+                <div key={t.label} className={`flex items-center justify-between gap-3 rounded-lg border px-3 py-2 ${
+                  isStalled
+                    ? 'bg-semantic-warning/[0.04] border-semantic-warning/15'
+                    : 'bg-white/[0.025] border-white/[0.04]'
+                }`}>
+                  <div className="min-w-0">
+                    <div className="text-sm text-text-primary truncate">{t.label}</div>
+                    <div className="text-[11px] text-text-muted">
+                      {t.count > 1 ? `${t.count} rows · ` : ''}
+                      {isStalled ? 'stale zero-work row' : isWarming ? 'waiting to report work' : 'actively processing'} · {formatDuration(t.longest)}
+                    </div>
+                  </div>
+                  <div className="text-right shrink-0 min-w-[88px]">
+                    <div className={`text-sm tabular-nums ${t.processed > 0 ? 'text-text-primary' : 'text-text-muted'}`}>
+                      {t.processed > 0 ? t.processed.toLocaleString() : 'No records'}
+                    </div>
+                    <div className="text-[10px] text-text-muted">{t.processed > 0 ? 'processed' : 'moved'}</div>
+                  </div>
+                </div>
+              );
+            })}
+            {!expanded && [...moving, ...stalled].length > visible.length && (
+              <div className="text-[11px] text-text-muted px-1">
+                {[...moving, ...stalled].length - visible.length} more signal row{[...moving, ...stalled].length - visible.length === 1 ? '' : 's'} hidden. Expand to inspect.
+              </div>
+            )}
+            {expanded && warming.length > 0 && (
+              <div className="text-[11px] text-text-muted px-1">
+                Warming rows are shown last because they have not yet moved records.
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );
@@ -3203,76 +3361,123 @@ function ActiveTasksCard({ tasks }: { tasks: SystemStatusActiveTask[] }) {
 
 // ── Section 2: Run History ───────────────────────────────────────────────
 
+function isZeroNoiseRun(row: SystemStatusRunHistoryEntry): boolean {
+  return row.status === 'completed' && row.items_processed === 0 && row.items_failed === 0 && !row.error_message;
+}
+
+function isAttentionRun(row: SystemStatusRunHistoryEntry): boolean {
+  return row.status !== 'completed' || row.items_failed > 0 || !!row.error_message;
+}
+
 function RunHistoryCard({ rows }: { rows: SystemStatusRunHistoryEntry[] }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const attentionRows = rows.filter(isAttentionRun);
+  const meaningfulRows = rows.filter(r => !isZeroNoiseRun(r) && !isAttentionRun(r));
+  const zeroNoiseCount = rows.length - attentionRows.length - meaningfulRows.length;
+  const latestMeaningful = [...attentionRows, ...meaningfulRows].sort(
+    (a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime()
+  )[0];
+  const orderedRows = [...attentionRows, ...meaningfulRows].sort(
+    (a, b) => Number(isAttentionRun(b)) - Number(isAttentionRun(a)) || new Date(b.started_at).getTime() - new Date(a.started_at).getTime()
+  );
+  const visibleRows = expanded ? orderedRows : orderedRows.slice(0, 4);
+
   return (
-    <div className="card p-0 overflow-hidden">
-      <div className="px-5 pt-5 pb-3 text-sm font-medium text-text-primary">Run History</div>
+    <div className="card p-5 overflow-hidden">
+      <button
+        onClick={() => setExpanded(e => !e)}
+        className="w-full flex items-center justify-between gap-3 text-left"
+      >
+        <div>
+          <div className="text-sm font-medium text-text-primary">Run History</div>
+          <div className="text-xs text-text-muted mt-0.5">
+            {latestMeaningful
+              ? `Latest signal: ${latestMeaningful.type} · ${latestMeaningful.items_processed.toLocaleString()} processed · ${formatRelative(latestMeaningful.started_at)}`
+              : 'No runs recorded yet'}
+            {attentionRows.length > 0 ? ` · ${attentionRows.length} need attention` : ''}
+          </div>
+        </div>
+        {rows.length > 0 && (
+          <span className="text-text-muted">{expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</span>
+        )}
+      </button>
       {rows.length === 0 ? (
-        <div className="px-5 pb-5 text-sm text-text-muted">No runs recorded yet.</div>
+        <div className="mt-3 text-sm text-text-muted">No runs recorded yet.</div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="bg-bg-inset/50 border-y border-border">
-              <tr>
-                <Th>Type</Th>
-                <Th>Status</Th>
-                <Th align="right">Items</Th>
-                <Th align="right">Failed</Th>
-                <Th>Started</Th>
-                <Th>Duration</Th>
-                <Th>Error</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map(r => <RunHistoryRow key={r.id} row={r} />)}
-            </tbody>
-          </table>
+        <div className="mt-4">
+          <div className="rounded-lg bg-white/[0.025] border border-white/[0.04] p-3 mb-3">
+            <div className="text-xs text-text-secondary leading-relaxed">
+              Run History shows recent background runs after they finish. Completed rows with 0 processed are usually health checks, webhooks with no eligible records, or cleanup passes, so they are hidden unless you expand.
+            </div>
+            {zeroNoiseCount > 0 && (
+              <div className="text-[11px] text-text-muted mt-1">
+                {zeroNoiseCount} zero-record bookkeeping run{zeroNoiseCount === 1 ? '' : 's'} hidden from the main view.
+              </div>
+            )}
+          </div>
+          {visibleRows.length === 0 ? (
+            <div className="rounded-lg bg-white/[0.025] border border-white/[0.04] px-3 py-2 text-sm text-text-secondary">
+              Only bookkeeping runs finished recently. Nothing needs attention.
+            </div>
+          ) : (
+            <div className={`space-y-2 ${expanded ? 'max-h-80 overflow-y-auto pr-1' : ''}`}>
+              {visibleRows.map(r => <RunHistoryRow key={r.id} row={r} />)}
+            </div>
+          )}
+          {!expanded && orderedRows.length > visibleRows.length && (
+            <div className="mt-2 text-[11px] text-text-muted px-1">
+              {orderedRows.length - visibleRows.length} more meaningful run{orderedRows.length - visibleRows.length === 1 ? '' : 's'} hidden. Expand to scroll.
+            </div>
+          )}
+          {expanded && zeroNoiseCount > 0 && (
+            <div className="mt-2 text-[11px] text-text-muted px-1">
+              Hidden zero-record runs are omitted here too so this panel stays focused on failures and real throughput.
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function Th({ children, align }: { children: React.ReactNode; align?: 'right' }) {
-  return (
-    <th className={`px-4 py-2.5 text-xs font-medium uppercase tracking-wider text-text-muted ${align === 'right' ? 'text-right' : 'text-left'}`}>
-      {children}
-    </th>
-  );
-}
-
 function RunHistoryRow({ row }: { row: SystemStatusRunHistoryEntry }) {
   const [expanded, setExpanded] = React.useState(false);
-  const failed = row.status === 'failed';
+  const attention = isAttentionRun(row);
+  const processedLabel = row.items_processed > 0
+    ? `${row.items_processed.toLocaleString()} processed`
+    : 'No records moved';
   return (
-    <tr className={`border-b border-border/40 ${failed ? 'bg-semantic-error/[0.04]' : ''}`}>
-      <td className="px-4 py-3 text-text-primary">{row.type}</td>
-      <td className="px-4 py-3">
-        <StatusBadge status={row.status} />
-      </td>
-      <td className="px-4 py-3 text-text-primary tabular-nums text-right">{row.items_processed.toLocaleString()}</td>
-      <td className={`px-4 py-3 tabular-nums text-right ${row.items_failed > 0 ? 'text-semantic-error' : 'text-text-muted'}`}>
-        {row.items_failed > 0 ? row.items_failed.toLocaleString() : '—'}
-      </td>
-      <td className="px-4 py-3 text-text-secondary whitespace-nowrap">{formatRelative(row.started_at)}</td>
-      <td className="px-4 py-3 text-text-secondary tabular-nums whitespace-nowrap">
-        {row.duration_seconds === 0 ? '—' : formatDuration(row.duration_seconds)}
-      </td>
-      <td className="px-4 py-3 text-text-secondary text-xs max-w-xs">
-        {row.error_message ? (
+    <div className={`rounded-lg border px-3 py-2 ${
+      attention ? 'bg-semantic-error/[0.045] border-semantic-error/15' : 'bg-white/[0.025] border-white/[0.04]'
+    }`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="text-sm text-text-primary truncate">{row.type}</div>
+            <StatusBadge status={row.status} />
+          </div>
+          <div className="text-[11px] text-text-muted mt-1 flex flex-wrap gap-x-2 gap-y-1">
+            <span>{processedLabel}</span>
+            {row.items_failed > 0 && <span className="text-semantic-error">{row.items_failed.toLocaleString()} failed</span>}
+            <span>{formatRelative(row.started_at)}</span>
+            <span>{row.duration_seconds === 0 ? 'instant' : formatDuration(row.duration_seconds)}</span>
+          </div>
+        </div>
+        {row.error_message && (
           <button
             onClick={() => setExpanded(e => !e)}
-            className="text-left text-semantic-error hover:underline"
+            className="shrink-0 text-[11px] text-semantic-error hover:underline"
           >
-            {expanded
-              ? row.error_message
-              : (row.error_message.length > 60
-                  ? row.error_message.slice(0, 60) + '…'
-                  : row.error_message)}
+            {expanded ? 'Hide error' : 'Show error'}
           </button>
-        ) : ''}
-      </td>
-    </tr>
+        )}
+      </div>
+      {row.error_message && expanded && (
+        <div className="mt-2 rounded-md bg-semantic-error/10 border border-semantic-error/15 px-2 py-1.5 text-xs text-semantic-error leading-relaxed">
+          {row.error_message}
+        </div>
+      )}
+    </div>
   );
 }
 
