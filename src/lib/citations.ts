@@ -178,22 +178,27 @@ async function hydrateSources(
           for (const ref of convRows) {
             const row = byId.get(ref.sourceId);
             if (!row) continue;
-            const isSlack = row.source === 'slack';
+            const isTranscript = String(ref.chunk.metadata.document_type || '') === 'transcript';
+            const isSlack = !isTranscript && row.source === 'slack';
             const senderName =
               (row.from_contact_id && contactNames.get(row.from_contact_id)) ||
               row.from_email ||
               'Unknown sender';
             const title =
               (row.subject && row.subject.trim()) ||
-              (isSlack
+              (isTranscript
+                ? (row.body_preview?.slice(0, 60) || 'Meeting transcript')
+                : isSlack
                 ? (row.body_preview?.slice(0, 60) || 'Slack message')
                 : `Email from ${senderName}`);
             const subtitle = isSlack
               ? `Slack — ${senderName}`
+              : isTranscript
+                ? 'Meeting transcript'
               : `${senderName}`;
             out.set(ref.id, {
               id: ref.id,
-              type: isSlack ? 'slack' : 'email',
+              type: isTranscript ? 'meeting' : isSlack ? 'slack' : 'email',
               source_table: 'conversations',
               source_id: row.id,
               entity_id: ref.chunk.metadata.primary_entity_id as string | undefined,
