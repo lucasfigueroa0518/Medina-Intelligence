@@ -184,6 +184,56 @@ function selectHydrationCandidates(
   return selected.slice(0, limit);
 }
 
+function rebalanceRerankedByPrimaryFamilies(
+  reranked: HydratedChunk[],
+  candidates: HydratedChunk[],
+  plan: EvidencePlan | null,
+  limit: number
+): HydratedChunk[] {
+  const primaryFamilies = uniqueStrings(plan?.evidence_strategy.primary_families || [])
+    .filter(family => family !== 'entity_context');
+  if (primaryFamilies.length === 0) return reranked.slice(0, limit);
+
+  const desiredByFamily = new Map<string, number>();
+  for (const family of primaryFamilies) {
+    const goal = plan?.source_balance_goal?.[family] || 0;
+    const desired = primaryFamilies.length === 1
+      ? Math.min(limit, Math.max(1, Math.min(goal || 6, Math.ceil(limit * 0.6))))
+      : Math.min(Math.max(1, Math.ceil((goal || 2) / 2)), Math.max(1, Math.floor(limit / 2)));
+    desiredByFamily.set(family, desired);
+  }
+
+  const pool = [...reranked, ...candidates];
+  const selected: HydratedChunk[] = [];
+  const selectedIds = new Set<string>();
+  const take = (chunk: HydratedChunk): void => {
+    if (selected.length >= limit || selectedIds.has(chunk.id)) return;
+    selected.push(chunk);
+    selectedIds.add(chunk.id);
+  };
+
+  for (const [family, desired] of desiredByFamily) {
+    const current = reranked
+      .filter(chunk => sourceFamilyForDocType(String(chunk.metadata?.document_type || 'unknown')) === family)
+      .slice(0, desired);
+    for (const chunk of current) take(chunk);
+
+    if (current.length < desired) {
+      for (const chunk of pool) {
+        if (selectedIds.has(chunk.id)) continue;
+        if (sourceFamilyForDocType(String(chunk.metadata?.document_type || 'unknown')) !== family) continue;
+        take(chunk);
+        if (selected.filter(c => sourceFamilyForDocType(String(c.metadata?.document_type || 'unknown')) === family).length >= desired) {
+          break;
+        }
+      }
+    }
+  }
+
+  for (const chunk of reranked) take(chunk);
+  return selected.slice(0, limit);
+}
+
 function targetedMembershipSample(
   chunks: Array<{ id?: unknown }>,
   targetedIds?: Set<string>
@@ -603,17 +653,39 @@ const SOURCE_FAMILY_DOC_TYPES: Record<string, string[]> = {
   entity_context: ['enrichment'],
 };
 
+const SAFE_DOCUMENT_TARGET_DOC_TYPES = [
+  'deal_pitch',
+  'deal_terms',
+  'deal_financials',
+  'deal_diligence',
+  'reference',
+  'meeting_material',
+  'document',
+  'pitch_deck',
+];
+
+function plannedDocumentDocTypes(plan: EvidencePlan | null): string[] {
+  const subtypeHints = plan?.evidence_strategy.subtype_hints || [];
+  if (subtypeHints.length > 0) return subtypeHints;
+
+  if (!plan) return [];
+  if (plan.intents.includes('document_artifact')) return ['reference', 'meeting_material', 'deal_pitch', 'document', 'pitch_deck'];
+  if (plan.intents.includes('pitch_opportunity')) return ['deal_pitch', 'deal_terms', 'deal_financials'];
+  if (plan.intents.includes('diligence_risk')) return ['deal_diligence', 'deal_financials', 'deal_terms', 'reference'];
+  return SAFE_DOCUMENT_TARGET_DOC_TYPES.filter(dt => dt !== 'reference' && dt !== 'meeting_material');
+}
+
 function plannedDocTypes(
   detectedDocTypes: string[],
   plan: EvidencePlan | null,
   forcedDocTypes?: string[]
 ): string[] {
   if (forcedDocTypes && forcedDocTypes.length > 0) return uniqueStrings(forcedDocTypes);
-  const families = [
-    ...(plan?.evidence_strategy.primary_families || []),
-    ...(plan?.evidence_strategy.supporting_families || []),
-  ];
-  const fromPlan = families.flatMap(family => SOURCE_FAMILY_DOC_TYPES[family] || []);
+  const primaryFamilies = plan?.evidence_strategy.primary_families || [];
+  const fromPlan = primaryFamilies.flatMap(family => {
+    if (family === 'documents') return plannedDocumentDocTypes(plan);
+    return SOURCE_FAMILY_DOC_TYPES[family] || [];
+  });
   return uniqueStrings([...detectedDocTypes, ...fromPlan]);
 }
 
@@ -1218,6 +1290,7 @@ export async function retrieveContext(
   let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env, targetedIds);
 
   const rerankedLimit = options.deepDive ? 20 : 10;
+  reranked = rebalanceRerankedByPrimaryFamilies(reranked, hydrated, evidencePlan, rerankedLimit);
   if (pq.entityIds.length > 0) {
     const entitySet = new Set(pq.entityIds);
     const scoped = reranked.filter(c => {
@@ -1240,6 +1313,7 @@ export async function retrieveContext(
     reranked_limit: rerankedLimit,
     reranked_count: reranked.length,
     reranked_doc_type_counts: countByDocType(reranked),
+    reranked_source_family_counts: countBySourceFamily(reranked),
     reranked_targeted_count: countTargetedIds(reranked, targetedIds),
   });
 
