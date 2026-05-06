@@ -45,12 +45,17 @@ import { handleDlqBatch, handleAuditDlqBatch } from './workers/dlq-consumer';
 
 import { runDailyCron } from './lib/daily-cron';
 
-export { IngestionWorkflow } from './workflows/ingestion';
-export { IngestionChunkWorkflow } from './workflows/ingestion-chunk';
-export { IngestionFinalizerWorkflow } from './workflows/ingestion-finalizer';
-export { EnrichmentWorkflow } from './workflows/enrichment';
-export { CampaignSendWorkflow } from './workflows/campaign-send';
-export { DailyCronWorkflow } from './workflows/daily-cron';
+// Phase 8 strip (2026-05-06): 6 Workflow class re-exports removed
+// from api Worker. Class ownership lives on medina-ventures-pipelines
+// (src/pipelines-index.ts re-exports from src/workflows/*.ts). The
+// workflow class definition files themselves stay untouched —
+// pipelines imports them, api just stops claiming ownership.
+//
+// Tomorrow's follow-up: add `[[services]] PIPELINES` service binding
+// to wrangler.toml + refactor admin.ts:465, admin.ts:543,
+// campaigns.ts:141 to trigger workflows via service binding instead
+// of direct env.<WORKFLOW>.create() (those bindings no longer exist
+// on api after this strip).
 
 // --- CORS helpers ---
 
@@ -801,7 +806,14 @@ async function routeAuthenticated(
 
 // --- Cron handler ---
 
-async function handleScheduled(
+// Phase 8 (2026-05-06): exported so src/pipelines-index.ts can import +
+// dispatch the same scheduled handler. During the bundled-deploy overlap
+// window, BOTH api and pipelines run this handler. Post-api-redeploy,
+// api removes its [triggers] from wrangler.toml so it never fires; only
+// pipelines' cron triggers it. esbuild tree-shakes api-specific paths
+// like handleRequest from the pipelines bundle since pipelines-index.ts
+// doesn't reference the default export.
+export async function handleScheduled(
   event: ScheduledEvent,
   env: Env,
   ctxExec: ExecutionContext
@@ -1074,7 +1086,13 @@ async function handleScheduled(
 
 // --- Queue handler ---
 
-async function handleQueue(
+// Phase 8 (2026-05-06): exported alongside handleScheduled. Pipelines
+// claims the audit consumer per dispatch override; webhook intake queue
+// consumer stays here on api until Stage 4 (Session B). After api
+// redeploys, api's [[queues.consumers]] for audit-log-queue is removed
+// from wrangler.toml so api no longer consumes audit events; pipelines
+// declares the consumer in wrangler.pipelines.toml.
+export async function handleQueue(
   batch: MessageBatch<AuditEvent | WebhookQueueMessage>,
   env: Env
 ): Promise<void> {
