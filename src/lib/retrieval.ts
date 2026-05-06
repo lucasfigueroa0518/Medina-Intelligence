@@ -30,11 +30,18 @@ function isAggregationQuery(query: string): boolean {
   return /\b(how many|count|total|tally|all the|every|list all|summarize all|aggregate|across all|compile|gather all)\b/i.test(query);
 }
 
-const DOC_TYPE_KEYWORDS: Record<string, string[]> = {
-  pitch_deck: ['pitch deck', 'pitch decks', 'deck', 'decks', 'presentation'],
-  email: ['email', 'emails', 'message', 'thread'],
-  transcript: ['meeting', 'meetings', 'call', 'calls', 'transcript', 'discussion'],
-  document: ['document', 'file', 'attachment', 'pdf', 'doc'],
+const DOC_TYPE_KEYWORDS: Array<{ docTypes: string[]; keywords: string[] }> = [
+  {
+    docTypes: ['transcript', 'deal_pitch'],
+    keywords: ['pitch', 'pitches', 'pitch deck', 'pitch decks', 'presentation', 'presentations'],
+  },
+  {
+    docTypes: ['deal_pitch'],
+    keywords: ['deck', 'decks', 'one pager', 'one-pager', 'company overview', 'executive summary'],
+  },
+  { docTypes: ['email'], keywords: ['email', 'emails', 'message', 'thread'] },
+  { docTypes: ['transcript'], keywords: ['meeting', 'meetings', 'call', 'calls', 'transcript', 'discussion'] },
+  { docTypes: ['document'], keywords: ['document', 'file', 'attachment', 'pdf', 'doc'] },
   // Slack messages get document_type='conversation' at ingestion (see
   // daily-cron.ts:562-564). When the user explicitly asks about Slack we
   // run a targeted Vectorize query filtered to document_type='conversation'
@@ -42,14 +49,17 @@ const DOC_TYPE_KEYWORDS: Record<string, string[]> = {
   // this, recent Slack content lost to older topical emails (audit
   // 2026-05-05). Keep this list TIGHT — adding 'message' here would over-
   // trigger because most queries about emails also use that word.
-  conversation: ['slack', 'channel'],
-};
+  { docTypes: ['conversation'], keywords: ['slack', 'channel'] },
+];
 
 function detectDocTypes(query: string): string[] {
   const lower = query.toLowerCase();
   const matched: string[] = [];
-  for (const [docType, keywords] of Object.entries(DOC_TYPE_KEYWORDS)) {
-    if (keywords.some(kw => lower.includes(kw))) matched.push(docType);
+  for (const { docTypes, keywords } of DOC_TYPE_KEYWORDS) {
+    if (!keywords.some(kw => lower.includes(kw))) continue;
+    for (const docType of docTypes) {
+      if (!matched.includes(docType)) matched.push(docType);
+    }
   }
   return matched;
 }
