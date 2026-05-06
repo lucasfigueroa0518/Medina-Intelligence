@@ -144,6 +144,268 @@ function summarizeMatches(
   }));
 }
 
+type EvidenceAnchor = {
+  id: string;
+  type: 'contact' | 'company' | 'deal';
+  name: string;
+  company_id?: string | null;
+  stage?: string | null;
+};
+
+type EvidenceIntent =
+  | 'pitch_opportunity'
+  | 'person_stance'
+  | 'project_status'
+  | 'meeting_summary'
+  | 'recent_activity'
+  | 'relationship_history'
+  | 'diligence_risk'
+  | 'document_artifact'
+  | 'generic_recall';
+
+type EvidencePlan = {
+  query: string;
+  anchor_ids: string[];
+  anchors: EvidenceAnchor[];
+  anchor_counts: Record<string, number>;
+  primary_intent: EvidenceIntent;
+  intents: EvidenceIntent[];
+  time_intent: 'latest' | 'recent' | 'historical' | 'specific_date' | 'unspecified';
+  evidence_strategy: {
+    primary_families: string[];
+    supporting_families: string[];
+    context_families: string[];
+    subtype_hints: string[];
+    subtype_hints_are_boosts_only: boolean;
+  };
+  source_balance_goal: Record<string, number>;
+  signal_terms: string[];
+  expansion_strategy: string[];
+  risk_flags: string[];
+  detected_doc_types: string[];
+  forced_doc_types: string[] | null;
+};
+
+async function resolveEvidenceAnchors(pq: ProcessedQuery, env: Env): Promise<EvidenceAnchor[]> {
+  if (pq.entityIds.length === 0) return [];
+  const ids = pq.entityIds;
+  const placeholders = ids.map(() => '?').join(',');
+  const [contacts, companies, deals] = await Promise.all([
+    env.D1.prepare(
+      `SELECT id, full_name, company_id
+       FROM contacts
+       WHERE org_id = ? AND id IN (${placeholders})`
+    ).bind(pq.orgId, ...ids).all<{ id: string; full_name: string; company_id: string | null }>(),
+    env.D1.prepare(
+      `SELECT id, name
+       FROM companies
+       WHERE org_id = ? AND id IN (${placeholders})`
+    ).bind(pq.orgId, ...ids).all<{ id: string; name: string }>(),
+    env.D1.prepare(
+      `SELECT id, title, company_id, stage
+       FROM deals
+       WHERE org_id = ? AND id IN (${placeholders}) AND deleted_at IS NULL`
+    ).bind(pq.orgId, ...ids).all<{ id: string; title: string; company_id: string | null; stage: string | null }>(),
+  ]);
+
+  const anchors = new Map<string, EvidenceAnchor>();
+  for (const row of contacts.results) {
+    anchors.set(row.id, { id: row.id, type: 'contact', name: row.full_name, company_id: row.company_id });
+  }
+  for (const row of companies.results) {
+    anchors.set(row.id, { id: row.id, type: 'company', name: row.name });
+  }
+  for (const row of deals.results) {
+    anchors.set(row.id, { id: row.id, type: 'deal', name: row.title, company_id: row.company_id, stage: row.stage });
+  }
+  return ids.map(id => anchors.get(id)).filter((a): a is EvidenceAnchor => Boolean(a));
+}
+
+function hasAny(lower: string, terms: string[]): boolean {
+  return terms.some(term => lower.includes(term));
+}
+
+function inferEvidenceIntents(query: string): EvidenceIntent[] {
+  const lower = query.toLowerCase();
+  const intents: EvidenceIntent[] = [];
+
+  if (hasAny(lower, ['pitch', 'fundraising', 'fundraise', 'raise', 'valuation', 'investment opportunity', 'terms', 'ask'])) {
+    intents.push('pitch_opportunity');
+  }
+  if (/\b(feel|feels|think|thinks|thoughts|view|views|opinion|stance|concern|concerns|worried|skeptical|bullish|bearish)\b/.test(lower)) {
+    intents.push('person_stance');
+  }
+  if (/\b(status|update|progress|blocker|blocked|owner|next step|next steps|timeline|where are we|where is|what's going on|whats going on)\b/.test(lower)) {
+    intents.push('project_status');
+  }
+  if (/\b(meeting|meetings|call|calls|transcript|discussion|readout)\b/.test(lower)) {
+    intents.push('meeting_summary');
+  }
+  if (/\b(latest|recent|recently|today|yesterday|this week|last week|current|currently|newest|last)\b/.test(lower)) {
+    intents.push('recent_activity');
+  }
+  if (/\b(history|relationship|interactions|touchpoints|last contact|met|know)\b/.test(lower)) {
+    intents.push('relationship_history');
+  }
+  if (/\b(risk|risks|diligence|concern|concerns|red flag|red flags|moat|defensibility|competition|competitive)\b/.test(lower)) {
+    intents.push('diligence_risk');
+  }
+  if (/\b(document|documents|doc|docs|pdf|attachment|file|deck|presentation|memo|model|term sheet)\b/.test(lower)) {
+    intents.push('document_artifact');
+  }
+
+  return intents.length > 0 ? intents : ['generic_recall'];
+}
+
+function inferTimeIntent(query: string): EvidencePlan['time_intent'] {
+  const lower = query.toLowerCase();
+  if (/\b\d{4}-\d{2}-\d{2}\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b|\bq[1-4]\b/i.test(query)) {
+    return 'specific_date';
+  }
+  if (/\b(latest|newest|most recent|last call|last meeting|current|currently)\b/.test(lower)) return 'latest';
+  if (/\b(recent|recently|today|yesterday|this week|last week|past)\b/.test(lower)) return 'recent';
+  if (/\b(history|historical|previous|earlier|old|older)\b/.test(lower)) return 'historical';
+  return 'unspecified';
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function buildEvidencePlan(
+  query: string,
+  anchors: EvidenceAnchor[],
+  detectedDocTypes: string[],
+  forcedDocTypes?: string[]
+): EvidencePlan {
+  const intents = inferEvidenceIntents(query);
+  const primaryIntent = intents[0] || 'generic_recall';
+  const lower = query.toLowerCase();
+
+  const primaryFamilies: string[] = [];
+  const supportingFamilies: string[] = [];
+  const contextFamilies: string[] = ['entity_context'];
+  const subtypeHints: string[] = [];
+  const signalTerms: string[] = [];
+  const expansionStrategy: string[] = [];
+  const balanceGoal: Record<string, number> = {};
+
+  const addPrimary = (...families: string[]) => primaryFamilies.push(...families);
+  const addSupporting = (...families: string[]) => supportingFamilies.push(...families);
+  const addSignals = (...signals: string[]) => signalTerms.push(...signals.filter(s => lower.includes(s)));
+  const addExpansion = (...targets: string[]) => expansionStrategy.push(...targets);
+
+  if (intents.includes('pitch_opportunity')) {
+    addPrimary('transcripts', 'documents');
+    addSupporting('emails', 'slack', 'deal_records');
+    subtypeHints.push('deal_pitch', 'deal_terms', 'deal_financials');
+    addSignals('pitch', 'raise', 'fundraising', 'valuation', 'ask', 'terms', 'deck', 'investment opportunity');
+    addExpansion('same_meeting', 'same_document', 'email_thread');
+    balanceGoal.transcripts = 6;
+    balanceGoal.documents = 4;
+    balanceGoal.emails = 4;
+    balanceGoal.slack = 3;
+    balanceGoal.entity_context = 3;
+  }
+
+  if (intents.includes('person_stance')) {
+    addPrimary('transcripts', 'emails', 'slack');
+    addSupporting('entity_context', 'documents');
+    addSignals('feel', 'think', 'thoughts', 'view', 'opinion', 'stance', 'concern', 'skeptical', 'bullish');
+    addExpansion('speaker_or_author_context', 'same_meeting', 'email_thread', 'slack_thread');
+    balanceGoal.transcripts = Math.max(balanceGoal.transcripts || 0, 6);
+    balanceGoal.emails = Math.max(balanceGoal.emails || 0, 5);
+    balanceGoal.slack = Math.max(balanceGoal.slack || 0, 5);
+  }
+
+  if (intents.includes('project_status')) {
+    addPrimary('slack', 'emails', 'transcripts');
+    addSupporting('documents', 'entity_context');
+    addSignals('status', 'update', 'progress', 'blocker', 'blocked', 'next step', 'owner', 'timeline');
+    addExpansion('slack_thread', 'email_thread', 'same_meeting');
+    balanceGoal.slack = Math.max(balanceGoal.slack || 0, 6);
+    balanceGoal.emails = Math.max(balanceGoal.emails || 0, 5);
+    balanceGoal.transcripts = Math.max(balanceGoal.transcripts || 0, 4);
+  }
+
+  if (intents.includes('meeting_summary')) {
+    addPrimary('transcripts');
+    addSupporting('emails', 'documents', 'entity_context');
+    addSignals('meeting', 'call', 'transcript', 'discussion', 'readout');
+    addExpansion('same_meeting');
+    balanceGoal.transcripts = Math.max(balanceGoal.transcripts || 0, 10);
+    balanceGoal.emails = Math.max(balanceGoal.emails || 0, 3);
+  }
+
+  if (intents.includes('recent_activity')) {
+    addPrimary('slack', 'emails', 'transcripts');
+    addSupporting('entity_context', 'documents');
+    addExpansion('slack_thread', 'email_thread', 'same_meeting');
+  }
+
+  if (intents.includes('relationship_history')) {
+    addPrimary('emails', 'transcripts', 'slack');
+    addSupporting('entity_context', 'documents');
+    addExpansion('email_thread', 'same_meeting', 'slack_thread');
+  }
+
+  if (intents.includes('diligence_risk')) {
+    addPrimary('transcripts', 'documents', 'emails');
+    addSupporting('slack', 'entity_context');
+    subtypeHints.push('deal_diligence', 'deal_financials', 'deal_terms');
+    addSignals('risk', 'concern', 'red flag', 'diligence', 'moat', 'defensibility', 'competition');
+    addExpansion('same_meeting', 'same_document', 'email_thread');
+  }
+
+  if (intents.includes('document_artifact')) {
+    addPrimary('documents');
+    addSupporting('emails', 'transcripts', 'entity_context');
+    addExpansion('same_document', 'email_thread');
+  }
+
+  if (primaryIntent === 'generic_recall') {
+    addPrimary('emails', 'transcripts', 'slack', 'documents');
+    addSupporting('entity_context');
+    balanceGoal.emails = 5;
+    balanceGoal.transcripts = 5;
+    balanceGoal.slack = 5;
+    balanceGoal.documents = 5;
+  }
+
+  const anchorCounts: Record<string, number> = {};
+  for (const anchor of anchors) anchorCounts[anchor.type] = (anchorCounts[anchor.type] || 0) + 1;
+
+  const riskFlags: string[] = [];
+  if (anchors.length === 0) riskFlags.push('no_entity_anchors');
+  if (intents.includes('person_stance') && !anchors.some(a => a.type === 'contact')) riskFlags.push('stance_query_without_person_anchor');
+  if (intents.includes('project_status') && anchors.length === 0) riskFlags.push('status_query_without_anchor');
+  if (intents.includes('pitch_opportunity') && anchors.length === 0) riskFlags.push('pitch_query_without_person_or_company_anchor');
+  if (intents.includes('pitch_opportunity')) riskFlags.push('document_subtypes_are_incomplete_do_not_filter_only_boost');
+
+  return {
+    query: query.slice(0, 120),
+    anchor_ids: anchors.map(a => a.id),
+    anchors,
+    anchor_counts: anchorCounts,
+    primary_intent: primaryIntent,
+    intents,
+    time_intent: inferTimeIntent(query),
+    evidence_strategy: {
+      primary_families: uniqueStrings(primaryFamilies),
+      supporting_families: uniqueStrings(supportingFamilies),
+      context_families: uniqueStrings(contextFamilies),
+      subtype_hints: uniqueStrings(subtypeHints),
+      subtype_hints_are_boosts_only: true,
+    },
+    source_balance_goal: balanceGoal,
+    signal_terms: uniqueStrings(signalTerms),
+    expansion_strategy: uniqueStrings(expansionStrategy),
+    risk_flags: uniqueStrings(riskFlags),
+    detected_doc_types: detectedDocTypes,
+    forced_doc_types: forcedDocTypes && forcedDocTypes.length > 0 ? forcedDocTypes : null,
+  };
+}
+
 export async function preprocessQuery(
   query: string,
   session: AgentSession,
@@ -460,6 +722,22 @@ export async function retrieveContext(
   const docTypes = options.forceDocTypes && options.forceDocTypes.length > 0
     ? options.forceDocTypes
     : detectDocTypes(pq.originalQuery);
+  try {
+    const anchors = await resolveEvidenceAnchors(pq, env);
+    retrievalLog('plan', {
+      query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+      ...buildEvidencePlan(pq.originalQuery, anchors, docTypes, options.forceDocTypes),
+    });
+  } catch (e) {
+    retrievalLog('plan', {
+      query: pq.originalQuery.slice(0, 120),
+      query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+      planner_error: e instanceof Error ? e.message : String(e),
+      anchor_ids: pq.entityIds,
+      detected_doc_types: docTypes,
+      forced_doc_types: options.forceDocTypes || null,
+    });
+  }
   if (docTypes.length > 0) {
     const seen = new Set(internalMatches.map(m => m.id));
     const seenBeforeTargeted = new Set(seen);
