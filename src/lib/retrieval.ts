@@ -54,6 +54,20 @@ function detectDocTypes(query: string): string[] {
   return matched;
 }
 
+function hashFirstFiveDims(embedding: number[]): string {
+  const firstFive = embedding
+    .slice(0, 5)
+    .map(v => (Number.isFinite(v) ? v.toFixed(6) : String(v)))
+    .join('|');
+
+  let hash = 2166136261;
+  for (let i = 0; i < firstFive.length; i++) {
+    hash ^= firstFive.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 export async function preprocessQuery(
   query: string,
   session: AgentSession,
@@ -434,6 +448,17 @@ export async function retrieveContext(
     .slice(0, 5);
   const { chunks: newsChunks } = await hydrateChunks(newsMatches, env);
 
+  console.log('[retrieve]', {
+    query: pq.originalQuery.slice(0, 80),
+    query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+    docTypes,
+    broad_count: internalMatches.length - targetedIds.size,
+    targeted_count: targetedIds.size,
+    filtered_count: filtered.length,
+    hydrated_count: hydrated.length,
+    reranked_count: reranked.length,
+  });
+
   if (options.deepDive) {
     const allChunks = [...reranked, ...newsChunks];
     const entitySet = new Set<string>();
@@ -632,4 +657,3 @@ export const TOKEN_BUDGET = {
   query: 1000,
   buffer: 4000,
 };
-
