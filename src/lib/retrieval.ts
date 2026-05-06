@@ -93,6 +93,18 @@ function countTargetedIds(
   return chunks.filter(chunk => targetedIds.has(chunk.id as string)).length;
 }
 
+function selectHydrationCandidates(
+  chunks: VectorMatch[],
+  limit: number,
+  targetedIds: Set<string>
+): VectorMatch[] {
+  if (targetedIds.size === 0) return chunks.slice(0, limit);
+
+  const targeted = chunks.filter(chunk => targetedIds.has(chunk.id));
+  const broad = chunks.filter(chunk => !targetedIds.has(chunk.id));
+  return [...targeted, ...broad].slice(0, limit);
+}
+
 function targetedMembershipSample(
   chunks: Array<{ id?: unknown }>,
   targetedIds?: Set<string>
@@ -543,7 +555,7 @@ export async function retrieveContext(
     .filter(pq.postRetrievalFilter)
     .filter(m => m.score >= 0.55 || targetedIds.has(m.id));
 
-  const hydrateCandidates = filtered.slice(0, hydrateLimit);
+  const hydrateCandidates = selectHydrationCandidates(filtered, hydrateLimit, targetedIds);
   retrievalLog('filter', {
     query: pq.originalQuery.slice(0, 80),
     query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
