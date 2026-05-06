@@ -85,6 +85,15 @@ function countByDocType(chunks: Array<{ metadata?: Record<string, any> }>): Reco
   return counts;
 }
 
+function countBySourceFamily(chunks: Array<{ metadata?: Record<string, any> }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const chunk of chunks) {
+    const family = sourceFamilyForDocType(String(chunk.metadata?.document_type || 'unknown'));
+    counts[family] = (counts[family] || 0) + 1;
+  }
+  return counts;
+}
+
 function countTargetedIds(
   chunks: Array<{ id?: unknown }>,
   targetedIds?: Set<string>
@@ -93,16 +102,86 @@ function countTargetedIds(
   return chunks.filter(chunk => targetedIds.has(chunk.id as string)).length;
 }
 
+function parseEntityIdList(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map(String);
+  const text = String(value).trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed.map(String);
+  } catch {
+    // Fall through to delimiter parsing; vector metadata is not guaranteed JSON.
+  }
+  return text
+    .split(/[,\s]+/)
+    .map(part => part.trim())
+    .filter(Boolean);
+}
+
+function countAnchorMatches(chunk: { metadata?: Record<string, any> }, anchorIds: string[]): number {
+  if (anchorIds.length === 0) return 0;
+  const anchors = new Set(anchorIds);
+  const chunkEntityIds = new Set<string>();
+  const primary = chunk.metadata?.primary_entity_id;
+  if (primary) chunkEntityIds.add(String(primary));
+  for (const id of parseEntityIdList(chunk.metadata?.secondary_entity_ids)) chunkEntityIds.add(id);
+  let count = 0;
+  for (const id of chunkEntityIds) {
+    if (anchors.has(id)) count++;
+  }
+  return count;
+}
+
+function sourceFamilyForDocType(docType: string): string {
+  if (docType === 'email') return 'emails';
+  if (docType === 'transcript') return 'transcripts';
+  if (docType === 'conversation') return 'slack';
+  if (docType === 'enrichment') return 'entity_context';
+  if (docType === 'deal_record') return 'deal_records';
+  return 'documents';
+}
+
 function selectHydrationCandidates(
   chunks: VectorMatch[],
   limit: number,
-  targetedIds: Set<string>
+  targetedIds: Set<string>,
+  plan?: EvidencePlan | null,
+  anchorIds: string[] = []
 ): VectorMatch[] {
-  if (targetedIds.size === 0) return chunks.slice(0, limit);
+  const scoreChunk = (chunk: VectorMatch): number => {
+    const targetedScore = targetedIds.has(chunk.id) ? 1_000_000 : 0;
+    const anchorScore = countAnchorMatches(chunk, anchorIds) * 10_000;
+    return targetedScore + anchorScore + chunk.score;
+  };
 
-  const targeted = chunks.filter(chunk => targetedIds.has(chunk.id));
-  const broad = chunks.filter(chunk => !targetedIds.has(chunk.id));
-  return [...targeted, ...broad].slice(0, limit);
+  const ordered = [...chunks].sort((a, b) => scoreChunk(b) - scoreChunk(a));
+  const balanceGoal = plan?.source_balance_goal || {};
+  const families = Object.entries(balanceGoal)
+    .filter(([, goal]) => goal > 0)
+    .sort((a, b) => b[1] - a[1]);
+
+  if (families.length === 0) return ordered.slice(0, limit);
+
+  const selected: VectorMatch[] = [];
+  const selectedIds = new Set<string>();
+  const take = (candidate: VectorMatch): void => {
+    if (selected.length >= limit || selectedIds.has(candidate.id)) return;
+    selected.push(candidate);
+    selectedIds.add(candidate.id);
+  };
+
+  for (const [family, goal] of families) {
+    const candidates = ordered.filter(chunk =>
+      sourceFamilyForDocType(String(chunk.metadata?.document_type || 'unknown')) === family
+    );
+    for (const candidate of candidates.slice(0, Math.min(goal, limit - selected.length))) {
+      take(candidate);
+    }
+  }
+
+  for (const candidate of ordered) take(candidate);
+  return selected.slice(0, limit);
 }
 
 function targetedMembershipSample(
@@ -502,6 +581,40 @@ function buildEvidencePlan(
     detected_doc_types: detectedDocTypes,
     forced_doc_types: forcedDocTypes && forcedDocTypes.length > 0 ? forcedDocTypes : null,
   };
+}
+
+const SOURCE_FAMILY_DOC_TYPES: Record<string, string[]> = {
+  emails: ['email'],
+  transcripts: ['transcript'],
+  slack: ['conversation'],
+  documents: [
+    'deal_pitch',
+    'deal_terms',
+    'deal_financials',
+    'deal_diligence',
+    'reference',
+    'internal_ops',
+    'meeting_material',
+    'contact_data',
+    'document',
+    'pitch_deck',
+  ],
+  deal_records: ['deal_record'],
+  entity_context: ['enrichment'],
+};
+
+function plannedDocTypes(
+  detectedDocTypes: string[],
+  plan: EvidencePlan | null,
+  forcedDocTypes?: string[]
+): string[] {
+  if (forcedDocTypes && forcedDocTypes.length > 0) return uniqueStrings(forcedDocTypes);
+  const families = [
+    ...(plan?.evidence_strategy.primary_families || []),
+    ...(plan?.evidence_strategy.supporting_families || []),
+  ];
+  const fromPlan = families.flatMap(family => SOURCE_FAMILY_DOC_TYPES[family] || []);
+  return uniqueStrings([...detectedDocTypes, ...fromPlan]);
 }
 
 export async function preprocessQuery(
@@ -936,20 +1049,17 @@ export async function retrieveContext(
   // top-10 rerank window even when the targeted secondary query did
   // surface real Slack content.
   const targetedIds = new Set<string>();
-  // Caller-forced doc types take precedence over detectDocTypes's keyword
-  // inspection. recall(query, source_types=['slack']) maps source_types to
-  // document_type values and passes via forceDocTypes — guarantees the
-  // targeted secondary query fires even when the query string doesn't
-  // contain a doc-type keyword. Falls back to detectDocTypes when caller
-  // didn't specify (the existing path for direct user queries).
-  const docTypes = options.forceDocTypes && options.forceDocTypes.length > 0
-    ? options.forceDocTypes
-    : detectDocTypes(pq.originalQuery);
+  // Caller-forced doc types take precedence over planner expansion. Direct
+  // user queries use the evidence plan to turn intent families ("documents",
+  // "transcripts", "slack") into concrete document_type-targeted searches.
+  const detectedDocTypes = detectDocTypes(pq.originalQuery);
+  let evidencePlan: EvidencePlan | null = null;
   try {
     const anchors = await resolveEvidenceAnchors(pq, env);
+    evidencePlan = buildEvidencePlan(pq.originalQuery, anchors, detectedDocTypes, options.forceDocTypes);
     retrievalLog('plan', {
       query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
-      ...buildEvidencePlan(pq.originalQuery, anchors, docTypes, options.forceDocTypes),
+      ...evidencePlan,
     });
   } catch (e) {
     retrievalLog('plan', {
@@ -957,10 +1067,11 @@ export async function retrieveContext(
       query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
       planner_error: e instanceof Error ? e.message : String(e),
       anchor_ids: pq.entityIds,
-      detected_doc_types: docTypes,
+      detected_doc_types: detectedDocTypes,
       forced_doc_types: options.forceDocTypes || null,
     });
   }
+  const docTypes = plannedDocTypes(detectedDocTypes, evidencePlan, options.forceDocTypes);
   if (docTypes.length > 0) {
     const seen = new Set(internalMatches.map(m => m.id));
     const seenBeforeTargeted = new Set(seen);
@@ -1000,6 +1111,13 @@ export async function retrieveContext(
       query: pq.originalQuery.slice(0, 80),
       query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
       doc_types: docTypes,
+      targeted_strategy: options.forceDocTypes && options.forceDocTypes.length > 0 ? 'forced' : 'planner',
+      planned_families: evidencePlan
+        ? uniqueStrings([
+            ...evidencePlan.evidence_strategy.primary_families,
+            ...evidencePlan.evidence_strategy.supporting_families,
+          ])
+        : [],
       force_doc_types: options.forceDocTypes || null,
       pre_targeted_internal_count: seenBeforeTargeted.size,
       targeted_raw_count: targetedRawMatches.length,
@@ -1016,6 +1134,7 @@ export async function retrieveContext(
       query: pq.originalQuery.slice(0, 80),
       query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
       doc_types: [],
+      targeted_strategy: 'none',
       force_doc_types: options.forceDocTypes || null,
       targeted_raw_count: 0,
       targeted_duplicate_count: 0,
@@ -1056,7 +1175,13 @@ export async function retrieveContext(
     .filter(pq.postRetrievalFilter)
     .filter(m => m.score >= 0.55 || targetedIds.has(m.id));
 
-  const hydrateCandidates = selectHydrationCandidates(filtered, hydrateLimit, targetedIds);
+  const hydrateCandidates = selectHydrationCandidates(
+    filtered,
+    hydrateLimit,
+    targetedIds,
+    evidencePlan,
+    pq.entityIds
+  );
   retrievalLog('filter', {
     query: pq.originalQuery.slice(0, 80),
     query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
@@ -1067,8 +1192,11 @@ export async function retrieveContext(
     filtered_doc_type_counts: countByDocType(filtered),
     targeted_survived_filter_count: countTargetedIds(filtered, targetedIds),
     hydrate_limit: hydrateLimit,
+    hydration_balance_goal: evidencePlan?.source_balance_goal || {},
     hydrate_candidate_count: hydrateCandidates.length,
     hydrate_candidate_doc_type_counts: countByDocType(hydrateCandidates),
+    hydrate_candidate_source_family_counts: countBySourceFamily(hydrateCandidates),
+    hydrate_candidate_multi_anchor_count: hydrateCandidates.filter(c => countAnchorMatches(c, pq.entityIds) >= 2).length,
     targeted_in_hydrate_slice_count: countTargetedIds(hydrateCandidates, targetedIds),
   });
 
@@ -1081,6 +1209,7 @@ export async function retrieveContext(
     hydration_summary: hydrationSummary,
     hydrated_count: hydrated.length,
     hydrated_doc_type_counts: countByDocType(hydrated),
+    hydrated_source_family_counts: countBySourceFamily(hydrated),
     hydrated_targeted_count: countTargetedIds(hydrated, targetedIds),
     targeted_id_type: typeof targetedIdSample,
     hydrated_target_id_type: typeof hydratedTargetSample?.id,
@@ -1339,7 +1468,10 @@ export async function crossEncoderRerank(
 
     let finalChunks: HydratedChunk[];
     if (targeted.length > 0) {
-      const targetedTake = Math.min(targeted.length, TARGETED_RESERVE);
+      const targetedTake = Math.min(
+        targeted.length,
+        broad.length === 0 ? TOTAL_SLOTS : TARGETED_RESERVE
+      );
       const broadTake = TOTAL_SLOTS - targetedTake;
       finalChunks = [
         ...targeted.slice(0, targetedTake).map(x => x.chunk),
