@@ -801,7 +801,14 @@ async function routeAuthenticated(
 
 // --- Cron handler ---
 
-async function handleScheduled(
+// Phase 8 (2026-05-06): exported so src/pipelines-index.ts can import +
+// dispatch the same scheduled handler. During the bundled-deploy overlap
+// window, BOTH api and pipelines run this handler. Post-api-redeploy,
+// api removes its [triggers] from wrangler.toml so it never fires; only
+// pipelines' cron triggers it. esbuild tree-shakes api-specific paths
+// like handleRequest from the pipelines bundle since pipelines-index.ts
+// doesn't reference the default export.
+export async function handleScheduled(
   event: ScheduledEvent,
   env: Env,
   ctxExec: ExecutionContext
@@ -1074,7 +1081,13 @@ async function handleScheduled(
 
 // --- Queue handler ---
 
-async function handleQueue(
+// Phase 8 (2026-05-06): exported alongside handleScheduled. Pipelines
+// claims the audit consumer per dispatch override; webhook intake queue
+// consumer stays here on api until Stage 4 (Session B). After api
+// redeploys, api's [[queues.consumers]] for audit-log-queue is removed
+// from wrangler.toml so api no longer consumes audit events; pipelines
+// declares the consumer in wrangler.pipelines.toml.
+export async function handleQueue(
   batch: MessageBatch<AuditEvent | WebhookQueueMessage>,
   env: Env
 ): Promise<void> {
