@@ -591,12 +591,11 @@ function buildEvidencePlan(
   }
 
   if (primaryIntent === 'generic_recall') {
-    addPrimary('emails', 'transcripts', 'slack', 'documents');
-    addSupporting('entity_context');
+    addPrimary('emails', 'transcripts', 'slack');
+    addSupporting('documents', 'entity_context');
     balanceGoal.emails = 5;
     balanceGoal.transcripts = 5;
     balanceGoal.slack = 5;
-    balanceGoal.documents = 5;
   }
 
   const anchorCounts: Record<string, number> = {};
