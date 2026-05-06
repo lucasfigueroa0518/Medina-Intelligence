@@ -487,10 +487,10 @@ export async function retrieveContext(
     let targetedAddedCount = 0;
     for (const matches of docResults.map(r => (r.matches || []) as VectorMatch[])) {
       for (const m of matches) {
+        targetedIds.add(m.id);
         if (!seen.has(m.id)) {
           seen.add(m.id);
           internalMatches.push(m);
-          targetedIds.add(m.id);
           targetedAddedCount++;
         }
       }
