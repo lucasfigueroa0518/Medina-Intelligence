@@ -15,6 +15,14 @@ import {
   classifyContactSide,
 } from '../lib/internal-entity';
 
+const DEAL_STAGE_VALUES = ['new', 'talking', 'due_diligence', 'term_sheet', 'closed'] as const;
+const DEAL_STAGE_SET = new Set<string>(DEAL_STAGE_VALUES);
+
+function normalizeDealStage(value: unknown, fallback: typeof DEAL_STAGE_VALUES[number] = 'talking'): string {
+  const stage = typeof value === 'string' ? value : fallback;
+  return DEAL_STAGE_SET.has(stage) ? stage : fallback;
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/deals
 // ---------------------------------------------------------------------------
@@ -178,6 +186,11 @@ export async function createDeal(
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const stage = normalizeDealStage(body.stage, 'talking');
+  const company = await env.D1.prepare(
+    'SELECT name FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(body.company_id, ctx.orgId).first<{ name: string }>();
+  const title = company?.name || String(body.title).slice(0, 160);
 
   await env.D1.prepare(
     `INSERT INTO deals
@@ -193,8 +206,8 @@ export async function createDeal(
       ctx.orgId,
       body.company_id,
       body.owner_id || ctx.userId,
-      body.title,
-      body.stage || 'prospect',
+      title,
+      stage,
       body.amount ?? null,
       body.currency || 'USD',
       body.probability ?? 0,
@@ -219,7 +232,7 @@ export async function createDeal(
   ] as const;
   const sourceMetadata: Record<string, any> = {};
   for (const field of provenanceFields) {
-    const val = field === 'stage' ? (body.stage || 'prospect') : body[field];
+    const val = field === 'stage' ? stage : body[field];
     if (val != null) {
       sourceMetadata[field] = { source: 'manual', set_by: ctx.userId, set_at: now };
     }
@@ -244,7 +257,7 @@ export async function createDeal(
     action: 'create',
     entity_type: 'deal',
     entity_id: id,
-    after_data: { id, title: body.title, stage: body.stage || 'prospect' },
+    after_data: { id, title, stage },
     created_at: now,
   });
 
@@ -540,8 +553,7 @@ export async function updateDeal(
 //
 // Applies the same field whitelist as updateDeal to every deal_id that
 // belongs to the caller's org. archive=true is a sugar for soft-delete
-// (sets deleted_at=now) — distinct from setting stage='closed_lost' which
-// keeps the row visible on the board's Closed Lost column.
+// (sets deleted_at=now).
 //
 // ACL matches updateDeal: any authenticated user in the org can update any
 // deal in the org. Per-deal id ownership check is implicit in the WHERE
@@ -597,6 +609,12 @@ export async function bulkUpdateDeals(
     }
     if (Object.keys(filteredUpdates).length === 0) {
       return errorResponse('VALIDATION_ERROR', 400, `updates must include at least one of: ${BULK_ALLOWED_FIELDS.join(', ')}`);
+    }
+    if ('stage' in filteredUpdates) {
+      const stage = typeof filteredUpdates.stage === 'string' ? filteredUpdates.stage : '';
+      if (!DEAL_STAGE_SET.has(stage)) {
+        return errorResponse('VALIDATION_ERROR', 400, `stage must be one of: ${DEAL_STAGE_VALUES.join(', ')}`);
+      }
     }
   }
 
@@ -690,6 +708,119 @@ export async function bulkUpdateDeals(
     updated_count: matchedIds.length,
     skipped_ids: dealIds.filter(id => !beforeById.has(id)),
     archived: archive,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/deals/bulk-decision
+// ---------------------------------------------------------------------------
+// Body: { deal_ids: string[], decision: 'yes' | 'no' | 'delete' }
+//
+// AI-suggested deals enter the board as stage='new'. A yes decision promotes
+// them into the user's active pipeline at talking. No/delete soft-delete the
+// suggestion while preserving an audit trail.
+
+export async function bulkDecideDeals(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    deal_ids?: unknown;
+    decision?: unknown;
+  }>(request);
+
+  const dealIds = Array.isArray(body?.deal_ids)
+    ? body!.deal_ids.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : [];
+  const decision = typeof body?.decision === 'string' ? body.decision : '';
+
+  if (dealIds.length === 0) {
+    return errorResponse('VALIDATION_ERROR', 400, 'deal_ids must be a non-empty array of strings');
+  }
+  if (dealIds.length > 100) {
+    return errorResponse('VALIDATION_ERROR', 400, 'bulk decision capped at 100 deal_ids per call');
+  }
+  if (!['yes', 'no', 'delete'].includes(decision)) {
+    return errorResponse('VALIDATION_ERROR', 400, 'decision must be yes, no, or delete');
+  }
+
+  const placeholders = dealIds.map(() => '?').join(',');
+  const beforeRows = await env.D1.prepare(
+    `SELECT * FROM deals WHERE id IN (${placeholders}) AND org_id = ? AND deleted_at IS NULL`
+  ).bind(...dealIds, ctx.orgId).all<any>();
+  const beforeById = new Map<string, any>(beforeRows.results.map(r => [r.id, r]));
+  const matchedIds = Array.from(beforeById.keys());
+
+  if (matchedIds.length === 0) {
+    return jsonResponse({ ok: true, updated_count: 0, skipped_ids: dealIds, decision });
+  }
+
+  const now = new Date().toISOString();
+  const suggestionMetadata = JSON.stringify({
+    suggestion: {
+      decision: decision === 'yes' ? 'approved' : decision === 'no' ? 'denied' : 'deleted',
+      decided_by: ctx.userId,
+      decided_at: now,
+    },
+  });
+
+  const stmts = matchedIds.map(id => {
+    if (decision === 'yes') {
+      return env.D1.prepare(
+        `UPDATE deals
+            SET stage = 'talking',
+                suggestion_decided_at = ?,
+                suggestion_decided_by = ?,
+                stage_changed_at = ?,
+                days_in_stage = 0,
+                last_activity_date = ?,
+                source_metadata = json_patch(COALESCE(source_metadata, '{}'), ?),
+                updated_at = ?
+          WHERE id = ? AND org_id = ?`
+      ).bind(now, ctx.userId, now, now, suggestionMetadata, now, id, ctx.orgId);
+    }
+
+    return env.D1.prepare(
+      `UPDATE deals
+          SET deleted_at = ?,
+              suggestion_decided_at = ?,
+              suggestion_decided_by = ?,
+              source_metadata = json_patch(COALESCE(source_metadata, '{}'), ?),
+              updated_at = ?
+        WHERE id = ? AND org_id = ?`
+    ).bind(now, now, ctx.userId, suggestionMetadata, now, id, ctx.orgId);
+  });
+
+  await env.D1.batch(stmts);
+
+  await Promise.all(matchedIds.map(id => emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: decision === 'yes' ? 'update' : 'soft_delete',
+    entity_type: 'deal',
+    entity_id: id,
+    before_data: beforeById.get(id),
+    after_data: {
+      ...beforeById.get(id),
+      stage: decision === 'yes' ? 'talking' : beforeById.get(id)?.stage,
+      deleted_at: decision === 'yes' ? beforeById.get(id)?.deleted_at : now,
+      suggestion_decided_at: now,
+      suggestion_decided_by: ctx.userId,
+    },
+    metadata: { bulk: true, decision },
+    created_at: now,
+  }).catch(err => {
+    console.error(`[bulk-decision] audit emit failed for deal ${id}:`, err);
+  })));
+
+  await invalidateRagCache(ctx.orgId, env);
+
+  return jsonResponse({
+    ok: true,
+    updated_count: matchedIds.length,
+    skipped_ids: dealIds.filter(id => !beforeById.has(id)),
+    decision,
   });
 }
 
@@ -1631,14 +1762,11 @@ export async function getDealMetrics(
        WHERE org_id = ? AND deleted_at IS NULL
        GROUP BY stage
        ORDER BY CASE stage
-         WHEN 'prospect' THEN 0
-         WHEN 'first_contact' THEN 1
-         WHEN 'meeting_scheduled' THEN 2
-         WHEN 'due_diligence' THEN 3
-         WHEN 'term_sheet' THEN 4
-         WHEN 'closing' THEN 5
-         WHEN 'closed_won' THEN 6
-         WHEN 'closed_lost' THEN 7
+         WHEN 'new' THEN 0
+         WHEN 'talking' THEN 1
+         WHEN 'due_diligence' THEN 2
+         WHEN 'term_sheet' THEN 3
+         WHEN 'closed' THEN 4
        END`
     ).bind(ctx.orgId).all(),
 
@@ -1653,7 +1781,7 @@ export async function getDealMetrics(
               ), 1) AS avg_days
        FROM deals
        WHERE org_id = ? AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')
+         AND stage != 'closed'
        GROUP BY stage`
     ).bind(ctx.orgId).all(),
 
@@ -1662,7 +1790,7 @@ export async function getDealMetrics(
       `SELECT COALESCE(SUM(amount), 0) AS total_pipeline_value
        FROM deals
        WHERE org_id = ? AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')`
+         AND stage != 'closed'`
     ).bind(ctx.orgId).first<{ total_pipeline_value: number }>(),
 
     // Stale deals: no activity in the last 7 days
@@ -1670,7 +1798,7 @@ export async function getDealMetrics(
       `SELECT id, title, stage, last_activity_date, company_id
        FROM deals
        WHERE org_id = ? AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')
+         AND stage != 'closed'
          AND (last_activity_date IS NULL
               OR last_activity_date < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days'))
        ORDER BY last_activity_date ASC NULLS FIRST

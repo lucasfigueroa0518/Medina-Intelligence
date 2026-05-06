@@ -347,18 +347,10 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
     return {};
   }
 
-  // The deal-detection proposal's stage values come from a 5-categorical
-  // prompt set ('prospect','qualified','diligence','term_sheet','closing')
-  // but the deals table CHECK accepts 8 stages. Map the LLM-side stages
-  // to the table-side stages so the INSERT doesn't violate the constraint.
-  const STAGE_MAP: Record<string, string> = {
-    prospect: 'prospect',
-    qualified: 'first_contact',
-    diligence: 'due_diligence',
-    term_sheet: 'term_sheet',
-    closing: 'closing',
-  };
-  const stage = STAGE_MAP[payload.stage] || 'prospect';
+  // Legacy approval_queue deal proposals pre-date the four-evidence gate.
+  // If an owner still approves one manually, place it in the active pipeline
+  // conservatively and use the startup company name as the card title.
+  const stage = 'talking';
 
   const dealId = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -367,8 +359,8 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
   // old; if the company was soft-deleted in between, fail loudly rather
   // than insert a deal pointing at a tombstone.
   const company = await env.D1.prepare(
-    `SELECT id, is_internal_entity FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-  ).bind(payload.company_id, item.org_id).first<{ id: string; is_internal_entity: number }>();
+    `SELECT id, name, is_internal_entity FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(payload.company_id, item.org_id).first<{ id: string; name: string; is_internal_entity: number }>();
   if (!company) {
     console.error(`[commit-create-deal] company ${payload.company_id} not found in org ${item.org_id}`);
     return {};
@@ -391,7 +383,7 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
     `SELECT id, title FROM deals
        WHERE org_id = ? AND company_id = ?
          AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')
+         AND stage != 'closed'
        LIMIT 1`
   ).bind(item.org_id, payload.company_id).first<{ id: string; title: string }>();
   if (existingOpen) {
@@ -430,7 +422,7 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
         item.org_id,
         payload.company_id,
         item.resolved_by || null,                 // approver becomes owner
-        String(payload.title).slice(0, 120),
+        String(company.name || payload.title).slice(0, 120),
         stage,
         Number.isFinite(payload.amount) ? payload.amount : null,
         Math.min(Math.max(Number(item.confidence) || 0, 0), 1),  // confidence as initial probability proxy

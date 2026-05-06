@@ -132,7 +132,7 @@ export class OpenDealConflictError extends Error {
   constructor(public companyId: string, public existingDealId: string, public existingTitle: string) {
     super(
       `An open deal already exists for this company ("${existingTitle}", id ${existingDealId}). ` +
-      `Close the existing deal (closed_won or closed_lost) before creating a new one, ` +
+      `Close the existing deal before creating a new one, ` +
       `or update the existing deal in place.`
     );
   }
@@ -148,7 +148,7 @@ export async function assertNoOpenDealForCompany(
     `SELECT id, title FROM deals
        WHERE org_id = ? AND company_id = ?
          AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')
+         AND stage != 'closed'
          AND id != ?
        LIMIT 1`
   ).bind(orgId, companyId, excludeDealId || '').first<{ id: string; title: string }>();

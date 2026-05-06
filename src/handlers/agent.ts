@@ -96,7 +96,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
       type: 'object',
       properties: {
         keyword: { type: 'string', description: 'Search by title or company name' },
-        stage: { type: 'string', description: 'Filter by stage: prospect, initial_contact, due_diligence, term_sheet, negotiation, closed_won, closed_lost, on_hold' },
+        stage: { type: 'string', description: 'Filter by stage: new, talking, due_diligence, term_sheet, closed' },
         company_id: { type: 'string' },
         limit: { type: 'number' },
       },
@@ -248,7 +248,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         title: { type: 'string' },
         company_name: { type: 'string', description: 'Name of an existing company' },
         company_id: { type: 'string', description: 'Or provide company ID directly' },
-        stage: { type: 'string', description: 'prospect, initial_contact, due_diligence, term_sheet, negotiation, closed_won, closed_lost, on_hold' },
+        stage: { type: 'string', description: 'new, talking, due_diligence, term_sheet, closed' },
         amount: { type: 'number' },
         valuation: { type: 'number' },
         description: { type: 'string' },

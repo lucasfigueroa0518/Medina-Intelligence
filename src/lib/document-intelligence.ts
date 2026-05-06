@@ -11,6 +11,7 @@ import { extractTextFromFile } from './file-extraction';
 import { emitAudit } from './audit';
 import { persistDocument } from './persist-document';
 import { classifyByFilename } from './document-filename-classifier';
+import { recordDealEvidenceSignal } from './deal-suggestions';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types
@@ -584,38 +585,48 @@ async function routeCompany(
 async function routeDeal(
   extracted: ExtractedDeal,
   companyLookup: Map<string, string>,
+  documentId: string,
+  documentTitle: string,
   orgId: string,
   env: Env
 ): Promise<{ created: boolean; id: string }> {
   let companyId: string | null = null;
   if (extracted.company_name) {
     companyId = companyLookup.get(extracted.company_name.toLowerCase()) || null;
+    if (!companyId) {
+      const existing = await env.D1.prepare(
+        `SELECT id FROM companies
+          WHERE org_id = ? AND lower(name) = lower(?) AND deleted_at IS NULL
+          LIMIT 1`
+      ).bind(orgId, extracted.company_name).first<{ id: string }>();
+      companyId = existing?.id || null;
+    }
   }
 
   // Wave 1: refuse to import deals targeting internal Medina-side entities.
   if (companyId && await isCompanyInternal(companyId, orgId, env)) {
-    console.warn(`[doc-intel] skipping deal import targeting internal company ${companyId}: ${extracted.name}`);
+    console.warn(`[doc-intel] skipping deal evidence targeting internal company ${companyId}: ${extracted.name}`);
+    return { created: false, id: '' };
+  }
+  if (!companyId) {
     return { created: false, id: '' };
   }
 
-  const dealId = crypto.randomUUID();
-  const now = new Date().toISOString();
-
-  await env.D1.prepare(
-    `INSERT INTO deals
-       (id, org_id, name, company_id, stage, amount, description, source, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'import', ?, ?)`
-  ).bind(
-    dealId, orgId,
-    extracted.name,
+  const result = await recordDealEvidenceSignal({
+    orgId,
     companyId,
-    extracted.stage || 'prospect',
-    extracted.amount || null,
-    extracted.description || null,
-    now, now
-  ).run();
+    sourceType: 'document',
+    sourceId: documentId,
+    sourceTitle: documentTitle || extracted.name,
+    sourceExcerpt: extracted.description || extracted.name,
+    signalKind: 'pitch',
+    fundingStage: extracted.stage || null,
+    amountUsd: extracted.amount || null,
+    confidence: extracted.confidence,
+    evidenceNote: extracted.description || extracted.name,
+  }, env);
 
-  return { created: true, id: dealId };
+  return { created: result.promoted, id: result.dealId || '' };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -752,7 +763,7 @@ export async function processIntelligentImport(
   let dealsCreated = 0;
   for (const deal of extraction.deals) {
     try {
-      const result = await routeDeal(deal, companyLookup, orgId, env);
+      const result = await routeDeal(deal, companyLookup, documentId, file.name, orgId, env);
       if (result.created) { dealsCreated++; await logCreated('deal', result.id); }
     } catch (e: any) {
       errors.push(`Deal "${deal.name}": ${e.message}`);

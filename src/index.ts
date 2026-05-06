@@ -336,6 +336,9 @@ async function routeAuthenticated(
   if (path === '/api/deals/bulk-update' && method === 'POST') {
     return Deals.bulkUpdateDeals(request, ctx, env);
   }
+  if (path === '/api/deals/bulk-decision' && method === 'POST') {
+    return Deals.bulkDecideDeals(request, ctx, env);
+  }
   m = path.match(/^\/api\/deals\/([^/]+)\/associations$/);
   if (m && method === 'GET') return Deals.getDealAssociations(m[1], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/timeline$/);

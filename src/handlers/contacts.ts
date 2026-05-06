@@ -140,7 +140,7 @@ export async function listContacts(
                JOIN deals d ON dc.deal_id = d.id
                WHERE dc.contact_id = c.id
                  AND d.deleted_at IS NULL
-                 AND d.stage NOT IN ('closed_won','closed_lost'))`
+                 AND d.stage != 'closed')`
     );
   }
 

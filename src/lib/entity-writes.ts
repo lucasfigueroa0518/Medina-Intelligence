@@ -94,6 +94,8 @@ const DEAL_WRITABLE = new Set([
   'instrument_type', 'actual_close_date', 'lead_source', 'thesis_fit',
 ]);
 
+const DEAL_STAGE_VALUES = new Set(['new', 'talking', 'due_diligence', 'term_sheet', 'closed']);
+
 // Deal fields whose changes are tracked in source_metadata for the
 // per-field provenance trail. Mirrors the existing updateDeal handler.
 const DEAL_PROVENANCE_FIELDS = [
@@ -849,14 +851,11 @@ export async function createDealRecord(
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
 
-  // Resolve title (default to "<Company> opportunity" when missing).
-  let title = input.title?.trim() || null;
-  if (!title) {
-    const company = await env.D1.prepare(
-      'SELECT name FROM companies WHERE id = ? AND org_id = ?'
-    ).bind(input.company_id, ctx.orgId).first<{ name: string }>();
-    title = `${company?.name || 'Unknown'} opportunity`;
-  }
+  const company = await env.D1.prepare(
+    'SELECT name FROM companies WHERE id = ? AND org_id = ?'
+  ).bind(input.company_id, ctx.orgId).first<{ name: string }>();
+  const title = company?.name || input.title?.trim() || 'Unknown';
+  const stage = input.stage && DEAL_STAGE_VALUES.has(input.stage) ? input.stage : 'talking';
 
   await env.D1.prepare(
     `INSERT INTO deals
@@ -870,7 +869,7 @@ export async function createDealRecord(
     id, ctx.orgId, input.company_id,
     input.owner_id || ctx.userId,
     title,
-    input.stage || 'prospect',
+    stage,
     input.amount ?? null, input.currency || 'USD',
     input.probability ?? 0, input.expected_close ?? null,
     input.notes ?? null, input.valuation ?? null, input.our_allocation ?? null,
@@ -883,7 +882,7 @@ export async function createDealRecord(
   const provenanceSource = ctx.origin === 'marty' ? 'marty' : 'manual';
   const sourceMetadata: Record<string, { source: string; set_by: string; set_at: string }> = {};
   for (const field of DEAL_PROVENANCE_FIELDS) {
-    const val = field === 'stage' ? (input.stage || 'prospect') : (input as any)[field];
+    const val = field === 'stage' ? stage : (input as any)[field];
     if (val != null) {
       sourceMetadata[field] = { source: provenanceSource, set_by: ctx.userId, set_at: now };
     }
@@ -898,7 +897,7 @@ export async function createDealRecord(
     action: 'create',
     entity_type: 'deal',
     entity_id: id,
-    after_data: { id, title, stage: input.stage || 'prospect' },
+    after_data: { id, title, stage },
     metadata: { origin: ctx.origin },
     created_at: now,
   });
@@ -908,7 +907,7 @@ export async function createDealRecord(
     entity_id: id,
     field_name: null,
     action: 'create_entity',
-    after_value: { ...input, title, stage: input.stage || 'prospect' },
+    after_value: { ...input, title, stage },
   });
 
   await invalidateRagCache(ctx.orgId, env);

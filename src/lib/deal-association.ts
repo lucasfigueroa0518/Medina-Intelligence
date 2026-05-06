@@ -137,7 +137,7 @@ export async function propagateContactToOpenDeals(
   const deals = await env.D1.prepare(
     `SELECT id, company_id FROM deals
        WHERE org_id = ? AND company_id = ? AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')`
+         AND stage != 'closed'`
   ).bind(orgId, contact.company_id).all<{ id: string; company_id: string }>();
   if (deals.results.length === 0) return { linked: 0, deal_count: 0 };
 
@@ -233,7 +233,7 @@ export async function findOpenDealForCompany(
   return env.D1.prepare(
     `SELECT id, title FROM deals
        WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won', 'closed_lost')
+         AND stage != 'closed'
        ORDER BY updated_at DESC LIMIT 1`
   ).bind(companyId, orgId).first<{ id: string; title: string }>();
 }
@@ -404,7 +404,7 @@ export async function applyHardSignalsToConversation(
            JOIN companies c ON c.id = d.company_id
           WHERE d.org_id = ?
             AND d.deleted_at IS NULL
-            AND d.stage NOT IN ('closed_won','closed_lost')
+            AND d.stage != 'closed'
           LIMIT 200`
       ).bind(orgId).all<{ id: string; name: string }>();
       for (const d of openDeals.results) {
@@ -463,7 +463,7 @@ export async function applyMeetingHeuristicToEvent(
        FROM deals d
        JOIN deal_contacts dc ON dc.deal_id = d.id
       WHERE d.org_id = ? AND d.deleted_at IS NULL
-        AND d.stage NOT IN ('closed_won','closed_lost')
+        AND d.stage != 'closed'
         AND dc.contact_id IN (${placeholders})
       LIMIT 5`
   ).bind(orgId, ...externalContactIds).all<{ id: string }>();
@@ -618,7 +618,7 @@ export async function findDealsByChannelNameMatch(
        JOIN companies c ON c.id = d.company_id
       WHERE d.org_id = ?
         AND d.deleted_at IS NULL
-        AND d.stage NOT IN ('closed_won','closed_lost')
+        AND d.stage != 'closed'
       LIMIT 200`
   ).bind(orgId).all<{ deal_id: string; company_name: string }>();
 

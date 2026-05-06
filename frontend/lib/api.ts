@@ -200,6 +200,11 @@ export const api = {
       '/deals/bulk-update',
       { method: 'POST', body: JSON.stringify(data) }
     ),
+  bulkDecideDeals: (data: { deal_ids: string[]; decision: 'yes' | 'no' | 'delete' }) =>
+    request<{ ok: boolean; updated_count: number; skipped_ids: string[]; decision: string }>(
+      '/deals/bulk-decision',
+      { method: 'POST', body: JSON.stringify(data) }
+    ),
   getDeal: (id: string) =>
     request<{ deal: any; contacts: { theirs: any[]; ours: any[]; other: any[] }; action_items: any[]; notes: any[]; company: any; users: any[] }>(`/deals/${id}`),
   deleteDeal: (id: string) =>

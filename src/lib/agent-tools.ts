@@ -849,7 +849,7 @@ export async function createDealTool(
     {
       company_id: companyId,
       title: input.title,
-      stage: input.stage || 'prospect',
+      stage: input.stage || 'talking',
       amount: input.amount ?? null,
       valuation: input.valuation ?? null,
       notes: input.description || null,

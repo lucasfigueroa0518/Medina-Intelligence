@@ -10,6 +10,7 @@ ALTER TABLE deals ADD COLUMN deal_memo_r2_key TEXT;
 ALTER TABLE deals ADD COLUMN last_activity_date TEXT;
 ALTER TABLE deals ADD COLUMN stage_changed_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 ALTER TABLE deals ADD COLUMN days_in_stage INTEGER DEFAULT 0;
+ALTER TABLE deals ADD COLUMN source_metadata TEXT DEFAULT '{}';
 
 CREATE TABLE deal_contacts (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),

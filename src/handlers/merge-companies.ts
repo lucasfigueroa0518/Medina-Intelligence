@@ -82,14 +82,14 @@ export async function handleMergeCompanies(
        WHERE org_id = ?
          AND company_id IN (?, ?)
          AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')
+         AND stage != 'closed'
        GROUP BY company_id HAVING COUNT(*) >= 1
        LIMIT 2`
   ).bind(ctx.orgId, loser.id, survivor.id).all<{ '1': number }>();
   if (openDealConflict.results.length > 1) {
     return errorResponse(
       'OPEN_DEAL_CONFLICT', 409,
-      `Both companies have open deals. Close one side (closed_won or closed_lost) before merging, or run /api/admin/dedup-deals first.`
+      `Both companies have open deals. Close one side before merging, or run /api/admin/dedup-deals first.`
     );
   }
 
