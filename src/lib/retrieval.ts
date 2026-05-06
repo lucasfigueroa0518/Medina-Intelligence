@@ -262,9 +262,11 @@ function inferTimeIntent(query: string): EvidencePlan['time_intent'] {
   if (/\b\d{4}-\d{2}-\d{2}\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b|\bq[1-4]\b/i.test(query)) {
     return 'specific_date';
   }
+  if (/\b(history|historical|previous|earlier|old|older)\b/.test(lower)) return 'historical';
   if (/\b(latest|newest|most recent|last call|last meeting|current|currently)\b/.test(lower)) return 'latest';
   if (/\b(recent|recently|today|yesterday|this week|last week|past)\b/.test(lower)) return 'recent';
-  if (/\b(history|historical|previous|earlier|old|older)\b/.test(lower)) return 'historical';
+  if (/\b(status|update|progress|blocker|blocked|next step|next steps|timeline|where are we|where is|what's going on|whats going on)\b/.test(lower)) return 'recent';
+  if (/\bthe\b.{0,80}\b(call|meeting|discussion|readout)\b/.test(lower)) return 'latest';
   return 'unspecified';
 }
 
@@ -1115,6 +1117,8 @@ const RECENCY_REGEXES: RegExp[] = [
 ];
 
 function detectsRecencyIntent(query: string): boolean {
+  const timeIntent = inferTimeIntent(query);
+  if (timeIntent === 'latest' || timeIntent === 'recent') return true;
   const lower = query.toLowerCase();
   return RECENCY_REGEXES.some(re => re.test(lower));
 }
@@ -1236,6 +1240,7 @@ export async function crossEncoderRerank(
       }
     }
 
+    const timeIntent = inferTimeIntent(query);
     const recencyOn = detectsRecencyIntent(query);
     const scored = chunks.map((c, i) => {
       const baseScore = scoreById.get(i) ?? 0;
@@ -1304,6 +1309,7 @@ export async function crossEncoderRerank(
       reason: 'scored',
       reranker_enabled: true,
       recency_on: recencyOn,
+      time_intent: timeIntent,
       input_count: chunks.length,
       input_doc_type_counts: countByDocType(chunks),
       scores_count: scoresArr.length,
