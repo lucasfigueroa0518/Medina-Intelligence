@@ -122,33 +122,25 @@ crons = [
 
 # --- Queues ---
 #
-# Audit queue: pipelines is producer + consumer (per dispatch
-# decision: audit consumer MOVES to pipelines). api keeps its
-# producer binding so it continues to emit user-request audit
-# events; api removes its consumer in the second deploy.
+# Phase 8 (2026-05-06) deploy-time finding: CF Queues allow ONLY ONE
+# CONSUMER per queue. api Worker is currently registered as the
+# consumer of audit-log-queue + audit-log-dlq. Attempting to register
+# pipelines as a second consumer fails with [code: 11004]: "Queue
+# 'audit-log-queue' already has a consumer". Same constraint applies
+# to webhook-intake-queue (already deferred to Stage 4 / Session B).
 #
-# Webhook queue: pipelines does NOT register webhook-intake-queue
-# producer or consumer in this session. Webhook intake stays on api
-# until Session B's Stage 4. api keeps both producer + consumer
-# until then.
+# Per Lucas's Option B decision (2026-05-06 dispatch): drop audit
+# queue consumer migration from this session. Audit consumer stays
+# on api as user-facing-Worker telemetry sink. Audit migration becomes
+# its own future workstream (clean two-deploy chain: api strip →
+# pipelines add).
+#
+# Pipelines therefore declares ZERO queue producers + consumers in
+# this session. After Phase 8 ships, a follow-up workstream will
+# move audit consumer in two deploys: (1) api redeploy strips audit
+# consumer; (2) pipelines redeploy adds audit consumer.
+#
+# Webhook queue: same constraint, already deferred to Stage 4
+# (Session B) for external service URL coordination.
 
-[[queues.producers]]
-queue = "audit-log-queue"
-binding = "AUDIT_QUEUE"
-
-[[queues.consumers]]
-queue = "audit-log-queue"
-max_batch_size = 50
-max_batch_timeout = 10
-max_retries = 3
-dead_letter_queue = "audit-log-dlq"
-
-[[queues.producers]]
-queue = "audit-log-dlq"
-binding = "AUDIT_DLQ"
-
-[[queues.consumers]]
-queue = "audit-log-dlq"
-max_batch_size = 25
-max_batch_timeout = 30
-max_retries = 1
+# (audit + webhook queue declarations intentionally absent — see comment above)
