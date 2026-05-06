@@ -279,6 +279,9 @@ const ENTITY_MATCH_STOP_WORDS = new Set([
   'tell', 'me', 'status', 'update', 'call', 'meeting', 'pitch', 'deal',
 ]);
 
+const MAX_AMBIGUOUS_CONTACT_NAME_TOKEN_MATCHES = 10;
+const STRONG_ENTITY_ANCHOR_SCORE = 0.75;
+
 function normalizeEntityText(text: string | null | undefined): string {
   return String(text || '')
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
@@ -320,6 +323,24 @@ function entityNameMatchesQuery(
   const compact = compactEntityText(name);
   if (!normalized || !compact) return false;
   return queryNormalized.includes(normalized) || queryCompact.includes(compact);
+}
+
+function hasEntityNameSignal(reasons: string[]): boolean {
+  return reasons.some(reason =>
+    reason === 'exact_or_normalized_name' ||
+    reason === 'multi_token_name_match' ||
+    reason === 'unique_single_name_token' ||
+    reason === 'ambiguous_name_token' ||
+    reason === 'email' ||
+    reason === 'domain'
+  );
+}
+
+function hasContextualEntitySignal(reasons: string[]): boolean {
+  return hasEntityNameSignal(reasons) ||
+    reasons.includes('company_name') ||
+    reasons.includes('job_title') ||
+    reasons.includes('sector');
 }
 
 function buildEvidencePlan(
@@ -558,9 +579,9 @@ export async function preprocessQuery(
           if (tokenCount === 1) {
             score += 0.55;
             reasons.push('unique_single_name_token');
-          } else if (nameTokens[0] === token && tokenCount <= 4) {
-            score += 0.35;
-            reasons.push('ambiguous_first_name_token');
+          } else if (nameTokens.includes(token) && tokenCount <= MAX_AMBIGUOUS_CONTACT_NAME_TOKEN_MATCHES) {
+            score += 0.55;
+            reasons.push('ambiguous_name_token');
           }
         }
         if (c.email && queryLower.includes(c.email.toLowerCase())) score += 0.8;
@@ -642,8 +663,15 @@ export async function preprocessQuery(
         return b.interactions - a.interactions;
       });
 
+      const hasStrongNameAnchor = scored.some(s =>
+        s.score >= STRONG_ENTITY_ANCHOR_SCORE && hasEntityNameSignal(s.reasons)
+      );
+      const selectable = hasStrongNameAnchor
+        ? scored.filter(s => hasContextualEntitySignal(s.reasons))
+        : scored;
+
       const selected: string[] = [];
-      for (const s of scored) {
+      for (const s of selectable) {
         if (selected.length >= maxEntities) break;
         if (!selected.includes(s.id)) selected.push(s.id);
         if (
@@ -660,6 +688,7 @@ export async function preprocessQuery(
       retrievalLog('anchors', {
         query: query.slice(0, 80),
         selected_entity_ids: entityIds,
+        selectable_count: selectable.length,
         top_candidates: scored.slice(0, 8).map(s => ({
           id: s.id,
           type: s.type,
