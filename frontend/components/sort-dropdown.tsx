@@ -34,16 +34,18 @@ export function SortDropdown({ options, value, dir, onChange }: SortDropdownProp
   const active = options.find(o => o.key === value) ?? options[0];
 
   return (
-    <div className="relative" ref={ref}>
+    <div className="relative shrink-0" ref={ref}>
       <button
         type="button"
         onClick={() => setOpen(o => !o)}
-        className="flex items-center gap-2 h-9 px-3 rounded-lg border border-border text-sm text-text-secondary hover:text-text-primary hover:border-border-hover transition-colors bg-bg-inset"
+        className="flex h-10 max-w-[320px] items-center gap-2 whitespace-nowrap rounded-lg border border-border bg-bg-inset px-3 text-sm text-text-secondary transition-colors hover:border-border-hover hover:text-text-primary"
       >
-        <ArrowUpDown size={14} className="text-text-muted" />
-        <span className="text-text-muted">Sort:</span>
-        <span className="text-text-primary">{active.label}</span>
-        {dir === 'asc' ? <ArrowUp size={12} /> : <ArrowDown size={12} />}
+        <ArrowUpDown size={14} className="shrink-0 text-text-muted" />
+        <span className="shrink-0 text-text-muted">Sort:</span>
+        <span className="min-w-0 max-w-[13rem] truncate text-text-primary">{active.label}</span>
+        {dir === 'asc'
+          ? <ArrowUp size={12} className="shrink-0" />
+          : <ArrowDown size={12} className="shrink-0" />}
       </button>
       {open && (
         <div

@@ -485,14 +485,14 @@ function CompaniesPage() {
             </div>
           }
           actions={
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               <SortDropdown
                 options={SORT_OPTIONS}
                 value={filters.sort}
                 dir={filters.order}
                 onChange={(key, dir) => setFilters(f => ({ ...f, sort: key, order: dir }))}
               />
-              <button className="btn-primary flex items-center gap-2" onClick={() => setCreateOpen(true)}>
+              <button className="btn-primary flex h-10 shrink-0 items-center gap-2 whitespace-nowrap" onClick={() => setCreateOpen(true)}>
                 <Plus size={16} /> Add Company
               </button>
             </div>
