@@ -309,8 +309,6 @@ const SYNC_OPTIONS = [
   { value: 30, label: 'Last 30 days (recommended)' },
   { value: 90, label: 'Last 90 days' },
   { value: 180, label: 'Last 6 months' },
-  { value: 365, label: 'Last year' },
-  { value: 0, label: 'All time' },
 ];
 
 function FirstConnectModal({ onComplete, onSkip }: { onComplete: (days: number) => void; onSkip: () => void }) {
