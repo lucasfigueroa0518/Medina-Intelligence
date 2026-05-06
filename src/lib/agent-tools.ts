@@ -339,6 +339,32 @@ export async function searchDeals(
 // document_type-filtered queries, the broad query still returns chunks
 // whose D1 source is 'slack' / 'firefly' etc., and the post-hydration
 // filter rescues them. (Audit 2026-05-05 surfaced this drift class.)
+function recallLog(stage: string, payload: Record<string, unknown>): void {
+  try {
+    console.log(`[recall:${stage}] ${JSON.stringify(payload)}`);
+  } catch {
+    console.log(`[recall:${stage}] {"telemetry_error":"json_stringify_failed"}`);
+  }
+}
+
+function countRecallDocTypes(chunks: Array<{ metadata?: Record<string, any> }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const chunk of chunks) {
+    const docType = String(chunk.metadata?.document_type || 'unknown');
+    counts[docType] = (counts[docType] || 0) + 1;
+  }
+  return counts;
+}
+
+function countRecallSourceTypes(sources: Array<{ type?: string }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const source of sources) {
+    const type = String(source.type || 'unknown');
+    counts[type] = (counts[type] || 0) + 1;
+  }
+  return counts;
+}
+
 export async function recall(
   ctx: AuthContext,
   input: {
@@ -388,6 +414,13 @@ export async function recall(
     .map(t => SOURCE_TYPE_TO_DOC_TYPE[t])
     .filter((dt): dt is string => Boolean(dt));
 
+  recallLog('start', {
+    query: input.query.slice(0, 80),
+    source_types: input.source_types || null,
+    force_doc_types: forceDocTypes,
+    limit: input.limit ?? null,
+  });
+
   const pq = await preprocessQuery(input.query, session, env, {});
   const result = await retrieveContext(pq, env, {
     forceDocTypes: forceDocTypes.length > 0 ? forceDocTypes : undefined,
@@ -415,6 +448,20 @@ export async function recall(
 
   const limit = Math.min(Math.max(input.limit ?? 20, 1), 50);
   const trimmed = filtered.slice(0, limit);
+  recallLog('result', {
+    query: input.query.slice(0, 80),
+    source_types: input.source_types || null,
+    force_doc_types: forceDocTypes,
+    internal_count: result.internal.length,
+    internal_doc_type_counts: countRecallDocTypes(result.internal),
+    news_count: result.news.length,
+    sources_before_filter_count: sources.length,
+    source_type_counts_before_filter: countRecallSourceTypes(sources),
+    sources_after_filter_count: filtered.length,
+    source_type_counts_after_filter: countRecallSourceTypes(filtered),
+    trimmed_count: trimmed.length,
+    limit,
+  });
 
   return {
     count: trimmed.length,

@@ -54,6 +54,84 @@ function detectDocTypes(query: string): string[] {
   return matched;
 }
 
+function hashFirstFiveDims(embedding: number[]): string {
+  const firstFive = embedding
+    .slice(0, 5)
+    .map(v => (Number.isFinite(v) ? v.toFixed(6) : String(v)))
+    .join('|');
+
+  let hash = 2166136261;
+  for (let i = 0; i < firstFive.length; i++) {
+    hash ^= firstFive.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function retrievalLog(stage: string, payload: Record<string, unknown>): void {
+  try {
+    console.log(`[retrieve:${stage}] ${JSON.stringify(payload)}`);
+  } catch {
+    console.log(`[retrieve:${stage}] {"telemetry_error":"json_stringify_failed"}`);
+  }
+}
+
+function countByDocType(chunks: Array<{ metadata?: Record<string, any> }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const chunk of chunks) {
+    const docType = String(chunk.metadata?.document_type || 'unknown');
+    counts[docType] = (counts[docType] || 0) + 1;
+  }
+  return counts;
+}
+
+function countTargetedIds(
+  chunks: Array<{ id?: unknown }>,
+  targetedIds?: Set<string>
+): number {
+  if (!targetedIds || targetedIds.size === 0) return 0;
+  return chunks.filter(chunk => targetedIds.has(chunk.id as string)).length;
+}
+
+function targetedMembershipSample(
+  chunks: Array<{ id?: unknown }>,
+  targetedIds?: Set<string>
+): Record<string, unknown> {
+  const targetedIdSample = targetedIds && targetedIds.size > 0
+    ? [...targetedIds][0]
+    : undefined;
+  const hydratedTargetSample = targetedIdSample === undefined
+    ? undefined
+    : chunks.find(chunk =>
+        [...targetedIds!].some(targetedId => String(targetedId) === String(chunk.id))
+      );
+
+  return {
+    targeted_id_type: typeof targetedIdSample,
+    hydrated_target_id_type: typeof hydratedTargetSample?.id,
+    targeted_id_sample: targetedIdSample || null,
+    hydrated_target_id_sample: hydratedTargetSample?.id || null,
+    targeted_string_match_found: !!hydratedTargetSample,
+    sample_set_has: hydratedTargetSample ? targetedIds!.has(hydratedTargetSample.id as string) : null,
+  };
+}
+
+function summarizeMatches(
+  matches: VectorMatch[],
+  duplicateSet?: Set<string>,
+  limit = 5
+): Array<Record<string, unknown>> {
+  return matches.slice(0, limit).map(m => ({
+    id: m.id,
+    id_type: typeof m.id,
+    score: m.score,
+    document_type: m.metadata.document_type,
+    source_table: m.metadata.source_table,
+    source_id: m.metadata.source_id,
+    duplicate: duplicateSet ? duplicateSet.has(m.id) : undefined,
+  }));
+}
+
 export async function preprocessQuery(
   query: string,
   session: AgentSession,
@@ -281,6 +359,8 @@ export async function retrieveContext(
   const hydrateLimit = options.deepDive ? 50 : (aggregation ? 30 : 20);
 
   let internalMatches: VectorMatch[];
+  let broadRawMatches: VectorMatch[] = [];
+  let entityRawMatches: VectorMatch[] = [];
 
   if (pq.entityIds.length > 0) {
     const [entityResults, broadResults] = await Promise.all([
@@ -301,6 +381,8 @@ export async function retrieveContext(
         returnMetadata: 'all',
       }),
     ]);
+    entityRawMatches = entityResults.flatMap(r => (r.matches || []) as VectorMatch[]);
+    broadRawMatches = (broadResults.matches || []) as VectorMatch[];
 
     const seen = new Set<string>();
     internalMatches = [];
@@ -326,7 +408,25 @@ export async function retrieveContext(
       returnMetadata: 'all',
     });
     internalMatches = (result.matches || []) as VectorMatch[];
+    broadRawMatches = internalMatches;
   }
+
+  retrievalLog('broad', {
+    query: pq.originalQuery.slice(0, 80),
+    query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+    entity_ids: pq.entityIds,
+    deep_dive: !!options.deepDive,
+    aggregation,
+    broad_top_k: broadTopK,
+    hydrate_limit: hydrateLimit,
+    entity_raw_count: entityRawMatches.length,
+    entity_raw_doc_type_counts: countByDocType(entityRawMatches),
+    broad_raw_count: broadRawMatches.length,
+    broad_raw_doc_type_counts: countByDocType(broadRawMatches),
+    internal_after_broad_count: internalMatches.length,
+    internal_after_broad_doc_type_counts: countByDocType(internalMatches),
+    broad_top: summarizeMatches(broadRawMatches),
+  });
 
   // Doc-type-aware secondary queries: if the query mentions specific
   // document types, run targeted filtered queries and merge results.
@@ -350,6 +450,7 @@ export async function retrieveContext(
     : detectDocTypes(pq.originalQuery);
   if (docTypes.length > 0) {
     const seen = new Set(internalMatches.map(m => m.id));
+    const seenBeforeTargeted = new Set(seen);
     const docResults = await Promise.all(
       docTypes.map(dt =>
         env.VECTORIZE.query(pq.embeddedQuery, {
@@ -360,15 +461,54 @@ export async function retrieveContext(
         })
       )
     );
-    for (const r of docResults) {
-      for (const m of (r.matches || []) as VectorMatch[]) {
+    const targetedRawMatches: VectorMatch[] = [];
+    const targetedByDocType = docTypes.map((dt, idx) => {
+      const matches = (docResults[idx]?.matches || []) as VectorMatch[];
+      targetedRawMatches.push(...matches);
+      return {
+        doc_type: dt,
+        raw_count: matches.length,
+        duplicate_count: matches.filter(m => seenBeforeTargeted.has(m.id)).length,
+        top: summarizeMatches(matches, seenBeforeTargeted),
+      };
+    });
+    let targetedAddedCount = 0;
+    for (const matches of docResults.map(r => (r.matches || []) as VectorMatch[])) {
+      for (const m of matches) {
         if (!seen.has(m.id)) {
           seen.add(m.id);
           internalMatches.push(m);
           targetedIds.add(m.id);
+          targetedAddedCount++;
         }
       }
     }
+    retrievalLog('targeted', {
+      query: pq.originalQuery.slice(0, 80),
+      query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+      doc_types: docTypes,
+      force_doc_types: options.forceDocTypes || null,
+      pre_targeted_internal_count: seenBeforeTargeted.size,
+      targeted_raw_count: targetedRawMatches.length,
+      targeted_raw_doc_type_counts: countByDocType(targetedRawMatches),
+      targeted_duplicate_count: targetedRawMatches.filter(m => seenBeforeTargeted.has(m.id)).length,
+      targeted_added_count: targetedAddedCount,
+      targeted_ids_count: targetedIds.size,
+      internal_after_targeted_count: internalMatches.length,
+      internal_after_targeted_doc_type_counts: countByDocType(internalMatches),
+      targeted_by_doc_type: targetedByDocType,
+    });
+  } else {
+    retrievalLog('targeted', {
+      query: pq.originalQuery.slice(0, 80),
+      query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+      doc_types: [],
+      force_doc_types: options.forceDocTypes || null,
+      targeted_raw_count: 0,
+      targeted_duplicate_count: 0,
+      targeted_added_count: 0,
+      targeted_ids_count: 0,
+    });
   }
 
   if (options.deepDive && pq.entityIds.length > 0) {
@@ -403,7 +543,36 @@ export async function retrieveContext(
     .filter(pq.postRetrievalFilter)
     .filter(m => m.score >= 0.55 || targetedIds.has(m.id));
 
-  const { chunks: hydrated } = await hydrateChunks(filtered.slice(0, hydrateLimit), env);
+  const hydrateCandidates = filtered.slice(0, hydrateLimit);
+  retrievalLog('filter', {
+    query: pq.originalQuery.slice(0, 80),
+    query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+    internal_count: internalMatches.length,
+    internal_doc_type_counts: countByDocType(internalMatches),
+    targeted_ids_count: targetedIds.size,
+    filtered_count: filtered.length,
+    filtered_doc_type_counts: countByDocType(filtered),
+    targeted_survived_filter_count: countTargetedIds(filtered, targetedIds),
+    hydrate_limit: hydrateLimit,
+    hydrate_candidate_count: hydrateCandidates.length,
+    hydrate_candidate_doc_type_counts: countByDocType(hydrateCandidates),
+    targeted_in_hydrate_slice_count: countTargetedIds(hydrateCandidates, targetedIds),
+  });
+
+  const { chunks: hydrated, summary: hydrationSummary } = await hydrateChunks(hydrateCandidates, env);
+  const targetedIdSample = [...targetedIds][0];
+  const hydratedTargetSample = hydrated.find(c => targetedIds.has(c.id));
+  retrievalLog('hydration', {
+    query: pq.originalQuery.slice(0, 80),
+    query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+    hydration_summary: hydrationSummary,
+    hydrated_count: hydrated.length,
+    hydrated_doc_type_counts: countByDocType(hydrated),
+    hydrated_targeted_count: countTargetedIds(hydrated, targetedIds),
+    targeted_id_type: typeof targetedIdSample,
+    hydrated_target_id_type: typeof hydratedTargetSample?.id,
+    sample_set_has: hydratedTargetSample ? targetedIds.has(hydratedTargetSample.id) : null,
+  });
   let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env, targetedIds);
 
   const rerankedLimit = options.deepDive ? 20 : 10;
@@ -422,6 +591,15 @@ export async function retrieveContext(
   } else {
     reranked = reranked.slice(0, rerankedLimit);
   }
+
+  retrievalLog('post-rerank', {
+    query: pq.originalQuery.slice(0, 80),
+    query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+    reranked_limit: rerankedLimit,
+    reranked_count: reranked.length,
+    reranked_doc_type_counts: countByDocType(reranked),
+    reranked_targeted_count: countTargetedIds(reranked, targetedIds),
+  });
 
   const newsResult = await env.VECTORIZE.query(pq.embeddedQuery, {
     topK: 10,
@@ -517,10 +695,38 @@ export async function crossEncoderRerank(
   // Pass undefined / empty Set when caller wants pre-2026-05-05 behavior.
   targetedIds?: Set<string>
 ): Promise<HydratedChunk[]> {
-  if (chunks.length <= 3) return chunks;
+  if (chunks.length <= 3) {
+    retrievalLog('rerank', {
+      query: query.slice(0, 80),
+      reason: 'small_candidate_set',
+      input_count: chunks.length,
+      input_doc_type_counts: countByDocType(chunks),
+      targeted_ids_count: targetedIds?.size || 0,
+      final_count: chunks.length,
+      final_doc_type_counts: countByDocType(chunks),
+      final_targeted_count: countTargetedIds(chunks, targetedIds),
+      ...targetedMembershipSample(chunks, targetedIds),
+    });
+    return chunks;
+  }
 
   const settings = await getOrgSettings(orgId, env);
-  if (!settings.reranker_enabled) return chunks.slice(0, 10);
+  if (!settings.reranker_enabled) {
+    const finalChunks = chunks.slice(0, 10);
+    retrievalLog('rerank', {
+      query: query.slice(0, 80),
+      reason: 'disabled',
+      reranker_enabled: false,
+      input_count: chunks.length,
+      input_doc_type_counts: countByDocType(chunks),
+      targeted_ids_count: targetedIds?.size || 0,
+      final_count: finalChunks.length,
+      final_doc_type_counts: countByDocType(finalChunks),
+      final_targeted_count: countTargetedIds(finalChunks, targetedIds),
+      ...targetedMembershipSample(chunks, targetedIds),
+    });
+    return finalChunks;
+  }
 
   try {
     // BGE reranker accepts up to ~16K tokens of context combined; cap each
@@ -541,7 +747,20 @@ export async function crossEncoderRerank(
 
     if (scoresArr.length === 0) {
       // Defensive: model returned nothing usable. Fall back.
-      return chunks.slice(0, 10);
+      const finalChunks = chunks.slice(0, 10);
+      retrievalLog('rerank', {
+        query: query.slice(0, 80),
+        reason: 'empty_scores',
+        reranker_enabled: true,
+        input_count: chunks.length,
+        input_doc_type_counts: countByDocType(chunks),
+        targeted_ids_count: targetedIds?.size || 0,
+        final_count: finalChunks.length,
+        final_doc_type_counts: countByDocType(finalChunks),
+        final_targeted_count: countTargetedIds(finalChunks, targetedIds),
+        ...targetedMembershipSample(chunks, targetedIds),
+      });
+      return finalChunks;
     }
 
     const scoreById = new Map<number, number>();
@@ -614,10 +833,41 @@ export async function crossEncoderRerank(
       finalChunks = broadFloored.slice(0, TOTAL_SLOTS).map(x => x.chunk);
     }
 
+    retrievalLog('rerank', {
+      query: query.slice(0, 80),
+      reason: 'scored',
+      reranker_enabled: true,
+      recency_on: recencyOn,
+      input_count: chunks.length,
+      input_doc_type_counts: countByDocType(chunks),
+      scores_count: scoresArr.length,
+      targeted_ids_count: targetedIds?.size || 0,
+      targeted_scored_count: targeted.length,
+      broad_scored_count: broad.length,
+      broad_floored_count: broadFloored.length,
+      final_count: finalChunks.length,
+      final_doc_type_counts: countByDocType(finalChunks),
+      final_targeted_count: countTargetedIds(finalChunks, targetedIds),
+      hydrated_id_type_sample: typeof chunks[0]?.id,
+      ...targetedMembershipSample(chunks, targetedIds),
+    });
     return finalChunks;
   } catch (e) {
     console.error('[rerank] BGE reranker fallback:', e);
-    return chunks.slice(0, 10);
+    const finalChunks = chunks.slice(0, 10);
+    retrievalLog('rerank', {
+      query: query.slice(0, 80),
+      reason: 'fallback',
+      error: e instanceof Error ? e.message : String(e),
+      input_count: chunks.length,
+      input_doc_type_counts: countByDocType(chunks),
+      targeted_ids_count: targetedIds?.size || 0,
+      final_count: finalChunks.length,
+      final_doc_type_counts: countByDocType(finalChunks),
+      final_targeted_count: countTargetedIds(finalChunks, targetedIds),
+      ...targetedMembershipSample(chunks, targetedIds),
+    });
+    return finalChunks;
   }
 }
 
@@ -632,4 +882,3 @@ export const TOKEN_BUDGET = {
   query: 1000,
   buffer: 4000,
 };
-

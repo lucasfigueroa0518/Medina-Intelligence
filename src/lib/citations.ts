@@ -487,6 +487,31 @@ function detectIntendedSourceTypes(query: string): Set<CitationSourceType> {
   return intended;
 }
 
+function sourceLog(stage: string, payload: Record<string, unknown>): void {
+  try {
+    console.log(`[sources:${stage}] ${JSON.stringify(payload)}`);
+  } catch {
+    console.log(`[sources:${stage}] {"telemetry_error":"json_stringify_failed"}`);
+  }
+}
+
+function countChunksByDocType(chunks: HydratedChunk[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const chunk of chunks) {
+    const docType = String(chunk.metadata.document_type || 'unknown');
+    counts[docType] = (counts[docType] || 0) + 1;
+  }
+  return counts;
+}
+
+function countSourcesByType(sources: CitationSource[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const source of sources) {
+    counts[source.type] = (counts[source.type] || 0) + 1;
+  }
+  return counts;
+}
+
 export async function buildSourcesAndContext(
   internal: HydratedChunk[],
   news: HydratedChunk[],
@@ -513,6 +538,15 @@ export async function buildSourcesAndContext(
   }
 
   const sources = await hydrateSources(refs, orgId, env);
+  sourceLog('assemble', {
+    query: query?.slice(0, 80) || null,
+    internal_chunk_count: internal.length,
+    news_chunk_count: news.length,
+    input_chunk_doc_type_counts: countChunksByDocType([...internal, ...news]),
+    unique_sources_count: sources.length,
+    ordered_chunks_count: orderedChunks.length,
+    source_type_counts: countSourcesByType(sources),
+  });
 
   // SOURCES list at the top of the context — Claude reads this as the lookup
   // table for [^N] markers.
