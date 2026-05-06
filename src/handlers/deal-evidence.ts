@@ -65,10 +65,11 @@ export async function getDealEvidenceCandidates(
 
   if (type === 'conversation' || type === 'all') {
     const rows = await env.D1.prepare(
-      `SELECT conv.id, conv.subject, conv.sent_at, conv.from_email, conv.from_name,
+      `SELECT conv.id, conv.subject, conv.sent_at, conv.from_email, fc.full_name AS from_name,
               conv.body_preview, conv.source AS conv_source, conv.participant_user_ids,
               conv.is_campaign_email
          FROM conversations conv
+         LEFT JOIN contacts fc ON conv.from_contact_id = fc.id AND fc.deleted_at IS NULL
          LEFT JOIN conversation_deals cd
            ON cd.conversation_id = conv.id AND cd.deal_id = ?
         WHERE conv.org_id = ?
@@ -204,11 +205,12 @@ export async function getDealEvidence(
   const convRows = await env.D1.prepare(
     `SELECT cd.conversation_id AS id, cd.source, cd.confidence, cd.created_at AS linked_at,
             cd.created_by, cu.full_name AS created_by_name,
-            conv.subject, conv.sent_at, conv.from_email, conv.from_name,
+            conv.subject, conv.sent_at, conv.from_email, fc.full_name AS from_name,
             conv.body_preview, conv.source AS conv_source,
             conv.participant_user_ids, conv.is_campaign_email
        FROM conversation_deals cd
        JOIN conversations conv ON conv.id = cd.conversation_id
+       LEFT JOIN contacts fc ON conv.from_contact_id = fc.id AND fc.deleted_at IS NULL
        LEFT JOIN users cu ON cu.id = cd.created_by
       WHERE cd.deal_id = ? AND conv.org_id = ?
       ORDER BY conv.sent_at DESC`

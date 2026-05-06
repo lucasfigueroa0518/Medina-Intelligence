@@ -442,9 +442,11 @@ async function resolveDealOrigin(
 
   if (origin.source_kind === 'conversation' && origin.source_communication_id) {
     const conv = await env.D1.prepare(
-      `SELECT subject, sent_at, from_email, from_name, source, participant_user_ids, is_campaign_email
-         FROM conversations
-        WHERE id = ? AND org_id = ?`
+      `SELECT conv.subject, conv.sent_at, conv.from_email, fc.full_name AS from_name,
+              conv.source, conv.participant_user_ids, conv.is_campaign_email
+         FROM conversations conv
+         LEFT JOIN contacts fc ON conv.from_contact_id = fc.id AND fc.deleted_at IS NULL
+        WHERE conv.id = ? AND conv.org_id = ?`
     ).bind(origin.source_communication_id, ctx.orgId).first<any>();
     if (conv) {
       const sharingFlags = await getSharingFlags(ctx.orgId, env);
