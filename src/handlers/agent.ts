@@ -529,7 +529,13 @@ async function executeTool(
     case 'search_companies': return searchCompanies(ctx, toolInput, env);
     case 'search_deals': return searchDeals(ctx, toolInput, env);
     case 'search_conversations': return searchConversations(ctx, toolInput, env);
-    case 'recall': return recall(ctx, toolInput, env);
+    case 'recall':
+      console.log(`[agent:tool:recall] ${JSON.stringify({
+        query: typeof toolInput?.query === 'string' ? toolInput.query.slice(0, 80) : null,
+        source_types: Array.isArray(toolInput?.source_types) ? toolInput.source_types : null,
+        limit: typeof toolInput?.limit === 'number' ? toolInput.limit : null,
+      })}`);
+      return recall(ctx, toolInput, env);
     case 'get_contact_detail': return getContactDetail(ctx, toolInput.contact_id, env);
     case 'get_company_detail': return getCompanyDetail(ctx, toolInput.company_id, env);
     case 'get_deal_detail': return getDealDetail(ctx, toolInput.deal_id, env);
