@@ -272,6 +272,56 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
 }
 
+const ENTITY_MATCH_STOP_WORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of',
+  'with', 'by', 'from', 'about', 'this', 'that', 'these', 'those', 'what',
+  'whats', "what's", 'who', 'where', 'when', 'how', 'is', 'are', 'was', 'were',
+  'tell', 'me', 'status', 'update', 'call', 'meeting', 'pitch', 'deal',
+]);
+
+function normalizeEntityText(text: string | null | undefined): string {
+  return String(text || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function compactEntityText(text: string | null | undefined): string {
+  return normalizeEntityText(text).replace(/\s+/g, '');
+}
+
+function tokenizeEntityText(text: string | null | undefined): string[] {
+  return normalizeEntityText(text)
+    .split(/\s+/)
+    .filter(token => token.length > 1 && !ENTITY_MATCH_STOP_WORDS.has(token));
+}
+
+function countNameTokens<T>(items: T[], getName: (item: T) => string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    for (const token of new Set(tokenizeEntityText(getName(item)))) {
+      counts.set(token, (counts.get(token) || 0) + 1);
+    }
+  }
+  return counts;
+}
+
+function entityNameMatchesQuery(
+  name: string,
+  queryNormalized: string,
+  queryCompact: string
+): boolean {
+  const tokens = tokenizeEntityText(name);
+  if (tokens.length === 0) return false;
+  const normalized = normalizeEntityText(name);
+  const compact = compactEntityText(name);
+  if (!normalized || !compact) return false;
+  return queryNormalized.includes(normalized) || queryCompact.includes(compact);
+}
+
 function buildEvidencePlan(
   query: string,
   anchors: EvidenceAnchor[],
@@ -471,46 +521,118 @@ export async function preprocessQuery(
   } else {
     try {
       const index = await getEntityIndex(session.org_id, env);
-      type ScoredEntity = { id: string; score: number; interactions: number; recency: number };
+      type ScoredEntity = {
+        id: string;
+        type: 'contact' | 'company';
+        name: string;
+        score: number;
+        interactions: number;
+        recency: number;
+        companyId?: string | null;
+        reasons: string[];
+      };
       const scored: ScoredEntity[] = [];
+      const queryNormalized = normalizeEntityText(query);
+      const queryCompact = compactEntityText(query);
+      const queryTokens = new Set(tokenizeEntityText(query));
+      const contactTokenCounts = countNameTokens(index.contacts, c => c.full_name);
+      const companyTokenCounts = countNameTokens(index.companies, c => c.name);
+      const hasExactContactNameMatch = index.contacts.some(c =>
+        entityNameMatchesQuery(c.full_name, queryNormalized, queryCompact)
+      );
 
       for (const c of index.contacts) {
         let score = 0;
-        const nameLower = c.full_name.toLowerCase();
-        if (queryLower.includes(nameLower)) score += 1.0;
-        else if (nameLower.split(' ').some(part => part.length > 2 && queryLower.includes(part))) score += 0.4;
+        const reasons: string[] = [];
+        const nameTokens = tokenizeEntityText(c.full_name);
+        const matchedNameTokens = nameTokens.filter(token => queryTokens.has(token));
+        if (entityNameMatchesQuery(c.full_name, queryNormalized, queryCompact)) {
+          score += 1.2;
+          reasons.push('exact_or_normalized_name');
+        } else if (matchedNameTokens.length >= 2) {
+          score += 0.75;
+          reasons.push('multi_token_name_match');
+        } else if (matchedNameTokens.length === 1 && !hasExactContactNameMatch) {
+          const token = matchedNameTokens[0];
+          const tokenCount = contactTokenCounts.get(token) || 0;
+          if (tokenCount === 1) {
+            score += 0.55;
+            reasons.push('unique_single_name_token');
+          } else if (nameTokens[0] === token && tokenCount <= 4) {
+            score += 0.35;
+            reasons.push('ambiguous_first_name_token');
+          }
+        }
         if (c.email && queryLower.includes(c.email.toLowerCase())) score += 0.8;
-        if (c.company_name && queryLower.includes(c.company_name.toLowerCase())) score += 0.3;
+        if (c.email && queryLower.includes(c.email.toLowerCase())) reasons.push('email');
+        if (c.company_name && entityNameMatchesQuery(c.company_name, queryNormalized, queryCompact)) {
+          score += 0.3;
+          reasons.push('company_name');
+        }
         if (c.job_title && queryLower.includes(c.job_title.toLowerCase())) score += 0.2;
+        if (c.job_title && queryLower.includes(c.job_title.toLowerCase())) reasons.push('job_title');
         if (c.bio_keywords) {
           const kws = c.bio_keywords.split(',');
           const matched = kws.filter(kw => queryLower.includes(kw)).length;
-          if (matched > 0) score += 0.15 * matched;
+          if (matched > 0) {
+            score += 0.15 * matched;
+            reasons.push('bio_keywords');
+          }
         }
         if (score > 0) {
           scored.push({
             id: c.id,
+            type: 'contact',
+            name: c.full_name,
             score,
             interactions: c.total_interactions || 0,
             recency: c.last_contact_date ? new Date(c.last_contact_date).getTime() : 0,
+            companyId: c.company_id,
+            reasons,
           });
         }
       }
 
       for (const c of index.companies) {
         let score = 0;
-        const nameLower = c.name.toLowerCase();
-        if (queryLower.includes(nameLower)) score += 1.0;
-        else if (nameLower.split(' ').some(part => part.length > 2 && queryLower.includes(part))) score += 0.4;
+        const reasons: string[] = [];
+        const nameTokens = tokenizeEntityText(c.name);
+        const matchedNameTokens = nameTokens.filter(token => queryTokens.has(token));
+        if (entityNameMatchesQuery(c.name, queryNormalized, queryCompact)) {
+          score += 1.2;
+          reasons.push('exact_or_normalized_name');
+        } else if (matchedNameTokens.length >= 2) {
+          score += 0.75;
+          reasons.push('multi_token_name_match');
+        } else if (matchedNameTokens.length === 1) {
+          const token = matchedNameTokens[0];
+          if ((companyTokenCounts.get(token) || 0) === 1) {
+            score += 0.45;
+            reasons.push('unique_single_name_token');
+          }
+        }
         if (c.domain && queryLower.includes(c.domain.toLowerCase())) score += 0.5;
+        if (c.domain && queryLower.includes(c.domain.toLowerCase())) reasons.push('domain');
         if (c.sector && queryLower.includes(c.sector.toLowerCase())) score += 0.2;
+        if (c.sector && queryLower.includes(c.sector.toLowerCase())) reasons.push('sector');
         if (c.description_keywords) {
           const kws = c.description_keywords.split(',');
           const matched = kws.filter(kw => queryLower.includes(kw)).length;
-          if (matched > 0) score += 0.15 * matched;
+          if (matched > 0) {
+            score += 0.15 * matched;
+            reasons.push('description_keywords');
+          }
         }
         if (score > 0) {
-          scored.push({ id: c.id, score, interactions: c.contact_count || 0, recency: 0 });
+          scored.push({
+            id: c.id,
+            type: 'company',
+            name: c.name,
+            score,
+            interactions: c.contact_count || 0,
+            recency: 0,
+            reasons,
+          });
         }
       }
 
@@ -520,7 +642,32 @@ export async function preprocessQuery(
         return b.interactions - a.interactions;
       });
 
-      for (const s of scored.slice(0, maxEntities)) entityIds.push(s.id);
+      const selected: string[] = [];
+      for (const s of scored) {
+        if (selected.length >= maxEntities) break;
+        if (!selected.includes(s.id)) selected.push(s.id);
+        if (
+          s.type === 'contact' &&
+          s.companyId &&
+          s.score >= 1.0 &&
+          selected.length < maxEntities &&
+          !selected.includes(s.companyId)
+        ) {
+          selected.push(s.companyId);
+        }
+      }
+      entityIds.push(...selected.slice(0, maxEntities));
+      retrievalLog('anchors', {
+        query: query.slice(0, 80),
+        selected_entity_ids: entityIds,
+        top_candidates: scored.slice(0, 8).map(s => ({
+          id: s.id,
+          type: s.type,
+          name: s.name,
+          score: Number(s.score.toFixed(3)),
+          reasons: s.reasons,
+        })),
+      });
     } catch (e) {
       console.error('[retrieval] entity index failed, falling back to D1:', e);
       const [contacts, companies] = await Promise.all([
