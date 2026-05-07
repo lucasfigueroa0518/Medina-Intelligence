@@ -3,8 +3,9 @@
 import React from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { Download, FileText, AlertCircle, Loader2, ExternalLink } from 'lucide-react';
+import { FileText, AlertCircle, Loader2, ExternalLink } from 'lucide-react';
 import { FilePreview, kindFromMime } from '@/components/file-preview';
+import { DocumentActions } from '@/components/document-actions';
 
 const API_BASE = `${process.env.NEXT_PUBLIC_API_URL ?? ''}/api`;
 
@@ -25,6 +26,7 @@ type Doc = {
   processing_status: string | null;
   error_message: string | null;
   extracted_text_preview: string | null;
+  r2_key: string | null;
   contact_id: string | null;
   company_id: string | null;
   deal_id: string | null;
@@ -40,7 +42,6 @@ export default function DocumentDetailPage() {
   const [doc, setDoc] = React.useState<Doc | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
-  const [downloading, setDownloading] = React.useState(false);
 
   // Inline preview state. For PDFs and images we fetch the file as a blob
   // (bearer auth required) and render via an object URL — iframe/img can't
@@ -80,13 +81,17 @@ export default function DocumentDetailPage() {
   }, [id]);
 
   // Fetch the file as a blob and turn it into an object URL for inline
-  // preview. Only triggers for PDFs and images — text bodies are rendered
-  // from extracted_text_preview without a separate fetch.
+  // preview. PDFs/images render natively; DOCX uses browser-side rendering.
   React.useEffect(() => {
     if (!doc) return;
     const kind = kindFromMime(doc.mime_type);
-    if (kind !== 'pdf' && kind !== 'image') {
+    if (kind !== 'pdf' && kind !== 'image' && kind !== 'docx') {
       setPreviewBlobUrl(null);
+      return;
+    }
+    if (!doc.r2_key) {
+      setPreviewBlobUrl(null);
+      setPreviewError('Original file is unavailable.');
       return;
     }
     let alive = true;
@@ -117,30 +122,6 @@ export default function DocumentDetailPage() {
       if (createdUrl) URL.revokeObjectURL(createdUrl);
     };
   }, [doc]);
-
-  // Download must pass the bearer token, so an <a href> won't work — fetch
-  // the file as a blob, build an object URL, and click it programmatically.
-  async function handleDownload() {
-    if (!id || !doc) return;
-    setDownloading(true);
-    try {
-      const res = await fetch(`${API_BASE}/documents/${id}/download`, { headers: authHeader() });
-      if (!res.ok) throw new Error(`Download failed (${res.status})`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = doc.file_name || doc.title || 'document';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (e: any) {
-      setError(`Download failed: ${e?.message || 'unknown error'}`);
-    } finally {
-      setDownloading(false);
-    }
-  }
 
   if (loading) {
     return (
@@ -191,15 +172,13 @@ export default function DocumentDetailPage() {
         </div>
       </header>
 
-      <div className="flex gap-2 mb-6">
-        <button
-          onClick={handleDownload}
-          disabled={downloading}
-          className="inline-flex items-center gap-2 bg-purple-500/20 border border-purple-500/30 text-purple-200 px-3.5 py-2 rounded-lg text-sm hover:bg-purple-500/30 disabled:opacity-50"
-        >
-          {downloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-          {downloading ? 'Downloading…' : 'Download original'}
-        </button>
+      <div className="mb-6">
+        <DocumentActions
+          doc={doc}
+          variant="compact"
+          showPreview={false}
+          onError={message => setError(message)}
+        />
       </div>
 
       {doc.processing_status === 'failed' && (
@@ -225,8 +204,9 @@ export default function DocumentDetailPage() {
       )}
 
       {(() => {
-        const kind = kindFromMime(doc.mime_type);
-        if (kind === 'pdf' || kind === 'image') {
+        const rawKind = kindFromMime(doc.mime_type);
+        const kind = rawKind === 'unsupported' && doc.extracted_text_preview ? 'text' : rawKind;
+        if (kind === 'pdf' || kind === 'image' || kind === 'docx') {
           return (
             <section className="mb-6 bg-white/[0.03] border border-border rounded-lg overflow-hidden" style={{ height: 'min(70vh, 800px)' }}>
               <FilePreview
@@ -238,6 +218,9 @@ export default function DocumentDetailPage() {
               />
             </section>
           );
+        }
+        if (kind === 'text') {
+          return null;
         }
         return null;
       })()}

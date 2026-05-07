@@ -15,6 +15,7 @@ import { CompanySearchField } from '@/components/company-search-field';
 import { TagPicker } from '@/components/tag-picker';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
+import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
 
@@ -273,7 +274,7 @@ export default function ContactDetailPage() {
   );
 
   const es = ENGAGEMENT_STATUSES.find(s => s.value === contact.engagement_status) || ENGAGEMENT_STATUSES[2];
-  const bio = fullBio || contact.bio_summary;
+  const bio = cleanIntelBrief(fullBio || contact.bio_summary);
   const bioParas = bio ? bio.split(/\n{2,}/).map((p: string) => p.trim()).filter(Boolean) : [];
   const hasInvestment = contact.investment_focus || contact.check_size_range || contact.fund_name || contact.commitment_status;
   const showInvestmentCard = editMode ? hasInvestorTag : (hasInvestorTag || hasInvestment);
@@ -911,9 +912,17 @@ export default function ContactDetailPage() {
               </div>
             ) : (
               <div className="space-y-2">
-                {documents.map((doc: any) => (
+                {documents.map((doc: any) => {
+                  const canPreviewDoc = Boolean(
+                    doc.r2_key ||
+                    (typeof doc.extracted_text_preview === 'string' && doc.extracted_text_preview.trim().length > 0)
+                  );
+                  return (
                   <div key={doc.id}
-                    onClick={() => setPreviewDocId(doc.id)}
+                    onClick={() => {
+                      if (canPreviewDoc) setPreviewDocId(doc.id);
+                      else setToast('Preview is unavailable for this document');
+                    }}
                     className="flex items-center gap-4 rounded-xl p-4 transition-all hover:bg-white/[0.05] cursor-pointer"
                     style={{ background: 'rgba(17,17,20,0.5)', border: '1px solid rgba(255,255,255,0.05)' }}>
                     <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
@@ -959,13 +968,28 @@ export default function ContactDetailPage() {
                         )}
                       </div>
                     </div>
-                    <button onClick={() => handleDocDelete(doc.id)}
-                      className="p-2 rounded-lg text-text-muted hover:text-semantic-error hover:bg-semantic-error/10 transition-colors shrink-0"
-                      title="Delete document">
-                      <Trash2 size={14} />
-                    </button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <DocumentActions
+                        doc={doc}
+                        variant="compact"
+                        onPreview={documentId => setPreviewDocId(documentId)}
+                        onError={setToast}
+                      />
+                      <button
+                        type="button"
+                        onClick={e => {
+                          e.stopPropagation();
+                          void handleDocDelete(doc.id);
+                        }}
+                        className="p-2 rounded-lg text-text-muted hover:text-semantic-error hover:bg-semantic-error/10 transition-colors"
+                        title="Delete document"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -1283,6 +1307,16 @@ function cleanValue(raw: any): string {
     if (typeof parsed === 'string') return parsed;
   } catch { /* not JSON */ }
   return s;
+}
+
+function cleanIntelBrief(raw: string | null | undefined): string {
+  if (!raw) return '';
+  return raw
+    .replace(/^\s*\[(?:source|sources?)\s*:\s*[^\]]+\]\s*/gim, '')
+    .replace(/\s*\[(?:source|sources?)\s*:\s*[^\]]+\]\s*/gi, ' ')
+    .replace(/^\s*(?:source|sources?)\s*:\s*(?:gemini|claude|web_search|reversecontact)[^\n]*\n?/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function shortUrl(v: string): string {

@@ -12,6 +12,7 @@ import { TopBar } from '@/components/top-bar';
 import { TagPicker } from '@/components/tag-picker';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
+import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
 
@@ -676,7 +677,10 @@ export default function CompanyDetailPage() {
             <div className="space-y-2">
               {documents.map((doc: any) => (
                 <div key={doc.id}
-                  onClick={() => setPreviewDocId(doc.id)}
+                  onClick={() => {
+                    if (doc.r2_key || String(doc.extracted_text_preview || '').trim()) setPreviewDocId(doc.id);
+                    else setToast('Preview is unavailable for this document');
+                  }}
                   className="flex items-center gap-4 rounded-xl p-4 transition-all hover:bg-white/[0.05] cursor-pointer"
                   style={{ background: 'rgba(17,17,20,0.5)', border: '1px solid rgba(255,255,255,0.05)' }}>
                   <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
@@ -724,11 +728,19 @@ export default function CompanyDetailPage() {
                       )}
                     </div>
                   </div>
-                  <button onClick={e => { e.stopPropagation(); handleDocDelete(doc.id); }}
-                    className="p-2 rounded-lg text-text-muted hover:text-semantic-error hover:bg-semantic-error/10 transition-colors shrink-0"
-                    title="Delete document">
-                    <Trash2 size={14} />
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <DocumentActions
+                      doc={doc}
+                      variant="compact"
+                      onPreview={documentId => setPreviewDocId(documentId)}
+                      onError={setToast}
+                    />
+                    <button onClick={e => { e.stopPropagation(); handleDocDelete(doc.id); }}
+                      className="p-2 rounded-lg text-text-muted hover:text-semantic-error hover:bg-semantic-error/10 transition-colors"
+                      title="Delete document">
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>

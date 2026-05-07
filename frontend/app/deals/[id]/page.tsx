@@ -10,6 +10,7 @@ import {
   Sparkles, ArrowRight, Lock, Upload, Paperclip, ExternalLink,
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
+import { DocumentActions } from '@/components/document-actions';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import {
@@ -1471,11 +1472,19 @@ export default function DealDetailPage() {
                           <span className="text-[9px] text-text-muted">{fmtRel(doc.created_at)}</span>
                         </div>
                       </div>
-                      <button onClick={e => { e.stopPropagation(); handleDocDelete(doc.id); }}
-                        className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-text-muted hover:text-semantic-error shrink-0"
-                        title="Delete document">
-                        <Trash2 size={11} />
-                      </button>
+                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                        <DocumentActions
+                          doc={doc}
+                          variant="compact"
+                          onPreview={documentId => setPreviewDocId(documentId)}
+                          onError={setToast}
+                        />
+                        <button onClick={e => { e.stopPropagation(); handleDocDelete(doc.id); }}
+                          className="p-1 rounded text-text-muted hover:text-semantic-error shrink-0"
+                          title="Delete document">
+                          <Trash2 size={11} />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>

@@ -34,6 +34,7 @@ interface DocLite {
   file_name: string | null;
   mime_type: string | null;
   file_size: number | null;
+  r2_key?: string | null;
   document_type: string | null;
   source: string | null;
   processing_status: string | null;
@@ -54,6 +55,7 @@ export function DocumentPreviewModal({
   const [error, setError] = React.useState<string | null>(null);
   const [previewBlobUrl, setPreviewBlobUrl] = React.useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = React.useState(false);
+  const [previewError, setPreviewError] = React.useState<string | null>(null);
   const [downloading, setDownloading] = React.useState(false);
   const [sendingToMarty, setSendingToMarty] = React.useState(false);
 
@@ -64,6 +66,7 @@ export function DocumentPreviewModal({
     setError(null);
     setDoc(null);
     setPreviewBlobUrl(null);
+    setPreviewError(null);
     api.getDocument(docId)
       .then((res: any) => {
         if (!alive) return;
@@ -81,19 +84,25 @@ export function DocumentPreviewModal({
     return () => { alive = false; };
   }, [docId]);
 
-  // PDF/image preview: blob-fetch with bearer auth → object URL
+  // Original-file preview: blob-fetch with bearer auth → object URL.
+  // PDFs/images render natively; DOCX uses browser-side document rendering.
   React.useEffect(() => {
     if (!doc) return;
     const kind = kindFromMime(doc.mime_type);
-    if (kind !== 'pdf' && kind !== 'image') return;
-    if (doc.processing_status === 'failed') return; // skip preview when extraction failed
+    if (kind !== 'pdf' && kind !== 'image' && kind !== 'docx') return;
+    if (!doc.r2_key) {
+      setPreviewError('Original file is unavailable.');
+      return;
+    }
     let alive = true;
     let createdUrl: string | null = null;
     setPreviewLoading(true);
+    setPreviewError(null);
     fetch(`${API_BASE}/documents/${doc.id}/download`, { headers: authHeader() })
       .then(async r => {
         if (!alive) return;
         if (!r.ok) {
+          setPreviewError(`Preview failed to load (${r.status}).`);
           setPreviewLoading(false);
           return;
         }
@@ -103,7 +112,11 @@ export function DocumentPreviewModal({
         setPreviewBlobUrl(createdUrl);
         setPreviewLoading(false);
       })
-      .catch(() => { if (alive) setPreviewLoading(false); });
+      .catch((e: any) => {
+        if (!alive) return;
+        setPreviewError(e?.message || 'Preview failed to load.');
+        setPreviewLoading(false);
+      });
     return () => {
       alive = false;
       if (createdUrl) URL.revokeObjectURL(createdUrl);
@@ -144,6 +157,10 @@ export function DocumentPreviewModal({
 
   async function handleDownload() {
     if (!doc) return;
+    if (!doc.r2_key) {
+      setError('Original file is unavailable for this document.');
+      return;
+    }
     setDownloading(true);
     try {
       const res = await fetch(`${API_BASE}/documents/${doc.id}/download`, { headers: authHeader() });
@@ -156,15 +173,19 @@ export function DocumentPreviewModal({
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch { /* swallow — UI shows nothing extra */ }
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e: any) {
+      setError(e?.message || 'Download failed.');
+    }
     finally { setDownloading(false); }
   }
 
   if (!docId) return null;
 
-  const kind = doc ? kindFromMime(doc.mime_type) : 'unsupported';
+  const rawKind = doc ? kindFromMime(doc.mime_type) : 'unsupported';
+  const kind = rawKind === 'unsupported' && doc?.extracted_text_preview ? 'text' : rawKind;
   const showFailedBanner = doc?.processing_status === 'failed';
+  const hasOriginalFile = !!doc?.r2_key;
   const title = doc?.title || doc?.file_name || 'Document';
 
   return (
@@ -196,7 +217,7 @@ export function DocumentPreviewModal({
               {sendingToMarty ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
               {sendingToMarty ? 'Sending…' : 'Send to MARTy'}
             </button>
-            <button onClick={handleDownload} disabled={downloading || !doc}
+            <button onClick={handleDownload} disabled={downloading || !doc || !hasOriginalFile}
               title="Download"
               className="p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-white/5 disabled:opacity-30">
               {downloading ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
@@ -235,12 +256,12 @@ export function DocumentPreviewModal({
                 text={doc?.extracted_text_preview || undefined}
                 emptyMessage="No text preview available — open detail page for full content."
               />
-            ) : kind === 'pdf' || kind === 'image' ? (
+            ) : kind === 'pdf' || kind === 'image' || kind === 'docx' ? (
               <FilePreview
                 kind={kind}
                 src={previewBlobUrl || undefined}
                 fileName={doc?.file_name || undefined}
-                error={!previewBlobUrl && !previewLoading ? 'Preview unavailable' : null}
+                error={previewError || (!previewBlobUrl && !previewLoading ? 'Preview unavailable' : null)}
               />
             ) : (
               <FilePreview kind="unsupported" />

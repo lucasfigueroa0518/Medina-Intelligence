@@ -4,7 +4,8 @@ import React from 'react';
 import { X, ExternalLink, FileText } from 'lucide-react';
 import { api, type ChatUploadSummary } from '@/lib/api';
 import { formatBytes } from './chat-upload-pill';
-import { FilePreview } from './file-preview';
+import { FilePreview, kindFromMime } from './file-preview';
+import { DocumentActions } from './document-actions';
 
 export function UploadPreviewModal({
   upload,
@@ -27,8 +28,7 @@ export function UploadPreviewModal({
 
   if (!upload) return null;
 
-  const isPdf = upload.upload_type === 'pdf';
-  const isImage = upload.upload_type === 'image';
+  const previewKind = kindFromMime(upload.mime_type);
   const contentUrl = api.uploadContentUrl(upload.id);
 
   return (
@@ -57,13 +57,20 @@ export function UploadPreviewModal({
           </div>
           <div className="flex items-center gap-1 shrink-0">
             {upload.saved_to_documents && upload.saved_document_id && (
-              <a
-                href={`/documents/${upload.saved_document_id}`}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-text-secondary hover:bg-white/5 hover:text-text-primary transition-colors"
-                style={{ fontFamily: "'DM Sans', sans-serif" }}
-              >
-                <ExternalLink size={12} /> Open in Documents
-              </a>
+              <>
+                <DocumentActions
+                  docId={upload.saved_document_id}
+                  fileName={upload.filename}
+                  variant="compact"
+                />
+                <a
+                  href={`/documents/${upload.saved_document_id}`}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-text-secondary hover:bg-white/5 hover:text-text-primary transition-colors"
+                  style={{ fontFamily: "'DM Sans', sans-serif" }}
+                >
+                  <ExternalLink size={12} /> Open
+                </a>
+              </>
             )}
             <button onClick={onClose} className="p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-white/5">
               <X size={16} />
@@ -71,10 +78,12 @@ export function UploadPreviewModal({
           </div>
         </header>
         <div className="flex-1 overflow-hidden p-3">
-          {isPdf ? (
+          {previewKind === 'pdf' ? (
             <FilePreview kind="pdf" src={contentUrl} fileName={upload.filename} />
-          ) : isImage ? (
+          ) : previewKind === 'image' ? (
             <FilePreview kind="image" src={contentUrl} fileName={upload.filename} />
+          ) : previewKind === 'docx' ? (
+            <FilePreview kind="docx" src={contentUrl} fileName={upload.filename} />
           ) : (
             <ExtractedTextPreview uploadId={upload.id} extractionStatus={upload.extraction_status} />
           )}

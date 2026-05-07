@@ -8,7 +8,7 @@ import { Loader2, AlertCircle, FileText } from 'lucide-react';
 // the blob/text and passing in `src` (for pdf/image) or `text`. This split
 // keeps auth concerns at the call site: the modal can pass a same-origin URL
 // (cookie-auth), the detail page passes a blob: URL after a bearer-fetch.
-export type FilePreviewKind = 'pdf' | 'image' | 'text' | 'unsupported';
+export type FilePreviewKind = 'pdf' | 'image' | 'docx' | 'text' | 'unsupported';
 
 export function FilePreview({
   kind,
@@ -52,6 +52,9 @@ export function FilePreview({
       </div>
     );
   }
+  if (kind === 'docx' && src) {
+    return <DocxPreview src={src} fileName={fileName} />;
+  }
   if (kind === 'text' && text) {
     return (
       <pre className="w-full h-full overflow-auto bg-bg-root rounded-md p-4 text-xs text-text-secondary whitespace-pre-wrap font-mono">
@@ -73,6 +76,67 @@ export function kindFromMime(mime: string | null | undefined): FilePreviewKind {
   const m = (mime || '').toLowerCase();
   if (m.startsWith('application/pdf')) return 'pdf';
   if (m.startsWith('image/')) return 'image';
+  if (m.includes('wordprocessingml.document') || m === 'application/msword') return 'docx';
   if (m.startsWith('text/')) return 'text';
   return 'unsupported';
+}
+
+function DocxPreview({ src, fileName }: { src: string; fileName?: string }) {
+  const hostRef = React.useRef<HTMLDivElement | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const host = hostRef.current;
+    if (!host) return;
+    host.innerHTML = '';
+    setError(null);
+
+    (async () => {
+      try {
+        const [{ renderAsync }, res] = await Promise.all([
+          import('docx-preview'),
+          fetch(src),
+        ]);
+        if (!res.ok) throw new Error(`DOCX preview failed (${res.status})`);
+        const buffer = await res.arrayBuffer();
+        if (cancelled || !hostRef.current) return;
+        await renderAsync(buffer, hostRef.current, undefined, {
+          className: 'docx-preview',
+          inWrapper: true,
+          ignoreWidth: false,
+          ignoreHeight: false,
+          breakPages: true,
+          renderHeaders: true,
+          renderFooters: true,
+          renderFootnotes: true,
+          renderEndnotes: true,
+        });
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || 'DOCX preview unavailable');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (host) host.innerHTML = '';
+    };
+  }, [src]);
+
+  if (error) {
+    return (
+      <div className="w-full h-full flex items-center justify-center text-semantic-error text-xs">
+        <AlertCircle size={14} className="mr-2" /> {error}
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full h-full overflow-auto rounded-md bg-zinc-100 text-zinc-950" title={fileName}>
+      <div
+        ref={hostRef}
+        className="min-h-full p-4 [&_.docx-wrapper]:!bg-transparent [&_.docx-wrapper]:!p-0 [&_.docx]:mx-auto [&_.docx]:shadow-lg"
+      />
+    </div>
+  );
 }

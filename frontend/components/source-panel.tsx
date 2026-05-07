@@ -1,17 +1,9 @@
 'use client';
 
 import React from 'react';
-import { X, ExternalLink, Eye, Mail, Calendar, FileText, Hash, Newspaper, User, Building2, ArrowUpRight, Download, Loader2 } from 'lucide-react';
+import { X, ExternalLink, Mail, Calendar, FileText, Hash, Newspaper, User, Building2, ArrowUpRight } from 'lucide-react';
 import type { CitationSource, CitationSourceType } from '@/lib/citations';
-import { DocumentPreviewModal } from './document-preview-modal';
-
-const API_BASE = `${process.env.NEXT_PUBLIC_API_URL ?? ''}/api`;
-
-function authHeader(): Record<string, string> | undefined {
-  if (typeof window === 'undefined') return undefined;
-  const t = localStorage.getItem('auth_token');
-  return t ? { Authorization: `Bearer ${t}` } : undefined;
-}
+import { DocumentActions } from './document-actions';
 
 const ICON_FOR_TYPE: Record<CitationSourceType, typeof Mail> = {
   email: Mail,
@@ -193,7 +185,6 @@ function MeetingBody({ source }: { source: CitationSource }) {
 }
 
 function DocumentBody({ source }: { source: CitationSource }) {
-  const [previewOpen, setPreviewOpen] = React.useState(false);
   return (
     <>
       {source.subtitle && <MetaRow label="Type" value={source.subtitle} />}
@@ -206,69 +197,14 @@ function DocumentBody({ source }: { source: CitationSource }) {
         />
       )}
       <Excerpt text={source.excerpt} />
-      {/* Wave 5 Phase G — Preview button opens the shared modal in-context.
-          The modal's "Open in detail page" link is the escape hatch for
-          power users who want the deep-linkable URL. */}
-      <button
-        onClick={() => setPreviewOpen(true)}
-        className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg bg-purple-500/10 hover:bg-purple-500/15 text-purple-300 transition-colors text-sm mt-2 w-full"
-        style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}
-      >
-        <span>Preview document</span>
-        <Eye size={14} />
-      </button>
+      <div className="mt-2">
+        <DocumentActions
+          docId={source.source_id}
+          fileName={source.title}
+          variant="panel"
+        />
+      </div>
       <PrimaryAction href={source.url_path} label="Open in new tab" />
-      <DocumentDownloadButton documentId={source.source_id} fileName={source.title} />
-      <DocumentPreviewModal
-        docId={previewOpen ? source.source_id : null}
-        onClose={() => setPreviewOpen(false)}
-      />
-    </>
-  );
-}
-
-function DocumentDownloadButton({ documentId, fileName }: { documentId: string; fileName: string }) {
-  const [busy, setBusy] = React.useState(false);
-  const [err, setErr] = React.useState<string | null>(null);
-
-  // Same auth-bearing blob-fetch pattern as documents/[id]/page.tsx — an
-  // <a href> can't carry the bearer token, so we fetch as blob, build an
-  // object URL, and click it programmatically.
-  async function handleClick() {
-    if (busy) return;
-    setBusy(true);
-    setErr(null);
-    try {
-      const res = await fetch(`${API_BASE}/documents/${documentId}/download`, { headers: authHeader() });
-      if (!res.ok) throw new Error(`Download failed (${res.status})`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = fileName || 'document';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (e: any) {
-      setErr(e?.message || 'Download failed');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <>
-      <button
-        onClick={handleClick}
-        disabled={busy}
-        className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-text-secondary hover:text-text-primary transition-colors text-sm w-full disabled:opacity-50"
-        style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}
-      >
-        <span>{busy ? 'Downloading…' : 'Download'}</span>
-        {busy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-      </button>
-      {err && <div className="text-[11px] text-semantic-error">{err}</div>}
     </>
   );
 }

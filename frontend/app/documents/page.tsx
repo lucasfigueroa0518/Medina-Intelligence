@@ -11,10 +11,10 @@ import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { api } from '@/lib/api';
 import { DocumentUploadModal } from '@/components/document-upload-modal';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
+import { DocumentActions } from '@/components/document-actions';
 import {
   Search,
   X as XIcon,
-  Download,
   FileText,
   FileSpreadsheet,
   Image as ImageIcon,
@@ -432,21 +432,13 @@ function DocumentsPage() {
       accessor: row => <span className="text-text-secondary">{formatRelative(row.created_at)}</span>,
     },
     {
-      key: 'actions', header: '', width: '50px',
+      key: 'actions', header: '', width: '120px',
       accessor: row => (
-        <button
-          title="Download"
-          onClick={async e => {
-            e.stopPropagation();
-            try {
-              const { downloadUrl } = await api.getDocument(row.id);
-              if (downloadUrl) window.open(downloadUrl, '_blank');
-            } catch { /* ignore */ }
-          }}
-          className="p-1.5 rounded-md text-text-muted hover:text-text-primary hover:bg-white/[0.06] transition-colors"
-        >
-          <Download size={14} />
-        </button>
+        <DocumentActions
+          doc={row}
+          variant="icon"
+          onPreview={documentId => setPreviewDocId(documentId)}
+        />
       ),
     },
   ];
