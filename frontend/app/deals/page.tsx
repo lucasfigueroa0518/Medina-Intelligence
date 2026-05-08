@@ -16,12 +16,6 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import {
-  MomentumSparkline,
-  RiskFlag,
-  SentimentIndicator,
-  TopicChips,
-} from '@/components/deal-intelligence';
 
 type DealStage = 'new' | 'talking' | 'due_diligence' | 'term_sheet' | 'closed';
 
@@ -33,21 +27,6 @@ const STAGES: Array<{ key: DealStage; label: string; color: string }> = [
   { key: 'closed', label: 'Closed', color: '#22C55E' },
 ];
 
-const FUNDING_LABELS: Record<string, string> = {
-  pre_seed: 'Pre-Seed',
-  seed: 'Seed',
-  series_a: 'Series A',
-  series_b: 'Series B',
-  series_c: 'Series C',
-  series_d: 'Series D',
-  series_e_plus: 'Series E+',
-  growth: 'Growth',
-  bridge: 'Bridge',
-  secondary: 'Secondary',
-  debt: 'Debt',
-  unknown: 'Unknown Stage',
-};
-
 function normalizeStage(stage: string | null | undefined): DealStage {
   return STAGES.some(s => s.key === stage) ? stage as DealStage : 'talking';
 }
@@ -58,22 +37,6 @@ function cardTitle(deal: any): string {
 
 function lastActivity(deal: any): string | null {
   return deal.last_inferred_activity_date || deal.evidence_last_seen_at || deal.last_activity_date || deal.updated_at || deal.created_at || null;
-}
-
-function daysAgo(value: string | null | undefined): number {
-  if (!value) return 999;
-  const t = new Date(value).getTime();
-  if (!Number.isFinite(t)) return 999;
-  return Math.max(0, Math.floor((Date.now() - t) / 86400000));
-}
-
-function daysBetween(start: string | null | undefined): string {
-  if (!start) return 'New';
-  const days = daysAgo(start);
-  if (days === 999) return 'New';
-  if (days === 0) return 'Today';
-  if (days === 1) return '1 day';
-  return `${days} days`;
 }
 
 function formatCurrency(v: number): string {
@@ -90,7 +53,6 @@ function DealCard({
   busy,
   isDragging,
   onToggle,
-  onDecision,
   onDragStart,
   onDragEnd,
   onOpen,
@@ -101,19 +63,12 @@ function DealCard({
   busy: boolean;
   isDragging: boolean;
   onToggle: () => void;
-  onDecision: (decision: 'yes' | 'no' | 'delete') => void;
   onDragStart: (e: React.DragEvent) => void;
   onDragEnd: () => void;
   onOpen: () => void;
 }) {
   const { intelligence } = useDealIntelligence(deal.id);
-  const stage = normalizeStage(deal.stage);
-  const isSuggestion = stage === 'new';
-  const activityDays = daysAgo(lastActivity(deal));
-  const activityColor = activityDays <= 2 ? '#22C55E' : activityDays <= 7 ? '#EAB308' : '#71717A';
-  const hasAmount = deal.amount && deal.amount > 0;
-  const hasValuation = deal.valuation && deal.valuation > 0;
-  const showCompanySubtitle = Boolean(deal.company_name && deal.title && !String(deal.title).toLowerCase().includes(String(deal.company_name).toLowerCase()));
+  const brief = intelligence?.brief_summary || deal.notes || 'No current intel brief yet.';
 
   return (
     <article
@@ -121,19 +76,20 @@ function DealCard({
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
       onClick={onOpen}
-      className={`card cursor-grab active:cursor-grabbing hover:border-border-hover transition-all group ${
+      className={`card relative !p-3 cursor-grab active:cursor-grabbing hover:border-border-hover transition-all group ${
         isDragging ? 'opacity-40 scale-95' : ''
       } ${selected ? 'ring-2 ring-accent-magenta/40' : ''}`}
       style={{ borderLeft: `3px solid ${stageColor}35` }}
     >
-      <div className="flex items-start gap-1.5">
+      <div className="absolute right-2 top-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
         <button
           type="button"
           onClick={e => { e.stopPropagation(); onToggle(); }}
-          className={`shrink-0 mt-0.5 w-3.5 h-3.5 rounded flex items-center justify-center transition-all ${
+          disabled={busy}
+          className={`shrink-0 w-4 h-4 rounded flex items-center justify-center transition-all ${
             selected
               ? 'bg-accent-magenta border-accent-magenta'
-              : 'border border-white/15 opacity-0 group-hover:opacity-100 hover:border-white/40'
+              : 'border border-white/15 hover:border-white/40'
           }`}
           title={selected ? 'Deselect' : 'Select for bulk action'}
         >
@@ -141,83 +97,15 @@ function DealCard({
         </button>
         <GripVertical
           size={14}
-          className="text-text-muted/30 shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+          className="text-text-muted/30 shrink-0"
         />
-        <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium text-text-primary truncate">{cardTitle(deal)}</div>
-          {showCompanySubtitle && (
-            <div className="text-xs text-text-muted mt-0.5 truncate">{deal.company_name}</div>
-          )}
-        </div>
       </div>
-
-      {(hasAmount || hasValuation) && (
-        <div className="text-xs text-text-secondary mt-2 font-accent font-semibold">
-          {hasAmount && formatCurrency(deal.amount)}
-          {hasAmount && hasValuation && ' @ '}
-          {hasValuation && `${formatCurrency(deal.valuation)} pre`}
-        </div>
-      )}
-
-      <div className="mt-2 flex flex-wrap gap-1.5">
-        <span
-          className="text-[10px] font-accent px-1.5 py-0.5 rounded"
-          style={{ background: 'rgba(255,255,255,0.04)', color: '#A1A1AA' }}
-        >
-          {FUNDING_LABELS[deal.funding_stage] || 'Stage unknown'}
-        </span>
-        <span
-          className="text-[10px] font-accent px-1.5 py-0.5 rounded"
-          style={{ background: 'rgba(255,255,255,0.04)', color: '#A1A1AA' }}
-        >
-          Age {daysBetween(deal.evidence_first_seen_at || deal.created_at)}
-        </span>
+      <div className="min-w-0 pr-8">
+        <div className="truncate text-sm font-semibold text-text-primary">{cardTitle(deal)}</div>
+        <p className="mt-1 line-clamp-2 text-xs leading-5 text-text-secondary">
+          {brief}
+        </p>
       </div>
-
-      <div className="flex items-center gap-2 mt-2.5">
-        <MomentumSparkline intelligence={intelligence} size="compact" />
-        <SentimentIndicator intelligence={intelligence} size="compact" />
-      </div>
-      <div className="mt-1.5"><TopicChips intelligence={intelligence} size="compact" /></div>
-      <div className="mt-1.5"><RiskFlag intelligence={intelligence} size="compact" /></div>
-
-      <p className="mt-2.5 line-clamp-3 text-xs leading-5 text-text-secondary">
-        {intelligence?.brief_summary || deal.notes || 'MARTy is waiting for enough readable activity to build the current brief.'}
-      </p>
-
-      <div className="flex items-center gap-2 mt-2.5">
-        <div
-          className="w-1.5 h-1.5 rounded-full"
-          style={{ background: activityColor }}
-          title={activityDays === 999 ? 'No activity yet' : `Last activity: ${activityDays}d ago`}
-        />
-        <span className="text-[10px] text-text-muted font-accent">
-          {activityDays === 999 ? 'No activity' : `${activityDays}d ago`}
-        </span>
-      </div>
-
-      {isSuggestion && (
-        <div className="mt-3 flex items-center gap-2 border-t border-white/[0.04] pt-3">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={e => { e.stopPropagation(); onDecision('yes'); }}
-            className="inline-flex flex-1 items-center justify-center gap-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-colors disabled:opacity-40"
-            style={{ background: 'rgba(34,197,94,0.12)', color: '#4ADE80', border: '1px solid rgba(34,197,94,0.22)' }}
-          >
-            <Check size={12} /> Yes
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={e => { e.stopPropagation(); onDecision('no'); }}
-            className="inline-flex flex-1 items-center justify-center gap-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-colors disabled:opacity-40"
-            style={{ background: 'rgba(239,68,68,0.10)', color: '#F87171', border: '1px solid rgba(239,68,68,0.20)' }}
-          >
-            <X size={12} /> No
-          </button>
-        </div>
-      )}
     </article>
   );
 }
@@ -452,7 +340,6 @@ export default function DealsPage() {
                           busy={busy}
                           isDragging={dragDealId === deal.id}
                           onToggle={() => toggleSelected(deal.id)}
-                          onDecision={(decision) => void decide([deal.id], decision)}
                           onDragStart={(e) => handleDragStart(e, deal.id)}
                           onDragEnd={() => { setDragDealId(null); setDragOverStage(null); }}
                           onOpen={() => router.push(`/deals/${deal.id}`)}
