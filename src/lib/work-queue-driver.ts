@@ -56,6 +56,14 @@ export interface WorkQueueHandler {
   batchSize: number;
 
   /**
+   * Optional global concurrency cap for long-running domains. Without this,
+   * batchSize=1 still permits a new row to be claimed on the next minute tick
+   * while an earlier row is still in_progress. Heavy domains like intelligent
+   * imports should set this to 1.
+   */
+  maxConcurrent?: number;
+
+  /**
    * 'minute' (default) runs every minute tick. 'hour' runs only when
    * the dispatching minute tick happens at minute :00 (caller decides).
    * Keeping the dispatch logic in src/index.ts means this field is
@@ -159,6 +167,7 @@ import { embedRetryHandler } from './work-queue-handlers/embed-retry';
 import { calendarRefreshHandler } from './work-queue-handlers/calendar-refresh';
 import { fireflyWindowHandler } from './work-queue-handlers/firefly-window';
 import { dealReplayEvidenceHandler } from './work-queue-handlers/deal-replay-evidence';
+import { intelligentImportHandler } from './work-queue-handlers/intelligent-import';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -189,6 +198,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   calendarRefreshHandler,
   fireflyWindowHandler,
   dealReplayEvidenceHandler,
+  intelligentImportHandler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────
@@ -254,10 +264,25 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
     const stats = { domain: handler.domain, claimed: 0, completed: 0, failed: 0 };
     let claimed: WorkQueueRow[] = [];
     try {
+      let claimLimit = Math.min(handler.batchSize, 10);
+      if (handler.maxConcurrent !== undefined) {
+        const active = await env.D1.prepare(
+          `SELECT COUNT(*) AS count FROM work_queue
+            WHERE domain = ? AND status = 'in_progress'`
+        ).bind(handler.domain).first<{ count: number }>();
+        const activeCount = active?.count ?? 0;
+        const available = handler.maxConcurrent - activeCount;
+        if (available <= 0) {
+          result.per_domain.push(stats);
+          continue;
+        }
+        claimLimit = Math.min(claimLimit, available);
+      }
+
       claimed = await claimNextBatch(
         env,
         handler.domain,
-        Math.min(handler.batchSize, 10),
+        claimLimit,
         result.open_circuits
       );
       stats.claimed = claimed.length;

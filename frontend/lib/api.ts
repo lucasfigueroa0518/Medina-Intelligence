@@ -870,7 +870,7 @@ export const api = {
     const fd = new FormData();
     fd.append('file', file);
     // Always async — server returns { job_id, status: 'processing' } and the
-    // import runs in waitUntil so the user can navigate away.
+    // import runs through the durable work queue so the user can navigate away.
     return request<{ job_id: string; status: string; file_name: string; message: string }>(
       '/imports/intelligent', { method: 'POST', body: fd }
     );

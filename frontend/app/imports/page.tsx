@@ -87,9 +87,13 @@ interface ImportJob {
   source_type: string;
   status: string;
   created_at: string;
+  updated_at?: string;
+  source_r2_key?: string;
   total_rows?: number;
+  processed_rows?: number;
   created_rows?: number;
   updated_rows?: number;
+  skipped_rows?: number;
   failed_rows?: number;
 }
 
@@ -183,6 +187,10 @@ export default function ImportsPage() {
   // Report state
   const [activeTab, setActiveTab] = React.useState<'contacts' | 'companies' | 'deals'>('contacts');
   const [expandedRows, setExpandedRows] = React.useState<Set<number>>(new Set());
+  const activeJobs = React.useMemo(
+    () => history.filter(j => j.status === 'processing'),
+    [history]
+  );
 
   React.useEffect(() => {
     api.listImports()
@@ -202,23 +210,23 @@ export default function ImportsPage() {
   // state. This makes navigation work trivially: the import keeps running
   // server-side, and whenever the user lands back on /imports, polling
   // resumes automatically. No 3-min cap, no full-screen blocker.
-  const polling = React.useRef<Set<string>>(new Set());
+  const activeJobIds = React.useMemo(
+    () => activeJobs.map(j => j.id).sort().join('|'),
+    [activeJobs]
+  );
   React.useEffect(() => {
-    const inProgress = history.filter(j => j.status === 'processing').map(j => j.id);
-    if (inProgress.length === 0) return;
-    const intervals: number[] = [];
-    for (const jobId of inProgress) {
-      if (polling.current.has(jobId)) continue;
-      polling.current.add(jobId);
-      const id = window.setInterval(async () => {
+    if (!activeJobIds) return;
+    let cancelled = false;
+    const inProgress = activeJobIds.split('|').filter(Boolean);
+
+    const refresh = async () => {
+      await Promise.all(inProgress.map(async jobId => {
         try {
           const data = await api.getImportJob(jobId);
           const job = data.job;
-          if (!job) return;
+          if (!job || cancelled) return;
+          setHistory(prev => prev.map(j => j.id === jobId ? { ...j, ...job } : j));
           if (job.status === 'completed' || job.status === 'failed' || job.status === 'reverted') {
-            window.clearInterval(id);
-            polling.current.delete(jobId);
-            setHistory(prev => prev.map(j => j.id === jobId ? { ...j, ...job } : j));
             if (job.status === 'completed') {
               setToast(`Analysis complete: ${(job as any).total_rows ?? 0} entities. Click the row to view the report.`);
             } else if (job.status === 'failed') {
@@ -228,11 +236,16 @@ export default function ImportsPage() {
         } catch {
           // keep trying — transient network errors shouldn't kill the poll
         }
-      }, 4000);
-      intervals.push(id);
-    }
-    return () => { for (const id of intervals) window.clearInterval(id); };
-  }, [history]);
+      }));
+    };
+
+    refresh();
+    const intervalId = window.setInterval(refresh, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeJobIds]);
 
   // Animated analysis steps
   React.useEffect(() => {
@@ -249,11 +262,11 @@ export default function ImportsPage() {
     const fileName = file.name;
     try {
       // Fire-and-forget. Server returns a job_id within a second; processing
-      // runs server-side via waitUntil. We add the job to history and let the
-      // background-polling effect drive status updates. The user is freed
-      // immediately — no full-screen blocker, navigate-away works, and
-      // returning to /imports just resumes polling for any 'processing'
-      // rows in the list.
+      // runs server-side through the durable work queue. We add the job to
+      // history and let the background-polling effect drive status updates.
+      // The user is freed immediately — no full-screen blocker, navigate-away
+      // works, and returning to /imports just resumes polling for any
+      // 'processing' rows in the list.
       const data = await api.intelligentImport(file);
       setHistory(prev => [
         { id: data.job_id, source_type: 'intelligent', status: 'processing',
@@ -376,6 +389,36 @@ export default function ImportsPage() {
         />
       <div className="flex-1 p-4 md:p-8 overflow-auto">
           <div className="max-w-2xl mx-auto">
+            {activeJobs.length > 0 && (
+              <div className="card p-4 mb-5 border-accent-magenta/25 bg-accent-magenta/5">
+                <div className="flex items-start gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-accent-magenta/10 text-accent-magenta flex items-center justify-center shrink-0">
+                    <Loader2 size={18} className="animate-spin" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-text-primary">
+                      {activeJobs.length === 1 ? 'Import running in the background' : `${activeJobs.length} imports running in the background`}
+                    </div>
+                    <div className="text-xs text-text-muted mt-1">
+                      You can leave this page. This list will reconnect to the job when you come back.
+                    </div>
+                    <div className="mt-3 space-y-2">
+                      {activeJobs.slice(0, 3).map(job => (
+                        <div key={job.id} className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-bg-inset/70 px-3 py-2 text-xs">
+                          <span className="text-text-secondary truncate">
+                            {(job.source_r2_key || 'Uploaded file').split('/').pop()}
+                          </span>
+                          <span className="text-accent-magenta shrink-0">
+                            {job.processed_rows ? `${job.processed_rows} routed` : 'analyzing...'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Upload Area */}
             <label
               className={`card border-2 border-dashed flex flex-col items-center justify-center py-16 cursor-pointer transition-all ${

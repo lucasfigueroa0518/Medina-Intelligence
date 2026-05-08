@@ -786,6 +786,9 @@ async function routeAuthenticated(
   if (path === '/api/imports/intelligent' && method === 'POST') {
     return IntelligentImport.intelligentImport(request, ctx, env, ctxExec);
   }
+  if (path === '/api/imports' && method === 'GET') {
+    return Imports.listImports(ctx, env);
+  }
   if (path === '/api/imports' && method === 'POST') {
     return Imports.uploadImport(request, ctx, env);
   }

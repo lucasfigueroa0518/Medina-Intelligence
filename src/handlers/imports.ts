@@ -5,6 +5,23 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { callClaude } from '../lib/claude';
 import { IMPORT_COLUMN_MAPPING_PROMPT } from '../prompts/import-mapping';
 
+export async function listImports(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const imports = await env.D1.prepare(
+    `SELECT id, source_type, source_r2_key, status,
+            total_rows, processed_rows, created_rows, updated_rows,
+            skipped_rows, failed_rows, created_at, updated_at
+       FROM import_jobs
+      WHERE org_id = ?
+      ORDER BY created_at DESC
+      LIMIT 50`
+  ).bind(ctx.orgId).all();
+
+  return jsonResponse({ imports: imports.results || [] });
+}
+
 export async function uploadImport(
   request: Request,
   ctx: AuthContext,

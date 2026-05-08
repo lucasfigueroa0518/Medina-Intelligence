@@ -55,6 +55,8 @@ const RULES: Rule[] = [
 
   // ── RELATIONSHIPS ──────────────────────────────────────────────────────
   { pattern: /\b(contact[\s_-]?list|attendee[\s_-]?list|crm[\s_-]?export|vcard|linkedin[\s_-]?export|guest[\s_-]?list)\b/, category: 'contact_data', confidence: 'high', why: 'contact-data structures' },
+  { pattern: /\b(vc|venture[\s_-]?capital|investor|lp|family[\s_-]?office|firm)[\s_-]?(?:list|directory|database|spreadsheet|sheet)\b/, category: 'contact_data', confidence: 'high', why: 'relationship directory/list spreadsheet' },
+  { pattern: /\b(?:list|directory|database|spreadsheet|sheet)[\s_-]?(vc|venture[\s_-]?capital|investor|lp|family[\s_-]?office|firm)\b/, category: 'contact_data', confidence: 'high', why: 'relationship directory/list spreadsheet' },
   { pattern: /\.vcf$/, category: 'contact_data', confidence: 'high', why: 'vCard file extension' },
 
   { pattern: /\b(email[\s_-]?(?:thread|chain)|fwd?[\s_-]?re|reply[\s_-]?chain)\b/, category: 'correspondence', confidence: 'medium', why: 'plain "thread"/"reply" too noisy alone — restrict to email-thread phrasing' },

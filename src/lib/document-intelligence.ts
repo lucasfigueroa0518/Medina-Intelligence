@@ -187,8 +187,7 @@ export async function classifyDocument(
       'low',
       env
     );
-    const cleaned = response.trim().replace(/```json\s*/g, '').replace(/```/g, '').trim();
-    const parsed = JSON.parse(cleaned);
+    const parsed = parseJsonObject(response);
     const cat = parsed.category as DocumentCategory;
     // Validate against the allow-list — never return an unknown string as a category.
     const valid: Set<DocumentCategory> = new Set([
@@ -262,6 +261,44 @@ const TABULAR_CATEGORIES = new Set<DocumentCategory>([
   'fund_reporting',
 ]);
 
+function parseJsonObject<T = any>(raw: string): T {
+  const cleaned = raw.trim().replace(/```json\s*/g, '').replace(/```/g, '').trim();
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch (firstError) {
+    const start = cleaned.indexOf('{');
+    if (start < 0) throw firstError;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < cleaned.length; i++) {
+      const ch = cleaned[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\' && inString) {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (ch === '{') depth++;
+      if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return JSON.parse(cleaned.slice(start, i + 1)) as T;
+        }
+      }
+    }
+    throw firstError;
+  }
+}
+
 // Tabular text larger than this gets line-chunked across multiple Claude
 // calls so a 500-row XLSX doesn't get silently truncated at the 30k limit.
 const TABULAR_CHUNK_THRESHOLD = 15000;
@@ -302,8 +339,7 @@ export async function extractEntities(
       'high',
       env
     );
-    const cleaned = response.trim().replace(/```json\s*/g, '').replace(/```/g, '').trim();
-    const parsed = JSON.parse(cleaned);
+    const parsed = parseJsonObject(response);
 
     return {
       category,
@@ -356,8 +392,7 @@ async function extractTabularChunked(
         'high',
         env
       );
-      const cleaned = response.trim().replace(/```json\s*/g, '').replace(/```/g, '').trim();
-      const parsed = JSON.parse(cleaned);
+      const parsed = parseJsonObject(response);
       merged.contacts.push(...(parsed.contacts || []).filter((c: any) => c.full_name));
       merged.companies.push(...(parsed.companies || []).filter((c: any) => c.name));
       merged.deals.push(...(parsed.deals || []));

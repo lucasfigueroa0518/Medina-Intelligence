@@ -1,18 +1,18 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
-import { processIntelligentImport } from '../lib/document-intelligence';
 import { emitAudit } from '../lib/audit';
+import { enqueueWork } from '../lib/work-queue';
 
 // Always async — the upload returns 202 with a job_id immediately so the UI
-// is free to navigate away. Processing runs in waitUntil and the user polls
-// GET /api/imports/:id (or sees the job in the listing on /imports) to find
-// out when it completes.
+// is free to navigate away. Processing runs through the durable work_queue
+// and the user polls GET /api/imports/:id (or sees the job in the listing on
+// /imports) to find out when it completes.
 export async function intelligentImport(
   request: Request,
   ctx: AuthContext,
   env: Env,
-  ctxExec: ExecutionContext
+  _ctxExec: ExecutionContext
 ): Promise<Response> {
   const form = await request.formData();
   const file = form.get('file') as File | null;
@@ -25,6 +25,30 @@ export async function intelligentImport(
     return errorResponse('FILE_TOO_LARGE', 400, 'Maximum file size is 25MB');
   }
 
+  // If the user retries the same upload while the first copy is still
+  // processing, return the active job instead of creating duplicate CRM work.
+  const activeCutoff = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const activeSameFile = await env.D1.prepare(
+    `SELECT id, source_r2_key
+       FROM import_jobs
+      WHERE org_id = ?
+        AND source_type = 'intelligent'
+        AND status = 'processing'
+        AND source_r2_key LIKE ?
+        AND created_at > ?
+      ORDER BY created_at DESC
+      LIMIT 1`
+  ).bind(ctx.orgId, `%_${file.name}`, activeCutoff).first<{ id: string; source_r2_key: string }>();
+
+  if (activeSameFile) {
+    return jsonResponse({
+      job_id: activeSameFile.id,
+      status: 'processing',
+      file_name: file.name,
+      message: 'This file is already being analyzed in the background.',
+    }, 202);
+  }
+
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
   const r2Key = `${ctx.orgId}/imports/${now.slice(0, 7)}/${jobId}_${file.name}`;
@@ -32,54 +56,49 @@ export async function intelligentImport(
   // Persist the raw upload + an import_jobs row before we return so the UI
   // can poll immediately.
   const buffer = await file.arrayBuffer();
-  await env.R2.put(r2Key, buffer);
+  await env.R2.put(r2Key, buffer, {
+    httpMetadata: { contentType: file.type || 'application/octet-stream' },
+  });
 
   await env.D1.prepare(
     `INSERT INTO import_jobs (id, org_id, created_by, source_type, source_r2_key, status, created_at, updated_at)
      VALUES (?, ?, ?, 'intelligent', ?, 'processing', ?, ?)`
   ).bind(jobId, ctx.orgId, ctx.userId, r2Key, now, now).run();
 
-  // Re-create a File from the buffer for the background task — the original
-  // request body is consumed by formData() above and isn't safe to pass into
-  // waitUntil where the request lifetime has already ended.
-  const fileForBg = new File([buffer], file.name, { type: file.type });
-
-  ctxExec.waitUntil(
-    (async () => {
-      try {
-        const result = await processIntelligentImport(
-          fileForBg, ctx.orgId, ctx.userId, env, jobId
-        );
-
-        await env.D1.prepare(
-          `UPDATE import_jobs SET
-             status = 'completed',
-             total_rows = ?, created_rows = ?, updated_rows = ?,
-             processed_rows = ?, skipped_rows = 0, failed_rows = ?,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-           WHERE id = ?`
-        ).bind(
-          result.contacts_created + result.companies_created + result.deals_created + result.contacts_updated + result.companies_updated,
-          result.contacts_created + result.companies_created + result.deals_created,
-          result.contacts_updated + result.companies_updated,
-          result.entities_routed,
-          result.errors.length,
-          jobId
-        ).run();
-      } catch (e: any) {
-        console.error('[intelligent-import] async processing failed:', e);
-        await env.D1.prepare(
-          `UPDATE import_jobs SET status = 'failed', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-        ).bind(jobId).run();
+  try {
+    await enqueueWork(
+      env,
+      ctx.orgId,
+      'intelligent_import',
+      {
+        import_job_id: jobId,
+        r2_key: r2Key,
+        file_name: file.name,
+        mime_type: file.type || null,
+        user_id: ctx.userId,
+      },
+      {
+        upstream: 'claude',
+        idempotency_key: `${ctx.orgId}:${jobId}:intelligent_import`,
+        max_attempts: 3,
       }
-    })()
-  );
+    );
+  } catch (e) {
+    console.error('[intelligent-import] queue enqueue failed:', e);
+    await env.D1.prepare(
+      `UPDATE import_jobs
+          SET status = 'failed',
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(jobId).run();
+    return errorResponse('IMPORT_QUEUE_FAILED', 500, 'Import uploaded, but the background processor could not be queued.');
+  }
 
   return jsonResponse({
     job_id: jobId,
     status: 'processing',
     file_name: file.name,
-    message: 'Import started — you can navigate away. Poll GET /api/imports/:id for status.',
+    message: 'Import queued — you can navigate away. Poll GET /api/imports/:id for status.',
   }, 202);
 }
 
