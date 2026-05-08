@@ -513,8 +513,9 @@ export default function ImportsPage() {
                 <div className="card p-6 text-sm text-text-muted text-center">No imports yet</div>
               ) : (
                 <div className="card p-0 overflow-hidden">
-                  <table className="w-full text-sm">
-                    <thead>
+                  <div className="max-h-[420px] overflow-auto overscroll-contain">
+                    <table className="min-w-[860px] w-full text-sm">
+                    <thead className="sticky top-0 z-10">
                       <tr className="border-b border-border bg-bg-inset/50">
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">File</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Type</th>
@@ -526,7 +527,7 @@ export default function ImportsPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {history.slice(0, 20).map(job => {
+                      {history.map(job => {
                         const clickable = job.status === 'completed';
                         return (
                           <tr
@@ -572,6 +573,7 @@ export default function ImportsPage() {
                       })}
                     </tbody>
                   </table>
+                  </div>
                 </div>
               )}
             </div>
