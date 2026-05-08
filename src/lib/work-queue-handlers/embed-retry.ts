@@ -34,12 +34,16 @@
 import type { Env } from '../../types/env';
 import type { WorkQueueHandler } from '../work-queue-driver';
 import { recordUsage, recordRateLimit } from '../upstream-budget';
-import { embedSingleItem } from '../daily-cron';
+import { embedDocumentItem, embedSingleItem } from '../daily-cron';
+import { enqueueWork } from '../work-queue';
 
 interface EmbedRetryPayload {
   entity_id: string;
   source_table: 'conversations' | 'events' | 'documents';
+  cursor?: number | null;
 }
+
+const DOCUMENT_CHUNKS_PER_WORK_ITEM = 50;
 
 const TRANSIENT_RATE_LIMIT_PATTERNS = [
   'EMBED_RATE_LIMIT_TIMEOUT',
@@ -78,6 +82,36 @@ export const embedRetryHandler: WorkQueueHandler = {
     }
 
     try {
+      if (source_table === 'documents') {
+        const result = await embedDocumentItem(
+          entity_id,
+          item.org_id,
+          env,
+          Math.max(0, payload.cursor || 0),
+          DOCUMENT_CHUNKS_PER_WORK_ITEM
+        );
+
+        if (result.status === 'partial') {
+          const nextCursor = result.next_cursor ?? 0;
+          await enqueueWork(
+            env,
+            item.org_id,
+            'embed_retry',
+            { entity_id, source_table, cursor: nextCursor },
+            {
+              upstream: 'bge',
+              idempotency_key: `${item.org_id}:${entity_id}:documents:${nextCursor}`,
+              max_attempts: 3,
+            }
+          );
+        }
+
+        if (result.status !== 'missing' && result.status !== 'skipped') {
+          await recordUsage(env, item.org_id, null, 'bge', 'per_second');
+        }
+        return;
+      }
+
       // embedSingleItem returns 'embedded' | 'skipped' | 'missing'. All
       // three are non-retryable success terminals — driver's completeWork
       // path runs after we return.

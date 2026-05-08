@@ -1248,6 +1248,88 @@ export async function processEmbedRetryQueue(
   return result ?? { processed: 0, succeeded: 0, failed: 0, stale_reset: 0 };
 }
 
+export interface DocumentEmbedResult {
+  status: 'embedded' | 'skipped' | 'missing' | 'partial';
+  next_cursor?: number;
+  total_chunks?: number;
+}
+
+export async function embedDocumentItem(
+  entityId: string,
+  orgId: string,
+  env: Env,
+  cursor = 0,
+  maxChunks = Number.POSITIVE_INFINITY
+): Promise<DocumentEmbedResult> {
+  const row = await env.D1.prepare(
+    `SELECT id, title, document_type, r2_key, created_at,
+            contact_id, company_id, conversation_id
+       FROM documents WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(entityId, orgId).first<{
+    id: string; title: string; document_type: string; r2_key: string;
+    created_at: string; contact_id: string | null; company_id: string | null; conversation_id: string | null;
+  }>();
+  if (!row) return { status: 'missing' };
+  if (!row.r2_key) return { status: 'missing' };
+
+  const { chunkEmbedAndPersist } = await import('./embedding');
+  const { createSplitter } = await import('./chunking');
+  const { extractTextFromFile } = await import('./file-extraction');
+
+  const obj = await env.R2.get(row.r2_key);
+  if (!obj) return { status: 'missing' };
+  const buffer = await obj.arrayBuffer();
+  const file = new File([buffer], row.title, { type: '' });
+
+  let text: string;
+  try {
+    text = await extractTextFromFile(file);
+  } catch (e: any) {
+    console.error(`[self-heal] extract failed for doc ${entityId}:`, e?.message || e);
+    return { status: 'missing' };
+  }
+  if (!text || text.trim().length < 10) return { status: 'missing' };
+
+  const splitter = createSplitter(row.document_type || 'reference');
+  const chunks = await splitter.splitText(text);
+  if (chunks.length === 0) return { status: 'missing' };
+
+  const existing = await env.D1.prepare(
+    `SELECT COUNT(*) AS count FROM vector_entity_index
+       WHERE entity_id = ? AND source_table = 'documents' AND org_id = ?`
+  ).bind(row.id, orgId).first<{ count: number }>();
+  const existingCount = existing?.count || 0;
+  if (existingCount >= chunks.length) return { status: 'skipped', total_chunks: chunks.length };
+
+  const start = Math.max(0, cursor, existingCount);
+  const end = Math.min(chunks.length, start + Math.max(1, maxChunks));
+  if (start >= chunks.length) return { status: 'skipped', total_chunks: chunks.length };
+
+  for (let i = start; i < end; i++) {
+    const entry = await chunkEmbedAndPersist(chunks[i], {
+      org_id: orgId,
+      visibility: 'private',
+      document_type: row.document_type,
+      source_table: 'documents',
+      source_id: row.id,
+      r2_key: row.r2_key,
+      created_at: row.created_at,
+      primary_entity_id: row.contact_id || row.company_id || row.id,
+      entity_name: row.title,
+    }, i, chunks.length, env);
+
+    await env.D1.prepare(
+      'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+    ).bind(entry.vectorId, entry.entityId, entry.sourceTable, entry.orgId).run();
+  }
+
+  if (end < chunks.length) {
+    return { status: 'partial', next_cursor: end, total_chunks: chunks.length };
+  }
+
+  return { status: 'embedded', total_chunks: chunks.length };
+}
+
 // Re-embed a single item from its source table. Returns:
 //   'embedded' — vectors written to vector_entity_index
 //   'skipped'  — item already has vectors (dedup guard hit), nothing to do
@@ -1405,56 +1487,8 @@ export async function embedSingleItem(
   }
 
   if (sourceTable === 'documents') {
-    const row = await env.D1.prepare(
-      `SELECT id, title, document_type, r2_key, extracted_text_preview, created_at,
-              contact_id, company_id, conversation_id
-         FROM documents WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-    ).bind(entityId, orgId).first<{
-      id: string; title: string; document_type: string; r2_key: string;
-      extracted_text_preview: string | null; created_at: string;
-      contact_id: string | null; company_id: string | null; conversation_id: string | null;
-    }>();
-    if (!row) return 'missing';
-    if (!row.r2_key) return 'missing';
-
-    const { extractTextFromFile } = await import('./file-extraction');
-    const obj = await env.R2.get(row.r2_key);
-    if (!obj) return 'missing';
-    const buffer = await obj.arrayBuffer();
-    const file = new File([buffer], row.title, { type: '' });
-    // Wave 5 Phase A: extractTextFromFile now re-throws on parser error.
-    // Treat self-heal extraction failure as 'missing' (can't reconstruct
-    // chunks) rather than letting it crash the cron run.
-    let text: string;
-    try {
-      text = await extractTextFromFile(file);
-    } catch (e: any) {
-      console.error(`[self-heal] extract failed for doc ${entityId}:`, e?.message || e);
-      return 'missing';
-    }
-    if (!text || text.trim().length < 10) return 'missing';
-
-    const entries = await chunkEmbedAndPersistAll(text, {
-      org_id: orgId,
-      visibility: 'private',
-      document_type: row.document_type,
-      source_table: 'documents',
-      source_id: row.id,
-      r2_key: row.r2_key,
-      created_at: row.created_at,
-      primary_entity_id: row.contact_id || row.company_id || row.id,
-      entity_name: row.title,
-    }, env);
-
-    if (entries.length === 0) return 'skipped';
-    await env.D1.batch(
-      entries.map(e =>
-        env.D1.prepare(
-          'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-        ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
-      )
-    );
-    return 'embedded';
+    const result = await embedDocumentItem(entityId, orgId, env);
+    return result.status === 'partial' ? 'embedded' : result.status;
   }
 
   throw new Error(`unknown source_table: ${sourceTable}`);
