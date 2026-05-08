@@ -134,6 +134,9 @@ export interface ImportResult {
   document_id: string;
   category: DocumentCategory;
   summary: string;
+  completed: boolean;
+  next_start?: number;
+  total_units?: number;
   contacts_created: number;
   contacts_updated: number;
   companies_created: number;
@@ -150,6 +153,18 @@ export interface ImportResult {
     relationships: ExtractedRelationship[];
     signals: ExtractedSignal[];
   };
+}
+
+interface ImportProgressRow {
+  processed_rows: number | null;
+  created_rows: number | null;
+  updated_rows: number | null;
+  failed_rows: number | null;
+}
+
+interface ImportProcessingOptions {
+  startAt?: number;
+  maxUnits?: number;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1277,9 +1292,14 @@ export async function processIntelligentImport(
   orgId: string,
   userId: string,
   env: Env,
-  importJobId?: string
+  importJobId?: string,
+  options: ImportProcessingOptions = {}
 ): Promise<ImportResult> {
   const errors: string[] = [];
+  const startAt = Math.max(0, options.startAt || 0);
+  const maxUnits = Math.max(1, options.maxUnits || Number.POSITIVE_INFINITY);
+  let processedThisRun = 0;
+  let unitIndex = 0;
   // Helper to log lineage so the undo endpoint can revert exactly what was
   // created. Only CREATEs are tracked; updates to pre-existing entities are
   // intentionally not undoable (they entangle with downstream enrichment).
@@ -1343,9 +1363,24 @@ export async function processIntelligentImport(
   let contactsCreated = 0;
   let contactsUpdated = 0;
   let dealsCreated = 0;
-  let processedUnits = 0;
+  let processedUnits = startAt;
   let lastProgressAt = 0;
   const totalUnits = extraction.companies.length + extraction.contacts.length + extraction.deals.length + 1;
+  let baseCreated = 0;
+  let baseUpdated = 0;
+  let baseFailed = 0;
+
+  if (importJobId && startAt > 0) {
+    const existingProgress = await env.D1.prepare(
+      `SELECT processed_rows, created_rows, updated_rows, failed_rows
+         FROM import_jobs
+        WHERE id = ? AND org_id = ?
+        LIMIT 1`
+    ).bind(importJobId, orgId).first<ImportProgressRow>();
+    baseCreated = existingProgress?.created_rows || 0;
+    baseUpdated = existingProgress?.updated_rows || 0;
+    baseFailed = existingProgress?.failed_rows || 0;
+  }
 
   const ensureImportStillActive = async () => {
     if (!importJobId) return;
@@ -1379,9 +1414,9 @@ export async function processIntelligentImport(
     ).bind(
       totalUnits,
       Math.min(processedUnits, totalUnits),
-      contactsCreated + companiesCreated + dealsCreated,
-      contactsUpdated + companiesUpdated,
-      errors.length,
+      baseCreated + contactsCreated + companiesCreated + dealsCreated,
+      baseUpdated + contactsUpdated + companiesUpdated,
+      baseFailed + errors.length,
       importJobId,
       orgId
     ).run();
@@ -1389,8 +1424,39 @@ export async function processIntelligentImport(
 
   const markUnitProcessed = async (forceProgress = false) => {
     processedUnits++;
+    processedThisRun++;
     if (processedUnits % 50 === 0) await ensureImportStillActive();
     await updateImportProgress(forceProgress);
+  };
+
+  const shouldPause = () => processedThisRun >= maxUnits && processedUnits < totalUnits;
+
+  const partialResult = (currentDocumentId: string): ImportResult => {
+    const totalRouted = contactsCreated + contactsUpdated + companiesCreated + companiesUpdated + dealsCreated;
+    return {
+      document_id: currentDocumentId,
+      category,
+      summary: extraction.summary,
+      completed: false,
+      next_start: processedUnits,
+      total_units: totalUnits,
+      contacts_created: contactsCreated,
+      contacts_updated: contactsUpdated,
+      companies_created: companiesCreated,
+      companies_updated: companiesUpdated,
+      deals_created: dealsCreated,
+      relationships_found: extraction.relationships.length,
+      signals_found: extraction.signals.length,
+      entities_routed: totalRouted,
+      errors,
+      extraction: {
+        contacts: [],
+        companies: [],
+        deals: [],
+        relationships: [],
+        signals: [],
+      },
+    };
   };
 
   await updateImportProgress(true);
@@ -1451,7 +1517,11 @@ export async function processIntelligentImport(
   } catch (e: any) {
     errors.push(`Document store: ${e?.message || e}`);
   } finally {
-    await markUnitProcessed(true);
+    if (unitIndex >= startAt) {
+      await markUnitProcessed(true);
+      if (shouldPause()) return partialResult(documentId);
+    }
+    unitIndex++;
   }
 
   // Match + Route companies first (contacts may reference them)
@@ -1470,6 +1540,16 @@ export async function processIntelligentImport(
   }
 
   for (const company of extraction.companies) {
+    if (unitIndex < startAt) {
+      const existingMatch = matchCompanyFromIndexes(company, companyCandidates, companyByDomain, companyByName);
+      if (existingMatch.matched_id) {
+        companyLookup.set(company.name.toLowerCase(), existingMatch.matched_id);
+        const domain = normalizeLookupDomain(company.domain || company.website);
+        if (domain) companyDomainLookup.set(domain, existingMatch.matched_id);
+      }
+      unitIndex++;
+      continue;
+    }
     try {
       const match = matchCompanyFromIndexes(company, companyCandidates, companyByDomain, companyByName);
       const result = await routeCompany(company, match, orgId, documentId, env);
@@ -1490,6 +1570,8 @@ export async function processIntelligentImport(
       errors.push(`Company "${company.name}": ${e.message}`);
     } finally {
       await markUnitProcessed();
+      unitIndex++;
+      if (shouldPause()) return partialResult(documentId);
     }
   }
 
@@ -1511,6 +1593,10 @@ export async function processIntelligentImport(
   }
 
   for (const contact of extraction.contacts) {
+    if (unitIndex < startAt) {
+      unitIndex++;
+      continue;
+    }
     try {
       const match = matchContactFromIndexes(contact, contactCandidates, contactByEmail, contactByName);
       let preferredCompanyId = contact.company_name ? companyLookup.get(contact.company_name.toLowerCase()) : null;
@@ -1554,11 +1640,17 @@ export async function processIntelligentImport(
       errors.push(`Contact "${contact.full_name}": ${e.message}`);
     } finally {
       await markUnitProcessed();
+      unitIndex++;
+      if (shouldPause()) return partialResult(documentId);
     }
   }
 
   // Route deals
   for (const deal of extraction.deals) {
+    if (unitIndex < startAt) {
+      unitIndex++;
+      continue;
+    }
     try {
       const result = await routeDeal(deal, companyLookup, orgId, env);
       if (result.created) { dealsCreated++; await logCreated('deal', result.id); }
@@ -1566,10 +1658,14 @@ export async function processIntelligentImport(
       errors.push(`Deal "${deal.name}": ${e.message}`);
     } finally {
       await markUnitProcessed();
+      unitIndex++;
+      if (shouldPause()) return partialResult(documentId);
     }
   }
 
   // Audit
+  await updateImportProgress(true);
+
   await emitAudit(env, {
     org_id: orgId,
     user_id: userId,
@@ -1597,6 +1693,8 @@ export async function processIntelligentImport(
     document_id: documentId,
     category,
     summary: extraction.summary,
+    completed: true,
+    total_units: totalUnits,
     contacts_created: contactsCreated,
     contacts_updated: contactsUpdated,
     companies_created: companiesCreated,
