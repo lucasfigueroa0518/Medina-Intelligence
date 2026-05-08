@@ -21,6 +21,7 @@ interface ImportJobRow {
   processed_rows: number | null;
   created_rows: number | null;
   updated_rows: number | null;
+  skipped_rows: number | null;
   failed_rows: number | null;
 }
 
@@ -28,6 +29,7 @@ interface ImportProgressRow {
   processed_rows: number | null;
   created_rows: number | null;
   updated_rows: number | null;
+  skipped_rows: number | null;
   failed_rows: number | null;
 }
 
@@ -75,7 +77,7 @@ export const intelligentImportHandler: WorkQueueHandler = {
     const payload = decodePayload(item.payload);
     const job = await env.D1.prepare(
       `SELECT id, org_id, created_by, source_r2_key, status,
-              processed_rows, created_rows, updated_rows, failed_rows
+              processed_rows, created_rows, updated_rows, skipped_rows, failed_rows
          FROM import_jobs
         WHERE id = ? AND org_id = ?`
     ).bind(payload.import_job_id, item.org_id).first<ImportJobRow>();
@@ -157,7 +159,7 @@ export const intelligentImportHandler: WorkQueueHandler = {
       }
 
       const finalProgress = await env.D1.prepare(
-        `SELECT processed_rows, created_rows, updated_rows, failed_rows
+        `SELECT processed_rows, created_rows, updated_rows, skipped_rows, failed_rows
            FROM import_jobs
           WHERE id = ? AND org_id = ?
           LIMIT 1`
@@ -167,6 +169,7 @@ export const intelligentImportHandler: WorkQueueHandler = {
       const chunkUpdated = result.contacts_updated + result.companies_updated;
       const created = Math.max(finalProgress?.created_rows || 0, chunkCreated);
       const updated = Math.max(finalProgress?.updated_rows || 0, chunkUpdated);
+      const skipped = Math.max(finalProgress?.skipped_rows || 0, result.contacts_skipped || 0);
       const failed = Math.max(finalProgress?.failed_rows || 0, result.errors.length);
       const processed = result.total_units || finalProgress?.processed_rows || result.entities_routed;
 
@@ -177,7 +180,7 @@ export const intelligentImportHandler: WorkQueueHandler = {
            created_rows = ?,
            updated_rows = ?,
            processed_rows = ?,
-           skipped_rows = 0,
+           skipped_rows = ?,
            failed_rows = ?,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE id = ?`
@@ -186,6 +189,7 @@ export const intelligentImportHandler: WorkQueueHandler = {
         created,
         updated,
         processed,
+        skipped,
         failed,
         job.id
       ).run();

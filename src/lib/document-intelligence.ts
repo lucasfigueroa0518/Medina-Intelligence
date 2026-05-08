@@ -139,6 +139,7 @@ export interface ImportResult {
   total_units?: number;
   contacts_created: number;
   contacts_updated: number;
+  contacts_skipped: number;
   companies_created: number;
   companies_updated: number;
   deals_created: number;
@@ -159,6 +160,7 @@ interface ImportProgressRow {
   processed_rows: number | null;
   created_rows: number | null;
   updated_rows: number | null;
+  skipped_rows: number | null;
   failed_rows: number | null;
 }
 
@@ -982,7 +984,8 @@ function matchContactFromIndexes(
   extracted: ExtractedContact,
   candidates: ExistingContactRow[],
   byEmail: Map<string, ExistingContactRow>,
-  byName: Map<string, ExistingContactRow[]>
+  byName: Map<string, ExistingContactRow[]>,
+  preferredCompanyId?: string | null
 ): MatchedEntity {
   const email = extracted.email?.toLowerCase().trim();
   if (email) {
@@ -995,9 +998,20 @@ function matchContactFromIndexes(
   const name = normalizeLookupName(extracted.full_name);
   if (name) {
     const exactNameMatches = byName.get(name) || [];
-    if (exactNameMatches.length === 1) {
+    if (
+      exactNameMatches.length === 1 &&
+      preferredCompanyId &&
+      exactNameMatches[0].company_id === preferredCompanyId
+    ) {
       return { extracted_name: extracted.full_name, matched_id: exactNameMatches[0].id, match_type: 'exact', confidence: 0.94 };
     }
+  }
+
+  // Without email, name-only fuzzy matching is too risky for bulk document
+  // imports. Keep these as skipped candidates unless we already matched the
+  // same person at the same company above.
+  if (!email) {
+    return { extracted_name: extracted.full_name, matched_id: null, match_type: 'new', confidence: 0 };
   }
 
   return matchContactFromCandidates(extracted, candidates);
@@ -1099,7 +1113,7 @@ async function routeContact(
   documentId: string,
   env: Env,
   preferredCompanyId?: string | null
-): Promise<{ created: boolean; updated: boolean; id: string }> {
+): Promise<{ created: boolean; updated: boolean; skipped: boolean; id: string | null; skip_reason?: string }> {
   if (match.matched_id && match.match_type !== 'new') {
     const hasUpdates = !!(
       extracted.job_title ||
@@ -1127,7 +1141,18 @@ async function routeContact(
         match.matched_id, orgId
       ).run();
     }
-    return { created: false, updated: hasUpdates, id: match.matched_id };
+    return { created: false, updated: hasUpdates, skipped: false, id: match.matched_id };
+  }
+
+  const email = extracted.email?.trim();
+  if (!email) {
+    return {
+      created: false,
+      updated: false,
+      skipped: true,
+      id: null,
+      skip_reason: 'missing_email_for_new_contact',
+    };
   }
 
   const contactId = crypto.randomUUID();
@@ -1143,7 +1168,7 @@ async function routeContact(
   ).bind(
     contactId, orgId,
     extracted.full_name,
-    extracted.email || null,
+    email,
     extracted.phone || null,
     extracted.job_title || null,
     extracted.linkedin_url || null,
@@ -1153,7 +1178,7 @@ async function routeContact(
     now, now
   ).run();
 
-  return { created: true, updated: false, id: contactId };
+  return { created: true, updated: false, skipped: false, id: contactId };
 }
 
 async function routeCompany(
@@ -1362,23 +1387,26 @@ export async function processIntelligentImport(
   let companiesUpdated = 0;
   let contactsCreated = 0;
   let contactsUpdated = 0;
+  let contactsSkipped = 0;
   let dealsCreated = 0;
   let processedUnits = startAt;
   let lastProgressAt = 0;
   const totalUnits = extraction.companies.length + extraction.contacts.length + extraction.deals.length + 1;
   let baseCreated = 0;
   let baseUpdated = 0;
+  let baseSkipped = 0;
   let baseFailed = 0;
 
   if (importJobId && startAt > 0) {
     const existingProgress = await env.D1.prepare(
-      `SELECT processed_rows, created_rows, updated_rows, failed_rows
+      `SELECT processed_rows, created_rows, updated_rows, skipped_rows, failed_rows
          FROM import_jobs
         WHERE id = ? AND org_id = ?
         LIMIT 1`
     ).bind(importJobId, orgId).first<ImportProgressRow>();
     baseCreated = existingProgress?.created_rows || 0;
     baseUpdated = existingProgress?.updated_rows || 0;
+    baseSkipped = existingProgress?.skipped_rows || 0;
     baseFailed = existingProgress?.failed_rows || 0;
   }
 
@@ -1408,6 +1436,7 @@ export async function processIntelligentImport(
               processed_rows = ?,
               created_rows = ?,
               updated_rows = ?,
+              skipped_rows = ?,
               failed_rows = ?,
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         WHERE id = ? AND org_id = ?`
@@ -1416,6 +1445,7 @@ export async function processIntelligentImport(
       Math.min(processedUnits, totalUnits),
       baseCreated + contactsCreated + companiesCreated + dealsCreated,
       baseUpdated + contactsUpdated + companiesUpdated,
+      baseSkipped + contactsSkipped,
       baseFailed + errors.length,
       importJobId,
       orgId
@@ -1442,6 +1472,7 @@ export async function processIntelligentImport(
       total_units: totalUnits,
       contacts_created: contactsCreated,
       contacts_updated: contactsUpdated,
+      contacts_skipped: contactsSkipped,
       companies_created: companiesCreated,
       companies_updated: companiesUpdated,
       deals_created: dealsCreated,
@@ -1598,17 +1629,20 @@ export async function processIntelligentImport(
       continue;
     }
     try {
-      const match = matchContactFromIndexes(contact, contactCandidates, contactByEmail, contactByName);
       let preferredCompanyId = contact.company_name ? companyLookup.get(contact.company_name.toLowerCase()) : null;
       if (!preferredCompanyId && contact.email) {
         const emailDomain = normalizeLookupDomain(contact.email.split('@')[1]);
         preferredCompanyId = companyDomainLookup.get(emailDomain) || null;
       }
+      const match = matchContactFromIndexes(contact, contactCandidates, contactByEmail, contactByName, preferredCompanyId);
       const result = await routeContact(contact, match, orgId, documentId, env, preferredCompanyId);
+      if (result.skipped) {
+        contactsSkipped++;
+      }
       if (result.created) {
         contactsCreated++;
         const candidate = {
-          id: result.id,
+          id: result.id!,
           full_name: contact.full_name,
           email: contact.email || null,
           phone: contact.phone || null,
@@ -1623,7 +1657,7 @@ export async function processIntelligentImport(
           bucket.push(candidate);
           contactByName.set(name, bucket);
         }
-        await logCreated('contact', result.id);
+        await logCreated('contact', result.id!);
       }
       if (result.updated) contactsUpdated++;
 
@@ -1678,6 +1712,7 @@ export async function processIntelligentImport(
       extraction_failed: extractionFailed,
       contacts_created: contactsCreated,
       contacts_updated: contactsUpdated,
+      contacts_skipped: contactsSkipped,
       companies_created: companiesCreated,
       companies_updated: companiesUpdated,
       deals_created: dealsCreated,
@@ -1697,6 +1732,7 @@ export async function processIntelligentImport(
     total_units: totalUnits,
     contacts_created: contactsCreated,
     contacts_updated: contactsUpdated,
+    contacts_skipped: contactsSkipped,
     companies_created: companiesCreated,
     companies_updated: companiesUpdated,
     deals_created: dealsCreated,
