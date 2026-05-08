@@ -117,6 +117,46 @@ function fmtDate(iso?: string): string | undefined {
   }
 }
 
+function fmtSourceAge(iso?: string, nowMs: number = Date.now()): string | undefined {
+  if (!iso) return undefined;
+  const sourceMs = new Date(iso).getTime();
+  if (!Number.isFinite(sourceMs)) return undefined;
+  const diffDays = Math.floor((nowMs - sourceMs) / 86_400_000);
+  if (diffDays < 0) return 'future-dated';
+  if (diffDays === 0) return 'today';
+  if (diffDays === 1) return '1 day old';
+  if (diffDays < 14) return `${diffDays} days old`;
+  if (diffDays < 60) {
+    const weeks = Math.floor(diffDays / 7);
+    return `${weeks} week${weeks === 1 ? '' : 's'} old`;
+  }
+  const months = Math.max(1, Math.floor(diffDays / 30));
+  return `${months} month${months === 1 ? '' : 's'} old`;
+}
+
+function sourceDateSuffix(iso?: string, nowMs: number = Date.now()): string {
+  const date = fmtDate(iso);
+  if (!date) return '';
+  const age = fmtSourceAge(iso, nowMs);
+  return ` — source date: ${date}${age ? ` (${age})` : ''}`;
+}
+
+const RELATIVE_TIME_RE =
+  /\b(next|last|this)\s+(week|month|quarter|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b(today|tomorrow|yesterday|tonight|currently|right now|now|soon|upcoming|on the horizon|in a week|in the next|later this week|earlier this week)\b/i;
+
+function hasRelativeTimeLanguage(text: string): boolean {
+  return RELATIVE_TIME_RE.test(text);
+}
+
+function timelineNoteForSource(sourceId: number, source?: CitationSource, nowMs: number = Date.now()): string {
+  const date = fmtDate(source?.date);
+  const age = fmtSourceAge(source?.date, nowMs);
+  if (!date) {
+    return `\n[TIMELINE NOTE for source ${sourceId}: this chunk contains relative time language but no source date. Do not turn "next week", "currently", "today", or similar phrases into current claims unless another dated source confirms them.]`;
+  }
+  return `\n[TIMELINE NOTE for source ${sourceId}: relative phrases in this source are anchored to ${date}${age ? ` (${age})` : ''}, not today's date. If you cite it, use "as of ${date}" or convert the timing to an absolute/historical timeframe. Do not call an old "next week" event upcoming unless newer evidence confirms it.]`;
+}
+
 async function hydrateSources(
   refs: { id: number; chunk: HydratedChunk }[],
   orgId: string,
@@ -449,19 +489,19 @@ async function hydrateSources(
   return Array.from(out.values()).sort((a, b) => a.id - b.id);
 }
 
-function formatSourceLine(s: CitationSource): string {
-  const date = fmtDate(s.date);
+function formatSourceLine(s: CitationSource, nowMs: number = Date.now()): string {
+  const date = sourceDateSuffix(s.date, nowMs);
   switch (s.type) {
     case 'email':
-      return `[${s.id}] EMAIL — "${s.title}"${s.subtitle ? ` — ${s.subtitle}` : ''}${date ? ` — ${date}` : ''}`;
+      return `[${s.id}] EMAIL — "${s.title}"${s.subtitle ? ` — ${s.subtitle}` : ''}${date}`;
     case 'slack':
-      return `[${s.id}] SLACK — ${s.subtitle || 'message'}: "${s.title}"${date ? ` — ${date}` : ''}`;
+      return `[${s.id}] SLACK — ${s.subtitle || 'message'}: "${s.title}"${date}`;
     case 'meeting':
-      return `[${s.id}] MEETING — "${s.title}"${date ? ` — ${date}` : ''}`;
+      return `[${s.id}] MEETING — "${s.title}"${date}`;
     case 'document':
-      return `[${s.id}] DOCUMENT — "${s.title}"${s.subtitle ? ` (${s.subtitle})` : ''}${date ? ` — ${date}` : ''}`;
+      return `[${s.id}] DOCUMENT — "${s.title}"${s.subtitle ? ` (${s.subtitle})` : ''}${date}`;
     case 'news':
-      return `[${s.id}] NEWS — "${s.title}"${s.subtitle ? ` — ${s.subtitle}` : ''}${date ? ` — ${date}` : ''}`;
+      return `[${s.id}] NEWS — "${s.title}"${s.subtitle ? ` — ${s.subtitle}` : ''}${date}`;
     case 'contact':
       return `[${s.id}] CONTACT — ${s.title}${s.subtitle ? ` (${s.subtitle})` : ''}`;
     case 'company':
@@ -555,8 +595,18 @@ export async function buildSourcesAndContext(
 
   // SOURCES list at the top of the context — Claude reads this as the lookup
   // table for [^N] markers.
-  let header = 'SOURCES (cite these by number using [^N] format — never with parentheticals):\n';
-  for (const s of sources) header += formatSourceLine(s) + '\n';
+  const now = new Date();
+  const nowMs = now.getTime();
+  const today = fmtDate(now.toISOString()) || now.toISOString().slice(0, 10);
+  let header = `CURRENT DATE: ${today} (${now.toISOString()})\n\n`;
+  header += 'SOURCES (cite these by number using [^N] format — never with parentheticals):\n';
+  for (const s of sources) header += formatSourceLine(s, nowMs) + '\n';
+  header += `
+TIMELINE SAFETY:
+- Source dates above are authoritative. Relative phrases inside a source ("next week", "tomorrow", "currently", "now", "this week", "on the horizon") are relative to that source date, not the current date.
+- If an older source says something was happening "next week", convert it to an absolute/historical timeframe or say "as of SOURCE_DATE". Do not repeat it as "next week" unless newer evidence confirms that timing.
+- Before saying an event is current or upcoming, compare the source date and wording against CURRENT DATE. If timing is unclear, say it is unconfirmed.
+`;
 
   // Wave-fix Chunk 2 sentinels. Two failure modes the prompt-only fix in
   // Chunk 1 doesn't address structurally:
@@ -598,6 +648,7 @@ export async function buildSourcesAndContext(
 
   let body = '\nCONTEXT FROM SOURCES:\n';
   let tokens = 0;
+  const sourceById = new Map(sources.map(s => [s.id, s] as const));
   for (const ref of orderedChunks) {
     const isNews = (ref.chunk.metadata.document_type as string) === 'news';
     if (isNews) continue; // news rendered separately below with UNVERIFIED tag
@@ -608,7 +659,10 @@ export async function buildSourcesAndContext(
       t > PER_CHUNK_MAX
         ? truncateToTokens(ref.chunk.hydrated_text, PER_CHUNK_MAX)
         : ref.chunk.hydrated_text;
-    body += `\n[${sourceId}] ${text}\n`;
+    const timelineNote = hasRelativeTimeLanguage(text)
+      ? timelineNoteForSource(sourceId, sourceById.get(sourceId), nowMs)
+      : '';
+    body += `\n[${sourceId}]${timelineNote}\n${text}\n`;
     tokens += estimateTokens(text);
   }
 
@@ -628,7 +682,10 @@ export async function buildSourcesAndContext(
     const sourceId = sourceIdByKey.get(ref.sourceKey)!;
     const t = estimateTokens(ref.chunk.hydrated_text);
     if (nt + t > NEWS_TOKEN_BUDGET) break;
-    newsBlock += `\n[${sourceId}] [EXTERNAL — UNVERIFIED | ${ref.chunk.metadata.created_at || ''}]\n${ref.chunk.hydrated_text}\n`;
+    const timelineNote = hasRelativeTimeLanguage(ref.chunk.hydrated_text)
+      ? timelineNoteForSource(sourceId, sourceById.get(sourceId), nowMs)
+      : '';
+    newsBlock += `\n[${sourceId}] [EXTERNAL — UNVERIFIED | ${ref.chunk.metadata.created_at || ''}]${timelineNote}\n${ref.chunk.hydrated_text}\n`;
     nt += t;
   }
 

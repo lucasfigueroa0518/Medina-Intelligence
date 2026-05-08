@@ -45,6 +45,26 @@ import {
   wasCancelledIncludingKV,
 } from '../lib/agent-cancellation';
 
+function formatCurrentDateForMarty(now: Date): string {
+  return now.toLocaleDateString('en-US', {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+function buildTimelineAwarenessPrompt(now: Date): string {
+  const today = formatCurrentDateForMarty(now);
+  return `CURRENT DATE: ${today} (${now.toISOString()})
+
+TIMELINE AWARENESS - LOAD-BEARING:
+- Source dates are authoritative. Relative phrases inside emails, Slack, meetings, documents, and tool results ("next week", "tomorrow", "currently", "now", "this week", "on the horizon") are relative to the source date, not today's date.
+- Before saying anything is current or upcoming, compare the source date and wording against CURRENT DATE.
+- If an old source says "next week", do not repeat "next week" as if it is still future. Convert it to an absolute/historical timeframe, or write "as of SOURCE_DATE" and say the current status is unconfirmed unless newer evidence confirms it.
+- Prefer absolute dates when timing matters. If timing cannot be confirmed, say so clearly.`;
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions for Claude
 // ---------------------------------------------------------------------------
@@ -53,7 +73,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
   // PRIMARY RETRIEVAL — call this FIRST for any content question
   {
     name: 'recall',
-    description: 'Semantic search across the firm intelligence — emails, Slack messages, meeting transcripts, documents, contacts, companies. THIS IS YOUR PRIMARY TOOL for any question about CRM content. Always call this FIRST when the user asks about communications, meetings, history, what was discussed, who said what, or any specific person/company/deal context. The pre-populated SOURCES list at the top of context is just the initial framing — call recall to dig deeper, retrieve a specific source type, or recover when SOURCES looks empty for an asked-for type. Examples: "what\'s been happening on Slack" → recall("recent slack activity", source_types=["slack"]). "summarize the NeuralSeek meeting" → recall("NeuralSeek meeting", source_types=["meeting"]). "find Patrick\'s pitch emails" → recall("Patrick Dyer pitch", source_types=["email"]).',
+    description: 'Semantic search across the firm intelligence — emails, Slack messages, meeting transcripts, documents, contacts, companies. THIS IS YOUR PRIMARY TOOL for any question about CRM content. Always call this FIRST when the user asks about communications, meetings, history, what was discussed, who said what, or any specific person/company/deal context. The pre-populated SOURCES list at the top of context is just the initial framing — call recall to dig deeper, retrieve a specific source type, or recover when SOURCES looks empty for an asked-for type. Treat each returned source date as authoritative: relative phrases in an excerpt ("next week", "currently", "now") are relative to that source date, not today. Examples: "what\'s been happening on Slack" → recall("recent slack activity", source_types=["slack"]). "summarize the NeuralSeek meeting" → recall("NeuralSeek meeting", source_types=["meeting"]). "find Patrick\'s pitch emails" → recall("Patrick Dyer pitch", source_types=["email"]).',
     input_schema: {
       type: 'object',
       properties: {
@@ -1079,7 +1099,7 @@ export async function queryAgent(
   ).bind(userMessageId, session.id, turnIndex, query, attachmentsJson).run();
 
   // --- Stream Claude response with tool use ---
-  let systemPrompt = GOD_MODE_SYSTEM_PROMPT;
+  let systemPrompt = `${GOD_MODE_SYSTEM_PROMPT}\n\n${buildTimelineAwarenessPrompt(new Date())}`;
   if (deepDive && stats) {
     systemPrompt += `\n\nYou are in Deep Dive mode. Begin your response with a single brief line summarizing the scope, formatted as:\n🔍 Deep dive: Searched ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts.\nThen proceed with your thorough analysis. Be exhaustive — reference every relevant piece of evidence you find. Cite specific emails, meetings, and documents by name and date. Don't summarize — be thorough.`;
   }

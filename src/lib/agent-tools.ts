@@ -465,6 +465,8 @@ export async function recall(
 
   return {
     count: trimmed.length,
+    current_date: new Date().toISOString(),
+    timeline_note: 'Dates are source dates. Relative phrases in excerpts such as "next week", "currently", "today", or "now" are relative to each source date, not the current date.',
     sources: trimmed.map(s => ({
       type: s.type,
       title: s.title,
