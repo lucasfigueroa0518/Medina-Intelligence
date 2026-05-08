@@ -34,17 +34,17 @@ interface Observation {
 }
 
 const OBSERVATION_LABELS: Record<string, string> = {
-  personal_update: 'Personal update',
-  follow_up_commitment: 'Follow-up commitment',
-  product_update: 'Product update',
+  personal_update: 'Personal Update',
+  follow_up_commitment: 'Follow-Up',
+  product_update: 'Product Update',
   partnership: 'Partnership',
-  relationship_knows_person: 'Knows person',
-  relationship_decision_maker: 'Decision maker',
-  relationship_introduction_offer: 'Introduction offered',
+  relationship_knows_person: 'Knows Person',
+  relationship_decision_maker: 'Decision Maker',
+  relationship_introduction_offer: 'Intro Offer',
 };
 
 function labelFor(type: string): string {
-  return OBSERVATION_LABELS[type] || type.replace(/_/g, ' ');
+  return OBSERVATION_LABELS[type] || type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
 function timeAgo(iso: string): string {
@@ -57,23 +57,98 @@ function timeAgo(iso: string): string {
   return `${Math.floor(diffSec / 86400)}d ago`;
 }
 
-// Some observation values are JSON (relationship_* signals carry a
-// structured object); others are plain strings. Best-effort render.
-function renderValue(v: string): React.ReactNode {
-  const trimmed = v.trim();
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        // Pull a few human-readable fields if present, fall back to
-        // compact JSON otherwise.
-        const desc = parsed.description || parsed.detail || parsed.summary;
-        if (desc) return <span>{String(desc)}</span>;
-        return <span className="font-mono text-[10px] text-text-muted/80">{JSON.stringify(parsed)}</span>;
-      }
-    } catch { /* fall through to raw string */ }
+interface ParsedObservationValue {
+  speaker?: unknown;
+  signal_type?: unknown;
+  people_involved?: unknown;
+  people?: unknown;
+  value?: unknown;
+  evidence?: unknown;
+  description?: unknown;
+  detail?: unknown;
+  summary?: unknown;
+  confidence?: unknown;
+}
+
+interface DisplayObservation {
+  label: string;
+  summary: string;
+  evidence: string | null;
+  speaker: string | null;
+  people: string[];
+  confidence: number;
+}
+
+function normalizeText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value
+    .replace(/\s+/g, ' ')
+    .replace(/^["'“”]+|["'“”]+$/g, '')
+    .trim();
+  return normalized || null;
+}
+
+function normalizePeople(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const people: string[] = [];
+  value.forEach(item => {
+    const text = normalizeText(item);
+    if (!text) return;
+    const key = text.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    people.push(text);
+  });
+  return people;
+}
+
+function mergePeople(primary: string[], secondary: string[]): string[] {
+  const seen = new Set(primary.map(person => person.toLowerCase()));
+  return primary.concat(secondary.filter(person => {
+    const key = person.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }));
+}
+
+function parseObservationValue(raw: string): ParsedObservationValue | null {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as ParsedObservationValue;
+    }
+  } catch {
+    return null;
   }
-  return <span>{v}</span>;
+  return null;
+}
+
+function formatObservation(o: Observation): DisplayObservation {
+  const parsed = parseObservationValue(o.observation_value);
+  const primaryPeople = normalizePeople(parsed?.people_involved);
+  const people = mergePeople(primaryPeople, normalizePeople(parsed?.people));
+  const rawFallback = o.observation_value.trim().startsWith('{')
+    ? null
+    : normalizeText(o.observation_value);
+  const summary = normalizeText(parsed?.value)
+    || normalizeText(parsed?.summary)
+    || normalizeText(parsed?.description)
+    || normalizeText(parsed?.detail)
+    || rawFallback
+    || 'Observation captured from recent communications.';
+  const parsedConfidence = typeof parsed?.confidence === 'number' ? parsed.confidence : null;
+  return {
+    label: labelFor(o.observation_type || normalizeText(parsed?.signal_type) || 'Observation'),
+    summary,
+    evidence: normalizeText(parsed?.evidence) || normalizeText(o.evidence),
+    speaker: normalizeText(parsed?.speaker),
+    people,
+    confidence: parsedConfidence ?? o.confidence,
+  };
 }
 
 export function RecentObservations({
@@ -144,35 +219,66 @@ export function RecentObservations({
             {observations.length}
           </span>
         </div>
-        <span className="text-[10px] text-text-muted/60 italic">
-          LLM-extracted from conversations you can read · not editable fields
+        <span className="hidden text-[10px] text-text-muted/60 sm:inline">
+          Signals from recent communications · dismiss anything no longer useful
         </span>
       </div>
-      <div>
-        {observations.map(o => (
+      <div className="divide-y divide-white/[0.04]">
+        {observations.map(o => {
+          const display = formatObservation(o);
+          const visiblePeople = display.people.slice(0, 4);
+          const hiddenPeople = Math.max(0, display.people.length - visiblePeople.length);
+
+          return (
           <div
             key={o.id}
-            className="grid grid-cols-[1fr_28px] md:grid-cols-[110px_1fr_72px_28px] gap-2 md:gap-x-2 items-start px-4 py-3 md:py-2"
-            style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}
+            className="grid grid-cols-[1fr_32px] gap-3 px-4 py-4 md:grid-cols-[150px_1fr_96px_28px] md:gap-x-4"
           >
-            <span className="text-[10px] font-semibold text-purple-400/80 uppercase tracking-wider truncate">
-              {labelFor(o.observation_type)}
-            </span>
-            <div className="text-xs text-text-secondary col-span-2 md:col-span-1 md:col-start-2">
-              {renderValue(o.observation_value)}
-              {o.evidence && (
-                <div className="text-[10px] text-text-muted/60 italic mt-0.5 line-clamp-2">
-                  evidence: {o.evidence}
+            <div className="min-w-0">
+              <span className="inline-flex max-w-full rounded-md bg-purple-500/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-purple-300">
+                <span className="truncate">{display.label}</span>
+              </span>
+              {display.speaker && (
+                <div className="mt-2 truncate text-[11px] text-text-muted">
+                  Mentioned by {display.speaker}
+                </div>
+              )}
+            </div>
+            <div className="col-span-2 min-w-0 md:col-span-1 md:col-start-2">
+              <p className="text-sm leading-relaxed text-text-secondary">
+                {display.summary}
+              </p>
+              {visiblePeople.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {visiblePeople.map(person => (
+                    <span
+                      key={person}
+                      className="max-w-[180px] truncate rounded-full bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium text-text-muted"
+                    >
+                      {person}
+                    </span>
+                  ))}
+                  {hiddenPeople > 0 && (
+                    <span className="rounded-full bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium text-text-muted">
+                      +{hiddenPeople}
+                    </span>
+                  )}
+                </div>
+              )}
+              {display.evidence && (
+                <div className="mt-2 rounded-lg border border-white/[0.06] bg-white/[0.025] px-3 py-2 text-[11px] leading-relaxed text-text-muted">
+                  <span className="font-semibold uppercase tracking-wide text-text-muted/80">Evidence: </span>
+                  <span className="line-clamp-2">{display.evidence}</span>
                 </div>
               )}
             </div>
             <div
-              className="text-[10px] text-text-muted/70 text-left md:text-right tabular-nums col-span-2 md:col-span-1"
+              className="col-span-2 text-left text-[10px] tabular-nums text-text-muted/70 md:col-span-1 md:text-right"
               title={`First: ${o.first_observed_at}\nLast: ${o.last_observed_at}\nChannels: ${o.channels.join(', ')}`}
             >
               <div>{timeAgo(o.last_observed_at)}</div>
               <div className="text-[9px] text-text-muted/60">
-                {o.channels.length}ch · {Math.round(o.confidence * 100)}%
+                {o.channels.length}ch · {Math.round(display.confidence * 100)}%
               </div>
             </div>
             <button
@@ -184,7 +290,8 @@ export function RecentObservations({
               ×
             </button>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
