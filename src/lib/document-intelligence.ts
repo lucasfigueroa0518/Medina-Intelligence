@@ -1,16 +1,15 @@
 import type { Env } from '../types/env';
 import type { ChunkMetadata } from '../types/interfaces';
+import Papa from 'papaparse';
 import { callClaude } from './claude';
 import { jaroWinkler, scoreSimilarity } from './dedup';
-import { proposeMultipleUpdates, type SourceType } from './progressive-enrichment';
 import { isCompanyInternal } from './internal-entity';
-import { findOrCreateCompanyByDomain } from './discovery';
-import { updateEntityInIndex } from './entity-index';
 import { chunkEmbedAndPersistAll } from './embedding';
 import { extractTextFromFile } from './file-extraction';
 import { emitAudit } from './audit';
 import { persistDocument } from './persist-document';
 import { classifyByFilename } from './document-filename-classifier';
+import { enqueueWork } from './work-queue';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types
@@ -102,6 +101,33 @@ interface MatchedEntity {
   matched_id: string | null;
   match_type: 'exact' | 'fuzzy' | 'new';
   confidence: number;
+}
+
+interface ExistingContactRow {
+  id: string;
+  full_name: string;
+  email: string | null;
+  phone: string | null;
+  company_id: string | null;
+}
+
+interface ExistingCompanyRow {
+  id: string;
+  name: string;
+  domain: string | null;
+}
+
+function normalizeLookupName(value: string | null | undefined): string {
+  return String(value || '').toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
+function normalizeLookupDomain(value: string | null | undefined): string {
+  return String(value || '')
+    .toLowerCase()
+    .trim()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .split('/')[0];
 }
 
 export interface ImportResult {
@@ -306,6 +332,429 @@ const TABULAR_LINES_PER_CHUNK = 80;
 const TABULAR_HEADER_LINES = 5;
 const TABULAR_MAX_CHUNKS = 12; // hard cap so a pathological file can't blow the LLM budget
 
+const EMPTY_CELL_VALUES = new Set([
+  '',
+  '-',
+  '--',
+  'n/a',
+  'na',
+  'none',
+  'none found',
+  'null',
+  'unknown',
+]);
+
+const FREE_EMAIL_DOMAINS = new Set([
+  'gmail.com',
+  'googlemail.com',
+  'yahoo.com',
+  'hotmail.com',
+  'outlook.com',
+  'icloud.com',
+  'me.com',
+  'aol.com',
+  'proton.me',
+  'protonmail.com',
+]);
+
+type BaseSpreadsheetField =
+  | 'company_name'
+  | 'website'
+  | 'location'
+  | 'sector'
+  | 'stage'
+  | 'description'
+  | 'key_people'
+  | 'contact_name'
+  | 'contact_title'
+  | 'contact_email'
+  | 'contact_linkedin'
+  | 'contact_phone';
+
+type PersonField = 'name' | 'title' | 'email' | 'linkedin_url' | 'phone';
+
+interface SpreadsheetHeaderMap {
+  base: Map<BaseSpreadsheetField, number>;
+  descriptionIndexes: number[];
+  people: Map<number, Partial<Record<PersonField, number>>>;
+}
+
+function cleanCell(value: unknown): string {
+  return String(value ?? '')
+    .replace(/\r/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isMeaningful(value: unknown): value is string {
+  const cleaned = cleanCell(value);
+  return !!cleaned && !EMPTY_CELL_VALUES.has(cleaned.toLowerCase());
+}
+
+function normalizeHeader(value: unknown): string {
+  return cleanCell(value)
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[()]/g, '')
+    .trim();
+}
+
+function baseFieldForHeader(header: string): BaseSpreadsheetField | null {
+  const h = normalizeHeader(header);
+  if (!h) return null;
+  if (/^(vc|firm|company|organization|fund)\s*name$/.test(h)) return 'company_name';
+  if (h === 'name') return 'company_name';
+  if (/\b(website|web site|url|domain)\b/.test(h)) return 'website';
+  if (/\b(headquarters|hq|location|city|address|office)\b/.test(h)) return 'location';
+  if (/\b(sector|industry|focus)\b/.test(h)) return 'sector';
+  if (/\b(investment stage|stage|round)\b/.test(h)) return 'stage';
+  if (/\b(thesis|description|notes|portfolio|miami connection|recent news|aum|assets under management)\b/.test(h)) return 'description';
+  if (/\b(key people|team|principals|partners)\b/.test(h)) return 'key_people';
+  if (/\b(contact name|person name|full name)\b/.test(h)) return 'contact_name';
+  if (/\b(contact title|person title|job title|role|position)\b/.test(h)) return 'contact_title';
+  if (/\b(contact email|person email|email address|e-mail|email)\b/.test(h)) return 'contact_email';
+  if (/\b(contact linkedin|person linkedin|linkedin)\b/.test(h)) return 'contact_linkedin';
+  if (/\b(contact phone|person phone|phone|mobile|cell)\b/.test(h)) return 'contact_phone';
+  return null;
+}
+
+function personFieldForHeader(header: string): { index: number; field: PersonField } | null {
+  const h = normalizeHeader(header);
+  const match = h.match(/\b(?:person|contact)\s*#?\s*(\d+)\s*(name|title|email|e-mail|linkedin|phone|mobile|cell)\b/);
+  if (!match) return null;
+  const fieldRaw = match[2];
+  const field: PersonField =
+    fieldRaw === 'title' ? 'title'
+      : fieldRaw === 'email' || fieldRaw === 'e-mail' ? 'email'
+      : fieldRaw === 'linkedin' ? 'linkedin_url'
+      : fieldRaw === 'phone' || fieldRaw === 'mobile' || fieldRaw === 'cell' ? 'phone'
+      : 'name';
+  return { index: Number(match[1]), field };
+}
+
+function scoreHeaderRow(row: unknown[]): number {
+  let score = 0;
+  for (const cell of row) {
+    const h = normalizeHeader(cell);
+    if (!h) continue;
+    if (personFieldForHeader(h)) score += 2;
+    if (baseFieldForHeader(h)) score += 1;
+  }
+  return score;
+}
+
+function buildHeaderMap(headerRow: unknown[]): SpreadsheetHeaderMap {
+  const map: SpreadsheetHeaderMap = { base: new Map(), descriptionIndexes: [], people: new Map() };
+  headerRow.forEach((cell, idx) => {
+    const h = normalizeHeader(cell);
+    const person = personFieldForHeader(h);
+    if (person) {
+      const existing = map.people.get(person.index) || {};
+      existing[person.field] = idx;
+      map.people.set(person.index, existing);
+      return;
+    }
+    const base = baseFieldForHeader(h);
+    if (base === 'description') map.descriptionIndexes.push(idx);
+    if (base && !map.base.has(base)) map.base.set(base, idx);
+  });
+  return map;
+}
+
+function cellAt(row: unknown[], index: number | undefined): string {
+  return index === undefined ? '' : cleanCell(row[index]);
+}
+
+function baseCell(row: unknown[], map: SpreadsheetHeaderMap, field: BaseSpreadsheetField): string {
+  return cellAt(row, map.base.get(field));
+}
+
+function descriptionCells(row: unknown[], map: SpreadsheetHeaderMap): string[] {
+  return map.descriptionIndexes
+    .map(index => cellAt(row, index))
+    .filter(isMeaningful);
+}
+
+function splitSheetText(text: string): Array<{ name: string; csv: string }> {
+  const marker = /^--- Sheet: (.+?) ---\s*$/gm;
+  const matches = Array.from(text.matchAll(marker));
+  if (matches.length === 0) return [{ name: 'Sheet1', csv: text }];
+
+  return matches.map((match, index) => {
+    const start = (match.index ?? 0) + match[0].length;
+    const end = index + 1 < matches.length ? (matches[index + 1].index ?? text.length) : text.length;
+    return {
+      name: cleanCell(match[1]) || `Sheet${index + 1}`,
+      csv: text.slice(start, end).trim(),
+    };
+  }).filter(section => section.csv.length > 0);
+}
+
+function parseCsvRows(csv: string): string[][] {
+  const parsed = Papa.parse<string[]>(csv, {
+    skipEmptyLines: 'greedy',
+  });
+  return (parsed.data || [])
+    .filter(row => Array.isArray(row) && row.some(isMeaningful))
+    .map(row => row.map(cleanCell));
+}
+
+function extractEmail(value: string): string | undefined {
+  const match = cleanCell(value).match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match?.[0]?.toLowerCase();
+}
+
+function normalizeWebsite(value: string): string | undefined {
+  const cleaned = cleanCell(value);
+  if (!isMeaningful(cleaned)) return undefined;
+  const first = cleaned.split(/[,;\s]+/).find(part => /\./.test(part) && !part.includes('@'));
+  if (!first) return undefined;
+  const withScheme = /^https?:\/\//i.test(first) ? first : `https://${first}`;
+  try {
+    const url = new URL(withScheme);
+    return `${url.protocol}//${url.hostname}${url.pathname && url.pathname !== '/' ? url.pathname.replace(/\/$/, '') : ''}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function domainFromWebsiteOrEmail(value: string): string | undefined {
+  const email = extractEmail(value);
+  if (email) {
+    const domain = email.split('@')[1]?.toLowerCase().replace(/^www\./, '');
+    return domain && !FREE_EMAIL_DOMAINS.has(domain) ? domain : undefined;
+  }
+
+  const website = normalizeWebsite(value);
+  if (!website) return undefined;
+  try {
+    return new URL(website).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeLinkedIn(value: string): string | undefined {
+  const cleaned = cleanCell(value);
+  if (!isMeaningful(cleaned)) return undefined;
+  if (!/linkedin/i.test(cleaned)) return undefined;
+  const first = cleaned.split(/[,;\s]+/).find(part => /linkedin/i.test(part)) || cleaned;
+  if (/^https?:\/\//i.test(first)) return first;
+  if (first.startsWith('/')) return `https://www.linkedin.com${first}`;
+  return `https://${first.replace(/^www\./i, 'www.')}`;
+}
+
+function titleCaseFromEmail(email: string): string {
+  const local = email.split('@')[0] || '';
+  return local
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(' ')
+    .trim();
+}
+
+function splitOutsideParens(value: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of value) {
+    if (ch === '(') depth++;
+    if (ch === ')') depth = Math.max(0, depth - 1);
+    if (ch === ',' && depth === 0) {
+      if (isMeaningful(current)) out.push(cleanCell(current));
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (isMeaningful(current)) out.push(cleanCell(current));
+  return out;
+}
+
+function truncateText(value: string, max = 1200): string | undefined {
+  const cleaned = cleanCell(value);
+  if (!isMeaningful(cleaned)) return undefined;
+  return cleaned.length > max ? `${cleaned.slice(0, max - 1)}…` : cleaned;
+}
+
+function normalizeCompanyStage(value: string | undefined): string | undefined {
+  const cleaned = cleanCell(value).toLowerCase();
+  if (!isMeaningful(cleaned)) return undefined;
+
+  if (/\bpre[-\s]?seed\b/.test(cleaned)) return 'pre_seed';
+  if (/\bseed\b/.test(cleaned)) return 'seed';
+  if (/\bseries\s*a\b|\bser\.?\s*a\b/.test(cleaned)) return 'series_a';
+  if (/\bseries\s*b\b|\bser\.?\s*b\b/.test(cleaned)) return 'series_b';
+  if (/\bseries\s*c\b|\bser\.?\s*c\b/.test(cleaned)) return 'series_c';
+  if (/\bgrowth\b|\blate[-\s]?stage\b|\bexpansion\b|\bscale[-\s]?up\b/.test(cleaned)) return 'growth';
+  if (/\bpublic\b|\bipo\b|\bnyse\b|\bnasdaq\b/.test(cleaned)) return 'public';
+  if (/\bacquir/.test(cleaned)) return 'acquired';
+
+  // Controlled CRM enum fallback. Keep the raw spreadsheet language in the
+  // description so we don't lose detail, but never violate the DB CHECK.
+  return 'other';
+}
+
+function dedupeContactKey(contact: ExtractedContact): string {
+  if (contact.email) return `email:${contact.email.toLowerCase()}`;
+  if (contact.linkedin_url) return `linkedin:${contact.linkedin_url.toLowerCase()}`;
+  return `name:${contact.full_name.toLowerCase()}|${(contact.company_name || '').toLowerCase()}`;
+}
+
+function dedupeCompanyKey(company: ExtractedCompany): string {
+  if (company.domain) return `domain:${company.domain.toLowerCase()}`;
+  return `name:${company.name.toLowerCase()}`;
+}
+
+function inferCompanyType(map: SpreadsheetHeaderMap): string {
+  return map.base.has('stage') || map.base.has('sector') || map.base.has('key_people')
+    ? 'vc_firm'
+    : 'other';
+}
+
+function findHeaderIndex(rows: string[][]): number {
+  let bestIndex = -1;
+  let bestScore = 0;
+  const limit = Math.min(rows.length, 20);
+  for (let i = 0; i < limit; i++) {
+    const score = scoreHeaderRow(rows[i]);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  }
+  return bestScore >= 2 ? bestIndex : -1;
+}
+
+function extractContactsFromKeyPeople(value: string, companyName: string): ExtractedContact[] {
+  if (!isMeaningful(value)) return [];
+  return splitOutsideParens(value).flatMap(entry => {
+    const match = entry.match(/^(.+?)\s*\((.+?)\)$/);
+    const name = cleanCell(match ? match[1] : entry);
+    if (!isMeaningful(name) || name.length < 3) return [];
+    const title = match ? truncateText(match[2], 160) : undefined;
+    return [{
+      full_name: name,
+      company_name: companyName,
+      job_title: title,
+      confidence: 0.72,
+    }];
+  });
+}
+
+function extractStructuredContactData(text: string, category: DocumentCategory): ExtractionResult | null {
+  const contacts: ExtractedContact[] = [];
+  const companies: ExtractedCompany[] = [];
+  const seenContacts = new Set<string>();
+  const seenCompanies = new Set<string>();
+  let parsedRows = 0;
+
+  for (const section of splitSheetText(text)) {
+    const rows = parseCsvRows(section.csv);
+    if (rows.length < 2) continue;
+    const headerIndex = findHeaderIndex(rows);
+    if (headerIndex < 0) continue;
+
+    const headerMap = buildHeaderMap(rows[headerIndex]);
+    const companyType = inferCompanyType(headerMap);
+
+    for (const row of rows.slice(headerIndex + 1)) {
+      const companyName = baseCell(row, headerMap, 'company_name');
+      if (!isMeaningful(companyName)) continue;
+      parsedRows++;
+
+      const website = normalizeWebsite(baseCell(row, headerMap, 'website'));
+      const domain = domainFromWebsiteOrEmail(website || baseCell(row, headerMap, 'website'));
+      const sector = truncateText(baseCell(row, headerMap, 'sector'), 500);
+      const rawStage = truncateText(baseCell(row, headerMap, 'stage'), 240);
+      const stage = normalizeCompanyStage(rawStage);
+      const location = truncateText(baseCell(row, headerMap, 'location'), 240);
+      const descriptionParts = [
+        ...descriptionCells(row, headerMap),
+        rawStage ? `Investment stage: ${rawStage}` : '',
+        baseCell(row, headerMap, 'key_people') ? `Key people: ${baseCell(row, headerMap, 'key_people')}` : '',
+      ].filter(isMeaningful);
+
+      const company: ExtractedCompany = {
+        name: companyName,
+        website,
+        domain,
+        sector,
+        company_type: companyType,
+        location,
+        description: truncateText(descriptionParts.join(' | ')),
+        stage,
+        confidence: domain ? 0.94 : 0.88,
+      };
+      const companyKey = dedupeCompanyKey(company);
+      if (!seenCompanies.has(companyKey)) {
+        seenCompanies.add(companyKey);
+        companies.push(company);
+      }
+
+      const addContact = (contact: ExtractedContact) => {
+        if (!isMeaningful(contact.full_name) || contact.full_name.length < 3) return;
+        const key = dedupeContactKey(contact);
+        if (seenContacts.has(key)) return;
+        seenContacts.add(key);
+        contacts.push(contact);
+      };
+
+      for (const person of headerMap.people.values()) {
+        const rawEmail = cellAt(row, person.email);
+        const email = extractEmail(rawEmail);
+        const rawName = cellAt(row, person.name);
+        const fullName = isMeaningful(rawName) ? rawName : (email ? titleCaseFromEmail(email) : '');
+        const linkedinUrl = normalizeLinkedIn(cellAt(row, person.linkedin_url));
+        const phone = truncateText(cellAt(row, person.phone), 80);
+        const jobTitle = truncateText(cellAt(row, person.title), 180);
+        if (!isMeaningful(fullName) && !email) continue;
+        addContact({
+          full_name: isMeaningful(fullName) ? fullName : email!,
+          email,
+          phone,
+          job_title: jobTitle,
+          linkedin_url: linkedinUrl,
+          company_name: companyName,
+          location,
+          confidence: email && isMeaningful(rawName) ? 0.94 : email ? 0.82 : 0.76,
+        });
+      }
+
+      const rowEmail = extractEmail(baseCell(row, headerMap, 'contact_email'));
+      const rowName = baseCell(row, headerMap, 'contact_name') || (rowEmail ? titleCaseFromEmail(rowEmail) : '');
+      if (isMeaningful(rowName) || rowEmail) {
+        addContact({
+          full_name: isMeaningful(rowName) ? rowName : rowEmail!,
+          email: rowEmail,
+          phone: truncateText(baseCell(row, headerMap, 'contact_phone'), 80),
+          job_title: truncateText(baseCell(row, headerMap, 'contact_title'), 180),
+          linkedin_url: normalizeLinkedIn(baseCell(row, headerMap, 'contact_linkedin')),
+          company_name: companyName,
+          location,
+          confidence: rowEmail && isMeaningful(rowName) ? 0.92 : rowEmail ? 0.8 : 0.74,
+        });
+      }
+
+      for (const keyContact of extractContactsFromKeyPeople(baseCell(row, headerMap, 'key_people'), companyName)) {
+        addContact(keyContact);
+      }
+    }
+  }
+
+  if (parsedRows === 0) return null;
+  return {
+    category,
+    contacts,
+    companies,
+    deals: [],
+    relationships: [],
+    signals: [],
+    summary: `Parsed ${contacts.length} contacts and ${companies.length} companies from ${parsedRows} structured spreadsheet rows.`,
+  };
+}
+
 export async function extractEntities(
   text: string,
   category: DocumentCategory,
@@ -319,6 +768,16 @@ export async function extractEntities(
   }
 
   const isTabular = TABULAR_CATEGORIES.has(category);
+
+  if (category === 'contact_data') {
+    const structured = extractStructuredContactData(text, category);
+    if (structured && (structured.contacts.length > 0 || structured.companies.length > 0)) {
+      console.log(
+        `[doc-intel] structured spreadsheet extracted: ${structured.contacts.length} contacts, ${structured.companies.length} companies`
+      );
+      return structured;
+    }
+  }
 
   // Line-chunked path for large tabular text. Keeps the first few lines as
   // header context in every chunk so column meaning isn't lost. Results are
@@ -472,6 +931,63 @@ async function matchContact(
   return { extracted_name: extracted.full_name, matched_id: null, match_type: 'new', confidence: 0 };
 }
 
+function matchContactFromCandidates(
+  extracted: ExtractedContact,
+  candidates: ExistingContactRow[]
+): MatchedEntity {
+  if (extracted.email) {
+    const emailLower = extracted.email.toLowerCase();
+    const byEmail = candidates.find(c => c.email?.toLowerCase() === emailLower);
+    if (byEmail) {
+      return { extracted_name: extracted.full_name, matched_id: byEmail.id, match_type: 'exact', confidence: 1.0 };
+    }
+  }
+
+  let bestId: string | null = null;
+  let bestScore = 0;
+  for (const c of candidates) {
+    const sim = scoreSimilarity(
+      { full_name: extracted.full_name, email: extracted.email || undefined, phone: extracted.phone || undefined } as any,
+      { full_name: c.full_name, email: c.email || undefined, phone: c.phone || undefined, company_id: c.company_id || undefined } as any
+    );
+    if (sim > bestScore) {
+      bestScore = sim;
+      bestId = c.id;
+    }
+  }
+
+  if (bestScore >= 0.6 && bestId) {
+    return { extracted_name: extracted.full_name, matched_id: bestId, match_type: 'fuzzy', confidence: bestScore };
+  }
+
+  return { extracted_name: extracted.full_name, matched_id: null, match_type: 'new', confidence: 0 };
+}
+
+function matchContactFromIndexes(
+  extracted: ExtractedContact,
+  candidates: ExistingContactRow[],
+  byEmail: Map<string, ExistingContactRow>,
+  byName: Map<string, ExistingContactRow[]>
+): MatchedEntity {
+  const email = extracted.email?.toLowerCase().trim();
+  if (email) {
+    const match = byEmail.get(email);
+    if (match) {
+      return { extracted_name: extracted.full_name, matched_id: match.id, match_type: 'exact', confidence: 1.0 };
+    }
+  }
+
+  const name = normalizeLookupName(extracted.full_name);
+  if (name) {
+    const exactNameMatches = byName.get(name) || [];
+    if (exactNameMatches.length === 1) {
+      return { extracted_name: extracted.full_name, matched_id: exactNameMatches[0].id, match_type: 'exact', confidence: 0.94 };
+    }
+  }
+
+  return matchContactFromCandidates(extracted, candidates);
+}
+
 async function matchCompany(
   extracted: ExtractedCompany,
   orgId: string,
@@ -505,6 +1021,58 @@ async function matchCompany(
   return { extracted_name: extracted.name, matched_id: null, match_type: 'new', confidence: 0 };
 }
 
+function matchCompanyFromCandidates(
+  extracted: ExtractedCompany,
+  candidates: ExistingCompanyRow[]
+): MatchedEntity {
+  if (extracted.domain) {
+    const domainLower = extracted.domain.toLowerCase().replace(/^www\./, '');
+    const byDomain = candidates.find(c => c.domain?.toLowerCase().replace(/^www\./, '') === domainLower);
+    if (byDomain) {
+      return { extracted_name: extracted.name, matched_id: byDomain.id, match_type: 'exact', confidence: 1.0 };
+    }
+  }
+
+  const nameA = extracted.name.toLowerCase().trim();
+  for (const c of candidates) {
+    const nameB = c.name.toLowerCase().trim();
+    if (nameA === nameB) {
+      return { extracted_name: extracted.name, matched_id: c.id, match_type: 'exact', confidence: 1.0 };
+    }
+    const score = jaroWinkler(nameA, nameB);
+    if (score >= 0.85) {
+      return { extracted_name: extracted.name, matched_id: c.id, match_type: 'fuzzy', confidence: score };
+    }
+  }
+
+  return { extracted_name: extracted.name, matched_id: null, match_type: 'new', confidence: 0 };
+}
+
+function matchCompanyFromIndexes(
+  extracted: ExtractedCompany,
+  candidates: ExistingCompanyRow[],
+  byDomain: Map<string, ExistingCompanyRow>,
+  byName: Map<string, ExistingCompanyRow>
+): MatchedEntity {
+  const domain = normalizeLookupDomain(extracted.domain || extracted.website);
+  if (domain) {
+    const match = byDomain.get(domain);
+    if (match) {
+      return { extracted_name: extracted.name, matched_id: match.id, match_type: 'exact', confidence: 1.0 };
+    }
+  }
+
+  const name = normalizeLookupName(extracted.name);
+  if (name) {
+    const match = byName.get(name);
+    if (match) {
+      return { extracted_name: extracted.name, matched_id: match.id, match_type: 'exact', confidence: 1.0 };
+    }
+  }
+
+  return matchCompanyFromCandidates(extracted, candidates);
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // 4. Entity Router
 // ────────────────────────────────────────────────────────────────────────────
@@ -514,32 +1082,43 @@ async function routeContact(
   match: MatchedEntity,
   orgId: string,
   documentId: string,
-  env: Env
+  env: Env,
+  preferredCompanyId?: string | null
 ): Promise<{ created: boolean; updated: boolean; id: string }> {
   if (match.matched_id && match.match_type !== 'new') {
-    const updates: { field: string; value: string; source: string; confidence: number; source_description: string }[] = [];
-
-    if (extracted.job_title) updates.push({ field: 'job_title', value: extracted.job_title, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-    if (extracted.phone) updates.push({ field: 'phone', value: extracted.phone, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-    if (extracted.linkedin_url) updates.push({ field: 'linkedin_url', value: extracted.linkedin_url, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-    if (extracted.location) updates.push({ field: 'location', value: extracted.location, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-
-    if (updates.length > 0) {
-      await proposeMultipleUpdates(orgId, 'contact', match.matched_id, updates, env, { policy: 'auto_if_confident' });
+    const hasUpdates = !!(
+      extracted.job_title ||
+      extracted.phone ||
+      extracted.linkedin_url ||
+      extracted.location ||
+      preferredCompanyId
+    );
+    if (hasUpdates) {
+      await env.D1.prepare(
+        `UPDATE contacts
+            SET job_title = CASE WHEN (job_title IS NULL OR job_title = '') AND ? IS NOT NULL THEN ? ELSE job_title END,
+                phone = CASE WHEN (phone IS NULL OR phone = '') AND ? IS NOT NULL THEN ? ELSE phone END,
+                linkedin_url = CASE WHEN (linkedin_url IS NULL OR linkedin_url = '') AND ? IS NOT NULL THEN ? ELSE linkedin_url END,
+                location = CASE WHEN (location IS NULL OR location = '') AND ? IS NOT NULL THEN ? ELSE location END,
+                company_id = CASE WHEN company_id IS NULL AND ? IS NOT NULL THEN ? ELSE company_id END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND org_id = ?`
+      ).bind(
+        extracted.job_title || null, extracted.job_title || null,
+        extracted.phone || null, extracted.phone || null,
+        extracted.linkedin_url || null, extracted.linkedin_url || null,
+        extracted.location || null, extracted.location || null,
+        preferredCompanyId || null, preferredCompanyId || null,
+        match.matched_id, orgId
+      ).run();
     }
-    return { created: false, updated: updates.length > 0, id: match.matched_id };
+    return { created: false, updated: hasUpdates, id: match.matched_id };
   }
 
   const contactId = crypto.randomUUID();
   const now = new Date().toISOString();
 
-  let companyId: string | null = null;
-  if (extracted.email) {
-    const domain = extracted.email.split('@')[1];
-    if (domain) {
-      companyId = await findOrCreateCompanyByDomain(domain, orgId, env);
-    }
-  }
+  const companyId: string | null = preferredCompanyId || null;
 
   await env.D1.prepare(
     `INSERT INTO contacts
@@ -569,49 +1148,85 @@ async function routeCompany(
   documentId: string,
   env: Env
 ): Promise<{ created: boolean; updated: boolean; id: string }> {
+  const normalizedStage = normalizeCompanyStage(extracted.stage);
   if (match.matched_id && match.match_type !== 'new') {
-    const updates: { field: string; value: string; source: string; confidence: number; source_description: string }[] = [];
-
-    if (extracted.sector) updates.push({ field: 'sector', value: extracted.sector, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-    if (extracted.website) updates.push({ field: 'website', value: extracted.website, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-    if (extracted.description) updates.push({ field: 'description', value: extracted.description, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-    if (extracted.location) updates.push({ field: 'hq_location', value: extracted.location, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-    if (extracted.stage) updates.push({ field: 'stage', value: extracted.stage, source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-    if (extracted.valuation) updates.push({ field: 'current_valuation', value: String(extracted.valuation), source: 'llm_extraction', confidence: extracted.confidence, source_description: `Document import ${documentId}` });
-
-    if (updates.length > 0) {
-      await proposeMultipleUpdates(orgId, 'company', match.matched_id, updates, env, { policy: 'auto_if_confident' });
+    const valuation = extracted.valuation ? String(extracted.valuation) : null;
+    const hasUpdates = !!(
+      extracted.sector ||
+      extracted.website ||
+      extracted.description ||
+      extracted.location ||
+      normalizedStage ||
+      valuation
+    );
+    if (hasUpdates) {
+      await env.D1.prepare(
+        `UPDATE companies
+            SET name = CASE
+                  WHEN ? IS NOT NULL
+                   AND (
+                     name IS NULL
+                     OR name = ''
+                     OR LOWER(name) = LOWER(COALESCE(domain, ''))
+                     OR (name NOT LIKE '% %' AND name LIKE '%.%')
+                   )
+                  THEN ?
+                  ELSE name
+                END,
+                sector = CASE WHEN (sector IS NULL OR sector = '') AND ? IS NOT NULL THEN ? ELSE sector END,
+                website = CASE WHEN (website IS NULL OR website = '') AND ? IS NOT NULL THEN ? ELSE website END,
+                description = CASE WHEN (description IS NULL OR description = '') AND ? IS NOT NULL THEN ? ELSE description END,
+                hq_location = CASE WHEN (hq_location IS NULL OR hq_location = '') AND ? IS NOT NULL THEN ? ELSE hq_location END,
+                stage = CASE WHEN (stage IS NULL OR stage = '') AND ? IS NOT NULL THEN ? ELSE stage END,
+                current_valuation = CASE WHEN current_valuation IS NULL AND ? IS NOT NULL THEN ? ELSE current_valuation END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND org_id = ?`
+      ).bind(
+        extracted.name || null, extracted.name || null,
+        extracted.sector || null, extracted.sector || null,
+        extracted.website || null, extracted.website || null,
+        extracted.description || null, extracted.description || null,
+        extracted.location || null, extracted.location || null,
+        normalizedStage || null, normalizedStage || null,
+        valuation, valuation,
+        match.matched_id, orgId
+      ).run();
     }
-    return { created: false, updated: updates.length > 0, id: match.matched_id };
-  }
-
-  if (extracted.domain) {
-    const companyId = await findOrCreateCompanyByDomain(extracted.domain, orgId, env);
-    if (companyId) return { created: true, updated: false, id: companyId };
+    return { created: false, updated: hasUpdates, id: match.matched_id };
   }
 
   const companyId = crypto.randomUUID();
   const now = new Date().toISOString();
+  const domain = normalizeLookupDomain(extracted.domain || extracted.website) || null;
+  const website = extracted.website || (domain ? `https://${domain}` : null);
 
-  await env.D1.prepare(
-    `INSERT INTO companies
-       (id, org_id, name, domain, website, sector, company_type, hq_location, description,
-        stage, investment_status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)`
-  ).bind(
-    companyId, orgId,
-    extracted.name,
-    extracted.domain || null,
-    extracted.website || null,
-    extracted.sector || null,
-    extracted.company_type || 'other',
-    extracted.location || null,
-    extracted.description || null,
-    extracted.stage || null,
-    now, now
-  ).run();
-
-  try { await updateEntityInIndex(orgId, 'company', companyId, env); } catch {}
+  try {
+    await env.D1.prepare(
+      `INSERT INTO companies
+         (id, org_id, name, domain, website, sector, company_type, hq_location, description,
+          stage, investment_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)`
+    ).bind(
+      companyId, orgId,
+      extracted.name,
+      domain,
+      website,
+      extracted.sector || null,
+      extracted.company_type || 'other',
+      extracted.location || null,
+      extracted.description || null,
+      normalizedStage || null,
+      now, now
+    ).run();
+  } catch (e: any) {
+    if (domain && String(e?.message || e).includes('UNIQUE constraint failed')) {
+      const existing = await env.D1.prepare(
+        'SELECT id FROM companies WHERE org_id = ? AND LOWER(domain) = ? AND deleted_at IS NULL LIMIT 1'
+      ).bind(orgId, domain).first<{ id: string }>();
+      if (existing) return { created: false, updated: false, id: existing.id };
+    }
+    throw e;
+  }
 
   return { created: true, updated: false, id: companyId };
 }
@@ -723,6 +1338,63 @@ export async function processIntelligentImport(
     `[doc-intel] extracted: ${extraction.contacts.length} contacts, ${extraction.companies.length} companies, ${extraction.deals.length} deals`
   );
 
+  let companiesCreated = 0;
+  let companiesUpdated = 0;
+  let contactsCreated = 0;
+  let contactsUpdated = 0;
+  let dealsCreated = 0;
+  let processedUnits = 0;
+  let lastProgressAt = 0;
+  const totalUnits = extraction.companies.length + extraction.contacts.length + extraction.deals.length + 1;
+
+  const ensureImportStillActive = async () => {
+    if (!importJobId) return;
+    const active = await env.D1.prepare(
+      `SELECT status
+         FROM work_queue
+        WHERE domain = 'intelligent_import'
+          AND payload LIKE ?
+        ORDER BY created_at DESC
+        LIMIT 1`
+    ).bind(`%${importJobId}%`).first<{ status: string }>();
+    if (active && !['pending', 'in_progress'].includes(active.status)) {
+      throw new Error('Import job was cancelled or superseded');
+    }
+  };
+
+  const updateImportProgress = async (force = false) => {
+    if (!importJobId) return;
+    const nowMs = Date.now();
+    if (!force && nowMs - lastProgressAt < 5000) return;
+    lastProgressAt = nowMs;
+    await env.D1.prepare(
+      `UPDATE import_jobs
+          SET total_rows = ?,
+              processed_rows = ?,
+              created_rows = ?,
+              updated_rows = ?,
+              failed_rows = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(
+      totalUnits,
+      Math.min(processedUnits, totalUnits),
+      contactsCreated + companiesCreated + dealsCreated,
+      contactsUpdated + companiesUpdated,
+      errors.length,
+      importJobId,
+      orgId
+    ).run();
+  };
+
+  const markUnitProcessed = async (forceProgress = false) => {
+    processedUnits++;
+    if (processedUnits % 50 === 0) await ensureImportStillActive();
+    await updateImportProgress(forceProgress);
+  };
+
+  await updateImportProgress(true);
+
   // Persist via the unified writer. Pre-extracted text + pre-classified
   // category short-circuit finalize()'s extract/classify steps so we don't
   // waste a second LLM call on the classifier.
@@ -742,65 +1414,159 @@ export async function processIntelligentImport(
   const documentId = persisted.documentId;
   await logCreated('document', documentId);
 
+  // Make the document visible and queued for embedding before the slower CRM
+  // routing begins. Imports should behave like durable document uploads even
+  // if contact/company routing takes several minutes or is later cancelled.
+  try {
+    if (extractionError) {
+      await env.D1.prepare(
+        `UPDATE documents
+            SET processing_status = 'failed',
+                error_message = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND org_id = ?`
+      ).bind(extractionError, documentId, orgId).run();
+    } else {
+      await env.D1.prepare(
+        `UPDATE documents
+            SET document_type = ?,
+                extracted_text_preview = CASE
+                  WHEN extracted_text_preview IS NULL OR extracted_text_preview = '' THEN ?
+                  ELSE extracted_text_preview
+                END,
+                processing_status = 'completed',
+                error_message = NULL,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND org_id = ?`
+      ).bind(category, text.slice(0, 4000), documentId, orgId).run();
+
+      await enqueueWork(env, orgId, 'embed_retry',
+        { entity_id: documentId, source_table: 'documents' },
+        {
+          upstream: 'bge',
+          idempotency_key: `${orgId}:${documentId}:documents`,
+        }
+      );
+    }
+  } catch (e: any) {
+    errors.push(`Document store: ${e?.message || e}`);
+  } finally {
+    await markUnitProcessed(true);
+  }
+
   // Match + Route companies first (contacts may reference them)
   const companyLookup = new Map<string, string>();
-  let companiesCreated = 0;
-  let companiesUpdated = 0;
+  const companyDomainLookup = new Map<string, string>();
+  const companyCandidates = (await env.D1.prepare(
+    'SELECT id, name, domain FROM companies WHERE org_id = ? AND deleted_at IS NULL LIMIT 10000'
+  ).bind(orgId).all<ExistingCompanyRow>()).results;
+  const companyByDomain = new Map<string, ExistingCompanyRow>();
+  const companyByName = new Map<string, ExistingCompanyRow>();
+  for (const company of companyCandidates) {
+    const domain = normalizeLookupDomain(company.domain);
+    if (domain) companyByDomain.set(domain, company);
+    const name = normalizeLookupName(company.name);
+    if (name && !companyByName.has(name)) companyByName.set(name, company);
+  }
 
   for (const company of extraction.companies) {
     try {
-      const match = await matchCompany(company, orgId, env);
+      const match = matchCompanyFromIndexes(company, companyCandidates, companyByDomain, companyByName);
       const result = await routeCompany(company, match, orgId, documentId, env);
       companyLookup.set(company.name.toLowerCase(), result.id);
-      if (result.created) { companiesCreated++; await logCreated('company', result.id); }
+      const domain = normalizeLookupDomain(company.domain || company.website);
+      if (domain) companyDomainLookup.set(domain, result.id);
+      if (result.created) {
+        companiesCreated++;
+        const candidate = { id: result.id, name: company.name, domain: domain || null };
+        companyCandidates.push(candidate);
+        if (domain) companyByDomain.set(domain, candidate);
+        const name = normalizeLookupName(company.name);
+        if (name) companyByName.set(name, candidate);
+        await logCreated('company', result.id);
+      }
       if (result.updated) companiesUpdated++;
     } catch (e: any) {
       errors.push(`Company "${company.name}": ${e.message}`);
+    } finally {
+      await markUnitProcessed();
     }
   }
 
   // Match + Route contacts
-  let contactsCreated = 0;
-  let contactsUpdated = 0;
+  const contactCandidates = (await env.D1.prepare(
+    'SELECT id, full_name, email, phone, company_id FROM contacts WHERE org_id = ? AND deleted_at IS NULL LIMIT 20000'
+  ).bind(orgId).all<ExistingContactRow>()).results;
+  const contactByEmail = new Map<string, ExistingContactRow>();
+  const contactByName = new Map<string, ExistingContactRow[]>();
+  for (const contact of contactCandidates) {
+    const email = contact.email?.toLowerCase().trim();
+    if (email) contactByEmail.set(email, contact);
+    const name = normalizeLookupName(contact.full_name);
+    if (name) {
+      const bucket = contactByName.get(name) || [];
+      bucket.push(contact);
+      contactByName.set(name, bucket);
+    }
+  }
 
   for (const contact of extraction.contacts) {
     try {
-      const match = await matchContact(contact, orgId, env);
-      const result = await routeContact(contact, match, orgId, documentId, env);
-      if (result.created) { contactsCreated++; await logCreated('contact', result.id); }
+      const match = matchContactFromIndexes(contact, contactCandidates, contactByEmail, contactByName);
+      let preferredCompanyId = contact.company_name ? companyLookup.get(contact.company_name.toLowerCase()) : null;
+      if (!preferredCompanyId && contact.email) {
+        const emailDomain = normalizeLookupDomain(contact.email.split('@')[1]);
+        preferredCompanyId = companyDomainLookup.get(emailDomain) || null;
+      }
+      const result = await routeContact(contact, match, orgId, documentId, env, preferredCompanyId);
+      if (result.created) {
+        contactsCreated++;
+        const candidate = {
+          id: result.id,
+          full_name: contact.full_name,
+          email: contact.email || null,
+          phone: contact.phone || null,
+          company_id: preferredCompanyId || null,
+        };
+        contactCandidates.push(candidate);
+        const email = contact.email?.toLowerCase().trim();
+        if (email) contactByEmail.set(email, candidate);
+        const name = normalizeLookupName(contact.full_name);
+        if (name) {
+          const bucket = contactByName.get(name) || [];
+          bucket.push(candidate);
+          contactByName.set(name, bucket);
+        }
+        await logCreated('contact', result.id);
+      }
       if (result.updated) contactsUpdated++;
 
       if (contact.company_name && result.id) {
         const companyId = companyLookup.get(contact.company_name.toLowerCase());
         if (companyId) {
-          await env.D1.prepare(
-            'UPDATE contacts SET company_id = ? WHERE id = ? AND company_id IS NULL'
-          ).bind(companyId, result.id).run();
+          const sql = result.created
+            ? 'UPDATE contacts SET company_id = ? WHERE id = ?'
+            : 'UPDATE contacts SET company_id = ? WHERE id = ? AND company_id IS NULL';
+          await env.D1.prepare(sql).bind(companyId, result.id).run();
         }
       }
     } catch (e: any) {
       errors.push(`Contact "${contact.full_name}": ${e.message}`);
+    } finally {
+      await markUnitProcessed();
     }
   }
 
   // Route deals
-  let dealsCreated = 0;
   for (const deal of extraction.deals) {
     try {
       const result = await routeDeal(deal, companyLookup, orgId, env);
       if (result.created) { dealsCreated++; await logCreated('deal', result.id); }
     } catch (e: any) {
       errors.push(`Deal "${deal.name}": ${e.message}`);
+    } finally {
+      await markUnitProcessed();
     }
-  }
-
-  // Embed + status='completed' via the helper's finalize step. preExtractedText
-  // and documentType were passed to persistDocument, so finalize skips the
-  // re-extract / re-classify and goes straight to chunking.
-  try {
-    await persisted.finalize();
-  } catch (e: any) {
-    errors.push(`Finalize: ${e?.message || e}`);
   }
 
   // Audit

@@ -148,6 +148,17 @@ function formatRelative(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
+function importFileName(job: ImportJob): string {
+  const raw = job.source_r2_key || 'Uploaded file';
+  const file = raw.split('/').pop() || raw;
+  return file.replace(/^[0-9a-f-]{36}_/i, '');
+}
+
+function routedCount(job: ImportJob): number {
+  const routed = (job.created_rows ?? 0) + (job.updated_rows ?? 0);
+  return routed || job.processed_rows || job.total_rows || 0;
+}
+
 function confidenceBadge(c: number) {
   const pct = Math.round(c * 100);
   const color = c >= 0.9 ? '#22C55E' : c >= 0.7 ? '#F59E0B' : '#EF4444';
@@ -228,7 +239,7 @@ export default function ImportsPage() {
           setHistory(prev => prev.map(j => j.id === jobId ? { ...j, ...job } : j));
           if (job.status === 'completed' || job.status === 'failed' || job.status === 'reverted') {
             if (job.status === 'completed') {
-              setToast(`Analysis complete: ${(job as any).total_rows ?? 0} entities. Click the row to view the report.`);
+              setToast(`Analysis complete: ${routedCount(job)} entities routed. Click the row to view the report.`);
             } else if (job.status === 'failed') {
               setToast('Import failed. Check the row in your history.');
             }
@@ -406,10 +417,10 @@ export default function ImportsPage() {
                       {activeJobs.slice(0, 3).map(job => (
                         <div key={job.id} className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-bg-inset/70 px-3 py-2 text-xs">
                           <span className="text-text-secondary truncate">
-                            {(job.source_r2_key || 'Uploaded file').split('/').pop()}
+                            {importFileName(job)}
                           </span>
                           <span className="text-accent-magenta shrink-0">
-                            {job.processed_rows ? `${job.processed_rows} routed` : 'analyzing...'}
+                            {routedCount(job) ? `${routedCount(job)} routed` : 'analyzing...'}
                           </span>
                         </div>
                       ))}
@@ -505,8 +516,9 @@ export default function ImportsPage() {
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b border-border bg-bg-inset/50">
-                        <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Date</th>
+                        <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">File</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Type</th>
+                        <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Routed</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Created</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Updated</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Status</th>
@@ -522,10 +534,14 @@ export default function ImportsPage() {
                             className={`border-b border-border/50 ${clickable ? 'cursor-pointer hover:bg-bg-surface-hover' : ''}`}
                             onClick={clickable ? () => openReportFromJob(job) : undefined}
                           >
-                            <td className="px-4 py-3 text-text-secondary">{formatRelative(job.created_at)}</td>
+                            <td className="px-4 py-3">
+                              <div className="max-w-[260px] truncate text-text-primary">{importFileName(job)}</div>
+                              <div className="text-[11px] text-text-muted">{formatRelative(job.created_at)}</div>
+                            </td>
                             <td className="px-4 py-3">
                               <span className="badge capitalize">{job.source_type}</span>
                             </td>
+                            <td className="px-4 py-3 text-text-primary tabular-nums">{routedCount(job)}</td>
                             <td className="px-4 py-3 text-text-primary tabular-nums">{job.created_rows ?? '—'}</td>
                             <td className="px-4 py-3 text-text-primary tabular-nums">{job.updated_rows ?? '—'}</td>
                             <td className="px-4 py-3">

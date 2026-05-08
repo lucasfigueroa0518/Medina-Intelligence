@@ -30,12 +30,19 @@ export async function intelligentImport(
   const activeCutoff = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
   const activeSameFile = await env.D1.prepare(
     `SELECT id, source_r2_key
-       FROM import_jobs
+      FROM import_jobs
       WHERE org_id = ?
         AND source_type = 'intelligent'
         AND status = 'processing'
         AND source_r2_key LIKE ?
         AND created_at > ?
+        AND EXISTS (
+          SELECT 1
+            FROM work_queue w
+           WHERE w.domain = 'intelligent_import'
+             AND w.payload LIKE '%' || import_jobs.id || '%'
+             AND w.status IN ('pending', 'in_progress')
+        )
       ORDER BY created_at DESC
       LIMIT 1`
   ).bind(ctx.orgId, `%_${file.name}`, activeCutoff).first<{ id: string; source_r2_key: string }>();

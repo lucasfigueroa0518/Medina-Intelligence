@@ -152,17 +152,28 @@ export async function persistDocument(
   const contentHash = await computeSha256Hex(buffer);
 
   const dedupOn = input.dedupOnContentHash !== false;
+  const now = new Date().toISOString();
 
   // Phase 1 — dedup on content hash. Existing row wins; no new row, no new
   // links. Caller decides whether to add additional links separately.
   if (dedupOn) {
     const existing = await env.D1.prepare(
-      `SELECT id, r2_key, version_number, parent_document_id
+      `SELECT d.id, d.r2_key, d.version_number, d.parent_document_id, d.processing_status,
+              COUNT(v.vector_id) AS vector_count
          FROM documents
-        WHERE org_id = ? AND content_hash = ? AND deleted_at IS NULL
+           d
+          LEFT JOIN vector_entity_index v
+            ON v.entity_id = d.id AND v.source_table = 'documents'
+        WHERE d.org_id = ? AND d.content_hash = ? AND d.deleted_at IS NULL
+        GROUP BY d.id
         LIMIT 1`
     ).bind(input.orgId, contentHash).first<{
-      id: string; r2_key: string; version_number: number | null; parent_document_id: string | null;
+      id: string;
+      r2_key: string;
+      version_number: number | null;
+      parent_document_id: string | null;
+      processing_status: string | null;
+      vector_count: number | null;
     }>();
     if (existing) {
       return {
@@ -172,7 +183,101 @@ export async function persistDocument(
         parentDocumentId: existing.parent_document_id,
         r2Key: existing.r2_key,
         contentHash,
-        finalize: async () => { /* no-op — existing doc is already finalized (or has its own retry path) */ },
+        finalize: async () => {
+          // Dedup can hit an existing row that was left pending/processing by a
+          // cancelled Worker. Let the newer caller repair it instead of
+          // silently leaving the document unavailable to MARTy.
+          if (existing.processing_status === 'completed' && (existing.vector_count || 0) > 0) return;
+
+          await env.D1.prepare(
+            `UPDATE documents
+                SET processing_status = 'processing',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE id = ?`
+          ).bind(existing.id).run();
+
+          if (input.extractionError !== undefined) {
+            await env.D1.prepare(
+              `UPDATE documents
+                  SET processing_status = 'failed',
+                      error_message = ?,
+                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?`
+            ).bind(input.extractionError.slice(0, 500), existing.id).run();
+            return;
+          }
+
+          let text = input.preExtractedText;
+          if (text === undefined) {
+            try {
+              text = await extractTextFromFile(input.file);
+            } catch (e: any) {
+              const msg = String(e?.message || e).slice(0, 500);
+              await env.D1.prepare(
+                `UPDATE documents
+                    SET processing_status = 'failed',
+                        error_message = ?,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                  WHERE id = ?`
+              ).bind(msg, existing.id).run();
+              return;
+            }
+          }
+
+          let finalType = input.documentType || 'other';
+          if (!input.documentType && text.length > 20) {
+            const cheap = classifyByFilename(input.file.name);
+            if (cheap?.confidence === 'high') {
+              finalType = cheap.category;
+            } else {
+              try {
+                finalType = (await classifyDocument(text, input.file.name, env, input.orgId, cheap)).category;
+              } catch {
+                finalType = cheap?.category || finalType;
+              }
+            }
+          }
+
+          if (input.embed !== false && text.length > 10 && (existing.vector_count || 0) === 0) {
+            try {
+              const visibility: 'private' | 'org_wide' | 'confidential' =
+                input.visibility === 'public' ? 'org_wide' : input.visibility;
+              const meta: ChunkMetadata = {
+                org_id: input.orgId,
+                document_type: finalType,
+                source_table: 'documents',
+                source_id: existing.id,
+                r2_key: existing.r2_key,
+                visibility,
+                participant_user_ids: input.participantUserIds?.length ? input.participantUserIds.join(',') : undefined,
+                primary_entity_id: existing.id,
+                created_at: now,
+                entity_name: input.title || input.file.name,
+              };
+              const entries = await chunkEmbedAndPersistAll(text, meta, env);
+              if (entries.length > 0) {
+                await env.D1.batch(
+                  entries.map(e =>
+                    env.D1.prepare(
+                      'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
+                    ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
+                  )
+                );
+              }
+            } catch (e: any) {
+              console.error(`[persistDocument:dedup-finalize] embed failed for ${existing.id}:`, e?.message || e);
+            }
+          }
+
+          await env.D1.prepare(
+            `UPDATE documents
+                SET processing_status = 'completed',
+                    document_type = ?,
+                    extracted_text_preview = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE id = ?`
+          ).bind(finalType, text.slice(0, 500), existing.id).run();
+        },
       };
     }
   }
@@ -202,7 +307,6 @@ export async function persistDocument(
 
   // Phase 3 — generate ID + R2 key, put binary.
   const documentId = crypto.randomUUID();
-  const now = new Date().toISOString();
   const r2Key = `${input.orgId}/document/${now.slice(0, 7)}/${documentId}_${input.file.name}`;
   await env.R2.put(r2Key, buffer);
 
