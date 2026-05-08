@@ -34,7 +34,7 @@ function FilesPageInner() {
   }
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 min-h-0">
+    <div className="flex-1 flex h-full min-h-0 flex-col overflow-hidden min-w-0">
       <TopBar title="Files" />
 
       <div className="border-b border-border bg-bg-root/95 backdrop-blur supports-[backdrop-filter]:bg-bg-root/80">
@@ -63,7 +63,7 @@ function FilesPageInner() {
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-hidden">
+      <div className="flex-1 min-h-0 h-full overflow-hidden">
         {activeTab === 'imports'
           ? <ImportsPageContent embedded />
           : <DocumentsPageContent embedded />}

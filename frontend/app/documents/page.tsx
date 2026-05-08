@@ -452,7 +452,7 @@ export function DocumentsPageContent({ embedded = false }: { embedded?: boolean 
   }
 
   return (
-    <div className="flex-1 flex flex-col md:flex-row min-w-0">
+    <div className="flex-1 flex h-full min-h-0 flex-col md:flex-row overflow-hidden min-w-0">
       <FilterPanel
         sections={[
           {
@@ -559,7 +559,7 @@ export function DocumentsPageContent({ embedded = false }: { embedded?: boolean 
       />
 
       <main
-        className="flex-1 flex flex-col overflow-hidden relative min-w-0"
+        className="flex-1 flex min-h-0 flex-col overflow-hidden relative min-w-0"
         onDragEnter={e => {
           if (!e.dataTransfer.types.includes('Files')) return;
           e.preventDefault();
@@ -630,7 +630,7 @@ export function DocumentsPageContent({ embedded = false }: { embedded?: boolean 
           </div>
         )}
 
-        <div className="flex-1 p-4 md:p-6 overflow-auto">
+        <div className="flex-1 min-h-0 p-4 md:p-6 overflow-y-auto overflow-x-hidden">
           <QuickFilters<FilterState>
             filters={filters}
             presets={QUICK_FILTERS}
