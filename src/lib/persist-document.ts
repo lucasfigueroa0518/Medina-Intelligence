@@ -32,6 +32,7 @@ export type DocumentSource =
   | 'manual_upload'
   | 'intelligent_import'
   | 'chat_upload'
+  | 'marty_generated'
   | 'drive_import'
   | 'meeting_transcript';
 

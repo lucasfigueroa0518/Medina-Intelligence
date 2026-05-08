@@ -16,9 +16,12 @@
   "dependencies": {
     "@langchain/textsplitters": "^0.1.0",
     "@types/papaparse": "^5.5.2",
+    "docx": "^9.6.1",
     "jszip": "^3.10.1",
     "mammoth": "^1.8.0",
     "papaparse": "^5.5.3",
+    "pdf-lib": "^1.17.1",
+    "pptxgenjs": "^4.0.1",
     "unpdf": "^1.6.2",
     "xlsx": "^0.18.5"
   },

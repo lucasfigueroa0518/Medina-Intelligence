@@ -8,6 +8,13 @@ import { callClaude, callClaudeStreaming } from '../lib/claude';
 import type { ToolDefinition } from '../lib/claude';
 import { extractTextFromFile } from '../lib/file-extraction';
 import { assembleSessionAttachments, type UploadSummary } from '../lib/chat-uploads';
+import {
+  createDocumentArtifactTool,
+  editDocumentArtifactTool,
+  findDocumentsTool,
+  normalizeDocumentCards,
+  type MartyDocumentCard,
+} from '../lib/document-artifacts';
 import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { SESSION_TITLE_PROMPT } from '../prompts/session-title';
 import { estimateTokens, truncateToTokens } from '../lib/tokens';
@@ -59,6 +66,66 @@ const AGENT_TOOLS: ToolDefinition[] = [
         limit: { type: 'number', description: 'Max results. Default 20, max 50.' },
       },
       required: ['query'],
+    },
+  },
+
+  // DOCUMENT INTELLIGENCE + ARTIFACTS
+  {
+    name: 'find_documents',
+    description: 'Find and surface existing database documents for MARTy chat. Use this when the user asks to show, find, open, preview, download, send, work with, or reference a document/deck/PDF/spreadsheet/presentation, and also when a highly relevant document should be subtly surfaced as supporting context. Returns document cards with Preview, Download, and Send to MARTy actions. Use mode="dominant" for explicit document tasks; mode="compact" when the document is secondary support.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Document search query. Include likely title, company, deal, topic, and file kind when known.' },
+        document_types: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional document_type filters such as pitch_deck, deal_pitch, spreadsheet, presentation, memo, report, legal, financials.',
+        },
+        entity_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional CRM entity IDs to scope linked documents.',
+        },
+        limit: { type: 'number', description: 'Max documents to return. Default 6, max 20.' },
+        mode: { type: 'string', enum: ['auto', 'compact', 'dominant'], description: 'UI surfacing mode. Use dominant for document-centric requests.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'create_document_artifact',
+    description: 'Create a new editable document artifact from structured content and save it to Documents. Supports docx, xlsx, pptx, and pdf. Use when the user asks MARTy to prepare, draft, build, create, generate, or export a memo/model/deck/summary/file.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['docx', 'xlsx', 'pptx', 'pdf'] },
+        title: { type: 'string', description: 'Human-readable document title.' },
+        structured_content: {
+          type: 'object',
+          description: 'Structured content. docx/pdf: paragraphs, bullets, sections. xlsx: sheets with rows. pptx: slides with title and bullets.',
+        },
+        source_document_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional source document IDs used to create the artifact.',
+        },
+      },
+      required: ['kind', 'title', 'structured_content'],
+    },
+  },
+  {
+    name: 'edit_document_artifact',
+    description: 'Create a new edited copy/version of an existing document. Never mutates the original. Use when the user asks to revise, duplicate, update, convert, summarize into, or alter an existing document.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        source_document_id: { type: 'string', description: 'ID of the source document to copy/edit.' },
+        instructions: { type: 'string', description: 'Specific edit/conversion instructions.' },
+        output_kind: { type: 'string', enum: ['docx', 'xlsx', 'pptx', 'pdf'], description: 'Optional output type. Defaults to the source file type when possible.' },
+        title: { type: 'string', description: 'Optional title for the new edited copy.' },
+      },
+      required: ['source_document_id', 'instructions'],
     },
   },
 
@@ -529,6 +596,9 @@ async function executeTool(
     case 'search_companies': return searchCompanies(ctx, toolInput, env);
     case 'search_deals': return searchDeals(ctx, toolInput, env);
     case 'search_conversations': return searchConversations(ctx, toolInput, env);
+    case 'find_documents': return findDocumentsTool(ctx, toolInput, env);
+    case 'create_document_artifact': return createDocumentArtifactTool(ctx, toolInput, env);
+    case 'edit_document_artifact': return editDocumentArtifactTool(ctx, toolInput, env);
     case 'recall':
       console.log(`[agent:tool:recall] ${JSON.stringify({
         query: typeof toolInput?.query === 'string' ? toolInput.query.slice(0, 80) : null,
@@ -615,6 +685,33 @@ function safeParseJson<T>(json: string): T | null {
   } catch {
     return null;
   }
+}
+
+async function linkDocumentCardsToMessage(
+  cards: MartyDocumentCard[],
+  assistantMessageId: string,
+  ctx: AuthContext,
+  env: Env
+) {
+  const normalized = normalizeDocumentCards(cards);
+  if (normalized.length === 0) return;
+  const stmts = normalized.map(card =>
+    env.D1.prepare(
+      `INSERT OR IGNORE INTO document_links
+         (id, document_id, org_id, entity_type, entity_id, link_kind, link_source, created_at, created_by)
+       VALUES (?, ?, ?, 'agent_message', ?, ?, 'llm_extracted', strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)`
+    ).bind(
+      crypto.randomUUID(),
+      card.document_id,
+      ctx.orgId,
+      assistantMessageId,
+      card.generated ? 'derived' : 'mentioned',
+      ctx.userId
+    )
+  );
+  await env.D1.batch(stmts).catch(e => {
+    console.warn('[agent:documents] failed linking cards to message:', e?.message || e);
+  });
 }
 
 export async function deleteSession(
@@ -1054,6 +1151,7 @@ export async function queryAgent(
       const reader = captureStream.getReader();
       const decoder = new TextDecoder();
       let fullText = '';
+      const surfacedDocumentCards: MartyDocumentCard[] = [];
       try {
         while (true) {
           const { done, value } = await reader.read();
@@ -1067,6 +1165,11 @@ export async function queryAgent(
             try {
               const evt = JSON.parse(jsonStr);
               if (evt.text) fullText += evt.text;
+              if (evt.type === 'document_cards') {
+                surfacedDocumentCards.push(...normalizeDocumentCards(evt.document_cards));
+              } else if (evt.type === 'tool_result' && evt.result?.document_cards) {
+                surfacedDocumentCards.push(...normalizeDocumentCards(evt.result.document_cards));
+              }
             } catch { /* skip */ }
           }
         }
@@ -1088,7 +1191,14 @@ export async function queryAgent(
       // in metadata for UI badging + the existing marty_citation_metrics
       // telemetry table.
       const cancelled = await wasCancelledIncludingKV(requestId, env);
-      const rawContent = fullText || (cancelled ? '_(cancelled before MARTy started generating)_' : '');
+      const documentCards = normalizeDocumentCards(surfacedDocumentCards);
+      const rawContent = fullText || (
+        cancelled
+          ? '_(cancelled before MARTy started generating)_'
+          : documentCards.length > 0
+            ? 'I pulled the relevant document forward.'
+            : ''
+      );
       let strippedContent = rawContent;
       let invalidCitationsStripped = 0;
       if (rawContent && sources.length > 0) {
@@ -1116,11 +1226,17 @@ export async function queryAgent(
         if (invalidCitationsStripped > 0) {
           metadataObj.invalid_citations_stripped = invalidCitationsStripped;
         }
+        if (documentCards.length > 0) {
+          metadataObj.document_cards = documentCards;
+        }
         const metadataJson = Object.keys(metadataObj).length > 0 ? JSON.stringify(metadataObj) : null;
         await env.D1.prepare(
           `INSERT INTO agent_messages (id, session_id, turn_index, role, content, sources_json, metadata, created_at)
            VALUES (?, ?, ?, 'assistant', ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
         ).bind(assistantMessageId, session.id, turnIndex + 1, persistedContent, sourcesJson, metadataJson).run();
+        if (documentCards.length > 0) {
+          await linkDocumentCardsToMessage(documentCards, assistantMessageId, ctx, env);
+        }
       }
       // Free the in-isolate controller entry (KV marker ages out on its own).
       unregisterRequest(requestId);

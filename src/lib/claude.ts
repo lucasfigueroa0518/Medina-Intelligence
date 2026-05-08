@@ -279,6 +279,9 @@ export async function callClaudeStreaming(
             const result = await params.onToolCall(block.name, block.input);
             const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
 
+            if (result && typeof result === 'object' && Array.isArray((result as any).document_cards)) {
+              await emit({ type: 'document_cards', document_cards: (result as any).document_cards });
+            }
             await emit({ type: 'tool_result', tool: block.name, result, status: 'done' });
 
             toolResults.push({

@@ -1008,6 +1008,22 @@ export interface StuckWorkQueueEntry {
   silent_for_minutes: number;
 }
 
+export interface BudgetSnapshotRow {
+  org_id: string;
+  user_id: string;
+  upstream: string;
+  bucket_window: string;
+  used: number;
+  cap: number;
+  reset_at: string | null;
+  circuit_open: boolean;
+  circuit_open_until: string | null;
+  consecutive_429s: number;
+  consecutive_successes: number;
+  cap_lowered_at: string | null;
+  last_429_at: string | null;
+}
+
 export interface SystemStatusResponse {
   active_tasks: SystemStatusActiveTask[];
   run_history: SystemStatusRunHistoryEntry[];
@@ -1028,6 +1044,7 @@ export interface SystemStatusResponse {
   // an empty-state card when registry is unpopulated.
   work_queue_inventory: WorkQueueInventoryEntry[];
   stuck_work_queue: StuckWorkQueueEntry[];
+  budgets: BudgetSnapshotRow[];
   generated_at: string;
 }
 
@@ -1125,6 +1142,8 @@ export async function streamAgentQuery(
           } else if (evt.type === 'sources') {
             onToolEvent?.({ type: 'sources', sources: evt.sources });
           } else if (evt.type === 'attachments') {
+            onToolEvent?.(evt);
+          } else if (evt.type === 'document_cards') {
             onToolEvent?.(evt);
           } else if (evt.text) {
             receivedContent = true;

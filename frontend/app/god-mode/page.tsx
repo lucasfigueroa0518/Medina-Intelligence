@@ -15,6 +15,7 @@ import { CitationPill } from '@/components/citation-pill';
 import { SourcePanel } from '@/components/source-panel';
 import { PendingUploadPill, SentUploadPill, formatBytes } from '@/components/chat-upload-pill';
 import { UploadPreviewModal } from '@/components/upload-preview-modal';
+import { DocumentActions } from '@/components/document-actions';
 import { trimPartialCitation, type CitationSource } from '@/lib/citations';
 import type { ChatUploadSummary } from '@/lib/api';
 
@@ -116,6 +117,26 @@ interface ToolCall {
   collapsed: boolean;
 }
 
+interface MartyDocumentCard {
+  document_id: string;
+  title: string;
+  file_name?: string | null;
+  mime_type?: string | null;
+  document_type?: string | null;
+  mode?: 'compact' | 'dominant';
+  reason?: string;
+  excerpt?: string;
+  confidence?: number;
+  source?: string | null;
+  date?: string | null;
+  actions?: {
+    preview?: boolean;
+    download?: boolean;
+    send_to_marty?: boolean;
+  };
+  generated?: boolean;
+}
+
 interface Message {
   id: string;
   role: 'user' | 'assistant';
@@ -129,6 +150,7 @@ interface Message {
   cancelled?: boolean;
   sources?: CitationSource[];
   attachments?: ChatUploadSummary[];
+  documentCards?: MartyDocumentCard[];
 }
 
 // Selected/in-flight uploads (state local to the input bar before send).
@@ -302,12 +324,13 @@ function TableOfContents({ content }: { content: string }) {
 
 const TOOL_ICONS: Record<string, typeof Search> = {
   search_contacts: Search, search_companies: Search, search_deals: Search,
-  search_conversations: Search,
+  search_conversations: Search, find_documents: FileText,
   get_contact_detail: Database, get_company_detail: Database, get_deal_detail: Database,
   web_search: Globe, read_url: Globe,
   create_contact: FileText, update_contact: FileText,
   create_company: FileText, update_company: FileText,
   create_deal: FileText, update_deal: FileText,
+  create_document_artifact: FileText, edit_document_artifact: FileText,
   add_note: FileText, add_deal_action_item: FileText, apply_tag: FileText,
   delete_entity: AlertCircle,
 };
@@ -318,7 +341,10 @@ function toolLabel(name: string): string {
 
 function toolStatusText(tool: ToolCall): string {
   if (tool.status === 'started' || tool.status === 'executing') {
-    const action = tool.tool.startsWith('search') ? 'Searching' :
+    const action = tool.tool === 'find_documents' ? 'Finding documents' :
+      tool.tool === 'create_document_artifact' ? 'Creating document' :
+      tool.tool === 'edit_document_artifact' ? 'Editing document' :
+      tool.tool.startsWith('search') ? 'Searching' :
       tool.tool.startsWith('get') ? 'Loading' :
       tool.tool === 'web_search' ? 'Searching the web' :
       tool.tool === 'read_url' ? 'Reading page' :
@@ -329,6 +355,10 @@ function toolStatusText(tool: ToolCall): string {
     return `${action}...`;
   }
   if (tool.status === 'error') return 'Failed';
+  if (tool.tool === 'find_documents' && tool.result?.count !== undefined) return `Found ${tool.result.count} documents`;
+  if ((tool.tool === 'create_document_artifact' || tool.tool === 'edit_document_artifact') && tool.result?.document?.file_name) {
+    return tool.result.document.file_name;
+  }
   if (tool.result?.count !== undefined) return `Found ${tool.result.count} results`;
   if (tool.result?.success) return tool.result.message || 'Done';
   if (tool.result?.summary) return 'Results ready';
@@ -337,6 +367,98 @@ function toolStatusText(tool: ToolCall): string {
   if (tool.result?.deal) return `Loaded ${tool.result.deal.title || 'deal'}`;
   if (tool.result?.requires_confirmation) return 'Needs confirmation';
   return 'Done';
+}
+
+function mergeDocumentCards(
+  existing: MartyDocumentCard[] | undefined,
+  incoming: MartyDocumentCard[] | undefined
+): MartyDocumentCard[] | undefined {
+  const all = [...(existing || []), ...(incoming || [])].filter(c => c?.document_id && c?.title);
+  if (all.length === 0) return undefined;
+  const byId = new Map<string, MartyDocumentCard>();
+  for (const card of all) {
+    const prior = byId.get(card.document_id);
+    byId.set(card.document_id, {
+      ...prior,
+      ...card,
+      mode: prior?.mode === 'dominant' || card.mode === 'dominant' ? 'dominant' : (card.mode || prior?.mode || 'compact'),
+      actions: {
+        preview: card.actions?.preview ?? prior?.actions?.preview ?? true,
+        download: card.actions?.download ?? prior?.actions?.download ?? true,
+        send_to_marty: card.actions?.send_to_marty ?? prior?.actions?.send_to_marty ?? true,
+      },
+    });
+  }
+  return [...byId.values()];
+}
+
+function DocumentCardList({ cards }: { cards?: MartyDocumentCard[] }) {
+  const normalized = mergeDocumentCards(undefined, cards) || [];
+  if (normalized.length === 0) return null;
+
+  return (
+    <div className="mb-4 space-y-2">
+      {normalized.map(card => {
+        const dominant = card.mode === 'dominant';
+        const title = card.title || card.file_name || 'Document';
+        const meta = [
+          card.generated ? 'Created by MARTy' : card.document_type?.replace(/_/g, ' '),
+          card.file_name,
+          card.source,
+        ].filter(Boolean).join(' · ');
+        return (
+          <div
+            key={card.document_id}
+            className={`rounded-xl border bg-[#111114]/85 backdrop-blur-sm ${
+              dominant ? 'border-accent-magenta/25 p-4 shadow-[0_0_30px_rgba(236,72,153,0.08)]' : 'border-border/70 p-3'
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <div className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
+                dominant ? 'bg-accent-magenta/15 text-accent-magenta' : 'bg-white/[0.04] text-text-muted'
+              }`}>
+                <FileText size={17} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="truncate text-sm font-semibold text-text-primary" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+                    {title}
+                  </div>
+                  {card.confidence !== undefined && (
+                    <span className="rounded-full bg-white/[0.05] px-1.5 py-0.5 text-[10px] text-text-muted">
+                      {Math.round(card.confidence * 100)}% match
+                    </span>
+                  )}
+                </div>
+                {meta && <div className="mt-0.5 truncate text-xs text-text-muted">{meta}</div>}
+                {(dominant || card.reason) && card.reason && (
+                  <div className="mt-2 text-xs text-text-secondary">{card.reason}</div>
+                )}
+                {dominant && card.excerpt && (
+                  <div className="mt-2 line-clamp-3 text-xs leading-relaxed text-text-muted">{card.excerpt}</div>
+                )}
+              </div>
+              <div className="shrink-0">
+                <DocumentActions
+                  doc={{
+                    id: card.document_id,
+                    title,
+                    file_name: card.file_name || title,
+                    extracted_text_preview: card.excerpt || null,
+                  }}
+                  variant={dominant ? 'compact' : 'icon'}
+                  showPreview={card.actions?.preview !== false}
+                  showDownload={card.actions?.download !== false}
+                  showSendToMarty={card.actions?.send_to_marty !== false}
+                  onError={(message) => console.warn('[MARTy document card]', message)}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -792,10 +914,12 @@ export default function GodModePage() {
           setMessages(d.messages.map((m: any) => {
             // Pull cancelled flag out of the JSON metadata column.
             let cancelled = false;
+            let documentCards: MartyDocumentCard[] | undefined;
             if (m.metadata) {
               try {
                 const meta = typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata;
                 cancelled = !!meta?.cancelled;
+                documentCards = mergeDocumentCards(undefined, meta?.document_cards);
               } catch { /* ignore malformed metadata */ }
             }
             return {
@@ -805,6 +929,7 @@ export default function GodModePage() {
               timestamp: m.created_at,
               attachments: m.attachments || undefined,
               sources: m.sources || undefined,
+              documentCards,
               cancelled,
             };
           }));
@@ -1037,19 +1162,36 @@ export default function GodModePage() {
             }
             return;
           }
+          if (event.type === 'document_cards') {
+            const incoming = mergeDocumentCards(undefined, event.document_cards);
+            if (incoming?.length) {
+              setMessages(m => m.map(msg =>
+                msg.id === assistantMsgId
+                  ? { ...msg, documentCards: mergeDocumentCards(msg.documentCards, incoming) }
+                  : msg
+              ));
+            }
+            return;
+          }
           setMessages(m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
             const toolCalls = [...(msg.toolCalls || [])];
             if (event.status === 'started') {
-              toolCalls.push({ id: crypto.randomUUID(), tool: event.tool, status: 'started', collapsed: true });
+              const last = toolCalls[toolCalls.length - 1];
+              if (!last || last.tool !== event.tool || last.status === 'done' || last.status === 'error') {
+                toolCalls.push({ id: crypto.randomUUID(), tool: event.tool, status: 'started', collapsed: true });
+              }
             } else if (event.status === 'executing') {
-              const last = toolCalls.findLast(tc => tc.tool === event.tool);
+              const last = toolCalls.findLast(tc => tc.tool === event.tool && tc.status !== 'done' && tc.status !== 'error');
               if (last) { last.status = 'executing'; last.input = event.input; }
             } else if (event.status === 'done' || event.status === 'error') {
               const last = toolCalls.findLast(tc => tc.tool === event.tool && tc.status !== 'done' && tc.status !== 'error');
               if (last) { last.status = event.status; last.result = event.result; }
             }
-            return { ...msg, toolCalls };
+            const documentCards = event.result?.document_cards
+              ? mergeDocumentCards(msg.documentCards, event.result.document_cards)
+              : msg.documentCards;
+            return { ...msg, toolCalls, documentCards };
           }));
         },
         uploadIds.length > 0 ? uploadIds : undefined,
@@ -1303,6 +1445,10 @@ export default function GodModePage() {
 
                     {m.streaming && isThinking && (
                       <ThinkingIndicator />
+                    )}
+
+                    {m.documentCards && m.documentCards.length > 0 && (
+                      <DocumentCardList cards={m.documentCards} />
                     )}
 
                     {m.content && m.error ? (
