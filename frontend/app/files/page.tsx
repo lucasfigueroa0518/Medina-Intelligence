@@ -1,7 +1,8 @@
 'use client';
 
 import React, { Suspense } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
+import Link from 'next/link';
+import { useSearchParams } from 'next/navigation';
 import { FileText, Upload, type LucideIcon } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { ImportsPageContent } from '../imports/page';
@@ -23,30 +24,34 @@ export default function FilesPage() {
 }
 
 function FilesPageInner() {
-  const router = useRouter();
   const searchParams = useSearchParams();
-  const activeTab: FilesTab = searchParams.get('tab') === 'documents' ? 'documents' : 'imports';
+  const tabFromUrl: FilesTab = searchParams.get('tab') === 'documents' ? 'documents' : 'imports';
+  const [activeTab, setActiveTabState] = React.useState<FilesTab>(tabFromUrl);
+
+  React.useEffect(() => {
+    setActiveTabState(tabFromUrl);
+  }, [tabFromUrl]);
 
   function setActiveTab(tab: FilesTab) {
-    const next = new URLSearchParams(searchParams.toString());
-    next.set('tab', tab);
-    router.replace(`/files?${next.toString()}`, { scroll: false });
+    setActiveTabState(tab);
   }
 
   return (
     <div className="flex-1 flex h-full min-h-0 flex-col overflow-hidden min-w-0">
       <TopBar title="Files" />
 
-      <div className="border-b border-border bg-bg-root/95 backdrop-blur supports-[backdrop-filter]:bg-bg-root/80">
+      <div className="relative z-20 border-b border-border bg-bg-root/95 backdrop-blur supports-[backdrop-filter]:bg-bg-root/80">
         <div className="px-4 md:px-6 pt-4">
           <div className="inline-flex rounded-xl border border-border bg-bg-inset p-1">
             {TABS.map(tab => {
               const Icon = tab.icon;
               const active = activeTab === tab.key;
               return (
-                <button
+                <Link
                   key={tab.key}
-                  type="button"
+                  href={`/files?tab=${tab.key}`}
+                  replace
+                  scroll={false}
                   onClick={() => setActiveTab(tab.key)}
                   className={`h-10 px-4 rounded-lg text-sm font-medium transition-colors inline-flex items-center gap-2 ${
                     active
@@ -56,7 +61,7 @@ function FilesPageInner() {
                 >
                   <Icon size={16} className={active ? 'text-accent-magenta' : ''} />
                   {tab.label}
-                </button>
+                </Link>
               );
             })}
           </div>
