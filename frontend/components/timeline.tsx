@@ -21,10 +21,13 @@ export interface TimelineEntry {
   body_preview?: string | null;
   canReadContent?: boolean;
   from_email?: string;
+  external_thread_id?: string | null;
   participant_user_ids?: string;
   has_attachments?: number;
   attachment_count?: number;
   attachment_names?: string[];
+  occurrence_count?: number;
+  thread_count?: number;
 }
 
 interface TimelineProps {
@@ -37,7 +40,9 @@ export function Timeline({ entries, loading }: TimelineProps) {
     'all'
   );
 
-  const filtered = entries.filter(e => {
+  const dedupedEntries = React.useMemo(() => dedupeTimelineEntries(entries), [entries]);
+
+  const filtered = dedupedEntries.filter(e => {
     if (filter === 'all') return true;
     if (filter === 'emails') return e.type === 'conversation';
     if (filter === 'meetings') return e.type === 'event';
@@ -85,6 +90,48 @@ export function Timeline({ entries, loading }: TimelineProps) {
       )}
     </div>
   );
+}
+
+function normalizedTimelineTitle(title?: string | null): string {
+  return String(title || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function timelineDay(timestamp?: string | null): string {
+  return String(timestamp || '').slice(0, 10);
+}
+
+function mergeEntryCounts(existing: TimelineEntry, incoming: TimelineEntry): TimelineEntry {
+  const countField = incoming.type === 'event' ? 'occurrence_count' : 'thread_count';
+  const count = (existing[countField] ?? 1) + (incoming[countField] ?? 1);
+  if (String(incoming.timestamp) > String(existing.timestamp)) {
+    return { ...incoming, [countField]: count };
+  }
+  return { ...existing, [countField]: count };
+}
+
+function dedupeTimelineEntries(entries: TimelineEntry[]): TimelineEntry[] {
+  const grouped = new Map<string, TimelineEntry>();
+  const passthrough: TimelineEntry[] = [];
+
+  for (const entry of entries) {
+    let key: string | null = null;
+    if (entry.type === 'event') {
+      key = `event:${normalizedTimelineTitle(entry.title)}:${timelineDay(entry.timestamp)}`;
+    } else if (entry.type === 'conversation' && entry.external_thread_id) {
+      key = `conversation:${entry.external_thread_id}`;
+    }
+
+    if (!key) {
+      passthrough.push(entry);
+      continue;
+    }
+
+    const existing = grouped.get(key);
+    grouped.set(key, existing ? mergeEntryCounts(existing, entry) : entry);
+  }
+
+  return [...grouped.values(), ...passthrough]
+    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
 }
 
 function TimelineEntryRow({ entry }: { entry: TimelineEntry }) {
@@ -137,6 +184,16 @@ function TimelineEntryRow({ entry }: { entry: TimelineEntry }) {
                   {entry.attachment_names.length > 3 ? ` +${entry.attachment_names.length - 3}` : ''}
                 </span>
               )}
+            </div>
+          ) : null}
+          {entry.type === 'event' && entry.occurrence_count && entry.occurrence_count > 1 ? (
+            <div className="mt-1.5 text-[11px] text-text-muted">
+              {entry.occurrence_count} similar calendar entries grouped
+            </div>
+          ) : null}
+          {entry.type === 'conversation' && entry.thread_count && entry.thread_count > 1 ? (
+            <div className="mt-1.5 text-[11px] text-text-muted">
+              {entry.thread_count} messages in this thread
             </div>
           ) : null}
         </div>

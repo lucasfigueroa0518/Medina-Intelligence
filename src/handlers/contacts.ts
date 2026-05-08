@@ -687,6 +687,7 @@ export async function getContactTimeline(
 ): Promise<Response> {
   const url = new URL(request.url);
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
+  const sourceLimit = Math.min(limit * 4, 500);
 
   const [events, conversations, tasks, documents, sharingFlags] = await Promise.all([
     env.D1.prepare(
@@ -694,21 +695,22 @@ export async function getContactTimeline(
        FROM events e JOIN event_attendees ea ON e.id = ea.event_id
        WHERE ea.contact_id = ? AND e.org_id = ? AND e.deleted_at IS NULL
        ORDER BY e.start_time DESC LIMIT ?`
-    ).bind(id, ctx.orgId, limit).all(),
+    ).bind(id, ctx.orgId, sourceLimit).all(),
     env.D1.prepare(
       `SELECT c.id, c.subject as title, c.sent_at as timestamp, 'conversation' as type,
               c.source as subtype, c.body_preview, c.participant_user_ids,
               c.source as conv_source, c.is_campaign_email, c.from_email,
+              c.external_thread_id,
               c.has_attachments, c.attachment_count
        FROM conversations c JOIN conversation_contacts cc ON c.id = cc.conversation_id
        WHERE cc.contact_id = ? AND c.org_id = ?
        ORDER BY c.sent_at DESC LIMIT ?`
-    ).bind(id, ctx.orgId, limit).all(),
+    ).bind(id, ctx.orgId, sourceLimit).all(),
     env.D1.prepare(
       `SELECT id, title, due_date as timestamp, 'task' as type, status as subtype
        FROM tasks WHERE contact_id = ? AND org_id = ? AND deleted_at IS NULL
        ORDER BY due_date DESC LIMIT ?`
-    ).bind(id, ctx.orgId, limit).all(),
+    ).bind(id, ctx.orgId, sourceLimit).all(),
     env.D1.prepare(
       // Documents linked to this contact through the junction table. Includes
       // ACL columns so the post-query filter can apply isDocumentAccessibleToUser.
@@ -720,7 +722,7 @@ export async function getContactTimeline(
           AND dl.deleted_at IS NULL AND d.deleted_at IS NULL
           AND d.org_id = ?
         ORDER BY d.created_at DESC LIMIT ?`
-    ).bind(id, ctx.orgId, limit).all(),
+    ).bind(id, ctx.orgId, sourceLimit).all(),
     getSharingFlags(ctx.orgId, env),
   ]);
 
@@ -774,6 +776,42 @@ export async function getContactTimeline(
     };
   });
 
+  // Contact timelines can be joined through several participant/import paths.
+  // Collapse the noisy duplicates users see as repeated same-day calendar rows
+  // and multi-message email threads while keeping the freshest representative.
+  const threadGroups = new Map<string, any>();
+  const standaloneConvs: any[] = [];
+  for (const c of conversationsWithAccess) {
+    const threadId = c.external_thread_id;
+    if (!threadId) {
+      standaloneConvs.push(c);
+      continue;
+    }
+    const existing = threadGroups.get(threadId);
+    const nextCount = (existing?.thread_count ?? 0) + 1;
+    if (!existing || String(c.timestamp) > String(existing.timestamp)) {
+      threadGroups.set(threadId, { ...c, thread_count: nextCount });
+    } else {
+      existing.thread_count = nextCount;
+    }
+  }
+  const dedupedConvs = [...threadGroups.values(), ...standaloneConvs];
+
+  const eventGroups = new Map<string, any>();
+  for (const e of (events.results as any[])) {
+    const titleKey = String(e.title || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const dayKey = String(e.timestamp || '').slice(0, 10);
+    const key = `${titleKey}|${dayKey}`;
+    const existing = eventGroups.get(key);
+    const nextCount = (existing?.occurrence_count ?? 0) + 1;
+    if (!existing || String(e.timestamp) > String(existing.timestamp)) {
+      eventGroups.set(key, { ...e, occurrence_count: nextCount });
+    } else {
+      existing.occurrence_count = nextCount;
+    }
+  }
+  const dedupedEvents = [...eventGroups.values()];
+
   // ACL-filter the contact-linked documents before they hit the timeline.
   // Same gate as RAG / /api/documents — owner bypass, default-deny on missing
   // visibility, participant-or-uploader for private. Strip the ACL fields
@@ -784,8 +822,8 @@ export async function getContactTimeline(
     .map(({ visibility: _v, participant_user_ids: _p, uploaded_by: _u, ...rest }) => rest);
 
   const entries = [
-    ...events.results,
-    ...conversationsWithAccess,
+    ...dedupedEvents,
+    ...dedupedConvs,
     ...tasks.results,
     ...accessibleDocs,
   ]
