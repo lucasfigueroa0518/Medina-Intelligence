@@ -200,6 +200,18 @@ export const api = {
       '/deals/bulk-update',
       { method: 'POST', body: JSON.stringify(data) }
     ),
+  bulkDecideDeals: async (data: { deal_ids: string[]; decision: 'yes' | 'no' | 'delete' }) => {
+    const result = await request<{ ok: boolean; updated_count: number; skipped_ids: string[]; archived: boolean }>(
+      '/deals/bulk-update',
+      {
+        method: 'POST',
+        body: JSON.stringify(data.decision === 'yes'
+          ? { deal_ids: data.deal_ids, updates: { stage: 'talking' } }
+          : { deal_ids: data.deal_ids, archive: true }),
+      }
+    );
+    return { ...result, decision: data.decision };
+  },
   getDealReplayStatus: () =>
     request<DealReplayStatusSnapshot>('/deals/replay/status'),
   getDealReplayEvidence: (params?: { limit?: number; offset?: number; company_id?: string }) => {
