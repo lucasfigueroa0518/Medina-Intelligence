@@ -62,6 +62,7 @@ export interface SystemStatusResponse {
   completeness: {
     email_embedding: CompletenessMetric;
     email_linkage: CompletenessMetric;
+    document_embedding: CompletenessMetric;
     contact_enrichment: CompletenessMetric;
     contact_company: CompletenessMetric;
     contact_linkedin: CompletenessMetric;
@@ -189,6 +190,7 @@ export async function getSystemStatus(
   // Phase 1 pipelines/dead_letter/stuck_runs/budgets sections.
   const [
     convoTotalRow, convoEmbeddedRow, convoLinkedRow,
+    documentTotalRow, documentEmbeddedRow,
     contactRow,
     companyRow,
     eventTotalRow, eventEmbeddedRow, attendeeRow,
@@ -205,6 +207,26 @@ export async function getSystemStatus(
          FROM conversation_contacts cc
          JOIN conversations c ON c.id = cc.conversation_id
         WHERE c.org_id = ?`
+    ).bind(orgId).first<{n:number}>(),
+    env.D1.prepare(
+      `SELECT COUNT(*) as n
+         FROM documents
+        WHERE org_id = ?
+          AND deleted_at IS NULL
+          AND processing_status = 'completed'
+          AND r2_key IS NOT NULL`
+    ).bind(orgId).first<{n:number}>(),
+    env.D1.prepare(
+      `SELECT COUNT(DISTINCT d.id) as n
+         FROM documents d
+         JOIN vector_entity_index vei
+           ON vei.entity_id = d.id
+          AND vei.source_table = 'documents'
+          AND vei.org_id = d.org_id
+        WHERE d.org_id = ?
+          AND d.deleted_at IS NULL
+          AND d.processing_status = 'completed'
+          AND d.r2_key IS NOT NULL`
     ).bind(orgId).first<{n:number}>(),
     env.D1.prepare(
       `SELECT COUNT(*) as total,
@@ -256,6 +278,7 @@ export async function getSystemStatus(
   const completeness: SystemStatusResponse['completeness'] = {
     email_embedding: metric(convoEmbeddedRow?.n || 0, convoTotalRow?.n || 0),
     email_linkage: metric(convoLinkedRow?.n || 0, convoTotalRow?.n || 0),
+    document_embedding: metric(documentEmbeddedRow?.n || 0, documentTotalRow?.n || 0),
     contact_enrichment: metric(contactRow?.enriched || 0, contactRow?.total || 0),
     contact_company: metric(contactRow?.has_company || 0, contactRow?.total || 0),
     contact_linkedin: metric(contactRow?.has_linkedin || 0, contactRow?.total || 0),

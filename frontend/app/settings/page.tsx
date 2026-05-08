@@ -3869,6 +3869,15 @@ function DataCompletenessCard({ c }: { c: SystemStatusResponse['completeness'] }
         />
       </CompletenessGroup>
 
+      <CompletenessGroup title="Document Coverage">
+        <CompletenessBar
+          label="embedded"
+          metric={c.document_embedding}
+          unit="documents searchable by MARTy"
+          warningHint="Unembedded documents are stored and preview/downloadable, but MARTy's semantic retrieval is weaker until the document self-healer processes them."
+        />
+      </CompletenessGroup>
+
       <CompletenessGroup title="Contact Coverage">
         <CompletenessBar
           label="enriched"

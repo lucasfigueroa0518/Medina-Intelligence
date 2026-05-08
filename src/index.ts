@@ -928,6 +928,15 @@ export async function handleScheduled(
           try { await enqueueBackfillEvents(org.id, env); }
           catch (e) { console.error(`hourly self-heal: enqueueBackfillEvents failed for ${org.id}:`, e); }
         })());
+        // Hourly document embed self-heal — same work_queue path as
+        // conversations/events, capped at 40 completed documents per org
+        // per hour. This keeps MARTy's semantic document retrieval getting
+        // healthier without a one-time quota spike.
+        ctxExec.waitUntil((async () => {
+          const { enqueueBackfillDocuments } = await import('./lib/daily-cron');
+          try { await enqueueBackfillDocuments(org.id, env); }
+          catch (e) { console.error(`hourly self-heal: enqueueBackfillDocuments failed for ${org.id}:`, e); }
+        })());
         // deal_intelligence batch refresh — recompute the oldest 50
         // stale-or-invalidated rows for this org. Bounded subrequest
         // budget by HOURLY_BATCH_LIMIT (1 Claude call + ~3 D1 calls per

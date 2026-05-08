@@ -1128,6 +1128,7 @@ export interface SystemStatusResponse {
   completeness: {
     email_embedding: CompletenessMetric;
     email_linkage: CompletenessMetric;
+    document_embedding: CompletenessMetric;
     contact_enrichment: CompletenessMetric;
     contact_company: CompletenessMetric;
     contact_linkedin: CompletenessMetric;

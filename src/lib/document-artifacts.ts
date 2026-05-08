@@ -111,7 +111,8 @@ function compactText(value: string): string {
 
 function wantsSingleDocument(query: string): boolean {
   const lower = query.toLowerCase();
-  if (/\b(documents|docs|files|decks|presentations|attachments)\b/.test(lower)) return false;
+  if (/\b(all|any|several|multiple|many|list|related|relevant|every|set|materials|packet|folder)\b/.test(lower)) return false;
+  if (/\b(documents|docs|files|decks|presentations|attachments|materials)\b/.test(lower)) return false;
   return /\b(pull up|open|show me|preview|download|send)\b/.test(lower)
     && /\b(deck|document|doc|file|pdf|pptx|powerpoint|spreadsheet|xlsx|excel|memo)\b/.test(lower);
 }

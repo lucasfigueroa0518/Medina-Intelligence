@@ -656,6 +656,52 @@ export async function enqueueBackfillEvents(orgId: string, env: Env): Promise<nu
 }
 
 /**
+ * Continuous document embedding health: completed documents with original
+ * binaries should be searchable by MARTy. This scanner only enqueues missing
+ * vectors; embedSingleItem(..., 'documents', ...) remains the execution path.
+ */
+export async function enqueueBackfillDocuments(orgId: string, env: Env): Promise<number> {
+  const { enqueueWork } = await import('./work-queue');
+  const rows = await env.D1.prepare(
+    `SELECT d.id
+       FROM documents d
+      WHERE d.org_id = ?
+        AND d.deleted_at IS NULL
+        AND d.processing_status = 'completed'
+        AND d.r2_key IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM vector_entity_index vei
+           WHERE vei.source_table = 'documents'
+             AND vei.entity_id = d.id
+             AND vei.org_id = d.org_id
+        )
+      ORDER BY d.created_at DESC
+      LIMIT 40`
+  ).bind(orgId).all<{ id: string }>();
+  if (rows.results.length === 0) return 0;
+
+  let enqueued = 0;
+  for (const row of rows.results) {
+    try {
+      await enqueueWork(env, orgId, 'embed_retry',
+        { entity_id: row.id, source_table: 'documents' },
+        {
+          upstream: 'bge',
+          idempotency_key: `${orgId}:${row.id}:documents`,
+        }
+      );
+      enqueued++;
+    } catch (e) {
+      console.error(`[daily-cron:enqueueBackfillDocuments] failed for ${row.id}:`, e instanceof Error ? e.message : e);
+    }
+  }
+  if (enqueued > 0) {
+    console.log(`[daily-cron] enqueued ${enqueued} document embed-retry rows for org ${orgId}`);
+  }
+  return enqueued;
+}
+
+/**
  * @deprecated Phase 8 1a (2026-05-05) — replaced by enqueueBackfillConversations.
  * Inline embedding bypasses upstream_budget_ledger (audit finding G).
  * Kept exported for revert window; deleted in 1b after ~5 days of
