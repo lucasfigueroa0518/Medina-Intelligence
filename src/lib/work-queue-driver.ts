@@ -158,6 +158,7 @@ async function withHeartbeat<T>(
 import { embedRetryHandler } from './work-queue-handlers/embed-retry';
 import { calendarRefreshHandler } from './work-queue-handlers/calendar-refresh';
 import { fireflyWindowHandler } from './work-queue-handlers/firefly-window';
+import { dealReplayEvidenceHandler } from './work-queue-handlers/deal-replay-evidence';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -187,6 +188,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   embedRetryHandler,
   calendarRefreshHandler,
   fireflyWindowHandler,
+  dealReplayEvidenceHandler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────

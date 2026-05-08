@@ -336,6 +336,15 @@ async function routeAuthenticated(
   if (path === '/api/deals/bulk-update' && method === 'POST') {
     return Deals.bulkUpdateDeals(request, ctx, env);
   }
+  if (path === '/api/deals/replay/start' && method === 'POST') {
+    return Deals.startDealReplay(request, ctx, env);
+  }
+  if (path === '/api/deals/replay/status' && method === 'GET') {
+    return Deals.getDealReplayStatus(ctx, env);
+  }
+  if (path === '/api/deals/replay/cancel' && method === 'POST') {
+    return Deals.cancelDealReplay(ctx, env);
+  }
   m = path.match(/^\/api\/deals\/([^/]+)\/associations$/);
   if (m && method === 'GET') return Deals.getDealAssociations(m[1], ctx, env);
   m = path.match(/^\/api\/deals\/([^/]+)\/timeline$/);

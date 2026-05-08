@@ -19,6 +19,7 @@ import {
   type WorkQueueInventoryEntry,
   type StuckWorkQueueEntry,
   type BudgetSnapshotRow,
+  type DealReplayStatusSnapshot,
 } from '@/lib/api';
 import { useBackgroundTasks } from '@/components/background-task-indicator';
 
@@ -3051,6 +3052,7 @@ function SystemStatusSection() {
   return (
     <div className="space-y-6">
       <RateLimitIndicator budgets={data.budgets || []} />
+      <DealReplayStatusCard replay={data.deal_replay || emptyDealReplay} onRefresh={load} />
       <ActiveTasksCard tasks={data.active_tasks} />
       <RunHistoryCard rows={data.run_history} />
       <DataCompletenessCard c={data.completeness} />
@@ -3058,6 +3060,230 @@ function SystemStatusSection() {
         inventory={data.work_queue_inventory}
         stuck={data.stuck_work_queue}
       />
+    </div>
+  );
+}
+
+const emptyDealReplay: DealReplayStatusSnapshot = {
+  run: null,
+  queue: { pending: 0, in_progress: 0, completed: 0, failed: 0, dead_letter: 0 },
+  generated_at: new Date().toISOString(),
+};
+
+function ReplayMetric({
+  label,
+  value,
+  tone = 'default',
+}: {
+  label: string;
+  value: string | number;
+  tone?: 'default' | 'good' | 'warn' | 'bad';
+}) {
+  const color = tone === 'good'
+    ? 'text-semantic-success'
+    : tone === 'warn'
+      ? 'text-semantic-warning'
+      : tone === 'bad'
+        ? 'text-semantic-error'
+        : 'text-text-primary';
+  return (
+    <div className="rounded-lg border border-white/[0.04] bg-white/[0.025] px-3 py-2">
+      <div className={`text-lg font-semibold tabular-nums ${color}`}>{value}</div>
+      <div className="text-[11px] text-text-muted mt-0.5">{label}</div>
+    </div>
+  );
+}
+
+function ReplayStatusPill({ status }: { status: NonNullable<DealReplayStatusSnapshot['run']>['status'] }) {
+  const cfg = {
+    running: { label: 'Running', cls: 'bg-accent-magenta/15 text-accent-magenta' },
+    completed: { label: 'Completed', cls: 'bg-semantic-success/15 text-semantic-success' },
+    cancelled: { label: 'Cancelled', cls: 'bg-semantic-warning/15 text-semantic-warning' },
+    failed: { label: 'Failed', cls: 'bg-semantic-error/15 text-semantic-error' },
+  }[status];
+  return <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${cfg.cls}`}>{cfg.label}</span>;
+}
+
+function friendlyReplayReason(reason: string): string {
+  return reason.replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function DealReplayStatusCard({
+  replay,
+  onRefresh,
+}: {
+  replay: DealReplayStatusSnapshot;
+  onRefresh: () => void;
+}) {
+  const [canceling, setCanceling] = React.useState(false);
+  const run = replay.run;
+  const queue = replay.queue;
+
+  async function cancelReplay() {
+    if (!run || run.status !== 'running') return;
+    setCanceling(true);
+    try {
+      await api.cancelDealReplay();
+      onRefresh();
+    } finally {
+      setCanceling(false);
+    }
+  }
+
+  if (!run) {
+    return (
+      <div className="card p-5">
+        <div className="text-sm font-medium text-text-primary">Deal Rebuild</div>
+        <div className="text-xs text-text-muted mt-1">
+          No six-week rebuild has been started yet. When it runs, this panel shows candidate scanning, conservative evidence, promotions, skips, and Claude deferrals.
+        </div>
+      </div>
+    );
+  }
+
+  const queuedRemaining = queue.pending + queue.in_progress + queue.failed;
+  const progressPct = run.enqueued_count > 0
+    ? Math.min(100, Math.round((run.processed_count / run.enqueued_count) * 100))
+    : 100;
+  const skipReasons = Object.entries(run.skip_reasons || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6);
+  const promoted = run.promoted_companies.slice(0, 5);
+  const evidence = run.recent_evidence.slice(0, 5);
+  const errors = run.recent_errors.slice(0, 4);
+  const titleStatus = run.status === 'running'
+    ? `Running for ${formatDuration(run.elapsed_seconds)}`
+    : `Finished ${run.completed_at ? formatRelative(run.completed_at) : formatRelative(run.updated_at)}`;
+
+  return (
+    <div className="card p-5 space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <div className="text-sm font-medium text-text-primary">Deal Rebuild</div>
+            <ReplayStatusPill status={run.status} />
+          </div>
+          <div className="text-xs text-text-muted mt-1">
+            Conservative replay for the last {run.days_back} days. It only promotes a startup after 4 strong evidence records across at least 2 source families.
+          </div>
+          {run.last_event && (
+            <div className="mt-2 text-xs text-text-secondary">{run.last_event}</div>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="text-right text-[11px] text-text-muted">
+            <div>{titleStatus}</div>
+            <div>{run.pace_per_minute.toLocaleString()} items/min</div>
+          </div>
+          {run.status === 'running' && (
+            <button
+              type="button"
+              onClick={cancelReplay}
+              disabled={canceling}
+              className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 px-2.5 py-1.5 text-[11px] text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+            >
+              <XIcon size={12} /> Cancel
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div>
+        <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+          <div className="h-full rounded-full bg-accent-magenta transition-all" style={{ width: `${progressPct}%` }} />
+        </div>
+        <div className="mt-1 flex flex-wrap justify-between gap-2 text-[11px] text-text-muted">
+          <span>{run.processed_count.toLocaleString()} of {run.enqueued_count.toLocaleString()} candidates processed</span>
+          <span>{queuedRemaining.toLocaleString()} still queued or retrying</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-2">
+        <ReplayMetric label="Scanned" value={run.scanned_count.toLocaleString()} />
+        <ReplayMetric label="Strong evidence" value={run.evidence_recorded_count.toLocaleString()} tone="good" />
+        <ReplayMetric label="Promoted to New" value={run.promoted_count.toLocaleString()} tone="good" />
+        <ReplayMetric label="Skipped" value={run.skipped_count.toLocaleString()} />
+        <ReplayMetric label="Claude pauses" value={run.rate_limited_count.toLocaleString()} tone={run.rate_limited_count > 0 ? 'warn' : 'default'} />
+        <ReplayMetric label="Errors" value={run.error_count.toLocaleString()} tone={run.error_count > 0 ? 'bad' : 'default'} />
+      </div>
+
+      <div className="grid gap-3 xl:grid-cols-2">
+        <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
+          <div className="text-xs font-medium text-text-primary">Queue State</div>
+          <div className="mt-2 grid grid-cols-5 gap-2 text-center text-[11px]">
+            {(['pending', 'in_progress', 'failed', 'dead_letter', 'completed'] as const).map(key => (
+              <div key={key} className="rounded-md bg-white/[0.025] px-2 py-1">
+                <div className="text-text-primary tabular-nums">{queue[key].toLocaleString()}</div>
+                <div className="text-[10px] text-text-muted">{key.replace('_', ' ')}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
+          <div className="text-xs font-medium text-text-primary">Skipped Candidates</div>
+          {skipReasons.length === 0 ? (
+            <div className="mt-2 text-xs text-text-muted">No skipped candidates recorded yet.</div>
+          ) : (
+            <div className="mt-2 max-h-28 overflow-y-auto pr-1 space-y-1.5">
+              {skipReasons.map(([reason, count]) => (
+                <div key={reason} className="flex items-center justify-between gap-3 text-xs">
+                  <span className="min-w-0 truncate text-text-secondary">{friendlyReplayReason(reason)}</span>
+                  <span className="shrink-0 tabular-nums text-text-muted">{count.toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="grid gap-3 xl:grid-cols-2">
+        <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
+          <div className="text-xs font-medium text-text-primary">Recent Evidence</div>
+          {evidence.length === 0 ? (
+            <div className="mt-2 text-xs text-text-muted">Strong evidence snippets will appear here as they are recorded.</div>
+          ) : (
+            <div className="mt-2 max-h-44 overflow-y-auto pr-1 space-y-2">
+              {evidence.map((item, idx) => (
+                <div key={`${item.company_name}-${item.at}-${idx}`} className="rounded-md bg-white/[0.025] px-2 py-1.5">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="font-medium text-text-primary truncate">{item.company_name}</span>
+                    <span className="shrink-0 text-[10px] text-text-muted">{item.source_type}</span>
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-text-muted truncate">
+                    {item.source_title || 'Untitled source'}{typeof item.confidence === 'number' ? ` · ${(item.confidence * 100).toFixed(0)}%` : ''}
+                  </div>
+                  {item.evidence && (
+                    <div className="mt-1 text-[11px] leading-relaxed text-text-secondary line-clamp-2">{item.evidence}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
+          <div className="text-xs font-medium text-text-primary">Promotions And Issues</div>
+          {promoted.length === 0 && errors.length === 0 ? (
+            <div className="mt-2 text-xs text-text-muted">Promoted startup cards and replay issues will appear here.</div>
+          ) : (
+            <div className="mt-2 max-h-44 overflow-y-auto pr-1 space-y-2">
+              {promoted.map((item, idx) => (
+                <div key={`${item.company_name}-${item.at}-${idx}`} className="rounded-md bg-semantic-success/[0.06] border border-semantic-success/10 px-2 py-1.5">
+                  <div className="text-xs font-medium text-semantic-success truncate">{item.company_name}</div>
+                  <div className="text-[11px] text-text-muted">Promoted {formatRelative(item.at)}</div>
+                </div>
+              ))}
+              {errors.map((item, idx) => (
+                <div key={`${item.error}-${item.at}-${idx}`} className="rounded-md bg-semantic-error/[0.06] border border-semantic-error/10 px-2 py-1.5">
+                  <div className="text-xs text-semantic-error line-clamp-2">{item.error}</div>
+                  <div className="text-[11px] text-text-muted">{item.source_type || 'source'} · {formatRelative(item.at)}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

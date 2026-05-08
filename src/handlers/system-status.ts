@@ -27,6 +27,10 @@ import {
 } from '../lib/system-status';
 import type { FireflyKeyStatus } from '../lib/firefly-credentials';
 import type { WorkQueueDomainCount } from '../lib/work-queue';
+import {
+  getDealReplayStatusSnapshot,
+  type DealReplayStatusSnapshot,
+} from '../lib/deal-replay';
 
 export interface SystemStatusActiveTask {
   type: string;                  // human-readable
@@ -87,6 +91,7 @@ export interface SystemStatusResponse {
   // separate field needed; getDeadLetterItems handles the merge).
   work_queue_inventory: WorkQueueDomainCount[];
   stuck_work_queue: StuckWorkQueueRow[];
+  deal_replay: DealReplayStatusSnapshot;
   generated_at: string;
 }
 
@@ -189,6 +194,7 @@ export async function getSystemStatus(
     eventTotalRow, eventEmbeddedRow, attendeeRow,
     userRow, userMissingRows,
     snapshot,
+    dealReplay,
   ] = await Promise.all([
     // conversations table has no deleted_at column (verified against live
     // schema). All conversations rows are considered live.
@@ -235,6 +241,16 @@ export async function getSystemStatus(
     // Phase 1: observability surface. Returns
     // { pipelines, dead_letter, stuck_runs, budgets, generated_at }.
     getSystemStatusSnapshot(env, orgId),
+    // Safe Six-Week Deals Rebuild cockpit. Keep this in System Status so
+    // operators can monitor skips, deferrals, and promotions without
+    // turning the Deals board itself into a log.
+    ctx.userRole === 'owner'
+      ? getDealReplayStatusSnapshot(env, orgId)
+      : Promise.resolve({
+        run: null,
+        queue: { pending: 0, in_progress: 0, completed: 0, failed: 0, dead_letter: 0 },
+        generated_at: new Date().toISOString(),
+      }),
   ]);
 
   const completeness: SystemStatusResponse['completeness'] = {
@@ -264,6 +280,7 @@ export async function getSystemStatus(
     firefly_credentials: snapshot.firefly_credentials,
     work_queue_inventory: snapshot.work_queue_inventory,
     stuck_work_queue: snapshot.stuck_work_queue,
+    deal_replay: dealReplay,
     generated_at: new Date().toISOString(),
   } satisfies SystemStatusResponse);
 }

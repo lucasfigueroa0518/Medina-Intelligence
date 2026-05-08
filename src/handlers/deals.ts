@@ -14,6 +14,12 @@ import {
   OpenDealConflictError,
   classifyContactSide,
 } from '../lib/internal-entity';
+import {
+  cancelDealReplayRun,
+  DEAL_REPLAY_CONFIRMATION,
+  getDealReplayStatusSnapshot,
+  startDealReplayRun,
+} from '../lib/deal-replay';
 
 // ---------------------------------------------------------------------------
 // GET /api/deals
@@ -777,6 +783,90 @@ export async function getDealAssociations(
   }
 
   return jsonResponse({ associations: hydrated });
+}
+
+// ---------------------------------------------------------------------------
+// Deal replay controls — owner-only destructive rebuild workflow
+// ---------------------------------------------------------------------------
+
+export async function startDealReplay(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('FORBIDDEN', 403, 'Only owners can start a deal replay.');
+  }
+  const body = await parseJsonBody<{ confirmation?: string; days_back?: number }>(request);
+  if (!body || body.confirmation !== DEAL_REPLAY_CONFIRMATION) {
+    return errorResponse(
+      'CONFIRMATION_REQUIRED',
+      400,
+      `confirmation must equal ${DEAL_REPLAY_CONFIRMATION}`
+    );
+  }
+
+  try {
+    const result = await startDealReplayRun({
+      orgId: ctx.orgId,
+      userId: ctx.userId,
+      daysBack: body.days_back,
+      confirmation: body.confirmation,
+      env,
+    });
+    await emitAudit(env, {
+      org_id: ctx.orgId,
+      user_id: ctx.userId,
+      action: 'hard_delete',
+      entity_type: 'deal',
+      entity_id: result.run.id,
+      metadata: {
+        sub_action: 'deal_replay_start',
+        days_back: result.run.days_back,
+        cutoff_at: result.run.cutoff_at,
+        deleted_deals: result.deleted_deals,
+        enqueued_count: result.enqueued_count,
+      },
+      created_at: new Date().toISOString(),
+    });
+    return jsonResponse(result, 202);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    const status = /already running/i.test(message) ? 409 : 500;
+    return errorResponse(status === 409 ? 'REPLAY_ALREADY_RUNNING' : 'REPLAY_START_FAILED', status, message);
+  }
+}
+
+export async function getDealReplayStatus(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('FORBIDDEN', 403, 'Only owners can view deal replay status.');
+  }
+  return jsonResponse(await getDealReplayStatusSnapshot(env, ctx.orgId));
+}
+
+export async function cancelDealReplay(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('FORBIDDEN', 403, 'Only owners can cancel a deal replay.');
+  }
+  const result = await cancelDealReplayRun(env, ctx.orgId);
+  if (result.cancelled) {
+    await emitAudit(env, {
+      org_id: ctx.orgId,
+      user_id: ctx.userId,
+      action: 'update',
+      entity_type: 'deal',
+      entity_id: result.run?.id || 'deal_replay',
+      metadata: { sub_action: 'deal_replay_cancel', cancelled_work: result.cancelled_work },
+      created_at: new Date().toISOString(),
+    });
+  }
+  return jsonResponse(result);
 }
 
 // ---------------------------------------------------------------------------

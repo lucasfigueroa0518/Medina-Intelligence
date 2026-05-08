@@ -200,6 +200,18 @@ export const api = {
       '/deals/bulk-update',
       { method: 'POST', body: JSON.stringify(data) }
     ),
+  getDealReplayStatus: () =>
+    request<DealReplayStatusSnapshot>('/deals/replay/status'),
+  startDealReplay: (data: { confirmation: string; days_back?: number }) =>
+    request<{ run: DealReplayRunSnapshot; deleted_deals: number; enqueued_count: number }>(
+      '/deals/replay/start',
+      { method: 'POST', body: JSON.stringify(data) }
+    ),
+  cancelDealReplay: () =>
+    request<{ cancelled: boolean; run: DealReplayRunSnapshot | null; cancelled_work: number }>(
+      '/deals/replay/cancel',
+      { method: 'POST' }
+    ),
   getDeal: (id: string) =>
     request<{ deal: any; contacts: { theirs: any[]; ours: any[]; other: any[] }; action_items: any[]; notes: any[]; company: any; users: any[] }>(`/deals/${id}`),
   deleteDeal: (id: string) =>
@@ -1024,6 +1036,57 @@ export interface BudgetSnapshotRow {
   last_429_at: string | null;
 }
 
+export type DealReplayStatus = 'running' | 'completed' | 'cancelled' | 'failed';
+
+export interface DealReplayRunSnapshot {
+  id: string;
+  org_id: string;
+  status: DealReplayStatus;
+  days_back: number;
+  cutoff_at: string;
+  reset_mode: 'hard_delete';
+  started_by: string | null;
+  enqueued_count: number;
+  scanned_count: number;
+  processed_count: number;
+  skipped_count: number;
+  evidence_recorded_count: number;
+  promoted_count: number;
+  rate_limited_count: number;
+  error_count: number;
+  skip_reasons: Record<string, number>;
+  promoted_companies: Array<{ deal_id: string | null; company_name: string; at: string }>;
+  recent_evidence: Array<{
+    company_name: string;
+    source_type: string;
+    source_title: string | null;
+    evidence: string | null;
+    confidence: number | null;
+    at: string;
+  }>;
+  recent_errors: Array<{ source_type?: string; source_id?: string; error: string; at: string }>;
+  last_event: string | null;
+  started_at: string;
+  completed_at: string | null;
+  cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
+  elapsed_seconds: number;
+  pace_per_minute: number;
+}
+
+export interface DealReplayStatusSnapshot {
+  run: DealReplayRunSnapshot | null;
+  queue: {
+    pending: number;
+    in_progress: number;
+    completed: number;
+    failed: number;
+    dead_letter: number;
+  };
+  generated_at: string;
+}
+
 export interface SystemStatusResponse {
   active_tasks: SystemStatusActiveTask[];
   run_history: SystemStatusRunHistoryEntry[];
@@ -1044,6 +1107,7 @@ export interface SystemStatusResponse {
   // an empty-state card when registry is unpopulated.
   work_queue_inventory: WorkQueueInventoryEntry[];
   stuck_work_queue: StuckWorkQueueEntry[];
+  deal_replay: DealReplayStatusSnapshot;
   budgets: BudgetSnapshotRow[];
   generated_at: string;
 }

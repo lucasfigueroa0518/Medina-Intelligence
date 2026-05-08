@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
 import { CompanySearchField } from '@/components/company-search-field';
-import { api } from '@/lib/api';
+import { api, type DealReplayStatusSnapshot } from '@/lib/api';
 import {
   Plus,
   X as XIcon,
@@ -88,6 +88,7 @@ export default function DealsPage() {
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = React.useState(false);
   const [bulkConfirmArchive, setBulkConfirmArchive] = React.useState(false);
+  const [replayStatus, setReplayStatus] = React.useState<DealReplayStatusSnapshot | null>(null);
 
   function toggleSelected(id: string) {
     setSelectedIds(prev => {
@@ -258,6 +259,24 @@ export default function DealsPage() {
     return () => clearTimeout(t);
   }, [toast]);
 
+  React.useEffect(() => {
+    let cancelled = false;
+    async function loadReplayStatus() {
+      try {
+        const status = await api.getDealReplayStatus();
+        if (!cancelled) setReplayStatus(status);
+      } catch {
+        if (!cancelled) setReplayStatus(null);
+      }
+    }
+    loadReplayStatus();
+    const id = window.setInterval(loadReplayStatus, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
   function openModal() {
     setForm({ ...EMPTY_FORM });
     setModalOpen(true);
@@ -394,6 +413,8 @@ export default function DealsPage() {
           </div>
         }
       />
+
+      <DealReplayBanner status={replayStatus} />
 
       {/* ── Day-5 Phase A: filter panel. URL-state-driven; refresh / share-link
            preserves selections. Multi-select chips for stage/owner/instrument/
@@ -1017,6 +1038,34 @@ function BulkActionBar({
       >
         Clear
       </button>
+    </div>
+  );
+}
+
+function DealReplayBanner({ status }: { status: DealReplayStatusSnapshot | null }) {
+  const run = status?.run;
+  if (!run || run.status !== 'running') return null;
+
+  const progressPct = run.enqueued_count > 0
+    ? Math.min(100, Math.round((run.processed_count / run.enqueued_count) * 100))
+    : 0;
+
+  return (
+    <div className="mx-6 mt-4 rounded-xl border border-accent-magenta/20 bg-accent-magenta/[0.06] px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium text-text-primary">Deal rebuild running</div>
+          <div className="text-xs text-text-muted mt-0.5">
+            {run.processed_count.toLocaleString()} processed · {run.promoted_count.toLocaleString()} promoted to New · {run.rate_limited_count.toLocaleString()} Claude pauses
+          </div>
+        </div>
+        <Link href="/settings?tab=system" className="text-xs text-accent-magenta hover:underline">
+          View run cockpit
+        </Link>
+      </div>
+      <div className="mt-2 h-1.5 rounded-full bg-white/[0.08] overflow-hidden">
+        <div className="h-full rounded-full bg-accent-magenta transition-all" style={{ width: `${progressPct}%` }} />
+      </div>
     </div>
   );
 }

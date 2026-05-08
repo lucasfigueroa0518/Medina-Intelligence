@@ -1,21 +1,21 @@
 // Deal signal detection — runs over freshly classified items at the end of
-// each ingestion cycle. Stages discovered deals in approval_queue rather than
-// inserting deals directly so a human reviews before a record exists.
+// each ingestion cycle. This is deliberately conservative: individual items
+// only become evidence records. A suggested deal is created later, and only
+// after four strong pieces of evidence corroborate the same startup company.
 
 import type { Env } from '../types/env';
 import type { ClassifiedItem } from '../types/interfaces';
 import { callClaude } from './claude';
 import { truncateToTokens } from './tokens';
-import { hashShort } from './helpers';
 import { LLM_PROMPTS } from '../prompts';
+import { recordDealEvidenceSignal } from './deal-suggestions';
 
 interface DealSignal {
   is_deal: boolean;
-  stage: 'prospect' | 'qualified' | 'diligence' | 'term_sheet' | 'closing' | null;
-  title: string | null;
+  startup_company_name: string | null;
+  funding_stage: string | null;
   amount_usd: number | null;
-  our_check_size_usd: number | null;
-  lead_source: 'inbound_email' | 'warm_intro' | 'outbound' | 'meeting' | 'referral' | null;
+  signal_kind: 'pitch' | 'raise' | 'diligence' | 'terms' | 'financials' | 'internal_discussion' | null;
   confidence: number;
   evidence: string;
 }
@@ -37,7 +37,7 @@ function parseDealResponse(raw: string): DealSignal | null {
   }
 }
 
-const DEAL_KEYWORDS = [
+export const DEAL_KEYWORDS = [
   'raise', 'raising', 'round', 'allocation', 'check size', 'safe',
   'term sheet', 'lead investor', 'pre-seed', 'seed round', 'series a',
   'series b', 'series c', 'investment opportunity', 'pitch deck',
@@ -46,16 +46,155 @@ const DEAL_KEYWORDS = [
   'definitive agreement',
 ];
 
-// Cheap pre-filter to avoid burning Claude budget on every item. Phase C
-// (2026-04-30): widened to include `calendar_event` so meeting transcripts
-// flow through the same detection pipeline as emails. Slack messages and
-// news items still excluded — they're noisier signal.
-function looksLikeDealCandidate(item: ClassifiedItem): boolean {
-  if (!item.companyId) return false;
-  if (item.type !== 'email' && item.type !== 'calendar_event') return false;
-  const haystack = `${item.subject || ''}\n${item.bodyText || ''}\n${item.bodyPreview || ''}`.toLowerCase();
+export interface DealDetectionSource {
+  orgId: string;
+  companyId: string;
+  sourceType: 'conversation' | 'event' | 'document';
+  sourceId: string;
+  sourceTitle?: string | null;
+  sourceDate?: string | null;
+  bodyText: string;
+  bodyPreview?: string | null;
+  fromEmail?: string | null;
+  direction?: string | null;
+  sourceLabel?: string | null;
+}
+
+export interface DealDetectionResult {
+  recorded: boolean;
+  promoted: boolean;
+  dealId: string | null;
+  reason: string;
+  companyName?: string;
+  evidence?: string | null;
+  confidence?: number | null;
+}
+
+function normalizeCompanyName(name: string | null | undefined): string {
+  return (name || '')
+    .toLowerCase()
+    .replace(/\b(inc|incorporated|llc|ltd|limited|corp|corporation|co|company|ai|technologies|technology)\b/g, '')
+    .replace(/[^a-z0-9]+/g, '')
+    .trim();
+}
+
+function namesReferToSameStartup(a: string | null | undefined, b: string | null | undefined): boolean {
+  const left = normalizeCompanyName(a);
+  const right = normalizeCompanyName(b);
+  if (!left || !right) return false;
+  return left === right || left.includes(right) || right.includes(left);
+}
+
+export function looksLikeDealText(text: string | null | undefined): boolean {
+  const haystack = (text || '').toLowerCase();
   if (haystack.length < 80) return false;
   return DEAL_KEYWORDS.some(kw => haystack.includes(kw));
+}
+
+// Cheap pre-filter to avoid burning Claude budget on every item. Emails,
+// meetings, and Slack messages are eligible; news remains excluded because it
+// does not prove this firm is actually looking at the startup.
+function looksLikeDealCandidate(item: ClassifiedItem): boolean {
+  if (!item.companyId) return false;
+  if (item.type !== 'email' && item.type !== 'calendar_event' && item.type !== 'slack_message') return false;
+  const haystack = `${item.subject || ''}\n${item.bodyText || ''}\n${item.bodyPreview || ''}`.toLowerCase();
+  return looksLikeDealText(haystack);
+}
+
+export async function detectDealSignalForSource(
+  source: DealDetectionSource,
+  env: Env
+): Promise<DealDetectionResult> {
+  if (!looksLikeDealText(`${source.sourceTitle || ''}\n${source.bodyText || ''}\n${source.bodyPreview || ''}`)) {
+    return { recorded: false, promoted: false, dealId: null, reason: 'keyword_prefilter' };
+  }
+
+  const company = await env.D1.prepare(
+    'SELECT name FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(source.companyId, source.orgId).first<{ name: string }>();
+  if (!company?.name) {
+    return { recorded: false, promoted: false, dealId: null, reason: 'company_missing' };
+  }
+
+  const sourceKind = source.sourceLabel || source.sourceType;
+  const userPrompt = `${LLM_PROMPTS.DEAL_DETECTION_USER_PREFIX}
+
+Resolved startup company candidate: ${company.name}
+Source type: ${sourceKind}
+Subject: ${source.sourceTitle || '(none)'}
+From: ${source.fromEmail || '(unknown)'}
+Direction: ${source.direction || 'unknown'}
+Date: ${source.sourceDate || '(unknown)'}
+
+---
+
+${truncateToTokens(source.bodyText || '', 2000)}`;
+
+  const raw = await callClaude(
+    {
+      system: LLM_PROMPTS.DEAL_DETECTION_SYSTEM,
+      user: userPrompt,
+      max_tokens: 400,
+      orgId: source.orgId,
+    },
+    'low',
+    env
+  );
+
+  const signal = parseDealResponse(raw);
+  if (!signal || !signal.is_deal) {
+    return { recorded: false, promoted: false, dealId: null, reason: 'llm_not_deal', companyName: company.name };
+  }
+  if (signal.confidence < 0.78) {
+    return {
+      recorded: false,
+      promoted: false,
+      dealId: null,
+      reason: 'low_confidence',
+      companyName: company.name,
+      evidence: signal.evidence,
+      confidence: signal.confidence,
+    };
+  }
+  if (!namesReferToSameStartup(signal.startup_company_name, company.name)) {
+    console.log(
+      `[deal-detect] skipped ambiguous target. resolved="${company.name}" extracted="${signal.startup_company_name || ''}"`
+    );
+    return {
+      recorded: false,
+      promoted: false,
+      dealId: null,
+      reason: 'target_mismatch',
+      companyName: company.name,
+      evidence: signal.evidence,
+      confidence: signal.confidence,
+    };
+  }
+
+  const result = await recordDealEvidenceSignal({
+    orgId: source.orgId,
+    companyId: source.companyId,
+    sourceType: source.sourceType,
+    sourceId: source.sourceId,
+    sourceTitle: source.sourceTitle || company.name,
+    sourceExcerpt: signal.evidence || source.bodyPreview || null,
+    sourceDate: source.sourceDate || null,
+    signalKind: signal.signal_kind,
+    fundingStage: signal.funding_stage,
+    amountUsd: signal.amount_usd,
+    confidence: signal.confidence,
+    evidenceNote: signal.evidence,
+  }, env);
+
+  return {
+    recorded: result.recorded,
+    promoted: result.promoted,
+    dealId: result.dealId,
+    reason: result.reason,
+    companyName: company.name,
+    evidence: signal.evidence,
+    confidence: signal.confidence,
+  };
 }
 
 export async function detectAndStageDealSignals(
@@ -95,130 +234,32 @@ export async function detectAndStageDealSignals(
   let staged = 0;
 
   for (const item of budget) {
-    const userPrompt = `${LLM_PROMPTS.DEAL_DETECTION_USER_PREFIX}\n\nSubject: ${item.subject || '(none)'}\nFrom: ${item.fromEmail || '(unknown)'}\nDirection: ${item.direction || 'unknown'}\nDate: ${item.sentAt}\n\n---\n\n${truncateToTokens(item.bodyText || '', 2000)}`;
-
-    let raw: string;
+    const sourceType = item.type === 'calendar_event' ? 'event' : 'conversation';
+    let result: DealDetectionResult;
     try {
-      raw = await callClaude(
-        {
-          system: LLM_PROMPTS.DEAL_DETECTION_SYSTEM,
-          user: userPrompt,
-          max_tokens: 400,
-          orgId,
-        },
-        'low',
-        env
-      );
+      result = await detectDealSignalForSource({
+        orgId,
+        companyId: item.companyId!,
+        sourceType,
+        sourceId: item.entityId,
+        sourceTitle: item.subject || null,
+        sourceDate: item.sentAt,
+        bodyText: item.bodyText || '',
+        bodyPreview: item.bodyPreview || null,
+        fromEmail: item.fromEmail || null,
+        direction: item.direction || null,
+        sourceLabel: item.type,
+      }, env);
     } catch (e) {
       console.error('[deal-detect] claude call failed:', e);
       continue;
     }
 
-    const signal = parseDealResponse(raw);
-    if (!signal || !signal.is_deal) continue;
-    if (signal.confidence < 0.7) continue;
-    if (!signal.title || !signal.stage) continue;
-
-    // Phase C: when a deal already exists for this company, treat the
-    // signal as a LINK candidate (not a new-deal candidate). For
-    // transcripts (item.type='calendar_event') the link target is
-    // event_deals; for emails it's conversation_deals.
-    //   confidence ≥ 0.9 → auto-link directly via junction
-    //   0.7 ≤ confidence < 0.9 → propose via approval_queue 'link_to_deal'
-    // Pre-existing item.type='email' behavior preserved when no deal
-    // exists yet (still stages create_deal as before).
-    const {
-      findOpenDealForCompany,
-      linkConversationToDeal,
-      linkEventToDeal,
-      proposeLinkToDeal,
-    } = await import('./deal-association');
-
-    const existingDeal = await findOpenDealForCompany(item.companyId!, orgId, env);
-    if (existingDeal) {
-      const kind: 'conversation' | 'event' =
-        item.type === 'calendar_event' ? 'event' : 'conversation';
-      if (signal.confidence >= 0.9) {
-        const r = kind === 'event'
-          ? await linkEventToDeal(item.entityId, existingDeal.id, 'llm_classification', signal.confidence, orgId, env)
-          : await linkConversationToDeal(item.entityId, existingDeal.id, 'llm_classification', signal.confidence, orgId, env);
-        if (r.inserted) {
-          staged++;
-          console.log(
-            `[deal-detect] auto-linked ${kind}=${item.entityId} → deal=${existingDeal.id} (${existingDeal.title}) confidence=${signal.confidence}`
-          );
-        }
-      } else {
-        const r = await proposeLinkToDeal(
-          {
-            kind,
-            sourceId: item.entityId,
-            dealId: existingDeal.id,
-            orgId,
-            confidence: signal.confidence,
-            sourceCommunicationId: item.entityId,
-            visibility: item.visibility,
-          },
-          env
-        );
-        if (r.inserted) {
-          staged++;
-          console.log(
-            `[deal-detect] proposed link ${kind}=${item.entityId} → deal=${existingDeal.id} confidence=${signal.confidence}`
-          );
-        }
-      }
-      continue;
-    }
-
-    // No existing deal for this company — stage create_deal proposal as
-    // before (works for both emails and transcripts now that the
-    // pre-filter allows calendar_event).
-    const company = await env.D1.prepare(
-      'SELECT name FROM companies WHERE id = ? AND org_id = ?'
-    ).bind(item.companyId!, orgId).first<{ name: string }>();
-    const dealTitle = signal.title || `${company?.name || 'Unknown'} opportunity`;
-
-    const proposedValue = JSON.stringify({
-      company_id: item.companyId,
-      title: dealTitle.slice(0, 120),
-      stage: signal.stage,
-      amount: signal.amount_usd,
-      our_allocation: signal.our_check_size_usd,
-      lead_source: signal.lead_source,
-      evidence: signal.evidence?.slice(0, 500),
-      source_communication_id: item.entityId,
-      source_sent_at: item.sentAt,
-      // Phase C: tells commitCreateDealApproval which junction to write
-      // when the proposal is accepted. Defaults to conversation for
-      // back-compat with pre-Phase-C proposals.
-      source_kind: item.type === 'calendar_event' ? 'event' : 'conversation',
-    });
-
-    // No per-cycle component — same source email/transcript must collapse across cycles.
-    const idempotencyKey = `${orgId}:deal:${item.companyId}:${hashShort(item.entityId)}`;
-
-    const result = await env.D1.prepare(
-      `INSERT OR IGNORE INTO approval_queue
-         (idempotency_key, org_id, entity_type, entity_id, change_type, field_name,
-          proposed_value, source_communication_id, source_visibility, confidence, status)
-       VALUES (?, ?, 'deal', ?, 'create_deal', 'deal', ?, ?, ?, ?, 'pending')`
-    )
-      .bind(
-        idempotencyKey,
-        orgId,
-        item.companyId!,
-        proposedValue,
-        item.entityId,
-        item.visibility || 'org_wide',
-        signal.confidence
-      )
-      .run();
-
-    if (result.meta?.changes) {
+    if (result.recorded) {
       staged++;
       console.log(
-        `[deal-detect] staged create_deal "${dealTitle}" from ${item.type}=${item.entityId} company=${item.companyId} stage=${signal.stage} confidence=${signal.confidence}`
+        `[deal-detect] recorded evidence company=${result.companyName || item.companyId} source=${sourceType}:${item.entityId} ` +
+        `confidence=${result.confidence ?? 'unknown'} promotion=${result.reason}${result.dealId ? ` deal=${result.dealId}` : ''}`
       );
     }
   }
