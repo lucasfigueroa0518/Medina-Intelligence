@@ -109,6 +109,14 @@ export async function approveItem(
   ).bind(id, ctx.orgId).first<any>();
   if (!item) return errorResponse('APPROVAL_ALREADY_RESOLVED', 409);
 
+  if (item.change_type === 'create_deal') {
+    return errorResponse(
+      'DEAL_APPROVAL_RETIRED',
+      422,
+      'AI deal proposals now require conservative replay evidence before they can become deals.'
+    );
+  }
+
   // Optimistic concurrency
   const result = await env.D1.prepare(
     `UPDATE approval_queue SET status = 'approved', resolved_by = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -269,16 +277,9 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
     return commitProgressiveApproval(item, env);
   }
 
-  // Day-5 hotfix: create_deal proposals from src/lib/deal-detection.ts were
-  // landing in approval_queue but the commit path below gates on
-  // contact|company tables only — approving a create_deal silently
-  // no-op'd. Explains the 97.7% rejection rate against deal proposals
-  // (users figured out approval was useless and started rejecting). Fix:
-  // actually insert the deal + auto-link contacts (company match) + link
-  // the source-conversation's participants (the email that triggered
-  // detection is direct evidence of who's involved).
   if (item.change_type === 'create_deal') {
-    return commitCreateDealApproval(item, env);
+    console.warn('[approval] ignored retired create_deal approval path');
+    return {};
   }
 
   // Phase C/D: 'link_to_deal' proposals from medium-confidence detection
