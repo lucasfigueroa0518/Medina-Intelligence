@@ -202,6 +202,14 @@ export const api = {
     ),
   getDealReplayStatus: () =>
     request<DealReplayStatusSnapshot>('/deals/replay/status'),
+  getDealReplayEvidence: (params?: { limit?: number; offset?: number; company_id?: string }) => {
+    const search = new URLSearchParams();
+    if (params?.limit) search.set('limit', String(params.limit));
+    if (params?.offset) search.set('offset', String(params.offset));
+    if (params?.company_id) search.set('company_id', params.company_id);
+    const qs = search.toString();
+    return request<DealReplayEvidenceResponse>(`/deals/replay/evidence${qs ? `?${qs}` : ''}`);
+  },
   startDealReplay: (data: { confirmation: string; days_back?: number }) =>
     request<{ run: DealReplayRunSnapshot; deleted_deals: number; enqueued_count: number }>(
       '/deals/replay/start',
@@ -1085,6 +1093,33 @@ export interface DealReplayStatusSnapshot {
     dead_letter: number;
   };
   generated_at: string;
+}
+
+export interface DealReplayEvidenceRow {
+  id: string;
+  company_id: string;
+  company_name: string | null;
+  deal_id: string | null;
+  source_type: 'conversation' | 'event' | 'document';
+  source_id: string;
+  source_title: string | null;
+  source_excerpt: string | null;
+  source_date: string | null;
+  signal_kind: string | null;
+  funding_stage: string | null;
+  amount_usd: number | null;
+  confidence: number;
+  evidence_note: string | null;
+  created_at: string;
+  promoted_at: string | null;
+}
+
+export interface DealReplayEvidenceResponse {
+  evidence: DealReplayEvidenceRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
 }
 
 export interface SystemStatusResponse {

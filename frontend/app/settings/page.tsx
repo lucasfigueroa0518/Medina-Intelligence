@@ -19,6 +19,7 @@ import {
   type WorkQueueInventoryEntry,
   type StuckWorkQueueEntry,
   type BudgetSnapshotRow,
+  type DealReplayEvidenceRow,
   type DealReplayStatusSnapshot,
 } from '@/lib/api';
 import { useBackgroundTasks } from '@/components/background-task-indicator';
@@ -3116,8 +3117,33 @@ function DealReplayStatusCard({
   onRefresh: () => void;
 }) {
   const [canceling, setCanceling] = React.useState(false);
+  const [evidenceOpen, setEvidenceOpen] = React.useState(false);
+  const [evidenceRows, setEvidenceRows] = React.useState<DealReplayEvidenceRow[]>([]);
+  const [evidenceTotal, setEvidenceTotal] = React.useState(0);
+  const [evidenceLoading, setEvidenceLoading] = React.useState(false);
+  const [evidenceError, setEvidenceError] = React.useState<string | null>(null);
   const run = replay.run;
   const queue = replay.queue;
+
+  const loadEvidence = React.useCallback(async (offset = 0) => {
+    setEvidenceLoading(true);
+    setEvidenceError(null);
+    try {
+      const result = await api.getDealReplayEvidence({ limit: 50, offset });
+      setEvidenceTotal(result.total);
+      setEvidenceRows(prev => offset === 0 ? result.evidence : [...prev, ...result.evidence]);
+    } catch (e: any) {
+      setEvidenceError(e?.message || 'Failed to load evidence');
+    } finally {
+      setEvidenceLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (evidenceOpen && evidenceRows.length === 0 && !evidenceLoading) {
+      loadEvidence(0);
+    }
+  }, [evidenceOpen, evidenceRows.length, evidenceLoading, loadEvidence]);
 
   async function cancelReplay() {
     if (!run || run.status !== 'running') return;
@@ -3283,6 +3309,102 @@ function DealReplayStatusCard({
             </div>
           )}
         </div>
+      </div>
+
+      <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <div className="text-xs font-medium text-text-primary">All Recorded Evidence</div>
+            <div className="mt-0.5 text-[11px] text-text-muted">
+              Read-only view of every strong evidence record written by the replay. Loading this does not touch the scan queue.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              const next = !evidenceOpen;
+              setEvidenceOpen(next);
+              if (next && evidenceRows.length === 0) loadEvidence(0);
+            }}
+            className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-white/[0.04]"
+          >
+            {evidenceOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            {evidenceOpen ? 'Hide evidence' : 'Show evidence'}
+          </button>
+        </div>
+
+        {evidenceOpen && (
+          <div className="mt-3">
+            {evidenceError && (
+              <div className="mb-2 rounded-md border border-semantic-error/20 bg-semantic-error/10 px-3 py-2 text-xs text-semantic-error">
+                {evidenceError}
+              </div>
+            )}
+            <div className="max-h-96 overflow-y-auto rounded-lg border border-white/[0.04]">
+              {evidenceRows.length === 0 && !evidenceLoading ? (
+                <div className="p-3 text-xs text-text-muted">No evidence records have been written yet.</div>
+              ) : (
+                <div className="divide-y divide-white/[0.04]">
+                  {evidenceRows.map(row => (
+                    <div key={row.id} className="grid gap-2 p-3 lg:grid-cols-[minmax(150px,220px)_minmax(0,1fr)_auto]">
+                      <div className="min-w-0">
+                        <div className="truncate text-xs font-medium text-text-primary">{row.company_name || 'Unknown company'}</div>
+                        <div className="mt-1 flex flex-wrap gap-1.5">
+                          {row.funding_stage && row.funding_stage !== 'unknown' && (
+                            <span className="rounded-full bg-accent-magenta/10 px-2 py-0.5 text-[10px] uppercase tracking-wide text-accent-magenta">
+                              {row.funding_stage.replace('_', ' ')}
+                            </span>
+                          )}
+                          {row.signal_kind && (
+                            <span className="rounded-full bg-white/[0.05] px-2 py-0.5 text-[10px] uppercase tracking-wide text-text-muted">
+                              {row.signal_kind}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-text-muted">
+                          <span>{row.source_type}</span>
+                          <span>·</span>
+                          <span className="min-w-0 truncate">{row.source_title || 'Untitled source'}</span>
+                          {row.source_date && <span>· {formatRelative(row.source_date)}</span>}
+                        </div>
+                        {row.evidence_note && (
+                          <div className="mt-1 text-xs leading-relaxed text-text-secondary">{row.evidence_note}</div>
+                        )}
+                        {row.source_excerpt && (
+                          <div className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-text-muted">{row.source_excerpt}</div>
+                        )}
+                      </div>
+                      <div className="flex items-start justify-between gap-3 lg:block lg:text-right">
+                        <div className="text-xs font-medium text-semantic-success">{Math.round(row.confidence * 100)}%</div>
+                        <div className="mt-0.5 text-[11px] text-text-muted">{formatRelative(row.created_at)}</div>
+                        {row.promoted_at && (
+                          <div className="mt-1 text-[10px] text-semantic-success">Promoted</div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-text-muted">
+              <span>
+                Showing {evidenceRows.length.toLocaleString()} of {evidenceTotal.toLocaleString()} evidence records
+              </span>
+              {evidenceRows.length < evidenceTotal && (
+                <button
+                  type="button"
+                  onClick={() => loadEvidence(evidenceRows.length)}
+                  disabled={evidenceLoading}
+                  className="rounded-lg border border-white/10 px-2.5 py-1.5 text-text-secondary hover:bg-white/[0.04] disabled:opacity-50"
+                >
+                  {evidenceLoading ? 'Loading...' : 'Load more'}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

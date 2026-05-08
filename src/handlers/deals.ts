@@ -847,6 +847,68 @@ export async function getDealReplayStatus(
   return jsonResponse(await getDealReplayStatusSnapshot(env, ctx.orgId));
 }
 
+export async function getDealReplayEvidence(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('FORBIDDEN', 403, 'Only owners can view deal replay evidence.');
+  }
+
+  const url = new URL(request.url);
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 200);
+  const offset = Math.max(Number(url.searchParams.get('offset') || 0), 0);
+  const companyId = url.searchParams.get('company_id');
+
+  const where = ['dse.org_id = ?'];
+  const binds: unknown[] = [ctx.orgId];
+  if (companyId) {
+    where.push('dse.company_id = ?');
+    binds.push(companyId);
+  }
+  const whereClause = where.join(' AND ');
+
+  const [rows, count] = await Promise.all([
+    env.D1.prepare(
+      `SELECT dse.id,
+              dse.company_id,
+              co.name AS company_name,
+              dse.deal_id,
+              dse.source_type,
+              dse.source_id,
+              dse.source_title,
+              dse.source_excerpt,
+              dse.source_date,
+              dse.signal_kind,
+              dse.funding_stage,
+              dse.amount_usd,
+              dse.confidence,
+              dse.evidence_note,
+              dse.created_at,
+              dse.promoted_at
+         FROM deal_suggestion_evidence dse
+         LEFT JOIN companies co ON co.id = dse.company_id
+        WHERE ${whereClause}
+        ORDER BY dse.created_at DESC
+        LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all(),
+    env.D1.prepare(
+      `SELECT COUNT(*) AS total
+         FROM deal_suggestion_evidence dse
+        WHERE ${whereClause}`
+    ).bind(...binds).first<{ total: number }>(),
+  ]);
+
+  return jsonResponse({
+    evidence: rows.results || [],
+    total: count?.total || 0,
+    limit,
+    offset,
+    has_more: offset + limit < (count?.total || 0),
+  });
+}
+
 export async function cancelDealReplay(
   ctx: AuthContext,
   env: Env

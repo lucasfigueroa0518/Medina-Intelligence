@@ -342,6 +342,9 @@ async function routeAuthenticated(
   if (path === '/api/deals/replay/status' && method === 'GET') {
     return Deals.getDealReplayStatus(ctx, env);
   }
+  if (path === '/api/deals/replay/evidence' && method === 'GET') {
+    return Deals.getDealReplayEvidence(request, ctx, env);
+  }
   if (path === '/api/deals/replay/cancel' && method === 'POST') {
     return Deals.cancelDealReplay(ctx, env);
   }
