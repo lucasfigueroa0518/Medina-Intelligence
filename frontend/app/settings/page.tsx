@@ -107,6 +107,14 @@ function SettingsPageInner() {
     router.replace(`/settings?tab=${tab}`, { scroll: false });
   };
 
+  React.useEffect(() => {
+    if (activeTab !== 'integrations') return;
+    if (typeof window === 'undefined' || window.location.hash !== '#sync-integrations') return;
+    window.setTimeout(() => {
+      document.getElementById('sync-integrations')?.scrollIntoView({ block: 'start' });
+    }, 80);
+  }, [activeTab]);
+
   const connectOutlook = () => {
     if (!API_ORIGIN) {
       setBanner({
@@ -216,7 +224,7 @@ function SyncIntegrationsTab({
   connectOutlook: () => void;
 }) {
   return (
-    <div className="space-y-6">
+    <div id="sync-integrations" className="space-y-6 scroll-mt-24">
       <div className="card">
         <div className="font-medium mb-4">Sync Behavior</div>
         <div className="space-y-3 text-sm">
@@ -227,11 +235,11 @@ function SyncIntegrationsTab({
         </div>
       </div>
 
+      <EmailSyncSection outlook={status?.outlook ?? null} />
+
       <EmailHistoricalBackfillSection isOutlookConnected={status?.outlook?.status === 'connected'} />
 
       <FireflyHistoricalBackfillSection />
-
-      <EmailSyncSection isOutlookConnected={status?.outlook?.status === 'connected'} />
 
       <div className="card">
         <div className="flex items-center justify-between mb-4">
@@ -314,6 +322,66 @@ const SYNC_OPTIONS = [
   { value: 180, label: 'Last 6 months' },
 ];
 
+function syncHistoryLabel(days: number): string {
+  if (days <= 0 || days >= 3650) return 'All available email history';
+  if (days >= 365) return `Last ${Math.round(days / 365)} year${Math.round(days / 365) === 1 ? '' : 's'}`;
+  if (days >= 180) return 'Last 6 months';
+  return `Last ${days} days`;
+}
+
+function connectionTone(row: IntegrationRow | null): {
+  label: string;
+  dot: string;
+  bg: string;
+  text: string;
+  help: string;
+} {
+  if (!row) {
+    return {
+      label: 'Checking',
+      dot: 'bg-text-muted',
+      bg: 'bg-white/5',
+      text: 'text-text-muted',
+      help: 'Loading the latest sync status.',
+    };
+  }
+  if (row.status === 'connected' && row.token_healthy !== false) {
+    return {
+      label: 'Connected',
+      dot: 'bg-semantic-success',
+      bg: 'bg-semantic-success/10',
+      text: 'text-semantic-success',
+      help: 'New email and calendar updates are syncing automatically.',
+    };
+  }
+  if (row.status === 'auth_failed' || row.token_healthy === false) {
+    return {
+      label: 'Needs reconnect',
+      dot: 'bg-semantic-error',
+      bg: 'bg-semantic-error/10',
+      text: 'text-semantic-error',
+      help: 'Outlook is not currently syncing. Reconnect Microsoft Outlook below to resume updates.',
+    };
+  }
+  return {
+    label: 'Not connected',
+    dot: 'bg-semantic-error',
+    bg: 'bg-semantic-error/10',
+    text: 'text-semantic-error',
+    help: 'Connect Microsoft Outlook to sync email and meetings into MARTy.',
+  };
+}
+
+function BackfillStat({ label, value, hint }: { label: string; value: React.ReactNode; hint?: string }) {
+  return (
+    <div className="rounded-lg border border-border/50 bg-bg-elevated/35 p-3 min-w-0">
+      <div className="text-[10px] uppercase tracking-wide text-text-muted">{label}</div>
+      <div className="mt-1 text-sm font-medium text-text-primary">{value}</div>
+      {hint && <div className="mt-1 text-[10px] text-text-muted leading-snug">{hint}</div>}
+    </div>
+  );
+}
+
 function FirstConnectModal({ onComplete, onSkip }: { onComplete: (days: number) => void; onSkip: () => void }) {
   const [selectedDays, setSelectedDays] = React.useState(30);
   const [saving, setSaving] = React.useState(false);
@@ -386,7 +454,7 @@ function FirstConnectModal({ onComplete, onSkip }: { onComplete: (days: number) 
   );
 }
 
-function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean }) {
+function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
   const [syncDays, setSyncDays] = React.useState<number>(30);
   const [configLoaded, setConfigLoaded] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -419,23 +487,61 @@ function EmailSyncSection({ isOutlookConnected }: { isOutlookConnected: boolean 
     setSaving(false);
   }
 
-  // Reference isOutlookConnected to keep the prop on the type signature even
-  // though the section's only remaining surface (Sync History dropdown)
-  // applies whether or not the user is currently connected — the value picks
-  // up on first connect.
-  void isOutlookConnected;
+  const tone = connectionTone(outlook);
+  const isHealthy = outlook?.status === 'connected' && outlook.token_healthy !== false;
 
   return (
     <div className="card">
-      <div className="flex items-center gap-2 mb-4">
-        <Mail size={16} className="text-accent-magenta" />
-        <div className="font-medium">Email Sync</div>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between mb-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <Mail size={16} className="text-accent-magenta" />
+            <div className="font-medium">Live Outlook Sync</div>
+          </div>
+          <div className="text-xs text-text-secondary mt-1 max-w-2xl">
+            Shows whether new Outlook email and calendar activity are flowing into Medina Intelligence right now.
+            Historical imports below are separate, background catch-up jobs.
+          </div>
+        </div>
+        <div className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-medium ${tone.bg} ${tone.text}`}>
+          <span className={`h-2 w-2 rounded-full ${tone.dot}`} />
+          {tone.label}
+        </div>
+      </div>
+
+      <div className={`rounded-lg border px-3 py-2 text-xs mb-4 ${
+        isHealthy
+          ? 'border-semantic-success/20 bg-semantic-success/5 text-text-secondary'
+          : 'border-semantic-error/25 bg-semantic-error/10 text-semantic-error'
+      }`}>
+        {tone.help}
+        {outlook?.last_sync && (
+          <span className="block mt-1 text-text-muted">Last successful sync: {formatRelative(outlook.last_sync)}.</span>
+        )}
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-3 mb-4">
+        <BackfillStat
+          label="Mailbox"
+          value={outlook?.connected_email || (isHealthy ? 'Connected' : 'Not connected')}
+          hint={outlook?.connected_email ? 'Connected Microsoft account' : 'Reconnect Outlook to identify the mailbox'}
+        />
+        <BackfillStat
+          label="First-time import"
+          value={configLoaded ? syncHistoryLabel(syncDays) : 'Loading...'}
+          hint="Used the next time Outlook is connected for the first time"
+        />
+        <BackfillStat
+          label="Live updates"
+          value={isHealthy ? 'On' : 'Paused'}
+          hint={isHealthy ? 'New mail and calendar changes keep flowing' : 'Reconnect Outlook to resume automatic sync'}
+        />
       </div>
 
       <div>
-        <div className="text-xs text-text-muted mb-2">Sync History</div>
-        <div className="text-xs text-text-secondary mb-2">
-          When connecting Outlook for the first time, how far back should we import emails?
+        <div className="text-xs text-text-muted mb-2">Default history for new Outlook connections</div>
+        <div className="text-xs text-text-secondary mb-2 max-w-xl">
+          Choose how much older email to pull the first time a mailbox connects. You can import more history later without keeping this page open.
         </div>
         <select
           value={syncDays}
@@ -554,7 +660,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
         days_back: daysBack,
         ...(isSelf ? {} : { user_id: selectedUserId! }),
       });
-      setToast('Backfill started — first window kicks off within 2 minutes');
+      setToast('Email import started — first batch begins within 2 minutes');
       fetchProgress();
     } catch (e: any) {
       setToast(`Failed: ${e?.message || 'unknown error'}`);
@@ -567,7 +673,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
     try {
       const isSelf = selectedUserId === me?.id;
       await api.cancelProgressiveBackfill(isSelf ? undefined : selectedUserId!);
-      setToast('Backfill cancelled');
+      setToast('Email import cancelled');
       fetchProgress();
     } catch (e: any) {
       setToast(`Cancel failed: ${e?.message || 'unknown'}`);
@@ -587,23 +693,34 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
   const targetUserLabel = selectedUserId === me?.id
     ? 'yourself'
     : (eligibleUsers.find(u => u.id === selectedUserId)?.email ?? 'this user');
+  const completedBatches = summary?.windows_completed ?? windows.filter((w: any) => w.status === 'completed').length;
+  const totalBatches = summary?.windows_total ?? windows.length;
+  const percentComplete = totalBatches > 0 ? Math.round((completedBatches / totalBatches) * 100) : 0;
+  const currentBatch = windows.find((w: any) => w.status === 'in_progress');
 
   return (
     <div className="card">
-      <div className="flex items-center gap-2 mb-4">
-        <Clock size={16} className="text-accent-purple" />
-        <div className="font-medium">Email Historical Backfill</div>
-        {isActive && (
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold ml-1"
-            style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>
-            ACTIVE
-          </span>
-        )}
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <Clock size={16} className="text-accent-purple" />
+            <div className="font-medium">Email History Import</div>
+            {isActive && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold ml-1"
+                style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>
+                RUNNING
+              </span>
+            )}
+          </div>
+          <div className="text-xs text-text-secondary mt-1 max-w-2xl">
+            Pulls older Outlook email and attachments into MARTy in the background. You can leave this page while it works.
+          </div>
+        </div>
       </div>
 
       {isOwner && eligibleUsers.length > 1 && (
         <div className="mb-4">
-          <div className="text-xs text-text-muted mb-1">Backfill for</div>
+          <div className="text-xs text-text-muted mb-1">Import for</div>
           <select
             value={selectedUserId ?? ''}
             onChange={e => setSelectedUserId(e.target.value)}
@@ -621,8 +738,8 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
       {isIdle && (
         <div>
           <div className="text-xs text-text-secondary mb-3">
-            Pull historical email in the background. Runs server-side in 10-day windows.
-            Survives page refresh, paces itself across cron ticks. No babysitting.
+            No email history import is running. Start one when you need older Outlook conversations
+            and attachments to become searchable by MARTy.
           </div>
           <div className="flex flex-wrap gap-2">
             {PROGRESSIVE_DAYS_OPTIONS.map(d => (
@@ -648,22 +765,44 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
 
       {(isActive || isDone || isCancelled) && summary && (
         <div className="space-y-3">
-          <div className="text-sm text-text-primary">
-            <span className="font-medium">
-              {isActive
-                ? `${summary.windows_completed} of ${summary.windows_total} windows`
-                : isDone
-                ? 'Backfill complete'
-                : 'Backfill cancelled'}
-            </span>
-            <span className="text-text-muted">
-              {' · '}{summary.emails_total.toLocaleString()} emails
-              {' · '}{summary.attachments_persisted.toLocaleString()} attachments
-              {isActive && summary.eta_seconds !== null && ` · ETA ${fmtDuration(summary.eta_seconds)}`}
-            </span>
+          <div className="rounded-lg border border-accent-purple/20 bg-accent-purple/5 p-3">
+            <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-sm text-text-primary font-medium">
+                {isActive
+                  ? `Importing older email for ${targetUserLabel}`
+                  : isDone
+                  ? 'Email history import complete'
+                  : 'Email history import cancelled'}
+              </div>
+              <div className="text-xs text-text-muted">
+                {percentComplete}% checked
+                {isActive && summary.eta_seconds !== null && ` · about ${fmtDuration(summary.eta_seconds)} remaining`}
+              </div>
+            </div>
+            <div className="mt-3 h-2 rounded-full bg-white/5 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-accent-magenta transition-all"
+                style={{ width: `${Math.max(2, Math.min(100, percentComplete))}%` }}
+              />
+            </div>
+            <div className="mt-2 text-xs text-text-secondary">
+              {completedBatches} of {totalBatches} date batches checked
+              {currentBatch && <> · currently checking {new Date(currentBatch.start_date).toLocaleDateString()} to {new Date(currentBatch.end_date).toLocaleDateString()}</>}
+            </div>
           </div>
 
-          {/* 18-pill progress strip */}
+          <div className="grid gap-3 sm:grid-cols-4">
+            <BackfillStat label="Emails found" value={summary.emails_total.toLocaleString()} />
+            <BackfillStat label="Attachments saved" value={summary.attachments_persisted.toLocaleString()} />
+            <BackfillStat label="Running for" value={fmtDuration(summary.elapsed_seconds)} />
+            <BackfillStat
+              label="Import pace"
+              value={summary.avg_window_seconds !== null ? `${fmtDuration(summary.avg_window_seconds)} / batch` : 'Warming up'}
+              hint="Small batches protect Outlook and keep the app usable"
+            />
+          </div>
+
+          {/* Small date-batch progress strip */}
           <div className="flex flex-wrap gap-1">
             {windows.map((w: any) => {
               const cls = w.status === 'completed'
@@ -678,7 +817,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
               return (
                 <div
                   key={w.id}
-                  title={`Window ${w.window_index} (${range})\nstatus: ${w.status}\n${subtitle}${w.last_error ? '\n' + w.last_error : ''}`}
+                  title={`Batch ${w.window_index} (${range})\nstatus: ${w.status}\n${subtitle}${w.last_error ? '\n' + w.last_error : ''}`}
                   className={`h-2 w-6 rounded-sm border ${cls}`}
                 />
               );
@@ -686,10 +825,9 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
           </div>
 
           <div className="text-[10px] text-text-muted">
-            Elapsed {fmtDuration(summary.elapsed_seconds)}
-            {summary.avg_window_seconds !== null && ` · avg ${fmtDuration(summary.avg_window_seconds)}/window`}
             {summary.attachments_failed > 0 && ` · ${summary.attachments_failed} attachment failures`}
             {summary.attachments_skipped > 0 && ` · ${summary.attachments_skipped} skipped`}
+            {summary.emails_total === 0 && 'No email found yet. That can be normal until the first batch finishes.'}
           </div>
 
           <div className="flex items-center gap-2">
@@ -699,7 +837,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
                 disabled={loading}
                 className="btn-ghost text-xs py-1.5 flex items-center gap-2 text-red-400 hover:text-red-300"
               >
-                <XIcon size={13} /> Cancel backfill
+                <XIcon size={13} /> Cancel import
               </button>
             )}
             {(isDone || isCancelled) && (
@@ -707,7 +845,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
                 onClick={() => setProgress(null)}
                 className="btn-secondary text-xs py-1.5 flex items-center gap-2"
               >
-                <Clock size={13} /> Start a new backfill
+                <Clock size={13} /> Start a new import
               </button>
             )}
           </div>
@@ -722,10 +860,10 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
           <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
             style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
             onClick={e => e.stopPropagation()}>
-            <div className="text-lg font-medium text-text-primary mb-2">Start backfill</div>
+            <div className="text-lg font-medium text-text-primary mb-2">Start email history import</div>
             <div className="text-sm text-text-secondary mb-4">
               Pull last <strong>{days}</strong> days of email for <strong>{targetUserLabel}</strong>.
-              Runs in 10-day windows, server-side. No need to keep this tab open.
+              Runs in small background batches. No need to keep this tab open.
             </div>
             <div className="flex justify-end gap-3">
               <button className="btn-ghost" onClick={() => setConfirmOpen(false)}>Cancel</button>
@@ -745,7 +883,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
           onClose={() => setDateRangeOpen(false)}
           onStarted={() => {
             setDateRangeOpen(false);
-            setToast('Backfill started');
+            setToast('Email import started');
             fetchProgress();
           }}
         />
@@ -806,7 +944,7 @@ function ProgressiveDateRangeModal({
         onClick={e => e.stopPropagation()}>
         <div className="text-lg font-medium text-text-primary mb-2">Custom date range</div>
         <div className="text-sm text-text-secondary mb-4">
-          Pulled in 10-day windows for <strong>{targetUserLabel}</strong>, newest first.
+          Imported in small background batches for <strong>{targetUserLabel}</strong>, newest first.
         </div>
         <div className="space-y-3 mb-4">
           <div>
@@ -824,7 +962,7 @@ function ProgressiveDateRangeModal({
         <div className="flex justify-end gap-3">
           <button className="btn-ghost" onClick={onClose}>Cancel</button>
           <button className="btn-primary" disabled={loading} onClick={submit}>
-            {loading ? 'Starting...' : 'Start backfill'}
+            {loading ? 'Starting...' : 'Start import'}
           </button>
         </div>
       </div>
@@ -981,7 +1119,7 @@ function FireflyHistoricalBackfillSection() {
         days_back: daysBack,
       });
       setTriggerOpen(false);
-      setToast('Backfill started — first window kicks off within 60 seconds');
+      setToast('Meeting import started — first batch begins within 60 seconds');
       fetchProgress();
     } catch (e: any) {
       setToast(`Failed: ${e?.message || 'unknown error'}`);
@@ -995,7 +1133,7 @@ function FireflyHistoricalBackfillSection() {
     setCancelConfirmOpen(false);
     try {
       await api.cancelFireflyProgressiveBackfill(selectedUserId);
-      setToast('Backfill cancelled');
+      setToast('Meeting import cancelled');
       fetchProgress();
     } catch (e: any) {
       setToast(`Cancel failed: ${e?.message || 'unknown'}`);
@@ -1029,23 +1167,32 @@ function FireflyHistoricalBackfillSection() {
   const targetUserLabel = selectedUserId === me?.id
     ? 'yourself'
     : (eligibleUsers.find(u => u.id === selectedUserId)?.email ?? 'this user');
+  const percentComplete = totalWindows > 0 ? Math.round((completedCount / totalWindows) * 100) : 0;
+  const currentBatch = windows.find((w: any) => w.status === 'in_progress');
 
   return (
     <div className="card">
-      <div className="flex items-center gap-2 mb-4">
-        <Mic size={16} className="text-accent-purple" />
-        <div className="font-medium">Fireflies Historical Backfill</div>
-        {isActive && (
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold ml-1"
-            style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>
-            ACTIVE
-          </span>
-        )}
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <Mic size={16} className="text-accent-purple" />
+            <div className="font-medium">Meeting Transcript Import</div>
+            {isActive && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold ml-1"
+                style={{ background: 'rgba(139,92,246,0.15)', color: '#A78BFA' }}>
+                RUNNING
+              </span>
+            )}
+          </div>
+          <div className="text-xs text-text-secondary mt-1 max-w-2xl">
+            Pulls older Fireflies transcripts into Medina Intelligence so MARTy can search and summarize past meetings.
+          </div>
+        </div>
       </div>
 
       {eligibleUsers.length > 1 && (
         <div className="mb-4">
-          <div className="text-xs text-text-muted mb-1">Backfill for</div>
+          <div className="text-xs text-text-muted mb-1">Import for</div>
           <select
             value={selectedUserId ?? ''}
             onChange={e => setSelectedUserId(e.target.value)}
@@ -1081,7 +1228,7 @@ function FireflyHistoricalBackfillSection() {
             <div className="text-xs text-text-secondary">
               {credStatus.rotation_count > 0
                 ? `Rotated ${credStatus.rotation_count}× since first set.`
-                : 'Stored — encrypted at rest, used automatically by every backfill below.'}
+                : 'Stored — encrypted at rest, used automatically by every meeting import below.'}
               {credStatus.last_used_at && (
                 <> Last used {new Date(credStatus.last_used_at).toISOString().slice(0, 10)}.</>
               )}
@@ -1106,7 +1253,7 @@ function FireflyHistoricalBackfillSection() {
         ) : (
           <div>
             <div className="text-xs text-text-secondary mb-2">
-              Set once and reuse for every backfill. Encrypted at rest (AES-256-GCM); plaintext
+              Set once and reuse for every meeting import. Encrypted at rest (AES-256-GCM); plaintext
               never returned by any API. Get yours at <span className="text-text-primary">app.fireflies.ai → Settings → Developer settings</span>.
             </div>
             {credEditOpen ? (
@@ -1189,11 +1336,11 @@ function FireflyHistoricalBackfillSection() {
       {isIdle && (
         <div>
           <div className="text-xs text-text-secondary mb-3">
-            Pull historical Fireflies meetings in the background. Runs server-side in
-            10-day windows. Survives page refresh, paces itself across cron ticks.
+            No meeting history import is running. Start one to recover older Fireflies transcripts
+            in the background without keeping this page open.
             {!credStatus?.exists && (
               <span className="block mt-1 text-text-muted">
-                Save your API key above to enable backfills.
+                Save your API key above to enable meeting imports.
               </span>
             )}
           </div>
@@ -1221,22 +1368,37 @@ function FireflyHistoricalBackfillSection() {
 
       {(isActive || isDone || isCancelled) && (
         <div className="space-y-3">
-          <div className="text-sm text-text-primary">
-            <span className="font-medium">
-              {isActive
-                ? `${completedCount} of ${totalWindows} windows`
-                : isDone
-                ? 'Backfill complete'
-                : 'Backfill cancelled'}
-            </span>
-            <span className="text-text-muted">
-              {' · '}{counters.persisted.toLocaleString()} transcripts ingested
-              {counters.duplicate > 0 && ` · ${counters.duplicate} already had`}
-              {counters.failed > 0 && ` · ${counters.failed} failed`}
-            </span>
+          <div className="rounded-lg border border-accent-purple/20 bg-accent-purple/5 p-3">
+            <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-sm text-text-primary font-medium">
+                {isActive
+                  ? `Importing older meeting transcripts for ${targetUserLabel}`
+                  : isDone
+                  ? 'Meeting transcript import complete'
+                  : 'Meeting transcript import cancelled'}
+              </div>
+              <div className="text-xs text-text-muted">{percentComplete}% checked</div>
+            </div>
+            <div className="mt-3 h-2 rounded-full bg-white/5 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-accent-magenta transition-all"
+                style={{ width: `${Math.max(2, Math.min(100, percentComplete))}%` }}
+              />
+            </div>
+            <div className="mt-2 text-xs text-text-secondary">
+              {completedCount} of {totalWindows} date batches checked
+              {currentBatch && <> · currently checking {new Date(currentBatch.start_date).toLocaleDateString()} to {new Date(currentBatch.end_date).toLocaleDateString()}</>}
+            </div>
           </div>
 
-          {/* Per-window pill strip — 9 windows for a 90-day backfill. */}
+          <div className="grid gap-3 sm:grid-cols-4">
+            <BackfillStat label="Transcripts saved" value={counters.persisted.toLocaleString()} />
+            <BackfillStat label="Already had" value={counters.duplicate.toLocaleString()} hint="Skipped because they were already imported" />
+            <BackfillStat label="Problems" value={counters.failed.toLocaleString()} />
+            <BackfillStat label="Batches checked" value={`${completedCount} / ${totalWindows || 0}`} hint="Small batches protect Fireflies and keep the app usable" />
+          </div>
+
+          {/* Small date-batch progress strip. */}
           <div className="flex flex-wrap gap-1">
             {windows.map((w: any) => {
               const cls = w.status === 'completed'
@@ -1251,7 +1413,7 @@ function FireflyHistoricalBackfillSection() {
               return (
                 <div
                   key={w.id}
-                  title={`Window ${w.window_index} (${range})\nstatus: ${w.status}\n${subtitle}${w.last_error ? '\n' + w.last_error : ''}`}
+                  title={`Batch ${w.window_index} (${range})\nstatus: ${w.status}\n${subtitle}${w.last_error ? '\n' + w.last_error : ''}`}
                   className={`h-2 w-6 rounded-sm border ${cls}`}
                 />
               );
@@ -1265,7 +1427,7 @@ function FireflyHistoricalBackfillSection() {
                 disabled={loading}
                 className="btn-ghost text-xs py-1.5 flex items-center gap-2 text-red-400 hover:text-red-300"
               >
-                <XIcon size={13} /> Cancel backfill
+                <XIcon size={13} /> Cancel import
               </button>
             )}
             {(isDone || isCancelled) && (
@@ -1273,7 +1435,7 @@ function FireflyHistoricalBackfillSection() {
                 onClick={() => setProgress(null)}
                 className="btn-secondary text-xs py-1.5 flex items-center gap-2"
               >
-                <Mic size={13} /> Start a new backfill
+                <Mic size={13} /> Start a new import
               </button>
             )}
           </div>
@@ -1300,7 +1462,7 @@ function FireflyHistoricalBackfillSection() {
           onClose={() => setDateRangeOpen(false)}
           onStarted={() => {
             setDateRangeOpen(false);
-            setToast('Backfill started');
+            setToast('Meeting import started');
             fetchProgress();
           }}
         />
@@ -1315,9 +1477,9 @@ function FireflyHistoricalBackfillSection() {
             onClick={e => e.stopPropagation()}>
             <div className="text-lg font-medium text-text-primary mb-2">Revoke saved API key?</div>
             <div className="text-sm text-text-secondary mb-4">
-              The encrypted key will be deleted from the server. Future backfills will
+              The encrypted key will be deleted from the server. Future meeting imports will
               be disabled until you save a new key. Already-ingested transcripts are
-              kept. Any in-flight backfill will fail at its next window tick.
+              kept. Any in-flight import will stop at its next batch.
             </div>
             <div className="flex justify-end gap-3">
               <button className="btn-ghost" onClick={() => setCredRevokeConfirmOpen(false)}>Keep saved</button>
@@ -1338,18 +1500,18 @@ function FireflyHistoricalBackfillSection() {
           <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
             style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
             onClick={e => e.stopPropagation()}>
-            <div className="text-lg font-medium text-text-primary mb-2">Cancel the backfill?</div>
+            <div className="text-lg font-medium text-text-primary mb-2">Cancel the meeting import?</div>
             <div className="text-sm text-text-secondary mb-4">
               Transcripts already ingested will be kept. Pending and in-progress
-              windows will be marked failed. Your saved API key stays put — you
-              can start a new backfill any time without re-entering it.
+              pending batches will be stopped. Your saved API key stays put — you
+              can start a new import any time without re-entering it.
             </div>
             <div className="flex justify-end gap-3">
               <button className="btn-ghost" onClick={() => setCancelConfirmOpen(false)}>Keep running</button>
               <button className="btn-primary" disabled={loading}
                 style={{ background: '#DC2626', borderColor: '#DC2626' }}
                 onClick={cancelBackfill}>
-                {loading ? 'Cancelling...' : 'Cancel backfill'}
+                {loading ? 'Cancelling...' : 'Cancel import'}
               </button>
             </div>
           </div>
@@ -1390,10 +1552,10 @@ function FireflyTriggerModal({
       <div className="rounded-2xl w-full max-w-sm shadow-2xl p-6"
         style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
         onClick={e => e.stopPropagation()}>
-        <div className="text-lg font-medium text-text-primary mb-2">Start Fireflies backfill</div>
+        <div className="text-lg font-medium text-text-primary mb-2">Start meeting transcript import</div>
         <div className="text-sm text-text-secondary mb-4">
           Pull last <strong>{days}</strong> days of meetings for <strong>{targetUserLabel}</strong>.
-          Runs in 10-day windows, server-side. No need to keep this tab open.
+          Runs in small background batches. No need to keep this tab open.
         </div>
         <div className="text-xs text-text-muted mb-4">
           Uses the saved Fireflies API key — no need to re-enter it.
@@ -1401,7 +1563,7 @@ function FireflyTriggerModal({
         <div className="flex justify-end gap-3">
           <button className="btn-ghost" onClick={onClose}>Cancel</button>
           <button className="btn-primary" disabled={loading} onClick={onSubmit}>
-            {loading ? 'Starting...' : 'Start backfill'}
+            {loading ? 'Starting...' : 'Start import'}
           </button>
         </div>
       </div>
@@ -1517,7 +1679,7 @@ function FireflyDateRangeModal({
         onClick={e => e.stopPropagation()}>
         <div className="text-lg font-medium text-text-primary mb-2">Custom date range</div>
         <div className="text-sm text-text-secondary mb-4">
-          Pulled in 10-day windows for <strong>{targetUserLabel}</strong>, newest first.
+          Imported in small background batches for <strong>{targetUserLabel}</strong>, newest first.
         </div>
         <div className="space-y-3 mb-4">
           <div>
@@ -1541,7 +1703,7 @@ function FireflyDateRangeModal({
             />
           </div>
           <div className="text-[10px] text-text-muted">
-            Maximum {FIREFLY_MAX_BACKFILL_DAYS} days per backfill — split longer pulls into
+            Maximum {FIREFLY_MAX_BACKFILL_DAYS} days per import — split longer pulls into
             multiple requests.
           </div>
         </div>
@@ -1558,7 +1720,7 @@ function FireflyDateRangeModal({
         <div className="flex justify-end gap-3">
           <button className="btn-ghost" onClick={onClose}>Cancel</button>
           <button className="btn-primary" disabled={loading} onClick={submit}>
-            {loading ? 'Starting...' : 'Start backfill'}
+            {loading ? 'Starting...' : 'Start import'}
           </button>
         </div>
       </div>
@@ -2776,8 +2938,8 @@ function statusColor(s: IntegrationRow['status']): string {
     case 'configured_no_channels':
       return 'text-semantic-warning';
     case 'auth_failed':
-      return 'text-semantic-error';
     case 'not_connected':
+      return 'text-semantic-error';
     case 'not_configured':
     default:
       return 'text-text-muted';
@@ -2854,7 +3016,7 @@ function IntegrationRowView({
 
       {primaryLabel && (
         <div className="shrink-0 flex items-center gap-2">
-          {row.status === 'connected' && (
+          {row.status === 'connected' && row.token_healthy !== false && (
             <span className="badge bg-semantic-success/10 text-semantic-success text-xs">Manage</span>
           )}
           <button onClick={onPrimaryClick} disabled={primaryDisabled} className={`${row.status === 'connected' ? 'btn-ghost text-xs' : 'btn-secondary text-xs py-1.5'} ${primaryDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}>
@@ -2886,7 +3048,7 @@ const FIREFLY_TROUBLESHOOTING: Array<{ q: string; a: React.ReactNode }> = [
   { q: 'Test event returns 401 Unauthorized', a: <>The signing secret doesn't match. Copy the secret from the setup guide above and paste it into Firefly's webhook Signing Secret field. Both values must be identical.</> },
   { q: 'Test event returns 200 but real meetings don\'t appear', a: <>Check that "Meeting Transcribed" is selected as a webhook event. Firefly only sends webhooks after the transcript is fully processed, which can take 5–15 minutes after a meeting ends.</> },
   { q: 'Meetings are being recorded but Firefly bot doesn\'t join', a: <>Go to Firefly Settings → Recording &amp; Privacy. Make sure "Auto-join" is enabled for your calendar. The Firefly bot needs calendar access to detect and join meetings.</> },
-  { q: 'How to import past meeting transcripts', a: <>Scroll up to the "Fireflies Historical Backfill" card. Pick a window (Last 30 / 60 / 90 / 180 days) or a custom date range, paste your Fireflies API key, and click Start. The backfill runs server-side across cron ticks and survives page refreshes.</> },
+  { q: 'How to import past meeting transcripts', a: <>Scroll up to the "Meeting Transcript Import" card. Pick Last 30 / 60 / 90 days or a custom date range, save your Fireflies API key, and click Start. The import runs in the background and survives page refreshes.</> },
 ];
 
 function FireflyIntegrationCard({ row }: { row: IntegrationRow }) {
@@ -2945,7 +3107,7 @@ function FireflySetupGuide() {
       <ol className="space-y-1.5 text-xs text-text-secondary list-decimal list-inside">
         <li>Log in to your Firefly account at <span className="text-text-primary">app.fireflies.ai</span></li>
         <li>Go to <span className="text-text-primary">Settings → Developer settings</span> (left sidebar)</li>
-        <li>Copy your <span className="text-text-primary">API Key</span> (you'll need this for transcript backfill)</li>
+        <li>Copy your <span className="text-text-primary">API Key</span> (you'll need this for meeting transcript imports)</li>
         <li>Go to <span className="text-text-primary">Integrations</span> (left sidebar)</li>
         <li>Click the <span className="text-text-primary">"API"</span> filter tab, then find <span className="text-text-primary">"Webhooks"</span></li>
         <li>Click on the Webhooks card, then <span className="text-text-primary">"+ Add Config"</span> or edit the Default Configuration</li>

@@ -296,7 +296,7 @@ export async function me(ctx: AuthContext, env: Env): Promise<Response> {
   if (tokenFailState && tokenFailState.count >= 3) {
     warnings.push({
       type: 'outlook_token_expired',
-      message: 'Your Outlook connection has stopped syncing. Go to Settings → Integrations to reconnect.',
+      message: 'Your Outlook connection has stopped syncing. Go to Settings → Sync & Integrations to reconnect.',
       consecutive_failures: tokenFailState.count,
     });
   }

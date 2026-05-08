@@ -31,15 +31,15 @@ export function IntegrationWarningBanner() {
       {visible.map(w => (
         <div
           key={w.type}
-          className="bg-bg-elevated border-l-4 border-semantic-warning px-5 py-3 flex items-center justify-between gap-4"
+          className="fixed top-4 left-4 right-4 md:left-[340px] md:right-6 z-[95] bg-bg-elevated/95 backdrop-blur-xl border border-border border-l-4 border-l-semantic-warning rounded-xl shadow-2xl px-4 py-3 flex items-center justify-between gap-4"
         >
           <div className="text-sm text-text-primary">
             {w.message}{' '}
             <Link
-              href="/settings"
+              href="/settings?tab=integrations#sync-integrations"
               className="text-accent-magenta underline underline-offset-2"
             >
-              Go to Settings
+              Fix sync
             </Link>
           </div>
           <button
