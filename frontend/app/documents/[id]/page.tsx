@@ -176,7 +176,6 @@ export default function DocumentDetailPage() {
         <DocumentActions
           doc={doc}
           variant="compact"
-          showPreview={false}
           onError={message => setError(message)}
         />
       </div>
@@ -208,7 +207,7 @@ export default function DocumentDetailPage() {
         const kind = rawKind === 'unsupported' && doc.extracted_text_preview ? 'text' : rawKind;
         if (kind === 'pdf' || kind === 'image' || kind === 'docx') {
           return (
-            <section className="mb-6 bg-white/[0.03] border border-border rounded-lg overflow-hidden" style={{ height: 'min(70vh, 800px)' }}>
+            <section className="mb-6 bg-white/[0.03] border border-border rounded-xl overflow-hidden h-[78dvh] max-h-[920px] min-h-[420px]">
               <FilePreview
                 kind={kind}
                 src={previewBlobUrl || undefined}

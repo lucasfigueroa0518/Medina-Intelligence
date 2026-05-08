@@ -1,8 +1,11 @@
 'use client';
 
 import React from 'react';
+import Link from 'next/link';
 import { TopBar } from '@/components/top-bar';
 import { api } from '@/lib/api';
+import { DocumentActions } from '@/components/document-actions';
+import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import {
   Upload, FileText, FileSpreadsheet, File, Presentation,
   Users, Building2, Handshake, Zap, ChevronDown, ChevronRight,
@@ -266,6 +269,7 @@ export default function ImportsPage() {
   const [result, setResult] = React.useState<IntelligenceResult | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [toast, setToast] = React.useState<string | null>(null);
+  const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
 
   // Import history
   const [history, setHistory] = React.useState<ImportJob[]>([]);
@@ -788,7 +792,7 @@ export default function ImportsPage() {
             </div>
           </div>
 
-          {importReport && <ImportRunReport report={importReport} />}
+          {importReport && <ImportRunReport report={importReport} onPreview={setPreviewDocId} />}
 
           {/* Stats Row */}
           <div className="grid grid-cols-4 gap-3">
@@ -894,6 +898,10 @@ export default function ImportsPage() {
           </div>
         );
       })()}
+      <DocumentPreviewModal
+        docId={previewDocId}
+        onClose={() => setPreviewDocId(null)}
+      />
     </div>
   );
 }
@@ -902,7 +910,7 @@ export default function ImportsPage() {
 // Sub-components
 // ────────────────────────────────────────────────────────────────────────────
 
-function ImportRunReport({ report }: { report: ImportReport }) {
+function ImportRunReport({ report, onPreview }: { report: ImportReport; onPreview: (documentId: string) => void }) {
   const createdTotal =
     (report.lineage_counts.contact || 0) +
     (report.lineage_counts.company || 0) +
@@ -950,9 +958,8 @@ function ImportRunReport({ report }: { report: ImportReport }) {
           <div className="text-xs font-medium uppercase tracking-wider text-text-muted mb-3">Document record</div>
           <div className="space-y-2">
             {report.documents.map(doc => (
-              <a
+              <div
                 key={doc.id}
-                href={`/documents/${doc.id}`}
                 className="flex flex-col md:flex-row md:items-center justify-between gap-3 rounded-xl border border-border/60 bg-bg-inset/60 px-3 py-3 hover:border-accent-magenta/40 transition-colors"
               >
                 <div className="flex items-start gap-3 min-w-0">
@@ -971,8 +978,20 @@ function ImportRunReport({ report }: { report: ImportReport }) {
                     )}
                   </div>
                 </div>
-                <span className="text-xs text-accent-magenta shrink-0">Open document</span>
-              </a>
+                <div className="flex items-center gap-2 shrink-0">
+                  <DocumentActions
+                    doc={doc}
+                    variant="compact"
+                    onPreview={onPreview}
+                  />
+                  <Link
+                    href={`/documents/${doc.id}`}
+                    className="inline-flex items-center rounded-lg border border-border px-2.5 py-1.5 text-xs text-text-muted hover:text-text-primary hover:bg-white/[0.04] transition-colors"
+                  >
+                    Open record
+                  </Link>
+                </div>
+              </div>
             ))}
           </div>
         </div>

@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { X as XIcon, ExternalLink, Download, AlertCircle, Loader2, Sparkles } from 'lucide-react';
@@ -58,6 +59,11 @@ export function DocumentPreviewModal({
   const [previewError, setPreviewError] = React.useState<string | null>(null);
   const [downloading, setDownloading] = React.useState(false);
   const [sendingToMarty, setSendingToMarty] = React.useState(false);
+  const [mounted, setMounted] = React.useState(false);
+
+  React.useEffect(() => {
+    setMounted(true);
+  }, []);
 
   React.useEffect(() => {
     if (!docId) return;
@@ -180,7 +186,7 @@ export function DocumentPreviewModal({
     finally { setDownloading(false); }
   }
 
-  if (!docId) return null;
+  if (!docId || !mounted) return null;
 
   const rawKind = doc ? kindFromMime(doc.mime_type) : 'unsupported';
   const kind = rawKind === 'unsupported' && doc?.extracted_text_preview ? 'text' : rawKind;
@@ -188,13 +194,12 @@ export function DocumentPreviewModal({
   const hasOriginalFile = !!doc?.r2_key;
   const title = doc?.title || doc?.file_name || 'Document';
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-end md:items-center justify-center p-0 md:p-4" style={{ background: 'rgba(0,0,0,0.6)' }}
+  const modal = (
+    <div className="fixed inset-0 z-[120] flex items-center justify-center p-0 sm:p-3 lg:p-6 bg-black/70 backdrop-blur-sm"
       onClick={onClose}>
       <div
         onClick={e => e.stopPropagation()}
-        className="bg-bg-inset border border-border rounded-t-2xl md:rounded-xl shadow-2xl flex flex-col w-full h-[94dvh] md:h-[92vh]"
-        style={{ maxWidth: 'min(1280px, 96vw)', maxHeight: '94dvh' }}
+        className="bg-bg-inset border border-border rounded-none sm:rounded-2xl shadow-2xl flex flex-col w-full h-[100dvh] sm:h-[96dvh] lg:h-[94dvh] sm:max-w-[96vw] xl:max-w-[1480px]"
       >
         <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 md:px-5 py-4 border-b border-border">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -234,7 +239,7 @@ export function DocumentPreviewModal({
           </div>
         </header>
 
-        <div className="flex-1 overflow-hidden p-2 md:p-4 flex flex-col gap-3 min-h-0">
+        <div className="flex-1 overflow-hidden p-3 md:p-5 flex flex-col gap-3 min-h-0">
           {showFailedBanner && doc?.error_message && (
             <div className="px-3 py-2.5 rounded-lg border text-xs flex items-start gap-2 shrink-0"
               style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.25)', color: '#FCA5A5' }}>
@@ -245,7 +250,7 @@ export function DocumentPreviewModal({
               </div>
             </div>
           )}
-          <div className="flex-1 min-h-0 rounded-lg overflow-hidden bg-white/[0.02] border border-white/[0.04]">
+          <div className="flex-1 min-h-0 rounded-xl overflow-hidden bg-[#050507] border border-white/[0.06]">
             {loading || (kind !== 'text' && previewLoading) ? (
               <FilePreview kind={kind as any} loading />
             ) : error ? (
@@ -271,6 +276,8 @@ export function DocumentPreviewModal({
       </div>
     </div>
   );
+
+  return createPortal(modal, document.body);
 }
 
 function formatBytes(b: number | null): string {
