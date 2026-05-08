@@ -80,6 +80,7 @@ interface IntelligenceResult {
     relationships: ExtractedRelationship[];
     signals: ExtractedSignal[];
   };
+  import_report?: ImportReport;
 }
 
 interface ImportJob {
@@ -95,6 +96,77 @@ interface ImportJob {
   updated_rows?: number;
   skipped_rows?: number;
   failed_rows?: number;
+}
+
+interface ImportReportStage {
+  key: string;
+  label: string;
+  status: 'completed' | 'running' | 'pending' | 'failed' | 'warning';
+  detail: string;
+}
+
+interface ImportReportDocument {
+  id: string;
+  title: string;
+  file_name?: string | null;
+  document_type?: string | null;
+  source?: string | null;
+  mime_type?: string | null;
+  file_size?: number | null;
+  processing_status?: string | null;
+  error_message?: string | null;
+  vector_count: number;
+}
+
+interface ImportCreatedEntity {
+  id: string;
+  type: 'contact' | 'company' | 'deal' | 'document';
+  name: string;
+  subtitle?: string | null;
+  created_at?: string | null;
+}
+
+interface ImportWorkItem {
+  id: string;
+  domain: string;
+  status: string;
+  attempt: number;
+  max_attempts: number;
+  last_error?: string | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+interface ImportReport {
+  job_id: string;
+  file_name: string;
+  source_r2_key: string;
+  status: string;
+  source_type: string;
+  created_at: string;
+  updated_at?: string | null;
+  summary: string;
+  counters: {
+    total_rows: number;
+    processed_rows: number;
+    created_rows: number;
+    updated_rows: number;
+    skipped_rows: number;
+    failed_rows: number;
+  };
+  lineage_counts: Record<string, number>;
+  documents: ImportReportDocument[];
+  created_entities: {
+    contacts: ImportCreatedEntity[];
+    companies: ImportCreatedEntity[];
+    deals: ImportCreatedEntity[];
+    documents: ImportCreatedEntity[];
+  };
+  stages: ImportReportStage[];
+  work_items: ImportWorkItem[];
+  errors: string[];
+  notes: string[];
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -159,6 +231,10 @@ function routedCount(job: ImportJob): number {
   return routed || job.processed_rows || job.total_rows || 0;
 }
 
+function formatNumber(value: number | null | undefined): string {
+  return new Intl.NumberFormat().format(Number(value || 0));
+}
+
 function confidenceBadge(c: number) {
   const pct = Math.round(c * 100);
   const color = c >= 0.9 ? '#22C55E' : c >= 0.7 ? '#F59E0B' : '#EF4444';
@@ -194,6 +270,7 @@ export default function ImportsPage() {
   // Import history
   const [history, setHistory] = React.useState<ImportJob[]>([]);
   const [historyLoading, setHistoryLoading] = React.useState(true);
+  const [reportLoadingId, setReportLoadingId] = React.useState<string | null>(null);
 
   // Report state
   const [activeTab, setActiveTab] = React.useState<'contacts' | 'companies' | 'deals'>('contacts');
@@ -293,22 +370,36 @@ export default function ImportsPage() {
     }
   }
 
-  function openReportFromJob(job: ImportJob) {
-    setResult({
-      document_id: job.id,
-      category: 'reference',
-      summary: `Processed ${job.total_rows || 0} entities from "${(job as any).source_r2_key?.split('/').pop() || 'uploaded file'}".`,
-      contacts_created: job.created_rows || 0,
-      contacts_updated: job.updated_rows || 0,
-      companies_created: 0,
-      companies_updated: 0,
-      deals_created: 0,
-      relationships_found: 0,
-      signals_found: 0,
-      entities_routed: (job as any).processed_rows || job.created_rows || 0,
-      errors: (job as any).failed_rows ? [`${(job as any).failed_rows} rows failed`] : [],
-    });
-    setPhase('report');
+  async function openReportFromJob(job: ImportJob) {
+    if (reportLoadingId) return;
+    setReportLoadingId(job.id);
+    try {
+      const data = await api.getImportJob(job.id);
+      const freshJob = data.job || job;
+      const report = (data as any).report as ImportReport | undefined;
+      const docType = report?.documents?.[0]?.document_type || 'reference';
+      setHistory(prev => prev.map(j => j.id === job.id ? { ...j, ...freshJob } : j));
+      setResult({
+        document_id: freshJob.id,
+        category: docType,
+        summary: report?.summary || `Processed ${freshJob.total_rows || 0} entities from "${importFileName(freshJob)}".`,
+        contacts_created: report?.lineage_counts?.contact || 0,
+        contacts_updated: freshJob.updated_rows || 0,
+        companies_created: report?.lineage_counts?.company || 0,
+        companies_updated: 0,
+        deals_created: report?.lineage_counts?.deal || 0,
+        relationships_found: 0,
+        signals_found: 0,
+        entities_routed: freshJob.processed_rows || routedCount(freshJob),
+        errors: report?.errors || (freshJob.failed_rows ? [`${freshJob.failed_rows} rows failed`] : []),
+        import_report: report,
+      });
+      setPhase('report');
+    } catch (e: any) {
+      setError(e?.message || 'Could not open import report');
+    } finally {
+      setReportLoadingId(null);
+    }
   }
 
   async function handleUndo(jobId: string) {
@@ -316,7 +407,7 @@ export default function ImportsPage() {
     try {
       const r = await api.undoImport(jobId);
       setHistory(prev => prev.map(j => j.id === jobId ? { ...j, status: 'reverted' } : j));
-      if (result?.document_id === jobId) {
+      if (result?.document_id === jobId || result?.import_report?.job_id === jobId) {
         setResult(null);
         setPhase('upload');
       }
@@ -334,19 +425,21 @@ export default function ImportsPage() {
         const data = await api.getImportJob(jobId);
         const job = data.job;
         if (job.status === 'completed') {
+          const report = (data as any).report as ImportReport | undefined;
           setResult({
             document_id: job.id,
-            category: 'reference',
-            summary: `Processed ${job.total_rows || 0} entities from uploaded file.`,
-            contacts_created: job.created_rows || 0,
+            category: report?.documents?.[0]?.document_type || 'reference',
+            summary: report?.summary || `Processed ${job.total_rows || 0} entities from uploaded file.`,
+            contacts_created: report?.lineage_counts?.contact || 0,
             contacts_updated: job.updated_rows || 0,
-            companies_created: 0,
+            companies_created: report?.lineage_counts?.company || 0,
             companies_updated: 0,
-            deals_created: 0,
+            deals_created: report?.lineage_counts?.deal || 0,
             relationships_found: 0,
             signals_found: 0,
             entities_routed: job.processed_rows || 0,
-            errors: job.failed_rows ? [`${job.failed_rows} rows failed`] : [],
+            errors: report?.errors || (job.failed_rows ? [`${job.failed_rows} rows failed`] : []),
+            import_report: report,
           });
           setHistory(prev => prev.map(j => j.id === jobId ? { ...j, ...job } : j));
           setPhase('report');
@@ -533,7 +626,7 @@ export default function ImportsPage() {
                           <tr
                             key={job.id}
                             className={`border-b border-border/50 ${clickable ? 'cursor-pointer hover:bg-bg-surface-hover' : ''}`}
-                            onClick={clickable ? () => openReportFromJob(job) : undefined}
+                            onClick={clickable ? () => void openReportFromJob(job) : undefined}
                           >
                             <td className="px-4 py-3">
                               <div className="max-w-[260px] truncate text-text-primary">{importFileName(job)}</div>
@@ -550,13 +643,18 @@ export default function ImportsPage() {
                             </td>
                             <td className="px-4 py-3 text-right">
                               {job.status === 'completed' && (
-                                <button
-                                  onClick={e => { e.stopPropagation(); handleUndo(job.id); }}
-                                  className="text-xs text-text-muted hover:text-semantic-error transition-colors"
-                                  title="Soft-delete created entities and remove the document"
-                                >
-                                  Undo
-                                </button>
+                                <div className="flex items-center justify-end gap-3">
+                                  <span className="text-xs text-accent-magenta">
+                                    {reportLoadingId === job.id ? 'opening…' : 'report'}
+                                  </span>
+                                  <button
+                                    onClick={e => { e.stopPropagation(); handleUndo(job.id); }}
+                                    className="text-xs text-text-muted hover:text-semantic-error transition-colors"
+                                    title="Soft-delete created entities and remove the document"
+                                  >
+                                    Undo
+                                  </button>
+                                </div>
                               )}
                               {job.status === 'reverted' && (
                                 <span className="text-xs text-text-muted italic">reverted</span>
@@ -639,9 +737,14 @@ export default function ImportsPage() {
 
   if (!result) return null;
 
-  const catConfig = CATEGORY_CONFIG[result.category] || CATEGORY_CONFIG.reference;
+  const importReport = result.import_report;
+  const primaryDocument = importReport?.documents?.[0];
+  const displayFileName = importReport?.file_name || primaryDocument?.file_name || file?.name || 'Uploaded file';
+  const displayFileSize = primaryDocument?.file_size || file?.size || null;
+  const catConfig = CATEGORY_CONFIG[primaryDocument?.document_type || result.category] || CATEGORY_CONFIG.reference;
   const totalContacts = result.contacts_created + result.contacts_updated;
   const totalCompanies = result.companies_created + result.companies_updated;
+  const undoJobId = importReport?.job_id || result.document_id;
 
   return (
     <div className="flex-1 flex flex-col">
@@ -650,7 +753,7 @@ export default function ImportsPage() {
         actions={
           <div className="flex items-center gap-2">
             <button
-              onClick={() => handleUndo(result.document_id)}
+              onClick={() => handleUndo(undoJobId)}
               className="btn-ghost text-sm text-semantic-error hover:bg-semantic-error/10"
               title="Soft-delete created entities and remove the document"
             >
@@ -678,10 +781,14 @@ export default function ImportsPage() {
                   </span>
                 </div>
                 <div className="text-sm text-text-primary leading-relaxed">{result.summary}</div>
-                <div className="text-xs text-text-muted mt-2">{file?.name} · {file ? formatFileSize(file.size) : ''}</div>
+                <div className="text-xs text-text-muted mt-2">
+                  {displayFileName}{displayFileSize ? ` · ${formatFileSize(displayFileSize)}` : ''}
+                </div>
               </div>
             </div>
           </div>
+
+          {importReport && <ImportRunReport report={importReport} />}
 
           {/* Stats Row */}
           <div className="grid grid-cols-4 gap-3">
@@ -794,6 +901,196 @@ export default function ImportsPage() {
 // ────────────────────────────────────────────────────────────────────────────
 // Sub-components
 // ────────────────────────────────────────────────────────────────────────────
+
+function ImportRunReport({ report }: { report: ImportReport }) {
+  const createdTotal =
+    (report.lineage_counts.contact || 0) +
+    (report.lineage_counts.company || 0) +
+    (report.lineage_counts.deal || 0);
+
+  return (
+    <div className="card p-5 space-y-5">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-sm font-medium text-text-primary">Import Run Report</h3>
+          <p className="text-xs text-text-muted mt-1">
+            Full trace of what happened to this upload, from document storage through CRM routing and MARTy embedding.
+          </p>
+        </div>
+        <StatusBadge status={report.status} />
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <MiniMetric label="Processed" value={formatNumber(report.counters.processed_rows)} />
+        <MiniMetric label="Created" value={formatNumber(report.counters.created_rows)} />
+        <MiniMetric label="Updated" value={formatNumber(report.counters.updated_rows)} />
+        <MiniMetric label="Failed" value={formatNumber(report.counters.failed_rows)} danger={report.counters.failed_rows > 0} />
+      </div>
+
+      <div>
+        <div className="text-xs font-medium uppercase tracking-wider text-text-muted mb-3">What happened</div>
+        <div className="space-y-2">
+          {report.stages.map(stage => (
+            <div key={stage.key} className="flex items-start gap-3 rounded-xl border border-border/60 bg-bg-inset/60 px-3 py-3">
+              <StageDot status={stage.status} />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium text-text-primary">{stage.label}</span>
+                  <StageStatusBadge status={stage.status} />
+                </div>
+                <div className="text-xs text-text-muted mt-1 leading-relaxed">{stage.detail}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {report.documents.length > 0 && (
+        <div>
+          <div className="text-xs font-medium uppercase tracking-wider text-text-muted mb-3">Document record</div>
+          <div className="space-y-2">
+            {report.documents.map(doc => (
+              <a
+                key={doc.id}
+                href={`/documents/${doc.id}`}
+                className="flex flex-col md:flex-row md:items-center justify-between gap-3 rounded-xl border border-border/60 bg-bg-inset/60 px-3 py-3 hover:border-accent-magenta/40 transition-colors"
+              >
+                <div className="flex items-start gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-lg bg-accent-magenta/10 text-accent-magenta flex items-center justify-center shrink-0">
+                    <FileText size={16} />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-text-primary truncate">{doc.file_name || doc.title}</div>
+                    <div className="text-xs text-text-muted mt-0.5">
+                      {(doc.document_type || 'document').replace(/_/g, ' ')}
+                      {doc.file_size ? ` · ${formatFileSize(doc.file_size)}` : ''}
+                      {` · ${formatNumber(doc.vector_count)} MARTy chunk${doc.vector_count === 1 ? '' : 's'}`}
+                    </div>
+                    {doc.error_message && (
+                      <div className="text-xs text-semantic-error mt-1">{doc.error_message}</div>
+                    )}
+                  </div>
+                </div>
+                <span className="text-xs text-accent-magenta shrink-0">Open document</span>
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <CreatedRecords report={report} createdTotal={createdTotal} />
+
+      {report.work_items.length > 0 && (
+        <div>
+          <div className="text-xs font-medium uppercase tracking-wider text-text-muted mb-3">Processing trail</div>
+          <div className="max-h-64 overflow-auto rounded-xl border border-border/60">
+            <table className="min-w-[680px] w-full text-xs">
+              <thead className="sticky top-0 bg-bg-inset z-10">
+                <tr className="border-b border-border/60 text-text-muted">
+                  <th className="text-left px-3 py-2 font-medium">Work</th>
+                  <th className="text-left px-3 py-2 font-medium">Status</th>
+                  <th className="text-left px-3 py-2 font-medium">Attempt</th>
+                  <th className="text-left px-3 py-2 font-medium">Created</th>
+                  <th className="text-left px-3 py-2 font-medium">Error</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.work_items.map(item => (
+                  <tr key={item.id} className="border-b border-border/40 last:border-b-0">
+                    <td className="px-3 py-2 text-text-primary">{item.domain.replace(/_/g, ' ')}</td>
+                    <td className="px-3 py-2"><StatusBadge status={item.status} /></td>
+                    <td className="px-3 py-2 text-text-secondary tabular-nums">{item.attempt}/{item.max_attempts}</td>
+                    <td className="px-3 py-2 text-text-secondary">{item.created_at ? formatRelative(item.created_at) : '—'}</td>
+                    <td className="px-3 py-2 text-text-muted max-w-[260px] truncate">{item.last_error || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {report.notes.length > 0 && (
+        <div className="rounded-xl border border-border/60 bg-bg-inset/60 px-3 py-3 space-y-1">
+          {report.notes.map((note, i) => (
+            <div key={i} className="text-xs text-text-muted leading-relaxed">{note}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MiniMetric({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
+  return (
+    <div className="rounded-xl border border-border/60 bg-bg-inset/60 px-3 py-3">
+      <div className="text-[10px] uppercase tracking-wider text-text-muted">{label}</div>
+      <div className={`text-xl font-semibold font-display tabular-nums mt-1 ${danger ? 'text-semantic-error' : 'text-text-primary'}`}>{value}</div>
+    </div>
+  );
+}
+
+function StageDot({ status }: { status: ImportReportStage['status'] }) {
+  const color =
+    status === 'completed' ? '#22C55E' :
+    status === 'running' ? '#D946A8' :
+    status === 'failed' ? '#EF4444' :
+    status === 'warning' ? '#F59E0B' :
+    '#64748B';
+  return <div className="w-2.5 h-2.5 rounded-full mt-1.5 shrink-0" style={{ background: color }} />;
+}
+
+function StageStatusBadge({ status }: { status: ImportReportStage['status'] }) {
+  const config: Record<ImportReportStage['status'], { color: string; bg: string; label: string }> = {
+    completed: { color: '#22C55E', bg: 'rgba(34,197,94,0.12)', label: 'Done' },
+    running: { color: '#D946A8', bg: 'rgba(217,70,168,0.12)', label: 'Running' },
+    pending: { color: '#94A3B8', bg: 'rgba(148,163,184,0.12)', label: 'Pending' },
+    failed: { color: '#EF4444', bg: 'rgba(239,68,68,0.12)', label: 'Failed' },
+    warning: { color: '#F59E0B', bg: 'rgba(245,158,11,0.12)', label: 'Needs attention' },
+  };
+  const c = config[status];
+  return <span className="px-2 py-0.5 rounded text-[10px] font-medium" style={{ color: c.color, background: c.bg }}>{c.label}</span>;
+}
+
+function CreatedRecords({ report, createdTotal }: { report: ImportReport; createdTotal: number }) {
+  const groups: Array<[string, ImportCreatedEntity[], number]> = [
+    ['Contacts', report.created_entities.contacts, report.lineage_counts.contact || 0],
+    ['Companies', report.created_entities.companies, report.lineage_counts.company || 0],
+    ['Deals', report.created_entities.deals, report.lineage_counts.deal || 0],
+  ];
+  if (createdTotal === 0) return null;
+
+  return (
+    <div>
+      <div className="text-xs font-medium uppercase tracking-wider text-text-muted mb-3">Created records</div>
+      <div className="grid md:grid-cols-3 gap-3">
+        {groups.map(([label, rows, total]) => (
+          <div key={label} className="rounded-xl border border-border/60 bg-bg-inset/60 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium text-text-primary">{label}</span>
+              <span className="text-xs text-text-muted tabular-nums">{formatNumber(total)}</span>
+            </div>
+            {rows.length > 0 ? (
+              <div className="space-y-2">
+                {rows.slice(0, 5).map(row => (
+                  <div key={row.id} className="min-w-0">
+                    <div className="text-xs text-text-primary truncate">{row.name}</div>
+                    {row.subtitle && <div className="text-[11px] text-text-muted truncate">{row.subtitle}</div>}
+                  </div>
+                ))}
+                {total > rows.length && (
+                  <div className="text-[11px] text-text-muted">+ {formatNumber(total - rows.length)} more tracked in lineage</div>
+                )}
+              </div>
+            ) : (
+              <div className="text-xs text-text-muted">No new {label.toLowerCase()} were created.</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function StatCard({ icon, label, total, created, updated }: {
   icon: React.ReactNode; label: string; total: number; created: number; updated: number;

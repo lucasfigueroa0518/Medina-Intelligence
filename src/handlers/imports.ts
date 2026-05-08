@@ -5,6 +5,116 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { callClaude } from '../lib/claude';
 import { IMPORT_COLUMN_MAPPING_PROMPT } from '../prompts/import-mapping';
 
+interface ImportJobRow {
+  id: string;
+  org_id: string;
+  created_by: string | null;
+  source_type: string;
+  source_r2_key: string;
+  status: string;
+  column_mapping?: string | null;
+  preview_data?: string | null;
+  total_rows?: number | null;
+  processed_rows?: number | null;
+  created_rows?: number | null;
+  updated_rows?: number | null;
+  skipped_rows?: number | null;
+  failed_rows?: number | null;
+  error_log_r2_key?: string | null;
+  created_at: string;
+  updated_at?: string | null;
+}
+
+interface ImportDocumentReport {
+  id: string;
+  title: string;
+  file_name: string | null;
+  document_type: string | null;
+  source: string | null;
+  mime_type: string | null;
+  file_size: number | null;
+  processing_status: string | null;
+  error_message: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  vector_count: number;
+}
+
+interface ImportCreatedEntity {
+  id: string;
+  type: 'contact' | 'company' | 'deal' | 'document';
+  name: string;
+  subtitle: string | null;
+  created_at: string | null;
+}
+
+interface ImportWorkItem {
+  id: string;
+  domain: string;
+  status: string;
+  attempt: number;
+  max_attempts: number;
+  last_error: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+interface ImportReport {
+  job_id: string;
+  file_name: string;
+  source_r2_key: string;
+  status: string;
+  source_type: string;
+  created_at: string;
+  updated_at: string | null;
+  summary: string;
+  counters: {
+    total_rows: number;
+    processed_rows: number;
+    created_rows: number;
+    updated_rows: number;
+    skipped_rows: number;
+    failed_rows: number;
+  };
+  lineage_counts: Record<string, number>;
+  documents: ImportDocumentReport[];
+  created_entities: {
+    contacts: ImportCreatedEntity[];
+    companies: ImportCreatedEntity[];
+    deals: ImportCreatedEntity[];
+    documents: ImportCreatedEntity[];
+  };
+  stages: Array<{
+    key: string;
+    label: string;
+    status: 'completed' | 'running' | 'pending' | 'failed' | 'warning';
+    detail: string;
+  }>;
+  work_items: ImportWorkItem[];
+  errors: string[];
+  notes: string[];
+}
+
+function numberish(value: unknown): number {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fileNameFromR2Key(key?: string | null): string {
+  if (!key) return 'Uploaded file';
+  const leaf = key.split('/').pop() || key;
+  return leaf.replace(/^[0-9a-f-]{36}_/i, '');
+}
+
+function stageStatusForJob(status: string): 'completed' | 'running' | 'pending' | 'failed' | 'warning' {
+  if (status === 'completed' || status === 'reverted') return 'completed';
+  if (status === 'failed') return 'failed';
+  if (status === 'cancelled') return 'warning';
+  if (status === 'processing') return 'running';
+  return 'pending';
+}
+
 export async function listImports(
   ctx: AuthContext,
   env: Env
@@ -106,9 +216,283 @@ export async function getImportJob(
 ): Promise<Response> {
   const job = await env.D1.prepare(
     'SELECT * FROM import_jobs WHERE id = ? AND org_id = ?'
-  ).bind(id, ctx.orgId).first();
+  ).bind(id, ctx.orgId).first<ImportJobRow>();
   if (!job) return errorResponse('IMPORT_NOT_FOUND', 404);
-  return jsonResponse({ job });
+  const report = await buildImportReport(job, env);
+  return jsonResponse({ job, report });
+}
+
+async function buildImportReport(job: ImportJobRow, env: Env): Promise<ImportReport> {
+  const fileName = fileNameFromR2Key(job.source_r2_key);
+  const counters = {
+    total_rows: numberish(job.total_rows),
+    processed_rows: numberish(job.processed_rows),
+    created_rows: numberish(job.created_rows),
+    updated_rows: numberish(job.updated_rows),
+    skipped_rows: numberish(job.skipped_rows),
+    failed_rows: numberish(job.failed_rows),
+  };
+
+  const lineageRows = await env.D1.prepare(
+    `SELECT entity_type, COUNT(*) AS count
+       FROM import_lineage
+      WHERE import_job_id = ?
+      GROUP BY entity_type`
+  ).bind(job.id).all<{ entity_type: string; count: number }>();
+
+  const lineageCounts: Record<string, number> = {};
+  for (const row of lineageRows.results || []) {
+    lineageCounts[row.entity_type] = numberish(row.count);
+  }
+
+  const documents = await env.D1.prepare(
+    `SELECT d.id, d.title, d.file_name, d.document_type, d.source, d.mime_type,
+            d.file_size, d.processing_status, d.error_message, d.created_at, d.updated_at,
+            COUNT(vei.vector_id) AS vector_count
+       FROM import_lineage il
+       JOIN documents d
+         ON d.id = il.entity_id
+        AND d.org_id = ?
+       LEFT JOIN vector_entity_index vei
+         ON vei.entity_id = d.id
+        AND vei.source_table = 'documents'
+        AND vei.org_id = d.org_id
+      WHERE il.import_job_id = ?
+        AND il.entity_type = 'document'
+      GROUP BY d.id
+      ORDER BY d.created_at DESC`
+  ).bind(job.org_id, job.id).all<ImportDocumentReport>();
+
+  const documentRows = documents.results || [];
+  const documentIds = documentRows.map(d => d.id);
+  const createdEntities = await loadCreatedEntities(job.id, job.org_id, env);
+  const workItems = await loadImportWorkItems(job, documentIds, env);
+  const errors = await loadImportErrors(job, env, workItems, documentRows);
+
+  const totalVectors = documentRows.reduce((sum, doc) => sum + numberish(doc.vector_count), 0);
+  const documentStageStatus = documentRows.length === 0
+    ? 'pending'
+    : documentRows.some(doc => doc.processing_status === 'failed')
+      ? 'failed'
+      : documentRows.every(doc => doc.processing_status === 'completed')
+        ? 'completed'
+        : 'running';
+  const embedWork = workItems.filter(item => item.domain === 'embed_retry');
+  const embeddingStageStatus = totalVectors > 0
+    ? 'completed'
+    : embedWork.some(item => item.status === 'dead_letter' || item.status === 'failed')
+      ? 'failed'
+      : embedWork.some(item => item.status === 'pending' || item.status === 'in_progress')
+        ? 'running'
+        : documentRows.length > 0
+          ? 'pending'
+          : 'pending';
+
+  const stages: ImportReport['stages'] = [
+    {
+      key: 'upload',
+      label: 'Uploaded original file',
+      status: 'completed',
+      detail: `Stored ${fileName} in durable storage for this org.`,
+    },
+    {
+      key: 'document',
+      label: 'Added to Documents',
+      status: documentStageStatus,
+      detail: documentRows.length > 0
+        ? `${documentRows.length} document record${documentRows.length === 1 ? '' : 's'} created.`
+        : 'No document record has been linked to this import yet.',
+    },
+    {
+      key: 'classification',
+      label: 'Classified and extracted',
+      status: documentStageStatus,
+      detail: documentRows[0]?.document_type
+        ? `Classified as ${documentRows[0].document_type.replace(/_/g, ' ')}.`
+        : job.status === 'failed'
+          ? 'Classification or extraction failed.'
+          : 'Classification details are not available yet.',
+    },
+    {
+      key: 'routing',
+      label: 'Routed into CRM',
+      status: stageStatusForJob(job.status),
+      detail: `${counters.processed_rows || 0} processed, ${counters.created_rows || 0} created, ${counters.updated_rows || 0} updated, ${counters.failed_rows || 0} failed.`,
+    },
+    {
+      key: 'embedding',
+      label: 'Made searchable by MARTy',
+      status: embeddingStageStatus,
+      detail: totalVectors > 0
+        ? `${totalVectors} document chunk${totalVectors === 1 ? '' : 's'} embedded for semantic search.`
+        : 'No document vectors found yet. Preview/download still works, but MARTy semantic retrieval is weaker until embedding completes.',
+    },
+  ];
+
+  const notes: string[] = [];
+  if (counters.updated_rows > 0) {
+    notes.push('Updates were applied to existing CRM records. The system tracks update counts, but import lineage only stores records created by this import.');
+  }
+  if (job.status === 'reverted') {
+    notes.push('This import has been reverted. Created records were soft-deleted and document vectors were removed where available.');
+  }
+
+  const summary = job.status === 'completed'
+    ? `${fileName} was analyzed and routed. ${counters.created_rows} records were created, ${counters.updated_rows} existing records were updated, and ${totalVectors} document chunks are searchable by MARTy.`
+    : job.status === 'processing'
+      ? `${fileName} is still being analyzed in the background.`
+      : job.status === 'failed'
+        ? `${fileName} failed during analysis. See the processing trail below for the failure details.`
+        : `${fileName} is currently ${job.status}.`;
+
+  return {
+    job_id: job.id,
+    file_name: fileName,
+    source_r2_key: job.source_r2_key,
+    status: job.status,
+    source_type: job.source_type,
+    created_at: job.created_at,
+    updated_at: job.updated_at || null,
+    summary,
+    counters,
+    lineage_counts: lineageCounts,
+    documents: documentRows.map(doc => ({
+      ...doc,
+      vector_count: numberish(doc.vector_count),
+      file_size: doc.file_size == null ? null : numberish(doc.file_size),
+    })),
+    created_entities: createdEntities,
+    stages,
+    work_items: workItems,
+    errors,
+    notes,
+  };
+}
+
+async function loadCreatedEntities(
+  jobId: string,
+  orgId: string,
+  env: Env
+): Promise<ImportReport['created_entities']> {
+  const [contacts, companies, deals, documents] = await Promise.all([
+    env.D1.prepare(
+      `SELECT c.id, 'contact' AS type, c.full_name AS name,
+              COALESCE(c.email, cmp.name, c.job_title) AS subtitle,
+              il.created_at
+         FROM import_lineage il
+         JOIN contacts c ON c.id = il.entity_id AND c.org_id = ?
+         LEFT JOIN companies cmp ON cmp.id = c.company_id AND cmp.org_id = c.org_id
+        WHERE il.import_job_id = ?
+          AND il.entity_type = 'contact'
+        ORDER BY il.created_at DESC
+        LIMIT 25`
+    ).bind(orgId, jobId).all<ImportCreatedEntity>(),
+    env.D1.prepare(
+      `SELECT c.id, 'company' AS type, c.name,
+              COALESCE(c.domain, c.website, c.company_type) AS subtitle,
+              il.created_at
+         FROM import_lineage il
+         JOIN companies c ON c.id = il.entity_id AND c.org_id = ?
+        WHERE il.import_job_id = ?
+          AND il.entity_type = 'company'
+        ORDER BY il.created_at DESC
+        LIMIT 25`
+    ).bind(orgId, jobId).all<ImportCreatedEntity>(),
+    env.D1.prepare(
+      `SELECT d.id, 'deal' AS type, d.title AS name,
+              c.name AS subtitle,
+              il.created_at
+         FROM import_lineage il
+         JOIN deals d ON d.id = il.entity_id AND d.org_id = ?
+         LEFT JOIN companies c ON c.id = d.company_id AND c.org_id = d.org_id
+        WHERE il.import_job_id = ?
+          AND il.entity_type = 'deal'
+        ORDER BY il.created_at DESC
+        LIMIT 25`
+    ).bind(orgId, jobId).all<ImportCreatedEntity>(),
+    env.D1.prepare(
+      `SELECT d.id, 'document' AS type, COALESCE(d.file_name, d.title) AS name,
+              d.document_type AS subtitle,
+              il.created_at
+         FROM import_lineage il
+         JOIN documents d ON d.id = il.entity_id AND d.org_id = ?
+        WHERE il.import_job_id = ?
+          AND il.entity_type = 'document'
+        ORDER BY il.created_at DESC
+        LIMIT 25`
+    ).bind(orgId, jobId).all<ImportCreatedEntity>(),
+  ]);
+
+  return {
+    contacts: contacts.results || [],
+    companies: companies.results || [],
+    deals: deals.results || [],
+    documents: documents.results || [],
+  };
+}
+
+async function loadImportWorkItems(
+  job: ImportJobRow,
+  documentIds: string[],
+  env: Env
+): Promise<ImportWorkItem[]> {
+  const clauses = ['payload LIKE ?'];
+  const binds: unknown[] = [`%${job.id}%`];
+  for (const documentId of documentIds.slice(0, 10)) {
+    clauses.push('payload LIKE ?');
+    binds.push(`%${documentId}%`);
+  }
+
+  const rows = await env.D1.prepare(
+    `SELECT id, domain, status, attempt, max_attempts, last_error,
+            created_at, started_at, completed_at
+       FROM work_queue
+      WHERE org_id = ?
+        AND (${clauses.join(' OR ')})
+      ORDER BY created_at DESC
+      LIMIT 25`
+  ).bind(job.org_id, ...binds).all<ImportWorkItem>();
+
+  return (rows.results || []).map(row => ({
+    ...row,
+    attempt: numberish(row.attempt),
+    max_attempts: numberish(row.max_attempts),
+  }));
+}
+
+async function loadImportErrors(
+  job: ImportJobRow,
+  env: Env,
+  workItems: ImportWorkItem[],
+  documents: ImportDocumentReport[]
+): Promise<string[]> {
+  const errors: string[] = [];
+  if (numberish(job.failed_rows) > 0) {
+    errors.push(`${numberish(job.failed_rows)} row${numberish(job.failed_rows) === 1 ? '' : 's'} failed during routing.`);
+  }
+
+  for (const doc of documents) {
+    if (doc.error_message) errors.push(`Document "${doc.file_name || doc.title}" failed: ${doc.error_message}`);
+  }
+  for (const item of workItems) {
+    if ((item.status === 'failed' || item.status === 'dead_letter') && item.last_error) {
+      errors.push(`${item.domain} ${item.status}: ${item.last_error}`);
+    }
+  }
+
+  if (job.error_log_r2_key) {
+    try {
+      const object = await env.R2.get(job.error_log_r2_key);
+      const text = object ? await object.text() : '';
+      if (text.trim()) {
+        errors.push(...text.split('\n').map(line => line.trim()).filter(Boolean).slice(0, 10));
+      }
+    } catch (e: any) {
+      errors.push(`Could not read import error log: ${e?.message || e}`);
+    }
+  }
+
+  return Array.from(new Set(errors)).slice(0, 25);
 }
 
 export async function setImportMapping(

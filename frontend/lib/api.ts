@@ -865,7 +865,7 @@ export const api = {
 
   // Imports
   listImports: () => request<{ imports: any[] }>('/imports'),
-  getImportJob: (id: string) => request<{ job: any }>(`/imports/${id}`),
+  getImportJob: (id: string) => request<{ job: any; report?: any }>(`/imports/${id}`),
   intelligentImport: (file: File) => {
     const fd = new FormData();
     fd.append('file', file);
