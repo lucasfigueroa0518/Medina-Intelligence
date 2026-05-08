@@ -5,7 +5,7 @@ import type { WorkQueueRow } from '../work-queue';
 
 export const dealReplayEvidenceHandler: WorkQueueHandler = {
   domain: DEAL_REPLAY_DOMAIN,
-  batchSize: 2,
+  batchSize: 3,
   async process(item: WorkQueueRow, env: Env): Promise<void> {
     await processDealReplayWorkItem(item, env);
   },
