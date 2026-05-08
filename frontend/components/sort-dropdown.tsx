@@ -38,16 +38,16 @@ export function SortDropdown({ options, value, dir, onChange }: SortDropdownProp
       <button
         type="button"
         onClick={() => setOpen(o => !o)}
-        className="flex items-center gap-2 h-9 px-3 rounded-lg border border-border text-sm text-text-secondary hover:text-text-primary hover:border-border-hover transition-colors bg-bg-inset"
+        className="flex items-center gap-2 h-9 px-3 rounded-lg border border-border text-sm text-text-secondary hover:text-text-primary hover:border-border-hover transition-colors bg-bg-inset max-w-full"
       >
         <ArrowUpDown size={14} className="text-text-muted" />
         <span className="text-text-muted">Sort:</span>
-        <span className="text-text-primary">{active.label}</span>
+        <span className="text-text-primary truncate max-w-[150px] sm:max-w-none">{active.label}</span>
         {dir === 'asc' ? <ArrowUp size={12} /> : <ArrowDown size={12} />}
       </button>
       {open && (
         <div
-          className="absolute right-0 mt-1 w-64 rounded-lg shadow-2xl z-30 py-1"
+          className="absolute right-0 mt-1 w-[min(16rem,calc(100vw-2rem))] rounded-lg shadow-2xl z-30 py-1"
           style={{ background: '#1A1A1F', border: '1px solid rgba(255,255,255,0.08)' }}
         >
           {options.map(opt => {

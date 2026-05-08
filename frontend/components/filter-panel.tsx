@@ -16,33 +16,63 @@ interface FilterPanelProps {
 
 export function FilterPanel({ sections, onClearAll, activeCount = 0 }: FilterPanelProps) {
   return (
-    <aside className="w-[280px] bg-bg-inset border-r border-border overflow-y-auto flex-shrink-0">
-      <div className="p-4 flex items-center justify-between border-b border-border">
-        <div className="flex items-center gap-2">
-          <span className="text-xs uppercase tracking-wider text-text-muted font-medium">
-            Filters
-          </span>
-          {activeCount > 0 && (
-            <span className="badge bg-accent-magenta text-white text-xs">{activeCount}</span>
+    <>
+      <details className="md:hidden border-b border-border bg-bg-inset">
+        <summary className="list-none p-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-xs uppercase tracking-wider text-text-muted font-medium">
+              Filters
+            </span>
+            {activeCount > 0 && (
+              <span className="badge bg-accent-magenta text-white text-xs">{activeCount}</span>
+            )}
+          </div>
+          <span className="text-xs text-text-secondary">Open</span>
+        </summary>
+        <div className="px-4 pb-4 space-y-5 max-h-[68vh] overflow-y-auto">
+          {onClearAll && activeCount > 0 && (
+            <button
+              onClick={onClearAll}
+              className="text-xs text-text-secondary hover:text-text-primary"
+            >
+              Clear All
+            </button>
+          )}
+          {sections.map((s, i) => (
+            <Section key={i} label={s.label} defaultOpen={s.defaultOpen ?? i < 3}>
+              {s.children}
+            </Section>
+          ))}
+        </div>
+      </details>
+      <aside className="hidden md:flex w-[280px] bg-bg-inset border-r border-border overflow-y-auto flex-shrink-0 flex-col">
+        <div className="p-4 flex items-center justify-between border-b border-border">
+          <div className="flex items-center gap-2">
+            <span className="text-xs uppercase tracking-wider text-text-muted font-medium">
+              Filters
+            </span>
+            {activeCount > 0 && (
+              <span className="badge bg-accent-magenta text-white text-xs">{activeCount}</span>
+            )}
+          </div>
+          {onClearAll && (
+            <button
+              onClick={onClearAll}
+              className="text-xs text-text-secondary hover:text-text-primary"
+            >
+              Clear All
+            </button>
           )}
         </div>
-        {onClearAll && (
-          <button
-            onClick={onClearAll}
-            className="text-xs text-text-secondary hover:text-text-primary"
-          >
-            Clear All
-          </button>
-        )}
-      </div>
-      <div className="p-4 space-y-6">
-        {sections.map((s, i) => (
-          <Section key={i} label={s.label} defaultOpen={s.defaultOpen ?? i < 3}>
-            {s.children}
-          </Section>
-        ))}
-      </div>
-    </aside>
+        <div className="p-4 space-y-6">
+          {sections.map((s, i) => (
+            <Section key={i} label={s.label} defaultOpen={s.defaultOpen ?? i < 3}>
+              {s.children}
+            </Section>
+          ))}
+        </div>
+      </aside>
+    </>
   );
 }
 

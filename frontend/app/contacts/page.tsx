@@ -393,7 +393,7 @@ function ContactsPage() {
   }
 
   return (
-    <div className="flex-1 flex">
+    <div className="flex-1 flex flex-col md:flex-row min-w-0">
       <FilterPanel
         sections={[
           {
@@ -541,11 +541,11 @@ function ContactsPage() {
         activeCount={chips.length}
       />
 
-      <main className="flex-1 flex flex-col overflow-hidden">
+      <main className="flex-1 flex flex-col overflow-hidden min-w-0">
         <TopBar
           title="Contacts"
           search={
-            <div className="relative flex-1 min-w-[320px]">
+            <div className="relative flex-1 min-w-0 md:min-w-[320px]">
               <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none" />
               <input type="text" placeholder="Search contacts by name, email, or company..."
                 value={searchInput} onChange={e => setSearchInput(e.target.value)}
@@ -553,7 +553,7 @@ function ContactsPage() {
             </div>
           }
           actions={
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <SortDropdown
                 options={SORT_OPTIONS}
                 value={filters.sort}
@@ -567,7 +567,7 @@ function ContactsPage() {
           }
         />
 
-        <div className="flex-1 p-6 overflow-auto">
+        <div className="flex-1 p-4 md:p-6 overflow-auto">
           <QuickFilters<FilterState>
             filters={filters}
             presets={QUICK_FILTERS}

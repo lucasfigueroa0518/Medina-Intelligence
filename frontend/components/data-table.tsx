@@ -78,7 +78,68 @@ export function DataTable<T>({
 
   return (
     <div className="card p-0 overflow-hidden">
-      <table className="w-full text-sm">
+      <div className="md:hidden divide-y divide-border/60">
+        {data.map((row, i) => {
+          const id = getRowId ? getRowId(row) : String(i);
+          const titleColumn = columns[0];
+          const detailColumns = columns.slice(1).filter(col => col.header);
+          return (
+            <div
+              key={id}
+              role={onRowClick ? 'button' : undefined}
+              tabIndex={onRowClick ? 0 : undefined}
+              onClick={() => onRowClick?.(row)}
+              onKeyDown={e => {
+                if (!onRowClick) return;
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onRowClick(row);
+                }
+              }}
+              className={`w-full text-left p-4 transition-colors ${
+                onRowClick ? 'cursor-pointer active:bg-bg-surface-hover' : ''
+              }`}
+            >
+              <div className="flex items-start gap-3">
+                {selectable && (
+                  <input
+                    type="checkbox"
+                    checked={selected.has(id)}
+                    onClick={e => e.stopPropagation()}
+                    onChange={e => {
+                      const next = new Set(selected);
+                      if (e.target.checked) next.add(id);
+                      else next.delete(id);
+                      setSelected(next);
+                    }}
+                    className="mt-1"
+                  />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm text-text-primary font-medium min-w-0">
+                    {titleColumn.accessor(row)}
+                  </div>
+                  {detailColumns.length > 0 && (
+                    <div className="mt-3 grid grid-cols-1 gap-2">
+                      {detailColumns.slice(0, 5).map(col => (
+                        <div key={col.key} className="flex items-start justify-between gap-3 text-xs">
+                          <span className="shrink-0 text-[10px] uppercase tracking-wider text-text-muted">
+                            {col.header}
+                          </span>
+                          <div className="min-w-0 text-right text-text-secondary">
+                            {col.accessor(row)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <table className="hidden md:table w-full text-sm">
         <thead>
           <tr className="border-b border-border bg-bg-inset/50">
             {selectable && <th className="w-10 p-3" />}

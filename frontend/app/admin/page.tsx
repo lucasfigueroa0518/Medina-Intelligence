@@ -12,7 +12,7 @@ export default function AdminPage() {
   return (
     <div className="flex-1 flex flex-col">
       <TopBar title="Admin Dashboard" />
-      <div className="px-8 border-b border-border flex gap-0">
+      <div className="px-4 md:px-8 border-b border-border flex gap-0 overflow-x-auto">
         {(['approval', 'dlq', 'enrichment', 'sync'] as Tab[]).map(t => (
           <button
             key={t}
@@ -27,7 +27,7 @@ export default function AdminPage() {
           </button>
         ))}
       </div>
-      <div className="flex-1 p-8 overflow-auto">
+      <div className="flex-1 p-4 md:p-8 overflow-auto">
         {tab === 'approval' && <ApprovalTab />}
         {tab === 'dlq' && <DlqTab />}
         {tab === 'enrichment' && <EnrichmentTab />}

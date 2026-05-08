@@ -136,7 +136,7 @@ function SettingsPageInner() {
           doesn't bleed through. `bg-bg-primary` was a broken token (no
           such color in tailwind.config.ts) which rendered transparent. */}
       <div className="sticky top-0 z-20 bg-bg-root border-b border-white/5">
-        <div className="max-w-4xl px-8 overflow-x-auto scrollbar-hide">
+        <div className="max-w-4xl px-4 md:px-8 overflow-x-auto scrollbar-hide">
           <div className="flex gap-0 min-w-max">
             {TABS.map(tab => (
               <button
@@ -155,7 +155,7 @@ function SettingsPageInner() {
         </div>
       </div>
 
-      <div className="p-8 max-w-4xl">
+      <div className="p-4 md:p-8 max-w-4xl">
         {banner && (
           <div
             className={`card border-l-4 mb-6 ${

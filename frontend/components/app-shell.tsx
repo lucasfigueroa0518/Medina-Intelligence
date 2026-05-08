@@ -2,6 +2,7 @@
 
 import { usePathname } from 'next/navigation';
 import { Sidebar } from '@/components/sidebar';
+import { MobileNav } from '@/components/mobile-nav';
 import { SessionExpiredBanner } from '@/components/session-expired-banner';
 import { IntegrationWarningBanner } from '@/components/integration-warning-banner';
 import { BackgroundTaskProvider, BackgroundTaskIndicator } from '@/components/background-task-indicator';
@@ -19,11 +20,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <SessionExpiredBanner />
       <div className="flex h-screen overflow-hidden">
         <Sidebar />
-        <div className="flex-1 flex flex-col overflow-y-auto">
+        <div className="flex-1 flex flex-col overflow-y-auto pb-[calc(76px+env(safe-area-inset-bottom))] md:pb-0">
           <IntegrationWarningBanner />
           {children}
         </div>
       </div>
+      <MobileNav />
       <BackgroundTaskIndicator />
     </BackgroundTaskProvider>
   );

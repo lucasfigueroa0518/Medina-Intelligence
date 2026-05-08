@@ -94,7 +94,7 @@ export function BackgroundTaskIndicator() {
     return (
       <button
         onClick={() => setCollapsed(false)}
-        className="fixed bottom-4 right-4 z-50 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-bg-elevated border border-border shadow-lg text-xs text-text-primary hover:bg-bg-input transition-colors"
+        className="fixed bottom-[calc(84px+env(safe-area-inset-bottom))] md:bottom-4 right-4 z-50 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-bg-elevated border border-border shadow-lg text-xs text-text-primary hover:bg-bg-input transition-colors"
       >
         {running > 0 ? (
           <Loader2 className="w-3 h-3 animate-spin text-accent-magenta" />
@@ -108,7 +108,7 @@ export function BackgroundTaskIndicator() {
   }
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 w-80 space-y-2">
+    <div className="fixed bottom-[calc(84px+env(safe-area-inset-bottom))] md:bottom-4 right-3 md:right-4 left-3 md:left-auto z-50 md:w-80 space-y-2">
       <div className="flex justify-end mb-1">
         <button
           onClick={() => setCollapsed(true)}

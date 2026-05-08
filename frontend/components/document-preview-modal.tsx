@@ -189,14 +189,14 @@ export function DocumentPreviewModal({
   const title = doc?.title || doc?.file_name || 'Document';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.6)' }}
+    <div className="fixed inset-0 z-50 flex items-end md:items-center justify-center p-0 md:p-4" style={{ background: 'rgba(0,0,0,0.6)' }}
       onClick={onClose}>
       <div
         onClick={e => e.stopPropagation()}
-        className="bg-bg-inset border border-border rounded-xl shadow-2xl flex flex-col w-full"
+        className="bg-bg-inset border border-border rounded-t-2xl md:rounded-xl shadow-2xl flex flex-col w-full h-[92vh] md:h-auto"
         style={{ maxWidth: '900px', maxHeight: '90vh' }}
       >
-        <header className="flex items-center justify-between gap-3 px-5 py-4 border-b border-border">
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 md:px-5 py-4 border-b border-border">
           <div className="flex items-center gap-2.5 min-w-0">
             <div className="w-9 h-9 rounded-lg bg-purple-500/15 flex items-center justify-center shrink-0">
               <ExternalLink size={16} className="text-purple-300" />
@@ -210,12 +210,12 @@ export function DocumentPreviewModal({
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          <div className="flex items-center gap-1 shrink-0 overflow-x-auto max-w-full">
             <button onClick={handleSendToMarty} disabled={sendingToMarty || !doc}
               title="Send to MARTy"
               className="flex items-center gap-1.5 px-2.5 py-1.5 mr-1 rounded-lg text-purple-300 bg-purple-500/10 hover:bg-purple-500/15 transition-colors text-xs font-medium disabled:opacity-30">
               {sendingToMarty ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
-              {sendingToMarty ? 'Sending…' : 'Send to MARTy'}
+              <span className="hidden sm:inline">{sendingToMarty ? 'Sending…' : 'Send to MARTy'}</span>
             </button>
             <button onClick={handleDownload} disabled={downloading || !doc || !hasOriginalFile}
               title="Download"

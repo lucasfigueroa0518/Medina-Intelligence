@@ -705,6 +705,7 @@ export default function GodModePage() {
   const skipNextFetchRef = React.useRef(false);
 
   const [sidebarSearch, setSidebarSearch] = React.useState('');
+  const [mobileSessionsOpen, setMobileSessionsOpen] = React.useState(false);
   const [copiedMsgId, setCopiedMsgId] = React.useState<string | null>(null);
   const [placeholderText, setPlaceholderText] = React.useState('Ask MARTy anything...');
   const [deepDive, setDeepDive] = React.useState(false);
@@ -1235,19 +1236,39 @@ export default function GodModePage() {
 
   return (
     <div className="h-full flex overflow-hidden">
+      {mobileSessionsOpen && (
+        <div
+          className="md:hidden fixed inset-0 z-40 bg-black/60 backdrop-blur-sm"
+          onClick={() => setMobileSessionsOpen(false)}
+        />
+      )}
       {/* Sessions sidebar */}
-      <aside className="w-[280px] bg-bg-inset border-r border-border flex flex-col shrink-0">
+      <aside
+        className={`fixed md:relative inset-y-0 left-0 z-50 md:z-auto w-[84vw] max-w-[320px] md:w-[280px] md:max-w-none bg-bg-inset border-r border-border flex flex-col shrink-0 transition-transform duration-200 ${
+          mobileSessionsOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
+        }`}
+      >
         {/* Fix 3: MARTy's own identity in sessions sidebar */}
-        <div className="px-4 pt-4 pb-2 flex items-center gap-2.5">
-          <MartyEmblem size={22} />
-          <span className="text-sm text-text-primary" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
-            MARTy
-          </span>
+        <div className="px-4 pt-4 pb-2 flex items-center justify-between gap-2.5">
+          <div className="flex items-center gap-2.5">
+            <MartyEmblem size={22} />
+            <span className="text-sm text-text-primary" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
+              MARTy
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setMobileSessionsOpen(false)}
+            className="md:hidden h-9 w-9 rounded-lg flex items-center justify-center text-text-muted hover:text-text-primary hover:bg-white/[0.05]"
+            aria-label="Close sessions"
+          >
+            <XIcon size={16} />
+          </button>
         </div>
 
         <div className="px-4 pb-3">
           <button
-            onClick={() => { setActiveSessionId(null); setMessages([]); setShowSparkles(true); setTimeout(() => setShowSparkles(false), 1200); }}
+            onClick={() => { setActiveSessionId(null); setMessages([]); setMobileSessionsOpen(false); setShowSparkles(true); setTimeout(() => setShowSparkles(false), 1200); }}
             className="new-session-btn btn-secondary w-full flex items-center justify-center gap-2"
           >
             <Plus size={16} /> New Session
@@ -1303,7 +1324,7 @@ export default function GodModePage() {
                         session={s}
                         isActive={activeSessionId === s.id}
                         index={idx}
-                        onSelect={() => setActiveSessionId(s.id)}
+                        onSelect={() => { setActiveSessionId(s.id); setMobileSessionsOpen(false); }}
                         onDelete={() => handleDeleteSession(s.id)}
                         onRename={() => handleRenameSession(s.id)}
                         deleteConfirmId={deleteConfirmId}
@@ -1325,11 +1346,27 @@ export default function GodModePage() {
 
       {/* Fix 1: Chat area — relative container, never scrolls, only messages-container scrolls */}
       <main className="flex-1 flex flex-col relative overflow-hidden">
+        <div className="md:hidden h-14 px-4 border-b border-border bg-bg-root flex items-center justify-between shrink-0">
+          <button
+            type="button"
+            onClick={() => setMobileSessionsOpen(true)}
+            className="h-10 px-3 rounded-lg border border-border text-sm text-text-secondary flex items-center gap-2"
+          >
+            <List size={16} /> Sessions
+          </button>
+          <button
+            type="button"
+            onClick={() => { setActiveSessionId(null); setMessages([]); setShowSparkles(true); setTimeout(() => setShowSparkles(false), 1200); inputRef.current?.focus(); }}
+            className="h-10 px-3 rounded-lg bg-accent-magenta/15 text-accent-magenta text-sm"
+          >
+            New
+          </button>
+        </div>
         {/* Messages — the ONLY scrollable element */}
         <div
           ref={messagesRef}
           onScroll={handleMessagesScroll}
-          className="flex-1 overflow-y-auto px-8 py-6"
+          className="flex-1 overflow-y-auto px-4 md:px-8 py-4 md:py-6"
           style={{ paddingBottom: 140 }}
         >
           {isEmptyState ? (
@@ -1341,7 +1378,7 @@ export default function GodModePage() {
                 <Sparkles active={showSparkles} />
               </div>
 
-              <div className="text-[48px] text-text-primary text-center mb-2 leading-tight" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700 }}>
+              <div className="text-4xl md:text-[48px] text-text-primary text-center mb-2 leading-tight" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700 }}>
                 MARTy
               </div>
 
@@ -1349,7 +1386,7 @@ export default function GodModePage() {
                 {getGreeting()}
               </div>
 
-              <div className="grid grid-cols-3 gap-3 max-w-2xl w-full mb-10">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 max-w-2xl w-full mb-10">
                 {SUGGESTION_CARDS.map((card, i) => {
                   const CardIcon = card.icon;
                   const isWide = i === 0 || i === 3;
@@ -1358,7 +1395,7 @@ export default function GodModePage() {
                       key={card.title}
                       onClick={() => handleSuggestionClick(card)}
                       className={`suggestion-card-glass card-stagger group/card flex items-start gap-3 p-4 rounded-xl text-left ${
-                        isWide ? 'col-span-2' : 'col-span-1'
+                        isWide ? 'sm:col-span-2' : 'sm:col-span-1'
                       }`}
                       style={{ animationDelay: emptyMounted ? `${i * 100}ms` : '0ms' }}
                     >
@@ -1387,7 +1424,7 @@ export default function GodModePage() {
               {messages.map(m =>
                 m.role === 'user' ? (
                   <div key={m.id} className="flex justify-end group/msg msg-slide-in">
-                    <div className="relative max-w-[75%]">
+                    <div className="relative max-w-[92%] md:max-w-[75%]">
                       {m.attachments && m.attachments.length > 0 && (
                         <div className="flex flex-wrap gap-1.5 justify-end mb-2">
                           {m.attachments.map(a => (
@@ -1425,7 +1462,7 @@ export default function GodModePage() {
                     </div>
                   </div>
                 ) : (
-                  <div key={m.id} className="max-w-[85%] group/msg msg-slide-in-left">
+                  <div key={m.id} className="max-w-full md:max-w-[85%] group/msg msg-slide-in-left">
                     {m.toolCalls && m.toolCalls.length > 0 && (
                       <div className="mb-2">
                         {m.toolCalls.map((tc, idx) => (
@@ -1528,10 +1565,10 @@ export default function GodModePage() {
         </div>
 
         {/* Fix 1+2: Floating prompt bar — absolutely positioned, doesn't take layout space */}
-        <div className="absolute bottom-8 left-10 right-10 z-10">
+        <div className="absolute bottom-3 md:bottom-8 left-3 right-3 md:left-10 md:right-10 z-10">
           {/* Session attachment indicator — shows what MARTy currently sees */}
           {sessionUploads.length > 0 && (
-            <div className="mb-2 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 text-[11px]" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+            <div className="mb-2 flex flex-wrap md:flex-nowrap items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 text-[11px]" style={{ fontFamily: "'DM Sans', sans-serif" }}>
               <Paperclip size={12} className="text-text-muted shrink-0" />
               <span className="text-text-muted shrink-0">In this conversation:</span>
               <div className="flex flex-wrap gap-1 min-w-0 flex-1">
@@ -1550,7 +1587,7 @@ export default function GodModePage() {
                   return acc;
                 }, [])}
               </div>
-              <span className="text-text-muted shrink-0 ml-auto">
+              <span className="text-text-muted shrink-0 md:ml-auto">
                 {sessionUploads.length} of 5 — {formatBytes(bytesUsed)} / 50 MB
               </span>
             </div>

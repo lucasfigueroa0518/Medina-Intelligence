@@ -259,6 +259,35 @@ html, body {
 }
 .input-flash { animation: inputFlash 500ms ease-out; }
 
+@media (max-width: 767px) {
+  html, body {
+    overflow-x: hidden;
+  }
+
+  .card {
+    border-radius: 10px;
+  }
+
+  .btn-primary,
+  .btn-secondary,
+  .btn-ghost,
+  .btn-destructive {
+    min-height: 40px;
+  }
+
+  .fixed.bottom-6.right-6 {
+    right: 12px !important;
+    left: 12px !important;
+    bottom: calc(84px + env(safe-area-inset-bottom)) !important;
+  }
+
+  .fixed.bottom-6.left-1\/2 {
+    bottom: calc(84px + env(safe-area-inset-bottom)) !important;
+    width: calc(100vw - 24px);
+    overflow-x: auto;
+  }
+}
+
 /* Tool card slide-in */
 @keyframes toolSlideIn {
   from { opacity: 0; transform: translateX(-12px); }

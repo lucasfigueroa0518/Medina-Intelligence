@@ -286,7 +286,7 @@ export default function ContactDetailPage() {
     <div className="flex-1 overflow-auto">
       {/* ── Edit mode sticky bar ── */}
       {editMode && (
-        <div className="sticky top-0 z-30 border-b px-8 py-3 flex items-center justify-between"
+        <div className="sticky top-0 z-30 border-b px-4 md:px-8 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
           style={{ background: 'rgba(9,9,11,0.92)', backdropFilter: 'blur(16px)', borderColor: 'rgba(217,70,168,0.25)' }}>
           <div className="flex items-center gap-2 text-sm text-text-secondary">
             <span className="w-2 h-2 rounded-full bg-accent-magenta animate-pulse" />
@@ -317,7 +317,7 @@ export default function ContactDetailPage() {
       )}
 
       {/* ── IDENTITY BAR ── */}
-      <div className="px-8 py-5 border-b border-border" style={{ background: 'rgba(17,17,20,0.6)' }}>
+      <div className="px-4 md:px-8 py-5 border-b border-border" style={{ background: 'rgba(17,17,20,0.6)' }}>
         <div className="flex items-start gap-5">
           <div className="w-14 h-14 rounded-full bg-brand-gradient flex items-center justify-center text-white text-lg font-semibold shrink-0 shadow-lg shadow-accent-magenta/10">
             {(editMode ? editForm.full_name : contact.full_name).charAt(0) || '?'}
@@ -492,7 +492,7 @@ export default function ContactDetailPage() {
       </div>
 
       {/* ── TABS ── */}
-      <div className="px-8 border-b border-border flex gap-0">
+      <div className="px-4 md:px-8 border-b border-border flex gap-0 overflow-x-auto">
         {(['overview', 'timeline', 'associations', 'documents', 'deals'] as Tab[]).map(t => (
           <button key={t} onClick={() => setActiveTab(t)}
             className={`px-5 py-3 text-sm capitalize transition-colors relative ${
@@ -505,7 +505,7 @@ export default function ContactDetailPage() {
       </div>
 
       {/* ── TAB CONTENT ── */}
-      <div className="p-6 lg:p-8">
+      <div className="p-4 md:p-6 lg:p-8">
         {activeTab === 'overview' && (
           <div className="space-y-5">
             {/* Q12 — synthetic observations from LLM extraction over

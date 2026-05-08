@@ -234,7 +234,7 @@ export default function CompanyDetailPage() {
     <div className="flex-1 overflow-auto">
       {/* ── Edit mode sticky bar ── */}
       {editMode && (
-        <div className="sticky top-0 z-30 border-b px-8 py-3 flex items-center justify-between"
+        <div className="sticky top-0 z-30 border-b px-4 md:px-8 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
           style={{ background: 'rgba(9,9,11,0.92)', backdropFilter: 'blur(16px)', borderColor: 'rgba(217,70,168,0.25)' }}>
           <div className="flex items-center gap-2 text-sm text-text-secondary">
             <span className="w-2 h-2 rounded-full bg-accent-magenta animate-pulse" />
@@ -265,7 +265,7 @@ export default function CompanyDetailPage() {
       )}
 
       {/* ── IDENTITY BAR ── */}
-      <div className="px-8 py-5 border-b border-border" style={{ background: 'rgba(17,17,20,0.6)' }}>
+      <div className="px-4 md:px-8 py-5 border-b border-border" style={{ background: 'rgba(17,17,20,0.6)' }}>
         <div className="flex items-start gap-5">
           <div className="w-14 h-14 rounded-xl bg-brand-gradient flex items-center justify-center text-white text-lg font-semibold shrink-0 shadow-lg shadow-accent-magenta/10">
             {(editMode ? editForm.name : company.name).charAt(0) || '?'}
@@ -351,7 +351,7 @@ export default function CompanyDetailPage() {
         </div>
       </div>
 
-      <div className="p-8 space-y-6">
+      <div className="p-4 md:p-8 space-y-6">
         {/* Q12 — synthetic observations from LLM extraction over
             conversations the user can read. Self-contained: hides
             itself when there's nothing to show. */}

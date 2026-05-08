@@ -89,6 +89,7 @@ export default function DealsPage() {
   const [bulkBusy, setBulkBusy] = React.useState(false);
   const [bulkConfirmArchive, setBulkConfirmArchive] = React.useState(false);
   const [replayStatus, setReplayStatus] = React.useState<DealReplayStatusSnapshot | null>(null);
+  const [mobileStage, setMobileStage] = React.useState<DealStage>('prospect');
 
   function toggleSelected(id: string) {
     setSelectedIds(prev => {
@@ -377,14 +378,14 @@ export default function DealsPage() {
       <TopBar
         title="Deal Pipeline"
         actions={
-          <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center gap-2 md:gap-4">
             {totalPipeline > 0 && (
               <span
                 className="inline-flex items-center gap-2 px-4 py-1.5 rounded-xl font-accent"
                 style={{ background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.15)' }}
               >
                 <span className="text-sm text-text-muted font-semibold">Pipeline:</span>
-                <span className="text-xl font-bold text-semantic-success">{formatCurrency(totalPipeline)}</span>
+                <span className="text-base md:text-xl font-bold text-semantic-success">{formatCurrency(totalPipeline)}</span>
               </span>
             )}
             <button
@@ -432,12 +433,32 @@ export default function DealsPage() {
       )}
 
       {/* ── Pipeline board with scroll arrows ── */}
-      <div className="flex-1 relative">
+      <div className="md:hidden px-4 pt-3 pb-2 border-b border-border/60 overflow-x-auto">
+        <div className="flex gap-2 min-w-max">
+          {dealsByStage.map(stage => (
+            <button
+              key={stage.key}
+              type="button"
+              onClick={() => setMobileStage(stage.key)}
+              className={`h-9 px-3 rounded-full text-xs font-medium border transition-colors ${
+                mobileStage === stage.key
+                  ? 'border-accent-magenta/50 bg-accent-magenta/15 text-text-primary'
+                  : 'border-border text-text-secondary bg-white/[0.02]'
+              }`}
+            >
+              {stage.label}
+              <span className="ml-1 text-text-muted">{stage.deals.length}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex-1 relative min-h-0">
         {/* Left scroll arrow */}
         {canScrollLeft && (
           <button
             onClick={() => scrollBy('left')}
-            className="absolute left-1 top-1/2 -translate-y-1/2 z-10 w-8 h-8 rounded-full
+            className="hidden md:flex absolute left-1 top-1/2 -translate-y-1/2 z-10 w-8 h-8 rounded-full
               flex items-center justify-center
               bg-bg-elevated/80 backdrop-blur-sm border border-border/50
               text-text-muted hover:text-text-primary hover:bg-bg-elevated
@@ -451,7 +472,7 @@ export default function DealsPage() {
         {canScrollRight && (
           <button
             onClick={() => scrollBy('right')}
-            className="absolute right-1 top-1/2 -translate-y-1/2 z-10 w-8 h-8 rounded-full
+            className="hidden md:flex absolute right-1 top-1/2 -translate-y-1/2 z-10 w-8 h-8 rounded-full
               flex items-center justify-center
               bg-bg-elevated/80 backdrop-blur-sm border border-border/50
               text-text-muted hover:text-text-primary hover:bg-bg-elevated
@@ -463,12 +484,12 @@ export default function DealsPage() {
 
         <div
           ref={scrollRef}
-          className="h-full p-6 overflow-x-auto deals-scroll"
+          className="h-full p-4 md:p-6 overflow-x-auto deals-scroll"
         >
           {loading ? (
             <div className="text-text-secondary">Loading pipeline...</div>
           ) : (
-            <div className="flex gap-4 h-full min-w-max">
+            <div className="flex gap-4 h-full md:min-w-max">
               {dealsByStage.map((stage) => {
                 const isClosed = stage.key === 'closed_won' || stage.key === 'closed_lost';
                 const isDropTarget = dragOverStage === stage.key;
@@ -484,9 +505,9 @@ export default function DealsPage() {
                 return (
                   <div
                     key={stage.key}
-                    className={`w-72 flex-shrink-0 rounded-xl p-3 transition-all duration-150 ${
+                    className={`w-full md:w-72 md:flex-shrink-0 rounded-xl p-3 transition-all duration-150 ${
                       isClosed ? 'border-l-4' : ''
-                    } ${isDropTarget ? 'ring-2 ring-accent-magenta/40' : ''}`}
+                    } ${isDropTarget ? 'ring-2 ring-accent-magenta/40' : ''} ${mobileStage === stage.key ? 'block' : 'hidden md:block'}`}
                     style={{
                       background: isDropTarget ? 'rgba(217,70,168,0.06)' : 'rgba(17,17,20,0.4)',
                       borderColor: isClosed ? stage.color + '30' : undefined,
@@ -1051,7 +1072,7 @@ function DealReplayBanner({ status }: { status: DealReplayStatusSnapshot | null 
     : 0;
 
   return (
-    <div className="mx-6 mt-4 rounded-xl border border-accent-magenta/20 bg-accent-magenta/[0.06] px-4 py-3">
+    <div className="mx-4 md:mx-6 mt-4 rounded-xl border border-accent-magenta/20 bg-accent-magenta/[0.06] px-4 py-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="text-sm font-medium text-text-primary">Deal rebuild running</div>

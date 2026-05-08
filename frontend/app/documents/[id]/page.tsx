@@ -125,7 +125,7 @@ export default function DocumentDetailPage() {
 
   if (loading) {
     return (
-      <div className="max-w-4xl mx-auto p-8 text-text-muted text-sm flex items-center gap-2">
+      <div className="max-w-4xl mx-auto p-4 md:p-8 text-text-muted text-sm flex items-center gap-2">
         <Loader2 size={14} className="animate-spin" /> Loading…
       </div>
     );
@@ -133,7 +133,7 @@ export default function DocumentDetailPage() {
 
   if (error) {
     return (
-      <div className="max-w-4xl mx-auto p-8">
+      <div className="max-w-4xl mx-auto p-4 md:p-8">
         <div className="flex items-center gap-2 text-semantic-error text-sm">
           <AlertCircle size={16} /> {error}
         </div>
@@ -148,7 +148,7 @@ export default function DocumentDetailPage() {
   const sourceLabel = doc.source ? doc.source.replace(/_/g, ' ') : null;
 
   return (
-    <div className="max-w-4xl mx-auto p-8">
+    <div className="max-w-4xl mx-auto p-4 md:p-8">
       <header className="flex items-start gap-3 mb-6">
         <div className="w-10 h-10 rounded-lg bg-purple-500/15 flex items-center justify-center shrink-0">
           <FileText size={20} className="text-purple-300" />

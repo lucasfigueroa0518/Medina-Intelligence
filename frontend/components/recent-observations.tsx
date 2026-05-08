@@ -152,13 +152,13 @@ export function RecentObservations({
         {observations.map(o => (
           <div
             key={o.id}
-            className="grid grid-cols-[110px_1fr_72px_28px] gap-x-2 items-start px-4 py-2"
+            className="grid grid-cols-[1fr_28px] md:grid-cols-[110px_1fr_72px_28px] gap-2 md:gap-x-2 items-start px-4 py-3 md:py-2"
             style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}
           >
             <span className="text-[10px] font-semibold text-purple-400/80 uppercase tracking-wider truncate">
               {labelFor(o.observation_type)}
             </span>
-            <div className="text-xs text-text-secondary">
+            <div className="text-xs text-text-secondary col-span-2 md:col-span-1 md:col-start-2">
               {renderValue(o.observation_value)}
               {o.evidence && (
                 <div className="text-[10px] text-text-muted/60 italic mt-0.5 line-clamp-2">
@@ -167,7 +167,7 @@ export function RecentObservations({
               )}
             </div>
             <div
-              className="text-[10px] text-text-muted/70 text-right tabular-nums"
+              className="text-[10px] text-text-muted/70 text-left md:text-right tabular-nums col-span-2 md:col-span-1"
               title={`First: ${o.first_observed_at}\nLast: ${o.last_observed_at}\nChannels: ${o.channels.join(', ')}`}
             >
               <div>{timeAgo(o.last_observed_at)}</div>
@@ -177,7 +177,7 @@ export function RecentObservations({
             </div>
             <button
               onClick={() => dismiss(o.id)}
-              className="w-5 h-5 rounded flex items-center justify-center hover:bg-red-500/20 transition-colors text-text-muted/70 hover:text-text-secondary"
+              className="w-7 h-7 md:w-5 md:h-5 rounded flex items-center justify-center hover:bg-red-500/20 transition-colors text-text-muted/70 hover:text-text-secondary row-start-1 col-start-2 md:row-auto md:col-auto justify-self-end"
               title="Dismiss this observation (re-sightings will re-surface it)"
               style={{ background: 'rgba(255,255,255,0.02)' }}
             >

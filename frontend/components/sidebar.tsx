@@ -87,7 +87,7 @@ export function Sidebar() {
   const roleLabel = me?.role === 'super_admin' ? 'Super Admin' : me?.role || '';
 
   return (
-    <aside className="w-[240px] bg-bg-inset border-r border-border flex-shrink-0 flex flex-col">
+    <aside className="hidden md:flex w-[240px] bg-bg-inset border-r border-border flex-shrink-0 flex-col">
       {/* Logo */}
       <div className="p-6 border-b border-border">
         <div className="flex items-center gap-2.5">
