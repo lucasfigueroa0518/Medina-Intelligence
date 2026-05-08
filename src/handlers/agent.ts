@@ -115,7 +115,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'create_document_artifact',
-    description: 'Create a new editable document artifact from structured content and save it to Documents. Supports docx, xlsx, pptx, and pdf. Use when the user asks MARTy to prepare, draft, build, create, generate, or export a memo/model/deck/summary/file.',
+    description: 'Create a polished, fully usable editable document artifact and save it to Documents. Supports docx, xlsx, pptx, and pdf. Use when the user asks MARTy to prepare, draft, build, create, generate, or export a memo/model/deck/summary/file. Never create title-only or skeletal files.',
     input_schema: {
       type: 'object',
       properties: {
@@ -123,7 +123,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         title: { type: 'string', description: 'Human-readable document title.' },
         structured_content: {
           type: 'object',
-          description: 'Structured content. docx/pdf: paragraphs, bullets, sections. xlsx: sheets with rows. pptx: slides with title and bullets.',
+          description: 'Complete structured content. docx/pdf: subtitle, summary, metadata, sections with paragraphs, bullets, numbered lists, checklists, and tables. xlsx: multiple sheets with headers, rows, and formulas where natural. pptx: 6-10 slides with cover, subtitles/body, bullets, and tables where useful.',
         },
         source_document_ids: {
           type: 'array',

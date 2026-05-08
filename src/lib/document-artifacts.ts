@@ -506,27 +506,238 @@ function asArray(value: any): any[] {
   return Array.isArray(value) ? value : [];
 }
 
+function cleanArtifactText(value: any): string {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/\s+/g, ' ').trim();
+}
+
+function normalizeStructuredArtifactContent(content: any): any {
+  if (typeof content === 'string') {
+    return {
+      summary: content,
+      sections: [{ heading: 'Draft', paragraphs: [content] }],
+    };
+  }
+  if (!content || typeof content !== 'object') return {};
+  return content;
+}
+
+function firstNonEmpty(...values: any[]): string {
+  for (const value of values) {
+    const text = cleanArtifactText(value);
+    if (text) return text;
+  }
+  return '';
+}
+
+function tableFromAny(value: any): { title?: string; headers: string[]; rows: any[][] } | null {
+  if (!value) return null;
+  if (Array.isArray(value)) {
+    const rows = value.filter(Array.isArray);
+    if (rows.length === 0) return null;
+    return { headers: rows[0].map(cleanArtifactText), rows: rows.slice(1) };
+  }
+  const headers = asArray(value.headers || value.columns).map(cleanArtifactText).filter(Boolean);
+  const rawRows = asArray(value.rows);
+  if (headers.length === 0 && rawRows.length === 0) return null;
+  const rows = rawRows.map(row => {
+    if (Array.isArray(row)) return row;
+    if (row && typeof row === 'object') {
+      const keys = headers.length > 0 ? headers : Object.keys(row);
+      return keys.map(k => row[k]);
+    }
+    return [row];
+  });
+  return {
+    title: cleanArtifactText(value.title || value.caption) || undefined,
+    headers: headers.length > 0 ? headers : rows[0]?.map((_, i) => `Column ${i + 1}`) || [],
+    rows,
+  };
+}
+
+function tablesFrom(value: any): Array<{ title?: string; headers: string[]; rows: any[][] }> {
+  return asArray(value).map(tableFromAny).filter((t): t is { title?: string; headers: string[]; rows: any[][] } => Boolean(t));
+}
+
 function plainTextFromStructured(content: any): string {
   if (typeof content === 'string') return content;
   if (!content || typeof content !== 'object') return '';
   const parts: string[] = [];
   if (content.title) parts.push(String(content.title));
+  if (content.subtitle) parts.push(String(content.subtitle));
+  if (content.summary) parts.push(String(content.summary));
+  for (const m of asArray(content.metadata)) {
+    if (m?.label || m?.key || m?.value) parts.push(`${m.label || m.key || 'Field'}: ${m.value || ''}`);
+  }
   for (const p of asArray(content.paragraphs)) parts.push(String(p));
   for (const b of asArray(content.bullets)) parts.push(`- ${String(b)}`);
+  for (const b of asArray(content.key_points)) parts.push(`- ${String(b)}`);
+  for (const b of asArray(content.recommendations)) parts.push(`- ${String(b)}`);
+  for (const table of tablesFrom(content.tables)) {
+    if (table.title) parts.push(table.title);
+    if (table.headers.length > 0) parts.push(table.headers.join(' | '));
+    for (const row of table.rows) parts.push(row.map(cleanArtifactText).join(' | '));
+  }
   for (const s of asArray(content.sections)) {
     if (s?.heading) parts.push(String(s.heading));
+    if (s?.summary) parts.push(String(s.summary));
     for (const p of asArray(s?.paragraphs)) parts.push(String(p));
     for (const b of asArray(s?.bullets)) parts.push(`- ${String(b)}`);
+    for (const b of asArray(s?.numbered)) parts.push(String(b));
+    for (const b of asArray(s?.checklist)) parts.push(`[ ] ${String(b)}`);
+    for (const table of tablesFrom(s?.tables || s?.table)) {
+      if (table.title) parts.push(table.title);
+      if (table.headers.length > 0) parts.push(table.headers.join(' | '));
+      for (const row of table.rows) parts.push(row.map(cleanArtifactText).join(' | '));
+    }
   }
   for (const slide of asArray(content.slides)) {
     if (slide?.title) parts.push(String(slide.title));
+    if (slide?.subtitle) parts.push(String(slide.subtitle));
+    if (slide?.body) parts.push(String(slide.body));
     for (const b of asArray(slide?.bullets)) parts.push(`- ${String(b)}`);
   }
   for (const sheet of asArray(content.sheets)) {
     if (sheet?.name) parts.push(`Sheet: ${sheet.name}`);
+    if (sheet?.title) parts.push(String(sheet.title));
     for (const row of asArray(sheet?.rows)) parts.push(Array.isArray(row) ? row.join(', ') : JSON.stringify(row));
   }
   return parts.join('\n');
+}
+
+function countSheetRows(content: any): number {
+  return asArray(content?.sheets).reduce((sum, sheet) => sum + asArray(sheet?.rows).length, 0)
+    + asArray(content?.rows).length;
+}
+
+function isThinArtifactContent(kind: ArtifactKind, content: any): boolean {
+  const text = plainTextFromStructured(content).trim();
+  if (kind === 'pptx') return asArray(content?.slides).length < 4 || text.length < 500;
+  if (kind === 'xlsx') return countSheetRows(content) < 6;
+  return text.length < 700 || (asArray(content?.sections).length + asArray(content?.paragraphs).length) < 4;
+}
+
+function defaultArtifactContent(kind: ArtifactKind, title: string, seed: any): any {
+  const seedText = plainTextFromStructured(seed).trim();
+  const summary = seedText || `This artifact was prepared by MARTy as a polished working document for ${title}. It is structured for quick review, clear next steps, and easy editing.`;
+  if (kind === 'xlsx') {
+    return {
+      sheets: [
+        {
+          name: 'Summary',
+          rows: [
+            ['Section', 'Detail', 'Owner', 'Status'],
+            ['Purpose', title, 'MARTy', 'Draft'],
+            ['Summary', summary.slice(0, 800), 'MARTy', 'Draft'],
+            ['Next step', 'Review, refine owners, and add dates where needed.', '', 'Open'],
+          ],
+        },
+        {
+          name: 'Workplan',
+          rows: [
+            ['Workstream', 'Priority', 'Action', 'Success measure', 'Due date'],
+            ['Strategy', 'High', 'Clarify the highest-impact recommendation.', 'Decision-ready memo or deck', ''],
+            ['Execution', 'High', 'Turn recommendations into assigned next steps.', 'Named owner for each step', ''],
+            ['Follow-up', 'Medium', 'Capture open questions and evidence gaps.', 'Clean issue list', ''],
+          ],
+        },
+      ],
+    };
+  }
+  if (kind === 'pptx') {
+    return {
+      subtitle: 'Prepared by MARTy',
+      slides: [
+        { title, subtitle: 'Prepared by MARTy' },
+        { title: 'Executive Takeaway', bullets: [summary.slice(0, 220), 'Use this as a working draft and tighten details with source-specific inputs.'] },
+        { title: 'Recommended Workstreams', bullets: ['Define the highest-impact objective', 'Map ownership and sequencing', 'Identify data or source gaps', 'Prepare a concise follow-up package'] },
+        { title: 'Execution Plan', bullets: ['Prioritize the first 7 days of work', 'Assign owners', 'Create checkpoints', 'Track outputs in a single place'] },
+        { title: 'Risks And Watchouts', bullets: ['Avoid vague ownership', 'Do not overbuild before stakeholder review', 'Flag uncertain facts before distribution'] },
+        { title: 'Next Steps', bullets: ['Review this draft', 'Add company-specific detail', 'Confirm owners and dates', 'Send the final version'] },
+      ],
+    };
+  }
+  return {
+    subtitle: 'Prepared by MARTy',
+    summary,
+    sections: [
+      { heading: 'Executive Summary', paragraphs: [summary] },
+      {
+        heading: 'Recommended Workstreams',
+        bullets: [
+          'Clarify the highest-impact objective and the audience for the artifact.',
+          'Translate the objective into concrete workstreams with clear owners.',
+          'Preserve evidence, open questions, and decisions in one working file.',
+        ],
+      },
+      {
+        heading: 'Execution Plan',
+        tables: [{
+          headers: ['Workstream', 'Action', 'Owner', 'Success Measure'],
+          rows: [
+            ['Strategy', 'Define the decision or output the document should support.', '', 'Reviewer can act without asking for context.'],
+            ['Execution', 'Turn recommendations into a concrete sequence.', '', 'Next steps have owners and timing.'],
+            ['Quality Control', 'Confirm facts, dates, and source-sensitive claims.', '', 'No unsupported claims remain.'],
+          ],
+        }],
+      },
+      {
+        heading: 'Risks And Watchouts',
+        bullets: [
+          'Avoid generic recommendations that do not connect to a business outcome.',
+          'Separate confirmed facts from working assumptions.',
+          'Keep the final document short enough to be used, not just admired.',
+        ],
+      },
+      {
+        heading: 'Next Steps',
+        checklist: ['Review the draft', 'Add missing owners or dates', 'Confirm source-sensitive facts', 'Finalize and circulate'],
+      },
+    ],
+  };
+}
+
+async function enrichArtifactContent(
+  kind: ArtifactKind,
+  title: string,
+  content: any,
+  ctx: AuthContext,
+  env: Env,
+  sourceDocs: DocumentRow[]
+): Promise<any> {
+  if (!isThinArtifactContent(kind, content)) return content;
+  const sourceContext = sourceDocs
+    .map(d => `- ${d.title || d.file_name || d.id}: ${d.extracted_text_preview || ''}`.slice(0, 1200))
+    .join('\n');
+  const system = `You are MARTy's production artifact engine. Return strict JSON only, no markdown.
+Your job is to turn a weak draft into a fully usable, polished business artifact.
+
+Quality bar:
+- No title-only or placeholder artifacts.
+- Use concrete headings, useful body copy, and skimmable structure.
+- Preserve any facts supplied by the draft or source context. Do not invent external facts.
+- If source facts are limited, create a high-quality editable template with clear placeholders and next-step fields instead of a blank file.
+
+Schemas:
+- docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]}
+- pptx: {"subtitle":"","slides":[{"title":"","subtitle":"","body":"","bullets":[],"table":{"headers":[],"rows":[[]]}}]}
+- xlsx: {"sheets":[{"name":"","title":"","rows":[[]]}]}
+
+Minimum richness:
+- docx/pdf: 5-8 sections, include at least one table or checklist when useful.
+- pptx: 6-10 slides, one idea per slide, no walls of text.
+- xlsx: 2-4 sheets with headers, usable rows, and formulas where natural.`;
+  const user = `Artifact kind: ${kind}
+Title: ${title}
+
+Current draft JSON:
+${JSON.stringify(content || {}, null, 2).slice(0, 18000)}
+
+Source document context:
+${sourceContext || '(none)'}`;
+  const raw = await callClaude({ system, user, max_tokens: 7000, orgId: ctx.orgId }, 'low', env).catch(() => '');
+  const parsed = parseJsonObject(raw);
+  return parsed || defaultArtifactContent(kind, title, content);
 }
 
 function fileTitle(title: string, kind: ArtifactKind): string {
@@ -534,52 +745,207 @@ function fileTitle(title: string, kind: ArtifactKind): string {
   return clean.toLowerCase().endsWith(`.${kind}`) ? clean : `${clean}.${kind}`;
 }
 
+function paragraphRuns(text: string, docx: any, opts: { bold?: boolean; color?: string; size?: number } = {}): any[] {
+  return [new docx.TextRun({
+    text: cleanArtifactText(text),
+    bold: opts.bold,
+    color: opts.color || '111827',
+    size: opts.size,
+  })];
+}
+
+function makeDocxParagraph(docx: any, text: string, opts: { style?: string; bullet?: boolean; numbered?: boolean; bold?: boolean } = {}): any {
+  return new docx.Paragraph({
+    style: opts.style || 'Body',
+    children: paragraphRuns(text, docx, { bold: opts.bold }),
+    bullet: opts.bullet ? { level: 0 } : undefined,
+    numbering: opts.numbered ? { reference: 'marty-numbering', level: 0 } : undefined,
+    spacing: { after: opts.style === 'Heading1' ? 120 : 170, line: 276 },
+  });
+}
+
+function makeDocxTable(docx: any, table: { title?: string; headers: string[]; rows: any[][] }): any[] {
+  const headers = table.headers.length > 0 ? table.headers : table.rows[0]?.map((_, i) => `Column ${i + 1}`) || [];
+  const rows = table.headers.length > 0 ? table.rows : table.rows.slice(1);
+  if (headers.length === 0) return [];
+  const cells = (values: any[], isHeader = false) => values.map(value => new docx.TableCell({
+    shading: isHeader ? { fill: 'F3E8FF' } : undefined,
+    margins: { top: 120, bottom: 120, left: 140, right: 140 },
+    children: [new docx.Paragraph({
+      children: [new docx.TextRun({
+        text: cleanArtifactText(value) || ' ',
+        bold: isHeader,
+        color: isHeader ? '581C87' : '111827',
+        size: 19,
+      })],
+      spacing: { after: 0, line: 240 },
+    })],
+  }));
+  const out: any[] = [];
+  if (table.title) out.push(makeDocxParagraph(docx, table.title, { style: 'Caption', bold: true }));
+  out.push(new docx.Table({
+    width: { size: 100, type: docx.WidthType.PERCENTAGE },
+    rows: [
+      new docx.TableRow({ tableHeader: true, children: cells(headers, true) }),
+      ...rows.map(row => new docx.TableRow({ children: cells(row, false) })),
+    ],
+  }));
+  out.push(new docx.Paragraph({ text: '', spacing: { after: 120 } }));
+  return out;
+}
+
 async function makeDocx(title: string, content: any): Promise<Uint8Array> {
   const mod = await import('docx');
   const docx: any = mod;
-  const children: any[] = [
-    new docx.Paragraph({ text: title, heading: docx.HeadingLevel.TITLE }),
-  ];
-  const addParagraph = (text: string) => children.push(new docx.Paragraph({ children: [new docx.TextRun(String(text))] }));
-  const addBullet = (text: string) => children.push(new docx.Paragraph({ text: String(text), bullet: { level: 0 } }));
+  const children: any[] = [];
+  children.push(new docx.Paragraph({
+    style: 'Title',
+    children: [new docx.TextRun({ text: title, bold: true, color: '111827', size: 38 })],
+    spacing: { after: 160 },
+  }));
+  const subtitle = firstNonEmpty(content?.subtitle, 'Prepared by MARTy');
+  if (subtitle) children.push(makeDocxParagraph(docx, subtitle, { style: 'Subtitle' }));
+  for (const m of asArray(content?.metadata)) {
+    const label = firstNonEmpty(m?.label, m?.key);
+    const value = cleanArtifactText(m?.value);
+    if (label || value) children.push(makeDocxParagraph(docx, `${label}: ${value}`, { style: 'Meta' }));
+  }
+  if (content?.summary) {
+    children.push(new docx.Paragraph({
+      style: 'Callout',
+      children: paragraphRuns(String(content.summary), docx, { bold: true, color: '581C87' }),
+      spacing: { before: 120, after: 220, line: 276 },
+      border: { left: { color: 'C026D3', size: 18, style: docx.BorderStyle.SINGLE } },
+      indent: { left: 220 },
+    }));
+  }
+
+  const addParagraph = (text: string) => cleanArtifactText(text) && children.push(makeDocxParagraph(docx, text));
+  const addBullet = (text: string) => cleanArtifactText(text) && children.push(makeDocxParagraph(docx, text, { bullet: true }));
+  const addNumbered = (text: string) => cleanArtifactText(text) && children.push(makeDocxParagraph(docx, text, { numbered: true }));
 
   if (typeof content === 'string') {
     content.split(/\n{2,}/).map(s => s.trim()).filter(Boolean).forEach(addParagraph);
   } else {
     for (const p of asArray(content?.paragraphs)) addParagraph(String(p));
-    for (const b of asArray(content?.bullets)) addBullet(String(b));
+    for (const b of asArray(content?.bullets || content?.key_points)) addBullet(String(b));
+    for (const table of tablesFrom(content?.tables)) children.push(...makeDocxTable(docx, table));
     for (const section of asArray(content?.sections)) {
-      if (section?.heading) children.push(new docx.Paragraph({ text: String(section.heading), heading: docx.HeadingLevel.HEADING_1 }));
+      if (section?.heading) children.push(makeDocxParagraph(docx, String(section.heading), { style: 'Heading1', bold: true }));
+      if (section?.summary) children.push(makeDocxParagraph(docx, String(section.summary), { style: 'Lead' }));
       for (const p of asArray(section?.paragraphs)) addParagraph(String(p));
       for (const b of asArray(section?.bullets)) addBullet(String(b));
+      for (const n of asArray(section?.numbered)) addNumbered(String(n));
+      for (const c of asArray(section?.checklist)) addBullet(`[ ] ${String(c)}`);
+      for (const table of tablesFrom(section?.tables || section?.table)) children.push(...makeDocxTable(docx, table));
     }
   }
 
-  const document = new docx.Document({ sections: [{ children }] });
+  const document = new docx.Document({
+    creator: 'MARTy',
+    title,
+    numbering: {
+      config: [{
+        reference: 'marty-numbering',
+        levels: [{ level: 0, format: 'decimal', text: '%1.', alignment: 'left', style: { paragraph: { indent: { left: 420, hanging: 220 } } } }],
+      }],
+    },
+    styles: {
+      paragraphStyles: [
+        { id: 'Title', name: 'Title', basedOn: 'Normal', run: { font: 'Aptos Display', size: 38, bold: true, color: '111827' }, paragraph: { spacing: { after: 140 } } },
+        { id: 'Subtitle', name: 'Subtitle', basedOn: 'Normal', run: { font: 'Aptos', size: 22, color: '6B7280' }, paragraph: { spacing: { after: 260 } } },
+        { id: 'Meta', name: 'Meta', basedOn: 'Normal', run: { font: 'Aptos', size: 18, color: '6B7280' }, paragraph: { spacing: { after: 80 } } },
+        { id: 'Heading1', name: 'Heading 1', basedOn: 'Normal', next: 'Body', run: { font: 'Aptos Display', size: 27, bold: true, color: '111827' }, paragraph: { spacing: { before: 260, after: 100 }, keepNext: true } },
+        { id: 'Lead', name: 'Lead', basedOn: 'Normal', run: { font: 'Aptos', size: 22, color: '374151' }, paragraph: { spacing: { after: 170, line: 288 } } },
+        { id: 'Body', name: 'Body', basedOn: 'Normal', run: { font: 'Aptos', size: 21, color: '111827' }, paragraph: { spacing: { after: 170, line: 276 } } },
+        { id: 'Caption', name: 'Caption', basedOn: 'Normal', run: { font: 'Aptos', size: 18, color: '6B7280' }, paragraph: { spacing: { before: 80, after: 80 } } },
+        { id: 'Callout', name: 'Callout', basedOn: 'Normal', run: { font: 'Aptos', size: 21, color: '581C87' }, paragraph: { spacing: { after: 190, line: 276 } } },
+      ],
+    },
+    sections: [{
+      properties: { page: { margin: { top: 900, right: 900, bottom: 900, left: 900 } } },
+      children,
+    }],
+  });
   const buffer = await docx.Packer.toBuffer(document);
   return new Uint8Array(buffer);
+}
+
+function normalizeCellForXlsx(cell: any): any {
+  if (cell && typeof cell === 'object' && !Array.isArray(cell)) {
+    if (cell.formula || cell.f) {
+      return { f: String(cell.formula || cell.f).replace(/^=/, ''), v: cell.value ?? cell.v ?? undefined };
+    }
+    if ('value' in cell) return cell.value;
+  }
+  return cell;
+}
+
+function rowsFromSheet(sheet: any): any[][] {
+  return asArray(sheet?.rows).map(row => {
+    if (Array.isArray(row)) return row.map(normalizeCellForXlsx);
+    if (row && typeof row === 'object') return Object.values(row).map(normalizeCellForXlsx);
+    return [row];
+  });
 }
 
 async function makeXlsx(title: string, content: any): Promise<Uint8Array> {
   const XLSX = await import('xlsx');
   const wb = XLSX.utils.book_new();
+  wb.Props = { Title: title, Author: 'MARTy', Company: 'Medina Ventures' };
   const sheets = asArray(content?.sheets);
   if (sheets.length > 0) {
     for (const sheet of sheets) {
-      const rows = asArray(sheet?.rows);
-      const aoa = rows.map(row => Array.isArray(row) ? row : Object.values(row || {}));
-      const ws = XLSX.utils.aoa_to_sheet(aoa.length > 0 ? aoa : [[title]]);
+      const rows = rowsFromSheet(sheet);
+      const aoa = rows.length > 0 ? rows : [[sheet?.title || title], ['No rows provided']];
+      if (sheet?.title && cleanArtifactText(aoa[0]?.[0]) !== cleanArtifactText(sheet.title)) aoa.unshift([sheet.title]);
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      const maxCols = Math.max(...aoa.map(row => row.length), 1);
+      ws['!cols'] = Array.from({ length: maxCols }, (_, i) => {
+        const max = Math.max(...aoa.map(row => cleanArtifactText(row[i]).length), i === 0 ? 18 : 10);
+        return { wch: Math.min(Math.max(max + 2, i === 0 ? 18 : 12), 48) };
+      });
+      if (ws['!ref'] && aoa.length > 1) {
+        const range = XLSX.utils.decode_range(ws['!ref']);
+        ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: sheet?.title ? 1 : 0, c: 0 }, e: range.e }) };
+      }
+      (ws as any)['!freeze'] = { xSplit: 0, ySplit: sheet?.title ? 2 : 1 };
       XLSX.utils.book_append_sheet(wb, ws, String(sheet?.name || 'Sheet').slice(0, 31));
     }
   } else {
     const rows = asArray(content?.rows);
     const aoa = rows.length > 0
-      ? rows.map(row => Array.isArray(row) ? row : Object.values(row || {}))
+      ? rows.map(row => Array.isArray(row) ? row.map(normalizeCellForXlsx) : Object.values(row || {}).map(normalizeCellForXlsx))
       : [['Title', title], ['Content', plainTextFromStructured(content)]];
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), 'Sheet1');
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{ wch: 24 }, { wch: 70 }];
+    XLSX.utils.book_append_sheet(wb, ws, 'Summary');
   }
   const out = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
   return new Uint8Array(out);
+}
+
+function slidesFromContent(title: string, content: any): any[] {
+  const explicit = asArray(content?.slides);
+  if (explicit.length > 0) return explicit;
+  const slides: any[] = [{ title, subtitle: content?.subtitle || 'Prepared by MARTy' }];
+  if (content?.summary) slides.push({ title: 'Executive Takeaway', body: content.summary });
+  for (const section of asArray(content?.sections)) {
+    slides.push({
+      title: section?.heading || 'Section',
+      body: section?.summary || asArray(section?.paragraphs)[0] || '',
+      bullets: [...asArray(section?.bullets), ...asArray(section?.numbered), ...asArray(section?.checklist)].slice(0, 6),
+      table: tableFromAny(section?.table || asArray(section?.tables)[0]),
+    });
+  }
+  if (slides.length < 4) {
+    slides.push(
+      { title: 'Recommended Workstreams', bullets: ['Clarify the objective', 'Assign owners', 'Identify evidence gaps', 'Create a review cadence'] },
+      { title: 'Risks And Watchouts', bullets: ['Separate facts from assumptions', 'Avoid vague ownership', 'Keep the output decision-ready'] },
+      { title: 'Next Steps', bullets: ['Review the draft', 'Confirm dates and owners', 'Finalize and circulate'] },
+    );
+  }
+  return slides.slice(0, 12);
 }
 
 async function makePptx(title: string, content: any): Promise<Uint8Array> {
@@ -590,36 +956,62 @@ async function makePptx(title: string, content: any): Promise<Uint8Array> {
   pptx.author = 'MARTy';
   pptx.subject = title;
   pptx.title = title;
-  const slides = asArray(content?.slides);
-  const normalizedSlides = slides.length > 0
-    ? slides
-    : [{ title, bullets: plainTextFromStructured(content).split('\n').filter(Boolean).slice(0, 8) }];
-  for (const s of normalizedSlides) {
+  pptx.company = 'Medina Ventures';
+  pptx.theme = { headFontFace: 'Aptos Display', bodyFontFace: 'Aptos', lang: 'en-US' };
+  const normalizedSlides = slidesFromContent(title, content);
+  normalizedSlides.forEach((s, idx) => {
     const slide = pptx.addSlide();
-    slide.background = { color: '111114' };
-    slide.addText(String(s?.title || title), { x: 0.6, y: 0.45, w: 12, h: 0.5, fontSize: 26, bold: true, color: 'FFFFFF' });
+    slide.background = { color: idx === 0 ? '0B0B10' : '111114' };
+    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 0.13, h: 7.5, fill: { color: 'C026D3' }, line: { color: 'C026D3' } });
+    slide.addText(String(s?.title || title), { x: 0.55, y: idx === 0 ? 2.25 : 0.42, w: 11.8, h: idx === 0 ? 0.85 : 0.5, fontSize: idx === 0 ? 34 : 25, bold: true, color: 'FFFFFF', margin: 0.02, fit: 'shrink' });
+    if (s?.subtitle) slide.addText(String(s.subtitle), { x: 0.58, y: idx === 0 ? 3.12 : 0.98, w: 10.8, h: 0.35, fontSize: idx === 0 ? 16 : 11, color: 'A1A1AA', margin: 0.02, fit: 'shrink' });
+    if (idx === 0) {
+      slide.addText('Prepared by MARTy', { x: 0.58, y: 6.65, w: 3.8, h: 0.3, fontSize: 10, color: 'A1A1AA', margin: 0.02 });
+      return;
+    }
     const bullets = asArray(s?.bullets).map(String);
-    const body = bullets.length > 0 ? bullets.map(b => `• ${b}`).join('\n') : String(s?.body || '');
-    slide.addText(body || ' ', { x: 0.8, y: 1.35, w: 11.8, h: 5.6, fontSize: 16, color: 'D4D4D8', breakLine: false, fit: 'shrink' });
-  }
+    if (s?.body) slide.addText(String(s.body), { x: 0.62, y: 1.38, w: 5.8, h: bullets.length > 0 ? 1.05 : 4.85, fontSize: 15, color: 'E5E7EB', margin: 0.04, breakLine: false, fit: 'shrink' });
+    if (bullets.length > 0) {
+      slide.addText(bullets.join('\n'), {
+        x: 0.76,
+        y: s?.body ? 2.55 : 1.42,
+        w: 5.75,
+        h: 4.25,
+        fontSize: 15,
+        color: 'D4D4D8',
+        bullet: { type: 'bullet' },
+        breakLine: false,
+        fit: 'shrink',
+        paraSpaceAfterPt: 8,
+      });
+    }
+    const table = tableFromAny(s?.table);
+    if (table && table.headers.length > 0) {
+      const pptRows = [table.headers, ...table.rows.slice(0, 6)].map(row => row.map(cleanArtifactText));
+      slide.addTable(pptRows, {
+        x: 6.9,
+        y: 1.35,
+        w: 5.75,
+        h: 4.65,
+        fontSize: 9.5,
+        color: 'F4F4F5',
+        border: { type: 'solid', color: '3F3F46', pt: 0.5 },
+        fill: { color: '18181B' },
+        margin: 0.08,
+      });
+    } else {
+      slide.addShape(pptx.ShapeType.rect, { x: 7.0, y: 1.4, w: 5.3, h: 4.55, fill: { color: '18181B' }, line: { color: '27272A' } });
+      const pull = firstNonEmpty(s?.callout, asArray(s?.bullets)[0], s?.body, 'Review this slide and refine with source-specific detail.');
+      slide.addText(pull, { x: 7.35, y: 1.82, w: 4.65, h: 3.55, fontSize: 20, bold: true, color: 'F4F4F5', margin: 0.03, fit: 'shrink' });
+    }
+    slide.addText(`${idx + 1}/${normalizedSlides.length}`, { x: 11.9, y: 6.9, w: 0.7, h: 0.2, fontSize: 8.5, color: '71717A', align: 'right' });
+  });
   const out = await pptx.write({ outputType: 'arraybuffer' });
   return new Uint8Array(out as ArrayBuffer);
 }
 
-function wrapText(text: string, maxChars: number): string[] {
-  const words = text.split(/\s+/);
-  const lines: string[] = [];
-  let line = '';
-  for (const word of words) {
-    if ((line + ' ' + word).trim().length > maxChars) {
-      if (line) lines.push(line);
-      line = word;
-    } else {
-      line = (line + ' ' + word).trim();
-    }
-  }
-  if (line) lines.push(line);
-  return lines;
+function pdfSafeText(value: any): string {
+  return cleanArtifactText(value).replace(/[^\x20-\x7E]/g, '-');
 }
 
 async function makePdf(title: string, content: any): Promise<Uint8Array> {
@@ -628,22 +1020,116 @@ async function makePdf(title: string, content: any): Promise<Uint8Array> {
   const font = await pdf.embedFont(StandardFonts.Helvetica);
   const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
   let page = pdf.addPage([612, 792]);
-  let y = 736;
+  let y = 724;
   const margin = 54;
-  const addLine = (text: string, size = 11, isBold = false) => {
-    if (y < 64) {
-      page = pdf.addPage([612, 792]);
-      y = 736;
+  const contentWidth = 612 - margin * 2;
+  const accent = rgb(0.75, 0.15, 0.83);
+  const ink = rgb(0.10, 0.10, 0.12);
+  const muted = rgb(0.42, 0.42, 0.48);
+  const addPage = () => {
+    page = pdf.addPage([612, 792]);
+    y = 724;
+  };
+  const ensureSpace = (height: number) => {
+    if (y - height < 58) addPage();
+  };
+  const linesFor = (text: string, size: number, f = font, maxWidth = contentWidth): string[] => {
+    const words = pdfSafeText(text).split(/\s+/).filter(Boolean);
+    const lines: string[] = [];
+    let line = '';
+    for (const word of words) {
+      const candidate = line ? `${line} ${word}` : word;
+      if (f.widthOfTextAtSize(candidate, size) > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = candidate;
+      }
     }
-    page.drawText(text, { x: margin, y, size, font: isBold ? bold : font, color: rgb(0.12, 0.12, 0.14) });
+    if (line) lines.push(line);
+    return lines.length > 0 ? lines : [''];
+  };
+  const addLine = (text: string, size = 11, isBold = false, color = ink, x = margin) => {
+    ensureSpace(size + 9);
+    page.drawText(pdfSafeText(text), { x, y, size, font: isBold ? bold : font, color });
     y -= size + 7;
   };
-  addLine(title, 20, true);
-  y -= 12;
-  for (const para of plainTextFromStructured(content).split(/\n+/).filter(Boolean)) {
-    for (const line of wrapText(para, 88)) addLine(line, 11);
-    y -= 6;
+  const addWrapped = (text: string, size = 11, isBold = false, color = ink, x = margin, maxWidth = contentWidth, after = 8) => {
+    const f = isBold ? bold : font;
+    const lines = linesFor(text, size, f, maxWidth);
+    ensureSpace(lines.length * (size + 5) + after);
+    for (const line of lines) {
+      page.drawText(line, { x, y, size, font: f, color });
+      y -= size + 5;
+    }
+    y -= after;
+  };
+  const addTable = (table: { title?: string; headers: string[]; rows: any[][] }) => {
+    const headers = table.headers.length > 0 ? table.headers : table.rows[0]?.map((_, i) => `Column ${i + 1}`) || [];
+    const rows = table.headers.length > 0 ? table.rows : table.rows.slice(1);
+    if (headers.length === 0) return;
+    if (table.title) addWrapped(table.title, 10, true, muted, margin, contentWidth, 4);
+    const colWidth = contentWidth / headers.length;
+    const rowHeight = 26;
+    ensureSpace(rowHeight * Math.min(rows.length + 1, 8) + 20);
+    page.drawRectangle({ x: margin, y: y - rowHeight + 6, width: contentWidth, height: rowHeight, color: rgb(0.96, 0.91, 0.98), borderColor: rgb(0.86, 0.74, 0.92), borderWidth: 0.5 });
+    headers.forEach((h, i) => page.drawText(pdfSafeText(h).slice(0, 28), { x: margin + i * colWidth + 6, y: y - 12, size: 8.5, font: bold, color: rgb(0.35, 0.11, 0.53) }));
+    y -= rowHeight;
+    for (const row of rows.slice(0, 12)) {
+      ensureSpace(rowHeight + 8);
+      page.drawRectangle({ x: margin, y: y - rowHeight + 6, width: contentWidth, height: rowHeight, borderColor: rgb(0.88, 0.88, 0.9), borderWidth: 0.5 });
+      row.slice(0, headers.length).forEach((cell, i) => {
+        const text = linesFor(cell, 8.5, font, colWidth - 12).slice(0, 2);
+        text.forEach((line, j) => page.drawText(line, { x: margin + i * colWidth + 6, y: y - 10 - j * 10, size: 8.5, font, color: ink }));
+      });
+      y -= rowHeight;
+    }
+    y -= 12;
+  };
+
+  page.drawRectangle({ x: 0, y: 0, width: 8, height: 792, color: accent });
+  addWrapped(title, 24, true, ink, margin, contentWidth, 6);
+  const subtitle = firstNonEmpty(content?.subtitle, 'Prepared by MARTy');
+  if (subtitle) addWrapped(subtitle, 10, false, muted, margin, contentWidth, 18);
+  if (content?.summary) {
+    ensureSpace(78);
+    page.drawRectangle({ x: margin, y: y - 62, width: contentWidth, height: 62, color: rgb(0.98, 0.94, 0.99), borderColor: rgb(0.88, 0.73, 0.92), borderWidth: 0.5 });
+    const summaryLines = linesFor(String(content.summary), 10.5, bold, contentWidth - 24).slice(0, 4);
+    summaryLines.forEach((line, i) => page.drawText(line, { x: margin + 12, y: y - 18 - i * 13, size: 10.5, font: bold, color: rgb(0.35, 0.11, 0.53) }));
+    y -= 78;
   }
+
+  const addSection = (section: any) => {
+    const heading = cleanArtifactText(section?.heading);
+    if (heading) {
+      ensureSpace(44);
+      y -= 4;
+      addLine(heading, 15, true, ink);
+      page.drawLine({ start: { x: margin, y: y + 6 }, end: { x: margin + 64, y: y + 6 }, thickness: 1.4, color: accent });
+      y -= 6;
+    }
+    if (section?.summary) addWrapped(String(section.summary), 11, true, rgb(0.23, 0.23, 0.28));
+    for (const p of asArray(section?.paragraphs)) addWrapped(String(p), 10.5, false, ink);
+    for (const b of asArray(section?.bullets)) addWrapped(`- ${String(b)}`, 10.2, false, ink, margin + 12, contentWidth - 12, 5);
+    for (const n of asArray(section?.numbered)) addWrapped(String(n), 10.2, false, ink, margin + 12, contentWidth - 12, 5);
+    for (const c of asArray(section?.checklist)) addWrapped(`[ ] ${String(c)}`, 10.2, false, ink, margin + 12, contentWidth - 12, 5);
+    for (const table of tablesFrom(section?.tables || section?.table)) addTable(table);
+  };
+
+  if (typeof content === 'string') {
+    for (const para of content.split(/\n{2,}/).filter(Boolean)) addWrapped(para, 10.5);
+  } else {
+    for (const p of asArray(content?.paragraphs)) addWrapped(String(p), 10.5);
+    for (const b of asArray(content?.bullets || content?.key_points)) addWrapped(`- ${String(b)}`, 10.2, false, ink, margin + 12, contentWidth - 12, 5);
+    for (const table of tablesFrom(content?.tables)) addTable(table);
+    for (const section of asArray(content?.sections)) addSection(section);
+  }
+
+  const pages = pdf.getPages();
+  pages.forEach((p, idx) => {
+    p.drawText(pdfSafeText(`MARTy - ${title}`).slice(0, 80), { x: margin, y: 30, size: 7.5, font, color: muted });
+    p.drawText(`${idx + 1}/${pages.length}`, { x: 548, y: 30, size: 7.5, font, color: muted });
+  });
   return await pdf.save();
 }
 
@@ -691,7 +1177,9 @@ async function persistArtifact(
     parentDocumentId?: string | null;
   }
 ): Promise<{ card: MartyDocumentCard; document: { id: string; title: string; file_name: string; mime_type: string } }> {
-  const bytes = await artifactBytes(opts.kind, opts.title, opts.structuredContent);
+  const inputContent = normalizeStructuredArtifactContent(opts.structuredContent);
+  const structuredContent = await enrichArtifactContent(opts.kind, opts.title, inputContent, ctx, env, opts.sourceDocs);
+  const bytes = await artifactBytes(opts.kind, opts.title, structuredContent);
   const fileName = fileTitle(opts.title, opts.kind);
   const file = new File([bytes], fileName, { type: MIME_BY_KIND[opts.kind] });
   const visibility = restrictiveVisibility(opts.sourceDocs);
@@ -702,7 +1190,7 @@ async function persistArtifact(
   else if (primarySource?.company_id) links.push({ entityType: 'company', entityId: primarySource.company_id, linkKind: 'derived', linkSource: 'llm_extracted' });
   else if (primarySource?.contact_id) links.push({ entityType: 'contact', entityId: primarySource.contact_id, linkKind: 'derived', linkSource: 'llm_extracted' });
 
-  const extractedText = plainTextFromStructured(opts.structuredContent);
+  const extractedText = plainTextFromStructured(structuredContent);
   const persisted = await persistDocument({
     file,
     orgId: ctx.orgId,
@@ -729,6 +1217,8 @@ async function persistArtifact(
       marty_generated: true,
       source_document_ids: opts.sourceDocs.map(d => d.id),
       artifact_kind: opts.kind,
+      artifact_schema_version: 2,
+      artifact_text_length: extractedText.length,
     }),
     persisted.documentId,
     ctx.orgId
@@ -848,12 +1338,20 @@ export async function editDocumentArtifactTool(
   const sourceText = await extractFullDocumentText(sourceDoc, env);
   const title = String(input.title || `${(sourceDoc.title || sourceDoc.file_name || 'Document').replace(/\.[a-z0-9]+$/i, '')} - MARTy edit`).slice(0, 140);
   const sourceForModel = truncateToTokens(sourceText || sourceDoc.extracted_text_preview || '', 14000);
-  const system = `You transform business documents into clean structured JSON for file generation.
+  const system = `You transform business documents into clean structured JSON for high-quality file generation.
 Return JSON only. No markdown.
-For docx/pdf return: {"paragraphs":[],"sections":[{"heading":"","paragraphs":[],"bullets":[]}]}.
-For xlsx return: {"sheets":[{"name":"Sheet1","rows":[["Header"],["Value"]]}]}.
-For pptx return: {"slides":[{"title":"","bullets":[]}]}.
-Preserve important facts, names, numbers, and ordering from the source unless the instructions say otherwise.`;
+Preserve important facts, names, numbers, and ordering from the source unless the instructions say otherwise.
+Do not return skeletal content. The edited copy must be useful as a standalone business document.
+
+Schemas:
+- docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]}
+- xlsx: {"sheets":[{"name":"","title":"","rows":[[]]}]}
+- pptx: {"subtitle":"","slides":[{"title":"","subtitle":"","body":"","bullets":[],"table":{"headers":[],"rows":[[]]}}]}
+
+Quality bar:
+- DOCX/PDF: create a polished memo/report with 5-8 sections, clear headings, and at least one table or checklist when useful.
+- XLSX: create a usable workbook with 2-4 sheets, headers, clean rows, and formulas where natural.
+- PPTX: create a 6-10 slide deck with a cover, executive takeaway, one idea per slide, and concise bullets or tables.`;
   const user = `Output kind: ${kind}
 New title: ${title}
 Instructions: ${String(input.instructions || '').slice(0, 4000)}
