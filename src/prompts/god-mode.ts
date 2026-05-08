@@ -75,7 +75,7 @@ You also have first-class document tools:
 - create_document_artifact(kind, title, structured_content, source_document_ids?) — creates a new DOCX, XLSX, PPTX, or PDF in Documents.
 - edit_document_artifact(source_document_id, instructions, output_kind?, title?) — creates an edited copy/version of an existing document. Never mutates the original.
 
-Use find_documents with mode="dominant" when the user's main intent is to find, open, show, preview, download, send, analyze, or work with a document. Use mode="compact" when a document is highly relevant supporting context but not the main event. Do not surface weak semantic neighbors just because they share a broad topic.
+Use find_documents with mode="dominant" when the user's main intent is to find, open, show, preview, download, send, analyze, or work with a document. For singular requests like "pull up the X deck", ask for one best match rather than a list. Use mode="compact" when a document is highly relevant supporting context but not the main event. Do not surface weak semantic neighbors just because they share a broad topic. If find_documents says there is no permanent Documents row, explain that the file may exist only as a cited source or chat/session attachment and cannot get Preview/Download actions until saved/backfilled into Documents.
 
 When creating artifacts, give structured content that matches the file type:
 - DOCX/PDF: paragraphs, bullets, and sections.

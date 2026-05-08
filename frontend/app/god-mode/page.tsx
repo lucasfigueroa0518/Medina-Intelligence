@@ -375,10 +375,26 @@ function mergeDocumentCards(
 ): MartyDocumentCard[] | undefined {
   const all = [...(existing || []), ...(incoming || [])].filter(c => c?.document_id && c?.title);
   if (all.length === 0) return undefined;
-  const byId = new Map<string, MartyDocumentCard>();
+
+  function canonicalCardKey(card: MartyDocumentCard): string {
+    const raw = (card.file_name || card.title || card.document_id)
+      .toLowerCase()
+      .replace(/\.(pdf|pptx?|docx?|xlsx?|csv)$/i, '')
+      .replace(/\b(copy|final|draft|execution copy|redline|signed)\b/g, '')
+      .replace(/\bv(?:ersion)?[\s_-]?\d+\b/g, '')
+      .replace(/[_\-\s]*\(\d+\)\s*/g, ' ')
+      .replace(/\b\d{4}[-_ ]?\d{2}[-_ ]?\d{2}\b/g, '')
+      .replace(/\b\d{8}\b/g, '')
+      .replace(/\b\d{1,2}[-_ ]\d{1,2}[-_ ]\d{2,4}\b/g, '');
+    const compact = raw.replace(/[^a-z0-9]+/g, '');
+    return compact ? `title:${compact}` : `id:${card.document_id}`;
+  }
+
+  const byKey = new Map<string, MartyDocumentCard>();
   for (const card of all) {
-    const prior = byId.get(card.document_id);
-    byId.set(card.document_id, {
+    const key = canonicalCardKey(card);
+    const prior = byKey.get(key);
+    const merged: MartyDocumentCard = {
       ...prior,
       ...card,
       mode: prior?.mode === 'dominant' || card.mode === 'dominant' ? 'dominant' : (card.mode || prior?.mode || 'compact'),
@@ -387,9 +403,12 @@ function mergeDocumentCards(
         download: card.actions?.download ?? prior?.actions?.download ?? true,
         send_to_marty: card.actions?.send_to_marty ?? prior?.actions?.send_to_marty ?? true,
       },
-    });
+    };
+    const priorConfidence = prior?.confidence ?? 0;
+    const nextConfidence = card.confidence ?? 0;
+    if (!prior || nextConfidence >= priorConfidence) byKey.set(key, merged);
   }
-  return [...byId.values()];
+  return [...byKey.values()];
 }
 
 function DocumentCardList({ cards }: { cards?: MartyDocumentCard[] }) {

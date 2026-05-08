@@ -193,8 +193,8 @@ export function DocumentPreviewModal({
       onClick={onClose}>
       <div
         onClick={e => e.stopPropagation()}
-        className="bg-bg-inset border border-border rounded-t-2xl md:rounded-xl shadow-2xl flex flex-col w-full h-[92vh] md:h-auto"
-        style={{ maxWidth: '900px', maxHeight: '90vh' }}
+        className="bg-bg-inset border border-border rounded-t-2xl md:rounded-xl shadow-2xl flex flex-col w-full h-[94dvh] md:h-[92vh]"
+        style={{ maxWidth: 'min(1280px, 96vw)', maxHeight: '94dvh' }}
       >
         <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 md:px-5 py-4 border-b border-border">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -234,7 +234,7 @@ export function DocumentPreviewModal({
           </div>
         </header>
 
-        <div className="flex-1 overflow-hidden p-3 flex flex-col gap-3 min-h-0">
+        <div className="flex-1 overflow-hidden p-2 md:p-4 flex flex-col gap-3 min-h-0">
           {showFailedBanner && doc?.error_message && (
             <div className="px-3 py-2.5 rounded-lg border text-xs flex items-start gap-2 shrink-0"
               style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.25)', color: '#FCA5A5' }}>
@@ -245,7 +245,7 @@ export function DocumentPreviewModal({
               </div>
             </div>
           )}
-          <div className="flex-1 min-h-0 rounded-md overflow-hidden bg-white/[0.02]">
+          <div className="flex-1 min-h-0 rounded-lg overflow-hidden bg-white/[0.02] border border-white/[0.04]">
             {loading || (kind !== 'text' && previewLoading) ? (
               <FilePreview kind={kind as any} loading />
             ) : error ? (

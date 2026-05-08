@@ -93,6 +93,29 @@ function clampLimit(limit: unknown, fallback = 8): number {
   return Math.min(Math.max(n, 1), 20);
 }
 
+const DOCUMENT_QUERY_STOPWORDS = new Set([
+  'pull', 'show', 'open', 'find', 'surface', 'preview', 'download', 'send',
+  'please', 'need', 'want', 'give', 'bring', 'forward', 'from', 'with', 'into',
+  'this', 'that', 'these', 'those', 'the', 'and', 'for', 'about', 'document',
+  'documents', 'doc', 'docs', 'file', 'files',
+]);
+
+const DOCUMENT_KIND_TERMS = new Set([
+  'deck', 'decks', 'presentation', 'presentations', 'ppt', 'pptx', 'powerpoint',
+  'pdf', 'memo', 'model', 'spreadsheet', 'excel', 'xlsx', 'docx', 'word',
+]);
+
+function compactText(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function wantsSingleDocument(query: string): boolean {
+  const lower = query.toLowerCase();
+  if (/\b(documents|docs|files|decks|presentations|attachments)\b/.test(lower)) return false;
+  return /\b(pull up|open|show me|preview|download|send)\b/.test(lower)
+    && /\b(deck|document|doc|file|pdf|pptx|powerpoint|spreadsheet|xlsx|excel|memo)\b/.test(lower);
+}
+
 function normalizeMode(mode: unknown, query: string): MartyDocumentCardMode {
   if (mode === 'compact' || mode === 'dominant') return mode;
   return /\b(show|open|find|pull|surface|preview|download|send|work with|edit|create|prepare|deck|doc|document|pdf|spreadsheet|powerpoint|excel)\b/i.test(query)
@@ -165,23 +188,100 @@ function mergeCards(cards: MartyDocumentCard[]): MartyDocumentCard[] {
   return normalizeDocumentCards(cards);
 }
 
-function tokenizeQuery(query: string): string[] {
-  return query
+function tokenizeRaw(query: string): string[] {
+  const base = query
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .map(s => s.trim())
     .filter(s => s.length >= 3)
-    .slice(0, 8);
+    .slice(0, 12);
+  const joined: string[] = [];
+  for (let i = 0; i < base.length - 1; i++) {
+    const a = base[i];
+    const b = base[i + 1];
+    if (!DOCUMENT_QUERY_STOPWORDS.has(a) && !DOCUMENT_QUERY_STOPWORDS.has(b)) {
+      joined.push(`${a}${b}`);
+    }
+  }
+  return [...new Set([...base, ...joined])];
+}
+
+function tokenizeQuery(query: string): string[] {
+  return tokenizeRaw(query)
+    .filter(t => !DOCUMENT_QUERY_STOPWORDS.has(t))
+    .slice(0, 10);
+}
+
+function importantQueryTerms(query: string): string[] {
+  const terms = tokenizeQuery(query)
+    .filter(t => !DOCUMENT_KIND_TERMS.has(t));
+  return terms.length > 0 ? terms : tokenizeQuery(query);
 }
 
 function scoreTitleMatch(doc: DocumentRow, query: string, terms: string[]): number {
   const haystack = `${doc.title || ''} ${doc.file_name || ''}`.toLowerCase();
   const q = query.toLowerCase().trim();
   if (!haystack || !q) return 0;
-  if (haystack.includes(q)) return 0.96;
-  const hits = terms.filter(t => haystack.includes(t)).length;
+  const important = importantQueryTerms(query);
+  const compactHaystack = compactText(haystack);
+  const compactImportantQuery = important.map(compactText).join('');
+  const compactFullQuery = compactText(terms.join(' '));
+  if (compactImportantQuery && compactHaystack.includes(compactImportantQuery)) return 0.97;
+  if (compactFullQuery && compactHaystack.includes(compactFullQuery)) return 0.95;
+
+  const hits = important.filter(t => {
+    const compactTerm = compactText(t);
+    return haystack.includes(t) || (!!compactTerm && compactHaystack.includes(compactTerm));
+  }).length;
   if (hits === 0) return 0;
-  return Math.min(0.9, 0.45 + hits / Math.max(terms.length, 1) * 0.4);
+  const coverage = hits / Math.max(important.length, 1);
+  const asksForDeck = /\b(deck|presentation|ppt|pptx|powerpoint)\b/i.test(query);
+  const looksLikeDeck = /\b(deck|presentation|pptx|powerpoint)\b/i.test(haystack)
+    || ['pitch_deck', 'deal_pitch', 'meeting_material', 'presentation'].includes(doc.document_type || '');
+  const kindBoost = asksForDeck && looksLikeDeck ? 0.06 : 0;
+  const exactEntityBoost = coverage === 1 && important.length >= 2 ? 0.08 : 0;
+  return Math.min(0.94, 0.42 + coverage * 0.38 + kindBoost + exactEntityBoost);
+}
+
+function canonicalDocumentKey(doc: DocumentRow): string {
+  if (doc.parent_document_id) return `parent:${doc.parent_document_id}`;
+  const raw = (doc.file_name || doc.title || doc.id)
+    .toLowerCase()
+    .replace(/\.(pdf|pptx?|docx?|xlsx?|csv)$/i, '')
+    .replace(/\b(copy|final|draft|execution copy|redline|signed)\b/g, '')
+    .replace(/\bv(?:ersion)?[\s_-]?\d+\b/g, '')
+    .replace(/[_\-\s]*\(\d+\)\s*/g, ' ')
+    .replace(/\b\d{4}[-_ ]?\d{2}[-_ ]?\d{2}\b/g, '')
+    .replace(/\b\d{8}\b/g, '')
+    .replace(/\b\d{1,2}[-_ ]\d{1,2}[-_ ]\d{2,4}\b/g, '');
+  const compact = compactText(raw);
+  return compact ? `title:${compact}` : `id:${doc.id}`;
+}
+
+function documentActionScore(doc: DocumentRow): number {
+  let score = 0;
+  if (doc.r2_key) score += 4;
+  if ((doc.extracted_text_preview || '').trim()) score += 2;
+  if (doc.mime_type?.includes('presentation') || /\.(pptx?|pdf)$/i.test(doc.file_name || '')) score += 1;
+  return score;
+}
+
+function collapseNearDuplicateMatches(matches: DocumentMatch[]): { matches: DocumentMatch[]; collapsed: number } {
+  const byKey = new Map<string, DocumentMatch>();
+  let collapsed = 0;
+  for (const match of matches) {
+    const key = canonicalDocumentKey(match.doc);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, match);
+      continue;
+    }
+    collapsed++;
+    const existingScore = existing.confidence + documentActionScore(existing.doc) * 0.01;
+    const nextScore = match.confidence + documentActionScore(match.doc) * 0.01;
+    if (nextScore > existingScore) byKey.set(key, match);
+  }
+  return { matches: [...byKey.values()], collapsed };
 }
 
 async function sharingSetFor(ctx: AuthContext, env: Env): Promise<Set<string>> {
@@ -317,7 +417,10 @@ export async function findDocumentsTool(
   const query = String(input.query || '').trim();
   if (!query) return { count: 0, documents: [], document_cards: [], message: 'query is required' };
 
-  const limit = clampLimit(input.limit, 6);
+  const singleDocumentRequest = wantsSingleDocument(query);
+  const limit = singleDocumentRequest
+    ? 1
+    : clampLimit(input.limit, 6);
   const requestedTypes = Array.isArray(input.document_types)
     ? input.document_types.filter(t => typeof t === 'string' && t.trim())
     : [];
@@ -326,7 +429,7 @@ export async function findDocumentsTool(
     ? input.entity_ids.filter(t => typeof t === 'string' && t.trim()).slice(0, 10)
     : [];
   const mode = normalizeMode(input.mode, query);
-  const minConfidence = mode === 'dominant' ? 0.52 : 0.78;
+  const minConfidence = mode === 'dominant' ? 0.64 : 0.8;
 
   const [titleMatches, vectorMatches] = await Promise.all([
     searchDocumentsByTitle(query, documentTypes, entityIds, limit, ctx, env),
@@ -341,8 +444,11 @@ export async function findDocumentsTool(
     const existing = merged.get(match.doc.id);
     if (!existing || match.confidence > existing.confidence) merged.set(match.doc.id, match);
   }
-  const matches = [...merged.values()]
+  const filteredMatches = [...merged.values()]
     .filter(m => m.confidence >= minConfidence)
+    .sort((a, b) => b.confidence - a.confidence);
+  const deduped = collapseNearDuplicateMatches(filteredMatches);
+  const matches = deduped.matches
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, limit);
 
@@ -351,6 +457,20 @@ export async function findDocumentsTool(
     excerpt: m.excerpt,
     confidence: Number(m.confidence.toFixed(2)),
   })));
+
+  console.log('[find_documents]', JSON.stringify({
+    query,
+    mode,
+    single_document_request: singleDocumentRequest,
+    requested_limit: input.limit ?? null,
+    effective_limit: limit,
+    title_matches: titleMatches.length,
+    vector_matches: vectorMatches.length,
+    above_threshold: filteredMatches.length,
+    collapsed_duplicates: deduped.collapsed,
+    returned: cards.length,
+    returned_titles: cards.map(c => c.title).slice(0, 5),
+  }));
 
   return {
     count: cards.length,
@@ -367,8 +487,16 @@ export async function findDocumentsTool(
       actions: c.actions,
     })),
     document_cards: cards,
+    diagnostics: {
+      single_document_request: singleDocumentRequest,
+      min_confidence: minConfidence,
+      title_matches: titleMatches.length,
+      vector_matches: vectorMatches.length,
+      above_threshold: filteredMatches.length,
+      collapsed_duplicates: deduped.collapsed,
+    },
     note: cards.length === 0
-      ? 'No sufficiently relevant accessible documents found.'
+      ? 'No sufficiently relevant accessible permanent Documents row found. The file may only exist as a cited source or chat/session attachment, may lack extraction or document embeddings, or may not have an original binary in Documents yet.'
       : undefined,
   };
 }

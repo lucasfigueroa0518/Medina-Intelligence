@@ -42,7 +42,8 @@ export function FilePreview({
     );
   }
   if (kind === 'pdf' && src) {
-    return <iframe src={src} title={fileName || 'document'} className="w-full h-full rounded-md bg-white" />;
+    const pdfSrc = src.startsWith('blob:') ? `${src}#toolbar=1&navpanes=0&view=FitH` : src;
+    return <iframe src={pdfSrc} title={fileName || 'document'} className="w-full h-full rounded-md bg-white" />;
   }
   if (kind === 'image' && src) {
     return (
@@ -135,7 +136,7 @@ function DocxPreview({ src, fileName }: { src: string; fileName?: string }) {
     <div className="w-full h-full overflow-auto rounded-md bg-zinc-100 text-zinc-950" title={fileName}>
       <div
         ref={hostRef}
-        className="min-h-full p-4 [&_.docx-wrapper]:!bg-transparent [&_.docx-wrapper]:!p-0 [&_.docx]:mx-auto [&_.docx]:shadow-lg"
+        className="min-h-full p-3 md:p-5 [&_.docx-wrapper]:!bg-transparent [&_.docx-wrapper]:!p-0 [&_.docx]:mx-auto [&_.docx]:max-w-full [&_.docx]:shadow-lg"
       />
     </div>
   );

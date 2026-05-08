@@ -87,7 +87,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           items: { type: 'string' },
           description: 'Optional CRM entity IDs to scope linked documents.',
         },
-        limit: { type: 'number', description: 'Max documents to return. Default 6, max 20.' },
+        limit: { type: 'number', description: 'Max documents to return. For singular requests like "pull up the X deck", use 1. Default 6, max 20.' },
         mode: { type: 'string', enum: ['auto', 'compact', 'dominant'], description: 'UI surfacing mode. Use dominant for document-centric requests.' },
       },
       required: ['query'],
