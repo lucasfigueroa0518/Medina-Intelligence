@@ -9,7 +9,6 @@ import {
   Handshake,
   Mail,
   Shield,
-  Upload,
   FileText,
   Settings as SettingsIcon,
   LogOut,
@@ -24,6 +23,8 @@ interface NavLink {
   label: string;
   icon?: LucideIcon;
   route: string;
+  href?: string;
+  matchRoutes?: string[];
   requireAdmin?: boolean;
 }
 
@@ -34,8 +35,7 @@ const NAV_LINKS: NavLink[] = [
   { label: 'Deals', icon: Handshake, route: '/deals' },
   { label: 'Campaigns', icon: Mail, route: '/campaigns' },
   { label: 'Admin', icon: Shield, route: '/admin', requireAdmin: true },
-  { label: 'Imports', icon: Upload, route: '/imports' },
-  { label: 'Documents', icon: FileText, route: '/documents' },
+  { label: 'Files', icon: FileText, route: '/files', href: '/files?tab=imports', matchRoutes: ['/files', '/imports', '/documents'] },
   { label: 'Settings', icon: SettingsIcon, route: '/settings' },
 ];
 
@@ -101,12 +101,13 @@ export function Sidebar() {
       {/* Nav links */}
       <nav className="flex-1 p-3 space-y-1">
         {NAV_LINKS.filter(link => !link.requireAdmin || isAdmin).map(link => {
-          const active = pathname === link.route || pathname.startsWith(link.route + '/');
+          const matchRoutes = link.matchRoutes ?? [link.route];
+          const active = matchRoutes.some(route => pathname === route || pathname.startsWith(route + '/'));
           const isMarty = link.route === '/god-mode';
           return (
             <Link
               key={link.route}
-              href={link.route}
+              href={link.href ?? link.route}
               className={`flex items-center gap-3 px-3 h-10 rounded-lg transition-colors ${
                 active
                   ? 'bg-accent-magenta/10 text-text-primary border-l-2 border-accent-magenta pl-[10px]'

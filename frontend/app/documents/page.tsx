@@ -219,12 +219,12 @@ function mimeBadge(mime: string | null): { label: string; icon: typeof FileIcon 
 export default function DocumentsPageWrapper() {
   return (
     <Suspense fallback={<div className="flex-1" />}>
-      <DocumentsPage />
+      <DocumentsPageContent />
     </Suspense>
   );
 }
 
-function DocumentsPage() {
+export function DocumentsPageContent({ embedded = false }: { embedded?: boolean } = {}) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -261,10 +261,11 @@ function DocumentsPage() {
   // URL sync — replace, not push, so back button doesn't undo each chip click.
   React.useEffect(() => {
     const params = filtersToParams(filters);
+    if (embedded) params.tab = 'documents';
     const qs = new URLSearchParams(params).toString();
     const next = qs ? `${pathname}?${qs}` : pathname;
     router.replace(next, { scroll: false });
-  }, [filters, pathname, router]);
+  }, [embedded, filters, pathname, router]);
 
   React.useEffect(() => {
     if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);

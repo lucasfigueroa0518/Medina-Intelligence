@@ -261,7 +261,7 @@ const ANALYZE_STEPS = [
   'Preparing intelligence report...',
 ];
 
-export default function ImportsPage() {
+export function ImportsPageContent({ embedded = false }: { embedded?: boolean } = {}) {
   const [phase, setPhase] = React.useState<Phase>('upload');
   const [file, setFile] = React.useState<File | null>(null);
   const [dragOver, setDragOver] = React.useState(false);
@@ -486,15 +486,17 @@ export default function ImportsPage() {
   if (phase === 'upload') {
     return (
       <div className="flex-1 flex flex-col">
-        <TopBar
-          title="Document Intelligence"
-          actions={
-            <div className="flex items-center gap-2 text-xs text-text-muted">
-              <Sparkles size={14} className="text-accent-magenta" />
-              AI-powered document analysis
-            </div>
-          }
-        />
+        {!embedded && (
+          <TopBar
+            title="Document Intelligence"
+            actions={
+              <div className="flex items-center gap-2 text-xs text-text-muted">
+                <Sparkles size={14} className="text-accent-magenta" />
+                AI-powered document analysis
+              </div>
+            }
+          />
+        )}
       <div className="flex-1 p-4 md:p-8 overflow-auto">
           <div className="max-w-2xl mx-auto">
             {activeJobs.length > 0 && (
@@ -692,7 +694,7 @@ export default function ImportsPage() {
   if (phase === 'analyzing') {
     return (
       <div className="flex-1 flex flex-col">
-        <TopBar title="Document Intelligence" />
+        {!embedded && <TopBar title="Document Intelligence" />}
         <div className="flex-1 flex items-center justify-center">
           <div className="max-w-md w-full px-6">
             <div className="flex flex-col items-center mb-10">
@@ -904,6 +906,10 @@ export default function ImportsPage() {
       />
     </div>
   );
+}
+
+export default function ImportsPage() {
+  return <ImportsPageContent />;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

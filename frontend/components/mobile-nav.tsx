@@ -11,7 +11,6 @@ import {
   Menu,
   Settings,
   Shield,
-  Upload,
   Users,
   X,
   LogOut,
@@ -23,6 +22,8 @@ import { MartyEmblem } from './marty-emblem';
 type NavItem = {
   label: string;
   route: string;
+  href?: string;
+  matchRoutes?: string[];
   icon?: LucideIcon;
   marty?: boolean;
   adminOnly?: boolean;
@@ -33,12 +34,11 @@ const PRIMARY: NavItem[] = [
   { label: 'Contacts', route: '/contacts', icon: Users },
   { label: 'Companies', route: '/companies', icon: Building2 },
   { label: 'Deals', route: '/deals', icon: Handshake },
-  { label: 'Docs', route: '/documents', icon: FileText },
+  { label: 'Files', route: '/files', href: '/files?tab=imports', matchRoutes: ['/files', '/imports', '/documents'], icon: FileText },
 ];
 
 const MORE: NavItem[] = [
   { label: 'Campaigns', route: '/campaigns', icon: Mail },
-  { label: 'Imports', route: '/imports', icon: Upload },
   { label: 'Settings', route: '/settings', icon: Settings },
   { label: 'Admin', route: '/admin', icon: Shield, adminOnly: true },
 ];
@@ -102,7 +102,7 @@ export function MobileNav() {
             </div>
             <div className="p-2">
               {moreItems.map(item => (
-                <MobileMenuLink key={item.route} item={item} active={isActive(pathname, item.route)} />
+                <MobileMenuLink key={item.route} item={item} active={isActive(pathname, item)} />
               ))}
               <button
                 type="button"
@@ -126,7 +126,7 @@ export function MobileNav() {
       <nav className="md:hidden fixed inset-x-0 bottom-0 z-[80] border-t border-border bg-bg-root/95 backdrop-blur-xl pb-[env(safe-area-inset-bottom)]">
         <div className="grid grid-cols-6 h-[68px] px-1">
           {PRIMARY.map(item => (
-            <MobileTab key={item.route} item={item} active={isActive(pathname, item.route)} martyPending={martyPending} />
+            <MobileTab key={item.route} item={item} active={isActive(pathname, item)} martyPending={martyPending} />
           ))}
           <button
             type="button"
@@ -148,7 +148,7 @@ function MobileTab({ item, active, martyPending }: { item: NavItem; active: bool
   const Icon = item.icon;
   return (
     <Link
-      href={item.route}
+      href={item.href ?? item.route}
       className={`flex flex-col items-center justify-center gap-1 rounded-xl text-[10px] transition-colors ${
         active ? 'text-text-primary bg-accent-magenta/10' : 'text-text-secondary'
       }`}
@@ -168,7 +168,7 @@ function MobileMenuLink({ item, active }: { item: NavItem; active: boolean }) {
   const Icon = item.icon;
   return (
     <Link
-      href={item.route}
+      href={item.href ?? item.route}
       className={`h-12 flex items-center gap-3 px-3 rounded-xl text-sm transition-colors ${
         active ? 'text-text-primary bg-accent-magenta/10' : 'text-text-secondary hover:text-text-primary hover:bg-white/[0.05]'
       }`}
@@ -179,6 +179,7 @@ function MobileMenuLink({ item, active }: { item: NavItem; active: boolean }) {
   );
 }
 
-function isActive(pathname: string, route: string) {
-  return pathname === route || pathname.startsWith(route + '/');
+function isActive(pathname: string, item: NavItem) {
+  const routes = item.matchRoutes ?? [item.route];
+  return routes.some(route => pathname === route || pathname.startsWith(route + '/'));
 }
