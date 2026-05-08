@@ -891,6 +891,14 @@ export const api = {
     request<{ ok: boolean; job_id: string; reverted: { document: number; contact: number; company: number; deal: number; vectors: number }; note: string }>(
       `/imports/${jobId}/undo`, { method: 'POST' }
     ),
+  hideImport: (jobId: string) =>
+    request<{ ok: boolean; job_id: string; hidden_at: string }>(
+      `/imports/${jobId}/hide`, { method: 'POST' }
+    ),
+  deleteImportHistory: (jobId: string) =>
+    request<{ ok: boolean; job_id: string; deleted_at: string; note: string }>(
+      `/imports/${jobId}`, { method: 'DELETE' }
+    ),
 
   // Auth
   login: (email: string, password: string) =>

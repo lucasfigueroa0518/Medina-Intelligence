@@ -21,6 +21,8 @@ interface ImportJobRow {
   skipped_rows?: number | null;
   failed_rows?: number | null;
   error_log_r2_key?: string | null;
+  hidden_at?: string | null;
+  deleted_at?: string | null;
   created_at: string;
   updated_at?: string | null;
 }
@@ -122,9 +124,11 @@ export async function listImports(
   const imports = await env.D1.prepare(
     `SELECT id, source_type, source_r2_key, status,
             total_rows, processed_rows, created_rows, updated_rows,
-            skipped_rows, failed_rows, created_at, updated_at
+            skipped_rows, failed_rows, hidden_at, deleted_at, created_at, updated_at
        FROM import_jobs
       WHERE org_id = ?
+        AND hidden_at IS NULL
+        AND deleted_at IS NULL
       ORDER BY created_at DESC
       LIMIT 50`
   ).bind(ctx.orgId).all();
@@ -215,11 +219,55 @@ export async function getImportJob(
   env: Env
 ): Promise<Response> {
   const job = await env.D1.prepare(
-    'SELECT * FROM import_jobs WHERE id = ? AND org_id = ?'
+    'SELECT * FROM import_jobs WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
   ).bind(id, ctx.orgId).first<ImportJobRow>();
   if (!job) return errorResponse('IMPORT_NOT_FOUND', 404);
   const report = await buildImportReport(job, env);
   return jsonResponse({ job, report });
+}
+
+export async function hideImportJob(
+  id: string,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const now = new Date().toISOString();
+  const result = await env.D1.prepare(
+    `UPDATE import_jobs
+        SET hidden_at = COALESCE(hidden_at, ?),
+            updated_at = ?
+      WHERE id = ?
+        AND org_id = ?
+        AND deleted_at IS NULL`
+  ).bind(now, now, id, ctx.orgId).run();
+
+  if (!result.meta.changes) return errorResponse('IMPORT_NOT_FOUND', 404);
+  return jsonResponse({ ok: true, job_id: id, hidden_at: now });
+}
+
+export async function deleteImportJob(
+  id: string,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const now = new Date().toISOString();
+  const result = await env.D1.prepare(
+    `UPDATE import_jobs
+        SET deleted_at = COALESCE(deleted_at, ?),
+            hidden_at = COALESCE(hidden_at, ?),
+            updated_at = ?
+      WHERE id = ?
+        AND org_id = ?
+        AND deleted_at IS NULL`
+  ).bind(now, now, now, id, ctx.orgId).run();
+
+  if (!result.meta.changes) return errorResponse('IMPORT_NOT_FOUND', 404);
+  return jsonResponse({
+    ok: true,
+    job_id: id,
+    deleted_at: now,
+    note: 'Only the import history row was hidden. Use Undo Import when you need to revert records created by an import.',
+  });
 }
 
 async function buildImportReport(job: ImportJobRow, env: Env): Promise<ImportReport> {

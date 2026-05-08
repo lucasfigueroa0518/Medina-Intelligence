@@ -9,7 +9,7 @@ import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import {
   Upload, FileText, FileSpreadsheet, File, Presentation,
   Users, Building2, Handshake, Zap, ChevronDown, ChevronRight,
-  Check, X as XIcon, Loader2, ArrowLeft, Sparkles,
+  Check, X as XIcon, Loader2, ArrowLeft, Sparkles, EyeOff, Trash2,
 } from 'lucide-react';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -99,6 +99,8 @@ interface ImportJob {
   updated_rows?: number;
   skipped_rows?: number;
   failed_rows?: number;
+  hidden_at?: string | null;
+  deleted_at?: string | null;
 }
 
 interface ImportReportStage {
@@ -275,6 +277,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
   const [history, setHistory] = React.useState<ImportJob[]>([]);
   const [historyLoading, setHistoryLoading] = React.useState(true);
   const [reportLoadingId, setReportLoadingId] = React.useState<string | null>(null);
+  const [historyActionId, setHistoryActionId] = React.useState<string | null>(null);
 
   // Report state
   const [activeTab, setActiveTab] = React.useState<'contacts' | 'companies' | 'deals'>('contacts');
@@ -421,6 +424,41 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
     }
   }
 
+  async function handleHideHistory(job: ImportJob) {
+    setHistoryActionId(job.id);
+    try {
+      await api.hideImport(job.id);
+      setHistory(prev => prev.filter(j => j.id !== job.id));
+      setToast(`Hidden from import history: ${importFileName(job)}`);
+    } catch (e: any) {
+      setToast(`Could not hide import: ${e?.message || e}`);
+    } finally {
+      setHistoryActionId(null);
+    }
+  }
+
+  async function handleDeleteHistory(job: ImportJob) {
+    const ok = confirm(
+      'Delete this import history row? This only removes it from the history table. It does not undo contacts, companies, deals, or documents created by the import.'
+    );
+    if (!ok) return;
+
+    setHistoryActionId(job.id);
+    try {
+      await api.deleteImportHistory(job.id);
+      setHistory(prev => prev.filter(j => j.id !== job.id));
+      if (result?.document_id === job.id || result?.import_report?.job_id === job.id) {
+        setResult(null);
+        setPhase('upload');
+      }
+      setToast(`Deleted import history row: ${importFileName(job)}`);
+    } catch (e: any) {
+      setToast(`Could not delete import history row: ${e?.message || e}`);
+    } finally {
+      setHistoryActionId(null);
+    }
+  }
+
   async function pollJob(jobId: string) {
     const maxAttempts = 60;
     for (let i = 0; i < maxAttempts; i++) {
@@ -498,7 +536,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
           />
         )}
       <div className="flex-1 p-4 md:p-8 overflow-auto">
-          <div className="max-w-2xl mx-auto">
+          <div className="max-w-5xl mx-auto">
             {activeJobs.length > 0 && (
               <div className="card p-4 mb-5 border-accent-magenta/25 bg-accent-magenta/5">
                 <div className="flex items-start gap-3">
@@ -531,7 +569,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
 
             {/* Upload Area */}
             <label
-              className={`card border-2 border-dashed flex flex-col items-center justify-center py-16 cursor-pointer transition-all ${
+              className={`card border-2 border-dashed flex flex-col items-center justify-center py-16 cursor-pointer transition-all max-w-3xl mx-auto ${
                 dragOver
                   ? 'border-accent-magenta bg-accent-magenta/5'
                   : file
@@ -593,7 +631,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
               </div>
             )}
 
-            <div className="flex justify-end mt-6">
+            <div className="flex justify-end mt-6 max-w-3xl mx-auto">
               <button
                 className="btn-primary flex items-center gap-2"
                 disabled={!file}
@@ -604,16 +642,32 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
             </div>
 
             {/* Import History */}
-            <div className="mt-12">
-              <h3 className="text-sm font-medium text-text-primary mb-3">Import History</h3>
+            <div className="mt-10 max-w-4xl mx-auto">
+              <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between mb-3">
+                <div>
+                  <h3 className="text-sm font-medium text-text-primary">Import History</h3>
+                  <p className="text-xs text-text-muted mt-1">
+                    Bounded history window. Hide duplicates, or delete history rows without undoing imported data.
+                  </p>
+                </div>
+                <span className="text-[11px] text-text-muted">Scroll inside the table</span>
+              </div>
               {historyLoading ? (
                 <div className="card p-6 text-sm text-text-muted text-center">Loading...</div>
               ) : history.length === 0 ? (
                 <div className="card p-6 text-sm text-text-muted text-center">No imports yet</div>
               ) : (
-                <div className="card p-0 overflow-hidden">
-                  <div className="max-h-[420px] overflow-auto overscroll-contain">
-                    <table className="min-w-[860px] w-full text-sm">
+                <div className="card p-0 overflow-hidden flex flex-col max-h-[340px]">
+                  <div className="px-4 py-3 border-b border-border/60 bg-bg-inset/40 flex items-center justify-between gap-3">
+                    <span className="text-xs text-text-muted">
+                      Showing {history.length} visible import{history.length === 1 ? '' : 's'}
+                    </span>
+                    <span className="text-[11px] text-text-muted">
+                      Report opens completed rows
+                    </span>
+                  </div>
+                  <div className="min-h-0 overflow-auto overscroll-contain">
+                    <table className="min-w-[980px] w-full text-sm">
                     <thead className="sticky top-0 z-10">
                       <tr className="border-b border-border bg-bg-inset/50">
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">File</th>
@@ -622,7 +676,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Created</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Updated</th>
                         <th className="text-left px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Status</th>
-                        <th className="text-right px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted"></th>
+                        <th className="text-right px-4 py-3 text-xs font-medium uppercase tracking-wider text-text-muted">Actions</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -648,11 +702,22 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
                               <StatusBadge status={job.status} />
                             </td>
                             <td className="px-4 py-3 text-right">
-                              {job.status === 'completed' && (
-                                <div className="flex items-center justify-end gap-3">
+                              <div className="flex items-center justify-end gap-2">
+                                {job.status === 'completed' && (
                                   <span className="text-xs text-accent-magenta">
                                     {reportLoadingId === job.id ? 'opening…' : 'report'}
                                   </span>
+                                )}
+                                {job.status === 'processing' && (
+                                  <span className="text-xs text-accent-magenta">in progress…</span>
+                                )}
+                                {job.status === 'failed' && (
+                                  <span className="text-xs text-semantic-error">failed</span>
+                                )}
+                                {job.status === 'reverted' && (
+                                  <span className="text-xs text-text-muted italic">reverted</span>
+                                )}
+                                {job.status === 'completed' && (
                                   <button
                                     onClick={e => { e.stopPropagation(); handleUndo(job.id); }}
                                     className="text-xs text-text-muted hover:text-semantic-error transition-colors"
@@ -660,17 +725,24 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
                                   >
                                     Undo
                                   </button>
-                                </div>
-                              )}
-                              {job.status === 'reverted' && (
-                                <span className="text-xs text-text-muted italic">reverted</span>
-                              )}
-                              {job.status === 'processing' && (
-                                <span className="text-xs text-accent-magenta">in progress…</span>
-                              )}
-                              {job.status === 'failed' && (
-                                <span className="text-xs text-semantic-error">failed</span>
-                              )}
+                                )}
+                                <button
+                                  onClick={e => { e.stopPropagation(); void handleHideHistory(job); }}
+                                  className="h-8 w-8 rounded-lg border border-border/70 text-text-muted hover:text-text-primary hover:bg-bg-surface-hover transition-colors disabled:opacity-40"
+                                  title="Hide this row from import history"
+                                  disabled={historyActionId === job.id}
+                                >
+                                  <EyeOff size={14} className="mx-auto" />
+                                </button>
+                                <button
+                                  onClick={e => { e.stopPropagation(); void handleDeleteHistory(job); }}
+                                  className="h-8 w-8 rounded-lg border border-semantic-error/30 text-semantic-error/80 hover:text-semantic-error hover:bg-semantic-error/10 transition-colors disabled:opacity-40"
+                                  title="Delete this import history row"
+                                  disabled={historyActionId === job.id}
+                                >
+                                  <Trash2 size={14} className="mx-auto" />
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );
@@ -683,6 +755,21 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
             </div>
           </div>
         </div>
+        {toast && (() => {
+          const isError = /fail|error|could not/i.test(toast);
+          return (
+            <div
+              className="fixed bottom-6 right-6 z-[60] rounded-xl shadow-2xl px-5 py-3 max-w-sm"
+              style={{
+                background: '#1A1A1F',
+                border: `1px solid ${isError ? 'rgba(239,68,68,0.3)' : 'rgba(34,197,94,0.3)'}`,
+                borderLeft: `3px solid ${isError ? '#EF4444' : '#22C55E'}`,
+              }}
+            >
+              <div className="text-sm text-text-primary">{toast}</div>
+            </div>
+          );
+        })()}
       </div>
     );
   }

@@ -794,8 +794,11 @@ async function routeAuthenticated(
   }
   m = path.match(/^\/api\/imports\/([^/]+)\/undo$/);
   if (m && method === 'POST') return IntelligentImport.undoImport(m[1], ctx, env);
+  m = path.match(/^\/api\/imports\/([^/]+)\/hide$/);
+  if (m && method === 'POST') return Imports.hideImportJob(m[1], ctx, env);
   m = path.match(/^\/api\/imports\/([^/]+)$/);
   if (m && method === 'GET') return Imports.getImportJob(m[1], ctx, env);
+  if (m && method === 'DELETE') return Imports.deleteImportJob(m[1], ctx, env);
   m = path.match(/^\/api\/imports\/([^/]+)\/mapping$/);
   if (m && method === 'POST') return Imports.setImportMapping(request, m[1], ctx, env);
   m = path.match(/^\/api\/imports\/([^/]+)\/confirm$/);
