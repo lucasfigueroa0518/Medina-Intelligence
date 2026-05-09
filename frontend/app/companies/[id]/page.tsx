@@ -68,7 +68,7 @@ export default function CompanyDetailPage() {
   const router = useRouter();
   const id = params.id;
   const demoMode = useDemoMode();
-  const isDemoCompany = demoMode && id.startsWith('demo-company');
+  const isDemoCompany = id.startsWith('demo-company');
   const [data, setData] = React.useState<any>(null);
   const [tags, setTags] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);

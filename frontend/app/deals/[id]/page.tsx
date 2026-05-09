@@ -138,7 +138,7 @@ export default function DealDetailPage() {
   const router = useRouter();
   const dealId = String(params.id || '');
   const demoMode = useDemoMode();
-  const isDemoDeal = demoMode && dealId.startsWith('demo-deal');
+  const isDemoDeal = dealId.startsWith('demo-deal');
   const [bundle, setBundle] = React.useState<any | null>(null);
   const [documents, setDocuments] = React.useState<any[]>([]);
   const [threads, setThreads] = React.useState<any[]>([]);

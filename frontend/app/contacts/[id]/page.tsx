@@ -57,7 +57,7 @@ export default function ContactDetailPage() {
   const router = useRouter();
   const id = params.id;
   const demoMode = useDemoMode();
-  const isDemoContact = demoMode && id.startsWith('demo-contact');
+  const isDemoContact = id.startsWith('demo-contact');
 
   const [contact, setContact] = React.useState<any>(null);
   const [tags, setTags] = React.useState<any[]>([]);
