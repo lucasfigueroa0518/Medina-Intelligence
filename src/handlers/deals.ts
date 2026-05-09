@@ -20,6 +20,12 @@ import {
   getDealReplayStatusSnapshot,
   startDealReplayRun,
 } from '../lib/deal-replay';
+import {
+  MANUAL_DETECTED_EVIDENCE_MIN,
+  MIN_STRONG_EVIDENCE_CONFIDENCE,
+  REQUIRED_SUGGESTION_EVIDENCE,
+  promoteDetectedDealCandidate,
+} from '../lib/deal-suggestions';
 
 // ---------------------------------------------------------------------------
 // GET /api/deals
@@ -156,6 +162,167 @@ export async function listDeals(
     offset,
     has_more: offset + limit < (countResult?.total || 0),
   });
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/deals/detected
+// ---------------------------------------------------------------------------
+
+export async function listDetectedDealCandidates(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const url = new URL(request.url);
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 25), 1), 100);
+
+  const grouped = await env.D1.prepare(
+    `SELECT dse.company_id,
+            co.name AS company_name,
+            COUNT(*) AS evidence_count,
+            COUNT(DISTINCT dse.source_type) AS source_family_count,
+            GROUP_CONCAT(DISTINCT dse.source_type) AS source_families,
+            AVG(dse.confidence) AS avg_confidence,
+            MAX(dse.confidence) AS max_confidence,
+            MAX(dse.amount_usd) AS amount_usd,
+            MIN(COALESCE(dse.source_date, dse.created_at)) AS first_seen_at,
+            MAX(COALESCE(dse.source_date, dse.created_at)) AS last_seen_at
+       FROM deal_suggestion_evidence dse
+       JOIN companies co
+         ON co.id = dse.company_id
+        AND co.org_id = dse.org_id
+        AND co.deleted_at IS NULL
+      WHERE dse.org_id = ?
+        AND dse.deal_id IS NULL
+        AND dse.confidence >= ?
+        AND COALESCE(co.is_internal_entity, 0) = 0
+        AND NOT EXISTS (
+          SELECT 1
+            FROM deals d
+           WHERE d.org_id = dse.org_id
+             AND d.company_id = dse.company_id
+             AND d.deleted_at IS NULL
+             AND d.stage != 'closed'
+        )
+      GROUP BY dse.company_id, co.name
+     HAVING COUNT(*) >= ?
+      ORDER BY evidence_count DESC, last_seen_at DESC, avg_confidence DESC
+      LIMIT ?`
+  ).bind(
+    ctx.orgId,
+    MIN_STRONG_EVIDENCE_CONFIDENCE,
+    MANUAL_DETECTED_EVIDENCE_MIN,
+    limit
+  ).all<any>();
+
+  const candidates = grouped.results || [];
+  if (candidates.length === 0) {
+    return jsonResponse({
+      candidates: [],
+      min_evidence: MANUAL_DETECTED_EVIDENCE_MIN,
+      min_confidence: MIN_STRONG_EVIDENCE_CONFIDENCE,
+      auto_promote_evidence: REQUIRED_SUGGESTION_EVIDENCE,
+    });
+  }
+
+  const companyIds = candidates.map((c: any) => c.company_id);
+  const placeholders = companyIds.map(() => '?').join(',');
+  const evidenceRows = await env.D1.prepare(
+    `SELECT id,
+            company_id,
+            source_type,
+            source_id,
+            source_title,
+            source_excerpt,
+            source_date,
+            signal_kind,
+            funding_stage,
+            amount_usd,
+            confidence,
+            evidence_note,
+            created_at
+       FROM deal_suggestion_evidence
+      WHERE org_id = ?
+        AND company_id IN (${placeholders})
+        AND deal_id IS NULL
+        AND confidence >= ?
+      ORDER BY COALESCE(source_date, created_at) DESC, confidence DESC`
+  ).bind(ctx.orgId, ...companyIds, MIN_STRONG_EVIDENCE_CONFIDENCE).all<any>();
+
+  const evidenceByCompany = new Map<string, any[]>();
+  for (const row of evidenceRows.results || []) {
+    const list = evidenceByCompany.get(row.company_id) || [];
+    if (list.length < 3) list.push(row);
+    evidenceByCompany.set(row.company_id, list);
+  }
+
+  return jsonResponse({
+    candidates: candidates.map((candidate: any) => {
+      const evidence = evidenceByCompany.get(candidate.company_id) || [];
+      return {
+        ...candidate,
+        evidence_count: Number(candidate.evidence_count || 0),
+        source_family_count: Number(candidate.source_family_count || 0),
+        source_families: String(candidate.source_families || '').split(',').filter(Boolean),
+        avg_confidence: Number(candidate.avg_confidence || 0),
+        max_confidence: Number(candidate.max_confidence || 0),
+        amount_usd: candidate.amount_usd ?? null,
+        latest_evidence: evidence[0] || null,
+        evidence,
+      };
+    }),
+    min_evidence: MANUAL_DETECTED_EVIDENCE_MIN,
+    min_confidence: MIN_STRONG_EVIDENCE_CONFIDENCE,
+    auto_promote_evidence: REQUIRED_SUGGESTION_EVIDENCE,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/deals/detected/promote
+// ---------------------------------------------------------------------------
+
+export async function promoteDetectedDeal(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ company_id?: unknown }>(request);
+  const companyId = typeof body?.company_id === 'string' ? body.company_id : null;
+  if (!companyId) return errorResponse('VALIDATION_ERROR', 400, 'company_id required');
+
+  const result = await promoteDetectedDealCandidate({
+    orgId: ctx.orgId,
+    companyId,
+    userId: ctx.userId,
+    env,
+  });
+
+  if (!result.dealId) {
+    return errorResponse('DETECTED_DEAL_NOT_PROMOTED', 409, result.reason);
+  }
+
+  const deal = await env.D1.prepare(
+    `SELECT d.*, co.name AS company_name, co.sector AS company_sector
+       FROM deals d
+       LEFT JOIN companies co ON co.id = d.company_id
+      WHERE d.id = ? AND d.org_id = ? AND d.deleted_at IS NULL`
+  ).bind(result.dealId, ctx.orgId).first<any>();
+
+  if (result.promoted) {
+    await emitAudit(env, {
+      org_id: ctx.orgId,
+      user_id: ctx.userId,
+      action: 'create',
+      entity_type: 'deal',
+      entity_id: result.dealId,
+      after_data: deal,
+      metadata: { sub_action: 'manual_detected_deal_promote', evidence_count: result.evidenceCount },
+      created_at: new Date().toISOString(),
+    }).catch(err => console.error(`[deals] audit emit failed for detected promotion ${result.dealId}:`, err));
+    await invalidateRagCache(ctx.orgId, env);
+  }
+
+  return jsonResponse({ ...result, deal }, result.promoted ? 201 : 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,9 +798,19 @@ export async function bulkUpdateDeals(
     const before = beforeById.get(id);
 
     if (archive) {
-      stmts.push(env.D1.prepare(
-        `UPDATE deals SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-      ).bind(id));
+      if (before.stage === 'new') {
+        stmts.push(env.D1.prepare(
+          `UPDATE deals
+              SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                  suggestion_decided_at = COALESCE(suggestion_decided_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                  suggestion_decided_by = COALESCE(suggestion_decided_by, ?)
+            WHERE id = ?`
+        ).bind(ctx.userId, id));
+      } else {
+        stmts.push(env.D1.prepare(
+          `UPDATE deals SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+        ).bind(id));
+      }
       auditEntries.push({
         id, before,
         after_partial: { deleted_at: new Date().toISOString() },
@@ -645,6 +822,7 @@ export async function bulkUpdateDeals(
     const setFragments: string[] = [];
     const binds: unknown[] = [];
     const stageChanged = 'stage' in filteredUpdates && filteredUpdates.stage !== before.stage;
+    const acceptsSuggestion = before.stage === 'new' && filteredUpdates.stage === 'talking';
 
     for (const [k, v] of Object.entries(filteredUpdates)) {
       setFragments.push(`${k} = ?`);
@@ -654,6 +832,11 @@ export async function bulkUpdateDeals(
     if (stageChanged) {
       setFragments.push(`stage_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
       setFragments.push('days_in_stage = 0');
+    }
+    if (acceptsSuggestion) {
+      setFragments.push(`suggestion_decided_at = COALESCE(suggestion_decided_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`);
+      setFragments.push(`suggestion_decided_by = COALESCE(suggestion_decided_by, ?)`);
+      binds.push(ctx.userId);
     }
     setFragments.push(`last_activity_date = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
     setFragments.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);

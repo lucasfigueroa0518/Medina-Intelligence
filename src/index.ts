@@ -336,6 +336,12 @@ async function routeAuthenticated(
   if (path === '/api/deals/bulk-update' && method === 'POST') {
     return Deals.bulkUpdateDeals(request, ctx, env);
   }
+  if (path === '/api/deals/detected' && method === 'GET') {
+    return Deals.listDetectedDealCandidates(request, ctx, env);
+  }
+  if (path === '/api/deals/detected/promote' && method === 'POST') {
+    return Deals.promoteDetectedDeal(request, ctx, env);
+  }
   if (path === '/api/deals/replay/start' && method === 'POST') {
     return Deals.startDealReplay(request, ctx, env);
   }

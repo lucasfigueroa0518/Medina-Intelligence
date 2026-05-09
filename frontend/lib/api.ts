@@ -212,6 +212,17 @@ export const api = {
     );
     return { ...result, decision: data.decision };
   },
+  getDetectedDealCandidates: (params?: { limit?: number }) => {
+    const search = new URLSearchParams();
+    if (params?.limit) search.set('limit', String(params.limit));
+    const qs = search.toString();
+    return request<DetectedDealCandidatesResponse>(`/deals/detected${qs ? `?${qs}` : ''}`);
+  },
+  promoteDetectedDealCandidate: (company_id: string) =>
+    request<{ promoted: boolean; dealId: string | null; evidenceCount: number; reason: string; deal: any }>(
+      '/deals/detected/promote',
+      { method: 'POST', body: JSON.stringify({ company_id }) }
+    ),
   getDealReplayStatus: () =>
     request<DealReplayStatusSnapshot>('/deals/replay/status'),
   getDealReplayEvidence: (params?: { limit?: number; offset?: number; company_id?: string }) => {
@@ -1140,6 +1151,28 @@ export interface DealReplayEvidenceResponse {
   limit: number;
   offset: number;
   has_more: boolean;
+}
+
+export interface DetectedDealCandidate {
+  company_id: string;
+  company_name: string;
+  evidence_count: number;
+  source_family_count: number;
+  source_families: Array<'conversation' | 'event' | 'document' | string>;
+  avg_confidence: number;
+  max_confidence: number;
+  amount_usd: number | null;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  latest_evidence: DealReplayEvidenceRow | null;
+  evidence: DealReplayEvidenceRow[];
+}
+
+export interface DetectedDealCandidatesResponse {
+  candidates: DetectedDealCandidate[];
+  min_evidence: number;
+  min_confidence: number;
+  auto_promote_evidence: number;
 }
 
 export interface SystemStatusResponse {

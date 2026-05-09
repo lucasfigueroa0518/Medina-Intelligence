@@ -23,6 +23,7 @@ export type FundingStage = typeof FUNDING_STAGES[number];
 export const REQUIRED_SUGGESTION_EVIDENCE = 4;
 export const MIN_STRONG_EVIDENCE_CONFIDENCE = 0.78;
 export const MIN_SUGGESTION_SOURCE_FAMILIES = 2;
+export const MANUAL_DETECTED_EVIDENCE_MIN = 2;
 
 export interface DealEvidenceSignal {
   orgId: string;
@@ -117,6 +118,19 @@ async function fetchStrongEvidence(companyId: string, orgId: string, env: Env): 
             confidence, evidence_note, created_at
        FROM deal_suggestion_evidence
       WHERE org_id = ? AND company_id = ? AND confidence >= ?
+      ORDER BY COALESCE(source_date, created_at) DESC, confidence DESC
+      LIMIT 20`
+  ).bind(orgId, companyId, MIN_STRONG_EVIDENCE_CONFIDENCE).all<EvidenceRow>();
+  return rows.results;
+}
+
+async function fetchManualCandidateEvidence(companyId: string, orgId: string, env: Env): Promise<EvidenceRow[]> {
+  const rows = await env.D1.prepare(
+    `SELECT id, source_type, source_id, source_title, source_excerpt,
+            source_date, signal_kind, funding_stage, amount_usd,
+            confidence, evidence_note, created_at
+       FROM deal_suggestion_evidence
+      WHERE org_id = ? AND company_id = ? AND confidence >= ? AND deal_id IS NULL
       ORDER BY COALESCE(source_date, created_at) DESC, confidence DESC
       LIMIT 20`
   ).bind(orgId, companyId, MIN_STRONG_EVIDENCE_CONFIDENCE).all<EvidenceRow>();
@@ -322,6 +336,96 @@ async function promoteIfQualified(
   }
 
   return { promoted: true, dealId, reason: 'qualified' };
+}
+
+export async function promoteDetectedDealCandidate(args: {
+  orgId: string;
+  companyId: string;
+  userId: string;
+  env: Env;
+}): Promise<{ promoted: boolean; dealId: string | null; evidenceCount: number; reason: string }> {
+  const company = await getExternalCompany(args.companyId, args.orgId, args.env);
+  if (!company) {
+    return { promoted: false, dealId: null, evidenceCount: 0, reason: 'company_missing_or_internal' };
+  }
+
+  const existing = await findOpenDeal(company.id, args.orgId, args.env);
+  if (existing) {
+    return { promoted: false, dealId: existing.id, evidenceCount: 0, reason: 'existing_open_deal' };
+  }
+
+  const rows = await fetchManualCandidateEvidence(company.id, args.orgId, args.env);
+  if (rows.length < MANUAL_DETECTED_EVIDENCE_MIN) {
+    return { promoted: false, dealId: null, evidenceCount: rows.length, reason: 'not_enough_evidence' };
+  }
+
+  const dealId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const firstSeen = rows.reduce((min, row) => evidenceDate(row) < min ? evidenceDate(row) : min, evidenceDate(rows[0]));
+  const lastSeen = rows.reduce((max, row) => evidenceDate(row) > max ? evidenceDate(row) : max, evidenceDate(rows[0]));
+  const avgConfidence = rows.reduce((sum, row) => sum + row.confidence, 0) / rows.length;
+  const fundingStage = chooseFundingStage(rows);
+  const amount = chooseAmount(rows);
+  const sourceFamilies = Array.from(new Set(rows.map(r => r.source_type)));
+  const sourceMetadata = {
+    origin: {
+      source_kind: 'manual_detected',
+      approved_by: args.userId,
+      approved_at: now,
+      confidence: avgConfidence,
+      evidence: `${rows.length} strong evidence records surfaced for manual review`,
+    },
+    suggestion: {
+      required_evidence: REQUIRED_SUGGESTION_EVIDENCE,
+      manual_review_minimum: MANUAL_DETECTED_EVIDENCE_MIN,
+      source_families: sourceFamilies,
+      evidence: summarizeEvidenceForMetadata(rows),
+    },
+  };
+
+  await args.env.D1.prepare(
+    `INSERT INTO deals
+       (id, org_id, company_id, owner_id, title, stage, amount, currency,
+        probability, lead_source, stage_changed_at, last_activity_date,
+        days_in_stage, created_at, updated_at, source_metadata, funding_stage,
+        evidence_first_seen_at, evidence_last_seen_at, suggestion_evidence_count)
+     VALUES (?, ?, ?, NULL, ?, 'new', ?, 'USD', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    dealId,
+    args.orgId,
+    company.id,
+    company.name,
+    amount,
+    avgConfidence,
+    'Manually surfaced from detected evidence',
+    now,
+    lastSeen,
+    now,
+    now,
+    JSON.stringify(sourceMetadata),
+    fundingStage,
+    firstSeen,
+    lastSeen,
+    rows.length
+  ).run();
+
+  await linkEvidenceToDeal(dealId, args.orgId, rows, args.env);
+
+  try {
+    const { linkContactsByCompanyMatch } = await import('./deal-association');
+    await linkContactsByCompanyMatch(dealId, args.orgId, args.env);
+  } catch (e) {
+    console.error(`[deal-suggestions] contact auto-link failed for manual candidate ${dealId}:`, e);
+  }
+
+  try {
+    const { embedDeal } = await import('./embedding');
+    await embedDeal(dealId, args.orgId, args.env);
+  } catch (e) {
+    console.error(`[deal-suggestions] embed failed for manual candidate ${dealId}:`, e);
+  }
+
+  return { promoted: true, dealId, evidenceCount: rows.length, reason: 'manual_candidate_promoted' };
 }
 
 export async function recordDealEvidenceSignal(

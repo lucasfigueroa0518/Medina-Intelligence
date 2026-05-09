@@ -3,7 +3,7 @@
 import React from 'react';
 import { useRouter } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
-import { api, type DealReplayStatusSnapshot } from '@/lib/api';
+import { api, type DealReplayStatusSnapshot, type DetectedDealCandidate } from '@/lib/api';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 import {
   Check,
@@ -48,21 +48,27 @@ function formatCurrency(v: number): string {
 
 function DealCard({
   deal,
+  stage,
   stageColor,
   selected,
   busy,
   isDragging,
   onToggle,
+  onYes,
+  onNo,
   onDragStart,
   onDragEnd,
   onOpen,
 }: {
   deal: any;
+  stage: DealStage;
   stageColor: string;
   selected: boolean;
   busy: boolean;
   isDragging: boolean;
   onToggle: () => void;
+  onYes: () => void;
+  onNo: () => void;
   onDragStart: (e: React.DragEvent) => void;
   onDragEnd: () => void;
   onOpen: () => void;
@@ -105,8 +111,101 @@ function DealCard({
         <p className="mt-1 line-clamp-2 text-xs leading-5 text-text-secondary">
           {brief}
         </p>
+        {stage === 'new' && (
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={e => { e.stopPropagation(); onYes(); }}
+              className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-2 py-1.5 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/[0.10] disabled:opacity-50"
+            >
+              Yes
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={e => { e.stopPropagation(); onNo(); }}
+              className="rounded-lg border border-red-500/20 bg-red-500/[0.05] px-2 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/[0.10] disabled:opacity-50"
+            >
+              No
+            </button>
+          </div>
+        )}
       </div>
     </article>
+  );
+}
+
+function OtherDetectedDeals({
+  candidates,
+  open,
+  busyCompanyId,
+  onToggle,
+  onPromote,
+}: {
+  candidates: DetectedDealCandidate[];
+  open: boolean;
+  busyCompanyId: string | null;
+  onToggle: () => void;
+  onPromote: (candidate: DetectedDealCandidate) => void;
+}) {
+  return (
+    <div className="mb-3">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-left transition-colors hover:border-accent-magenta/25 hover:bg-accent-magenta/[0.04]"
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-xs font-medium text-text-primary">Other detected deals</div>
+            <div className="mt-0.5 truncate text-[11px] text-text-muted">
+              {candidates.length > 0
+                ? `${candidates.length} below auto-threshold · 2+ strong evidence`
+                : 'None waiting for manual review'}
+            </div>
+          </div>
+          <ChevronRight size={14} className={`shrink-0 text-text-muted transition-transform ${open ? 'rotate-90' : ''}`} />
+        </div>
+      </button>
+
+      {open && (
+        <div className="mt-2 space-y-2 rounded-lg border border-white/10 bg-bg-surface/60 p-2">
+          {candidates.length === 0 ? (
+            <div className="px-2 py-3 text-center text-xs text-text-muted">
+              Detected deals will appear here after at least two strong evidence records.
+            </div>
+          ) : candidates.map(candidate => {
+            const latest = candidate.latest_evidence;
+            const brief = latest?.evidence_note || latest?.source_excerpt || 'Strong evidence found, but not enough yet for automatic promotion.';
+            const families = candidate.source_families.length > 0 ? candidate.source_families.join(', ') : 'source evidence';
+            const pct = Math.round((candidate.avg_confidence || 0) * 100);
+            return (
+              <article key={candidate.company_id} className="rounded-lg border border-white/10 bg-black/10 p-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-semibold text-text-primary">{candidate.company_name}</div>
+                    <div className="mt-0.5 text-[11px] text-text-muted">
+                      {candidate.evidence_count} evidence · {candidate.source_family_count} families · {pct}% avg
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={busyCompanyId === candidate.company_id}
+                    onClick={() => onPromote(candidate)}
+                    className="shrink-0 rounded-md border border-accent-magenta/20 bg-accent-magenta/[0.08] px-2 py-1 text-[11px] font-medium text-accent-magenta transition-colors hover:bg-accent-magenta/[0.12] disabled:opacity-50"
+                  >
+                    {busyCompanyId === candidate.company_id ? <Loader2 size={12} className="animate-spin" /> : 'Add'}
+                  </button>
+                </div>
+                <p className="mt-2 line-clamp-2 text-[11px] leading-4 text-text-secondary">{brief}</p>
+                <div className="mt-2 truncate text-[10px] text-text-muted">{families}</div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -120,6 +219,9 @@ export default function DealsPage() {
   const [dragOverStage, setDragOverStage] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [replayStatus, setReplayStatus] = React.useState<DealReplayStatusSnapshot | null>(null);
+  const [detectedCandidates, setDetectedCandidates] = React.useState<DetectedDealCandidate[]>([]);
+  const [detectedOpen, setDetectedOpen] = React.useState(false);
+  const [detectedBusyId, setDetectedBusyId] = React.useState<string | null>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const [canScrollLeft, setCanScrollLeft] = React.useState(false);
   const [canScrollRight, setCanScrollRight] = React.useState(false);
@@ -135,6 +237,17 @@ export default function DealsPage() {
   }, []);
 
   React.useEffect(() => { void loadDeals(); }, [loadDeals]);
+
+  const loadDetectedCandidates = React.useCallback(async () => {
+    try {
+      const res = await api.getDetectedDealCandidates({ limit: 25 });
+      setDetectedCandidates(res.candidates || []);
+    } catch {
+      setDetectedCandidates([]);
+    }
+  }, []);
+
+  React.useEffect(() => { void loadDetectedCandidates(); }, [loadDetectedCandidates]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -226,10 +339,25 @@ export default function DealsPage() {
       setSelectedIds(new Set());
       setToast(decision === 'yes' ? 'Moved to Talking' : decision === 'no' ? 'Suggestion denied' : 'Deals deleted');
       await loadDeals();
+      void loadDetectedCandidates();
     } catch (e: any) {
       setToast(e?.message || 'Decision failed');
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function promoteDetectedCandidate(candidate: DetectedDealCandidate) {
+    setDetectedBusyId(candidate.company_id);
+    try {
+      await api.promoteDetectedDealCandidate(candidate.company_id);
+      setDetectedOpen(false);
+      setToast(`${candidate.company_name} added to New`);
+      await Promise.all([loadDeals(), loadDetectedCandidates()]);
+    } catch (e: any) {
+      setToast(e?.message || 'Could not add detected deal');
+    } finally {
+      setDetectedBusyId(null);
     }
   }
 
@@ -330,16 +458,29 @@ export default function DealsPage() {
                       </span>
                     </div>
 
+                    {stage.key === 'new' && (
+                      <OtherDetectedDeals
+                        candidates={detectedCandidates}
+                        open={detectedOpen}
+                        busyCompanyId={detectedBusyId}
+                        onToggle={() => setDetectedOpen(v => !v)}
+                        onPromote={candidate => void promoteDetectedCandidate(candidate)}
+                      />
+                    )}
+
                     <div className="space-y-2">
                       {dealsForStage.map(deal => (
                         <DealCard
                           key={deal.id}
                           deal={deal}
+                          stage={stage.key}
                           stageColor={stage.color}
                           selected={selectedIds.has(deal.id)}
                           busy={busy}
                           isDragging={dragDealId === deal.id}
                           onToggle={() => toggleSelected(deal.id)}
+                          onYes={() => void decide([deal.id], 'yes')}
+                          onNo={() => void decide([deal.id], 'no')}
                           onDragStart={(e) => handleDragStart(e, deal.id)}
                           onDragEnd={() => { setDragDealId(null); setDragOverStage(null); }}
                           onOpen={() => router.push(`/deals/${deal.id}`)}
