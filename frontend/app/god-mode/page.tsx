@@ -115,6 +115,16 @@ interface ToolCall {
   result?: any;
   status: 'started' | 'executing' | 'done' | 'error';
   collapsed: boolean;
+  runs?: ToolRun[];
+  activeRunId?: string;
+  pulseKey?: number;
+}
+
+interface ToolRun {
+  id: string;
+  input?: any;
+  result?: any;
+  status: 'started' | 'executing' | 'done' | 'error';
 }
 
 interface MartyDocumentCard {
@@ -339,33 +349,177 @@ function toolLabel(name: string): string {
   return name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function toolStatusText(tool: ToolCall): string {
-  if (tool.status === 'started' || tool.status === 'executing') {
-    const action = tool.tool === 'find_documents' ? 'Finding documents' :
-      tool.tool === 'create_document_artifact' ? 'Creating document' :
-      tool.tool === 'edit_document_artifact' ? 'Editing document' :
-      tool.tool.startsWith('search') ? 'Searching' :
-      tool.tool.startsWith('get') ? 'Loading' :
-      tool.tool === 'web_search' ? 'Searching the web' :
-      tool.tool === 'read_url' ? 'Reading page' :
-      tool.tool.startsWith('create') ? 'Creating' :
-      tool.tool.startsWith('update') ? 'Updating' :
-      tool.tool.startsWith('add') ? 'Adding' :
-      tool.tool === 'apply_tag' ? 'Tagging' : 'Processing';
-    return `${action}...`;
+function toolActionLabel(name: string): string {
+  if (name === 'find_documents') return 'Finding documents';
+  if (name === 'create_document_artifact') return 'Creating document';
+  if (name === 'edit_document_artifact') return 'Editing document';
+  if (name.startsWith('search')) return 'Searching';
+  if (name.startsWith('get')) return 'Loading';
+  if (name === 'web_search') return 'Searching the web';
+  if (name === 'read_url') return 'Reading page';
+  if (name.startsWith('create')) return 'Creating';
+  if (name.startsWith('update')) return 'Updating';
+  if (name.startsWith('add')) return 'Adding';
+  if (name === 'apply_tag') return 'Tagging';
+  return 'Processing';
+}
+
+function isTerminalToolStatus(status: ToolCall['status']): boolean {
+  return status === 'done' || status === 'error';
+}
+
+function getToolRuns(tool: ToolCall): ToolRun[] {
+  if (tool.runs?.length) return tool.runs;
+  return [{
+    id: tool.id,
+    input: tool.input,
+    result: tool.result,
+    status: tool.status,
+  }];
+}
+
+function aggregateToolStatus(runs: ToolRun[]): ToolCall['status'] {
+  if (runs.some(run => run.status === 'executing')) return 'executing';
+  if (runs.some(run => run.status === 'started')) return 'started';
+  if (runs.length > 0 && runs.every(run => run.status === 'error')) return 'error';
+  return 'done';
+}
+
+function resultCountForRun(run: ToolRun): number | null {
+  const result = run.result;
+  if (!result) return null;
+  if (typeof result.count === 'number') return result.count;
+  if (Array.isArray(result.sources)) return result.sources.length;
+  if (Array.isArray(result.results)) return result.results.length;
+  if (Array.isArray(result.documents)) return result.documents.length;
+  if (Array.isArray(result.document_cards)) return result.document_cards.length;
+  if (Array.isArray(result.items)) return result.items.length;
+  return null;
+}
+
+function aggregateResultCount(tool: ToolCall): number | null {
+  let total = 0;
+  let sawCount = false;
+  for (const run of getToolRuns(tool)) {
+    const count = resultCountForRun(run);
+    if (typeof count === 'number') {
+      total += count;
+      sawCount = true;
+    }
   }
-  if (tool.status === 'error') return 'Failed';
-  if (tool.tool === 'find_documents' && tool.result?.count !== undefined) return `Found ${tool.result.count} documents`;
+  return sawCount ? total : null;
+}
+
+function resultNoun(toolName: string): string {
+  return toolName === 'find_documents' ? 'documents' : 'results';
+}
+
+function upsertToolEvent(toolCalls: ToolCall[], event: any): ToolCall[] {
+  if (!event?.tool || !event?.status) return toolCalls;
+
+  const toolName = String(event.tool);
+  const existingIndex = toolCalls.findIndex(tool => tool.tool === toolName);
+  const createRun = (status: ToolCall['status']): ToolRun => ({
+    id: crypto.randomUUID(),
+    input: event.input,
+    result: event.result,
+    status,
+  });
+
+  if (existingIndex === -1) {
+    const initialStatus = event.status as ToolCall['status'];
+    const run = createRun(initialStatus);
+    return [
+      ...toolCalls,
+      {
+        id: crypto.randomUUID(),
+        tool: toolName,
+        input: run.input,
+        result: run.result,
+        status: run.status,
+        collapsed: true,
+        runs: [run],
+        activeRunId: isTerminalToolStatus(run.status) ? undefined : run.id,
+        pulseKey: 0,
+      },
+    ];
+  }
+
+  const next = [...toolCalls];
+  const existing = next[existingIndex];
+  const runs = getToolRuns(existing).map(run => ({ ...run }));
+  let activeRunId = existing.activeRunId;
+
+  if (event.status === 'started') {
+    const run = createRun('started');
+    runs.push(run);
+    activeRunId = run.id;
+  } else if (event.status === 'executing') {
+    let runIndex = runs.findIndex(run => run.id === activeRunId && !isTerminalToolStatus(run.status));
+    if (runIndex < 0) runIndex = runs.findLastIndex(run => !isTerminalToolStatus(run.status));
+    if (runIndex < 0) {
+      const run = createRun('executing');
+      runs.push(run);
+      activeRunId = run.id;
+    } else {
+      runs[runIndex] = {
+        ...runs[runIndex],
+        status: 'executing',
+        input: event.input ?? runs[runIndex].input,
+      };
+      activeRunId = runs[runIndex].id;
+    }
+  } else if (event.status === 'done' || event.status === 'error') {
+    let runIndex = runs.findIndex(run => run.id === activeRunId && !isTerminalToolStatus(run.status));
+    if (runIndex < 0) runIndex = runs.findLastIndex(run => !isTerminalToolStatus(run.status));
+    if (runIndex < 0) {
+      const run = createRun(event.status);
+      runs.push(run);
+    } else {
+      runs[runIndex] = {
+        ...runs[runIndex],
+        status: event.status,
+        result: event.result,
+      };
+    }
+    activeRunId = undefined;
+  }
+
+  const latestRun = runs[runs.length - 1];
+  next[existingIndex] = {
+    ...existing,
+    input: latestRun?.input,
+    result: latestRun?.result,
+    status: aggregateToolStatus(runs),
+    runs,
+    activeRunId,
+    pulseKey: (existing.pulseKey || 0) + 1,
+  };
+  return next;
+}
+
+function toolStatusText(tool: ToolCall): string {
+  const runs = getToolRuns(tool);
+  const runCount = runs.length;
+  const totalCount = aggregateResultCount(tool);
+  const suffix = runCount > 1 ? ` across ${runCount} runs` : '';
+
+  if (tool.status === 'started' || tool.status === 'executing') {
+    const priorCount = totalCount !== null ? ` · ${totalCount} ${resultNoun(tool.tool)} so far` : '';
+    return `${toolActionLabel(tool.tool)}${runCount > 1 ? ` · ${runCount} runs` : ''}${priorCount}...`;
+  }
+  if (tool.status === 'error') return runCount > 1 ? `${runCount} runs failed` : 'Failed';
+  if (totalCount !== null) return `Found ${totalCount} ${resultNoun(tool.tool)}${suffix}`;
   if ((tool.tool === 'create_document_artifact' || tool.tool === 'edit_document_artifact') && tool.result?.document?.file_name) {
     return tool.result.document.file_name;
   }
-  if (tool.result?.count !== undefined) return `Found ${tool.result.count} results`;
   if (tool.result?.success) return tool.result.message || 'Done';
   if (tool.result?.summary) return 'Results ready';
   if (tool.result?.contact) return `Loaded ${tool.result.contact.full_name || 'contact'}`;
   if (tool.result?.company) return `Loaded ${tool.result.company.name || 'company'}`;
   if (tool.result?.deal) return `Loaded ${tool.result.deal.title || 'deal'}`;
   if (tool.result?.requires_confirmation) return 'Needs confirmation';
+  if (runCount > 1) return `${runCount} runs complete`;
   return 'Done';
 }
 
@@ -489,6 +643,8 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
   const isRunning = tool.status === 'started' || tool.status === 'executing';
   const isError = tool.status === 'error';
   const isDone = tool.status === 'done';
+  const runs = getToolRuns(tool);
+  const totalCount = aggregateResultCount(tool);
 
   return (
     <div className={`tool-slide-in rounded-lg border my-2 overflow-hidden transition-all ${
@@ -508,6 +664,16 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
         <span className="text-xs text-text-secondary flex-1 truncate" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
           {toolLabel(tool.tool)}
         </span>
+        {runs.length > 1 && (
+          <span className="rounded-full border border-accent-magenta/20 bg-accent-magenta/10 px-1.5 py-0.5 text-[10px] font-semibold text-accent-magenta">
+            {runs.length}x
+          </span>
+        )}
+        {totalCount !== null && runs.length > 1 && (
+          <span className="hidden sm:inline rounded-full bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-text-muted">
+            {totalCount} total
+          </span>
+        )}
         <span className={`text-[10px] ${
           isError ? 'text-semantic-error' : isDone ? 'text-semantic-success' : 'text-text-muted'
         }`} style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
@@ -517,22 +683,40 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
       </button>
       {!tool.collapsed && (
         <div className="border-t border-border/50 px-3 py-2 space-y-1.5">
-          {tool.input && (
-            <div>
-              <div className="text-[9px] uppercase text-text-muted font-semibold tracking-wider mb-0.5">Input</div>
-              <pre className="text-[11px] text-text-secondary bg-bg-root rounded p-2 overflow-x-auto max-h-32">
-                {JSON.stringify(tool.input, null, 2)}
-              </pre>
+          {runs.map((run, index) => (
+            <div key={run.id} className="rounded-md border border-white/[0.04] bg-white/[0.02] p-2">
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <div className="text-[9px] uppercase text-text-muted font-semibold tracking-wider">
+                  Run {index + 1}
+                </div>
+                <div className={`text-[10px] ${
+                  run.status === 'error' ? 'text-semantic-error' :
+                  run.status === 'done' ? 'text-semantic-success' :
+                  'text-text-muted'
+                }`}>
+                  {run.status === 'done' && resultCountForRun(run) !== null
+                    ? `Found ${resultCountForRun(run)} ${resultNoun(tool.tool)}`
+                    : run.status}
+                </div>
+              </div>
+              {run.input && (
+                <div className="mb-1.5">
+                  <div className="text-[9px] uppercase text-text-muted font-semibold tracking-wider mb-0.5">Input</div>
+                  <pre className="text-[11px] text-text-secondary bg-bg-root rounded p-2 overflow-x-auto max-h-32">
+                    {JSON.stringify(run.input, null, 2)}
+                  </pre>
+                </div>
+              )}
+              {run.result && (
+                <div>
+                  <div className="text-[9px] uppercase text-text-muted font-semibold tracking-wider mb-0.5">Result</div>
+                  <pre className="text-[11px] text-text-secondary bg-bg-root rounded p-2 overflow-x-auto max-h-48">
+                    {JSON.stringify(run.result, null, 2)}
+                  </pre>
+                </div>
+              )}
             </div>
-          )}
-          {tool.result && (
-            <div>
-              <div className="text-[9px] uppercase text-text-muted font-semibold tracking-wider mb-0.5">Result</div>
-              <pre className="text-[11px] text-text-secondary bg-bg-root rounded p-2 overflow-x-auto max-h-48">
-                {JSON.stringify(tool.result, null, 2)}
-              </pre>
-            </div>
-          )}
+          ))}
         </div>
       )}
     </div>
@@ -1195,19 +1379,7 @@ export default function GodModePage() {
           }
           setMessages(m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
-            const toolCalls = [...(msg.toolCalls || [])];
-            if (event.status === 'started') {
-              const last = toolCalls[toolCalls.length - 1];
-              if (!last || last.tool !== event.tool || last.status === 'done' || last.status === 'error') {
-                toolCalls.push({ id: crypto.randomUUID(), tool: event.tool, status: 'started', collapsed: true });
-              }
-            } else if (event.status === 'executing') {
-              const last = toolCalls.findLast(tc => tc.tool === event.tool && tc.status !== 'done' && tc.status !== 'error');
-              if (last) { last.status = 'executing'; last.input = event.input; }
-            } else if (event.status === 'done' || event.status === 'error') {
-              const last = toolCalls.findLast(tc => tc.tool === event.tool && tc.status !== 'done' && tc.status !== 'error');
-              if (last) { last.status = event.status; last.result = event.result; }
-            }
+            const toolCalls = upsertToolEvent(msg.toolCalls || [], event);
             const documentCards = event.result?.document_cards
               ? mergeDocumentCards(msg.documentCards, event.result.document_cards)
               : msg.documentCards;
@@ -1485,7 +1657,7 @@ export default function GodModePage() {
                     {m.toolCalls && m.toolCalls.length > 0 && (
                       <div className="mb-2">
                         {m.toolCalls.map((tc, idx) => (
-                          <ToolCallCard key={tc.id} tool={tc}
+                          <ToolCallCard key={`${tc.id}-${tc.pulseKey || 0}`} tool={tc}
                             onToggle={() => {
                               setMessages(msgs => msgs.map(msg => {
                                 if (msg.id !== m.id) return msg;
