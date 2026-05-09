@@ -31,6 +31,11 @@ import {
   getDealReplayStatusSnapshot,
   type DealReplayStatusSnapshot,
 } from '../lib/deal-replay';
+import {
+  emptyMartyLabStatusSnapshot,
+  getMartyLabStatusSnapshot,
+  type MartyLabStatusSnapshot,
+} from '../lib/marty-lab';
 
 export interface SystemStatusActiveTask {
   type: string;                  // human-readable
@@ -92,6 +97,7 @@ export interface SystemStatusResponse {
   // separate field needed; getDeadLetterItems handles the merge).
   work_queue_inventory: WorkQueueDomainCount[];
   stuck_work_queue: StuckWorkQueueRow[];
+  marty_lab: MartyLabStatusSnapshot;
   deal_replay: DealReplayStatusSnapshot;
   generated_at: string;
 }
@@ -196,6 +202,7 @@ export async function getSystemStatus(
     eventTotalRow, eventEmbeddedRow, attendeeRow,
     userRow, userMissingRows,
     snapshot,
+    martyLab,
     dealReplay,
   ] = await Promise.all([
     // conversations table has no deleted_at column (verified against live
@@ -263,6 +270,12 @@ export async function getSystemStatus(
     // Phase 1: observability surface. Returns
     // { pipelines, dead_letter, stuck_runs, budgets, generated_at }.
     getSystemStatusSnapshot(env, orgId),
+    // MARTy Human Conversation Lab cockpit. This is sandbox visibility
+    // only: experiments and candidate upgrades are tracked here without
+    // mutating the live assistant.
+    ctx.userRole === 'owner' || ctx.userRole === 'admin'
+      ? getMartyLabStatusSnapshot(env, orgId)
+      : Promise.resolve(emptyMartyLabStatusSnapshot()),
     // Safe Six-Week Deals Rebuild cockpit. Keep this in System Status so
     // operators can monitor skips, deferrals, and promotions without
     // turning the Deals board itself into a log.
@@ -303,6 +316,7 @@ export async function getSystemStatus(
     firefly_credentials: snapshot.firefly_credentials,
     work_queue_inventory: snapshot.work_queue_inventory,
     stuck_work_queue: snapshot.stuck_work_queue,
+    marty_lab: martyLab,
     deal_replay: dealReplay,
     generated_at: new Date().toISOString(),
   } satisfies SystemStatusResponse);

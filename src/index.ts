@@ -38,6 +38,7 @@ import * as Integrations from './handlers/integrations';
 import * as SystemStatusHandler from './handlers/system-status';
 import * as Backfill from './handlers/backfill';
 import * as FireflyCredentials from './handlers/firefly-credentials';
+import * as MartyLab from './handlers/marty-lab';
 
 import { handleAuditBatch } from './workers/audit-consumer';
 import { handleWebhookBatch } from './workers/webhook-consumer';
@@ -642,6 +643,20 @@ async function routeAuthenticated(
   if (path.startsWith('/api/admin')) {
     const forbidden = requireRole(ctx, ['owner', 'admin']);
     if (forbidden) return forbidden;
+
+    if (path === '/api/admin/marty-lab' && method === 'GET')
+      return MartyLab.getMartyLabStatus(ctx, env);
+    if (path === '/api/admin/marty-lab/runs' && method === 'POST')
+      return MartyLab.startMartyLabRunHandler(request, ctx, env);
+    m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)$/);
+    if (m && method === 'GET')
+      return MartyLab.getMartyLabRunHandler(m[1], ctx, env);
+    m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)\/cancel$/);
+    if (m && method === 'POST')
+      return MartyLab.cancelMartyLabRunHandler(m[1], ctx, env);
+    m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)\/experiments\/([^/]+)\/result$/);
+    if (m && method === 'POST')
+      return MartyLab.recordMartyLabExperimentResultHandler(request, m[1], m[2], ctx, env);
 
     if (path === '/api/admin/dlq' && method === 'GET') return Admin.listDlq(request, ctx, env);
     m = path.match(/^\/api\/admin\/dlq\/([^/]+)\/replay$/);

@@ -20,6 +20,7 @@ import {
   type StuckWorkQueueEntry,
   type BudgetSnapshotRow,
   type DealReplayEvidenceRow,
+  type MartyLabStatusSnapshot,
   type DealReplayStatusSnapshot,
 } from '@/lib/api';
 import { useBackgroundTasks } from '@/components/background-task-indicator';
@@ -3222,10 +3223,18 @@ function SystemStatusSection() {
         inventory={data.work_queue_inventory}
         stuck={data.stuck_work_queue}
       />
+      <MartyLabStatusCard lab={data.marty_lab || emptyMartyLab} onRefresh={load} />
       <DealReplayStatusCard replay={data.deal_replay || emptyDealReplay} onRefresh={load} />
     </div>
   );
 }
+
+const emptyMartyLab: MartyLabStatusSnapshot = {
+  run: null,
+  experiments: [],
+  upgrade_candidates: [],
+  generated_at: new Date().toISOString(),
+};
 
 const emptyDealReplay: DealReplayStatusSnapshot = {
   run: null,
@@ -3265,6 +3274,364 @@ function ReplayStatusPill({ status }: { status: NonNullable<DealReplayStatusSnap
     failed: { label: 'Failed', cls: 'bg-semantic-error/15 text-semantic-error' },
   }[status];
   return <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${cfg.cls}`}>{cfg.label}</span>;
+}
+
+function MartyLabStatusPill({ status }: { status: string }) {
+  const cfg = status === 'running' || status === 'queued' || status === 'sandbox_applied'
+    ? { cls: 'bg-accent-purple/15 text-accent-purple', label: status === 'sandbox_applied' ? 'Sandbox applied' : status.charAt(0).toUpperCase() + status.slice(1) }
+    : status === 'completed' || status === 'graded' || status === 'validated'
+      ? { cls: 'bg-semantic-success/15 text-semantic-success', label: status.charAt(0).toUpperCase() + status.slice(1) }
+      : status === 'blocked' || status === 'failed' || status === 'rejected'
+        ? { cls: 'bg-semantic-error/15 text-semantic-error', label: status.charAt(0).toUpperCase() + status.slice(1) }
+        : { cls: 'bg-white/[0.06] text-text-muted', label: status.charAt(0).toUpperCase() + status.slice(1) };
+  return <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${cfg.cls}`}>{cfg.label.replace('_', ' ')}</span>;
+}
+
+function formatLabScore(score: number | null | undefined): string {
+  return typeof score === 'number' ? `${Math.round(score)}/100` : '—';
+}
+
+function formatLabList(values: string[] | undefined, fallback = 'None recorded yet'): string {
+  if (!values || values.length === 0) return fallback;
+  return values.slice(0, 3).join(' · ');
+}
+
+function formatLabNote(value: Record<string, unknown>): string {
+  const title = value.title || value.label || value.dimension || value.type;
+  const body = value.body || value.message || value.note || value.summary || value.text;
+  if (title && body) return `${String(title)}: ${String(body)}`;
+  if (body) return String(body);
+  return JSON.stringify(value);
+}
+
+function labSummaryText(summary: Record<string, unknown> | null | undefined): string | null {
+  if (!summary) return null;
+  const conclusion = summary.conclusion || summary.current_phase || summary.message;
+  return conclusion ? String(conclusion) : null;
+}
+
+function labEvidenceList(evidence: Record<string, unknown> | null | undefined, key: string): string[] {
+  const value = evidence?.[key];
+  return Array.isArray(value) ? value.map(item => String(item)).filter(Boolean) : [];
+}
+
+function MartyLabStatusCard({
+  lab,
+  onRefresh,
+}: {
+  lab: MartyLabStatusSnapshot;
+  onRefresh: () => void;
+}) {
+  const [starting, setStarting] = React.useState(false);
+  const [canceling, setCanceling] = React.useState(false);
+  const [openExperiment, setOpenExperiment] = React.useState<string | null>(null);
+  const [openUpgrade, setOpenUpgrade] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const run = lab.run;
+
+  async function startLab() {
+    setStarting(true);
+    setError(null);
+    try {
+      await api.startMartyLabRun();
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start MARTy Lab');
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  async function cancelLab() {
+    if (!run || run.status !== 'running') return;
+    setCanceling(true);
+    setError(null);
+    try {
+      await api.cancelMartyLabRun(run.id);
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to cancel MARTy Lab run');
+    } finally {
+      setCanceling(false);
+    }
+  }
+
+  const experiments = lab.experiments || [];
+  const upgrades = lab.upgrade_candidates || [];
+  const completed = run?.completed_experiments || 0;
+  const total = run?.total_experiments || experiments.length || 0;
+  const progressPct = total > 0 ? Math.round((completed / total) * 100) : 0;
+  const scoreDelta = typeof run?.average_candidate_score === 'number' && typeof run?.average_baseline_score === 'number'
+    ? run.average_candidate_score - run.average_baseline_score
+    : null;
+  const candidateLosses = experiments.filter(exp =>
+    typeof exp.baseline_score === 'number'
+    && typeof exp.candidate_score === 'number'
+    && exp.candidate_score < exp.baseline_score
+  ).length;
+  const summaryText = labSummaryText(run?.summary);
+
+  return (
+    <div className="card p-5 space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <div className="text-sm font-medium text-text-primary">MARTy Human Conversation Lab</div>
+            {run && <MartyLabStatusPill status={run.status} />}
+          </div>
+          <div className="mt-1 max-w-3xl text-xs leading-relaxed text-text-muted">
+            Sandbox-only evaluation for human conversation quality. Each experiment starts with a persona, a simple firm-user goal,
+            a generated rubric, and the same baseline-vs-candidate scoring criteria.
+          </div>
+          {summaryText && <div className="mt-2 text-xs text-text-secondary">{summaryText}</div>}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={startLab}
+            disabled={starting || run?.status === 'running'}
+            className="inline-flex items-center gap-1 rounded-lg border border-accent-magenta/25 px-2.5 py-1.5 text-[11px] text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50"
+          >
+            <Sparkles size={12} /> {starting ? 'Starting...' : run ? 'Start new suite' : 'Start suite'}
+          </button>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-white/[0.04]"
+          >
+            Refresh
+          </button>
+          {run?.status === 'running' && (
+            <button
+              type="button"
+              onClick={cancelLab}
+              disabled={canceling}
+              className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 px-2.5 py-1.5 text-[11px] text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+            >
+              <XIcon size={12} /> {canceling ? 'Canceling...' : 'Cancel'}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded-lg border border-semantic-error/20 bg-semantic-error/10 px-3 py-2 text-xs text-semantic-error">
+          {error}
+        </div>
+      )}
+
+      {!run ? (
+        <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-4">
+          <div className="text-sm font-medium text-text-primary">No lab run yet</div>
+          <div className="mt-1 text-xs leading-relaxed text-text-muted">
+            Start a suite to create ten goal-driven conversations covering follow-ups, meeting prep, document work, deal understanding,
+            weekly summaries, drafting, privacy, and timeline awareness. Nothing changes live MARTy automatically.
+          </div>
+        </div>
+      ) : (
+        <>
+          <div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+              <div className="h-full rounded-full bg-accent-magenta transition-all" style={{ width: `${progressPct}%` }} />
+            </div>
+            <div className="mt-1 flex flex-wrap justify-between gap-2 text-[11px] text-text-muted">
+              <span>{completed.toLocaleString()} of {total.toLocaleString()} experiments graded or closed</span>
+              <span>{run.suite_name} · {run.baseline_label} vs {run.candidate_label}</span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+            <ReplayMetric label="Experiments" value={`${completed}/${total}`} />
+            <ReplayMetric label="Baseline avg" value={formatLabScore(run.average_baseline_score)} />
+            <ReplayMetric
+              label="Candidate avg"
+              value={formatLabScore(run.average_candidate_score)}
+              tone={scoreDelta !== null && scoreDelta > 0 ? 'good' : scoreDelta !== null && scoreDelta < 0 ? 'bad' : 'default'}
+            />
+            <ReplayMetric label="Candidate wins" value={run.winning_candidate_count.toLocaleString()} tone="good" />
+            <ReplayMetric label="Candidate losses" value={candidateLosses.toLocaleString()} tone={candidateLosses > 0 ? 'warn' : 'default'} />
+            <ReplayMetric label="Privacy failures" value={run.privacy_failures.toLocaleString()} tone={run.privacy_failures > 0 ? 'bad' : 'default'} />
+          </div>
+        </>
+      )}
+
+      <div className="grid gap-3 xl:grid-cols-[minmax(0,1.35fr)_minmax(280px,0.65fr)]">
+        <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <div className="text-xs font-medium text-text-primary">Human Conversation Experiments</div>
+              <div className="mt-0.5 text-[11px] text-text-muted">Goal, persona, prompt, fixed rubric, and A/B outcome.</div>
+            </div>
+            <div className="text-[11px] text-text-muted">{experiments.length.toLocaleString()} configured</div>
+          </div>
+          {experiments.length === 0 ? (
+            <div className="mt-3 text-xs text-text-muted">Start a suite to seed human-style conversation experiments.</div>
+          ) : (
+            <div className="mt-3 max-h-[32rem] overflow-y-auto pr-1 space-y-2">
+              {experiments.map(exp => {
+                const isOpen = openExperiment === exp.id;
+                const delta = typeof exp.candidate_score === 'number' && typeof exp.baseline_score === 'number'
+                  ? exp.candidate_score - exp.baseline_score
+                  : null;
+                return (
+                  <div key={exp.id} className="rounded-lg border border-white/[0.04] bg-black/10">
+                    <button
+                      type="button"
+                      onClick={() => setOpenExperiment(isOpen ? null : exp.id)}
+                      className="flex w-full items-start justify-between gap-3 px-3 py-2.5 text-left hover:bg-white/[0.025]"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <MartyLabStatusPill status={exp.status} />
+                          {exp.privacy_failure && (
+                            <span className="rounded-full bg-semantic-error/15 px-2 py-0.5 text-[11px] font-medium text-semantic-error">Privacy fail</span>
+                          )}
+                          <span className="text-xs text-text-muted">{exp.persona.name} · {exp.persona.role}</span>
+                        </div>
+                        <div className="mt-1 text-sm font-medium text-text-primary line-clamp-1">{exp.goal}</div>
+                        <div className="mt-1 text-xs text-text-muted line-clamp-2">“{exp.starting_prompt}”</div>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <div className="text-xs text-text-primary">{formatLabScore(exp.baseline_score)} → {formatLabScore(exp.candidate_score)}</div>
+                        <div className={`mt-0.5 text-[11px] ${delta && delta > 0 ? 'text-semantic-success' : delta && delta < 0 ? 'text-semantic-error' : 'text-text-muted'}`}>
+                          {delta == null ? 'Pending score' : `${delta > 0 ? '+' : ''}${Math.round(delta)} delta`}
+                        </div>
+                      </div>
+                    </button>
+                    {isOpen && (
+                      <div className="border-t border-white/[0.04] px-3 py-3 space-y-3">
+                        <div className="grid gap-3 lg:grid-cols-2">
+                          <div>
+                            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Persona permissions</div>
+                            <div className="mt-1 text-xs leading-relaxed text-text-secondary">{exp.persona.permissions}</div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Recommendation</div>
+                            <div className="mt-1 text-xs leading-relaxed text-text-secondary">{exp.recommendation || 'No recommendation recorded yet.'}</div>
+                          </div>
+                        </div>
+
+                        <div>
+                          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Rubric</div>
+                          <div className="mt-2 grid gap-2 md:grid-cols-2">
+                            {exp.rubric.dimensions.map(dim => (
+                              <div key={dim.key} className="rounded-md bg-white/[0.025] px-2 py-1.5">
+                                <div className="flex items-center justify-between gap-2 text-xs">
+                                  <span className="font-medium text-text-primary">{dim.label}</span>
+                                  <span className="text-text-muted">{Math.round(dim.weight)}%</span>
+                                </div>
+                                <div className="mt-0.5 text-[11px] leading-relaxed text-text-muted line-clamp-2">{dim.success_criteria}</div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="mt-2 text-[11px] text-semantic-error">
+                            Auto-fail: {exp.rubric.automatic_failures.join(' · ')}
+                          </div>
+                        </div>
+
+                        <div className="grid gap-3 lg:grid-cols-2">
+                          <div>
+                            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Friction moments</div>
+                            {exp.friction.length === 0 ? (
+                              <div className="mt-1 text-xs text-text-muted">None recorded yet.</div>
+                            ) : (
+                              <div className="mt-1 space-y-1">
+                                {exp.friction.slice(0, 3).map((item, idx) => (
+                                  <div key={idx} className="text-xs leading-relaxed text-text-secondary">{formatLabNote(item)}</div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <div>
+                            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Findings</div>
+                            {exp.findings.length === 0 ? (
+                              <div className="mt-1 text-xs text-text-muted">None recorded yet.</div>
+                            ) : (
+                              <div className="mt-1 space-y-1">
+                                {exp.findings.slice(0, 3).map((item, idx) => (
+                                  <div key={idx} className="text-xs leading-relaxed text-text-secondary">{formatLabNote(item)}</div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-3">
+          <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
+            <div className="text-xs font-medium text-text-primary">Sandbox Upgrade Hypotheses</div>
+            <div className="mt-0.5 text-[11px] text-text-muted">Nothing promotes live automatically. Privacy failures block candidates.</div>
+            {upgrades.length === 0 ? (
+              <div className="mt-3 text-xs text-text-muted">Start a suite to seed upgrade hypotheses.</div>
+            ) : (
+              <div className="mt-3 max-h-80 overflow-y-auto pr-1 space-y-2">
+                {upgrades.map(upgrade => {
+                  const isOpen = openUpgrade === upgrade.id;
+                  return (
+                    <div key={upgrade.id} className="rounded-md border border-white/[0.04] bg-black/10">
+                      <button
+                        type="button"
+                        onClick={() => setOpenUpgrade(isOpen ? null : upgrade.id)}
+                        className="flex w-full items-start justify-between gap-2 px-2.5 py-2 text-left hover:bg-white/[0.025]"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <MartyLabStatusPill status={upgrade.status} />
+                            <span className="text-xs font-medium text-text-primary line-clamp-1">{upgrade.title}</span>
+                          </div>
+                          <div className="mt-1 text-[11px] text-text-muted line-clamp-2">{upgrade.hypothesis}</div>
+                        </div>
+                        {isOpen ? <ChevronUp size={13} className="shrink-0 text-text-muted" /> : <ChevronDown size={13} className="shrink-0 text-text-muted" />}
+                      </button>
+                      {isOpen && (
+                        <div className="border-t border-white/[0.04] px-2.5 py-2 text-[11px] leading-relaxed text-text-muted space-y-2">
+                          <div>
+                            <span className="text-text-secondary">Targets:</span> {formatLabList(labEvidenceList(upgrade.evidence, 'target_behaviors'))}
+                          </div>
+                          <div>
+                            <span className="text-text-secondary">Guardrails:</span> {formatLabList(labEvidenceList(upgrade.evidence, 'guardrails'))}
+                          </div>
+                          {upgrade.change_summary && (
+                            <div><span className="text-text-secondary">Patch:</span> {upgrade.change_summary}</div>
+                          )}
+                          {upgrade.expected_benefit && (
+                            <div><span className="text-text-secondary">Expected benefit:</span> {upgrade.expected_benefit}</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
+            <div className="text-xs font-medium text-text-primary">Recent Lab Events</div>
+            {run?.recent_events?.length ? (
+              <div className="mt-2 max-h-44 overflow-y-auto pr-1 space-y-2">
+                {run.recent_events.map((event, idx) => (
+                  <div key={`${event.at}-${idx}`} className="text-xs">
+                    <div className="text-text-secondary">{event.message}</div>
+                    <div className="mt-0.5 text-[11px] text-text-muted">{formatRelative(event.at)}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="mt-2 text-xs text-text-muted">Lab events will appear here as the sandbox runner reports results.</div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function friendlyReplayReason(reason: string): string {

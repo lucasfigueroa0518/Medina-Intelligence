@@ -803,6 +803,30 @@ export const api = {
   // Settings → System Status tab (distinct from getSystemStatus above which
   // hits /system/status for admin mode/cache info).
   getSettingsSystemStatus: () => request<SystemStatusResponse>('/settings/system-status'),
+  getMartyLabStatus: () => request<MartyLabStatusSnapshot>('/admin/marty-lab'),
+  startMartyLabRun: (data?: { suite_name?: string; baseline_label?: string; candidate_label?: string }) =>
+    request<MartyLabStatusSnapshot>('/admin/marty-lab/runs', {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
+    }),
+  getMartyLabRun: (runId: string) =>
+    request<MartyLabStatusSnapshot>(`/admin/marty-lab/runs/${encodeURIComponent(runId)}`),
+  cancelMartyLabRun: (runId: string) =>
+    request<MartyLabStatusSnapshot>(`/admin/marty-lab/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    }),
+  recordMartyLabExperimentResult: (
+    runId: string,
+    experimentId: string,
+    data: Record<string, unknown>
+  ) =>
+    request<MartyLabStatusSnapshot>(
+      `/admin/marty-lab/runs/${encodeURIComponent(runId)}/experiments/${encodeURIComponent(experimentId)}/result`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }
+    ),
   getFireflyWebhookSecret: () =>
     request<{ secret: string }>('/integrations/firefly/webhook-secret'),
 
@@ -1075,6 +1099,93 @@ export interface BudgetSnapshotRow {
   last_429_at: string | null;
 }
 
+export type MartyLabRunStatus = 'configured' | 'running' | 'completed' | 'cancelled' | 'failed';
+export type MartyLabExperimentStatus = 'queued' | 'running' | 'graded' | 'blocked' | 'failed' | 'cancelled';
+export type MartyLabUpgradeStatus = 'hypothesis' | 'sandbox_applied' | 'validated' | 'rejected';
+
+export interface MartyLabPersona {
+  name: string;
+  role: string;
+  permissions: string;
+}
+
+export interface MartyLabRubricDimension {
+  key: string;
+  label: string;
+  weight: number;
+  success_criteria: string;
+}
+
+export interface MartyLabRubric {
+  version: string;
+  goal: string;
+  dimensions: MartyLabRubricDimension[];
+  automatic_failures: string[];
+}
+
+export interface MartyLabRunSnapshot {
+  id: string;
+  status: MartyLabRunStatus;
+  suite_name: string;
+  baseline_label: string;
+  candidate_label: string;
+  total_experiments: number;
+  completed_experiments: number;
+  privacy_failures: number;
+  average_baseline_score: number | null;
+  average_candidate_score: number | null;
+  winning_candidate_count: number;
+  recent_events: Array<{ at: string; message: string; experiment_id?: string }>;
+  summary: Record<string, unknown>;
+  completed_at: string | null;
+  cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MartyLabExperimentSnapshot {
+  id: string;
+  run_id: string;
+  status: MartyLabExperimentStatus;
+  persona: MartyLabPersona;
+  goal: string;
+  starting_prompt: string;
+  followup_policy: Record<string, unknown>;
+  rubric: MartyLabRubric;
+  baseline_transcript: Array<Record<string, unknown>>;
+  candidate_transcript: Array<Record<string, unknown>>;
+  tool_trace: Record<string, unknown> | null;
+  sources: Record<string, unknown> | null;
+  friction: Array<Record<string, unknown>>;
+  findings: Array<Record<string, unknown>>;
+  baseline_score: number | null;
+  candidate_score: number | null;
+  recommendation: string | null;
+  privacy_failure: boolean;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface MartyLabUpgradeCandidateSnapshot {
+  id: string;
+  status: MartyLabUpgradeStatus;
+  title: string;
+  hypothesis: string;
+  change_summary: string | null;
+  expected_benefit: string | null;
+  evidence: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MartyLabStatusSnapshot {
+  run: MartyLabRunSnapshot | null;
+  experiments: MartyLabExperimentSnapshot[];
+  upgrade_candidates: MartyLabUpgradeCandidateSnapshot[];
+  generated_at: string;
+}
+
 export type DealReplayStatus = 'running' | 'completed' | 'cancelled' | 'failed';
 
 export interface DealReplayRunSnapshot {
@@ -1196,6 +1307,7 @@ export interface SystemStatusResponse {
   // an empty-state card when registry is unpopulated.
   work_queue_inventory: WorkQueueInventoryEntry[];
   stuck_work_queue: StuckWorkQueueEntry[];
+  marty_lab: MartyLabStatusSnapshot;
   deal_replay: DealReplayStatusSnapshot;
   budgets: BudgetSnapshotRow[];
   generated_at: string;
