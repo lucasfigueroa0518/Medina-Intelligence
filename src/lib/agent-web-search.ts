@@ -1,9 +1,11 @@
 import type { Env } from '../types/env';
+import type { AuthContext } from '../types/interfaces';
 import { callGemini } from './gemini';
 
 export async function webSearch(
   query: string,
   numResults: number | undefined,
+  ctx: AuthContext,
   env: Env
 ): Promise<any> {
   try {
@@ -12,6 +14,9 @@ export async function webSearch(
         system: 'You are a research assistant. Search the web for the given query and provide a comprehensive summary of the top results. Include key facts, dates, and sources. Be concise and factual.',
         user: query,
         max_tokens: 2000,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        budgetSource: 'gemini_web_search',
         grounding: true,
         temperature: 0.3,
       },
@@ -26,7 +31,7 @@ export async function webSearch(
     };
   } catch (e: any) {
     if (e.message?.includes('GEMINI_RATE_LIMITED')) {
-      return { error: 'Web search is temporarily rate limited. Try again in a moment.', query };
+      return { error: 'MARTy web search is temporarily backed off because Google Search grounding is overloaded. Try again now; if it repeats, wait a few minutes.', query };
     }
     if (e.message?.includes('GEMINI_CONFIG_ERROR')) {
       return { error: 'Web search is not configured. The Gemini API key needs to be set up.', query };

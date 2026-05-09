@@ -29,6 +29,7 @@ export type Upstream =
   | 'claude'
   | 'bge'
   | 'gemini'
+  | 'gemini_web_search'
   | 'slack'
   | 'cloudflare_api';
 
@@ -70,6 +71,11 @@ const DEFAULT_CAPS: Partial<Record<Upstream, Partial<Record<BudgetWindow, number
   claude: { minute: 60 },
   bge: { per_second: 10 },
   gemini: { minute: 500 },
+  // MARTy chat web search uses Gemini grounding, but it must not share a
+  // circuit with background enrichment/news/LinkedIn jobs. Keeping a separate
+  // budget prevents noisy crawlers from making user-triggered search look
+  // "rate limited" for hours.
+  gemini_web_search: { minute: 60 },
   slack: { minute: 50 },
   // cloudflare_api.minute 200: CF's published platform limit is 1200
   // requests / 5 minutes globally per account. We cap at 200/min as a
@@ -84,6 +90,10 @@ const DEFAULT_CAPS: Partial<Record<Upstream, Partial<Record<BudgetWindow, number
  *  breaker. Long enough to ride out a real upstream outage; short enough
  *  that operator-free recovery happens within an hour. */
 const CIRCUIT_OPEN_MS = 30 * 60 * 1_000;
+
+/** A circuit should never be open for days. If old rows or clock drift leave
+ *  a far-future circuit_open_until, self-heal on the next read. */
+const MAX_VALID_CIRCUIT_OPEN_MS = 2 * 60 * 60 * 1_000;
 
 /** Number of consecutive 429s required to trip the circuit + lower the
  *  cap. Counter resets to 0 on any successful recordUsage. */
@@ -171,7 +181,31 @@ export async function checkBudget(
   // Circuit check first — when open, deny regardless of cap utilization.
   if (row?.circuit_open_until) {
     const openUntilMs = Date.parse(row.circuit_open_until);
-    if (Number.isFinite(openUntilMs) && openUntilMs > now) {
+    if (Number.isFinite(openUntilMs) && openUntilMs - now > MAX_VALID_CIRCUIT_OPEN_MS) {
+      console.warn(
+        `[upstream-budget] clearing stale ${upstream}.${window} circuit for org=${orgId} user=${uid}; ` +
+        `open_until=${row.circuit_open_until}`
+      );
+      await env.D1.prepare(
+        `UPDATE upstream_budget_ledger
+            SET circuit_open_until = NULL,
+                consecutive_429s = 0,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE org_id = ? AND user_id = ? AND upstream = ? AND bucket_window = ?`
+      ).bind(orgId, uid, upstream, window).run();
+    } else if (Number.isFinite(openUntilMs) && openUntilMs <= now) {
+      await env.D1.prepare(
+        `UPDATE upstream_budget_ledger
+            SET circuit_open_until = NULL,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE org_id = ? AND user_id = ? AND upstream = ? AND bucket_window = ?`
+      ).bind(orgId, uid, upstream, window).run();
+    }
+    if (
+      Number.isFinite(openUntilMs) &&
+      openUntilMs > now &&
+      openUntilMs - now <= MAX_VALID_CIRCUIT_OPEN_MS
+    ) {
       return {
         decision: 'circuit_open',
         used: row.used,

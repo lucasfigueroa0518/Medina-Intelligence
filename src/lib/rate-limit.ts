@@ -1,6 +1,6 @@
 // TRD §5.3 — Claude + enrichment rate limiters
 import type { Env } from '../types/env';
-import { checkBudget, recordUsage, recordRateLimit } from './upstream-budget';
+import { checkBudget, recordUsage, recordRateLimit, type Upstream } from './upstream-budget';
 
 interface ClaudeRateState {
   count: number;
@@ -79,9 +79,11 @@ const BASE_BACKOFF: Record<string, number> = {
 export async function checkGeminiRateLimit(
   env: Env,
   orgId: string,
-  priority: 'high' | 'low'
+  priority: 'high' | 'low',
+  upstream: Extract<Upstream, 'gemini' | 'gemini_web_search'> = 'gemini',
+  userId: string | null = null
 ): Promise<boolean> {
-  const result = await checkBudget(env, orgId, null, 'gemini', 'minute');
+  const result = await checkBudget(env, orgId, userId, upstream, 'minute');
   if (result.decision === 'circuit_open') return false;
   const reserve = Math.floor(result.cap / 3);
   const effectiveCap = priority === 'high' ? result.cap : result.cap - reserve;
@@ -89,7 +91,7 @@ export async function checkGeminiRateLimit(
   // Pre-record to mirror the KV impl's check-and-increment behavior;
   // existing callers expect a successful check to count toward the
   // window total.
-  await recordUsage(env, orgId, null, 'gemini', 'minute');
+  await recordUsage(env, orgId, userId, upstream, 'minute');
   return true;
 }
 const MAX_BACKOFF = 86400;

@@ -5,7 +5,7 @@
 
 import type { Env } from '../types/env';
 import { checkGeminiRateLimit } from './rate-limit';
-import { recordRateLimit } from './upstream-budget';
+import { recordRateLimit, type Upstream } from './upstream-budget';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -47,6 +47,8 @@ export async function callGemini(
     user: string;
     max_tokens: number;
     orgId?: string;
+    userId?: string | null;
+    budgetSource?: Extract<Upstream, 'gemini' | 'gemini_web_search'>;
     grounding?: boolean; // default true
     temperature?: number;
   },
@@ -54,7 +56,9 @@ export async function callGemini(
   env: Env
 ): Promise<GeminiResult> {
   const orgId = params.orgId || 'system';
-  if (!(await checkGeminiRateLimit(env, orgId, priority))) {
+  const userId = params.userId ?? null;
+  const budgetSource = params.budgetSource || 'gemini';
+  if (!(await checkGeminiRateLimit(env, orgId, priority, budgetSource, userId))) {
     throw new Error('GEMINI_RATE_LIMITED');
   }
 
@@ -107,7 +111,7 @@ export async function callGemini(
       // 3 consecutive 429s → cap drops 10%, circuit opens 30 min.
       // Pre-3.2 the KV-backed limiter could only observe its own
       // counter; the ledger gives us upstream-driven evidence.
-      await recordRateLimit(env, orgId, null, 'gemini', 'minute');
+      await recordRateLimit(env, orgId, userId, budgetSource, 'minute');
       throw new Error('GEMINI_RATE_LIMITED');
     }
     throw new Error(`Gemini API error ${resp.status}: ${errTxt.slice(0, 400)}`);

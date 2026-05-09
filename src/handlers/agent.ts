@@ -644,7 +644,7 @@ async function executeTool(
     case 'get_contact_detail': return getContactDetail(ctx, toolInput.contact_id, env);
     case 'get_company_detail': return getCompanyDetail(ctx, toolInput.company_id, env);
     case 'get_deal_detail': return getDealDetail(ctx, toolInput.deal_id, env);
-    case 'web_search': return webSearch(toolInput.query, toolInput.num_results, env);
+    case 'web_search': return webSearch(toolInput.query, toolInput.num_results, ctx, env);
     case 'read_url': return readUrl(toolInput.url);
     // Phase 1 refactor — these now take ctx (with userRole) so the
     // entity-writes lock checks can enforce the same-user exception.
