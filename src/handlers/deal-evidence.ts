@@ -34,7 +34,7 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
-import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
+import { canReadConversationContent, getSharingFlags } from '../lib/helpers';
 
 /* Phase F — manual-link candidate search.
  *
@@ -67,10 +67,19 @@ export async function getDealEvidenceCandidates(
     const rows = await env.D1.prepare(
       `SELECT conv.id, conv.subject, conv.sent_at, conv.from_email, conv.from_name,
               conv.body_preview, conv.source AS conv_source, conv.participant_user_ids,
-              conv.is_campaign_email
+              conv.is_campaign_email, conv.external_message_id,
+              sc.is_private AS slack_is_private
          FROM conversations conv
          LEFT JOIN conversation_deals cd
            ON cd.conversation_id = conv.id AND cd.deal_id = ?
+         LEFT JOIN slack_channels sc
+           ON conv.source = 'slack'
+          AND sc.org_id = conv.org_id
+          AND sc.channel_id = CASE
+            WHEN instr(conv.external_message_id, ':') > 0
+            THEN substr(conv.external_message_id, 1, instr(conv.external_message_id, ':') - 1)
+            ELSE conv.external_message_id
+          END
         WHERE conv.org_id = ?
           AND cd.deal_id IS NULL
           AND (lower(conv.subject) LIKE ? OR lower(conv.body_preview) LIKE ?)
@@ -78,18 +87,24 @@ export async function getDealEvidenceCandidates(
         LIMIT ?`
     ).bind(dealId, ctx.orgId, qPattern, qPattern, limit).all<any>();
     for (const r of rows.results) {
-      const canRead = canReadEmailContent(
-        { source: r.conv_source, participant_user_ids: r.participant_user_ids, is_campaign_email: r.is_campaign_email } as any,
+      const canRead = canReadConversationContent(
+        {
+          source: r.conv_source,
+          participant_user_ids: r.participant_user_ids,
+          is_campaign_email: r.is_campaign_email,
+          slack_is_private: r.slack_is_private,
+        } as any,
         ctx.userId, ctx.userRole, sharingFlags
       );
+      if (!canRead) continue;
       out.push({
         type: 'conversation',
         id: r.id,
         subject: r.subject || '(no subject)',
         sent_at: r.sent_at,
-        from_name: canRead ? (r.from_name || r.from_email || null) : null,
-        body_preview: canRead ? (r.body_preview || null) : null,
-        can_read_body: canRead,
+        from_name: r.from_name || r.from_email || null,
+        body_preview: r.body_preview || null,
+        can_read_body: true,
       });
     }
   }
@@ -206,36 +221,51 @@ export async function getDealEvidence(
             cd.created_by, cu.full_name AS created_by_name,
             conv.subject, conv.sent_at, conv.from_email, conv.from_name,
             conv.body_preview, conv.source AS conv_source,
-            conv.participant_user_ids, conv.is_campaign_email
+            conv.participant_user_ids, conv.is_campaign_email,
+            conv.external_message_id, sc.is_private AS slack_is_private
        FROM conversation_deals cd
        JOIN conversations conv ON conv.id = cd.conversation_id
+       LEFT JOIN slack_channels sc
+         ON conv.source = 'slack'
+        AND sc.org_id = conv.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(conv.external_message_id, ':') > 0
+          THEN substr(conv.external_message_id, 1, instr(conv.external_message_id, ':') - 1)
+          ELSE conv.external_message_id
+        END
        LEFT JOIN users cu ON cu.id = cd.created_by
       WHERE cd.deal_id = ? AND conv.org_id = ?
       ORDER BY conv.sent_at DESC`
   ).bind(id, ctx.orgId).all<any>();
 
   const conversationEvidence: ConversationEvidence[] = convRows.results.map(r => {
-    const canRead = canReadEmailContent(
-      { source: r.conv_source, participant_user_ids: r.participant_user_ids, is_campaign_email: r.is_campaign_email } as any,
+    const canRead = canReadConversationContent(
+      {
+        source: r.conv_source,
+        participant_user_ids: r.participant_user_ids,
+        is_campaign_email: r.is_campaign_email,
+        slack_is_private: r.slack_is_private,
+      } as any,
       ctx.userId, ctx.userRole, sharingFlags
     );
+    if (!canRead) return null;
     return {
       type: 'conversation',
       id: r.id,
       conversation_id: r.id,
       subject: r.subject ?? null,
       sent_at: r.sent_at,
-      from_email: canRead ? (r.from_email ?? null) : null,
-      from_name: canRead ? (r.from_name ?? null) : null,
-      body_preview: canRead ? (r.body_preview ?? null) : null,
+      from_email: r.from_email ?? null,
+      from_name: r.from_name ?? null,
+      body_preview: r.body_preview ?? null,
       source: r.source,
       confidence: r.confidence,
       linked_at: r.linked_at,
       created_by: r.created_by ?? null,
       created_by_name: r.created_by_name ?? null,
-      can_read_body: canRead,
+      can_read_body: true,
     };
-  });
+  }).filter((r): r is ConversationEvidence => Boolean(r));
 
   const eventRows = await env.D1.prepare(
     `SELECT ed.event_id AS id, ed.source, ed.confidence, ed.created_at AS linked_at,

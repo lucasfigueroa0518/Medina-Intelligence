@@ -10,8 +10,15 @@ import type {
 import { hydrateChunks } from './hydration';
 import { runEmbedding } from './embedding';
 import { truncateToTokens } from './tokens';
-import { getOrgSettings, getSharingFlags, parseParticipantUserIds } from './helpers';
+import {
+  canReadConversationContent,
+  getOrgSettings,
+  getSharingFlags,
+  hasOrgWidePrivateDataAccess,
+  parseParticipantUserIds,
+} from './helpers';
 import { getEntityIndex } from './entity-index';
+import { isDocumentAccessibleToUser } from './document-acl';
 
 export interface RetrievalOptions {
   deepDive?: boolean;
@@ -52,6 +59,188 @@ function detectDocTypes(query: string): string[] {
     if (keywords.some(kw => lower.includes(kw))) matched.push(docType);
   }
   return matched;
+}
+
+function placeholders(count: number): string {
+  return Array.from({ length: count }, () => '?').join(',');
+}
+
+function sourceTable(chunk: VectorMatch): string {
+  return String(chunk.metadata.source_table || '').toLowerCase();
+}
+
+function documentType(chunk: VectorMatch): string {
+  return String(chunk.metadata.document_type || '').toLowerCase();
+}
+
+function sourceId(chunk: VectorMatch): string | null {
+  const id = chunk.metadata.source_id;
+  return typeof id === 'string' && id.length > 0 ? id : null;
+}
+
+function requiresConversationParticipantGate(chunk: VectorMatch): boolean {
+  const table = sourceTable(chunk);
+  // Conversation chunks can contain private interaction content. Do not trust
+  // Vectorize visibility alone here: old vectors have carried stale org_wide
+  // metadata even when the authoritative conversation row is participant-
+  // scoped. The D1 row is the source of truth for all conversation families.
+  return table === 'conversations';
+}
+
+function canReadMeetingParticipants(
+  participantRaw: string | null | undefined,
+  userId: string,
+  sharingSet: Set<string>
+): boolean {
+  const participants = parseParticipantUserIds(participantRaw);
+  if (participants.length === 0) return false;
+  if (participants.includes(userId)) return true;
+  return participants.some(pid => sharingSet.has(pid));
+}
+
+async function filterMatchesByAuthoritativeAcl(
+  matches: VectorMatch[],
+  pq: ProcessedQuery,
+  env: Env
+): Promise<VectorMatch[]> {
+  // Keep the metadata ACL as the first gate so confidential/private Slack
+  // channels and other non-D1-backed metadata remain protected.
+  const metadataAllowed = matches.filter(pq.postRetrievalFilter);
+  if (hasOrgWidePrivateDataAccess(pq.userRole)) return metadataAllowed;
+
+  const sharingSet = new Set(Object.keys(pq.sharingFlags || {}));
+
+  const conversationIds = [...new Set(
+    metadataAllowed
+      .filter(requiresConversationParticipantGate)
+      .map(sourceId)
+      .filter((id): id is string => Boolean(id))
+  )];
+  const eventIds = [...new Set(
+    metadataAllowed
+      .filter(c => sourceTable(c) === 'events' && documentType(c) === 'transcript')
+      .map(sourceId)
+      .filter((id): id is string => Boolean(id))
+  )];
+  const documentIds = [...new Set(
+    metadataAllowed
+      .filter(c => sourceTable(c) === 'documents')
+      .map(sourceId)
+      .filter((id): id is string => Boolean(id))
+  )];
+
+  const conversationAccess = new Map<string, boolean>();
+  if (conversationIds.length > 0) {
+    const rows = await env.D1.prepare(
+      `SELECT c.id, c.source, c.participant_user_ids, c.is_campaign_email,
+              sc.is_private AS slack_is_private
+         FROM conversations c
+         LEFT JOIN slack_channels sc
+           ON c.source = 'slack'
+          AND sc.org_id = c.org_id
+          AND sc.channel_id = CASE
+            WHEN instr(c.external_message_id, ':') > 0
+            THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+            ELSE c.external_message_id
+          END
+        WHERE c.org_id = ? AND c.id IN (${placeholders(conversationIds.length)})`
+    ).bind(pq.orgId, ...conversationIds).all<{
+      id: string;
+      source: string;
+      participant_user_ids: string | null;
+      is_campaign_email: number | null;
+      slack_is_private: number | null;
+    }>();
+
+    for (const id of conversationIds) conversationAccess.set(id, false);
+    for (const row of rows.results || []) {
+      conversationAccess.set(
+        row.id,
+        canReadConversationContent(
+          {
+            source: row.source as any,
+            participant_user_ids: row.participant_user_ids || '[]',
+            is_campaign_email: row.is_campaign_email || 0,
+            slack_is_private: row.slack_is_private,
+          },
+          pq.userId,
+          pq.userRole,
+          pq.sharingFlags || {}
+        )
+      );
+    }
+  }
+
+  const eventAccess = new Map<string, boolean>();
+  if (eventIds.length > 0) {
+    const rows = await env.D1.prepare(
+      `SELECT e.id,
+              GROUP_CONCAT(ea.user_id) AS participant_user_ids
+         FROM events e
+         LEFT JOIN event_attendees ea
+           ON ea.event_id = e.id
+          AND ea.user_id IS NOT NULL
+        WHERE e.org_id = ? AND e.id IN (${placeholders(eventIds.length)})
+        GROUP BY e.id`
+    ).bind(pq.orgId, ...eventIds).all<{
+      id: string;
+      participant_user_ids: string | null;
+    }>();
+
+    for (const id of eventIds) eventAccess.set(id, false);
+    for (const row of rows.results || []) {
+      eventAccess.set(
+        row.id,
+        canReadMeetingParticipants(row.participant_user_ids, pq.userId, sharingSet)
+      );
+    }
+  }
+
+  const documentAccess = new Map<string, boolean>();
+  if (documentIds.length > 0) {
+    const rows = await env.D1.prepare(
+      `SELECT id, visibility, participant_user_ids, uploaded_by
+         FROM documents
+        WHERE org_id = ? AND deleted_at IS NULL AND id IN (${placeholders(documentIds.length)})`
+    ).bind(pq.orgId, ...documentIds).all<{
+      id: string;
+      visibility: string | null;
+      participant_user_ids: string | null;
+      uploaded_by: string | null;
+    }>();
+
+    for (const id of documentIds) documentAccess.set(id, false);
+    for (const row of rows.results || []) {
+      documentAccess.set(
+        row.id,
+        isDocumentAccessibleToUser(row, pq.userId, pq.userRole, sharingSet)
+      );
+    }
+  }
+
+  const allowed = metadataAllowed.filter(chunk => {
+    const table = sourceTable(chunk);
+    const id = sourceId(chunk);
+    if (!id) return true;
+    if (requiresConversationParticipantGate(chunk)) return conversationAccess.get(id) === true;
+    if (table === 'events' && documentType(chunk) === 'transcript') return eventAccess.get(id) === true;
+    if (table === 'documents') return documentAccess.get(id) === true;
+    return true;
+  });
+
+  const blocked = metadataAllowed.length - allowed.length;
+  if (blocked > 0) {
+    retrievalLog('acl-source-filter', {
+      query: pq.originalQuery.slice(0, 80),
+      query_emb_hash: hashFirstFiveDims(pq.embeddedQuery),
+      metadata_allowed_count: metadataAllowed.length,
+      source_allowed_count: allowed.length,
+      blocked_count: blocked,
+      blocked_doc_type_counts: countByDocType(metadataAllowed.filter(c => !allowed.includes(c))),
+    });
+  }
+
+  return allowed;
 }
 
 function hashFirstFiveDims(embedding: number[]): string {
@@ -971,7 +1160,7 @@ export async function preprocessQuery(
   // case gets a structured warn, so we can spot legitimate content being denied
   // due to data-integrity gaps and backfill the missing visibility.
   const postRetrievalFilter = (chunk: VectorMatch): boolean => {
-    if (userRole === 'owner') return true;
+    if (hasOrgWidePrivateDataAccess(userRole)) return true;
 
     // The interface narrows visibility to a fixed union, but Vectorize stores
     // `unknown` per-field — treat it as a string at runtime in case a vector
@@ -998,7 +1187,7 @@ export async function preprocessQuery(
     }
 
     if (visibility === 'confidential') {
-      return userRole === 'admin';
+      return hasOrgWidePrivateDataAccess(userRole);
     }
 
     if (visibility === 'org_wide' || visibility === 'public' || visibility === 'org') {
@@ -1021,6 +1210,9 @@ export async function preprocessQuery(
     entityIds: [...new Set(entityIds)].slice(0, maxEntities),
     filters: {},
     orgId: session.org_id,
+    userId,
+    userRole,
+    sharingFlags,
     postRetrievalFilter,
   };
 }
@@ -1252,8 +1444,8 @@ export async function retrieveContext(
   // chunks that score 0.40–0.55 (long transcripts, terse Slack messages).
   // Same architectural shape as the recency-floor exemption in rerank:
   // discipline applies to broad queries, exempts caller-targeted ones.
-  const filtered = internalMatches
-    .filter(pq.postRetrievalFilter)
+  const aclFiltered = await filterMatchesByAuthoritativeAcl(internalMatches, pq, env);
+  const filtered = aclFiltered
     .filter(m => m.score >= 0.55 || targetedIds.has(m.id));
 
   const hydrateCandidates = selectHydrationCandidates(
@@ -1269,6 +1461,8 @@ export async function retrieveContext(
     internal_count: internalMatches.length,
     internal_doc_type_counts: countByDocType(internalMatches),
     targeted_ids_count: targetedIds.size,
+    acl_filtered_count: aclFiltered.length,
+    acl_blocked_count: internalMatches.length - aclFiltered.length,
     filtered_count: filtered.length,
     filtered_doc_type_counts: countByDocType(filtered),
     targeted_survived_filter_count: countTargetedIds(filtered, targetedIds),

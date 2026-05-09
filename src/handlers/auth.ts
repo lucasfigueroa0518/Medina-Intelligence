@@ -190,9 +190,12 @@ export async function requireAuth(
 
 export function requireRole(
   ctx: AuthContext,
-  roles: Array<'owner' | 'admin' | 'member'>
+  roles: Array<'owner' | 'admin' | 'member' | 'super_admin'>
 ): Response | null {
-  if (!roles.includes(ctx.userRole)) {
+  const effectiveRoles = ctx.userRole === 'super_admin'
+    ? [...roles, 'super_admin', 'owner']
+    : roles;
+  if (!effectiveRoles.includes(ctx.userRole)) {
     return new Response(
       JSON.stringify({ error: 'AUTH_FORBIDDEN' }),
       { status: 403, headers: { 'Content-Type': 'application/json' } }

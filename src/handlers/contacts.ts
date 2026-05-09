@@ -5,7 +5,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { mergeContacts, resolveMergedContact, cleanupVectorsForEntity } from '../lib/merge';
-import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
+import { canReadConversationContent, getSharingFlags, hasOrgWidePrivateDataAccess, parseParticipantUserIds } from '../lib/helpers';
 import { isDocumentAccessibleToUser } from '../lib/document-acl';
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
@@ -691,18 +691,30 @@ export async function getContactTimeline(
 
   const [events, conversations, tasks, documents, sharingFlags] = await Promise.all([
     env.D1.prepare(
-      `SELECT e.id, e.title, e.start_time as timestamp, 'event' as type, e.event_type as subtype
-       FROM events e JOIN event_attendees ea ON e.id = ea.event_id
+      `SELECT e.id, e.title, e.start_time as timestamp, 'event' as type, e.event_type as subtype,
+              GROUP_CONCAT(all_ea.user_id) AS participant_user_ids
+       FROM events e
+       JOIN event_attendees ea ON e.id = ea.event_id
+       LEFT JOIN event_attendees all_ea ON all_ea.event_id = e.id
        WHERE ea.contact_id = ? AND e.org_id = ? AND e.deleted_at IS NULL
+       GROUP BY e.id
        ORDER BY e.start_time DESC LIMIT ?`
     ).bind(id, ctx.orgId, sourceLimit).all(),
     env.D1.prepare(
       `SELECT c.id, c.subject as title, c.sent_at as timestamp, 'conversation' as type,
               c.source as subtype, c.body_preview, c.participant_user_ids,
               c.source as conv_source, c.is_campaign_email, c.from_email,
-              c.external_thread_id,
+              c.external_thread_id, c.external_message_id, sc.is_private AS slack_is_private,
               c.has_attachments, c.attachment_count
        FROM conversations c JOIN conversation_contacts cc ON c.id = cc.conversation_id
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
        WHERE cc.contact_id = ? AND c.org_id = ?
        ORDER BY c.sent_at DESC LIMIT ?`
     ).bind(id, ctx.orgId, sourceLimit).all(),
@@ -758,11 +770,12 @@ export async function getContactTimeline(
   }
 
   const conversationsWithAccess = conversations.results.map((c: any) => {
-    const canRead = canReadEmailContent(
+    const canRead = canReadConversationContent(
       {
         source: c.conv_source,
         participant_user_ids: c.participant_user_ids,
         is_campaign_email: c.is_campaign_email,
+        slack_is_private: c.slack_is_private,
       } as any,
       ctx.userId,
       ctx.userRole,
@@ -774,7 +787,8 @@ export async function getContactTimeline(
       body_preview: canRead ? c.body_preview : null,
       attachment_names: attachmentsByConv[c.id] || [],
     };
-  });
+  }).filter((c: any) => c.canReadContent)
+    .map(({ participant_user_ids: _p, is_campaign_email: _i, slack_is_private: _s, external_message_id: _m, ...rest }: any) => rest);
 
   // Contact timelines can be joined through several participant/import paths.
   // Collapse the noisy duplicates users see as repeated same-day calendar rows
@@ -798,7 +812,14 @@ export async function getContactTimeline(
   const dedupedConvs = [...threadGroups.values(), ...standaloneConvs];
 
   const eventGroups = new Map<string, any>();
-  for (const e of (events.results as any[])) {
+  const sharingSet = new Set(Object.keys(sharingFlags));
+  const eventsWithAccess = (events.results as any[]).filter(e => {
+    if (hasOrgWidePrivateDataAccess(ctx.userRole)) return true;
+    const participants = parseParticipantUserIds(e.participant_user_ids);
+    return participants.includes(ctx.userId) || participants.some(pid => sharingSet.has(pid));
+  }).map(({ participant_user_ids: _p, ...rest }) => rest);
+
+  for (const e of eventsWithAccess) {
     const titleKey = String(e.title || '').trim().toLowerCase().replace(/\s+/g, ' ');
     const dayKey = String(e.timestamp || '').slice(0, 10);
     const key = `${titleKey}|${dayKey}`;

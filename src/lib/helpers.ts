@@ -216,6 +216,10 @@ export function parseParticipantUserIds(raw: string | string[] | null | undefine
   return trimmed.split(',').map(s => s.trim()).filter(Boolean);
 }
 
+export function hasOrgWidePrivateDataAccess(userRole?: string | null): boolean {
+  return userRole === 'owner' || userRole === 'super_admin';
+}
+
 export function canReadEmailContent(
   conversation: Pick<Conversation, 'source' | 'participant_user_ids' | 'is_campaign_email'>,
   requestingUserId: string,
@@ -224,13 +228,31 @@ export function canReadEmailContent(
 ): boolean {
   if (conversation.source === 'slack') return true;
   if ((conversation as any).is_campaign_email) return true;
-  if (userRole === 'owner') return true;
+  if (hasOrgWidePrivateDataAccess(userRole)) return true;
 
   const participants = parseParticipantUserIds(conversation.participant_user_ids);
   if (participants.length === 0) return false;
   if (participants.includes(requestingUserId)) return true;
   if (participantSharingFlags && participants.some(pid => participantSharingFlags[pid])) return true;
   return false;
+}
+
+export function canReadConversationContent(
+  conversation: Pick<Conversation, 'source' | 'participant_user_ids' | 'is_campaign_email'> & {
+    slack_is_private?: number | boolean | null;
+  },
+  requestingUserId: string,
+  userRole: string,
+  participantSharingFlags?: Record<string, boolean>
+): boolean {
+  if (conversation.source === 'slack' && conversation.slack_is_private) {
+    if (hasOrgWidePrivateDataAccess(userRole)) return true;
+    const participants = parseParticipantUserIds(conversation.participant_user_ids);
+    if (participants.includes(requestingUserId)) return true;
+    if (participantSharingFlags && participants.some(pid => participantSharingFlags[pid])) return true;
+    return false;
+  }
+  return canReadEmailContent(conversation, requestingUserId, userRole, participantSharingFlags);
 }
 
 export async function getSharingFlags(orgId: string, env: Env): Promise<Record<string, boolean>> {

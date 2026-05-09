@@ -4,7 +4,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
-import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
+import { canReadConversationContent, getSharingFlags } from '../lib/helpers';
 import { commitProgressiveApproval, markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { recordApproval, recordApprovalOfDeletion, recordRejection } from '../lib/proposal-evaluator';
@@ -71,11 +71,21 @@ export async function listApprovalQueue(
 
       if (row.source_communication_id && row.source_visibility === 'private') {
         const conv = await env.D1.prepare(
-          'SELECT source, participant_user_ids, is_campaign_email FROM conversations WHERE id = ?'
-        ).bind(row.source_communication_id).first<any>();
+          `SELECT c.source, c.participant_user_ids, c.is_campaign_email, sc.is_private AS slack_is_private
+             FROM conversations c
+             LEFT JOIN slack_channels sc
+               ON c.source = 'slack'
+              AND sc.org_id = c.org_id
+              AND sc.channel_id = CASE
+                WHEN instr(c.external_message_id, ':') > 0
+                THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+                ELSE c.external_message_id
+              END
+            WHERE c.id = ? AND c.org_id = ?`
+        ).bind(row.source_communication_id, ctx.orgId).first<any>();
 
         const canRead = conv
-          ? canReadEmailContent(conv, ctx.userId, ctx.userRole, sharingFlags)
+          ? canReadConversationContent(conv, ctx.userId, ctx.userRole, sharingFlags)
           : false;
 
         if (!canRead) {

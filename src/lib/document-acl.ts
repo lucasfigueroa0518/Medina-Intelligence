@@ -4,7 +4,7 @@
 // document chunks. Without this, a non-owner calling GET /api/documents would
 // see every row in the org while the same user's MARTy queries would correctly
 // hide private rows — a privacy bug, not just an inconsistency.
-import { parseParticipantUserIds } from './helpers';
+import { hasOrgWidePrivateDataAccess, parseParticipantUserIds } from './helpers';
 
 export interface DocumentAclFields {
   visibility?: string | null;
@@ -18,7 +18,7 @@ export function isDocumentAccessibleToUser(
   userRole: string,
   sharingSet?: Set<string>
 ): boolean {
-  if (userRole === 'owner') return true;
+  if (hasOrgWidePrivateDataAccess(userRole)) return true;
 
   const visibility = doc.visibility;
   // Default-deny on missing visibility — matches retrieval.ts:198-205. A row

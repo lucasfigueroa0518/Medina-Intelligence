@@ -2,7 +2,7 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
-import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
+import { canReadConversationContent, getSharingFlags } from '../lib/helpers';
 
 export async function listConversations(
   request: Request,
@@ -43,7 +43,19 @@ export async function listConversations(
 
   const [result, countResult, sharingFlags] = await Promise.all([
     env.D1.prepare(
-      `SELECT c.* FROM conversations c ${join} WHERE ${whereClause} ORDER BY c.sent_at DESC LIMIT ? OFFSET ?`
+      `SELECT c.*, sc.is_private AS slack_is_private
+       FROM conversations c
+       ${join}
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
+       WHERE ${whereClause}
+       ORDER BY c.sent_at DESC LIMIT ? OFFSET ?`
     ).bind(...binds, limit, offset).all(),
     env.D1.prepare(
       `SELECT COUNT(*) as total FROM conversations c ${join} WHERE ${whereClause}`
@@ -52,11 +64,12 @@ export async function listConversations(
   ]);
 
   const conversations = result.results.map((c: any) => {
-    const canRead = canReadEmailContent(
+    const canRead = canReadConversationContent(
       {
         source: c.source,
         participant_user_ids: c.participant_user_ids,
         is_campaign_email: c.is_campaign_email,
+        slack_is_private: c.slack_is_private,
       } as any,
       ctx.userId,
       ctx.userRole,
@@ -70,14 +83,15 @@ export async function listConversations(
       topics: canRead ? c.topics : null,
       action_items: canRead ? c.action_items : null,
     };
-  });
+  }).filter((c: any) => c.canReadContent)
+    .map(({ slack_is_private: _s, participant_user_ids: _p, is_campaign_email: _i, ...rest }: any) => rest);
 
   return jsonResponse({
     conversations,
-    total: countResult?.total || 0,
+    total: conversations.length,
     limit,
     offset,
-    has_more: offset + limit < (countResult?.total || 0),
+    has_more: conversations.length === limit && offset + limit < (countResult?.total || 0),
   });
 }
 
@@ -88,27 +102,33 @@ export async function getConversation(
 ): Promise<Response> {
   const [conv, sharingFlags] = await Promise.all([
     env.D1.prepare(
-      'SELECT * FROM conversations WHERE id = ? AND org_id = ?'
+      `SELECT c.*, sc.is_private AS slack_is_private
+       FROM conversations c
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
+       WHERE c.id = ? AND c.org_id = ?`
     ).bind(id, ctx.orgId).first<any>(),
     getSharingFlags(ctx.orgId, env),
   ]);
 
   if (!conv) return errorResponse('CONVERSATION_NOT_FOUND', 404);
 
-  const canRead = canReadEmailContent(conv, ctx.userId, ctx.userRole, sharingFlags);
+  const canRead = canReadConversationContent(conv, ctx.userId, ctx.userRole, sharingFlags);
+  if (!canRead) return errorResponse('CONVERSATION_NOT_FOUND', 404);
 
   const out: any = {
     ...conv,
     canReadContent: canRead,
   };
-
-  if (!canRead) {
-    out.body_preview = null;
-    out.sentiment = null;
-    out.topics = null;
-    out.action_items = null;
-    return jsonResponse({ conversation: out });
-  }
+  delete out.participant_user_ids;
+  delete out.is_campaign_email;
+  delete out.slack_is_private;
 
   // Fetch body from R2
   try {

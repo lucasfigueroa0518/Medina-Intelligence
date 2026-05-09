@@ -25,7 +25,7 @@
 
 import type { Env } from '../types/env';
 import { callClaude } from './claude';
-import { canReadEmailContent, getSharingFlags, parseParticipantUserIds } from './helpers';
+import { canReadConversationContent, getSharingFlags, parseParticipantUserIds } from './helpers';
 
 // Tunables. Stored as constants so behavior is auditable.
 export const STALENESS_WINDOW_MS = 60 * 60 * 1000;            // 1h per locked freshness contract
@@ -132,6 +132,7 @@ interface ConversationRow {
   source: 'outlook' | 'slack' | 'manual';
   participant_user_ids: string;
   is_campaign_email: number;
+  slack_is_private?: number | null;
   subject: string | null;
   body_preview: string | null;
   from_email: string | null;
@@ -160,14 +161,15 @@ async function fetchDealConversations(
   env: Env
 ): Promise<ConversationRow[]> {
   const rows = await env.D1.prepare(
-    `SELECT id, source, participant_user_ids, is_campaign_email, subject,
-            body_preview, from_email, sent_at, direction
-       FROM (
+	    `SELECT x.id, x.source, x.participant_user_ids, x.is_campaign_email, x.subject,
+	            x.body_preview, x.from_email, x.sent_at, x.direction,
+	            sc.is_private AS slack_is_private
+	       FROM (
          -- Direct links (Phase B+). source='manual' / 'auto_high' /
          -- 'inherited_channel' / 'llm_classification' / etc.
-         SELECT conv.id, conv.source, conv.participant_user_ids,
-                conv.is_campaign_email, conv.subject, conv.body_preview,
-                conv.from_email, conv.sent_at, conv.direction
+	         SELECT conv.id, conv.source, conv.participant_user_ids,
+	                conv.is_campaign_email, conv.subject, conv.body_preview,
+	                conv.from_email, conv.sent_at, conv.direction, conv.external_message_id
            FROM conversation_deals cd
            JOIN conversations conv ON cd.conversation_id = conv.id
           WHERE cd.deal_id = ? AND conv.org_id = ?
@@ -175,17 +177,25 @@ async function fetchDealConversations(
          -- Fallback: contact-overlap two-hop join via PR #24's
          -- propagateContactToOpenDeals. Stays as evidence source for
          -- deals that pre-date the direct-link era.
-         SELECT conv.id, conv.source, conv.participant_user_ids,
-                conv.is_campaign_email, conv.subject, conv.body_preview,
-                conv.from_email, conv.sent_at, conv.direction
+	         SELECT conv.id, conv.source, conv.participant_user_ids,
+	                conv.is_campaign_email, conv.subject, conv.body_preview,
+	                conv.from_email, conv.sent_at, conv.direction, conv.external_message_id
            FROM deal_contacts dc
            JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
            JOIN conversations conv       ON cc.conversation_id = conv.id
           WHERE dc.deal_id = ? AND dc.org_id = ? AND conv.org_id = ?
-       )
-      ORDER BY sent_at DESC
-      LIMIT ?`
-  ).bind(dealId, orgId, dealId, orgId, orgId, MAX_CONVERSATIONS_FOR_PROMPT)
+	       ) x
+	      LEFT JOIN slack_channels sc
+	        ON x.source = 'slack'
+	       AND sc.org_id = ?
+	       AND sc.channel_id = CASE
+	         WHEN instr(x.external_message_id, ':') > 0
+	         THEN substr(x.external_message_id, 1, instr(x.external_message_id, ':') - 1)
+	         ELSE x.external_message_id
+	       END
+	      ORDER BY sent_at DESC
+	      LIMIT ?`
+	  ).bind(dealId, orgId, dealId, orgId, orgId, orgId, MAX_CONVERSATIONS_FOR_PROMPT)
    .all<ConversationRow>();
   return rows.results;
 }
@@ -201,12 +211,13 @@ function filterConversationsByAcl(
   ctx: UserContext
 ): ConversationRow[] {
   return conversations.filter(c =>
-    canReadEmailContent(
-      {
-        source: c.source,
-        participant_user_ids: c.participant_user_ids,
-        is_campaign_email: c.is_campaign_email as 0 | 1,
-      },
+	    canReadConversationContent(
+	      {
+	        source: c.source,
+	        participant_user_ids: c.participant_user_ids,
+	        is_campaign_email: c.is_campaign_email as 0 | 1,
+	        slack_is_private: c.slack_is_private,
+	      },
       ctx.userId,
       ctx.userRole,
       ctx.sharingFlags
@@ -560,7 +571,7 @@ export async function invalidateForConversation(
   const sharingFlags = await getSharingFlags(orgId, env);
   const readableUserIds: string[] = [];
   for (const u of userRows.results) {
-    const ok = canReadEmailContent(
+    const ok = canReadConversationContent(
       {
         source: conversationSource,
         participant_user_ids: conversationParticipantUserIds,

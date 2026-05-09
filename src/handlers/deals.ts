@@ -4,7 +4,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
-import { canReadEmailContent, getSharingFlags } from '../lib/helpers';
+import { canReadConversationContent, getSharingFlags, hasOrgWidePrivateDataAccess, parseParticipantUserIds } from '../lib/helpers';
 import { computeDealIntelligence, readDealIntelligence } from '../lib/deal-intelligence';
 import { updateDealFields } from '../lib/entity-writes';
 import {
@@ -602,14 +602,29 @@ async function resolveDealOrigin(
 
   if (origin.source_kind === 'conversation' && origin.source_communication_id) {
     const conv = await env.D1.prepare(
-      `SELECT subject, sent_at, from_email, from_name, source, participant_user_ids, is_campaign_email
-         FROM conversations
-        WHERE id = ? AND org_id = ?`
+      `SELECT c.subject, c.sent_at, c.from_email, c.from_name, c.source,
+              c.participant_user_ids, c.is_campaign_email,
+              sc.is_private AS slack_is_private
+         FROM conversations c
+         LEFT JOIN slack_channels sc
+           ON c.source = 'slack'
+          AND sc.org_id = c.org_id
+          AND sc.channel_id = CASE
+            WHEN instr(c.external_message_id, ':') > 0
+            THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+            ELSE c.external_message_id
+          END
+        WHERE c.id = ? AND c.org_id = ?`
     ).bind(origin.source_communication_id, ctx.orgId).first<any>();
     if (conv) {
       const sharingFlags = await getSharingFlags(ctx.orgId, env);
-      canRead = canReadEmailContent(
-        { source: conv.source, participant_user_ids: conv.participant_user_ids, is_campaign_email: conv.is_campaign_email } as any,
+      canRead = canReadConversationContent(
+        {
+          source: conv.source,
+          participant_user_ids: conv.participant_user_ids,
+          is_campaign_email: conv.is_campaign_email,
+          slack_is_private: conv.slack_is_private,
+        } as any,
         ctx.userId, ctx.userRole, sharingFlags
       );
       sentAt = conv.sent_at ?? sentAt;
@@ -620,12 +635,20 @@ async function resolveDealOrigin(
     }
   } else if (origin.source_kind === 'event' && origin.source_communication_id) {
     const ev = await env.D1.prepare(
-      `SELECT title, start_time FROM events
-        WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-    ).bind(origin.source_communication_id, ctx.orgId).first<{ title: string; start_time: string }>();
+      `SELECT e.title, e.start_time, GROUP_CONCAT(ea.user_id) AS participant_user_ids
+         FROM events e
+         LEFT JOIN event_attendees ea ON ea.event_id = e.id
+        WHERE e.id = ? AND e.org_id = ? AND e.deleted_at IS NULL
+        GROUP BY e.id`
+    ).bind(origin.source_communication_id, ctx.orgId).first<{ title: string; start_time: string; participant_user_ids: string | null }>();
     if (ev) {
-      subject = ev.title;
+      const sharingFlags = await getSharingFlags(ctx.orgId, env);
+      const participants = parseParticipantUserIds(ev.participant_user_ids);
+      canRead = hasOrgWidePrivateDataAccess(ctx.userRole) ||
+        participants.includes(ctx.userId) ||
+        participants.some(pid => sharingFlags[pid]);
       sentAt = ev.start_time;
+      if (canRead) subject = ev.title;
     }
   }
 
@@ -1149,10 +1172,19 @@ export async function getDealTimeline(
       `SELECT conv.id, conv.subject AS title, conv.sent_at AS timestamp,
               'conversation' AS type, conv.source AS subtype, conv.body_preview,
               conv.source AS conv_source, conv.participant_user_ids,
-              conv.is_campaign_email, conv.external_thread_id,
+              conv.is_campaign_email, conv.external_thread_id, conv.external_message_id,
+              sc.is_private AS slack_is_private,
               cd.source AS link_source, cd.confidence AS link_confidence
          FROM conversation_deals cd
          JOIN conversations conv ON conv.id = cd.conversation_id
+         LEFT JOIN slack_channels sc
+           ON conv.source = 'slack'
+          AND sc.org_id = conv.org_id
+          AND sc.channel_id = CASE
+            WHEN instr(conv.external_message_id, ':') > 0
+            THEN substr(conv.external_message_id, 1, instr(conv.external_message_id, ':') - 1)
+            ELSE conv.external_message_id
+          END
         WHERE cd.deal_id = ? AND conv.org_id = ?
         ORDER BY conv.sent_at DESC
         LIMIT ?`
@@ -1162,10 +1194,13 @@ export async function getDealTimeline(
     env.D1.prepare(
       `SELECT e.id, e.title, e.start_time AS timestamp,
               'event' AS type, e.event_type AS subtype,
-              ed.source AS link_source, ed.confidence AS link_confidence
+              ed.source AS link_source, ed.confidence AS link_confidence,
+              GROUP_CONCAT(ea.user_id) AS participant_user_ids
          FROM event_deals ed
          JOIN events e ON e.id = ed.event_id
+         LEFT JOIN event_attendees ea ON ea.event_id = e.id
         WHERE ed.deal_id = ? AND e.org_id = ? AND e.deleted_at IS NULL
+        GROUP BY e.id
         ORDER BY e.start_time DESC
         LIMIT ?`
     ).bind(id, ctx.orgId, limit).all(),
@@ -1230,11 +1265,12 @@ export async function getDealTimeline(
   });
 
   const conversationsWithAccess = (conversations.results as any[]).map((c: any) => {
-    const canRead = canReadEmailContent(
+    const canRead = canReadConversationContent(
       {
         source: c.conv_source,
         participant_user_ids: c.participant_user_ids,
         is_campaign_email: c.is_campaign_email,
+        slack_is_private: c.slack_is_private,
       } as any,
       ctx.userId,
       ctx.userRole,
@@ -1245,7 +1281,8 @@ export async function getDealTimeline(
       canReadContent: canRead,
       body_preview: canRead ? c.body_preview : null,
     };
-  });
+  }).filter((c: any) => c.canReadContent)
+    .map(({ participant_user_ids: _p, is_campaign_email: _i, slack_is_private: _s, external_message_id: _m, ...rest }: any) => rest);
 
   // Wave 4B: dedup conversations by external_thread_id — keep the most
   // recent message per thread + a count. Conversations without a thread
@@ -1268,8 +1305,15 @@ export async function getDealTimeline(
   // No series_master_id column on events, so collapse same-day-same-title
   // occurrences (Outlook recurrings often appear N times/day across
   // attendee chains; the dedup tightens them to one row + count).
+  const eventSharingSet = new Set(Object.keys(sharingFlags));
+  const eventsWithAccess = (events.results as any[]).filter(e => {
+    if (hasOrgWidePrivateDataAccess(ctx.userRole)) return true;
+    const participants = parseParticipantUserIds(e.participant_user_ids);
+    return participants.includes(ctx.userId) || participants.some(pid => eventSharingSet.has(pid));
+  }).map(({ participant_user_ids: _p, ...rest }) => rest);
+
   const eventGroups = new Map<string, any>();
-  for (const e of (events.results as any[])) {
+  for (const e of eventsWithAccess) {
     const key = `${(e.title || '').toLowerCase()}|${(e.timestamp || '').slice(0, 10)}`;
     const existing = eventGroups.get(key);
     if (!existing || String(e.timestamp) > String(existing.timestamp)) {
@@ -1344,10 +1388,19 @@ export async function getDealConversations(
               conv.subject, conv.sent_at,
               conv.source, conv.body_preview, conv.participant_user_ids,
               conv.is_campaign_email, conv.from_email, conv.from_contact_id,
-              conv.direction, conv.has_attachments
+              conv.direction, conv.has_attachments,
+              sc.is_private AS slack_is_private
          FROM deal_contacts dc
          JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
          JOIN conversations conv       ON cc.conversation_id = conv.id
+         LEFT JOIN slack_channels sc
+           ON conv.source = 'slack'
+          AND sc.org_id = conv.org_id
+          AND sc.channel_id = CASE
+            WHEN instr(conv.external_message_id, ':') > 0
+            THEN substr(conv.external_message_id, 1, instr(conv.external_message_id, ':') - 1)
+            ELSE conv.external_message_id
+          END
         WHERE dc.deal_id = ? AND dc.org_id = ? AND conv.org_id = ?
         ORDER BY conv.external_thread_id IS NULL,
                  conv.external_thread_id ASC,
@@ -1360,6 +1413,7 @@ export async function getDealConversations(
       participant_user_ids: string | null; is_campaign_email: number;
       from_email: string | null; from_contact_id: string | null;
       direction: string | null; has_attachments: number;
+      slack_is_private: number | null;
     }>(),
     getSharingFlags(ctx.orgId, env),
   ]);
@@ -1410,16 +1464,18 @@ export async function getDealConversations(
   let ungroupedCount = 0;
 
   for (const r of rows.results) {
-    const canRead = canReadEmailContent(
+    const canRead = canReadConversationContent(
       {
         source: r.source as 'outlook' | 'slack' | 'manual',
         participant_user_ids: r.participant_user_ids ?? '[]',
         is_campaign_email: r.is_campaign_email,
+        slack_is_private: r.slack_is_private,
       } as any,
       ctx.userId,
       ctx.userRole,
       sharingFlags
     );
+    if (!canRead) continue;
 
     const fromContact = r.from_contact_id ? contactNameById[r.from_contact_id] : undefined;
     const senderName = fromContact?.name ?? null;
@@ -1429,12 +1485,12 @@ export async function getDealConversations(
       id: r.id,
       external_message_id: r.external_message_id,
       source: r.source,
-      sender_name: canRead ? senderName : null,
-      sender_email: canRead ? senderEmail : null,
+      sender_name: senderName,
+      sender_email: senderEmail,
       sent_at: r.sent_at,
       direction: r.direction,
       can_read_body: canRead,
-      body_preview: canRead ? r.body_preview : null,
+      body_preview: r.body_preview,
       has_attachments: !!r.has_attachments,
     };
 

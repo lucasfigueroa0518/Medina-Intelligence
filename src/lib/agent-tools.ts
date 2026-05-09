@@ -4,7 +4,7 @@ import { emitAudit } from './audit';
 import { invalidateRagCache } from './cache';
 import { findDuplicateCompany } from './discovery';
 import { updateEntityInIndex } from './entity-index';
-import { canReadEmailContent, getSharingFlags } from './helpers';
+import { canReadConversationContent, getSharingFlags, hasOrgWidePrivateDataAccess } from './helpers';
 import { isCompanyInternal, assertNoOpenDealForCompany, OpenDealConflictError } from './internal-entity';
 import {
   updateContactFields, updateCompanyFields, updateDealFields,
@@ -48,7 +48,7 @@ function redactSensitiveFields<T extends Record<string, any>>(
   userRole: string,
   entityType: 'contact' | 'deal',
 ): T {
-  if (userRole === 'owner') return entity;
+  if (hasOrgWidePrivateDataAccess(userRole)) return entity;
   const fields = entityType === 'contact' ? CONTACT_REDACTED_FIELDS : DEAL_REDACTED_FIELDS;
   for (const f of fields) {
     if (f in entity) entity[f as keyof T] = null as T[keyof T];
@@ -113,9 +113,18 @@ export async function searchConversations(
               c.body_preview, c.body_r2_key, c.sentiment, c.topics, c.action_items,
               c.to_emails, c.cc_emails, c.from_contact_id,
               c.participant_user_ids, c.is_campaign_email,
+              c.external_message_id, sc.is_private AS slack_is_private,
               fc.full_name AS from_name
        FROM conversations c
        LEFT JOIN contacts fc ON c.from_contact_id = fc.id
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
        WHERE ${where.join(' AND ')}
        ORDER BY c.sent_at DESC
        LIMIT ?`
@@ -125,11 +134,12 @@ export async function searchConversations(
 
   const conversations = (result.results as any[])
     .filter(c =>
-      canReadEmailContent(
+      canReadConversationContent(
         {
           source: c.source,
           participant_user_ids: c.participant_user_ids,
           is_campaign_email: c.is_campaign_email,
+          slack_is_private: c.slack_is_private,
         },
         ctx.userId,
         ctx.userRole,
@@ -141,6 +151,8 @@ export async function searchConversations(
   for (const c of conversations) {
     delete c.participant_user_ids;
     delete c.is_campaign_email;
+    delete c.external_message_id;
+    delete c.slack_is_private;
   }
 
   if (conversations.length > 0) {
@@ -505,9 +517,19 @@ export async function getContactDetail(
       'SELECT t.id, t.name, t.color FROM contact_tags ct JOIN tags t ON ct.tag_id = t.id WHERE ct.contact_id = ?'
     ).bind(contactId).all(),
     env.D1.prepare(
-      `SELECT id, subject, sent_at, source, direction, sentiment, body_preview,
-              participant_user_ids, is_campaign_email
-       FROM conversations WHERE from_contact_id = ? AND org_id = ?
+      `SELECT c.id, c.subject, c.sent_at, c.source, c.direction, c.sentiment, c.body_preview,
+              c.participant_user_ids, c.is_campaign_email, c.external_message_id,
+              sc.is_private AS slack_is_private
+       FROM conversations c
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
+       WHERE c.from_contact_id = ? AND c.org_id = ?
        ORDER BY sent_at DESC LIMIT 20`
     ).bind(contactId, ctx.orgId).all(),
     env.D1.prepare(
@@ -530,11 +552,12 @@ export async function getContactDetail(
 
   const recentConvos = (recentConvosRaw.results as any[])
     .filter(c =>
-      canReadEmailContent(
+      canReadConversationContent(
         {
           source: c.source,
           participant_user_ids: c.participant_user_ids,
           is_campaign_email: c.is_campaign_email,
+          slack_is_private: c.slack_is_private,
         },
         ctx.userId,
         ctx.userRole,
@@ -546,6 +569,8 @@ export async function getContactDetail(
   for (const c of recentConvos) {
     delete c.participant_user_ids;
     delete c.is_campaign_email;
+    delete c.external_message_id;
+    delete c.slack_is_private;
   }
 
   return {

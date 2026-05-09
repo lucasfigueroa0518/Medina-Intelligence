@@ -28,7 +28,7 @@ export interface User {
   email: string;
   full_name: string;
   avatar_url?: string | null;
-  role: 'owner' | 'admin' | 'member';
+  role: 'owner' | 'admin' | 'member' | 'super_admin';
   outlook_token?: string | null;
   slack_token?: string | null;
   outlook_delta_token?: string | null;
@@ -331,6 +331,9 @@ export interface ProcessedQuery {
   entityIds: string[];
   filters: Record<string, any>;
   orgId: string;
+  userId: string;
+  userRole: string;
+  sharingFlags?: Record<string, boolean>;
   postRetrievalFilter: (chunk: VectorMatch) => boolean;
 }
 
@@ -374,6 +377,6 @@ export interface MergeResult {
 export interface AuthContext {
   userId: string;
   orgId: string;
-  userRole: 'owner' | 'admin' | 'member';
+  userRole: 'owner' | 'admin' | 'member' | 'super_admin';
   email: string;
 }
