@@ -1081,6 +1081,63 @@ function parseJsonObject<T>(raw: string, fallback: T): T {
   }
 }
 
+type ConversationGrade = {
+  baseline_score: number;
+  candidate_score: number;
+  privacy_failure: boolean;
+  recommendation: string;
+  friction: Array<Record<string, unknown>>;
+  findings: Array<Record<string, unknown>>;
+};
+
+function normalizeConversationGrade(parsed: any): ConversationGrade | null {
+  const baselineScore = asScore(parsed?.baseline_score);
+  const candidateScore = asScore(parsed?.candidate_score);
+  const recommendation = typeof parsed?.recommendation === 'string'
+    ? parsed.recommendation.trim()
+    : '';
+  const findings = Array.isArray(parsed?.findings)
+    ? parsed.findings.filter((finding: any) => finding && typeof finding === 'object')
+    : [];
+  if (
+    baselineScore === null
+    || candidateScore === null
+    || recommendation.length < 12
+    || recommendation === 'No evaluator recommendation was produced.'
+    || findings.length === 0
+  ) {
+    return null;
+  }
+  return {
+    baseline_score: baselineScore,
+    candidate_score: candidateScore,
+    privacy_failure: Boolean(parsed?.privacy_failure),
+    recommendation,
+    friction: Array.isArray(parsed?.friction)
+      ? parsed.friction.filter((item: any) => item && typeof item === 'object')
+      : [],
+    findings,
+  };
+}
+
+function inconclusiveConversationGrade(note: string): ConversationGrade {
+  return {
+    baseline_score: 50,
+    candidate_score: 50,
+    privacy_failure: false,
+    recommendation: `Evaluator inconclusive: ${note}. Rerun this experiment before using it for an upgrade decision.`,
+    friction: [{
+      mode: 'evaluator',
+      note,
+    }],
+    findings: [{
+      dimension: 'grading_integrity',
+      winner: 'tie',
+      note,
+    }],
+  };
+}
+
 async function gradeConversationPair(
   env: Env,
   ctx: AuthContext,
@@ -1120,14 +1177,32 @@ async function gradeConversationPair(
     orgId: ctx.orgId,
   }, 'low', env);
   const parsed = parseJsonObject<any>(raw, {});
-  return {
-    baseline_score: asScore(parsed.baseline_score) ?? 50,
-    candidate_score: asScore(parsed.candidate_score) ?? 50,
-    privacy_failure: Boolean(parsed.privacy_failure),
-    recommendation: String(parsed.recommendation || 'No evaluator recommendation was produced.'),
-    friction: Array.isArray(parsed.friction) ? parsed.friction : [],
-    findings: Array.isArray(parsed.findings) ? parsed.findings : [],
-  };
+  const normalized = normalizeConversationGrade(parsed);
+  if (normalized) return normalized;
+
+  const repairRaw = await callClaude({
+    system: `You repair malformed MARTy Lab evaluator output. Return valid JSON only and include non-empty findings.`,
+    user: truncateForPrompt({
+      goal: experiment.goal,
+      rubric: experiment.rubric,
+      malformed_output: raw,
+      required_schema: {
+        baseline_score: 'number 0-100',
+        candidate_score: 'number 0-100',
+        privacy_failure: 'boolean',
+        recommendation: 'specific one-sentence deployment recommendation or inconclusive reason',
+        friction: [{ mode: 'baseline|candidate|evaluator', note: 'specific friction moment' }],
+        findings: [{ dimension: 'rubric dimension key', winner: 'baseline|candidate|tie', note: 'specific reason' }],
+      },
+      baseline,
+      candidate,
+    }, 18000),
+    max_tokens: 900,
+    orgId: ctx.orgId,
+  }, 'low', env);
+  const repaired = normalizeConversationGrade(parseJsonObject<any>(repairRaw, {}));
+  if (repaired) return repaired;
+  return inconclusiveConversationGrade('grading model returned empty or invalid structure twice');
 }
 
 export async function processMartyLabExperimentWorkItem(item: WorkQueueRow, env: Env): Promise<void> {
