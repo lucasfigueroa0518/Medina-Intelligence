@@ -30,10 +30,10 @@ type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals' | 'syst
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: 'profile', label: 'Profile' },
-  { id: 'security', label: 'Security' },
-  { id: 'integrations', label: 'Sync & Integrations' },
-  { id: 'approvals', label: 'Approval Queue' },
   { id: 'system', label: 'System Status' },
+  { id: 'integrations', label: 'Sync & Integrations' },
+  { id: 'security', label: 'Security' },
+  { id: 'approvals', label: 'Approval Queue' },
 ];
 
 export default function SettingsPageWrapper() {
@@ -3215,7 +3215,6 @@ function SystemStatusSection() {
   return (
     <div className="space-y-6">
       <RateLimitIndicator budgets={data.budgets || []} />
-      <DealReplayStatusCard replay={data.deal_replay || emptyDealReplay} onRefresh={load} />
       <ActiveTasksCard tasks={data.active_tasks} />
       <RunHistoryCard rows={data.run_history} />
       <DataCompletenessCard c={data.completeness} />
@@ -3223,6 +3222,7 @@ function SystemStatusSection() {
         inventory={data.work_queue_inventory}
         stuck={data.stuck_work_queue}
       />
+      <DealReplayStatusCard replay={data.deal_replay || emptyDealReplay} onRefresh={load} />
     </div>
   );
 }

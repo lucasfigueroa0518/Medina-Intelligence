@@ -34,8 +34,8 @@ const NAV_LINKS: NavLink[] = [
   { label: 'Companies', icon: Building2, route: '/companies' },
   { label: 'Deals', icon: Handshake, route: '/deals' },
   { label: 'Campaigns', icon: Mail, route: '/campaigns' },
-  { label: 'Admin', icon: Shield, route: '/admin', requireAdmin: true },
   { label: 'Files', icon: FileText, route: '/files', href: '/files?tab=imports', matchRoutes: ['/files', '/imports', '/documents'] },
+  { label: 'Admin', icon: Shield, route: '/admin', requireAdmin: true },
   { label: 'Settings', icon: SettingsIcon, route: '/settings' },
 ];
 
