@@ -19,6 +19,7 @@ import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
 import {
+  DEMO_IDS,
   demoContactDetailFixture,
   demoRecentObservationsForContact,
   demoToastMessage,
@@ -55,20 +56,21 @@ interface EditFormData {
 export default function ContactDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
-  const id = params.id;
+  const id = String(params?.id || '');
   const demoMode = useDemoMode();
-  const isDemoContact = id.startsWith('demo-contact');
+  const isDemoContact = id === DEMO_IDS.contact || id.startsWith('demo-contact');
+  const demoFixture = demoContactDetailFixture;
 
-  const [contact, setContact] = React.useState<any>(null);
-  const [tags, setTags] = React.useState<any[]>([]);
-  const [associations, setAssociations] = React.useState<any[]>([]);
-  const [entityAssociations, setEntityAssociations] = React.useState<any[]>([]);
-  const [signals, setSignals] = React.useState<any[]>([]);
-  const [timeline, setTimeline] = React.useState<TimelineEntry[]>([]);
-  const [fullBio, setFullBio] = React.useState<string | null>(null);
-  const [enrichmentMeta, setEnrichmentMeta] = React.useState<any>(null);
+  const [contact, setContact] = React.useState<any>(() => (isDemoContact ? demoFixture.contact : null));
+  const [tags, setTags] = React.useState<any[]>(() => (isDemoContact ? demoFixture.tags || [] : []));
+  const [associations, setAssociations] = React.useState<any[]>(() => (isDemoContact ? demoFixture.associations || [] : []));
+  const [entityAssociations, setEntityAssociations] = React.useState<any[]>(() => (isDemoContact ? demoFixture.entity_associations || [] : []));
+  const [signals, setSignals] = React.useState<any[]>(() => (isDemoContact ? demoFixture.signals || [] : []));
+  const [timeline, setTimeline] = React.useState<TimelineEntry[]>(() => (isDemoContact ? demoFixture.timeline as TimelineEntry[] : []));
+  const [fullBio, setFullBio] = React.useState<string | null>(() => (isDemoContact ? demoFixture.full_bio : null));
+  const [enrichmentMeta, setEnrichmentMeta] = React.useState<any>(() => (isDemoContact ? demoFixture.enrichment_meta : null));
   const [activeTab, setActiveTab] = React.useState<Tab>('overview');
-  const [loading, setLoading] = React.useState(true);
+  const [loading, setLoading] = React.useState(!isDemoContact);
   const [editMode, setEditMode] = React.useState(false);
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
@@ -83,14 +85,14 @@ export default function ContactDetailPage() {
   const [toast, setToast] = React.useState<string | null>(null);
   const [enriching, setEnriching] = React.useState(false);
   const [enriched, setEnriched] = React.useState(false);
-  const [weeklyInteractions, setWeeklyInteractions] = React.useState<any[]>([]);
-  const [firstInteractionDate, setFirstInteractionDate] = React.useState<string | null>(null);
+  const [weeklyInteractions, setWeeklyInteractions] = React.useState<any[]>(() => (isDemoContact ? demoFixture.weekly_interactions || [] : []));
+  const [firstInteractionDate, setFirstInteractionDate] = React.useState<string | null>(() => (isDemoContact ? demoFixture.first_interaction_date || null : null));
   const [statusOpen, setStatusOpen] = React.useState(false);
   const [bioExpanded, setBioExpanded] = React.useState(false);
-  const [pendingUpdates, setPendingUpdates] = React.useState<any[]>([]);
+  const [pendingUpdates, setPendingUpdates] = React.useState<any[]>(() => (isDemoContact ? demoFixture.pending_updates || [] : []));
   const [approvingIds, setApprovingIds] = React.useState<Set<string>>(new Set());
   const [approvedFields, setApprovedFields] = React.useState<Set<string>>(new Set());
-  const [documents, setDocuments] = React.useState<any[]>([]);
+  const [documents, setDocuments] = React.useState<any[]>(() => (isDemoContact ? demoFixture.documents || [] : []));
   const [docsLoading, setDocsLoading] = React.useState(false);
   const [uploading, setUploading] = React.useState(false);
   const [uploadVisibility, setUploadVisibility] = React.useState<'private' | 'org_wide'>('private');
