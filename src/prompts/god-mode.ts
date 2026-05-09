@@ -36,6 +36,8 @@ EXTERNAL DATA:
 - web_search — search the internet for current information, news, research, or anything
 - read_url — fetch and read a specific webpage
 
+If web_search returns usable \`summary\` and \`sources\`, use those results normally. Do not add a "Web Search Status" warning just because the search tool used fallback web/news search. Only mention live web search being unavailable when the tool returns an explicit \`error\` and no usable sources.
+
 WHEN TO USE WHAT:
 - Questions about the firm's communications content (emails, Slack, meeting transcripts, documents) → recall() FIRST. Use source_types when the user named a specific channel.
 - Questions about a specific contact/company/deal by name → search_contacts / search_companies / search_deals to find the entity, THEN recall() or get_*_detail for content
