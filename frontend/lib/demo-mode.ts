@@ -670,19 +670,31 @@ export const demoContactDetailFixture = {
   },
   tags: demoContact.tags,
   associations: demoAssociations,
-  entity_associations: demoAssociations.map((a, index) => ({
-    id: `demo-assoc-${index}`,
-    entity_type: a.type.toLowerCase().includes('company')
+  entity_associations: demoAssociations.map((a, index) => {
+    const otherType = a.type.toLowerCase().includes('company')
       ? 'company'
       : a.type.toLowerCase().includes('deal')
         ? 'deal'
-        : 'contact',
-    entity_id: a.href.split('/').pop() || `demo-assoc-${index}`,
-    display_name: a.name,
-    name: a.name,
-    relationship_type: a.strength,
-    strength_score: 0.92 - index * 0.06,
-  })),
+        : 'contact';
+    const otherId = a.href.split('/').pop() || `demo-assoc-${index}`;
+    const strength = Math.max(62, Math.round((0.92 - index * 0.06) * 100));
+    return {
+      id: `demo-assoc-${index}`,
+      entity_type: otherType,
+      entity_id: otherId,
+      other_type: otherType,
+      other_id: otherId,
+      display_name: a.name,
+      entity_name: a.name,
+      name: a.name,
+      reason: `${a.strength} in the demo relationship graph.`,
+      relationship_type: a.strength,
+      association_type: otherType === 'company' ? 'same_company' : otherType === 'deal' ? 'deal_involvement' : 'mentioned_together',
+      association_types: [otherType === 'company' ? 'same_company' : otherType === 'deal' ? 'deal_involvement' : 'mentioned_together'],
+      strength,
+      strength_score: strength / 100,
+    };
+  }),
   signals: [
     {
       id: 'demo-signal-1',

@@ -53,10 +53,10 @@ interface EditFormData {
   check_size_range: string; fund_name: string; commitment_status: string;
 }
 
-export default function ContactDetailPage() {
+export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
   const params = useParams<{ id: string }>();
   const router = useRouter();
-  const id = String(params?.id || '');
+  const id = forcedId || String(params?.id || '');
   const demoMode = useDemoMode();
   const isDemoContact = id === DEMO_IDS.contact || id.startsWith('demo-contact');
   const demoFixture = demoContactDetailFixture;
@@ -1151,6 +1151,10 @@ export default function ContactDetailPage() {
       })()}
     </div>
   );
+}
+
+export default function ContactDetailPage() {
+  return <ContactDetailContent />;
 }
 
 /* ───────── Sub-components ───────── */
