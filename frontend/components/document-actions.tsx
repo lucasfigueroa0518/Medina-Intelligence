@@ -51,6 +51,8 @@ export function DocumentActions({
   showPreview = true,
   showDownload = true,
   showSendToMarty = true,
+  sessionId,
+  onSentToMarty,
   onPreview,
   onError,
   stopPropagation = true,
@@ -62,6 +64,8 @@ export function DocumentActions({
   showPreview?: boolean;
   showDownload?: boolean;
   showSendToMarty?: boolean;
+  sessionId?: string | null;
+  onSentToMarty?: (result: Awaited<ReturnType<typeof api.attachDocumentToChat>>) => void;
   onPreview?: (documentId: string) => void;
   onError?: (message: string) => void;
   stopPropagation?: boolean;
@@ -121,8 +125,12 @@ export function DocumentActions({
     }
     setSending(true);
     try {
-      const res = await api.attachDocumentToChat(id);
-      router.push(`/god-mode?session_id=${encodeURIComponent(res.session_id)}&attach_upload=${encodeURIComponent(res.upload_id)}`);
+      const res = await api.attachDocumentToChat(id, { sessionId });
+      if (onSentToMarty) {
+        onSentToMarty(res);
+      } else {
+        router.push(`/god-mode?session_id=${encodeURIComponent(res.session_id)}&attach_upload=${encodeURIComponent(res.upload_id)}`);
+      }
     } catch (e: any) {
       fail(e?.message || 'Send to MARTy failed');
     } finally {
@@ -204,6 +212,8 @@ export function DocumentActions({
         <DocumentPreviewModal
           docId={previewOpen ? id : null}
           onClose={() => setPreviewOpen(false)}
+          sessionId={sessionId}
+          onSentToMarty={onSentToMarty}
         />
       )}
     </>

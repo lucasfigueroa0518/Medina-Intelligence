@@ -46,9 +46,13 @@ interface DocLite {
 export function DocumentPreviewModal({
   docId,
   onClose,
+  sessionId,
+  onSentToMarty,
 }: {
   docId: string | null;
   onClose: () => void;
+  sessionId?: string | null;
+  onSentToMarty?: (result: Awaited<ReturnType<typeof api.attachDocumentToChat>>) => void;
 }) {
   const router = useRouter();
   const [doc, setDoc] = React.useState<DocLite | null>(null);
@@ -151,9 +155,13 @@ export function DocumentPreviewModal({
     if (!doc) return;
     setSendingToMarty(true);
     try {
-      const res = await api.attachDocumentToChat(doc.id);
+      const res = await api.attachDocumentToChat(doc.id, { sessionId });
       onClose();
-      router.push(`/god-mode?session_id=${encodeURIComponent(res.session_id)}&attach_upload=${encodeURIComponent(res.upload_id)}`);
+      if (onSentToMarty) {
+        onSentToMarty(res);
+      } else {
+        router.push(`/god-mode?session_id=${encodeURIComponent(res.session_id)}&attach_upload=${encodeURIComponent(res.upload_id)}`);
+      }
     } catch (e: any) {
       setError(`Send to MARTy failed: ${e?.message || 'unknown error'}`);
     } finally {

@@ -565,7 +565,15 @@ function mergeDocumentCards(
   return [...byKey.values()];
 }
 
-function DocumentCardList({ cards }: { cards?: MartyDocumentCard[] }) {
+function DocumentCardList({
+  cards,
+  sessionId,
+  onDocumentAttached,
+}: {
+  cards?: MartyDocumentCard[];
+  sessionId?: string | null;
+  onDocumentAttached?: (result: { upload_id: string; session_id: string; summary: ChatUploadSummary }) => void;
+}) {
   const normalized = mergeDocumentCards(undefined, cards) || [];
   if (normalized.length === 0) return null;
 
@@ -623,6 +631,8 @@ function DocumentCardList({ cards }: { cards?: MartyDocumentCard[] }) {
                   showPreview={card.actions?.preview !== false}
                   showDownload={card.actions?.download !== false}
                   showSendToMarty={card.actions?.send_to_marty !== false}
+                  sessionId={sessionId}
+                  onSentToMarty={onDocumentAttached}
                   onError={(message) => console.warn('[MARTy document card]', message)}
                 />
               </div>
@@ -957,6 +967,21 @@ export default function GodModePage() {
     setUploadToast(msg);
     setTimeout(() => setUploadToast(null), 3500);
   }, []);
+
+  const syncSessionUploadState = React.useCallback((uploads: ChatUploadSummary[]) => {
+    setSessionUploads(uploads);
+    setBytesTotal(uploads.reduce((acc, u) => acc + u.size_bytes, 0));
+    setBytesUsed(uploads.filter(u => u.in_context).reduce((acc, u) => acc + u.size_bytes, 0));
+  }, []);
+
+  const handleDocumentAttachedToMarty = React.useCallback((result: { upload_id: string; session_id: string; summary: ChatUploadSummary }) => {
+    setActiveSessionId(result.session_id);
+    setSessionUploads(prev => [...prev.filter(u => u.id !== result.summary.id), result.summary]);
+    api.listSessionUploads(result.session_id).then(d => {
+      syncSessionUploadState(d.uploads);
+    }).catch(() => { /* keep optimistic attachment */ });
+    showToast(`${result.summary.filename} added to this MARTy conversation.`);
+  }, [showToast, syncSessionUploadState]);
 
   const handleFilesPicked = React.useCallback(async (selected: File[]) => {
     if (selected.length === 0) return;
@@ -1676,7 +1701,11 @@ export default function GodModePage() {
                     )}
 
                     {m.documentCards && m.documentCards.length > 0 && (
-                      <DocumentCardList cards={m.documentCards} />
+                      <DocumentCardList
+                        cards={m.documentCards}
+                        sessionId={activeSessionId}
+                        onDocumentAttached={handleDocumentAttachedToMarty}
+                      />
                     )}
 
                     {m.content && m.error ? (

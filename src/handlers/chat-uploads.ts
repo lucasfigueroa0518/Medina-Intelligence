@@ -336,7 +336,10 @@ export async function attachDocumentToChat(
     session_id?: string;
   };
   const documentId = body.document_id;
-  const sessionId = body.session_id || `sess_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  const requestedSessionId = typeof body.session_id === 'string' && body.session_id.trim()
+    ? body.session_id.trim()
+    : null;
+  const sessionId = requestedSessionId || `sess_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
   if (!documentId) {
     return errorResponse('VALIDATION_ERROR', 400, 'document_id required');
@@ -357,6 +360,28 @@ export async function attachDocumentToChat(
   }
   const buffer = await obj.arrayBuffer();
 
+  const now = new Date().toISOString();
+  if (requestedSessionId) {
+    const session = await env.D1.prepare(
+      `SELECT id FROM agent_sessions
+       WHERE id = ? AND org_id = ? AND user_id = ? AND deleted_at IS NULL`
+    ).bind(requestedSessionId, ctx.orgId, ctx.userId).first<{ id: string }>();
+    if (!session) {
+      return errorResponse('SESSION_NOT_FOUND', 404, 'MARTy session not accessible');
+    }
+    await env.D1.prepare(
+      `UPDATE agent_sessions SET last_activity_at = ? WHERE id = ?`
+    ).bind(now, requestedSessionId).run().catch(() => {});
+  } else {
+    const titleBase = String(doc.title || doc.file_name || 'Document').trim() || 'Document';
+    const title = `Document: ${titleBase}`.slice(0, 120);
+    await env.D1.prepare(
+      `INSERT INTO agent_sessions
+         (id, org_id, user_id, title, context_entity_type, context_entity_id, turn_count, last_activity_at, created_at)
+       VALUES (?, ?, ?, ?, NULL, NULL, 0, ?, ?)`
+    ).bind(sessionId, ctx.orgId, ctx.userId, title, now, now).run();
+  }
+
   // Decide upload_type from filename/mime; fall back to 'document' for
   // formats chat preview supports (extractable text + Documents save).
   const uploadType = detectUploadType(doc.file_name || 'document', doc.mime_type || '') || 'document';
@@ -367,14 +392,28 @@ export async function attachDocumentToChat(
     httpMetadata: { contentType: doc.mime_type || 'application/octet-stream' },
   });
 
-  const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + RETENTION_DAYS * 86400000).toISOString();
   // Carry the document's extracted text directly so the chat upload is
   // immediately searchable by MARTy. extraction_status='completed' marks
   // it as not-needing-async-extraction (we already have the text via doc).
-  const extractedText = doc.extracted_text_preview || '';
+  let extractedText = doc.extracted_text_preview || '';
+  if (uploadType !== 'image') {
+    try {
+      const file = new File(
+        [buffer],
+        doc.file_name || doc.title || 'document',
+        { type: doc.mime_type || 'application/octet-stream' }
+      );
+      const extracted = await extractTextFromFile(file);
+      if (extracted.trim()) extractedText = extracted;
+    } catch (e: any) {
+      console.warn(`[chat-uploads] document attach extraction fallback for ${documentId}:`, e?.message || e);
+    }
+  }
   const previewText = extractedText.slice(0, 500);
-  const extractionStatus = uploadType === 'image' ? 'skipped' : 'completed';
+  const extractionStatus = uploadType === 'image'
+    ? 'skipped'
+    : (extractedText.trim() ? 'completed' : 'failed');
 
   await env.D1.prepare(
     `INSERT INTO chat_uploads
