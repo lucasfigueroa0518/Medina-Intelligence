@@ -10,7 +10,7 @@ import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { TagManagerModal } from '@/components/tag-manager-modal';
 import { api } from '@/lib/api';
 import { initialFromName, faviconUrl } from '@/lib/avatar';
-import { demoCompanies, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
+import { DEMO_COMPANY_TOTAL, demoCompanies, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import { Plus, Search, X as XIcon, Settings2 } from 'lucide-react';
 
 interface Tag { id: string; name: string; color: string }
@@ -197,8 +197,14 @@ function CompaniesPage() {
   React.useEffect(() => {
     if (demoMode) {
       setAllTags(demoTags);
-      setAllCities([{ name: 'Mountain View', count: 1 }, { name: 'Zurich', count: 1 }, { name: 'Miami', count: 1 }]);
-      setFilterCounts({ tags: Object.fromEntries(demoTags.map(tag => [tag.id, demoCompanies.filter(c => (c.tags || []).some((t: any) => t.id === tag.id)).length])) });
+      setAllCities([
+        { name: 'Miami', count: 382 },
+        { name: 'New York', count: 271 },
+        { name: 'San Francisco', count: 214 },
+        { name: 'Los Angeles', count: 167 },
+        { name: 'Mountain View', count: 1 },
+      ]);
+      setFilterCounts({ tags: Object.fromEntries(demoTags.map((tag, index) => [tag.id, [512, 408, 447, 389][index] || 100])) });
       return;
     }
     api.listTags('company').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
@@ -226,7 +232,7 @@ function CompaniesPage() {
         ? demoCompanies.filter(c => [c.name, c.domain, c.sector, c.hq_location].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
         : demoCompanies;
       setCompanies(rows);
-      setTotal(rows.length);
+      setTotal(q ? rows.length : DEMO_COMPANY_TOTAL);
       return Promise.resolve();
     }
     setLoading(true);
@@ -567,14 +573,14 @@ function CompaniesPage() {
             onSort={handleSort}
           />
 
-          {!loading && companies.length < total && (
+          {!demoMode && !loading && companies.length < total && (
             <div className="flex justify-center mt-4">
               <button onClick={loadMore} disabled={loadingMore} className="btn-secondary text-sm">
                 {loadingMore ? 'Loading...' : `Load more (${total - companies.length} remaining)`}
               </button>
             </div>
           )}
-          {!loading && companies.length > 0 && companies.length >= total && (
+          {!demoMode && !loading && companies.length > 0 && companies.length >= total && (
             <div className="text-center mt-4 text-xs text-text-muted">End of results</div>
           )}
         </div>

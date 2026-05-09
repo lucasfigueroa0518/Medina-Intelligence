@@ -11,7 +11,7 @@ import { ContactCreateModal } from '@/components/contact-create-modal';
 import { TagManagerModal } from '@/components/tag-manager-modal';
 import { api } from '@/lib/api';
 import { initialFromName } from '@/lib/avatar';
-import { demoCompany, demoContacts, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
+import { DEMO_CONTACT_TOTAL, demoCompany, demoContacts, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import { Search, Plus, X as XIcon, Settings2 } from 'lucide-react';
 
 interface Contact {
@@ -224,11 +224,11 @@ function ContactsPage() {
   React.useEffect(() => {
     if (demoMode) {
       setAllTags(demoTags);
-      setAllCompanies([{ id: demoCompany.id, name: demoCompany.name, count: demoContacts.length }]);
+      setAllCompanies([{ id: demoCompany.id, name: demoCompany.name, count: 624 }]);
       setFilterCounts({
-        contact_type: { individual: demoContacts.length },
-        engagement_status: { active: 1, warm: 1, new: 1 },
-        tags: Object.fromEntries(demoTags.map(tag => [tag.id, demoContacts.filter(c => (c.tags || []).some(t => t.id === tag.id)).length])),
+        contact_type: { individual: DEMO_CONTACT_TOTAL },
+        engagement_status: { active: 1418, warm: 934, new: 617, dormant: 312, churning: 143, close: 55 },
+        tags: Object.fromEntries(demoTags.map((tag, index) => [tag.id, [928, 741, 864, 606][index] || 250])),
         overdue_followups: 0,
       });
       return;
@@ -254,7 +254,7 @@ function ContactsPage() {
         ? demoContacts.filter(c => [c.full_name, c.email, c.company_name].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
         : demoContacts;
       setContacts(rows as Contact[]);
-      setTotal(rows.length);
+      setTotal(q ? rows.length : DEMO_CONTACT_TOTAL);
       return Promise.resolve();
     }
     setLoading(true);
@@ -635,14 +635,14 @@ function ContactsPage() {
             onSort={handleSort}
           />
 
-          {!loading && contacts.length < total && (
+          {!demoMode && !loading && contacts.length < total && (
             <div className="flex justify-center mt-4">
               <button onClick={loadMore} disabled={loadingMore} className="btn-secondary text-sm">
                 {loadingMore ? 'Loading...' : `Load more (${total - contacts.length} remaining)`}
               </button>
             </div>
           )}
-          {!loading && contacts.length > 0 && contacts.length >= total && (
+          {!demoMode && !loading && contacts.length > 0 && contacts.length >= total && (
             <div className="text-center mt-4 text-xs text-text-muted">End of results</div>
           )}
         </div>
