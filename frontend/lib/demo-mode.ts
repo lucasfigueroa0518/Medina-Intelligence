@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import type { DealIntelligence } from './use-deal-intelligence';
 
 export const DEMO_MODE_STORAGE_KEY = 'medina-intelligence-demo-mode';
 
@@ -76,6 +77,10 @@ export const DEMO_CONTACT_TOTAL = 3479;
 export const DEMO_COMPANY_TOTAL = 1952;
 
 const DAY_MS = 86400000;
+
+function isoDaysAgo(days: number) {
+  return new Date(Date.now() - days * DAY_MS).toISOString();
+}
 
 function demoEmail(name: string) {
   const slug = name.toLowerCase().replace(/[^a-z]+/g, '.').replace(/^\.+|\.+$/g, '');
@@ -480,4 +485,450 @@ export const demoCompanyUpdates = [
   'Fictional partner team reviewed an AI event operations workflow with demo stakeholders.',
   'Synthetic news signal: demo company announced a media tooling pilot for large event teams.',
   'Demo-only internal note flagged potential overlap with the FIFA opportunity and sponsor-data workflows.',
+];
+
+export const demoActionDocuments = demoDocuments.map((doc, index) => ({
+  id: doc.id,
+  title: doc.title,
+  file_name: doc.file_name,
+  mime_type: doc.mime_type,
+  document_type: doc.document_type,
+  source: doc.source,
+  created_at: isoDaysAgo(index + 1),
+  updated_at: isoDaysAgo(index),
+  file_size: doc.size,
+  size_bytes: 128000 + index * 64000,
+  r2_key: `demo/${doc.file_name}`,
+  extracted_text_preview: doc.body.slice(0, 240),
+  processing_status: 'completed',
+  version_number: 1,
+  visibility: 'org_wide',
+}));
+
+function makeObservation(
+  id: string,
+  type: string,
+  daysAgo: number,
+  value: string,
+  people: string[],
+  evidence: string,
+  confidence: number,
+  speaker = 'MARTy demo',
+) {
+  return {
+    id,
+    observation_type: type,
+    observation_value: JSON.stringify({
+      speaker,
+      signal_type: type,
+      people_involved: people,
+      value,
+      evidence,
+      confidence,
+    }),
+    channels: ['demo'],
+    confidence,
+    evidence,
+    source_communication_id: null,
+    first_observed_at: isoDaysAgo(daysAgo + 2),
+    last_observed_at: isoDaysAgo(daysAgo),
+  };
+}
+
+export const demoRecentObservationsForContact = [
+  makeObservation(
+    'demo-obs-contact-1',
+    'relationship_signal',
+    0,
+    'Warm fictional relationship with a clear follow-up path.',
+    ['Donald Trump', 'Tony Jimenez'],
+    'Synthetic demo touchpoints show repeated briefings and document sharing.',
+    0.94,
+  ),
+  makeObservation(
+    'demo-obs-contact-2',
+    'interest_area',
+    1,
+    'Interest clusters around sports media, AI workflow, sponsorship data, and live-event operations.',
+    ['Donald Trump', 'Ava Morales'],
+    'Demo-only conversations repeatedly mention large-event operations and sponsor reporting.',
+    0.91,
+  ),
+  makeObservation(
+    'demo-obs-contact-3',
+    'next_action',
+    2,
+    'Prepare a concise briefing packet and route the FIFA deal memo for review.',
+    ['Donald Trump', 'Marco Silva'],
+    'Fictional follow-up note asks for a short packet before the next demo call.',
+    0.88,
+  ),
+];
+
+export const demoRecentObservationsForCompany = [
+  makeObservation(
+    'demo-obs-company-1',
+    'market_signal',
+    0,
+    'Fictional partner team reviewed an AI event operations workflow with demo stakeholders.',
+    ['Google', 'FIFA'],
+    'Demo update references enterprise AI workflows and event-scale data products.',
+    0.93,
+  ),
+  makeObservation(
+    'demo-obs-company-2',
+    'relationship_signal',
+    2,
+    'Google is shown as a synthetic strategic relationship linked to FIFA demo activity.',
+    ['Google', 'Donald Trump'],
+    'The demo fixture connects company, contact, and deal records for filming continuity.',
+    0.9,
+  ),
+];
+
+export const demoContactTimelineEntries = [
+  {
+    id: 'demo-timeline-1',
+    type: 'event',
+    subtype: 'meeting',
+    title: 'Demo intro call with Google media team',
+    timestamp: isoDaysAgo(0),
+    body_preview: 'Discussed a fictional sports analytics partnership and follow-up materials.',
+    occurrence_count: 1,
+  },
+  {
+    id: 'demo-timeline-2',
+    type: 'conversation',
+    subtype: 'outlook',
+    title: 'Follow-up: FIFA demo diligence packet',
+    timestamp: isoDaysAgo(1),
+    body_preview: 'Shared synthetic materials and scheduled a prep call.',
+    canReadContent: true,
+    external_thread_id: 'demo-thread-fifa-1',
+    attachment_count: 1,
+  },
+  {
+    id: 'demo-timeline-3',
+    type: 'task',
+    subtype: 'follow_up',
+    title: 'Prepare event-programming notes',
+    timestamp: isoDaysAgo(2),
+    body_preview: 'Internal demo task for a screen-recording workflow.',
+    occurrence_count: 1,
+  },
+  {
+    id: 'demo-timeline-4',
+    type: 'document',
+    subtype: 'attachment',
+    title: 'Relationship brief added',
+    timestamp: isoDaysAgo(3),
+    body_preview: 'Demo brief attached to the contact profile.',
+    occurrence_count: 1,
+  },
+  {
+    id: 'demo-timeline-5',
+    type: 'event',
+    subtype: 'meeting',
+    title: 'Synthetic partner strategy review',
+    timestamp: isoDaysAgo(5),
+    body_preview: 'Reviewed fictional contacts, associations, and next steps.',
+    occurrence_count: 1,
+  },
+  {
+    id: 'demo-timeline-6',
+    type: 'conversation',
+    subtype: 'slack',
+    title: 'Demo warm intro from Google to FIFA',
+    timestamp: isoDaysAgo(7),
+    body_preview: 'Introduced fictional stakeholders for the fake deal workflow.',
+    canReadContent: true,
+    external_thread_id: 'demo-thread-google-fifa',
+    attachment_count: 0,
+  },
+];
+
+const demoContactBio =
+  'Demo-only intelligence brief: Donald Trump is shown as a warm fictional relationship tied to Google and a FIFA-themed opportunity. The profile is intentionally dense for filming, with safe synthetic details about sports media, sponsorship data, and event operations.\n\nRecent activity suggests a clear next step: prepare a briefing packet, confirm stakeholders, and review the demo FIFA memo before the next fictional meeting.';
+
+export const demoContactDetailFixture = {
+  contact: {
+    ...demoContact,
+    bio_summary: demoContactBio,
+    topics_of_interest: JSON.stringify([
+      'Sports media',
+      'AI workflows',
+      'Event operations',
+      'Sponsorship data',
+      'Strategic introductions',
+    ]),
+    source_confidence: 0.96,
+    email_frequency_score: 2.4,
+    meetings_last_30d: 5,
+    created_at: isoDaysAgo(45),
+    updated_at: isoDaysAgo(0),
+    last_contact_date: isoDaysAgo(0),
+  },
+  tags: demoContact.tags,
+  associations: demoAssociations,
+  entity_associations: demoAssociations.map((a, index) => ({
+    id: `demo-assoc-${index}`,
+    entity_type: a.type.toLowerCase().includes('company')
+      ? 'company'
+      : a.type.toLowerCase().includes('deal')
+        ? 'deal'
+        : 'contact',
+    entity_id: a.href.split('/').pop() || `demo-assoc-${index}`,
+    display_name: a.name,
+    name: a.name,
+    relationship_type: a.strength,
+    strength_score: 0.92 - index * 0.06,
+  })),
+  signals: [
+    {
+      id: 'demo-signal-1',
+      field_name: 'relationship_warmth',
+      proposed_value: 'Warm relationship with clear next step',
+      confidence: 0.94,
+      created_at: isoDaysAgo(0),
+    },
+  ],
+  weekly_interactions: [
+    { week: isoDaysAgo(0), count: 8 },
+    { week: isoDaysAgo(7), count: 5 },
+    { week: isoDaysAgo(14), count: 7 },
+    { week: isoDaysAgo(21), count: 3 },
+  ],
+  first_interaction_date: isoDaysAgo(90),
+  timeline: demoContactTimelineEntries,
+  full_bio: demoContactBio,
+  enrichment_meta: { enrichment_last_run: isoDaysAgo(1), source: 'demo_mode', confidence: 0.96, contributions: 7 },
+  pending_updates: [],
+  documents: demoActionDocuments,
+};
+
+const demoCompanyBio =
+  'Demo-only Google company profile: the fictional story centers on enterprise AI workflows, live-event tooling, and a safe synthetic connection to the FIFA deal. This page is populated through the normal company UI so the recording reflects the real product surface without exposing production data.';
+
+export const demoCompanyDetailFixture = {
+  data: {
+    company: {
+      ...demoCompany,
+      description: demoCompany.description,
+      bio_summary: demoCompanyBio,
+      created_at: isoDaysAgo(120),
+      updated_at: isoDaysAgo(0),
+      location: demoCompany.hq_location,
+    },
+    contacts: demoContacts.slice(0, 10).map((c, index) => ({
+      ...c,
+      company_id: DEMO_IDS.company,
+      job_title: index === 0 ? 'Demo Principal' : 'Demo stakeholder',
+    })),
+    deals: demoDeals.slice(0, 5).map(d => ({ ...d, company_id: (d as any).company_id || DEMO_IDS.company })),
+    news_articles: demoCompanyUpdates.map((title, index) => ({
+      id: `demo-news-${index}`,
+      title,
+      summary: title,
+      source_name: 'Demo Mode',
+      published_at: isoDaysAgo(index + 1),
+      relevance_tag: index === 0 ? 'direct_mention' : 'industry_trend',
+    })),
+  },
+  tags: demoCompany.tags,
+  full_bio: demoCompanyBio,
+  enrichment_meta: { enrichment_last_run: isoDaysAgo(1), source: 'demo_mode', confidence: 0.94, contributions: 6 },
+  associations: demoAssociations.map((a, index) => ({
+    id: `demo-company-assoc-${index}`,
+    entity_type: a.type.toLowerCase().includes('deal') ? 'deal' : a.type.toLowerCase().includes('contact') ? 'contact' : 'company',
+    entity_id: a.href.split('/').pop() || `demo-company-assoc-${index}`,
+    display_name: a.name,
+    name: a.name,
+    relationship_type: a.strength,
+    strength_score: 0.9 - index * 0.05,
+  })),
+  documents: demoActionDocuments,
+};
+
+export const demoDealIntelligenceFixture: DealIntelligence & {
+  firm_sentiment_summary: string;
+  momentum_history: number[];
+  risk_level: string;
+  risk_summary: string;
+  risk_count: number;
+} = {
+  deal_id: DEMO_IDS.deal,
+  user_id: 'demo-user',
+  brief_summary:
+    'FIFA is a fictional demo opportunity centered on sports media workflows, sponsorship data, and global event operations. Recent synthetic activity shows constructive internal interest, a clean follow-up path, and documents ready for review.',
+  sentiment: 'positive',
+  sentiment_score: 0.68,
+  conversation_count: 3,
+  firm_sentiment_summary:
+    'Internal demo sentiment is constructive: the team is aligned on the thesis and wants a concise diligence packet before next steps.',
+  topics: ['sports media', 'global events', 'sponsorship data', 'AI workflow'],
+  momentum: 'accelerating',
+  momentum_score: 0.78,
+  momentum_history: [0.52, 0.6, 0.66, 0.72, 0.78],
+  risk_signals: [
+    {
+      type: 'integration_complexity',
+      severity: 'warning',
+      detail: 'Demo diligence should pressure-test event data integrations before next steps.',
+    },
+    {
+      type: 'data_quality',
+      severity: 'info',
+      detail: 'Synthetic sponsor reporting assumptions need confirmation in a follow-up packet.',
+    },
+  ],
+  risk_level: 'medium',
+  risk_summary: 'Synthetic risk flags focus on integration complexity and sponsor-data quality.',
+  risk_count: 2,
+  computed_at: new Date().toISOString(),
+  is_stale: false,
+};
+
+export const demoDealDetailFixture = {
+  bundle: {
+    deal: {
+      ...demoDeal,
+      title: 'FIFA',
+      company_name: 'FIFA',
+      stage: 'new',
+      lead_source: 'Demo relationship map',
+      evidence_count: 5,
+      source_family_count: 3,
+    },
+    company: {
+      id: 'demo-company-fifa',
+      name: 'FIFA',
+      company_type: 'corporation',
+      sector: 'Sports media and live events',
+      website: 'https://example.test/fifa-demo',
+      hq_location: 'Zurich',
+    },
+    contacts: {
+      theirs: [
+        {
+          id: 'demo-contact-fifa-marco',
+          full_name: 'Marco Silva',
+          email: 'marco.silva@example.test',
+          job_title: 'Sports media lead',
+        },
+      ],
+      ours: [
+        {
+          id: DEMO_IDS.contact,
+          full_name: 'Donald Trump',
+          email: 'donald.trump@example.test',
+          job_title: 'Demo Principal',
+        },
+      ],
+      other: [
+        {
+          id: 'demo-contact-google-ava',
+          full_name: 'Ava Morales',
+          email: 'ava.morales@example.test',
+          job_title: 'Operating partner',
+        },
+      ],
+    },
+    notes: [
+      {
+        id: 'demo-note-1',
+        content: 'Demo note: prepare the FIFA memo, confirm stakeholder map, and line up the next fictional diligence call.',
+        created_at: isoDaysAgo(1),
+        author_name: 'Tony Jimenez',
+      },
+    ],
+  },
+  documents: demoActionDocuments,
+  threads: [
+    {
+      external_thread_id: 'demo-fifa-thread-1',
+      subject: 'FIFA demo diligence packet',
+      message_count: 3,
+      last_sent_at: isoDaysAgo(0),
+      messages: [
+        {
+          id: 'demo-msg-1',
+          sender_name: 'Ava Morales',
+          sender_email: 'ava.morales@example.test',
+          sent_at: isoDaysAgo(0),
+          body_preview: 'Synthetic update: the FIFA demo packet is ready for review and the sponsorship data workflow is mapped.',
+          can_read_body: true,
+        },
+        {
+          id: 'demo-msg-2',
+          sender_name: 'Marco Silva',
+          sender_email: 'marco.silva@example.test',
+          sent_at: isoDaysAgo(1),
+          body_preview: 'Fictional follow-up confirming the demo stakeholder list and next call timing.',
+          can_read_body: true,
+        },
+      ],
+    },
+    {
+      external_thread_id: 'demo-fifa-thread-2',
+      subject: 'Google x FIFA demo workflow',
+      message_count: 2,
+      last_sent_at: isoDaysAgo(2),
+      messages: [
+        {
+          id: 'demo-msg-3',
+          sender_name: 'Donald Trump',
+          sender_email: 'donald.trump@example.test',
+          sent_at: isoDaysAgo(2),
+          body_preview: 'Demo-only note on how the Google company relationship connects to the FIFA opportunity.',
+          can_read_body: true,
+        },
+      ],
+    },
+  ],
+  intelligence: demoDealIntelligenceFixture,
+};
+
+export const demoMartySessions = [
+  {
+    id: 'demo-session-weekly-accomplishments',
+    title: 'Weekly Accomplishments Brief',
+    created_at: isoDaysAgo(0),
+    updated_at: isoDaysAgo(0),
+    demoMessages: [
+      {
+        id: 'demo-msg-user-1',
+        role: 'user',
+        content: 'Make me a doc listing the things that were accomplished this week.',
+        timestamp: isoDaysAgo(0),
+      },
+      {
+        id: 'demo-msg-assistant-1',
+        role: 'assistant',
+        content: 'Done — I created a clean weekly accomplishments brief using demo-safe data.',
+        timestamp: isoDaysAgo(0),
+        documentCards: [
+          {
+            document_id: 'demo-doc-contact-brief',
+            title: 'Weekly Accomplishments — Demo Brief',
+            file_name: 'weekly-accomplishments-demo.docx',
+            mime_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            document_type: 'document',
+            mode: 'dominant',
+            reason: 'Demo document for screen recording',
+            confidence: 1,
+            source: 'Demo Mode',
+            actions: { preview: true, download: true, send_to_marty: false },
+            generated: true,
+          },
+        ],
+      },
+    ],
+  },
+  { id: 'demo-session-tony-email-management', title: "Tony's Email Management Plan", created_at: isoDaysAgo(0), updated_at: isoDaysAgo(0), demoMessages: [] },
+  { id: 'demo-session-tony-email-comms', title: "Tony's Email Communication Summary", created_at: isoDaysAgo(0), updated_at: isoDaysAgo(0), demoMessages: [] },
+  { id: 'demo-session-direct-note', title: 'I appreciate you being direct', created_at: isoDaysAgo(0), updated_at: isoDaysAgo(0), demoMessages: [] },
+  { id: 'demo-session-recent-activities', title: "Tony's Recent Activities and Follow-ups", created_at: isoDaysAgo(0), updated_at: isoDaysAgo(0), demoMessages: [] },
+  { id: 'demo-session-private', title: "I don't have access to your private data", created_at: isoDaysAgo(4), updated_at: isoDaysAgo(4), demoMessages: [] },
+  { id: 'demo-session-jericho', title: 'Jericho Security Deal Detail Review', created_at: isoDaysAgo(9), updated_at: isoDaysAgo(9), demoMessages: [] },
+  { id: 'demo-session-tyler', title: 'Tyler Johnson Complete Catch-up', created_at: isoDaysAgo(9), updated_at: isoDaysAgo(9), demoMessages: [] },
 ];

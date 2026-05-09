@@ -24,8 +24,7 @@ import { DocumentActions } from '@/components/document-actions';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { ApiError, api } from '@/lib/api';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
-import { DemoDealDetail } from '@/components/demo/demo-detail-pages';
-import { useDemoMode } from '@/lib/demo-mode';
+import { demoDealDetailFixture, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import {
   MomentumSparkline,
   RiskFlag,
@@ -154,6 +153,7 @@ export default function DealDetailPage() {
   const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const { intelligence, refresh } = useDealIntelligence(dealId);
+  const effectiveIntelligence = isDemoDeal ? demoDealDetailFixture.intelligence : intelligence;
   const loadSeqRef = React.useRef(0);
 
   const deal = bundle?.deal;
@@ -164,13 +164,15 @@ export default function DealDetailPage() {
   const load = React.useCallback(async () => {
     if (!dealId) return;
     if (isDemoDeal) {
+      const fixture = demoDealDetailFixture;
       setLoading(false);
-      setBundle(null);
-      setDocuments([]);
-      setThreads([]);
+      setBundle(fixture.bundle);
+      setDocuments(fixture.documents || []);
+      setThreads(fixture.threads || []);
       setDealLoadError(null);
       setDocumentsError(null);
       setThreadsError(null);
+      setSupportingLoading(false);
       return;
     }
     const seq = ++loadSeqRef.current;
@@ -233,6 +235,14 @@ export default function DealDetailPage() {
   }, [toast]);
 
   async function updateStage(stage: DealStage) {
+    if (isDemoDeal) {
+      setBundle((current: any) => ({
+        ...(current || {}),
+        deal: { ...(current?.deal || {}), stage },
+      }));
+      setToast(demoToastMessage('Stage update'));
+      return;
+    }
     setBusy(true);
     try {
       await api.updateDeal(dealId, { stage });
@@ -246,6 +256,18 @@ export default function DealDetailPage() {
   }
 
   async function decide(decision: 'yes' | 'no' | 'delete') {
+    if (isDemoDeal) {
+      if (decision === 'yes') {
+        setBundle((current: any) => ({
+          ...(current || {}),
+          deal: { ...(current?.deal || {}), stage: 'talking' },
+        }));
+        setToast(demoToastMessage('Deal approval'));
+      } else {
+        router.push('/deals');
+      }
+      return;
+    }
     setBusy(true);
     try {
       await api.bulkDecideDeals({ deal_ids: [dealId], decision });
@@ -264,6 +286,24 @@ export default function DealDetailPage() {
 
   async function addNote() {
     if (!noteText.trim()) return;
+    if (isDemoDeal) {
+      const content = noteText.trim();
+      setBundle((current: any) => ({
+        ...(current || {}),
+        notes: [
+          {
+            id: `demo-note-${Date.now()}`,
+            content,
+            created_at: new Date().toISOString(),
+            author_name: 'Demo user',
+          },
+          ...((current?.notes || []) as any[]),
+        ],
+      }));
+      setNoteText('');
+      setToast(demoToastMessage('Deal note'));
+      return;
+    }
     setSavingNote(true);
     try {
       await api.createDealNote(dealId, { content: noteText.trim() });
@@ -276,8 +316,6 @@ export default function DealDetailPage() {
       setSavingNote(false);
     }
   }
-
-  if (isDemoDeal) return <DemoDealDetail />;
 
   if (loading) {
     return (
@@ -333,9 +371,9 @@ export default function DealDetailPage() {
     : dealAgeText.endsWith(' day')
       ? { value: dealAgeText.replace(' day', ''), unit: 'day' }
       : { value: dealAgeText, unit: '' };
-  const topics = (intelligence?.topics || []).slice(0, 8);
-  const sentimentLine = intelligence?.sentiment
-    ? `Recent internal tone is ${intelligence.sentiment}${intelligence.conversation_count ? ` across ${intelligence.conversation_count} readable source${intelligence.conversation_count === 1 ? '' : 's'}` : ''}.`
+  const topics = (effectiveIntelligence?.topics || []).slice(0, 8);
+  const sentimentLine = effectiveIntelligence?.sentiment
+    ? `Recent internal tone is ${effectiveIntelligence.sentiment}${effectiveIntelligence.conversation_count ? ` across ${effectiveIntelligence.conversation_count} readable source${effectiveIntelligence.conversation_count === 1 ? '' : 's'}` : ''}.`
     : 'Recent source messages linked to this deal are shown below when you have access.';
 
   return (
@@ -447,12 +485,12 @@ export default function DealDetailPage() {
           </div>
           <div className="px-5 py-4 border-r border-b sm:border-b-0 border-white/[0.04]">
             <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Sentiment</div>
-            <SentimentIndicator intelligence={intelligence} size="detail" />
+            <SentimentIndicator intelligence={effectiveIntelligence} size="detail" />
           </div>
           <div className="px-5 py-4">
             <div className="text-[10px] uppercase tracking-[0.12em] text-text-muted mb-2">Active Topics</div>
             {topics.length > 0 ? (
-              <TopicChips intelligence={intelligence} size="detail" />
+              <TopicChips intelligence={effectiveIntelligence} size="detail" />
             ) : (
               <span className="text-xs text-text-muted">No topics yet</span>
             )}
@@ -468,23 +506,23 @@ export default function DealDetailPage() {
               Intelligence Brief
             </div>
             <button
-              onClick={refresh}
+              onClick={isDemoDeal ? () => setToast(demoToastMessage('Intelligence refresh')) : refresh}
               className="inline-flex items-center gap-1.5 text-xs text-text-muted hover:text-text-primary transition-colors"
             >
               <RefreshCw size={12} /> Refresh
             </button>
           </div>
           <p className="max-w-5xl text-sm leading-6 text-text-secondary">
-            {intelligence?.brief_summary || 'MARTy has not generated a current brief yet. As more readable activity is linked to this startup, this will summarize what is happening now with recency bias.'}
+            {effectiveIntelligence?.brief_summary || 'MARTy has not generated a current brief yet. As more readable activity is linked to this startup, this will summarize what is happening now with recency bias.'}
           </p>
           <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
             <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2">
               <div className="mb-1 text-[10px] uppercase tracking-[0.12em] text-text-muted">Momentum</div>
-              <MomentumSparkline intelligence={intelligence} size="detail" />
+              <MomentumSparkline intelligence={effectiveIntelligence} size="detail" />
             </div>
             <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2">
               <div className="mb-1 text-[10px] uppercase tracking-[0.12em] text-text-muted">Risk Signal</div>
-              <RiskFlag intelligence={intelligence} size="detail" />
+              <RiskFlag intelligence={effectiveIntelligence} size="detail" />
             </div>
             <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2">
               <div className="mb-1 text-[10px] uppercase tracking-[0.12em] text-text-muted">Evidence Window</div>

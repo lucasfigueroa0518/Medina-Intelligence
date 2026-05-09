@@ -18,8 +18,12 @@ import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
-import { DemoContactDetail } from '@/components/demo/demo-detail-pages';
-import { useDemoMode } from '@/lib/demo-mode';
+import {
+  demoContactDetailFixture,
+  demoRecentObservationsForContact,
+  demoToastMessage,
+  useDemoMode,
+} from '@/lib/demo-mode';
 
 type Tab = 'overview' | 'timeline' | 'associations' | 'documents' | 'deals';
 
@@ -102,6 +106,20 @@ export default function ContactDetailPage() {
 
   React.useEffect(() => {
     if (isDemoContact) {
+      const fixture = demoContactDetailFixture;
+      setContact(fixture.contact);
+      setTags(fixture.tags || []);
+      setAssociations(fixture.associations || []);
+      setSignals(fixture.signals || []);
+      setWeeklyInteractions(fixture.weekly_interactions || []);
+      setFirstInteractionDate(fixture.first_interaction_date || null);
+      setTimeline(fixture.timeline as TimelineEntry[]);
+      setFullBio(fixture.full_bio);
+      setEnrichmentMeta(fixture.enrichment_meta);
+      setEntityAssociations(fixture.entity_associations || []);
+      setPendingUpdates(fixture.pending_updates || []);
+      setDocuments(fixture.documents || []);
+      setApprovedFields(new Set());
       setLoading(false);
       return;
     }
@@ -135,7 +153,11 @@ export default function ContactDetailPage() {
   }, [toast]);
 
   React.useEffect(() => {
-    if (isDemoContact) return;
+    if (isDemoContact) {
+      if (activeTab === 'documents') setDocuments(demoContactDetailFixture.documents || []);
+      setDocsLoading(false);
+      return;
+    }
     if (activeTab !== 'documents') return;
     setDocsLoading(true);
     api.listDocuments({ contact_id: id }).then(r => setDocuments(r.documents || []))
@@ -146,6 +168,11 @@ export default function ContactDetailPage() {
   async function handleDocUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (isDemoContact) {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      setToast(demoToastMessage('Document upload'));
+      return;
+    }
     setUploading(true);
     try {
       const res = await api.uploadDocument(file, { contact_id: id, visibility: uploadVisibility });
@@ -160,6 +187,11 @@ export default function ContactDetailPage() {
   }
 
   async function handleDocDelete(docId: string) {
+    if (isDemoContact) {
+      setDocuments(prev => prev.filter(d => d.id !== docId));
+      setToast(demoToastMessage('Document delete'));
+      return;
+    }
     try {
       await api.deleteDocument(docId);
       setDocuments(prev => prev.filter(d => d.id !== docId));
@@ -190,6 +222,29 @@ export default function ContactDetailPage() {
     if (!editForm.full_name.trim()) return;
     setSaving(true);
     try {
+      if (isDemoContact) {
+        setContact((c: any) => ({
+          ...c,
+          full_name: editForm.full_name.trim(),
+          email: editForm.email.trim() || null,
+          phone: editForm.phone.trim() || null,
+          job_title: editForm.job_title.trim() || null,
+          contact_type: editForm.contact_type,
+          linkedin_url: editForm.linkedin_url.trim() || null,
+          twitter_url: editForm.twitter_url.trim() || null,
+          company_id: editForm.company_id,
+          company_name: editForm.company_name,
+          location: editForm.location.trim() || null,
+          introduced_via: editForm.introduced_via.trim() || null,
+          investment_focus: editForm.investment_focus.trim() || null,
+          check_size_range: editForm.check_size_range.trim() || null,
+          fund_name: editForm.fund_name.trim() || null,
+          commitment_status: editForm.commitment_status.trim() || null,
+        }));
+        setEditMode(false);
+        setToast(demoToastMessage('Contact edit'));
+        return;
+      }
       await api.updateContact(id, {
         full_name: editForm.full_name.trim(),
         email: editForm.email.trim() || null, phone: editForm.phone.trim() || null,
@@ -213,6 +268,11 @@ export default function ContactDetailPage() {
 
   async function handleStatusChange(v: string) {
     setStatusOpen(false);
+    if (isDemoContact) {
+      setContact((c: any) => ({ ...c, engagement_status: v, engagement_status_manual: 1 }));
+      setToast(demoToastMessage('Status change'));
+      return;
+    }
     try {
       await api.updateContact(id, { engagement_status: v });
       setContact((c: any) => ({ ...c, engagement_status: v, engagement_status_manual: 1 }));
@@ -221,6 +281,15 @@ export default function ContactDetailPage() {
   }
 
   async function handleEnrich() {
+    if (isDemoContact) {
+      setEnriching(true);
+      window.setTimeout(() => {
+        setEnriching(false);
+        setEnriched(true);
+        setToast(demoToastMessage('Enrichment'));
+      }, 450);
+      return;
+    }
     setEnriching(true);
     try {
       await api.enrichContact(id);
@@ -230,6 +299,12 @@ export default function ContactDetailPage() {
   }
 
   async function handleApproveSuggestion(updateId: string, fieldName: string) {
+    if (isDemoContact) {
+      setApprovedFields(prev => new Set(prev).add(fieldName));
+      setPendingUpdates(prev => prev.filter(u => u.id !== updateId));
+      setToast(demoToastMessage('Suggestion approval'));
+      return;
+    }
     setApprovingIds(prev => new Set(prev).add(updateId));
     try {
       const res = await api.approveItem(updateId);
@@ -243,6 +318,11 @@ export default function ContactDetailPage() {
   }
 
   async function handleRejectSuggestion(updateId: string) {
+    if (isDemoContact) {
+      setPendingUpdates(prev => prev.filter(u => u.id !== updateId));
+      setToast(demoToastMessage('Suggestion dismissal'));
+      return;
+    }
     setApprovingIds(prev => new Set(prev).add(updateId));
     try {
       await api.rejectItem(updateId);
@@ -252,6 +332,11 @@ export default function ContactDetailPage() {
   }
 
   async function handleApproveAll() {
+    if (isDemoContact) {
+      setPendingUpdates([]);
+      setToast(demoToastMessage('Suggestion approval'));
+      return;
+    }
     try {
       await api.approveAllForEntity('contact', id);
       setPendingUpdates([]);
@@ -261,6 +346,11 @@ export default function ContactDetailPage() {
   }
 
   async function handleRejectAll() {
+    if (isDemoContact) {
+      setPendingUpdates([]);
+      setToast(demoToastMessage('Suggestion dismissal'));
+      return;
+    }
     try {
       await api.rejectAllForEntity('contact', id);
       setPendingUpdates([]);
@@ -269,12 +359,14 @@ export default function ContactDetailPage() {
   }
 
   async function handleDelete() {
+    if (isDemoContact) {
+      router.push('/contacts');
+      return;
+    }
     setDeleting(true);
     try { await api.deleteContact(id); router.push('/contacts'); }
     catch (e: any) { alert(e.message || 'Delete failed'); setDeleting(false); }
   }
-
-  if (isDemoContact) return <DemoContactDetail />;
 
   if (loading) return <div className="flex-1 flex items-center justify-center text-text-secondary">Loading...</div>;
   if (!contact) return (
@@ -522,7 +614,11 @@ export default function ContactDetailPage() {
             {/* Q12 — synthetic observations from LLM extraction over
                 conversations the user can read. Self-contained: hides
                 itself when there's nothing to show. */}
-            <RecentObservations entityType="contact" entityId={id} />
+            <RecentObservations
+              entityType="contact"
+              entityId={id}
+              observationsOverride={isDemoContact ? demoRecentObservationsForContact : undefined}
+            />
             {/* Pending Suggestions Banner */}
             {pendingUpdates.length > 0 && !editMode && (
               <div className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(245,158,11,0.25)', background: 'rgba(245,158,11,0.04)' }}>

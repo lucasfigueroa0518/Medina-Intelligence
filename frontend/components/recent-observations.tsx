@@ -21,7 +21,7 @@ import { api } from '@/lib/api';
 
 type EntityType = 'contact' | 'company' | 'deal';
 
-interface Observation {
+export interface Observation {
   id: string;
   observation_type: string;
   observation_value: string;
@@ -154,15 +154,23 @@ function formatObservation(o: Observation): DisplayObservation {
 export function RecentObservations({
   entityType,
   entityId,
+  observationsOverride,
 }: {
   entityType: EntityType;
   entityId: string;
+  observationsOverride?: Observation[] | null;
 }) {
   const [observations, setObservations] = React.useState<Observation[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
 
   const load = React.useCallback(async () => {
+    if (observationsOverride) {
+      setObservations(observationsOverride);
+      setError(null);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -177,13 +185,17 @@ export function RecentObservations({
       setObservations([]);
     }
     setLoading(false);
-  }, [entityType, entityId]);
+  }, [entityType, entityId, observationsOverride]);
 
   React.useEffect(() => {
     load();
   }, [load]);
 
   async function dismiss(id: string) {
+    if (observationsOverride) {
+      setObservations(prev => prev.filter(o => o.id !== id));
+      return;
+    }
     try {
       await api.dismissObservation(id);
       // Optimistic remove — server confirmed by 200.

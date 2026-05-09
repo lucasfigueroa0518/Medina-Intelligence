@@ -15,8 +15,12 @@ import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
-import { DemoCompanyDetail } from '@/components/demo/demo-detail-pages';
-import { useDemoMode } from '@/lib/demo-mode';
+import {
+  demoCompanyDetailFixture,
+  demoRecentObservationsForCompany,
+  demoToastMessage,
+  useDemoMode,
+} from '@/lib/demo-mode';
 
 const STAGE_OPTIONS = [
   { value: 'pre_seed', label: 'Pre-Seed' },
@@ -102,6 +106,13 @@ export default function CompanyDetailPage() {
 
   React.useEffect(() => {
     if (isDemoCompany) {
+      const fixture = demoCompanyDetailFixture;
+      setData(fixture.data);
+      setTags(fixture.tags || []);
+      setFullBio(fixture.full_bio);
+      setEnrichmentMeta(fixture.enrichment_meta);
+      setCompanyAssociations(fixture.associations || []);
+      setDocuments(fixture.documents || []);
       setLoading(false);
       return;
     }
@@ -122,7 +133,11 @@ export default function CompanyDetailPage() {
   }, [id, refreshKey, isDemoCompany]);
 
   React.useEffect(() => {
-    if (isDemoCompany) return;
+    if (isDemoCompany) {
+      setDocuments(demoCompanyDetailFixture.documents || []);
+      setDocsLoading(false);
+      return;
+    }
     setDocsLoading(true);
     api.listDocuments({ company_id: id }).then(r => setDocuments(r.documents || []))
       .catch(() => setDocuments([]))
@@ -132,6 +147,11 @@ export default function CompanyDetailPage() {
   async function handleDocUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (isDemoCompany) {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      setToast(demoToastMessage('Document upload'));
+      return;
+    }
     setUploading(true);
     try {
       const res = await api.uploadDocument(file, { company_id: id, visibility: uploadVisibility });
@@ -142,6 +162,11 @@ export default function CompanyDetailPage() {
   }
 
   async function handleDocDelete(docId: string) {
+    if (isDemoCompany) {
+      setDocuments(prev => prev.filter(d => d.id !== docId));
+      setToast(demoToastMessage('Document delete'));
+      return;
+    }
     try {
       await api.deleteDocument(docId);
       setDocuments(prev => prev.filter(d => d.id !== docId));
@@ -171,6 +196,26 @@ export default function CompanyDetailPage() {
     if (!editForm.name.trim()) return;
     setSaving(true);
     try {
+      if (isDemoCompany) {
+        setData((current: any) => ({
+          ...(current || {}),
+          company: {
+            ...(current?.company || {}),
+            name: editForm.name.trim(),
+            description: editForm.description.trim() || null,
+            sector: editForm.sector.trim() || null,
+            stage: editForm.stage || null,
+            company_type: editForm.company_type || null,
+            investment_status: editForm.investment_status || null,
+            website: editForm.website.trim() || null,
+            location: editForm.location.trim() || null,
+            domain: editForm.domain.trim() || null,
+          },
+        }));
+        setEditMode(false);
+        setToast(demoToastMessage('Company edit'));
+        return;
+      }
       await api.updateCompany(id, {
         name: editForm.name.trim(),
         description: editForm.description.trim() || null,
@@ -190,6 +235,15 @@ export default function CompanyDetailPage() {
   }
 
   async function handleEnrich() {
+    if (isDemoCompany) {
+      setEnriching(true);
+      window.setTimeout(() => {
+        setEnriching(false);
+        setEnriched(true);
+        setToast(demoToastMessage('Enrichment'));
+      }, 450);
+      return;
+    }
     setEnriching(true);
     try {
       await api.enrichCompany(id);
@@ -206,6 +260,10 @@ export default function CompanyDetailPage() {
   }
 
   async function handleDelete() {
+    if (isDemoCompany) {
+      router.push('/companies');
+      return;
+    }
     setDeleting(true);
     try {
       await api.deleteCompany(id);
@@ -215,8 +273,6 @@ export default function CompanyDetailPage() {
       setDeleting(false);
     }
   }
-
-  if (isDemoCompany) return <DemoCompanyDetail />;
 
   if (loading) {
     return (
@@ -366,7 +422,11 @@ export default function CompanyDetailPage() {
         {/* Q12 — synthetic observations from LLM extraction over
             conversations the user can read. Self-contained: hides
             itself when there's nothing to show. */}
-        <RecentObservations entityType="company" entityId={id} />
+        <RecentObservations
+          entityType="company"
+          entityId={id}
+          observationsOverride={isDemoCompany ? demoRecentObservationsForCompany : undefined}
+        />
         {/* Description Card */}
         <div className="relative rounded-xl p-5 transition-all duration-200 hover:border-white/[0.1]"
           style={{ background: 'rgba(17,17,20,0.65)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.05)' }}>

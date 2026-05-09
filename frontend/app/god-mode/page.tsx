@@ -18,6 +18,7 @@ import { UploadPreviewModal } from '@/components/upload-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { trimPartialCitation, type CitationSource } from '@/lib/citations';
 import type { ChatUploadSummary } from '@/lib/api';
+import { demoMartySessions, useDemoMode } from '@/lib/demo-mode';
 
 // ---------------------------------------------------------------------------
 // Thinking verbs (crossfade)
@@ -36,6 +37,7 @@ const THINKING_VERBS = [
   "Sharpening the brief", "Assembling the picture", "Locking in the signal",
   "Shining Manny's shoes", "Helping Raul pick his outfit", "Ordering lunch for Tony",
   "Helping Alvaro with Due Diligence", "Building firewalls for Adam",
+  "Is Tony a Vegan?", "Reposting Raul's Instagram Posts",
 ];
 
 function useThinkingVerb(active: boolean) {
@@ -887,6 +889,7 @@ function SessionItem({
 // ---------------------------------------------------------------------------
 
 export default function GodModePage() {
+  const demoMode = useDemoMode();
   const [sessions, setSessions] = React.useState<any[]>([]);
   const [sessionsLoading, setSessionsLoading] = React.useState(true);
   const [activeSessionId, setActiveSessionId] = React.useState<string | null>(null);
@@ -1073,12 +1076,17 @@ export default function GodModePage() {
   React.useEffect(() => {
     document.title = 'MARTy \u2014 Medina Intelligence';
     setSessionsLoading(true);
-    api.listSessions().then(d => { setSessions(d.sessions); setSessionsLoading(false); }).catch(() => setSessionsLoading(false));
+    if (demoMode) {
+      setSessions(demoMartySessions);
+      setSessionsLoading(false);
+    } else {
+      api.listSessions().then(d => { setSessions(d.sessions); setSessionsLoading(false); }).catch(() => setSessionsLoading(false));
+    }
     const t = setTimeout(() => setShowSparkles(false), 1200);
 
     try {
       const pending = localStorage.getItem('marty_pending');
-      if (pending) {
+      if (!demoMode && pending) {
         const { sessionId } = JSON.parse(pending);
         if (sessionId) {
           setActiveSessionId(sessionId);
@@ -1105,7 +1113,7 @@ export default function GodModePage() {
         const sp = new URLSearchParams(window.location.search);
         const incomingSession = sp.get('session_id');
         const incomingUpload = sp.get('attach_upload');
-        if (incomingSession) {
+        if (!demoMode && incomingSession) {
           setActiveSessionId(incomingSession);
           if (incomingUpload) {
             // listSessionUploads runs on activeSessionId change; the
@@ -1121,7 +1129,7 @@ export default function GodModePage() {
     } catch { /* ignore */ }
 
     return () => clearTimeout(t);
-  }, []);
+  }, [demoMode]);
 
   React.useEffect(() => {
     if (!activeSessionId && messages.length === 0) {
@@ -1133,6 +1141,19 @@ export default function GodModePage() {
   streamingRef.current = streaming;
 
   React.useEffect(() => {
+    if (demoMode) {
+      if (activeSessionId) {
+        const demoSession = demoMartySessions.find(s => s.id === activeSessionId);
+        setMessages(((demoSession as any)?.demoMessages || []) as Message[]);
+      } else {
+        setMessages([]);
+      }
+      setSessionUploads([]);
+      setBytesUsed(0);
+      setBytesTotal(0);
+      setPendingUploads([]);
+      return;
+    }
     if (skipNextFetchRef.current) {
       skipNextFetchRef.current = false;
       return;
@@ -1176,7 +1197,7 @@ export default function GodModePage() {
       setBytesTotal(0);
       setPendingUploads([]);
     }
-  }, [activeSessionId]);
+  }, [activeSessionId, demoMode]);
 
   // Fix 1: Auto-scroll only when user hasn't scrolled up
   React.useEffect(() => {
@@ -1203,6 +1224,11 @@ export default function GodModePage() {
   async function handleDeleteSession(sessionId: string) {
     setDeletingId(sessionId);
     try {
+      if (demoMode) {
+        setSessions(prev => prev.filter(s => s.id !== sessionId));
+        if (activeSessionId === sessionId) { setActiveSessionId(null); setMessages([]); }
+        return;
+      }
       await api.deleteSession(sessionId);
       setSessions(prev => prev.filter(s => s.id !== sessionId));
       if (activeSessionId === sessionId) { setActiveSessionId(null); setMessages([]); }
@@ -1214,6 +1240,10 @@ export default function GodModePage() {
     const trimmed = editTitleValue.trim();
     if (!trimmed) { setEditingTitleId(null); return; }
     try {
+      if (demoMode) {
+        setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: trimmed } : s));
+        return;
+      }
       await api.renameSession(sessionId, trimmed);
       setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: trimmed } : s));
     } catch { /* ignore */ }
@@ -1287,6 +1317,29 @@ export default function GodModePage() {
     setAttachedFile(null);
     setDeepDive(false);
     setPendingUploads([]);
+
+    if (demoMode) {
+      window.setTimeout(() => {
+        setIsThinking(false);
+        setMessages(m => m.map(msg =>
+          msg.id === assistantMsgId
+            ? {
+                ...msg,
+                content: 'Demo mode is using safe synthetic data for filming. No production emails, documents, contacts, deals, or chat sessions were queried or changed.',
+                streaming: false,
+                justFinished: true,
+              }
+            : msg
+        ));
+        setStreaming(false);
+        setTimeout(() => {
+          setMessages(m => m.map(msg =>
+            msg.id === assistantMsgId ? { ...msg, justFinished: false } : msg
+          ));
+        }, 1000);
+      }, 450);
+      return;
+    }
 
     try {
       await streamAgentQuery(
