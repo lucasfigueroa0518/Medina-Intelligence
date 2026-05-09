@@ -78,18 +78,80 @@ export function UploadPreviewModal({
           </div>
         </header>
         <div className="flex-1 overflow-hidden p-3">
-          {previewKind === 'pdf' ? (
-            <FilePreview kind="pdf" src={contentUrl} fileName={upload.filename} />
-          ) : previewKind === 'image' ? (
-            <FilePreview kind="image" src={contentUrl} fileName={upload.filename} />
-          ) : previewKind === 'docx' ? (
-            <FilePreview kind="docx" src={contentUrl} fileName={upload.filename} />
+          {previewKind === 'pdf' || previewKind === 'image' || previewKind === 'docx' || previewKind === 'xlsx' || previewKind === 'pptx' ? (
+            <AuthenticatedFilePreview upload={upload} kind={previewKind} contentUrl={contentUrl} />
           ) : (
             <ExtractedTextPreview uploadId={upload.id} extractionStatus={upload.extraction_status} />
           )}
         </div>
       </div>
     </div>
+  );
+}
+
+function authHeaders(): Record<string, string> | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const token = localStorage.getItem('auth_token');
+  return token ? { Authorization: `Bearer ${token}` } : undefined;
+}
+
+function AuthenticatedFilePreview({
+  upload,
+  kind,
+  contentUrl,
+}: {
+  upload: ChatUploadSummary;
+  kind: ReturnType<typeof kindFromMime>;
+  contentUrl: string;
+}) {
+  const [blobUrl, setBlobUrl] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let alive = true;
+    let createdUrl: string | null = null;
+    setLoading(true);
+    setError(null);
+    setBlobUrl(null);
+    const url = upload.saved_to_documents && upload.saved_document_id
+      ? `${process.env.NEXT_PUBLIC_API_URL ?? ''}/api/documents/${upload.saved_document_id}/download`
+      : contentUrl;
+    fetch(url, { headers: authHeaders() })
+      .then(async r => {
+        if (!alive) return;
+        if (!r.ok) throw new Error(`Failed to load preview (${r.status}).`);
+        const contentType = r.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          throw new Error('Original file is not available from this attachment.');
+        }
+        const blob = await r.blob();
+        if (!alive) return;
+        createdUrl = URL.createObjectURL(blob);
+        setBlobUrl(createdUrl);
+        setLoading(false);
+      })
+      .catch((e: any) => {
+        if (alive) {
+          setError(e?.message || 'Preview unavailable');
+          setLoading(false);
+        }
+      });
+    return () => {
+      alive = false;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+  }, [upload.id, upload.saved_document_id, upload.saved_to_documents, contentUrl]);
+
+  return (
+    <FilePreview
+      kind={kind}
+      src={blobUrl || undefined}
+      fileName={upload.filename}
+      loading={loading}
+      error={error}
+      emptyMessage="Preview not available for this attachment."
+    />
   );
 }
 

@@ -610,6 +610,74 @@ function countSheetRows(content: any): number {
     + asArray(content?.rows).length;
 }
 
+function meaningfulCellCount(rows: any[][]): number {
+  let count = 0;
+  for (const row of rows) {
+    for (const cell of row) {
+      if (cleanArtifactText(cell)) count++;
+    }
+  }
+  return count;
+}
+
+function allSheetRows(content: any): any[][] {
+  const rows: any[][] = [];
+  for (const sheet of asArray(content?.sheets)) rows.push(...rowsFromSheet(sheet));
+  for (const row of asArray(content?.rows)) {
+    if (Array.isArray(row)) rows.push(row.map(normalizeCellForXlsx));
+    else if (row && typeof row === 'object') rows.push(Object.values(row).map(normalizeCellForXlsx));
+    else rows.push([row]);
+  }
+  return rows;
+}
+
+function contentQualityIssues(kind: ArtifactKind, content: any): string[] {
+  const issues: string[] = [];
+  const text = plainTextFromStructured(content).trim();
+  if (kind === 'xlsx') {
+    const sheets = asArray(content?.sheets);
+    const rows = allSheetRows(content);
+    const nonEmptyCells = meaningfulCellCount(rows);
+    if (sheets.length === 0 && asArray(content?.rows).length === 0) issues.push('missing workbook sheets');
+    if (rows.length < 5) issues.push('spreadsheet has too few rows');
+    if (nonEmptyCells < 10) issues.push('spreadsheet has too few meaningful cells');
+    const looksLikeTextDump = rows.length <= 2
+      && cleanArtifactText(rows[0]?.[0]).toLowerCase() === 'title'
+      && cleanArtifactText(rows[1]?.[0]).toLowerCase() === 'content';
+    if (looksLikeTextDump) issues.push('spreadsheet is a title/content text dump');
+    return issues;
+  }
+  if (kind === 'pptx') {
+    const slides = asArray(content?.slides);
+    const meaningfulSlides = slides.filter(s => {
+      const slideText = [
+        s?.title,
+        s?.subtitle,
+        s?.body,
+        ...asArray(s?.bullets),
+        ...asArray(s?.table?.headers),
+        ...asArray(s?.table?.rows).flat(),
+      ].map(cleanArtifactText).filter(Boolean).join(' ');
+      return cleanArtifactText(s?.title) && slideText.length >= 35;
+    });
+    if (slides.length < 4) issues.push('presentation has too few slides');
+    if (meaningfulSlides.length < 3) issues.push('presentation has too few content-rich slides');
+    if (text.length < 300) issues.push('presentation content is too thin');
+    return issues;
+  }
+  const sectionCount = asArray(content?.sections).length;
+  const paragraphCount = asArray(content?.paragraphs).length
+    + asArray(content?.bullets).length
+    + asArray(content?.key_points).length
+    + asArray(content?.recommendations).length;
+  const tableCount = tablesFrom(content?.tables).length
+    + asArray(content?.sections).reduce((sum, section) => sum + tablesFrom(section?.tables || section?.table).length, 0);
+  if (text.length < 450) issues.push(`${kind.toUpperCase()} content is too thin`);
+  if (sectionCount + paragraphCount < 4) issues.push(`${kind.toUpperCase()} needs more structured sections or paragraphs`);
+  if (kind === 'docx' && sectionCount === 0 && tableCount === 0) issues.push('DOCX needs sections or tables');
+  return issues;
+}
+
 function isThinArtifactContent(kind: ArtifactKind, content: any): boolean {
   const text = plainTextFromStructured(content).trim();
   if (kind === 'pptx') return asArray(content?.slides).length < 4 || text.length < 500;
@@ -738,6 +806,65 @@ ${sourceContext || '(none)'}`;
   const raw = await callClaude({ system, user, max_tokens: 7000, orgId: ctx.orgId }, 'low', env).catch(() => '');
   const parsed = parseJsonObject(raw);
   return parsed || defaultArtifactContent(kind, title, content);
+}
+
+async function repairArtifactContent(
+  kind: ArtifactKind,
+  title: string,
+  content: any,
+  ctx: AuthContext,
+  env: Env,
+  sourceDocs: DocumentRow[],
+  issues: string[]
+): Promise<any> {
+  const sourceContext = sourceDocs
+    .map(d => `- ${d.title || d.file_name || d.id}: ${d.extracted_text_preview || ''}`.slice(0, 1200))
+    .join('\n');
+  const system = `You are MARTy's Office artifact repair engine. Return strict JSON only, no markdown.
+The previous artifact request failed validation. Repair it into a real structured artifact for the requested file type.
+
+Hard requirements:
+- Never return plain prose as the root object.
+- Never return a title/content dump for spreadsheets.
+- Preserve user-provided facts; if facts are limited, create a polished editable template with useful fields.
+- No unsupported external facts.
+
+Required schemas:
+- docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]}
+- xlsx: {"sheets":[{"name":"","title":"","rows":[[]]}]} with 2-4 sheets, headers, meaningful rows, and formulas where useful.
+- pptx: {"subtitle":"","slides":[{"title":"","subtitle":"","body":"","bullets":[],"table":{"headers":[],"rows":[[]]}}]} with 6-10 slides.`;
+  const user = `Artifact kind: ${kind}
+Title: ${title}
+Validation issues:
+${issues.map(i => `- ${i}`).join('\n')}
+
+Current draft JSON:
+${JSON.stringify(content || {}, null, 2).slice(0, 18000)}
+
+Source document context:
+${sourceContext || '(none)'}`;
+  const raw = await callClaude({ system, user, max_tokens: 7000, orgId: ctx.orgId }, 'low', env).catch(() => '');
+  return parseJsonObject(raw) || defaultArtifactContent(kind, title, content);
+}
+
+async function prepareArtifactContent(
+  kind: ArtifactKind,
+  title: string,
+  inputContent: any,
+  ctx: AuthContext,
+  env: Env,
+  sourceDocs: DocumentRow[]
+): Promise<any> {
+  let structuredContent = await enrichArtifactContent(kind, title, inputContent, ctx, env, sourceDocs);
+  let issues = contentQualityIssues(kind, structuredContent);
+  if (issues.length > 0) {
+    structuredContent = await repairArtifactContent(kind, title, structuredContent, ctx, env, sourceDocs, issues);
+    issues = contentQualityIssues(kind, structuredContent);
+  }
+  if (issues.length > 0) {
+    structuredContent = defaultArtifactContent(kind, title, structuredContent);
+  }
+  return structuredContent;
 }
 
 function fileTitle(title: string, kind: ArtifactKind): string {
@@ -893,7 +1020,10 @@ async function makeXlsx(title: string, content: any): Promise<Uint8Array> {
   const XLSX = await import('xlsx');
   const wb = XLSX.utils.book_new();
   wb.Props = { Title: title, Author: 'MARTy', Company: 'Medina Ventures' };
-  const sheets = asArray(content?.sheets);
+  const safeContent = asArray(content?.sheets).length > 0 || asArray(content?.rows).length > 0
+    ? content
+    : defaultArtifactContent('xlsx', title, content);
+  const sheets = asArray(safeContent?.sheets);
   if (sheets.length > 0) {
     for (const sheet of sheets) {
       const rows = rowsFromSheet(sheet);
@@ -913,10 +1043,10 @@ async function makeXlsx(title: string, content: any): Promise<Uint8Array> {
       XLSX.utils.book_append_sheet(wb, ws, String(sheet?.name || 'Sheet').slice(0, 31));
     }
   } else {
-    const rows = asArray(content?.rows);
+    const rows = asArray(safeContent?.rows);
     const aoa = rows.length > 0
       ? rows.map(row => Array.isArray(row) ? row.map(normalizeCellForXlsx) : Object.values(row || {}).map(normalizeCellForXlsx))
-      : [['Title', title], ['Content', plainTextFromStructured(content)]];
+      : rowsFromSheet(defaultArtifactContent('xlsx', title, safeContent).sheets[0]);
     const ws = XLSX.utils.aoa_to_sheet(aoa);
     ws['!cols'] = [{ wch: 24 }, { wch: 70 }];
     XLSX.utils.book_append_sheet(wb, ws, 'Summary');
@@ -1140,6 +1270,60 @@ async function artifactBytes(kind: ArtifactKind, title: string, content: any): P
   return makePdf(title, content);
 }
 
+async function validateGeneratedArtifact(kind: ArtifactKind, bytes: Uint8Array): Promise<{ ok: boolean; issues: string[] }> {
+  const issues: string[] = [];
+  if (bytes.byteLength < 800) issues.push('generated file is unexpectedly small');
+  try {
+    if (kind === 'pdf') {
+      const { PDFDocument } = await import('pdf-lib');
+      const pdf = await PDFDocument.load(bytes);
+      if (pdf.getPageCount() < 1) issues.push('PDF has no pages');
+      return { ok: issues.length === 0, issues };
+    }
+
+    const JSZip = (await import('jszip')).default;
+    const zip = await JSZip.loadAsync(bytes);
+    const entries = Object.keys(zip.files);
+    if (!entries.includes('[Content_Types].xml')) issues.push('missing Office content types manifest');
+
+    if (kind === 'docx') {
+      const xml = await zip.file('word/document.xml')?.async('string');
+      if (!xml) issues.push('DOCX missing word/document.xml');
+      else if (xml.replace(/<[^>]+>/g, '').trim().length < 80) issues.push('DOCX contains too little readable content');
+    }
+
+    if (kind === 'xlsx') {
+      if (!zip.file('xl/workbook.xml')) issues.push('XLSX missing xl/workbook.xml');
+      const worksheetEntries = entries.filter(e => /^xl\/worksheets\/sheet\d+\.xml$/.test(e));
+      if (worksheetEntries.length < 1) issues.push('XLSX has no worksheets');
+      const XLSX = await import('xlsx');
+      const wb = XLSX.read(bytes, { type: 'array' });
+      if (wb.SheetNames.length < 1) issues.push('XLSX workbook has no sheet names');
+      let nonEmptyCells = 0;
+      for (const name of wb.SheetNames) {
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, blankrows: false }) as any[][];
+        nonEmptyCells += meaningfulCellCount(rows);
+      }
+      if (nonEmptyCells < 10) issues.push('XLSX contains too few meaningful cells');
+    }
+
+    if (kind === 'pptx') {
+      if (!zip.file('ppt/presentation.xml')) issues.push('PPTX missing ppt/presentation.xml');
+      const slideEntries = entries.filter(e => /^ppt\/slides\/slide\d+\.xml$/.test(e));
+      if (slideEntries.length < 4) issues.push('PPTX has too few slides');
+      let slideText = '';
+      for (const entry of slideEntries.slice(0, 12)) {
+        const xml = await zip.file(entry)?.async('string');
+        slideText += ` ${xml?.replace(/<[^>]+>/g, ' ') || ''}`;
+      }
+      if (slideText.trim().length < 120) issues.push('PPTX contains too little readable slide text');
+    }
+  } catch (e: any) {
+    issues.push(`could not open generated ${kind.toUpperCase()} file: ${e?.message || e}`);
+  }
+  return { ok: issues.length === 0, issues };
+}
+
 function documentTypeForKind(kind: ArtifactKind): string {
   if (kind === 'xlsx') return 'spreadsheet';
   if (kind === 'pptx') return 'presentation';
@@ -1178,8 +1362,20 @@ async function persistArtifact(
   }
 ): Promise<{ card: MartyDocumentCard; document: { id: string; title: string; file_name: string; mime_type: string } }> {
   const inputContent = normalizeStructuredArtifactContent(opts.structuredContent);
-  const structuredContent = await enrichArtifactContent(opts.kind, opts.title, inputContent, ctx, env, opts.sourceDocs);
-  const bytes = await artifactBytes(opts.kind, opts.title, structuredContent);
+  let structuredContent = await prepareArtifactContent(opts.kind, opts.title, inputContent, ctx, env, opts.sourceDocs);
+  let bytes = await artifactBytes(opts.kind, opts.title, structuredContent);
+  let validation = await validateGeneratedArtifact(opts.kind, bytes);
+  if (!validation.ok) {
+    structuredContent = await repairArtifactContent(opts.kind, opts.title, structuredContent, ctx, env, opts.sourceDocs, validation.issues);
+    if (contentQualityIssues(opts.kind, structuredContent).length > 0) {
+      structuredContent = defaultArtifactContent(opts.kind, opts.title, structuredContent);
+    }
+    bytes = await artifactBytes(opts.kind, opts.title, structuredContent);
+    validation = await validateGeneratedArtifact(opts.kind, bytes);
+  }
+  if (!validation.ok) {
+    throw new Error(`MARTy could not create a valid ${opts.kind.toUpperCase()} file yet. ${validation.issues.join('; ')}`);
+  }
   const fileName = fileTitle(opts.title, opts.kind);
   const file = new File([bytes], fileName, { type: MIME_BY_KIND[opts.kind] });
   const visibility = restrictiveVisibility(opts.sourceDocs);
@@ -1217,8 +1413,9 @@ async function persistArtifact(
       marty_generated: true,
       source_document_ids: opts.sourceDocs.map(d => d.id),
       artifact_kind: opts.kind,
-      artifact_schema_version: 2,
+      artifact_schema_version: 3,
       artifact_text_length: extractedText.length,
+      artifact_validation: validation,
     }),
     persisted.documentId,
     ctx.orgId

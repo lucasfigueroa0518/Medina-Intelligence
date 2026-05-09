@@ -95,11 +95,11 @@ export function DocumentPreviewModal({
   }, [docId]);
 
   // Original-file preview: blob-fetch with bearer auth → object URL.
-  // PDFs/images render natively; DOCX uses browser-side document rendering.
+  // PDFs/images render natively; Office files use browser-side format-aware previews.
   React.useEffect(() => {
     if (!doc) return;
     const kind = kindFromMime(doc.mime_type);
-    if (kind !== 'pdf' && kind !== 'image' && kind !== 'docx') return;
+    if (kind !== 'pdf' && kind !== 'image' && kind !== 'docx' && kind !== 'xlsx' && kind !== 'pptx') return;
     if (!doc.r2_key) {
       setPreviewError('Original file is unavailable.');
       return;
@@ -269,7 +269,7 @@ export function DocumentPreviewModal({
                 text={doc?.extracted_text_preview || undefined}
                 emptyMessage="No text preview available — open detail page for full content."
               />
-            ) : kind === 'pdf' || kind === 'image' || kind === 'docx' ? (
+            ) : kind === 'pdf' || kind === 'image' || kind === 'docx' || kind === 'xlsx' || kind === 'pptx' ? (
               <FilePreview
                 kind={kind}
                 src={previewBlobUrl || undefined}

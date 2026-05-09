@@ -270,10 +270,15 @@ export async function getChatUploadContent(
   const obj = await env.R2.get(row.r2_key);
   if (!obj) return errorResponse('GONE', 410, 'attachment expired');
 
-  // For images and PDFs, return the raw bytes so the client can render the
-  // file directly. For text-extracted formats, return the extracted text as
-  // JSON so the modal can render it as a code block.
-  if (row.upload_type === 'pdf' || row.upload_type === 'image') {
+  // For binary previewable formats, return raw bytes so the client can render
+  // the file directly. For text-only formats, return extracted text as JSON.
+  if (
+    row.upload_type === 'pdf'
+    || row.upload_type === 'image'
+    || row.upload_type === 'document'
+    || row.upload_type === 'spreadsheet'
+    || row.upload_type === 'presentation'
+  ) {
     return new Response(obj.body, {
       headers: {
         'Content-Type': row.mime_type,
