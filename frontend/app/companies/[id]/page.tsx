@@ -15,6 +15,8 @@ import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
+import { DemoCompanyDetail } from '@/components/demo/demo-detail-pages';
+import { useDemoMode } from '@/lib/demo-mode';
 
 const STAGE_OPTIONS = [
   { value: 'pre_seed', label: 'Pre-Seed' },
@@ -61,6 +63,8 @@ export default function CompanyDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const id = params.id;
+  const demoMode = useDemoMode();
+  const isDemoCompany = demoMode && id.startsWith('demo-company');
   const [data, setData] = React.useState<any>(null);
   const [tags, setTags] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -97,6 +101,10 @@ export default function CompanyDetailPage() {
   const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
 
   React.useEffect(() => {
+    if (isDemoCompany) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     Promise.all([
       api.getCompany(id),
@@ -111,14 +119,15 @@ export default function CompanyDetailPage() {
         setCompanyAssociations(ea.associations || []);
       })
       .finally(() => setLoading(false));
-  }, [id, refreshKey]);
+  }, [id, refreshKey, isDemoCompany]);
 
   React.useEffect(() => {
+    if (isDemoCompany) return;
     setDocsLoading(true);
     api.listDocuments({ company_id: id }).then(r => setDocuments(r.documents || []))
       .catch(() => setDocuments([]))
       .finally(() => setDocsLoading(false));
-  }, [id, refreshKey]);
+  }, [id, refreshKey, isDemoCompany]);
 
   async function handleDocUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -206,6 +215,8 @@ export default function CompanyDetailPage() {
       setDeleting(false);
     }
   }
+
+  if (isDemoCompany) return <DemoCompanyDetail />;
 
   if (loading) {
     return (

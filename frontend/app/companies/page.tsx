@@ -10,6 +10,7 @@ import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { TagManagerModal } from '@/components/tag-manager-modal';
 import { api } from '@/lib/api';
 import { initialFromName, faviconUrl } from '@/lib/avatar';
+import { demoCompanies, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import { Plus, Search, X as XIcon, Settings2 } from 'lucide-react';
 
 interface Tag { id: string; name: string; color: string }
@@ -155,6 +156,7 @@ function CompaniesPage() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const demoMode = useDemoMode();
 
   const [filters, setFilters] = React.useState<FilterState>(() =>
     readFromUrl(searchParams ? new URLSearchParams(searchParams.toString()) : new URLSearchParams())
@@ -193,10 +195,16 @@ function CompaniesPage() {
   }, [searchInput]);
 
   React.useEffect(() => {
+    if (demoMode) {
+      setAllTags(demoTags);
+      setAllCities([{ name: 'Mountain View', count: 1 }, { name: 'Zurich', count: 1 }, { name: 'Miami', count: 1 }]);
+      setFilterCounts({ tags: Object.fromEntries(demoTags.map(tag => [tag.id, demoCompanies.filter(c => (c.tags || []).some((t: any) => t.id === tag.id)).length])) });
+      return;
+    }
     api.listTags('company').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
     api.listCompanyCities().then(d => setAllCities(d.cities)).catch(() => {});
     api.getCompanyFilterCounts().then(setFilterCounts).catch(() => {});
-  }, []);
+  }, [demoMode]);
 
   React.useEffect(() => {
     if (!toast) return;
@@ -211,6 +219,16 @@ function CompaniesPage() {
   }), [filters]);
 
   const loadCompanies = React.useCallback(() => {
+    if (demoMode) {
+      setLoading(false);
+      const q = filters.search.trim().toLowerCase();
+      const rows = q
+        ? demoCompanies.filter(c => [c.name, c.domain, c.sector, c.hq_location].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
+        : demoCompanies;
+      setCompanies(rows);
+      setTotal(rows.length);
+      return Promise.resolve();
+    }
     setLoading(true);
     return api.listCompanies(buildParams(0))
       .then(d => {
@@ -218,9 +236,10 @@ function CompaniesPage() {
         setTotal(d.total ?? d.companies.length);
       })
       .finally(() => setLoading(false));
-  }, [buildParams]);
+  }, [buildParams, demoMode, filters.search]);
 
   const loadMore = React.useCallback(() => {
+    if (demoMode) return;
     if (loadingMore || companies.length >= total) return;
     setLoadingMore(true);
     api.listCompanies(buildParams(companies.length))
@@ -229,12 +248,17 @@ function CompaniesPage() {
         if (typeof d.total === 'number') setTotal(d.total);
       })
       .finally(() => setLoadingMore(false));
-  }, [buildParams, companies.length, total, loadingMore]);
+  }, [buildParams, companies.length, total, loadingMore, demoMode]);
 
   React.useEffect(() => { loadCompanies(); }, [loadCompanies]);
 
   async function handleCreateCompany() {
     if (!createForm.name.trim()) return;
+    if (demoMode) {
+      setToast(demoToastMessage('Creating companies'));
+      setCreateOpen(false);
+      return;
+    }
     setCreating(true);
     try {
       await api.createCompany({
@@ -461,7 +485,7 @@ function CompaniesPage() {
                 }) : (
                   <div className="text-xs text-text-muted">No tags yet</div>
                 )}
-                <button onClick={() => setTagManagerOpen(true)}
+                <button onClick={() => demoMode ? setToast(demoToastMessage('Editing tags')) : setTagManagerOpen(true)}
                   className="flex items-center gap-1.5 text-[11px] text-text-muted hover:text-accent-magenta transition-colors mt-1">
                   <Settings2 size={11} /> Edit Tags
                 </button>
@@ -492,7 +516,10 @@ function CompaniesPage() {
                 dir={filters.order}
                 onChange={(key, dir) => setFilters(f => ({ ...f, sort: key, order: dir }))}
               />
-              <button className="btn-primary flex items-center gap-2" onClick={() => setCreateOpen(true)}>
+              <button
+                className="btn-primary flex items-center gap-2"
+                onClick={() => demoMode ? setToast(demoToastMessage('Adding companies')) : setCreateOpen(true)}
+              >
                 <Plus size={16} /> Add Company
               </button>
             </div>

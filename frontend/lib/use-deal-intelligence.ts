@@ -79,7 +79,7 @@ export function useDealIntelligence(dealId: string | null | undefined): UseDealI
   const [tick, setTick] = React.useState(0);
 
   React.useEffect(() => {
-    if (!dealId) {
+    if (!dealId || String(dealId).startsWith('demo-')) {
       setIntelligence(null);
       setLoading(false);
       setError(null);

@@ -11,6 +11,7 @@ import { ContactCreateModal } from '@/components/contact-create-modal';
 import { TagManagerModal } from '@/components/tag-manager-modal';
 import { api } from '@/lib/api';
 import { initialFromName } from '@/lib/avatar';
+import { demoCompany, demoContacts, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import { Search, Plus, X as XIcon, Settings2 } from 'lucide-react';
 
 interface Contact {
@@ -176,6 +177,7 @@ function ContactsPage() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const demoMode = useDemoMode();
 
   const [filters, setFilters] = React.useState<FilterState>(() =>
     readFiltersFromUrl(searchParams ? new URLSearchParams(searchParams.toString()) : new URLSearchParams())
@@ -220,10 +222,21 @@ function ContactsPage() {
 
   // Static rail data — tags, company list, filter counts. Loaded once.
   React.useEffect(() => {
+    if (demoMode) {
+      setAllTags(demoTags);
+      setAllCompanies([{ id: demoCompany.id, name: demoCompany.name, count: demoContacts.length }]);
+      setFilterCounts({
+        contact_type: { individual: demoContacts.length },
+        engagement_status: { active: 1, warm: 1, new: 1 },
+        tags: Object.fromEntries(demoTags.map(tag => [tag.id, demoContacts.filter(c => (c.tags || []).some(t => t.id === tag.id)).length])),
+        overdue_followups: 0,
+      });
+      return;
+    }
     api.listTags('contact').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
     api.listContactCompanies().then(d => setAllCompanies(d.companies)).catch(() => {});
     api.getContactFilterCounts().then(setFilterCounts).catch(() => {});
-  }, []);
+  }, [demoMode]);
 
   const buildParams = React.useCallback((offset: number): Record<string, string> => {
     return {
@@ -234,6 +247,16 @@ function ContactsPage() {
   }, [filters]);
 
   const loadContacts = React.useCallback(() => {
+    if (demoMode) {
+      setLoading(false);
+      const q = filters.search.trim().toLowerCase();
+      const rows = q
+        ? demoContacts.filter(c => [c.full_name, c.email, c.company_name].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
+        : demoContacts;
+      setContacts(rows as Contact[]);
+      setTotal(rows.length);
+      return Promise.resolve();
+    }
     setLoading(true);
     return api.listContacts(buildParams(0))
       .then(data => {
@@ -241,9 +264,10 @@ function ContactsPage() {
         setTotal(data.total ?? data.contacts.length);
       })
       .finally(() => setLoading(false));
-  }, [buildParams]);
+  }, [buildParams, demoMode, filters.search]);
 
   const loadMore = React.useCallback(() => {
+    if (demoMode) return;
     if (loadingMore || contacts.length >= total) return;
     setLoadingMore(true);
     api.listContacts(buildParams(contacts.length))
@@ -252,7 +276,7 @@ function ContactsPage() {
         if (typeof data.total === 'number') setTotal(data.total);
       })
       .finally(() => setLoadingMore(false));
-  }, [buildParams, contacts.length, total, loadingMore]);
+  }, [buildParams, contacts.length, total, loadingMore, demoMode]);
 
   React.useEffect(() => { loadContacts(); }, [loadContacts]);
 
@@ -511,7 +535,7 @@ function ContactsPage() {
                 }) : (
                   <div className="text-xs text-text-muted">No tags yet</div>
                 )}
-                <button onClick={() => setTagManagerOpen(true)}
+                <button onClick={() => demoMode ? setToast(demoToastMessage('Editing tags')) : setTagManagerOpen(true)}
                   className="flex items-center gap-1.5 text-[11px] text-text-muted hover:text-accent-magenta transition-colors mt-1">
                   <Settings2 size={11} /> Edit Tags
                 </button>
@@ -560,7 +584,10 @@ function ContactsPage() {
                 dir={filters.order}
                 onChange={(key, dir) => setFilters(f => ({ ...f, sort: key, order: dir }))}
               />
-              <button className="btn-primary flex items-center gap-2" onClick={() => setCreateOpen(true)}>
+              <button
+                className="btn-primary flex items-center gap-2"
+                onClick={() => demoMode ? setToast(demoToastMessage('Adding contacts')) : setCreateOpen(true)}
+              >
                 <Plus size={16} /> Add Contact
               </button>
             </div>

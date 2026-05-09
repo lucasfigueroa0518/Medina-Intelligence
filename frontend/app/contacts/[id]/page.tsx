@@ -18,6 +18,8 @@ import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
+import { DemoContactDetail } from '@/components/demo/demo-detail-pages';
+import { useDemoMode } from '@/lib/demo-mode';
 
 type Tab = 'overview' | 'timeline' | 'associations' | 'documents' | 'deals';
 
@@ -50,6 +52,8 @@ export default function ContactDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const id = params.id;
+  const demoMode = useDemoMode();
+  const isDemoContact = demoMode && id.startsWith('demo-contact');
 
   const [contact, setContact] = React.useState<any>(null);
   const [tags, setTags] = React.useState<any[]>([]);
@@ -97,6 +101,10 @@ export default function ContactDetailPage() {
   const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
 
   React.useEffect(() => {
+    if (isDemoContact) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     Promise.all([
       api.getContact(id),
@@ -118,7 +126,7 @@ export default function ContactDetailPage() {
       setPendingUpdates(pu.updates || []);
       setApprovedFields(new Set());
     }).finally(() => setLoading(false));
-  }, [id, refreshKey]);
+  }, [id, refreshKey, isDemoContact]);
 
   React.useEffect(() => {
     if (!toast) return;
@@ -127,12 +135,13 @@ export default function ContactDetailPage() {
   }, [toast]);
 
   React.useEffect(() => {
+    if (isDemoContact) return;
     if (activeTab !== 'documents') return;
     setDocsLoading(true);
     api.listDocuments({ contact_id: id }).then(r => setDocuments(r.documents || []))
       .catch(() => setDocuments([]))
       .finally(() => setDocsLoading(false));
-  }, [activeTab, id, refreshKey]);
+  }, [activeTab, id, refreshKey, isDemoContact]);
 
   async function handleDocUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -264,6 +273,8 @@ export default function ContactDetailPage() {
     try { await api.deleteContact(id); router.push('/contacts'); }
     catch (e: any) { alert(e.message || 'Delete failed'); setDeleting(false); }
   }
+
+  if (isDemoContact) return <DemoContactDetail />;
 
   if (loading) return <div className="flex-1 flex items-center justify-center text-text-secondary">Loading...</div>;
   if (!contact) return (

@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
 import { api, type DealReplayStatusSnapshot, type DetectedDealCandidate } from '@/lib/api';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
+import { demoDeals, demoDetectedDeals, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import {
   Check,
   ChevronLeft,
@@ -211,6 +212,7 @@ function OtherDetectedDeals({
 
 export default function DealsPage() {
   const router = useRouter();
+  const demoMode = useDemoMode();
   const [deals, setDeals] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [toast, setToast] = React.useState<string | null>(null);
@@ -227,6 +229,11 @@ export default function DealsPage() {
   const [canScrollRight, setCanScrollRight] = React.useState(false);
 
   const loadDeals = React.useCallback(async () => {
+    if (demoMode) {
+      setDeals(demoDeals);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const res = await api.listDeals({ limit: '500' });
@@ -234,22 +241,30 @@ export default function DealsPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [demoMode]);
 
   React.useEffect(() => { void loadDeals(); }, [loadDeals]);
 
   const loadDetectedCandidates = React.useCallback(async () => {
+    if (demoMode) {
+      setDetectedCandidates(demoDetectedDeals as DetectedDealCandidate[]);
+      return;
+    }
     try {
       const res = await api.getDetectedDealCandidates({ limit: 25 });
       setDetectedCandidates(res.candidates || []);
     } catch {
       setDetectedCandidates([]);
     }
-  }, []);
+  }, [demoMode]);
 
   React.useEffect(() => { void loadDetectedCandidates(); }, [loadDetectedCandidates]);
 
   React.useEffect(() => {
+    if (demoMode) {
+      setReplayStatus(null);
+      return;
+    }
     let cancelled = false;
     async function loadReplayStatus() {
       try {
@@ -265,7 +280,7 @@ export default function DealsPage() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, []);
+  }, [demoMode]);
 
   React.useEffect(() => {
     if (!toast) return;
@@ -334,6 +349,18 @@ export default function DealsPage() {
   async function decide(ids: string[], decision: 'yes' | 'no' | 'delete') {
     if (ids.length === 0) return;
     setBusy(true);
+    if (demoMode) {
+      if (decision === 'yes') {
+        setDeals(prev => prev.map(deal => ids.includes(deal.id) ? { ...deal, stage: 'talking' } : deal));
+        setToast('Demo mode: moved to Talking locally');
+      } else {
+        setDeals(prev => prev.filter(deal => !ids.includes(deal.id)));
+        setToast(demoToastMessage(decision === 'no' ? 'Denying suggestions' : 'Deleting deals'));
+      }
+      setSelectedIds(new Set());
+      setBusy(false);
+      return;
+    }
     try {
       await api.bulkDecideDeals({ deal_ids: ids, decision });
       setSelectedIds(new Set());
@@ -349,6 +376,27 @@ export default function DealsPage() {
 
   async function promoteDetectedCandidate(candidate: DetectedDealCandidate) {
     setDetectedBusyId(candidate.company_id);
+    if (demoMode) {
+      const demoDeal = {
+        id: `demo-deal-${candidate.company_id}`,
+        title: candidate.company_name,
+        company_name: candidate.company_name,
+        company_id: candidate.company_id,
+        stage: 'new',
+        amount: 0,
+        notes: candidate.latest_evidence?.evidence_note || candidate.latest_evidence?.source_excerpt || 'Synthetic detected deal promoted locally for recording.',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        evidence_first_seen_at: new Date(Date.now() - 4 * 86400000).toISOString(),
+        evidence_last_seen_at: new Date().toISOString(),
+      };
+      setDeals(prev => [demoDeal, ...prev]);
+      setDetectedCandidates(prev => prev.filter(item => item.company_id !== candidate.company_id));
+      setDetectedOpen(false);
+      setDetectedBusyId(null);
+      setToast(`Demo mode: ${candidate.company_name} added to New locally`);
+      return;
+    }
     try {
       await api.promoteDetectedDealCandidate(candidate.company_id);
       setDetectedOpen(false);
@@ -364,6 +412,14 @@ export default function DealsPage() {
   async function moveDeal(dealId: string, stage: DealStage) {
     if (stage === 'new') return;
     setBusy(true);
+    if (demoMode) {
+      setDeals(prev => prev.map(d => d.id === dealId ? { ...d, stage } : d));
+      setToast(`Demo mode: moved to ${STAGES.find(s => s.key === stage)?.label} locally`);
+      setBusy(false);
+      setDragDealId(null);
+      setDragOverStage(null);
+      return;
+    }
     try {
       await api.updateDeal(dealId, { stage });
       setDeals(prev => prev.map(d => d.id === dealId ? { ...d, stage } : d));

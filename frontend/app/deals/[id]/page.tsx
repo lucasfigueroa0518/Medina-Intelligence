@@ -24,6 +24,8 @@ import { DocumentActions } from '@/components/document-actions';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { ApiError, api } from '@/lib/api';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
+import { DemoDealDetail } from '@/components/demo/demo-detail-pages';
+import { useDemoMode } from '@/lib/demo-mode';
 import {
   MomentumSparkline,
   RiskFlag,
@@ -136,6 +138,8 @@ export default function DealDetailPage() {
   const params = useParams();
   const router = useRouter();
   const dealId = String(params.id || '');
+  const demoMode = useDemoMode();
+  const isDemoDeal = demoMode && dealId.startsWith('demo-deal');
   const [bundle, setBundle] = React.useState<any | null>(null);
   const [documents, setDocuments] = React.useState<any[]>([]);
   const [threads, setThreads] = React.useState<any[]>([]);
@@ -159,6 +163,16 @@ export default function DealDetailPage() {
 
   const load = React.useCallback(async () => {
     if (!dealId) return;
+    if (isDemoDeal) {
+      setLoading(false);
+      setBundle(null);
+      setDocuments([]);
+      setThreads([]);
+      setDealLoadError(null);
+      setDocumentsError(null);
+      setThreadsError(null);
+      return;
+    }
     const seq = ++loadSeqRef.current;
     setLoading(true);
     setSupportingLoading(false);
@@ -205,7 +219,7 @@ export default function DealDetailPage() {
       setThreadsError(convoRes.reason?.message || 'Firm sentiment is temporarily unavailable.');
     }
     setSupportingLoading(false);
-  }, [dealId]);
+  }, [dealId, isDemoDeal]);
 
   React.useEffect(() => {
     void load();
@@ -262,6 +276,8 @@ export default function DealDetailPage() {
       setSavingNote(false);
     }
   }
+
+  if (isDemoDeal) return <DemoDealDetail />;
 
   if (loading) {
     return (
