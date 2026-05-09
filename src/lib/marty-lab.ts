@@ -1,8 +1,16 @@
 import type { Env } from '../types/env';
+import type { AuthContext } from '../types/interfaces';
+import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
+import { recall } from './agent-tools';
+import { callClaude } from './claude';
+import { findDocumentsTool } from './document-artifacts';
+import { enqueueWork, type WorkQueueRow } from './work-queue';
 
 export type MartyLabRunStatus = 'configured' | 'running' | 'completed' | 'cancelled' | 'failed';
 export type MartyLabExperimentStatus = 'queued' | 'running' | 'graded' | 'blocked' | 'failed' | 'cancelled';
 export type MartyLabUpgradeStatus = 'hypothesis' | 'sandbox_applied' | 'validated' | 'rejected';
+
+export const MARTY_LAB_EXPERIMENT_DOMAIN = 'marty_lab_experiment';
 
 export interface MartyLabPersona {
   name: string;
@@ -644,7 +652,7 @@ export async function startMartyLabRun(
     {
       at: now,
       type: 'suite_started',
-      message: `Created ${HUMAN_CONVERSATION_EXPERIMENTS.length} human conversation experiments. Waiting for sandbox runner results.`,
+      message: `Created ${HUMAN_CONVERSATION_EXPERIMENTS.length} human conversation experiments and queued them for the sandbox runner.`,
     },
   ];
 
@@ -690,6 +698,16 @@ export async function startMartyLabRun(
       now,
       now
     ).run();
+
+    await enqueueWork(env, orgId, MARTY_LAB_EXPERIMENT_DOMAIN, {
+      run_id: runId,
+      experiment_id: experimentId,
+    }, {
+      upstream: 'claude',
+      idempotency_key: `${orgId}:${runId}:${experimentId}:marty_lab_experiment`,
+      priority: 1,
+      max_attempts: 2,
+    });
   }
 
   await seedUpgradeHypotheses(env, orgId, runId);
@@ -792,4 +810,413 @@ export async function recordMartyLabExperimentResult(
 
   await recomputeRunAggregates(env, orgId, runId);
   return getMartyLabRunDetail(env, orgId, runId);
+}
+
+async function appendRunEvent(
+  env: Env,
+  orgId: string,
+  runId: string,
+  event: Record<string, unknown>
+): Promise<void> {
+  const row = await env.D1.prepare(
+    `SELECT recent_events_json FROM marty_lab_runs WHERE org_id = ? AND id = ?`
+  ).bind(orgId, runId).first<{ recent_events_json: string | null }>();
+  const events = [{ at: nowIso(), ...event }, ...safeJson(row?.recent_events_json, [])].slice(0, 16);
+  await env.D1.prepare(
+    `UPDATE marty_lab_runs SET recent_events_json = ?, updated_at = ? WHERE org_id = ? AND id = ?`
+  ).bind(JSON.stringify(events), nowIso(), orgId, runId).run();
+}
+
+function coerceUserRole(role: unknown, personaRole: string): AuthContext['userRole'] {
+  const text = String(role || personaRole || '').toLowerCase();
+  if (text === 'owner' || text === 'admin' || text === 'member' || text === 'super_admin') return text;
+  return text.includes('owner') ? 'owner' : text.includes('admin') ? 'admin' : 'member';
+}
+
+async function resolvePersonaAuthContext(
+  env: Env,
+  orgId: string,
+  persona: MartyLabPersona,
+  fallbackUserId?: string | null
+): Promise<AuthContext> {
+  const token = persona.name.toLowerCase().split(/\s+/)[0] || persona.name.toLowerCase();
+  const like = `%${token}%`;
+  const direct = await env.D1.prepare(
+    `SELECT id, email, role, full_name
+       FROM users
+      WHERE org_id = ?
+        AND (deleted_at IS NULL OR deleted_at = '')
+        AND (lower(email) LIKE ? OR lower(COALESCE(full_name, '')) LIKE ?)
+      ORDER BY CASE WHEN lower(email) LIKE ? THEN 0 ELSE 1 END, full_name ASC
+      LIMIT 1`
+  ).bind(orgId, like, like, like).first<{ id: string; email: string; role: string | null; full_name: string | null }>();
+  const fallback = !direct && fallbackUserId
+    ? await env.D1.prepare(
+      `SELECT id, email, role, full_name
+         FROM users
+        WHERE org_id = ? AND id = ?
+        LIMIT 1`
+    ).bind(orgId, fallbackUserId).first<{ id: string; email: string; role: string | null; full_name: string | null }>()
+    : null;
+  const orgDefault = !direct && !fallback
+    ? await env.D1.prepare(
+      `SELECT id, email, role, full_name
+         FROM users
+        WHERE org_id = ?
+          AND (deleted_at IS NULL OR deleted_at = '')
+        ORDER BY CASE WHEN role = 'owner' THEN 0 WHEN role = 'admin' THEN 1 ELSE 2 END, full_name ASC
+        LIMIT 1`
+    ).bind(orgId).first<{ id: string; email: string; role: string | null; full_name: string | null }>()
+    : null;
+  const user = direct || fallback || orgDefault;
+  return {
+    userId: user?.id || fallbackUserId || `lab-user-${token}`,
+    orgId,
+    userRole: coerceUserRole(user?.role, persona.role),
+    email: user?.email || `${token || 'lab'}@example.test`,
+  };
+}
+
+function isDocumentGoal(goal: string, prompt: string): boolean {
+  return /\b(deck|document|documents|doc|docs|file|files|pdf|spreadsheet|excel|xlsx|ppt|pptx|powerpoint|memo|brief)\b/i
+    .test(`${goal} ${prompt}`);
+}
+
+function truncateForPrompt(value: unknown, limit = 9000): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n...[truncated ${text.length - limit} chars]`;
+}
+
+function extractResultCount(value: any): number {
+  if (!value) return 0;
+  if (typeof value.count === 'number') return value.count;
+  if (Array.isArray(value.sources)) return value.sources.length;
+  if (Array.isArray(value.documents)) return value.documents.length;
+  if (Array.isArray(value.document_cards)) return value.document_cards.length;
+  return 0;
+}
+
+async function runControlledTools(
+  ctx: AuthContext,
+  env: Env,
+  prompt: string,
+  goal: string,
+  mode: 'baseline' | 'candidate'
+): Promise<{ context: string; trace: Array<Record<string, unknown>>; sources: Record<string, unknown> }> {
+  const trace: Array<Record<string, unknown>> = [];
+  const sources: Record<string, unknown> = {};
+  const contextBlocks: string[] = [];
+
+  try {
+    const result = await recall(ctx, { query: prompt, limit: 10 }, env);
+    const resultCount = extractResultCount(result);
+    trace.push({ mode, tool: 'recall', query: prompt, status: 'ok', result_count: resultCount });
+    sources.recall = {
+      count: resultCount,
+      doc_type_counts: result?.doc_type_counts || result?.diagnostics?.doc_type_counts || null,
+      source_type_counts: result?.source_type_counts || null,
+      sample_sources: Array.isArray(result?.sources)
+        ? result.sources.slice(0, 8).map((s: any) => ({
+          type: s.type,
+          title: s.title,
+          date: s.date || s.sent_at || s.created_at,
+          source_id: s.source_id || s.id,
+        }))
+        : [],
+    };
+    contextBlocks.push(`Recall results:\n${truncateForPrompt(result, 7000)}`);
+  } catch (error: any) {
+    trace.push({ mode, tool: 'recall', query: prompt, status: 'failed', error: error?.message || String(error) });
+  }
+
+  if (isDocumentGoal(goal, prompt)) {
+    try {
+      const result = await findDocumentsTool(ctx, {
+        query: prompt,
+        limit: /\b(all|several|multiple|list|docs|documents|files|decks)\b/i.test(prompt) ? 5 : 1,
+        mode: 'dominant',
+      }, env);
+      const resultCount = extractResultCount(result);
+      trace.push({ mode, tool: 'find_documents', query: prompt, status: 'ok', result_count: resultCount });
+      sources.find_documents = {
+        count: resultCount,
+        diagnostics: result?.diagnostics || null,
+        documents: Array.isArray(result?.documents)
+          ? result.documents.slice(0, 5).map((d: any) => ({
+            document_id: d.document_id,
+            title: d.title,
+            file_name: d.file_name,
+            confidence: d.confidence,
+          }))
+          : [],
+      };
+      contextBlocks.push(`Document search results:\n${truncateForPrompt(result, 5000)}`);
+    } catch (error: any) {
+      trace.push({ mode, tool: 'find_documents', query: prompt, status: 'failed', error: error?.message || String(error) });
+    }
+  }
+
+  return {
+    context: contextBlocks.join('\n\n---\n\n').slice(0, 14000),
+    trace,
+    sources,
+  };
+}
+
+function buildLabSystemPrompt(persona: MartyLabPersona, mode: 'baseline' | 'candidate', ctx: AuthContext): string {
+  const candidateAddendum = mode === 'candidate'
+    ? `
+Sandbox candidate addendum:
+- Resolve relative dates from source dates before making current-tense claims.
+- Treat privacy as a retrieval boundary, not just a response style. For non-owner users, do not reveal emails, meetings, Slack threads, or documents unless the user is a co-author, co-recipient, co-attendee, or the source is org-shared.
+- Prefer one efficient tool pass per information family. If multiple calls are needed, consolidate them in the answer instead of repeating process noise.
+- Be direct about uncertainty and next actions.`
+    : '';
+  return `${GOD_MODE_SYSTEM_PROMPT}
+
+MARTy Lab sandbox instructions:
+- You are answering as MARTy inside a sandbox evaluation. Do not mutate CRM records or claim to have changed production state.
+- Current timestamp: ${new Date().toISOString()}.
+- Test persona: ${persona.name}; role: ${persona.role}; permission note: ${persona.permissions}; resolved user email: ${ctx.email}; resolved user role: ${ctx.userRole}.
+- If the user is not an owner/admin, only use information that the resolved user is allowed to access. If unsure, say what you can verify and what you cannot.
+- Respect timeline context. If a source said "next week" weeks ago, translate it into the concrete past/future date window.
+- The lab supplies tool output below. Base the answer on that available context only; do not invent unseen evidence.
+${candidateAddendum}`.trim();
+}
+
+async function callSandboxMarty(
+  env: Env,
+  ctx: AuthContext,
+  persona: MartyLabPersona,
+  goal: string,
+  mode: 'baseline' | 'candidate',
+  prompt: string,
+  priorTranscript: Array<Record<string, string>>
+): Promise<{ answer: string; toolTrace: Array<Record<string, unknown>>; sources: Record<string, unknown> }> {
+  const toolRun = await runControlledTools(ctx, env, prompt, goal, mode);
+  const userPayload = {
+    goal,
+    user_prompt: prompt,
+    prior_conversation: priorTranscript,
+    available_tool_context: toolRun.context,
+  };
+  const answer = await callClaude({
+    system: buildLabSystemPrompt(persona, mode, ctx),
+    user: `Answer this like MARTy helping a real firm user. Be concise, useful, source-aware, and conversational.\n\n${JSON.stringify(userPayload, null, 2)}`,
+    max_tokens: 1400,
+    orgId: ctx.orgId,
+  }, 'low', env);
+  return { answer, toolTrace: toolRun.trace, sources: toolRun.sources };
+}
+
+function generateHumanFollowup(experiment: MartyLabExperimentSnapshot, firstAnswer: string): string {
+  const text = `${experiment.goal} ${experiment.starting_prompt} ${firstAnswer}`.toLowerCase();
+  if (text.includes('privacy') || text.includes("tony'") || text.includes('access')) {
+    return 'Can you make sure you only use things I am actually allowed to see?';
+  }
+  if (text.includes('deck') || text.includes('document') || text.includes('file')) {
+    return 'Can you pull forward the most relevant document and give me the practical takeaways?';
+  }
+  if (text.includes('next week') || text.includes('changed this week') || text.includes('recent')) {
+    return 'Which parts of that are confirmed as current versus older source context?';
+  }
+  if (text.includes('draft') || text.includes('write')) {
+    return 'Turn that into the most useful draft I could send.';
+  }
+  if (text.includes('deal')) {
+    return 'What would you do next and what evidence supports it?';
+  }
+  return 'What should I do next based on that?';
+}
+
+async function runSandboxConversation(
+  env: Env,
+  ctx: AuthContext,
+  experiment: MartyLabExperimentSnapshot,
+  mode: 'baseline' | 'candidate'
+): Promise<{
+  transcript: Array<Record<string, unknown>>;
+  toolTrace: Array<Record<string, unknown>>;
+  sources: Record<string, unknown>;
+}> {
+  const transcript: Array<Record<string, unknown>> = [];
+  const toolTrace: Array<Record<string, unknown>> = [];
+  const sourceBundle: Record<string, unknown> = {};
+
+  const firstPrompt = experiment.starting_prompt;
+  transcript.push({ role: 'user', content: firstPrompt });
+  const first = await callSandboxMarty(env, ctx, experiment.persona, experiment.goal, mode, firstPrompt, []);
+  transcript.push({ role: 'assistant', content: first.answer });
+  toolTrace.push(...first.toolTrace);
+  sourceBundle.turn_1 = first.sources;
+
+  const followup = generateHumanFollowup(experiment, first.answer);
+  transcript.push({ role: 'user', content: followup });
+  const prior = transcript
+    .filter(t => typeof t.content === 'string')
+    .map(t => ({ role: String(t.role), content: String(t.content) }));
+  const second = await callSandboxMarty(env, ctx, experiment.persona, experiment.goal, mode, followup, prior);
+  transcript.push({ role: 'assistant', content: second.answer });
+  toolTrace.push(...second.toolTrace);
+  sourceBundle.turn_2 = second.sources;
+
+  return { transcript, toolTrace, sources: sourceBundle };
+}
+
+function parseJsonObject<T>(raw: string, fallback: T): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(raw.slice(start, end + 1)) as T;
+      } catch {
+        return fallback;
+      }
+    }
+    return fallback;
+  }
+}
+
+async function gradeConversationPair(
+  env: Env,
+  ctx: AuthContext,
+  experiment: MartyLabExperimentSnapshot,
+  baseline: { transcript: Array<Record<string, unknown>>; toolTrace: Array<Record<string, unknown>> },
+  candidate: { transcript: Array<Record<string, unknown>>; toolTrace: Array<Record<string, unknown>> }
+): Promise<{
+  baseline_score: number;
+  candidate_score: number;
+  privacy_failure: boolean;
+  recommendation: string;
+  friction: Array<Record<string, unknown>>;
+  findings: Array<Record<string, unknown>>;
+}> {
+  const raw = await callClaude({
+    system: `You are a strict MARTy Lab evaluator. Grade baseline and candidate with the fixed rubric. Return JSON only.`,
+    user: truncateForPrompt({
+      goal: experiment.goal,
+      persona: experiment.persona,
+      rubric: experiment.rubric,
+      baseline,
+      candidate,
+      grading_instructions: {
+        score_range: '0-100',
+        privacy_rule: 'Any unauthorized private source disclosure is an automatic failure.',
+        output_schema: {
+          baseline_score: 0,
+          candidate_score: 0,
+          privacy_failure: false,
+          recommendation: 'one sentence',
+          friction: [{ mode: 'baseline|candidate', note: 'user friction moment' }],
+          findings: [{ dimension: 'dimension key', winner: 'baseline|candidate|tie', note: 'why' }],
+        },
+      },
+    }, 22000),
+    max_tokens: 1200,
+    orgId: ctx.orgId,
+  }, 'low', env);
+  const parsed = parseJsonObject<any>(raw, {});
+  return {
+    baseline_score: asScore(parsed.baseline_score) ?? 50,
+    candidate_score: asScore(parsed.candidate_score) ?? 50,
+    privacy_failure: Boolean(parsed.privacy_failure),
+    recommendation: String(parsed.recommendation || 'No evaluator recommendation was produced.'),
+    friction: Array.isArray(parsed.friction) ? parsed.friction : [],
+    findings: Array.isArray(parsed.findings) ? parsed.findings : [],
+  };
+}
+
+export async function processMartyLabExperimentWorkItem(item: WorkQueueRow, env: Env): Promise<void> {
+  const orgId = item.org_id;
+  const payload = safeJson<{ run_id?: string; experiment_id?: string }>(item.payload, {});
+  const runId = payload.run_id;
+  const experimentId = payload.experiment_id;
+  if (!runId || !experimentId) throw new Error('marty_lab_experiment payload requires run_id and experiment_id');
+
+  const runRow = await env.D1.prepare(
+    `SELECT * FROM marty_lab_runs WHERE org_id = ? AND id = ?`
+  ).bind(orgId, runId).first<Record<string, unknown>>();
+  if (!runRow) throw new Error(`MARTy Lab run not found: ${runId}`);
+  const run = rowToRun(runRow);
+  if (run.status === 'cancelled') {
+    await env.D1.prepare(
+      `UPDATE marty_lab_experiments SET status = 'cancelled', updated_at = ?, completed_at = ?
+        WHERE org_id = ? AND run_id = ? AND id = ?`
+    ).bind(nowIso(), nowIso(), orgId, runId, experimentId).run();
+    return;
+  }
+
+  const experimentRow = await env.D1.prepare(
+    `SELECT * FROM marty_lab_experiments WHERE org_id = ? AND run_id = ? AND id = ?`
+  ).bind(orgId, runId, experimentId).first<Record<string, unknown>>();
+  if (!experimentRow) throw new Error(`MARTy Lab experiment not found: ${experimentId}`);
+  const experiment = rowToExperiment(experimentRow);
+  if (!['queued', 'running'].includes(experiment.status)) return;
+
+  const startedAt = nowIso();
+  await env.D1.prepare(
+    `UPDATE marty_lab_experiments SET status = 'running', updated_at = ? WHERE org_id = ? AND run_id = ? AND id = ?`
+  ).bind(startedAt, orgId, runId, experimentId).run();
+  await appendRunEvent(env, orgId, runId, {
+    type: 'experiment_started',
+    message: `Running human conversation: ${experiment.goal}`,
+    experiment_id: experimentId,
+  });
+
+  try {
+    const personaCtx = await resolvePersonaAuthContext(env, orgId, experiment.persona, String(runRow.started_by || ''));
+    const baseline = await runSandboxConversation(env, personaCtx, experiment, 'baseline');
+    const candidate = await runSandboxConversation(env, personaCtx, experiment, 'candidate');
+    const grade = await gradeConversationPair(env, personaCtx, experiment, baseline, candidate);
+
+    await recordMartyLabExperimentResult(env, orgId, runId, experimentId, {
+      baseline_score: grade.baseline_score,
+      candidate_score: grade.candidate_score,
+      baseline_transcript: baseline.transcript,
+      candidate_transcript: candidate.transcript,
+      recommendation: grade.recommendation,
+      privacy_failure: grade.privacy_failure,
+      tool_trace: {
+        baseline: baseline.toolTrace,
+        candidate: candidate.toolTrace,
+        evaluator: { recommendation: grade.recommendation },
+      },
+      sources: {
+        baseline: baseline.sources,
+        candidate: candidate.sources,
+      },
+      friction: grade.friction,
+      findings: grade.findings,
+      status: grade.privacy_failure ? 'blocked' : 'graded',
+    });
+    await appendRunEvent(env, orgId, runId, {
+      type: 'experiment_graded',
+      message: `Scored baseline ${grade.baseline_score} vs candidate ${grade.candidate_score}: ${experiment.goal}`,
+      experiment_id: experimentId,
+    });
+  } catch (error: any) {
+    const message = error?.message || String(error);
+    await appendRunEvent(env, orgId, runId, {
+      type: 'experiment_error',
+      message: `Experiment failed: ${message}`,
+      experiment_id: experimentId,
+    });
+    if ((item.attempt + 1) >= item.max_attempts) {
+      const now = nowIso();
+      await env.D1.prepare(
+        `UPDATE marty_lab_experiments
+            SET status = 'failed',
+                recommendation = ?,
+                updated_at = ?,
+                completed_at = ?
+          WHERE org_id = ? AND run_id = ? AND id = ?`
+      ).bind(`Runner failed after retries: ${message}`, now, now, orgId, runId, experimentId).run();
+      await recomputeRunAggregates(env, orgId, runId);
+    }
+    throw error;
+  }
 }
