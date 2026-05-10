@@ -11,6 +11,8 @@ export type MartyLabExperimentStatus = 'queued' | 'running' | 'graded' | 'blocke
 export type MartyLabUpgradeStatus = 'hypothesis' | 'sandbox_applied' | 'validated' | 'rejected';
 
 export const MARTY_LAB_EXPERIMENT_DOMAIN = 'marty_lab_experiment';
+export const MARTY_LAB_AUTOPILOT_SUITE = 'continuous_human_conversation_lab';
+export const MARTY_LAB_AUTOPILOT_COOLDOWN_MS = 3 * 60 * 60 * 1000;
 
 export interface MartyLabPersona {
   name: string;
@@ -207,6 +209,12 @@ const HUMAN_CONVERSATION_EXPERIMENTS: ExperimentTemplate[] = [
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function timestampMs(value: unknown): number | null {
+  if (!value || typeof value !== 'string') return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function makeId(prefix: string): string {
@@ -507,7 +515,15 @@ async function recomputeRunAggregates(env: Env, orgId: string, runId: string): P
   const privacyFailures = Number(stats?.privacy_failures || 0);
   const now = nowIso();
   const shouldComplete = total > 0 && completed >= total;
+  const runRow = await env.D1.prepare(
+    `SELECT summary_json
+       FROM marty_lab_runs
+      WHERE org_id = ? AND id = ?
+      LIMIT 1`
+  ).bind(orgId, runId).first<{ summary_json: string | null }>();
+  const existingSummary = safeJson<Record<string, unknown>>(runRow?.summary_json, {});
   const summary = {
+    ...existingSummary,
     current_phase: shouldComplete ? 'review' : 'conversation_testing',
     conclusion:
       shouldComplete
@@ -637,7 +653,7 @@ export async function startMartyLabRun(
   const existing = await env.D1.prepare(
     `SELECT id
        FROM marty_lab_runs
-      WHERE org_id = ? AND status = 'running'
+      WHERE org_id = ? AND status IN ('configured','running')
       ORDER BY created_at DESC
       LIMIT 1`
   ).bind(orgId).first<{ id: string }>();
@@ -648,7 +664,25 @@ export async function startMartyLabRun(
   const suiteName = opts.suite_name?.trim() || 'human_conversation_suite';
   const baselineLabel = opts.baseline_label?.trim() || 'current_sandbox';
   const candidateLabel = opts.candidate_label?.trim() || 'candidate_sandbox';
+  const isAutopilot = suiteName === MARTY_LAB_AUTOPILOT_SUITE;
+  const autopilotSummary = isAutopilot
+    ? {
+      enabled: true,
+      cadence: 'One sandbox suite at a time. Restarts after a 3-hour cooldown when no run is active.',
+      cooldown_hours: MARTY_LAB_AUTOPILOT_COOLDOWN_MS / (60 * 60 * 1000),
+      scope: 'sandbox_only',
+      started_at: now,
+      next_run_after: new Date(Date.now() + MARTY_LAB_AUTOPILOT_COOLDOWN_MS).toISOString(),
+    }
+    : null;
   const events = [
+    ...(isAutopilot
+      ? [{
+        at: now,
+        type: 'autopilot_started',
+        message: 'Continuous sandbox autopilot is active. It runs human conversation suites, records conclusions, and never promotes changes to live MARTy automatically.',
+      }]
+      : []),
     {
       at: now,
       type: 'suite_started',
@@ -671,7 +705,10 @@ export async function startMartyLabRun(
     HUMAN_CONVERSATION_EXPERIMENTS.length,
     JSON.stringify({
       current_phase: 'conversation_testing',
-      conclusion: 'Suite configured. No live Marty change has been made.',
+      conclusion: isAutopilot
+        ? 'Autopilot suite configured. The lab will keep testing sandbox MARTy and recording recommendations without changing live MARTy automatically.'
+        : 'Suite configured. No live Marty change has been made.',
+      ...(autopilotSummary ? { autopilot: autopilotSummary } : {}),
     }),
     JSON.stringify(events),
     now,
@@ -713,6 +750,72 @@ export async function startMartyLabRun(
   await seedUpgradeHypotheses(env, orgId, runId);
   await recomputeRunAggregates(env, orgId, runId);
   return getMartyLabRunDetail(env, orgId, runId);
+}
+
+async function resolveMartyLabAutopilotActor(env: Env, orgId: string): Promise<string | null> {
+  const row = await env.D1.prepare(
+    `SELECT id
+       FROM users
+      WHERE org_id = ?
+        AND (deleted_at IS NULL OR deleted_at = '')
+      ORDER BY CASE
+        WHEN role = 'owner' THEN 0
+        WHEN role = 'super_admin' THEN 1
+        WHEN role = 'admin' THEN 2
+        ELSE 3
+      END, created_at ASC
+      LIMIT 1`
+  ).bind(orgId).first<{ id: string }>();
+  return row?.id || null;
+}
+
+export async function driveMartyLabAutopilot(
+  env: Env,
+  orgId: string
+): Promise<{ started: boolean; run_id?: string; reason: string; next_eligible_at?: string }> {
+  const latest = await env.D1.prepare(
+    `SELECT id, status, updated_at, completed_at, cancelled_at
+       FROM marty_lab_runs
+      WHERE org_id = ?
+      ORDER BY created_at DESC
+      LIMIT 1`
+  ).bind(orgId).first<{
+    id: string;
+    status: MartyLabRunStatus;
+    updated_at: string;
+    completed_at: string | null;
+    cancelled_at: string | null;
+  }>();
+
+  if (latest && (latest.status === 'configured' || latest.status === 'running')) {
+    return { started: false, run_id: latest.id, reason: 'run_active' };
+  }
+
+  if (latest) {
+    const finishedAt = timestampMs(latest.completed_at || latest.cancelled_at || latest.updated_at);
+    if (finishedAt) {
+      const nextEligibleMs = finishedAt + MARTY_LAB_AUTOPILOT_COOLDOWN_MS;
+      if (Date.now() < nextEligibleMs) {
+        return {
+          started: false,
+          run_id: latest.id,
+          reason: 'cooldown',
+          next_eligible_at: new Date(nextEligibleMs).toISOString(),
+        };
+      }
+    }
+  }
+
+  const actorUserId = await resolveMartyLabAutopilotActor(env, orgId);
+  if (!actorUserId) return { started: false, reason: 'no_actor_user' };
+
+  const snapshot = await startMartyLabRun(env, orgId, actorUserId, {
+    suite_name: MARTY_LAB_AUTOPILOT_SUITE,
+    baseline_label: 'live-current',
+    candidate_label: 'sandbox-autopilot',
+  });
+
+  return { started: true, run_id: snapshot.run?.id, reason: 'started' };
 }
 
 export async function cancelMartyLabRun(env: Env, orgId: string, runId: string): Promise<MartyLabStatusSnapshot> {

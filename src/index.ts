@@ -1099,6 +1099,26 @@ export async function handleScheduled(
         const utcHour = dt.getUTCHours();
         const utcMinute = dt.getUTCMinutes();
 
+        // Continuous MARTy sandbox lab. Scope this expensive Claude-based
+        // evaluation loop to the production pilot org and keep it off the
+        // critical path with waitUntil. The lab itself enforces one active
+        // suite at a time plus cooldown, and never changes live MARTy.
+        if (org.id === 'medina-ventures' && utcMinute === 0) {
+          ctxExec.waitUntil((async () => {
+            try {
+              const { driveMartyLabAutopilot } = await import('./lib/marty-lab');
+              const result = await driveMartyLabAutopilot(env, org.id);
+              if (result.started) {
+                console.log(`[marty-lab] autopilot started org=${org.id} run=${result.run_id}`);
+              } else if (result.reason !== 'cooldown' && result.reason !== 'run_active') {
+                console.log(`[marty-lab] autopilot skipped org=${org.id} reason=${result.reason}`);
+              }
+            } catch (e) {
+              console.error(`MARTy lab autopilot failed for org ${org.id}:`, e);
+            }
+          })());
+        }
+
         // Folded from `5 * * * *`: hourly enrichment workflow trigger.
         // Shifted from minute :05 → :04 to spread load away from the
         // hour-boundary stampede where the heavy `0 * * * *` cron also

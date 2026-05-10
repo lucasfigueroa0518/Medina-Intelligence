@@ -3370,6 +3370,11 @@ function MartyLabStatusCard({
     && exp.candidate_score < exp.baseline_score
   ).length;
   const summaryText = labSummaryText(run?.summary);
+  const autopilot = run?.summary?.autopilot && typeof run.summary.autopilot === 'object'
+    ? run.summary.autopilot as Record<string, unknown>
+    : null;
+  const autopilotEnabled = autopilot?.enabled === true;
+  const nextRunAfter = typeof autopilot?.next_run_after === 'string' ? autopilot.next_run_after : null;
 
   return (
     <div className="card p-5 space-y-4">
@@ -3378,11 +3383,21 @@ function MartyLabStatusCard({
           <div className="flex items-center gap-2">
             <div className="text-sm font-medium text-text-primary">MARTy Human Conversation Lab</div>
             {run && <MartyLabStatusPill status={run.status} />}
+            {autopilotEnabled && (
+              <span className="rounded-full border border-accent-purple/30 bg-accent-purple/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-accent-purple">
+                Autopilot on
+              </span>
+            )}
           </div>
           <div className="mt-1 max-w-3xl text-xs leading-relaxed text-text-muted">
             Sandbox-only evaluation for human conversation quality. Each experiment starts with a persona, a simple firm-user goal,
             a generated rubric, and the same baseline-vs-candidate scoring criteria.
           </div>
+          {autopilotEnabled && (
+            <div className="mt-2 max-w-3xl rounded-lg border border-accent-purple/15 bg-accent-purple/5 px-3 py-2 text-[11px] leading-relaxed text-text-secondary">
+              Autopilot is running one sandbox suite at a time and will restart after cooldown. Candidate upgrades stay sandbox-only until reviewed.
+            </div>
+          )}
           {summaryText && <div className="mt-2 text-xs text-text-secondary">{summaryText}</div>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -3436,7 +3451,11 @@ function MartyLabStatusCard({
             </div>
             <div className="mt-1 flex flex-wrap justify-between gap-2 text-[11px] text-text-muted">
               <span>{completed.toLocaleString()} of {total.toLocaleString()} experiments graded or closed</span>
-              <span>{run.suite_name} · {run.baseline_label} vs {run.candidate_label}</span>
+              <span>
+                {autopilotEnabled && nextRunAfter
+                  ? `Autopilot · next suite eligible ${formatRelative(nextRunAfter)}`
+                  : `${run.suite_name} · ${run.baseline_label} vs ${run.candidate_label}`}
+              </span>
             </div>
           </div>
 
