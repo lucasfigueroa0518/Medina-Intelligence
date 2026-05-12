@@ -121,7 +121,7 @@ export const api = {
   createContact: (data: any) =>
     request<{ contact: any }>('/contacts', { method: 'POST', body: JSON.stringify(data) }),
   updateContact: (id: string, data: any) =>
-    request<{ contact: any }>(`/contacts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    request<{ contact: any; rejected_fields?: { field_name: string; reason: string; detail?: string }[] }>(`/contacts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteContact: (id: string) =>
     request<{ ok: boolean }>(`/contacts/${id}`, { method: 'DELETE' }),
   getContactTimeline: (id: string) =>

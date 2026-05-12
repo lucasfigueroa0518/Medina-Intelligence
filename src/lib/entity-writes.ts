@@ -227,7 +227,11 @@ export async function checkFieldWritability(
     const editedAtMs = new Date(row.last_human_edit_at).getTime();
     const withinWindow = Number.isFinite(editedAtMs) && (Date.now() - editedAtMs < HUMAN_EDIT_LOCK_DAYS * 86_400_000);
     if (withinWindow) {
-      const sameUser = row.last_human_edit_user_id && row.last_human_edit_user_id === userId;
+      // If last_human_edit_user_id is NULL (pre-0076 edits, or any future
+      // code path that stamps last_human_edit_at without attribution), there
+      // is no "other user" to protect — anyone can edit. 127 contact rows
+      // were silently locked org-wide before this fix (2026-05-12 audit).
+      const sameUser = !row.last_human_edit_user_id || row.last_human_edit_user_id === userId;
       if (!sameUser) {
         return {
           allowed: false,
