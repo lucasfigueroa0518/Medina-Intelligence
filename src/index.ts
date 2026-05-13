@@ -953,6 +953,31 @@ export async function handleScheduled(
           try { await renewExpiringSubscriptions(env); }
           catch (e) { console.error(`hourly self-heal: renewExpiringSubscriptions failed:`, e); }
         })());
+        // Universal pipeline heartbeat watchdog — last-resort safety net
+        // covering Outlook, Firefly, and Slack. Runs AFTER the per-pipeline
+        // gap detectors above; if those didn't catch a regression (e.g.
+        // pipeline silently died with no baseline to compare against), the
+        // watchdog inspects single-most-recent timestamps in each pipeline's
+        // landing table and force-heals when they go past per-pipeline
+        // staleness thresholds (Outlook 6h, Firefly 36h, Slack 48h).
+        // Per-pipeline 4h KV cooldown prevents re-trigger thrash while a
+        // backfill is draining. See src/lib/pipeline-watchdog.ts for the
+        // full rationale + heal actions per pipeline.
+        ctxExec.waitUntil((async () => {
+          const { runPipelineWatchdog } = await import('./lib/pipeline-watchdog');
+          try {
+            const summary = await runPipelineWatchdog(org.id, env);
+            for (const p of summary.pipelines) {
+              if (p.status === 'stale') {
+                console.warn(
+                  `[watchdog] org=${org.id} pipeline=${p.pipeline} hours_stale=${p.hours_stale?.toFixed(1)} heal=${p.heal_triggered} summary=${p.heal_summary || '-'}`
+                );
+              }
+            }
+          } catch (e) {
+            console.error(`hourly self-heal: runPipelineWatchdog failed for ${org.id}:`, e);
+          }
+        })());
         // Hourly contact + company embed backfill — backfillUnembeddedEntities
         // is the SOLE callsite of embedContactBio + embedCompanyDescription
         // in the codebase (no other ingestion path embeds these). Originally
