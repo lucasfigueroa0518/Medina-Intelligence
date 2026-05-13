@@ -244,6 +244,29 @@ export async function renewExpiringSubscriptions(env: Env): Promise<void> {
   }
 }
 
+// Self-heal: any active user (outlook_token AND outlook_delta_token both set)
+// must have all three subscription resources. Closes the 2026-05-09 gap where
+// expired subscriptions got 404 → D1 row deleted → never recreated because
+// renewExpiringSubscriptions only renews and ensureSubscriptionsForUser was
+// only called at OAuth time. ensureSubscriptionsForUser is idempotent on the
+// resource set, so this is safe to fire every hour.
+export async function ensureSubscriptionsForActiveUsers(env: Env): Promise<void> {
+  const users = await env.D1.prepare(
+    `SELECT id, org_id FROM users
+       WHERE deleted_at IS NULL
+         AND outlook_token IS NOT NULL
+         AND outlook_delta_token IS NOT NULL`
+  ).all<{ id: string; org_id: string }>();
+
+  for (const u of users.results) {
+    try {
+      await ensureSubscriptionsForUser(u.id, u.org_id, env);
+    } catch (e) {
+      console.error(`[graph-sub] ensureSubscriptionsForActiveUsers failed for user ${u.id}:`, e);
+    }
+  }
+}
+
 export async function ensureSubscriptionsForUser(
   userId: string,
   orgId: string,
