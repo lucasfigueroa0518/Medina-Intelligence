@@ -249,19 +249,62 @@ export async function ensureSubscriptionsForUser(
   orgId: string,
   env: Env
 ): Promise<void> {
+  // Phase 2 (2026-05-13): now expiration-aware. Original implementation
+  // only created subs for resources MISSING in D1, so an EXPIRED-but-
+  // present row (e.g. Tony's mail subs expired 2026-05-09 with rows
+  // never cleaned up because renewExpiringSubscriptions only deletes on
+  // a 404 from Graph — non-404 failures leave the row in place forever)
+  // would shadow ensure into a no-op and the subscription stayed dead.
+  //
+  // New behavior: for each row, if expiration_at < now, best-effort
+  // delete it from Graph + drop the D1 row. Then for each of the three
+  // expected resources, create fresh if not currently LIVE.
   const existing = await env.D1.prepare(
-    'SELECT resource FROM graph_subscriptions WHERE user_id = ?'
-  ).bind(userId).all<{ resource: string }>();
+    'SELECT subscription_id, resource, expiration_at FROM graph_subscriptions WHERE user_id = ?'
+  ).bind(userId).all<{ subscription_id: string; resource: string; expiration_at: string }>();
 
-  const resources = new Set(existing.results.map(r => r.resource));
+  const nowIso = new Date().toISOString();
+  const liveResources = new Set<string>();
 
-  if (!resources.has('me/mailFolders/inbox/messages')) {
-    await createMailSubscription(userId, orgId, env);
+  for (const row of existing.results) {
+    if (row.expiration_at < nowIso) {
+      console.log(
+        `[graph-sub] ensureSubscriptionsForUser: dropping stale ${row.resource} sub ${row.subscription_id} (expired ${row.expiration_at}) for user ${userId}`
+      );
+      // Best-effort delete from Graph — if Graph already 404s us, it's a
+      // no-op. The D1 delete is what matters for re-creation.
+      try {
+        await deleteSubscription(row.subscription_id, userId, env);
+      } catch {
+        // ignore — fall through to D1 delete
+      }
+      try {
+        await env.D1.prepare('DELETE FROM graph_subscriptions WHERE subscription_id = ?')
+          .bind(row.subscription_id).run();
+      } catch (e) {
+        console.error(`[graph-sub] failed to delete stale row ${row.subscription_id}:`, e);
+      }
+    } else {
+      liveResources.add(row.resource);
+    }
   }
-  if (!resources.has('me/mailFolders/sentitems/messages')) {
-    await createSentMailSubscription(userId, orgId, env);
+
+  if (!liveResources.has('me/mailFolders/inbox/messages')) {
+    const result = await createMailSubscription(userId, orgId, env);
+    if (!result) {
+      console.error(`[graph-sub] ensureSubscriptionsForUser: createMailSubscription returned null for ${userId}`);
+    }
   }
-  if (!resources.has('me/events')) {
-    await createCalendarSubscription(userId, orgId, env);
+  if (!liveResources.has('me/mailFolders/sentitems/messages')) {
+    const result = await createSentMailSubscription(userId, orgId, env);
+    if (!result) {
+      console.error(`[graph-sub] ensureSubscriptionsForUser: createSentMailSubscription returned null for ${userId}`);
+    }
+  }
+  if (!liveResources.has('me/events')) {
+    const result = await createCalendarSubscription(userId, orgId, env);
+    if (!result) {
+      console.error(`[graph-sub] ensureSubscriptionsForUser: createCalendarSubscription returned null for ${userId}`);
+    }
   }
 }
