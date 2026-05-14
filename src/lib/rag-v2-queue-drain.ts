@@ -1,7 +1,6 @@
 import type { Env } from '../types/env';
 import type { RagReindexQueueMessage } from '../types/rag-v2';
 import {
-  DEFAULT_LOCK_TTL_MS,
   deferWork,
   getOpenCircuits,
   sweepStaleClaims,
@@ -13,6 +12,7 @@ import { RAG_V2_WORK_QUEUE_DOMAIN } from './rag-v2';
 
 const DEFAULT_DISPATCH_BATCH = 600;
 const DEFAULT_MAX_ACTIVE = 720;
+const RAG_V2_QUEUE_LOCK_TTL_MS = 30 * 60 * 1000;
 
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value || '', 10);
@@ -43,7 +43,7 @@ async function claimRagV2BatchForOrg(
 ): Promise<WorkQueueRow[]> {
   const now = new Date();
   const nowIso = now.toISOString();
-  const lockedUntil = new Date(now.getTime() + DEFAULT_LOCK_TTL_MS).toISOString();
+  const lockedUntil = new Date(now.getTime() + RAG_V2_QUEUE_LOCK_TTL_MS).toISOString();
   const placeholders = openCircuitUpstreams.map(() => '?').join(',');
   const upstreamFilter = openCircuitUpstreams.length > 0
     ? `AND (upstream IS NULL OR upstream NOT IN (${placeholders}))`
