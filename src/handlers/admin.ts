@@ -216,13 +216,30 @@ const RAG_V2_BULK_SOURCE_SPECS: Record<RagV2SourceTable, RagV2BulkSourceSpec> = 
 async function countRemainingRagV2Sources(
   env: Env,
   orgId: string,
-  sourceTable: RagV2SourceTable
+  sourceTable: RagV2SourceTable,
+  profileKey: string
 ): Promise<number> {
   const spec = RAG_V2_BULK_SOURCE_SPECS[sourceTable];
   const row = await env.D1.prepare(
     `SELECT COUNT(*) AS count
-       FROM (SELECT src.id ${spec.fromWhere}) remaining`
-  ).bind(orgId, sourceTable, orgId).first<{ count: number }>();
+       FROM (
+         SELECT src.id
+           ${spec.fromWhere}
+            AND NOT EXISTS (
+              SELECT 1 FROM work_queue w
+               WHERE w.domain = ?
+                 AND w.idempotency_key = ? || ':' || ? || ':' || src.id || ':' || ? || ':v3:remaining'
+            )
+       ) remaining`
+  ).bind(
+    orgId,
+    sourceTable,
+    orgId,
+    RAG_V2_WORK_QUEUE_DOMAIN,
+    orgId,
+    sourceTable,
+    profileKey
+  ).first<{ count: number }>();
   return row?.count ?? 0;
 }
 
@@ -235,12 +252,12 @@ async function enqueueRemainingRagV2SourcesForTable(
   dryRun: boolean
 ): Promise<{ source_table: string; remaining_before: number; enqueued: number; limit: number }> {
   const spec = RAG_V2_BULK_SOURCE_SPECS[sourceTable];
-  const remainingBefore = await countRemainingRagV2Sources(env, orgId, sourceTable);
+  const profileKey = profiles.join('+');
+  const remainingBefore = await countRemainingRagV2Sources(env, orgId, sourceTable, profileKey);
   if (dryRun || remainingBefore === 0) {
     return { source_table: sourceTable, remaining_before: remainingBefore, enqueued: 0, limit };
   }
 
-  const profileKey = profiles.join('+');
   const profilePlaceholders = profiles.map(() => '?').join(', ');
   const result = await env.D1.prepare(
     `INSERT OR IGNORE INTO work_queue
@@ -260,6 +277,11 @@ async function enqueueRemainingRagV2SourcesForTable(
        FROM (
          SELECT src.id
            ${spec.fromWhere}
+            AND NOT EXISTS (
+              SELECT 1 FROM work_queue w
+               WHERE w.domain = ?
+                 AND w.idempotency_key = ? || ':' || ? || ':' || src.id || ':' || ? || ':v3:remaining'
+            )
           ${spec.orderBy}
           LIMIT ?
        ) remaining`
@@ -275,6 +297,10 @@ async function enqueueRemainingRagV2SourcesForTable(
     orgId,
     sourceTable,
     orgId,
+    RAG_V2_WORK_QUEUE_DOMAIN,
+    orgId,
+    sourceTable,
+    profileKey,
     limit
   ).run();
 
