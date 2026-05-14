@@ -121,3 +121,9 @@ export interface RagV2RuntimeConfig {
   embeddingProfile: EmbeddingProfileId;
   shadowEnabled: boolean;
 }
+
+export interface RagReindexQueueMessage {
+  work_queue_id: string;
+  lease_heartbeat_at: string | null;
+  dispatched_at: string;
+}

@@ -1095,6 +1095,18 @@ export async function handleScheduled(
           }
         })());
 
+        ctxExec.waitUntil((async () => {
+          try {
+            const { dispatchRagV2QueueBurst } = await import('./lib/rag-v2-queue-drain');
+            const result = await dispatchRagV2QueueBurst(env, org.id);
+            if (result.dispatched > 0) {
+              console.log(`[rag-v2-queue] dispatched org=${org.id} count=${result.dispatched}`);
+            }
+          } catch (e) {
+            console.error(`rag-v2 queue dispatch failed for ${org.id}:`, e);
+          }
+        })());
+
         // Phase 2 (2026-05-04): cron consolidation 4 → 2. The dedicated
         // `5 * * * *` and `0 0 * * *` triggers were removed from
         // wrangler.toml to eliminate the 4-trigger CF dispatch fragility
@@ -1178,6 +1190,9 @@ export async function handleQueue(
 
   if (queueName === 'audit-log-queue') {
     await handleAuditBatch(batch as MessageBatch<AuditEvent>, env);
+  } else if (queueName === 'rag-reindex-v2-queue') {
+    const { handleRagV2QueueBatch } = await import('./lib/rag-v2-queue-drain');
+    await handleRagV2QueueBatch(batch as any, env);
   } else if (queueName === 'webhook-intake-queue') {
     await handleWebhookBatch(batch as MessageBatch<WebhookQueueMessage>, env);
   } else if (queueName === 'webhook-dlq') {

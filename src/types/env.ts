@@ -1,5 +1,6 @@
 import type { AuditEvent } from './audit';
 import type { WebhookQueueMessage } from './webhooks';
+import type { RagReindexQueueMessage } from './rag-v2';
 
 export interface Env {
   // --- Storage ---
@@ -19,6 +20,7 @@ export interface Env {
   AUDIT_DLQ: Queue<AuditEvent>;
   WEBHOOK_QUEUE: Queue<WebhookQueueMessage>;
   WEBHOOK_DLQ: Queue<WebhookQueueMessage>;
+  RAG_REINDEX_QUEUE?: Queue<RagReindexQueueMessage>;
 
   // --- Workflows ---
   INGESTION_WORKFLOW: Workflow;
@@ -53,6 +55,8 @@ export interface Env {
   GEMINI_MAX_RPM?: string;
   RAG_RETRIEVAL_VERSION?: string;
   RAG_EMBEDDING_PROFILE?: string;
+  RAG_V2_QUEUE_DISPATCH_BATCH?: string;
+  RAG_V2_QUEUE_MAX_ACTIVE?: string;
   MINILM_EMBEDDING_ENDPOINT?: string;
   MINILM_EMBEDDING_API_KEY?: string;
 

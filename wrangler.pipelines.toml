@@ -36,6 +36,8 @@ ENVIRONMENT = "production"
 CLOUDFLARE_ACCOUNT_ID = "ad54df3fe69483d2c0b69be1b72864e8"
 CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
 GEMINI_MAX_RPM = "500"
+RAG_V2_QUEUE_DISPATCH_BATCH = "80"
+RAG_V2_QUEUE_MAX_ACTIVE = "96"
 # ALLOWED_ORIGINS + FRONTEND_URL only matter for CORS-aware fetch
 # handlers; pipelines's only public endpoint is /health which returns
 # JSON without CORS sensitivity. Keeping them parity for now.
@@ -147,12 +149,23 @@ crons = [
 # its own future workstream (clean two-deploy chain: api strip →
 # pipelines add).
 #
-# Pipelines therefore declares ZERO queue producers + consumers in
-# this session. After Phase 8 ships, a follow-up workstream will
-# move audit consumer in two deploys: (1) api redeploy strips audit
-# consumer; (2) pipelines redeploy adds audit consumer.
+# Pipelines therefore does not claim the existing audit/webhook queue
+# consumers in this session. RAG V2 uses its own dedicated queue below,
+# with D1 work_queue remaining the authoritative ledger.
 #
 # Webhook queue: same constraint, already deferred to Stage 4
 # (Session B) for external service URL coordination.
 
 # (audit + webhook queue declarations intentionally absent — see comment above)
+
+[[queues.producers]]
+queue = "rag-reindex-v2-queue"
+binding = "RAG_REINDEX_QUEUE"
+
+[[queues.consumers]]
+queue = "rag-reindex-v2-queue"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+retry_delay = 60
+max_concurrency = 16
