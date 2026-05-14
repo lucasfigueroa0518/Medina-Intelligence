@@ -10,6 +10,9 @@ export interface Env {
   // --- AI & Vector ---
   AI: Ai;
   VECTORIZE: VectorizeIndex;
+  VECTORIZE_RAG_V2_BGE?: VectorizeIndex;
+  VECTORIZE_RAG_V2_QWEN3?: VectorizeIndex;
+  VECTORIZE_RAG_V2_MINILM?: VectorizeIndex;
 
   // --- Queues ---
   AUDIT_QUEUE: Queue<AuditEvent>;
@@ -48,6 +51,10 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   GOOGLE_GEMINI_API_KEY: string;
   GEMINI_MAX_RPM?: string;
+  RAG_RETRIEVAL_VERSION?: string;
+  RAG_EMBEDDING_PROFILE?: string;
+  MINILM_EMBEDDING_ENDPOINT?: string;
+  MINILM_EMBEDDING_API_KEY?: string;
 
   SLACK_CLIENT_ID: string;
   SLACK_CLIENT_SECRET: string;

@@ -36,6 +36,7 @@ import {
   getMartyLabStatusSnapshot,
   type MartyLabStatusSnapshot,
 } from '../lib/marty-lab';
+import { getRagV2Status } from '../lib/rag-v2';
 
 export interface SystemStatusActiveTask {
   type: string;                  // human-readable
@@ -99,6 +100,7 @@ export interface SystemStatusResponse {
   stuck_work_queue: StuckWorkQueueRow[];
   marty_lab: MartyLabStatusSnapshot;
   deal_replay: DealReplayStatusSnapshot;
+  rag_v2: Record<string, unknown>;
   generated_at: string;
 }
 
@@ -305,6 +307,13 @@ export async function getSystemStatus(
     },
   };
 
+  let ragV2: Record<string, unknown>;
+  try {
+    ragV2 = await getRagV2Status(env, orgId);
+  } catch (e) {
+    ragV2 = { error: e instanceof Error ? e.message : String(e) };
+  }
+
   return jsonResponse({
     active_tasks,
     run_history,
@@ -318,6 +327,7 @@ export async function getSystemStatus(
     stuck_work_queue: snapshot.stuck_work_queue,
     marty_lab: martyLab,
     deal_replay: dealReplay,
+    rag_v2: ragV2,
     generated_at: new Date().toISOString(),
   } satisfies SystemStatusResponse);
 }

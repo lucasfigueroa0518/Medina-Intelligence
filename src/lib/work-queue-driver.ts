@@ -169,6 +169,7 @@ import { fireflyWindowHandler } from './work-queue-handlers/firefly-window';
 import { dealReplayEvidenceHandler } from './work-queue-handlers/deal-replay-evidence';
 import { intelligentImportHandler } from './work-queue-handlers/intelligent-import';
 import { martyLabExperimentHandler } from './work-queue-handlers/marty-lab-experiment';
+import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -201,6 +202,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   dealReplayEvidenceHandler,
   intelligentImportHandler,
   martyLabExperimentHandler,
+  ragReindexV2Handler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────

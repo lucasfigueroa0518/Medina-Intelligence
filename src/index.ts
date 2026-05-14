@@ -769,6 +769,16 @@ async function routeAuthenticated(
       return Admin.getEmbedQueueHealth(ctx, env);
     if (path === '/api/admin/process-embed-queue' && method === 'POST')
       return Admin.processEmbedQueue(ctx, env);
+    if (path === '/api/admin/rag-v2/backfill/start' && method === 'POST')
+      return Admin.startRagV2Backfill(request, ctx, env);
+    if (path === '/api/admin/rag-v2/backfill/status' && method === 'GET')
+      return Admin.getRagV2BackfillStatus(ctx, env);
+    if (path === '/api/admin/rag-v2/eval/run' && method === 'POST')
+      return Admin.runRagV2Eval(request, ctx, env);
+    if (path === '/api/admin/rag-v2/cutover' && method === 'POST')
+      return Admin.cutoverRagV2(request, ctx, env);
+    if (path === '/api/admin/rag-v2/rollback' && method === 'POST')
+      return Admin.rollbackRagV2(request, ctx, env);
     if (path === '/api/admin/recover-deal-conversation-links' && method === 'POST')
       return Admin.recoverDealConversationLinks(request, ctx, env);
     if (path === '/api/admin/progressive-backfill' && method === 'POST')
