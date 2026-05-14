@@ -250,6 +250,128 @@ export async function checkBudget(
   };
 }
 
+/** Atomically reserve capacity for an imminent upstream call.
+ *
+ * This is stricter than checkBudget()+recordUsage because the cap test and
+ * increment happen in one UPDATE. It is useful for high-concurrency drains
+ * where a hot check-then-record race can overshoot the intended per-second
+ * budget. The caller should still call recordRateLimit on an actual 429.
+ */
+export async function reserveBudget(
+  env: Env,
+  orgId: string,
+  userId: string | null | undefined,
+  upstream: Upstream,
+  window: BudgetWindow,
+  units = 1
+): Promise<BudgetCheckResult> {
+  const uid = userKey(userId);
+  const cap = defaultCapFor(upstream, window);
+  const windowMs = WINDOW_LENGTH_MS[window];
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const rolloverThresholdIso = new Date(now - windowMs).toISOString();
+
+  await env.D1.prepare(
+    `INSERT INTO upstream_budget_ledger
+       (org_id, user_id, upstream, bucket_window, bucket_start, used, cap, consecutive_429s, updated_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)
+     ON CONFLICT (org_id, user_id, upstream, bucket_window) DO UPDATE SET
+       used = CASE
+         WHEN bucket_start < ? THEN 0
+         ELSE used
+       END,
+       bucket_start = CASE
+         WHEN bucket_start < ? THEN ?
+         ELSE bucket_start
+       END,
+       circuit_open_until = CASE
+         WHEN circuit_open_until IS NOT NULL AND circuit_open_until <= ? THEN NULL
+         ELSE circuit_open_until
+       END,
+       updated_at = ?`
+  ).bind(
+    orgId, uid, upstream, window, nowIso, cap, nowIso,
+    rolloverThresholdIso,
+    rolloverThresholdIso, nowIso,
+    nowIso,
+    nowIso
+  ).run();
+
+  const reserved = await env.D1.prepare(
+    `UPDATE upstream_budget_ledger
+        SET used = used + ?,
+            updated_at = ?
+      WHERE org_id = ?
+        AND user_id = ?
+        AND upstream = ?
+        AND bucket_window = ?
+        AND (circuit_open_until IS NULL OR circuit_open_until <= ?)
+        AND used + ? <= cap
+      RETURNING used, cap, bucket_start, circuit_open_until`
+  ).bind(
+    units,
+    nowIso,
+    orgId,
+    uid,
+    upstream,
+    window,
+    nowIso,
+    units
+  ).first<{
+    used: number;
+    cap: number;
+    bucket_start: string;
+    circuit_open_until: string | null;
+  }>();
+
+  if (reserved) {
+    const bucketStartMs = Date.parse(reserved.bucket_start);
+    const windowEndsAt = Number.isFinite(bucketStartMs)
+      ? new Date(bucketStartMs + windowMs).toISOString()
+      : new Date(now + windowMs).toISOString();
+    return {
+      decision: 'ok',
+      used: reserved.used,
+      cap: reserved.cap,
+      remaining: Math.max(0, reserved.cap - reserved.used),
+      window_ends_at: windowEndsAt,
+      circuit_open_until: null,
+    };
+  }
+
+  return checkBudget(env, orgId, userId, upstream, window, units);
+}
+
+/** Mark a successful upstream call without consuming additional budget.
+ *
+ * reserveBudget already increments `used` before the request. This helper
+ * lets callers reset the 429 streak after a success without double-counting
+ * the request in the current window.
+ */
+export async function recordReservedUsageSuccess(
+  env: Env,
+  orgId: string,
+  userId: string | null | undefined,
+  upstream: Upstream,
+  window: BudgetWindow
+): Promise<void> {
+  const uid = userKey(userId);
+  const cap = defaultCapFor(upstream, window);
+  const nowIso = new Date().toISOString();
+  await env.D1.prepare(
+    `INSERT INTO upstream_budget_ledger
+       (org_id, user_id, upstream, bucket_window, bucket_start, used, cap, consecutive_429s, updated_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)
+     ON CONFLICT (org_id, user_id, upstream, bucket_window) DO UPDATE SET
+       consecutive_429s = 0,
+       updated_at = ?`
+  ).bind(
+    orgId, uid, upstream, window, nowIso, cap, nowIso,
+    nowIso
+  ).run();
+}
+
 /** Record a SUCCESSFUL upstream call (resets consecutive_429s, increments
  *  used, rolls over the window if expired). Atomic single-statement write. */
 export async function recordUsage(

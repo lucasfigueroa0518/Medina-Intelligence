@@ -25,7 +25,7 @@ const RRF_K = 60;
 const MAX_SOURCE_CHUNKS_BEFORE_RERANK = 3;
 const MAX_RAG_V2_CHUNKS_PER_JOB = 80;
 const RAG_V2_RANGE_CHUNK_SIZE = 60;
-const RAG_V2_EMBEDDING_BATCH_SIZE = 16;
+const DEFAULT_RAG_V2_EMBEDDING_BATCH_SIZE = 32;
 
 type RagV2SourceTable = 'conversations' | 'events' | 'documents' | 'contacts' | 'companies' | 'deals' | 'news_articles';
 
@@ -86,6 +86,12 @@ function epochSeconds(iso: string | null | undefined): number | null {
   if (!iso) return null;
   const ms = new Date(iso).getTime();
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+function ragV2EmbeddingBatchSize(env: Env): number {
+  const parsed = Number.parseInt(env.RAG_V2_EMBEDDING_BATCH_SIZE || '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_RAG_V2_EMBEDDING_BATCH_SIZE;
+  return Math.min(parsed, 64);
 }
 
 export function sourceFamilyForRagV2(documentType: string): string {
@@ -1079,6 +1085,8 @@ export async function reindexRagV2Item(
 
   await upsertRagChunkRecords(env, recordsForSearch);
 
+  const embeddingBatchSize = ragV2EmbeddingBatchSize(env);
+
   for (const profileId of profiles) {
     const profile = getEmbeddingProfile(profileId);
     const index = getVectorBinding(env, profile.id);
@@ -1093,8 +1101,8 @@ export async function reindexRagV2Item(
       continue;
     }
 
-    for (let i = 0; i < embeddingInputs.length; i += RAG_V2_EMBEDDING_BATCH_SIZE) {
-      const batch = embeddingInputs.slice(i, i + RAG_V2_EMBEDDING_BATCH_SIZE);
+    for (let i = 0; i < embeddingInputs.length; i += embeddingBatchSize) {
+      const batch = embeddingInputs.slice(i, i + embeddingBatchSize);
       try {
         const embeddingTexts = batch.map(input => truncateToTokens(input.prefixed, profile.maxInputTokens));
         const vectors = await runEmbeddingsForProfile(env, embeddingTexts, orgId, profile.id);

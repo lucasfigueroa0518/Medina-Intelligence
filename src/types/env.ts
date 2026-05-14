@@ -55,6 +55,7 @@ export interface Env {
   GEMINI_MAX_RPM?: string;
   RAG_RETRIEVAL_VERSION?: string;
   RAG_EMBEDDING_PROFILE?: string;
+  RAG_V2_EMBEDDING_BATCH_SIZE?: string;
   RAG_V2_QUEUE_DISPATCH_BATCH?: string;
   RAG_V2_QUEUE_MAX_ACTIVE?: string;
   MINILM_EMBEDDING_ENDPOINT?: string;

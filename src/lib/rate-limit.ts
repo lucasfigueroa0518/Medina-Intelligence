@@ -1,6 +1,6 @@
 // TRD §5.3 — Claude + enrichment rate limiters
 import type { Env } from '../types/env';
-import { checkBudget, recordUsage, recordRateLimit, type Upstream } from './upstream-budget';
+import { checkBudget, recordUsage, recordRateLimit, reserveBudget, type Upstream } from './upstream-budget';
 
 interface ClaudeRateState {
   count: number;
@@ -154,37 +154,42 @@ export async function clearEnrichmentRateLimit(
 // throw, the embed step fails after retries and chunks complete silently
 // with no vectors. Backoff-and-wait keeps work moving; it just paces it.
 //
-// Tuned to ~10 RPS per org (CF Workers AI BGE published soft limit ~12 RPS).
+// The old limiter used a hot KV key (`embed_rate:<org>`). At RAG V2 queue
+// concurrency that became the bottleneck before Workers AI did. The limiter
+// now reserves slots in upstream_budget_ledger with an atomic D1 UPDATE, so
+// the queue can run hundreds of jobs while the BGE call rate remains bounded.
+//
+// Tuned by upstream_budget_ledger (bge.per_second defaults to 10).
 // 90s ceiling on a single acquire — if we wait longer than that, surface the
 // failure explicitly so the caller can record it (the gap is then caught by
 // detect-embed-gaps in the finalizer and recovered via embed_retry_queue).
 
-const EMBED_MAX_RPS = 10;
-const EMBED_WINDOW_MS = 1000;
 const EMBED_BACKOFF_BASE_MS = 100;
 const EMBED_BACKOFF_MAX_MS = 5000;
 const EMBED_MAX_WAIT_MS = 90_000;
 
-interface EmbedRateState {
-  window_start: number;
-  count: number;
-}
-
-function isTransientKvBackpressure(error: unknown): boolean {
+function isTransientLimiterBackpressure(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
-  return msg.includes('429') || msg.includes('Too Many Requests') || /overloaded/i.test(msg);
+  return msg.includes('429') ||
+    msg.includes('Too Many Requests') ||
+    /overloaded/i.test(msg) ||
+    /SQLITE_BUSY/i.test(msg) ||
+    /database is locked/i.test(msg);
 }
 
 async function waitForEmbedLimiterRetry(
   startedAt: number,
   attempt: number,
-  reason: string
+  reason: string,
+  preferredDelayMs?: number
 ): Promise<void> {
-  const baseBackoff = Math.min(
-    EMBED_BACKOFF_BASE_MS * Math.pow(2, attempt),
-    EMBED_BACKOFF_MAX_MS
-  );
-  const jitter = (Math.random() - 0.5) * baseBackoff;
+  const baseBackoff = preferredDelayMs !== undefined
+    ? Math.min(Math.max(preferredDelayMs, 50), EMBED_BACKOFF_MAX_MS)
+    : Math.min(
+      EMBED_BACKOFF_BASE_MS * Math.pow(2, attempt),
+      EMBED_BACKOFF_MAX_MS
+    );
+  const jitter = Math.random() * Math.min(250, Math.max(50, baseBackoff * 0.25));
   const backoff = Math.max(50, baseBackoff + jitter);
 
   if (Date.now() - startedAt + backoff > EMBED_MAX_WAIT_MS) {
@@ -199,66 +204,32 @@ async function waitForEmbedLimiterRetry(
 export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number> {
   const startedAt = Date.now();
   let attempt = 0;
-  const key = `embed_rate:${orgId}`;
 
   while (true) {
-    const now = Date.now();
-    let raw: string | null;
+    let reservation: Awaited<ReturnType<typeof reserveBudget>>;
     try {
-      raw = await env.KV.get(key);
+      reservation = await reserveBudget(env, orgId, null, 'bge', 'per_second');
     } catch (e) {
-      if (!isTransientKvBackpressure(e)) throw e;
-      await waitForEmbedLimiterRetry(startedAt, attempt++, 'kv_get_backpressure');
+      if (!isTransientLimiterBackpressure(e)) throw e;
+      await waitForEmbedLimiterRetry(startedAt, attempt++, 'limiter_backpressure');
       continue;
     }
-    let state: EmbedRateState;
-    try {
-      state = raw ? JSON.parse(raw) : { window_start: now, count: 0 };
-    } catch {
-      state = { window_start: now, count: 0 };
-    }
 
-    if (now - state.window_start >= EMBED_WINDOW_MS) {
-      state.window_start = now;
-      state.count = 0;
-    }
-
-    if (state.count < EMBED_MAX_RPS) {
-      state.count += 1;
-      // Window enforcement is timestamp-based in `state` (window_start/count) — TTL
-      // is just disaster-recovery cleanup. Cloudflare KV minimum TTL is 60s; passing
-      // less than that throws KV PUT 400 Invalid expiration_ttl on every write,
-      // which previously crashed every embed-touching path (news, Deep Dive, ingestion).
-      try {
-        await env.KV.put(key, JSON.stringify(state), { expirationTtl: 60 });
-      } catch (e) {
-        if (!isTransientKvBackpressure(e)) throw e;
-        await waitForEmbedLimiterRetry(startedAt, attempt++, 'kv_put_backpressure');
-        continue;
-      }
+    if (reservation.decision === 'ok') {
       return Date.now() - startedAt;
     }
 
-    // Exponential backoff with proportional jitter (±50% of the base delay).
-    // Audit 2026-04-29: the prior fixed 0–100ms jitter was too small relative
-    // to the larger backoff windows (lockstep retry every ~5s when many
-    // isolates hit the limit simultaneously). Proportional jitter spreads
-    // retries across a meaningful window and breaks lockstep cleanly.
-    const baseBackoff = Math.min(
-      EMBED_BACKOFF_BASE_MS * Math.pow(2, attempt),
-      EMBED_BACKOFF_MAX_MS
-    );
-    const jitter = (Math.random() - 0.5) * baseBackoff;
-    const backoff = Math.max(50, baseBackoff + jitter);
-
-    if (Date.now() - startedAt + backoff > EMBED_MAX_WAIT_MS) {
+    if (reservation.decision === 'circuit_open') {
       throw new Error(
-        `EMBED_RATE_LIMIT_TIMEOUT after ${Math.round((Date.now() - startedAt) / 1000)}s waiting for slot`
+        `EMBED_RATE_LIMIT_CIRCUIT_OPEN until ${reservation.circuit_open_until || 'unknown'}`
       );
     }
 
-    await new Promise(resolve => setTimeout(resolve, backoff));
-    attempt += 1;
+    const windowEndMs = Date.parse(reservation.window_ends_at);
+    const preferredDelayMs = Number.isFinite(windowEndMs)
+      ? Math.max(50, windowEndMs - Date.now() + 25)
+      : undefined;
+    await waitForEmbedLimiterRetry(startedAt, attempt++, 'budget_over_cap', preferredDelayMs);
   }
 }
 
