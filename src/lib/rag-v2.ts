@@ -12,7 +12,7 @@ import {
   DEFAULT_RAG_V2_EMBEDDING_PROFILE,
   getEmbeddingProfile,
   RAG_V2_EMBEDDING_PROFILES,
-  runEmbeddingForProfile,
+  runEmbeddingsForProfile,
 } from './embedding';
 import { chunkTextForRagV2, RAG_V2_CHUNK_VERSION, RAG_V2_PREFIX_BUDGET_TOKENS } from './chunking';
 import { truncateToTokens } from './tokens';
@@ -25,6 +25,7 @@ const RRF_K = 60;
 const MAX_SOURCE_CHUNKS_BEFORE_RERANK = 3;
 const MAX_RAG_V2_CHUNKS_PER_JOB = 80;
 const RAG_V2_RANGE_CHUNK_SIZE = 60;
+const RAG_V2_EMBEDDING_BATCH_SIZE = 16;
 
 type RagV2SourceTable = 'conversations' | 'events' | 'documents' | 'contacts' | 'companies' | 'deals' | 'news_articles';
 
@@ -983,6 +984,7 @@ export async function reindexRagV2Item(
 
   const errors: string[] = [];
   const recordsForSearch: Array<RagChunkRecord & { body: string }> = [];
+  const embeddingInputs: Array<{ chunkId: string; prefixed: string }> = [];
 
   for (let i = range.start; i < range.end; i++) {
     const chunk = chunks[i];
@@ -1039,43 +1041,70 @@ export async function reindexRagV2Item(
     };
     await upsertRagChunkRecord(env, record);
     recordsForSearch.push({ ...record, body: chunk.text });
+    embeddingInputs.push({ chunkId, prefixed });
+  }
 
-    for (const profileId of profiles) {
-      const profile = getEmbeddingProfile(profileId);
-      const index = getVectorBinding(env, profile.id);
-      const vectorId = vectorIdFor(profile.id, chunkId);
-      if (!index) {
-        await markVectorStatus(env, chunkId, profile.id, null, 'skipped', `${profile.vectorBinding}_NOT_BOUND`);
-        continue;
-      }
+  for (const profileId of profiles) {
+    const profile = getEmbeddingProfile(profileId);
+    const index = getVectorBinding(env, profile.id);
+    if (!index) {
+      await Promise.all(embeddingInputs.map(input =>
+        markVectorStatus(env, input.chunkId, profile.id, null, 'skipped', `${profile.vectorBinding}_NOT_BOUND`)
+      ));
+      continue;
+    }
+
+    for (let i = 0; i < embeddingInputs.length; i += RAG_V2_EMBEDDING_BATCH_SIZE) {
+      const batch = embeddingInputs.slice(i, i + RAG_V2_EMBEDDING_BATCH_SIZE);
       try {
-        const embeddingText = truncateToTokens(prefixed, profile.maxInputTokens);
-        const values = await runEmbeddingForProfile(env, embeddingText, orgId, profile.id);
-        if (values.length !== profile.dimensions) {
-          throw new Error(`EMBEDDING_DIMENSION_MISMATCH expected=${profile.dimensions} actual=${values.length}`);
+        const embeddingTexts = batch.map(input => truncateToTokens(input.prefixed, profile.maxInputTokens));
+        const vectors = await runEmbeddingsForProfile(env, embeddingTexts, orgId, profile.id);
+        if (vectors.length !== batch.length) {
+          throw new Error(`EMBEDDING_BATCH_SIZE_MISMATCH expected=${batch.length} actual=${vectors.length}`);
         }
-        await index.upsert([{
-          id: vectorId,
-          values,
-          metadata: {
-            org_id: orgId,
-            document_type: source.documentType,
-            source_table: source.sourceTable,
-            source_family: source.sourceFamily,
-            primary_entity_id: source.primaryEntityId,
-            visibility: source.visibility,
-            created_at_epoch: epochSeconds(source.sourceCreatedAt) || 0,
-            chunk_config_version: RAG_V2_CHUNK_VERSION,
-            acl_mode: source.aclMode,
-            rag_chunk_id: chunkId,
-          },
-        }]);
-        await env.KV.put(`chunk:${vectorId}`, prefixed, { expirationTtl: 7776000 }).catch(() => undefined);
-        await markVectorStatus(env, chunkId, profile.id, vectorId, 'synced');
+        const upserts = vectors.map((values, idx) => {
+          const input = batch[idx];
+          if (values.length !== profile.dimensions) {
+            throw new Error(`EMBEDDING_DIMENSION_MISMATCH expected=${profile.dimensions} actual=${values.length}`);
+          }
+          return {
+            id: vectorIdFor(profile.id, input.chunkId),
+            values,
+            metadata: {
+              org_id: orgId,
+              document_type: source.documentType,
+              source_table: source.sourceTable,
+              source_family: source.sourceFamily,
+              primary_entity_id: source.primaryEntityId,
+              visibility: source.visibility,
+              created_at_epoch: epochSeconds(source.sourceCreatedAt) || 0,
+              chunk_config_version: RAG_V2_CHUNK_VERSION,
+              acl_mode: source.aclMode,
+              rag_chunk_id: input.chunkId,
+            },
+          };
+        });
+        await index.upsert(upserts);
+        await Promise.all(batch.map((input) => {
+          const vectorId = vectorIdFor(profile.id, input.chunkId);
+          return Promise.all([
+            env.KV.put(`chunk:${vectorId}`, input.prefixed, { expirationTtl: 7776000 }).catch(() => undefined),
+            markVectorStatus(env, input.chunkId, profile.id, vectorId, 'synced'),
+          ]);
+        }));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        errors.push(`${chunkId}:${profile.id}:${msg}`);
-        await markVectorStatus(env, chunkId, profile.id, vectorId, 'failed', msg.slice(0, 1000));
+        errors.push(`${profile.id}:batch_${i}:${msg}`);
+        await Promise.all(batch.map(input =>
+          markVectorStatus(
+            env,
+            input.chunkId,
+            profile.id,
+            vectorIdFor(profile.id, input.chunkId),
+            'failed',
+            msg.slice(0, 1000)
+          )
+        ));
       }
     }
   }
