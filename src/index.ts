@@ -771,6 +771,8 @@ async function routeAuthenticated(
       return Admin.processEmbedQueue(ctx, env);
     if (path === '/api/admin/rag-v2/backfill/start' && method === 'POST')
       return Admin.startRagV2Backfill(request, ctx, env);
+    if (path === '/api/admin/rag-v2/backfill/enqueue-remaining' && method === 'POST')
+      return Admin.enqueueRemainingRagV2Backfill(request, ctx, env);
     if (path === '/api/admin/rag-v2/backfill/status' && method === 'GET')
       return Admin.getRagV2BackfillStatus(ctx, env);
     if (path === '/api/admin/rag-v2/eval/run' && method === 'POST')

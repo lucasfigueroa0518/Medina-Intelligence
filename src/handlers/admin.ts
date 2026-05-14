@@ -141,6 +141,151 @@ async function listRagV2SourceIds(
   return rows.results.map(r => r.id);
 }
 
+interface RagV2BulkSourceSpec {
+  fromWhere: string;
+  orderBy: string;
+  priority: number;
+}
+
+const RAG_V2_BULK_SOURCE_SPECS: Record<RagV2SourceTable, RagV2BulkSourceSpec> = {
+  conversations: {
+    fromWhere: `FROM conversations src
+      LEFT JOIN rag_source_index_state s
+        ON s.org_id = ? AND s.source_table = ? AND s.source_id = src.id AND s.backfill_status = 'completed'
+     WHERE src.org_id = ? AND src.body_r2_key IS NOT NULL AND s.source_id IS NULL`,
+    orderBy: `ORDER BY src.sent_at DESC`,
+    priority: 10,
+  },
+  events: {
+    fromWhere: `FROM events src
+      LEFT JOIN rag_source_index_state s
+        ON s.org_id = ? AND s.source_table = ? AND s.source_id = src.id AND s.backfill_status = 'completed'
+     WHERE src.org_id = ? AND src.deleted_at IS NULL
+       AND (src.transcript_r2_key IS NOT NULL OR length(coalesce(src.summary,'')) > 20)
+       AND s.source_id IS NULL`,
+    orderBy: `ORDER BY src.start_time DESC`,
+    priority: 10,
+  },
+  documents: {
+    fromWhere: `FROM documents src
+      LEFT JOIN rag_source_index_state s
+        ON s.org_id = ? AND s.source_table = ? AND s.source_id = src.id AND s.backfill_status = 'completed'
+     WHERE src.org_id = ? AND src.deleted_at IS NULL AND src.processing_status = 'completed'
+       AND s.source_id IS NULL`,
+    orderBy: `ORDER BY src.created_at DESC`,
+    priority: 10,
+  },
+  contacts: {
+    fromWhere: `FROM contacts src
+      LEFT JOIN rag_source_index_state s
+        ON s.org_id = ? AND s.source_table = ? AND s.source_id = src.id AND s.backfill_status = 'completed'
+     WHERE src.org_id = ? AND src.deleted_at IS NULL AND src.merged_into IS NULL
+       AND length(coalesce(src.bio_summary,'')) > 20
+       AND s.source_id IS NULL`,
+    orderBy: `ORDER BY src.updated_at DESC`,
+    priority: 0,
+  },
+  companies: {
+    fromWhere: `FROM companies src
+      LEFT JOIN rag_source_index_state s
+        ON s.org_id = ? AND s.source_table = ? AND s.source_id = src.id AND s.backfill_status = 'completed'
+     WHERE src.org_id = ? AND src.deleted_at IS NULL AND src.merged_into IS NULL
+       AND length(coalesce(src.description,'')) > 20
+       AND s.source_id IS NULL`,
+    orderBy: `ORDER BY src.updated_at DESC`,
+    priority: 0,
+  },
+  deals: {
+    fromWhere: `FROM deals src
+      LEFT JOIN rag_source_index_state s
+        ON s.org_id = ? AND s.source_table = ? AND s.source_id = src.id AND s.backfill_status = 'completed'
+     WHERE src.org_id = ? AND src.deleted_at IS NULL AND s.source_id IS NULL`,
+    orderBy: `ORDER BY src.updated_at DESC`,
+    priority: 0,
+  },
+  news_articles: {
+    fromWhere: `FROM news_articles src
+      LEFT JOIN rag_source_index_state s
+        ON s.org_id = ? AND s.source_table = ? AND s.source_id = src.id AND s.backfill_status = 'completed'
+     WHERE src.org_id = ? AND length(coalesce(src.summary,'')) > 20 AND s.source_id IS NULL`,
+    orderBy: `ORDER BY src.published_at DESC`,
+    priority: 0,
+  },
+};
+
+async function countRemainingRagV2Sources(
+  env: Env,
+  orgId: string,
+  sourceTable: RagV2SourceTable
+): Promise<number> {
+  const spec = RAG_V2_BULK_SOURCE_SPECS[sourceTable];
+  const row = await env.D1.prepare(
+    `SELECT COUNT(*) AS count
+       FROM (SELECT src.id ${spec.fromWhere}) remaining`
+  ).bind(orgId, sourceTable, orgId).first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
+async function enqueueRemainingRagV2SourcesForTable(
+  env: Env,
+  orgId: string,
+  sourceTable: RagV2SourceTable,
+  profiles: string[],
+  limit: number,
+  dryRun: boolean
+): Promise<{ source_table: string; remaining_before: number; enqueued: number; limit: number }> {
+  const spec = RAG_V2_BULK_SOURCE_SPECS[sourceTable];
+  const remainingBefore = await countRemainingRagV2Sources(env, orgId, sourceTable);
+  if (dryRun || remainingBefore === 0) {
+    return { source_table: sourceTable, remaining_before: remainingBefore, enqueued: 0, limit };
+  }
+
+  const profileKey = profiles.join('+');
+  const profilePlaceholders = profiles.map(() => '?').join(', ');
+  const result = await env.D1.prepare(
+    `INSERT OR IGNORE INTO work_queue
+       (org_id, domain, payload, upstream, idempotency_key, priority, max_attempts)
+     SELECT
+       ?,
+       ?,
+       json_object(
+         'source_table', ?,
+         'source_id', remaining.id,
+         'profiles', json_array(${profilePlaceholders})
+       ),
+       'bge',
+       ? || ':' || ? || ':' || remaining.id || ':' || ? || ':v3:remaining',
+       ?,
+       5
+       FROM (
+         SELECT src.id
+           ${spec.fromWhere}
+          ${spec.orderBy}
+          LIMIT ?
+       ) remaining`
+  ).bind(
+    orgId,
+    RAG_V2_WORK_QUEUE_DOMAIN,
+    sourceTable,
+    ...profiles,
+    orgId,
+    sourceTable,
+    profileKey,
+    spec.priority,
+    orgId,
+    sourceTable,
+    orgId,
+    limit
+  ).run();
+
+  return {
+    source_table: sourceTable,
+    remaining_before: remainingBefore,
+    enqueued: result.meta.changes ?? 0,
+    limit,
+  };
+}
+
 export async function startRagV2Backfill(
   request: Request,
   ctx: AuthContext,
@@ -149,9 +294,15 @@ export async function startRagV2Backfill(
   const body = await parseJsonBody<{
     source_tables?: RagV2SourceTable[];
     limit?: number;
+    limit_per_table?: number;
     profiles?: string[];
     dry_run?: boolean;
+    remaining_only?: boolean;
   }>(request);
+  const remainingOnly = body?.remaining_only === true;
+  if (remainingOnly) {
+    return enqueueRemainingRagV2Backfill(request, ctx, env);
+  }
   const limit = Math.max(1, Math.min(body?.limit ?? 100, 1000));
   const sourceTables = (body?.source_tables?.length ? body.source_tables : RAG_V2_SOURCE_TABLES)
     .filter((table): table is RagV2SourceTable => RAG_V2_SOURCE_TABLES.includes(table as RagV2SourceTable));
@@ -188,6 +339,48 @@ export async function startRagV2Backfill(
       max_content_tokens: p.maxContentTokens,
       benchmark_only: !!p.benchmarkOnly,
     })),
+    per_table: perTable,
+  });
+}
+
+export async function enqueueRemainingRagV2Backfill(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    source_tables?: RagV2SourceTable[];
+    limit_per_table?: number;
+    profiles?: string[];
+    dry_run?: boolean;
+  }>(request);
+  const limit = Math.max(1, Math.min(body?.limit_per_table ?? 5000, 25000));
+  const sourceTables = (body?.source_tables?.length ? body.source_tables : RAG_V2_SOURCE_TABLES)
+    .filter((table): table is RagV2SourceTable => RAG_V2_SOURCE_TABLES.includes(table as RagV2SourceTable));
+  const profiles = (body?.profiles || ['bge-base-en-v1.5:cls:v3'])
+    .map(id => getEmbeddingProfile(id).id);
+  const dryRun = body?.dry_run === true;
+
+  const perTable = [];
+  for (const sourceTable of sourceTables) {
+    perTable.push(await enqueueRemainingRagV2SourcesForTable(
+      env,
+      ctx.orgId,
+      sourceTable,
+      profiles,
+      limit,
+      dryRun
+    ));
+  }
+
+  return jsonResponse({
+    ok: true,
+    mode: 'remaining',
+    dry_run: dryRun,
+    profiles,
+    limit_per_table: limit,
+    enqueued_total: perTable.reduce((sum, row) => sum + row.enqueued, 0),
+    remaining_before_total: perTable.reduce((sum, row) => sum + row.remaining_before, 0),
     per_table: perTable,
   });
 }
