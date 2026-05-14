@@ -11,8 +11,8 @@ import { processClaimedWorkItem } from './work-queue-driver';
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 import { RAG_V2_WORK_QUEUE_DOMAIN } from './rag-v2';
 
-const DEFAULT_DISPATCH_BATCH = 750;
-const DEFAULT_MAX_ACTIVE = 960;
+const DEFAULT_DISPATCH_BATCH = 600;
+const DEFAULT_MAX_ACTIVE = 720;
 
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value || '', 10);

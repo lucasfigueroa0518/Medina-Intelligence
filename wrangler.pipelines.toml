@@ -37,8 +37,8 @@ CLOUDFLARE_ACCOUNT_ID = "ad54df3fe69483d2c0b69be1b72864e8"
 CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
 GEMINI_MAX_RPM = "500"
 RAG_V2_EMBEDDING_BATCH_SIZE = "32"
-RAG_V2_QUEUE_DISPATCH_BATCH = "750"
-RAG_V2_QUEUE_MAX_ACTIVE = "960"
+RAG_V2_QUEUE_DISPATCH_BATCH = "600"
+RAG_V2_QUEUE_MAX_ACTIVE = "720"
 # ALLOWED_ORIGINS + FRONTEND_URL only matter for CORS-aware fetch
 # handlers; pipelines's only public endpoint is /health which returns
 # JSON without CORS sensitivity. Keeping them parity for now.
@@ -169,4 +169,4 @@ max_batch_size = 1
 max_batch_timeout = 1
 max_retries = 3
 retry_delay = 60
-max_concurrency = 96
+max_concurrency = 72
