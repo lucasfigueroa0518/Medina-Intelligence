@@ -11,8 +11,8 @@ import { processClaimedWorkItem } from './work-queue-driver';
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 import { RAG_V2_WORK_QUEUE_DOMAIN } from './rag-v2';
 
-const DEFAULT_DISPATCH_BATCH = 80;
-const DEFAULT_MAX_ACTIVE = 96;
+const DEFAULT_DISPATCH_BATCH = 500;
+const DEFAULT_MAX_ACTIVE = 640;
 
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value || '', 10);
@@ -89,8 +89,8 @@ export async function dispatchRagV2QueueBurst(
 
   await sweepStaleClaims(env).catch(() => 0);
 
-  const maxActive = positiveInt(env.RAG_V2_QUEUE_MAX_ACTIVE, DEFAULT_MAX_ACTIVE, 250);
-  const dispatchBatch = positiveInt(env.RAG_V2_QUEUE_DISPATCH_BATCH, DEFAULT_DISPATCH_BATCH, 100);
+  const maxActive = positiveInt(env.RAG_V2_QUEUE_MAX_ACTIVE, DEFAULT_MAX_ACTIVE, 2000);
+  const dispatchBatch = positiveInt(env.RAG_V2_QUEUE_DISPATCH_BATCH, DEFAULT_DISPATCH_BATCH, 1000);
   const active = await activeRagV2Count(env, orgId);
   const available = Math.max(0, maxActive - active);
   const claimLimit = Math.min(dispatchBatch, available);
@@ -105,13 +105,16 @@ export async function dispatchRagV2QueueBurst(
   }
 
   try {
-    await env.RAG_REINDEX_QUEUE.sendBatch(rows.map(row => ({
-      body: {
-        work_queue_id: row.id,
-        lease_heartbeat_at: row.heartbeat_at,
-        dispatched_at: new Date().toISOString(),
-      } satisfies RagReindexQueueMessage,
-    })));
+    const dispatchedAt = new Date().toISOString();
+    for (let i = 0; i < rows.length; i += 100) {
+      await env.RAG_REINDEX_QUEUE.sendBatch(rows.slice(i, i + 100).map(row => ({
+        body: {
+          work_queue_id: row.id,
+          lease_heartbeat_at: row.heartbeat_at,
+          dispatched_at: dispatchedAt,
+        } satisfies RagReindexQueueMessage,
+      })));
+    }
     return { claimed: rows.length, dispatched: rows.length, skipped: null };
   } catch (e) {
     const retryAt = new Date(Date.now() + 60_000).toISOString();

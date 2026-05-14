@@ -667,8 +667,8 @@ export async function persistRagV2Trace(
   }
 }
 
-async function upsertRagChunkRecord(env: Env, record: RagChunkRecord): Promise<void> {
-  await env.D1.prepare(
+function upsertRagChunkRecordStatement(env: Env, record: RagChunkRecord): D1PreparedStatement {
+  return env.D1.prepare(
     `INSERT INTO rag_chunks_v2
        (id, org_id, source_table, source_id, source_family, document_type,
         chunk_index, total_chunks, parent_chunk_id, previous_chunk_id,
@@ -734,7 +734,17 @@ async function upsertRagChunkRecord(env: Env, record: RagChunkRecord): Promise<v
     record.chunk_config_version,
     record.lexical_doc_id,
     record.opensearch_status
-  ).run();
+  );
+}
+
+async function upsertRagChunkRecord(env: Env, record: RagChunkRecord): Promise<void> {
+  await upsertRagChunkRecordStatement(env, record).run();
+}
+
+async function upsertRagChunkRecords(env: Env, records: RagChunkRecord[]): Promise<void> {
+  for (let i = 0; i < records.length; i += 50) {
+    await env.D1.batch(records.slice(i, i + 50).map(record => upsertRagChunkRecordStatement(env, record)));
+  }
 }
 
 async function markVectorStatus(
@@ -754,6 +764,30 @@ async function markVectorStatus(
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = ?`
   ).bind(vectorId, status, error || null, chunkId).run();
+}
+
+async function markVectorStatuses(
+  env: Env,
+  updates: Array<{
+    chunkId: string;
+    profileId: EmbeddingProfileId;
+    vectorId: string | null;
+    status: 'synced' | 'failed' | 'skipped';
+    error?: string;
+  }>
+): Promise<void> {
+  for (let i = 0; i < updates.length; i += 100) {
+    const statements = updates.slice(i, i + 100).map(update => {
+      const profile = getEmbeddingProfile(update.profileId);
+      return env.D1.prepare(
+        `UPDATE rag_chunks_v2
+            SET ${profile.vectorColumn} = ?, ${profile.vectorStatusColumn} = ?, last_error = ?, indexed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`
+      ).bind(update.vectorId, update.status, update.error || null, update.chunkId);
+    });
+    await env.D1.batch(statements);
+  }
 }
 
 async function deleteObsoleteRagV2Chunks(
@@ -1039,18 +1073,23 @@ export async function reindexRagV2Item(
       opensearch_status: 'skipped',
       last_error: null,
     };
-    await upsertRagChunkRecord(env, record);
     recordsForSearch.push({ ...record, body: chunk.text });
     embeddingInputs.push({ chunkId, prefixed });
   }
+
+  await upsertRagChunkRecords(env, recordsForSearch);
 
   for (const profileId of profiles) {
     const profile = getEmbeddingProfile(profileId);
     const index = getVectorBinding(env, profile.id);
     if (!index) {
-      await Promise.all(embeddingInputs.map(input =>
-        markVectorStatus(env, input.chunkId, profile.id, null, 'skipped', `${profile.vectorBinding}_NOT_BOUND`)
-      ));
+      await markVectorStatuses(env, embeddingInputs.map(input => ({
+        chunkId: input.chunkId,
+        profileId: profile.id,
+        vectorId: null,
+        status: 'skipped',
+        error: `${profile.vectorBinding}_NOT_BOUND`,
+      })));
       continue;
     }
 
@@ -1087,24 +1126,24 @@ export async function reindexRagV2Item(
         await index.upsert(upserts);
         await Promise.all(batch.map((input) => {
           const vectorId = vectorIdFor(profile.id, input.chunkId);
-          return Promise.all([
-            env.KV.put(`chunk:${vectorId}`, input.prefixed, { expirationTtl: 7776000 }).catch(() => undefined),
-            markVectorStatus(env, input.chunkId, profile.id, vectorId, 'synced'),
-          ]);
+          return env.KV.put(`chunk:${vectorId}`, input.prefixed, { expirationTtl: 7776000 }).catch(() => undefined);
         }));
+        await markVectorStatuses(env, batch.map(input => ({
+          chunkId: input.chunkId,
+          profileId: profile.id,
+          vectorId: vectorIdFor(profile.id, input.chunkId),
+          status: 'synced',
+        })));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         errors.push(`${profile.id}:batch_${i}:${msg}`);
-        await Promise.all(batch.map(input =>
-          markVectorStatus(
-            env,
-            input.chunkId,
-            profile.id,
-            vectorIdFor(profile.id, input.chunkId),
-            'failed',
-            msg.slice(0, 1000)
-          )
-        ));
+        await markVectorStatuses(env, batch.map(input => ({
+          chunkId: input.chunkId,
+          profileId: profile.id,
+          vectorId: vectorIdFor(profile.id, input.chunkId),
+          status: 'failed',
+          error: msg.slice(0, 1000),
+        })));
       }
     }
   }
