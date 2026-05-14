@@ -159,7 +159,7 @@ export async function clearEnrichmentRateLimit(
 // now reserves slots in upstream_budget_ledger with an atomic D1 UPDATE, so
 // the queue can run hundreds of jobs while the BGE call rate remains bounded.
 //
-// Tuned by upstream_budget_ledger (bge.per_second defaults to 10).
+// Tuned by upstream_budget_ledger (bge.per_second defaults to 12).
 // 90s ceiling on a single acquire — if we wait longer than that, surface the
 // failure explicitly so the caller can record it (the gap is then caught by
 // detect-embed-gaps in the finalizer and recovered via embed_retry_queue).

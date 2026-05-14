@@ -69,7 +69,7 @@ const DEFAULT_CAPS: Partial<Record<Upstream, Partial<Record<BudgetWindow, number
   // callClaude wrapper does not differentiate by model so it shares
   // one bucket here.
   claude: { minute: 60 },
-  bge: { per_second: 10 },
+  bge: { per_second: 12 },
   gemini: { minute: 500 },
   // MARTy chat web search uses Gemini grounding, but it must not share a
   // circuit with background enrichment/news/LinkedIn jobs. Keeping a separate

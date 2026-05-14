@@ -25,7 +25,7 @@ const RRF_K = 60;
 const MAX_SOURCE_CHUNKS_BEFORE_RERANK = 3;
 const MAX_RAG_V2_CHUNKS_PER_JOB = 80;
 const RAG_V2_RANGE_CHUNK_SIZE = 60;
-const DEFAULT_RAG_V2_EMBEDDING_BATCH_SIZE = 32;
+const DEFAULT_RAG_V2_EMBEDDING_BATCH_SIZE = 48;
 
 type RagV2SourceTable = 'conversations' | 'events' | 'documents' | 'contacts' | 'companies' | 'deals' | 'news_articles';
 
