@@ -17,8 +17,8 @@ const RATE_LIMIT_PATTERNS = [
 
 export const ragReindexV2Handler: WorkQueueHandler = {
   domain: RAG_V2_WORK_QUEUE_DOMAIN,
-  batchSize: 2,
-  maxConcurrent: 4,
+  batchSize: 4,
+  maxConcurrent: 8,
   cadence: 'minute',
 
   process: async (item, env: Env) => {
