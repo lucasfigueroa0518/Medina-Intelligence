@@ -39,6 +39,7 @@ export interface Env {
   MARTY_LAB_HAIKU_MODEL?: string;
   MARTY_LAB_CODE_PATCH_MODEL?: string;
   MARTY_MAX_MODEL?: string;
+  MARTY_RUNTIME_GIT_SHA?: string;
   // Optional: gateway-level token. Only required when the AI Gateway has
   // "Authenticated Gateway" enabled. Set via `wrangler secret put CLOUDFLARE_AI_GATEWAY_TOKEN`.
   CLOUDFLARE_AI_GATEWAY_TOKEN?: string;

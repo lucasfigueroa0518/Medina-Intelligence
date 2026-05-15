@@ -819,7 +819,7 @@ export const api = {
   getMartyLabStatus: () => request<MartyLabStatusSnapshot>('/admin/marty-lab'),
   getMartyLabReadiness: () => request<MartyLabReadinessSnapshot>('/admin/marty-lab/readiness'),
   repairMartyLabReadiness: (data?: {
-    action?: 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts';
+    action?: 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts' | 'reset_lab_baseline_to_live_runtime';
   }) =>
     request<MartyLabStatusSnapshot>('/admin/marty-lab/repair-readiness', {
       method: 'POST',

@@ -56,7 +56,7 @@ interface CodePatchBody {
 }
 
 interface ReadinessRepairBody {
-  action?: 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts';
+  action?: 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts' | 'reset_lab_baseline_to_live_runtime';
 }
 
 export async function getMartyLabStatus(ctx: AuthContext, env: Env): Promise<Response> {

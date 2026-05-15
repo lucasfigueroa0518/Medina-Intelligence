@@ -1,10 +1,17 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
-import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { recall } from './agent-tools';
 import { callClaude as rawCallClaude } from './claude';
 import { createDocumentArtifactTool, findDocumentsTool, type ArtifactKind } from './document-artifacts';
 import { enqueueWork, type WorkQueueRow } from './work-queue';
+import {
+  buildLabSandboxRuntimeFingerprint,
+  buildLiveMartyRuntimeFingerprint,
+  buildMartyBaseSystemPrompt,
+  extractProductionRuntimeFingerprint,
+  productionRuntimeMatches,
+  type MartyRuntimeFingerprint,
+} from './marty-runtime';
 
 export type MartyLabRunStatus = 'queued' | 'configured' | 'running' | 'completed' | 'cancelled' | 'failed';
 export type MartyLabExperimentStatus = 'queued' | 'running' | 'graded' | 'blocked' | 'failed' | 'cancelled';
@@ -35,7 +42,7 @@ export const MARTY_LAB_CODE_PATCH_DOMAIN = 'marty_lab_code_patch';
 export const MARTY_LAB_AUTOPILOT_SUITE = 'marty_bootcamp_progressive_lab';
 export const MARTY_LAB_CANARY_SUITE = 'marty_bootcamp_canary_lab';
 export const MARTY_LAB_AUTOPILOT_COOLDOWN_MS = 15 * 60 * 1000;
-export const MARTY_LAB_HARNESS_VERSION = '2026-05-14-canary-human-conversation-v1';
+export const MARTY_LAB_HARNESS_VERSION = '2026-05-15-runtime-parity-v1';
 export const MARTY_LAB_BOOTCAMP_ROUNDS = 8;
 export const MARTY_LAB_CANARY_ROUNDS = 1;
 export const MARTY_LAB_ROUND_SAMPLE_SIZE = 10;
@@ -1340,6 +1347,31 @@ function runtimeStrategyHasActiveChange(strategy: MartyLabRuntimeStrategy | null
   );
 }
 
+function acceptedVersionRuntimeStrategy(version: MartyLabVersionSnapshot | { evidence?: Record<string, unknown> | null }): MartyLabRuntimeStrategy {
+  return normalizeLabRuntimeStrategy((version.evidence as any)?.lab_runtime_strategy || {});
+}
+
+function acceptedVersionIsLiveEquivalent(version: {
+  prompt_addendum?: string | null;
+  evidence?: Record<string, unknown> | null;
+}): boolean {
+  return !String(version.prompt_addendum || '').trim()
+    && !runtimeStrategyHasActiveChange(acceptedVersionRuntimeStrategy(version));
+}
+
+function runtimeFingerprintSummary(fingerprint: MartyRuntimeFingerprint | null | undefined): Record<string, unknown> | null {
+  if (!fingerprint) return null;
+  return {
+    fingerprint_version: fingerprint.fingerprint_version,
+    runtime_kind: fingerprint.runtime_kind,
+    hash: fingerprint.hash,
+    production_runtime_hash: fingerprint.production_runtime_hash,
+    sandbox_runtime_hash: fingerprint.sandbox_runtime_hash || null,
+    generated_at: fingerprint.generated_at,
+    deploy_sha: fingerprint.deploy_sha || null,
+  };
+}
+
 function normalizeTargetBehaviorScore(
   parsed: any,
   priorityScores: PriorityIntegrityScores,
@@ -2198,10 +2230,31 @@ async function ensureAcceptedMartyLabVersion(env: Env, orgId: string): Promise<M
       ORDER BY generation DESC, accepted_at DESC, created_at DESC
       LIMIT 1`
   ).bind(orgId).first<any>();
-  if (accepted) return rowToVersion(accepted);
+  if (accepted) {
+    const version = rowToVersion(accepted);
+    const fingerprint = extractProductionRuntimeFingerprint(version.evidence);
+    if (!fingerprint && acceptedVersionIsLiveEquivalent(version) && Number(version.generation || 0) === 0) {
+      const productionRuntimeFingerprint = buildLiveMartyRuntimeFingerprint(env, { deepDive: false });
+      const evidence = {
+        ...version.evidence,
+        production_runtime_fingerprint: productionRuntimeFingerprint,
+        production_runtime_hash: productionRuntimeFingerprint.production_runtime_hash,
+        baseline_runtime_recorded_at: nowIso(),
+      };
+      await env.D1.prepare(
+        `UPDATE marty_lab_versions
+            SET evidence_json = ?,
+                updated_at = ?
+          WHERE org_id = ? AND id = ?`
+      ).bind(JSON.stringify(evidence), nowIso(), orgId, version.id).run();
+      return { ...version, evidence };
+    }
+    return version;
+  }
 
   const now = nowIso();
   const id = makeId('lab_version');
+  const productionRuntimeFingerprint = buildLiveMartyRuntimeFingerprint(env, { deepDive: false });
   await env.D1.prepare(
     `INSERT INTO marty_lab_versions
       (id, org_id, status, label, generation, prompt_addendum, applied_upgrades_json,
@@ -2213,6 +2266,9 @@ async function ensureAcceptedMartyLabVersion(env: Env, orgId: string): Promise<M
     JSON.stringify({
       conclusion: 'Initial accepted baseline before progressive bootcamp upgrades.',
       scientific_model: 'Control version. No bootcamp variables have been introduced.',
+      production_runtime_fingerprint: productionRuntimeFingerprint,
+      production_runtime_hash: productionRuntimeFingerprint.production_runtime_hash,
+      baseline_runtime_recorded_at: now,
     }),
     now,
     now,
@@ -4171,13 +4227,20 @@ export async function checkMartyLabReadiness(
     ));
   }
 
+  const currentProductionRuntimeFingerprint = buildLiveMartyRuntimeFingerprint(env, { deepDive: false });
   const acceptedVersion = await env.D1.prepare(
-    `SELECT id, label, generation
+    `SELECT id, label, generation, prompt_addendum, evidence_json
        FROM marty_lab_versions
       WHERE org_id = ? AND status = 'accepted'
       ORDER BY generation DESC, created_at DESC
       LIMIT 1`
-  ).bind(orgId).first<{ id: string; label: string; generation: number }>();
+  ).bind(orgId).first<{
+    id: string;
+    label: string;
+    generation: number;
+    prompt_addendum: string | null;
+    evidence_json: string | null;
+  }>();
   checks.push(acceptedVersion
     ? martyLabReadinessCheck(
       'accepted_baseline',
@@ -4192,6 +4255,66 @@ export async function checkMartyLabReadiness(
       'warn',
       'No accepted lab baseline exists yet. The starter will create the initial current-baseline record.'
     ));
+  if (acceptedVersion) {
+    const evidence = safeJson<Record<string, unknown>>(acceptedVersion.evidence_json, {});
+    const recordedProductionRuntime = extractProductionRuntimeFingerprint(evidence);
+    const liveEquivalent = acceptedVersionIsLiveEquivalent({
+      prompt_addendum: acceptedVersion.prompt_addendum,
+      evidence,
+    });
+    checks.push(!liveEquivalent
+      ? martyLabReadinessCheck(
+        'accepted_baseline_live_parity',
+        'Live baseline parity',
+        'block',
+        'The accepted MARTy Lab baseline contains a lab-only prompt or runtime strategy. Reset it to the current live runtime before treating lab results as production-baseline comparisons.',
+        {
+          version_id: acceptedVersion.id,
+          generation: Number(acceptedVersion.generation || 0),
+          current_production_runtime: runtimeFingerprintSummary(currentProductionRuntimeFingerprint),
+          recorded_production_runtime: runtimeFingerprintSummary(recordedProductionRuntime),
+          suggested_repair_action: 'reset_lab_baseline_to_live_runtime',
+        }
+      )
+      : !recordedProductionRuntime
+        ? martyLabReadinessCheck(
+          'accepted_baseline_live_parity',
+          'Live baseline parity',
+          'block',
+          'The accepted MARTy Lab baseline is missing a production runtime fingerprint. Reset it to the current live runtime before starting another canary.',
+          {
+            version_id: acceptedVersion.id,
+            generation: Number(acceptedVersion.generation || 0),
+            current_production_runtime: runtimeFingerprintSummary(currentProductionRuntimeFingerprint),
+            suggested_repair_action: 'reset_lab_baseline_to_live_runtime',
+          }
+        )
+        : !productionRuntimeMatches(recordedProductionRuntime, currentProductionRuntimeFingerprint)
+          ? martyLabReadinessCheck(
+            'accepted_baseline_live_parity',
+            'Live baseline parity',
+            'block',
+            'The accepted MARTy Lab baseline was stamped with a different production runtime than the currently deployed MARTy runtime. Reset it after deploy so baseline tests compare against the live system.',
+            {
+              version_id: acceptedVersion.id,
+              generation: Number(acceptedVersion.generation || 0),
+              current_production_runtime: runtimeFingerprintSummary(currentProductionRuntimeFingerprint),
+              recorded_production_runtime: runtimeFingerprintSummary(recordedProductionRuntime),
+              suggested_repair_action: 'reset_lab_baseline_to_live_runtime',
+            }
+          )
+          : martyLabReadinessCheck(
+            'accepted_baseline_live_parity',
+            'Live baseline parity',
+            'pass',
+            'Accepted MARTy Lab baseline is stamped with the current live production runtime.',
+            {
+              version_id: acceptedVersion.id,
+              generation: Number(acceptedVersion.generation || 0),
+              production_runtime_hash: currentProductionRuntimeFingerprint.production_runtime_hash,
+            }
+          ));
+  }
 
   checks.push(martyLabReadinessCheck(
     'model_roles_configured',
@@ -4232,14 +4355,59 @@ function finalizeMartyLabReadiness(
   };
 }
 
+async function resetMartyLabAcceptedBaselineToLiveRuntime(
+  env: Env,
+  orgId: string,
+  userId: string
+): Promise<void> {
+  const now = nowIso();
+  const productionRuntimeFingerprint = buildLiveMartyRuntimeFingerprint(env, { deepDive: false });
+  const maxGeneration = await env.D1.prepare(
+    `SELECT MAX(generation) AS generation
+       FROM marty_lab_versions
+      WHERE org_id = ?`
+  ).bind(orgId).first<{ generation: number | null }>();
+  const generation = Math.max(0, Number(maxGeneration?.generation || 0) + 1);
+  const id = makeId('lab_version');
+  await env.D1.batch([
+    env.D1.prepare(
+      `UPDATE marty_lab_versions
+          SET status = 'archived',
+              updated_at = ?
+        WHERE org_id = ? AND status = 'accepted'`
+    ).bind(now, orgId),
+    env.D1.prepare(
+      `INSERT INTO marty_lab_versions
+        (id, org_id, status, label, generation, prompt_addendum, applied_upgrades_json,
+         evidence_json, accepted_at, created_at, updated_at)
+       VALUES (?, ?, 'accepted', 'Live production MARTy baseline', ?, '', '[]', ?, ?, ?, ?)`
+    ).bind(
+      id,
+      orgId,
+      generation,
+      JSON.stringify({
+        conclusion: 'Accepted lab baseline reset to the current live production MARTy runtime.',
+        scientific_model: 'Control version. No lab-only prompt addendum or runtime strategy is active.',
+        reset_by: userId,
+        reset_at: now,
+        production_runtime_fingerprint: productionRuntimeFingerprint,
+        production_runtime_hash: productionRuntimeFingerprint.production_runtime_hash,
+      }),
+      now,
+      now,
+      now
+    ),
+  ]);
+}
+
 export async function repairMartyLabReadinessBlocker(
   env: Env,
   orgId: string,
   userId: string,
-  opts: { action?: 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts' } = {}
+  opts: { action?: 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts' | 'reset_lab_baseline_to_live_runtime' } = {}
 ): Promise<MartyLabStatusSnapshot> {
   const action = opts.action || 'clear_orphaned_lab_queue';
-  if (!['clear_orphaned_lab_queue', 'archive_legacy_full_lab', 'quarantine_lab_artifacts'].includes(action)) {
+  if (!['clear_orphaned_lab_queue', 'archive_legacy_full_lab', 'quarantine_lab_artifacts', 'reset_lab_baseline_to_live_runtime'].includes(action)) {
     throw new Error('Unsupported MARTy Sandbox repair action');
   }
 
@@ -4259,6 +4427,14 @@ export async function repairMartyLabReadinessBlocker(
     upgrade_variable_json: string | null;
   }>();
   const activeRunIsLegacyFullLab = isLegacyFullLabRunRecord(activeRun);
+
+  if (action === 'reset_lab_baseline_to_live_runtime') {
+    if (activeRun?.id) {
+      throw new Error('Cannot reset the MARTy Lab baseline while a sandbox run is active. Finish, cancel, or archive it first.');
+    }
+    await resetMartyLabAcceptedBaselineToLiveRuntime(env, orgId, userId);
+    return getMartyLabStatusSnapshot(env, orgId);
+  }
 
   if (action === 'archive_legacy_full_lab') {
     if (!activeRun?.id || !activeRunIsLegacyFullLab) {
@@ -4934,8 +5110,12 @@ async function startBootcampRound(
     ));
   }
   const now = nowIso();
+  const productionRuntimeFingerprint = buildLiveMartyRuntimeFingerprint(env, { deepDive: false });
+  const baselineProductionRuntimeFingerprint = extractProductionRuntimeFingerprint(baseline.evidence);
 	  const evidence = {
 	    harness_version: MARTY_LAB_HARNESS_VERSION,
+      production_runtime_fingerprint: productionRuntimeFingerprint,
+      baseline_production_runtime_fingerprint: baselineProductionRuntimeFingerprint,
 	    round_index: roundIndex,
     total_rounds: totalRounds,
     run_mode: runShape.mode,
@@ -5036,6 +5216,8 @@ async function startBootcampRound(
 	      priority,
       focus_prompt: focusPrompt,
 	      harness_version: MARTY_LAB_HARNESS_VERSION,
+        production_runtime_fingerprint: productionRuntimeFingerprint,
+        baseline_production_runtime_fingerprint: baselineProductionRuntimeFingerprint,
 	    }),
 	    roundIndex,
 	    MARTY_LAB_HARNESS_VERSION,
@@ -5313,6 +5495,8 @@ export async function startMartyLabRun(
     `Superseded by ${runLabel} progressive baseline testing.`
   );
   const baselineVersion = await ensureAcceptedMartyLabVersion(env, orgId);
+  const productionRuntimeFingerprint = buildLiveMartyRuntimeFingerprint(env, { deepDive: false });
+  const baselineProductionRuntimeFingerprint = extractProductionRuntimeFingerprint(baselineVersion.evidence);
   const baselineLabel = opts.baseline_label?.trim() || baselineVersion.label;
   const candidateLabel = opts.candidate_label?.trim() || 'Round candidate pending';
   const events = [
@@ -5328,6 +5512,7 @@ export async function startMartyLabRun(
 	      type: 'suite_started',
 	      message: `Created ${runLabel} with ${configuredRounds} sequential round${configuredRounds === 1 ? '' : 's'}, candidate pools, and baseline-relative local validation gates before promotion.`,
 	      harness_version: MARTY_LAB_HARNESS_VERSION,
+        production_runtime_hash: productionRuntimeFingerprint.production_runtime_hash,
 	    },
   ];
 
@@ -5364,6 +5549,8 @@ export async function startMartyLabRun(
       validation_conversations: MARTY_LAB_VALIDATION_CONVERSATIONS,
       golden_guardrail_conversations: MARTY_LAB_GLOBAL_GUARDRAIL_CONVERSATIONS,
       global_guardrail_conversations: MARTY_LAB_GLOBAL_GUARDRAIL_CONVERSATIONS,
+      production_runtime_fingerprint: productionRuntimeFingerprint,
+      baseline_production_runtime_fingerprint: baselineProductionRuntimeFingerprint,
     }),
     phaseName,
     configuredRounds * MARTY_LAB_ROUND_SAMPLE_SIZE,
@@ -5373,10 +5560,13 @@ export async function startMartyLabRun(
 	      mode: requestedMode,
 	      harness_version: MARTY_LAB_HARNESS_VERSION,
       focus_prompt: focusPrompt,
+      production_runtime_fingerprint: productionRuntimeFingerprint,
+      baseline_production_runtime_fingerprint: baselineProductionRuntimeFingerprint,
 	      conclusion: `${runLabel} configured. It will run ${MARTY_LAB_DISCOVERY_CONVERSATIONS} adaptive discovery chats, build one candidate upgrade, test it across ${MARTY_LAB_VALIDATION_CONVERSATIONS} adaptive validation chats, and wait for human Ship before changing the accepted baseline.`,
 	      scientific_model: {
 	        harness_version: MARTY_LAB_HARNESS_VERSION,
 	        control: baselineVersion.label,
+        production_runtime_hash: productionRuntimeFingerprint.production_runtime_hash,
         rounds: configuredRounds,
         sample_size_per_round: MARTY_LAB_ROUND_SAMPLE_SIZE,
         discovery_conversations_per_round: MARTY_LAB_DISCOVERY_CONVERSATIONS,
@@ -5547,6 +5737,7 @@ export async function decideMartyLabRun(
 
   const now = nowIso();
   const shipped = decision === 'ship';
+  const productionRuntimeFingerprint = buildLiveMartyRuntimeFingerprint(env, { deepDive: false });
   const nextTrialStatus: MartyLabUpgradeTrialStatus = shipped ? 'accepted' : 'rejected';
   const existingEvidence = trial.evidence || {};
   const humanDecision = {
@@ -5559,7 +5750,7 @@ export async function decideMartyLabRun(
       : 'Human rejected the lab candidate after reviewing the full run, experiment pages, and approval assessment.',
   };
   const conclusion = shipped
-    ? `Human shipped ${trial.title}. The candidate is now the accepted MARTy Lab baseline for future controlled rounds.`
+    ? `Human shipped ${trial.title}. The candidate is accepted in MARTy Lab, and live-baseline parity must be reset after the production runtime is updated.`
     : `Human rejected ${trial.title}. The current accepted MARTy Lab baseline remains unchanged.`;
 
   await env.D1.prepare(
@@ -5591,6 +5782,9 @@ export async function decideMartyLabRun(
     human_decision: humanDecision,
     source_trial_id: trial.id,
     source_run_id: runId,
+    production_runtime_fingerprint: productionRuntimeFingerprint,
+    production_runtime_hash: productionRuntimeFingerprint.production_runtime_hash,
+    live_parity_pending: shipped,
   };
   await env.D1.prepare(
     `UPDATE marty_lab_versions
@@ -5650,6 +5844,7 @@ export async function decideMartyLabRun(
     message: conclusion,
     trial_id: trial.id,
     decided_by: userId,
+    production_runtime_hash: productionRuntimeFingerprint.production_runtime_hash,
   });
 
   await activateNextQueuedMartyLabRun(env, orgId, userId);
@@ -9216,7 +9411,7 @@ ${JSON.stringify(runtimeStrategy, null, 2)}
 
 Use the supplied tool context according to that strategy. If the strategy says evidence-first, make source coverage and uncertainty explicit. If it says artifact-first, prioritize a real editable artifact over prose about an artifact. If it says privacy-boundary, state access limits plainly.`
     : '';
-  return `${GOD_MODE_SYSTEM_PROMPT}
+  return `${buildMartyBaseSystemPrompt(ctx, new Date())}
 
 MARTy Lab sandbox instructions:
 - You are answering as MARTy inside a sandbox evaluation. Do not mutate CRM records or claim to have changed production state.
@@ -9354,6 +9549,21 @@ async function runSandboxConversation(
   const toolTrace: Array<Record<string, unknown>> = [];
   const sourceBundle: Record<string, unknown> = {};
   const adaptiveFollowups: Array<Record<string, unknown>> = [];
+  const productionRuntimeFingerprint = buildLiveMartyRuntimeFingerprint(env, { deepDive: false });
+  const sandboxRuntimeFingerprint = buildLabSandboxRuntimeFingerprint(env, {
+    mode,
+    harnessVersion: MARTY_LAB_HARNESS_VERSION,
+    promptAddendum: versionPromptAddendum,
+    runtimeStrategy,
+    productionFingerprint: productionRuntimeFingerprint,
+  });
+  toolTrace.push({
+    tool: 'runtime_fingerprint',
+    mode,
+    production_runtime_fingerprint: runtimeFingerprintSummary(productionRuntimeFingerprint),
+    sandbox_runtime_fingerprint: runtimeFingerprintSummary(sandboxRuntimeFingerprint),
+  });
+  sourceBundle.runtime_fingerprint = sandboxRuntimeFingerprint;
 
   let userPrompt = experiment.starting_prompt;
   for (let turn = 1; turn <= MARTY_LAB_MAX_ADAPTIVE_FOLLOWUPS + 1; turn += 1) {

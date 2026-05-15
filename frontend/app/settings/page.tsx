@@ -3739,7 +3739,7 @@ function labExperimentTagline(page: MartyLabExperimentPage | null): string {
 }
 
 type MartyLabTone = 'good' | 'warn' | 'bad' | 'purple' | 'muted';
-type MartyLabRepairAction = 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts';
+type MartyLabRepairAction = 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts' | 'reset_lab_baseline_to_live_runtime';
 
 function martyToneClasses(tone: MartyLabTone): { box: string; text: string; border: string; soft: string } {
   if (tone === 'good') return {
@@ -4196,6 +4196,7 @@ function sandboxCheckLabel(key: string): string {
     lab_work_queue_clear: 'Stuck sandbox work',
     legacy_full_lab_active: 'Legacy sandbox cleanup',
     sandbox_artifact_isolation: 'Sandbox artifact cleanup',
+    accepted_baseline_live_parity: 'Live baseline parity',
     round_inconclusive_needs_review: 'Needs your review',
     no_active_lab_run: 'Another improvement is already running',
     no_active_lab_run_race: 'Another improvement is already running',
@@ -4217,6 +4218,7 @@ function sandboxRunViewState(args: {
   canRepairLabQueue: boolean;
   canArchiveLegacyRun: boolean;
   canQuarantineLabArtifacts: boolean;
+  canResetLabBaseline: boolean;
   runIsCanary: boolean;
   completed: number;
   expectedTotal: number;
@@ -4235,6 +4237,7 @@ function sandboxRunViewState(args: {
     canRepairLabQueue,
     canArchiveLegacyRun,
     canQuarantineLabArtifacts,
+    canResetLabBaseline,
     runIsCanary,
     completed,
     expectedTotal,
@@ -4270,6 +4273,15 @@ function sandboxRunViewState(args: {
         eyebrow: 'Sandbox cleanup',
         title: 'Sandbox cleanup needed',
         body: 'Some retryable sandbox work is still waiting even though no experiment is active. Clear it here, then start the next clean experiment.',
+        tone: 'warn',
+      };
+    }
+    if (canResetLabBaseline) {
+      return {
+        id: 'needs_cleanup',
+        eyebrow: 'Live baseline parity',
+        title: 'Reset the lab baseline',
+        body: 'The accepted sandbox baseline is not stamped as the live production MARTy runtime. Reset it before starting another comparison.',
         tone: 'warn',
       };
     }
@@ -5032,6 +5044,7 @@ function SandboxImprovementQueue({
   readinessMessage,
   canRepairLabQueue,
   canQuarantineLabArtifacts,
+  canResetLabBaseline,
   repairingAction,
   onRepairReadiness,
   deepWorkItems,
@@ -5054,6 +5067,7 @@ function SandboxImprovementQueue({
   readinessMessage: string;
   canRepairLabQueue: boolean;
   canQuarantineLabArtifacts: boolean;
+  canResetLabBaseline: boolean;
   repairingAction: MartyLabRepairAction | null;
   onRepairReadiness: (action?: MartyLabRepairAction) => void;
   deepWorkItems: MartyLabDeepWorkItemRow[];
@@ -5249,6 +5263,17 @@ function SandboxImprovementQueue({
                 {repairingAction === 'quarantine_lab_artifacts' ? 'Quarantining artifacts' : 'Quarantine sandbox artifacts'}
               </button>
             )}
+            {canResetLabBaseline && (
+              <button
+                type="button"
+                onClick={() => onRepairReadiness('reset_lab_baseline_to_live_runtime')}
+                disabled={repairingAction !== null}
+                className="ml-2 inline-flex items-center gap-1 rounded-md border border-semantic-warning/25 px-2 py-1 text-[10px] font-medium text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+              >
+                {repairingAction === 'reset_lab_baseline_to_live_runtime' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                {repairingAction === 'reset_lab_baseline_to_live_runtime' ? 'Resetting baseline' : 'Reset baseline to live'}
+              </button>
+            )}
             <div className="grid gap-1">
               {readiness.checks.map(check => (
                 <div key={check.key} className="rounded border border-white/[0.04] bg-white/[0.02] px-2 py-1.5 text-[11px] leading-relaxed text-text-secondary">
@@ -5364,6 +5389,8 @@ function MartyLabStatusCard({
         ? 'Failed to archive legacy sandbox run'
         : action === 'quarantine_lab_artifacts'
           ? 'Failed to quarantine sandbox artifacts'
+          : action === 'reset_lab_baseline_to_live_runtime'
+            ? 'Failed to reset lab baseline to live runtime'
           : 'Failed to clear stuck sandbox work';
       setError(e?.message || fallback);
     } finally {
@@ -5475,6 +5502,7 @@ function MartyLabStatusCard({
   const labQueueBlocker = readiness.checks.find(check => check.key === 'lab_work_queue_clear' && check.status === 'block');
   const artifactIsolationCheck = readiness.checks.find(check => check.key === 'sandbox_artifact_isolation' && check.status !== 'pass');
   const legacyRunBlocker = readiness.checks.find(check => check.key === 'legacy_full_lab_active' && check.status === 'block');
+  const baselineParityBlocker = readiness.checks.find(check => check.key === 'accepted_baseline_live_parity' && check.status === 'block');
   const labQueueHasStaleRows = Array.isArray((labQueueBlocker?.data as any)?.stale_queue)
     && ((labQueueBlocker?.data as any)?.stale_queue as unknown[]).length > 0;
   const liveRunIsLegacyFullLab = labRunIsLegacyFullLab(liveRun, readiness.harness_version);
@@ -5482,6 +5510,7 @@ function MartyLabStatusCard({
   const canArchiveLegacyRun = Boolean(isViewingCurrent && liveRun && selectedRunIsLegacyFullLab && liveRunIsLegacyFullLab && legacyRunBlocker);
   const canQuarantineLabArtifacts = Boolean(!liveRun && artifactIsolationCheck);
   const canRepairLabQueue = Boolean(!liveRun && labQueueBlocker);
+  const canResetLabBaseline = Boolean(!liveRun && baselineParityBlocker);
   const canQueueWhenBlocked = !readiness.ok && blockingKeys.length > 0 && blockingKeys.every(key => [
     'no_active_lab_run',
     'human_decision_required',
@@ -5490,7 +5519,7 @@ function MartyLabStatusCard({
     'one_active_lab_run_per_suite',
     'one_active_lab_run_per_org',
   ].includes(key) || (key === 'lab_work_queue_clear' && Boolean(liveRun) && !labQueueHasStaleRows));
-  const startDisabled = Boolean(startingMode || canRepairLabQueue || canArchiveLegacyRun || canQuarantineLabArtifacts || (!readiness.ok && !canQueueWhenBlocked));
+  const startDisabled = Boolean(startingMode || canRepairLabQueue || canArchiveLegacyRun || canQuarantineLabArtifacts || canResetLabBaseline || (!readiness.ok && !canQueueWhenBlocked));
   const startVerb = readiness.ok && !liveRun ? 'Start' : 'Queue';
   const currentRunPhase = labRunPhase(run);
   const hasHumanDecision = currentRunPhase === 'human_shipped' || currentRunPhase === 'human_rejected';
@@ -5512,6 +5541,7 @@ function MartyLabStatusCard({
     canRepairLabQueue,
     canArchiveLegacyRun,
     canQuarantineLabArtifacts,
+    canResetLabBaseline,
     runIsCanary,
     completed,
     expectedTotal,
@@ -5570,6 +5600,17 @@ function MartyLabStatusCard({
               >
                 {repairingAction === 'clear_orphaned_lab_queue' ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
                 {repairingAction === 'clear_orphaned_lab_queue' ? 'Clearing...' : 'Clear stuck work'}
+              </button>
+            )}
+            {canResetLabBaseline && (
+              <button
+                type="button"
+                onClick={() => repairReadiness('reset_lab_baseline_to_live_runtime')}
+                disabled={repairingAction !== null}
+                className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs font-medium text-semantic-warning hover:bg-semantic-warning/15 disabled:opacity-50"
+              >
+                {repairingAction === 'reset_lab_baseline_to_live_runtime' ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                {repairingAction === 'reset_lab_baseline_to_live_runtime' ? 'Resetting...' : 'Reset baseline to live'}
               </button>
             )}
             {!isViewingCurrent && (

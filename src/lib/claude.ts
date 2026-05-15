@@ -10,7 +10,7 @@ interface ClaudeResponse {
 }
 
 const ANTHROPIC_VERSION = '2023-06-01';
-const CLAUDE_MODEL = 'claude-sonnet-4-6';
+export const CLAUDE_MODEL = 'claude-sonnet-4-6';
 
 function isMaxTokenRejection(status: number, body: string): boolean {
   return status === 400 && /max_tokens|maximum.*tokens|tokens.*maximum|output.*tokens/i.test(body);
