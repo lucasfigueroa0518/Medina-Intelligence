@@ -552,6 +552,8 @@ export const api = {
 
   // Agent
   listSessions: () => request<{ sessions: any[] }>('/agent/sessions'),
+  createSession: (body?: { context_entity_type?: string | null; context_entity_id?: string | null }) =>
+    request<{ session: any }>('/agent/sessions', { method: 'POST', body: JSON.stringify(body || {}) }),
   getSessionMessages: (id: string) =>
     request<{ session: any; messages: any[] }>(`/agent/sessions/${id}/messages`),
   deleteSession: (id: string) =>

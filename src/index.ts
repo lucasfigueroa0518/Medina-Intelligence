@@ -576,6 +576,9 @@ async function routeAuthenticated(
   if (path === '/api/agent/sessions' && method === 'GET') {
     return Agent.listSessions(ctx, env);
   }
+  if (path === '/api/agent/sessions' && method === 'POST') {
+    return Agent.createSession(request, ctx, env);
+  }
   m = path.match(/^\/api\/agent\/sessions\/([^/]+)\/messages$/);
   if (m && method === 'GET') return Agent.getSessionMessages(m[1], ctx, env);
   m = path.match(/^\/api\/agent\/sessions\/([^/]+)\/trace$/);

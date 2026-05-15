@@ -3660,6 +3660,29 @@ function labFriendlyOutcomeNote(note: string | null | undefined): string {
   return text.replace(/\b[a-z]+(?:_[a-z0-9]+)+\b/gi, match => titleizeLabValue(match).toLowerCase());
 }
 
+function cleanLabPromptForDisplay(text: string | null | undefined): string {
+  return String(text || '')
+    .replace(/\s+Validation pass\s+\d+\s*:\s*use a fresh angle and make the output fully usable\.?/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function labSampleDisplayTitle(sample: MartyLabExperimentRow): string {
+  const meta = labRoundPolicy(sample);
+  const goal = cleanLabPromptForDisplay(sample.goal);
+  const prompt = cleanLabPromptForDisplay(sample.starting_prompt);
+  if (meta?.role === 'validation') return prompt || goal || 'Validation sample';
+  return goal || prompt || 'Lab sample';
+}
+
+function labSampleDisplaySubtitle(sample: MartyLabExperimentRow): string {
+  const meta = labRoundPolicy(sample);
+  if (meta?.role !== 'validation') return '';
+  const goal = cleanLabPromptForDisplay(sample.goal);
+  const title = labSampleDisplayTitle(sample);
+  return goal && goal !== title ? goal : '';
+}
+
 function labExperimentOutcome(exp: MartyLabExperimentRow): { label: string; tone: 'good' | 'bad' | 'warn' | 'muted'; note: string } {
   const meta = labRoundPolicy(exp);
   const isDiscovery = meta?.role === 'discovery';
@@ -4100,13 +4123,16 @@ function MartyLabRoundSampleCard({ sample }: { sample: MartyLabExperimentRow }) 
       ? `Guardrail ${roundMeta.sample}`
       : `Validation ${Math.max(1, (roundMeta?.sample || 4) - 3)}/7`;
   const artifactText = labArtifactResultText(sample);
+  const displayTitle = labSampleDisplayTitle(sample);
+  const displaySubtitle = labSampleDisplaySubtitle(sample);
 
   return (
     <article className="rounded-lg border border-white/[0.05] bg-black/10 p-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">{label}</div>
-          <div className="mt-1 text-sm font-medium leading-snug text-text-primary">{sample.goal}</div>
+          <div className="mt-1 text-sm font-medium leading-snug text-text-primary">{displayTitle}</div>
+          {displaySubtitle && <div className="mt-1 text-[11px] leading-relaxed text-text-muted">{displaySubtitle}</div>}
         </div>
         <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${outcomeTone}`}>{outcome.label}</span>
       </div>
@@ -4704,6 +4730,8 @@ function SandboxRoundCard({ sample }: { sample: MartyLabExperimentRow }) {
   const artifactText = labArtifactResultText(sample);
   const humanPick = labHumanPreferenceText(sample);
   const note = labFriendlyOutcomeNote(outcome.note);
+  const displayTitle = labSampleDisplayTitle(sample);
+  const displaySubtitle = labSampleDisplaySubtitle(sample);
   const observation = roundMeta?.role === 'discovery'
     ? note || 'Discovery captured baseline behavior for this experiment.'
     : delta === null
@@ -4720,7 +4748,8 @@ function SandboxRoundCard({ sample }: { sample: MartyLabExperimentRow }) {
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">{label}</div>
-            <h5 className="mt-1 text-sm font-semibold leading-snug text-text-primary">{sample.goal}</h5>
+            <h5 className="mt-1 text-sm font-semibold leading-snug text-text-primary">{displayTitle}</h5>
+            {displaySubtitle && <p className="mt-1 text-[11px] leading-relaxed text-text-muted">{displaySubtitle}</p>}
             <p className="mt-2 text-xs leading-relaxed text-text-secondary">{observation}</p>
           </div>
           <div className="flex shrink-0 items-center gap-2">

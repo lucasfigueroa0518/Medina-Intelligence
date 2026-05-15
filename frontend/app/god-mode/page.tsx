@@ -164,6 +164,7 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   streaming?: boolean;
+  pendingRequestId?: string;
   justFinished?: boolean;
   toolCalls?: ToolCall[];
   timestamp?: string;
@@ -174,6 +175,11 @@ interface Message {
   attachments?: ChatUploadSummary[];
   documentCards?: MartyDocumentCard[];
 }
+
+type MartyMode = 'fast' | 'max';
+
+const MARTY_MODE_STORAGE_KEY = 'marty_chat_mode';
+const MARTY_PENDING_STORAGE_KEY = 'marty_pending';
 
 // Selected/in-flight uploads (state local to the input bar before send).
 interface PendingUpload {
@@ -577,6 +583,55 @@ function mergeDocumentCards(
   return [...byKey.values()];
 }
 
+function readStoredMartyMode(): MartyMode {
+  if (typeof window === 'undefined') return 'fast';
+  try {
+    return localStorage.getItem(MARTY_MODE_STORAGE_KEY) === 'max' ? 'max' : 'fast';
+  } catch {
+    return 'fast';
+  }
+}
+
+function parseAgentMetadata(raw: unknown): Record<string, any> {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw as Record<string, any>;
+  if (typeof raw !== 'string') return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, any> : {};
+  } catch {
+    return {};
+  }
+}
+
+function hydrateAgentMessage(m: any): Message {
+  const meta = parseAgentMetadata(m.metadata);
+  const running = m.role === 'assistant' && meta.status === 'running';
+  const documentCards = mergeDocumentCards(undefined, meta?.document_cards);
+  return {
+    id: m.id,
+    role: m.role,
+    content: m.role === 'assistant' ? normalizeMartySentenceSpacing(m.content || '') : (m.content || ''),
+    timestamp: m.created_at,
+    attachments: m.attachments || undefined,
+    sources: m.sources || undefined,
+    documentCards,
+    cancelled: !!meta.cancelled || meta.status === 'cancelled',
+    streaming: running,
+    pendingRequestId: running && typeof meta.request_id === 'string' ? meta.request_id : undefined,
+    error: meta.status === 'error',
+    retryable: meta.status === 'error' ? true : undefined,
+  };
+}
+
+function hydrateAgentMessages(rows: any[]): Message[] {
+  return rows.map(hydrateAgentMessage);
+}
+
+function getRunningAssistantMessage(messages: Message[]): Message | undefined {
+  return [...messages].reverse().find(m => m.role === 'assistant' && m.streaming && m.pendingRequestId);
+}
+
 function DocumentCardList({
   cards,
   sessionId,
@@ -934,8 +989,15 @@ export default function GodModePage() {
   const [mobileSessionsOpen, setMobileSessionsOpen] = React.useState(false);
   const [copiedMsgId, setCopiedMsgId] = React.useState<string | null>(null);
   const [placeholderText, setPlaceholderText] = React.useState('Ask MARTy anything...');
-  const [deepDive, setDeepDive] = React.useState(false);
+  const [martyMode, setMartyMode] = React.useState<MartyMode>(readStoredMartyMode);
+  const deepDive = martyMode === 'max';
   const maxModeShortcut = typeof navigator !== 'undefined' && navigator.platform?.includes('Mac') ? '⌘⇧D' : 'Ctrl⇧D';
+
+  React.useEffect(() => {
+    try {
+      localStorage.setItem(MARTY_MODE_STORAGE_KEY, martyMode);
+    } catch { /* ignore */ }
+  }, [martyMode]);
 
   // Fix 4: Explicit isThinking state — only cleared on first text token
   const [isThinking, setIsThinking] = React.useState(false);
@@ -1084,6 +1146,24 @@ export default function GodModePage() {
   // Fix 1: Smart auto-scroll — respect user's scroll position
   const userScrolledUpRef = React.useRef(false);
 
+  const applyServerMessages = React.useCallback((rows: any[], sessionIdForPending?: string | null) => {
+    const nextMessages = hydrateAgentMessages(rows);
+    setMessages(nextMessages);
+    const runningMessage = getRunningAssistantMessage(nextMessages);
+    if (runningMessage?.pendingRequestId) {
+      activeRequestIdRef.current = runningMessage.pendingRequestId;
+      setIsThinking(true);
+      setStreaming(true);
+      try {
+        if (sessionIdForPending) {
+          localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: sessionIdForPending, requestId: runningMessage.pendingRequestId }));
+        }
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+      } catch { /* ignore */ }
+    }
+    return runningMessage;
+  }, []);
+
   React.useEffect(() => {
     document.title = 'MARTy \u2014 Medina Intelligence';
     setSessionsLoading(true);
@@ -1096,23 +1176,19 @@ export default function GodModePage() {
     const t = setTimeout(() => setShowSparkles(false), 1200);
 
     try {
-      const pending = localStorage.getItem('marty_pending');
+      const pending = localStorage.getItem(MARTY_PENDING_STORAGE_KEY);
       if (!demoMode && pending) {
         const { sessionId } = JSON.parse(pending);
         if (sessionId) {
           setActiveSessionId(sessionId);
           api.getSessionMessages(sessionId).then(d => {
-            setMessages(d.messages.map((m: any) => ({
-              id: m.id,
-              role: m.role,
-              content: m.role === 'assistant' ? normalizeMartySentenceSpacing(m.content) : m.content,
-              timestamp: m.created_at,
-              sources: m.sources || undefined,
-            })));
-            localStorage.removeItem('marty_pending');
-            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+            const runningMessage = applyServerMessages(d.messages, sessionId);
+            if (!runningMessage) {
+              localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+              window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+            }
           }).catch(() => {
-            localStorage.removeItem('marty_pending');
+            localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
           });
         }
       }
@@ -1144,7 +1220,7 @@ export default function GodModePage() {
     } catch { /* ignore */ }
 
     return () => clearTimeout(t);
-  }, [demoMode]);
+  }, [applyServerMessages, demoMode]);
 
   React.useEffect(() => {
     if (!activeSessionId && messages.length === 0) {
@@ -1176,28 +1252,7 @@ export default function GodModePage() {
     if (activeSessionId && !streamingRef.current) {
       api.getSessionMessages(activeSessionId).then(d => {
         if (!streamingRef.current) {
-          setMessages(d.messages.map((m: any) => {
-            // Pull cancelled flag out of the JSON metadata column.
-            let cancelled = false;
-            let documentCards: MartyDocumentCard[] | undefined;
-            if (m.metadata) {
-              try {
-                const meta = typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata;
-                cancelled = !!meta?.cancelled;
-                documentCards = mergeDocumentCards(undefined, meta?.document_cards);
-              } catch { /* ignore malformed metadata */ }
-            }
-            return {
-              id: m.id,
-              role: m.role,
-              content: m.role === 'assistant' ? normalizeMartySentenceSpacing(m.content) : m.content,
-              timestamp: m.created_at,
-              attachments: m.attachments || undefined,
-              sources: m.sources || undefined,
-              documentCards,
-              cancelled,
-            };
-          }));
+          applyServerMessages(d.messages, activeSessionId);
         }
       });
       api.listSessionUploads(activeSessionId).then(d => {
@@ -1212,7 +1267,46 @@ export default function GodModePage() {
       setBytesTotal(0);
       setPendingUploads([]);
     }
-  }, [activeSessionId, demoMode]);
+  }, [activeSessionId, applyServerMessages, demoMode]);
+
+  React.useEffect(() => {
+    if (demoMode || !activeSessionId) return;
+    const runningMessage = getRunningAssistantMessage(messages);
+    if (!runningMessage?.pendingRequestId) return;
+
+    let stopped = false;
+    const refreshPendingTurn = async () => {
+      try {
+        const d = await api.getSessionMessages(activeSessionId);
+        if (stopped) return;
+        const nextMessages = hydrateAgentMessages(d.messages);
+        const stillRunning = getRunningAssistantMessage(nextMessages);
+        setMessages(nextMessages);
+        if (stillRunning?.pendingRequestId) {
+          activeRequestIdRef.current = stillRunning.pendingRequestId;
+          setIsThinking(true);
+          setStreaming(true);
+          return;
+        }
+        activeRequestIdRef.current = null;
+        setIsThinking(false);
+        setStreaming(false);
+        localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+        api.listSessions().then(d2 => setSessions(d2.sessions)).catch(() => {});
+      } catch {
+        // Keep the visible pending state. A later poll or manual refresh can
+        // recover the finalized assistant turn.
+      }
+    };
+
+    const timer = window.setInterval(refreshPendingTurn, 2500);
+    refreshPendingTurn();
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [activeSessionId, demoMode, messages]);
 
   // Fix 1: Auto-scroll only when user hasn't scrolled up
   React.useEffect(() => {
@@ -1357,8 +1451,18 @@ export default function GodModePage() {
     }
 
     try {
+      let requestSessionId = activeSessionId ?? liveSessionIdRef.current;
+      if (!requestSessionId) {
+        const created = await api.createSession();
+        requestSessionId = created.session.id;
+        liveSessionIdRef.current = requestSessionId;
+        pendingSessionIdRef.current = requestSessionId;
+        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId }));
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+      }
+
       await streamAgentQuery(
-        queryText, activeSessionId ?? liveSessionIdRef.current, null, null, file, isDeepDive,
+        queryText, requestSessionId, null, null, file, isDeepDive,
         token => {
           if (typeof token === 'string') {
             setIsThinking(false);
@@ -1390,7 +1494,7 @@ export default function GodModePage() {
             pendingSessionIdRef.current = null;
           }
           liveSessionIdRef.current = null;
-          localStorage.removeItem('marty_pending');
+          localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
           window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
           api.listSessions().then(d => setSessions(d.sessions));
           setTimeout(() => {
@@ -1418,7 +1522,7 @@ export default function GodModePage() {
             pendingSessionIdRef.current = null;
           }
           liveSessionIdRef.current = null;
-          localStorage.removeItem('marty_pending');
+          localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
           window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
         },
         (event: any) => {
@@ -1427,7 +1531,7 @@ export default function GodModePage() {
             if (!activeSessionId) {
               pendingSessionIdRef.current = event.session_id;
             }
-            localStorage.setItem('marty_pending', JSON.stringify({ sessionId: event.session_id }));
+            localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: event.session_id }));
             window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
             return;
           }
@@ -1500,7 +1604,7 @@ export default function GodModePage() {
         pendingSessionIdRef.current = null;
       }
       liveSessionIdRef.current = null;
-      localStorage.removeItem('marty_pending');
+      localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
       window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
     }
   };
@@ -1926,24 +2030,44 @@ export default function GodModePage() {
                 />
               </label>
 
-              {/* MAX mode toggle */}
-              <button
-                onClick={() => setDeepDive(d => !d)}
-                aria-pressed={deepDive}
-                aria-label={deepDive ? 'Turn off MAX mode' : 'Turn on MAX mode'}
-                title={`MAX mode — maximum sweep across all data (${maxModeShortcut})`}
-                className="w-9 h-9 flex items-center justify-center rounded-lg shrink-0 transition-all"
-                style={{
-                  color: deepDive ? '#A855F7' : 'rgba(255,255,255,0.4)',
-                  background: deepDive ? 'rgba(168,85,247,0.15)' : 'transparent',
-                  boxShadow: deepDive ? '0 0 12px rgba(168,85,247,0.3)' : 'none',
-                }}
+              {/* MARTy mode — explicit, persisted choice */}
+              <div
+                className="relative shrink-0"
+                title={`MARTy mode. Fast is concise; MAX performs the widest data sweep (${maxModeShortcut}).`}
               >
-                <span className="relative flex h-5 w-5 items-center justify-center" aria-hidden="true">
-                  <Search size={18} strokeWidth={2.25} />
-                  <Plus size={9} strokeWidth={3} className="absolute -right-0.5 -top-0.5" />
-                </span>
-              </button>
+                <Search
+                  size={15}
+                  strokeWidth={2.25}
+                  className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2"
+                  style={{ color: deepDive ? '#A855F7' : 'rgba(255,255,255,0.48)' }}
+                />
+                <select
+                  value={martyMode}
+                  onChange={e => setMartyMode(e.target.value === 'max' ? 'max' : 'fast')}
+                  aria-label="MARTy mode"
+                  className="h-9 appearance-none rounded-lg border outline-none transition-all"
+                  style={{
+                    width: 92,
+                    paddingLeft: 31,
+                    paddingRight: 26,
+                    fontFamily: "'DM Sans', sans-serif",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    color: deepDive ? '#D8B4FE' : 'rgba(255,255,255,0.76)',
+                    background: deepDive ? 'rgba(168,85,247,0.14)' : 'rgba(255,255,255,0.04)',
+                    borderColor: deepDive ? 'rgba(168,85,247,0.38)' : 'rgba(255,255,255,0.08)',
+                    boxShadow: deepDive ? '0 0 12px rgba(168,85,247,0.18)' : 'none',
+                  }}
+                >
+                  <option value="fast">Fast</option>
+                  <option value="max">MAX</option>
+                </select>
+                <ChevronDown
+                  size={13}
+                  className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2"
+                  style={{ color: 'rgba(255,255,255,0.42)' }}
+                />
+              </div>
 
               {/* Textarea — flex-1, auto-resizes */}
               <textarea
@@ -1952,7 +2076,10 @@ export default function GodModePage() {
                 onChange={handleInputChange}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); }
-                  if (e.key === 'd' && (e.metaKey || e.ctrlKey) && e.shiftKey) { e.preventDefault(); setDeepDive(d => !d); }
+                  if (e.key === 'd' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
+                    e.preventDefault();
+                    setMartyMode(mode => mode === 'max' ? 'fast' : 'max');
+                  }
                 }}
                 placeholder={deepDive ? 'MAX mode — sweeping across everything...' : placeholderText}
                 onBlur={() => {

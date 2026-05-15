@@ -673,6 +673,43 @@ export async function listSessions(
   return jsonResponse({ sessions: rows.results });
 }
 
+export async function createSession(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  let contextEntityType: string | null = null;
+  let contextEntityId: string | null = null;
+  try {
+    const body = await parseJsonBody<any>(request);
+    contextEntityType = typeof body?.context_entity_type === 'string' ? body.context_entity_type : null;
+    contextEntityId = typeof body?.context_entity_id === 'string' ? body.context_entity_id : null;
+  } catch {
+    // Empty bodies are allowed; this endpoint mostly exists so the client can
+    // create a durable chat target before handing a turn to the stream.
+  }
+
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  await env.D1.prepare(
+    `INSERT INTO agent_sessions (id, org_id, user_id, context_entity_type, context_entity_id, turn_count, last_activity_at, created_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
+  ).bind(id, ctx.orgId, ctx.userId, contextEntityType, contextEntityId, now, now).run();
+
+  return jsonResponse({
+    session: {
+      id,
+      org_id: ctx.orgId,
+      user_id: ctx.userId,
+      context_entity_type: contextEntityType,
+      context_entity_id: contextEntityId,
+      turn_count: 0,
+      last_activity_at: now,
+      created_at: now,
+    },
+  });
+}
+
 export async function getSessionMessages(
   id: string,
   ctx: AuthContext,
@@ -953,18 +990,60 @@ export async function queryAgent(
     }
   }
 
+  const turnIndex = session.turn_count;
+
+  // ---- Wave-1 cancellation: per-request AbortController ----
+  // Create this before retrieval so the durable placeholder can expose a
+  // cancellation handle even if the user navigates away before streaming starts.
+  const requestId = crypto.randomUUID();
+  const cancelController = registerActiveRequest(requestId);
+
+  // --- Per-session attachment replay (Approach A + 50 MB cap) ---
+  const sessionAttachments = await assembleSessionAttachments(session.id, ctx.userId, env);
+  // Filter the summaries down to only the uploads referenced by this turn —
+  // those are what we render under the user message bubble. Aged-out and
+  // older session attachments still ride along in `sessionAttachments` for
+  // the model's benefit, but the message bubble shouldn't be cluttered with
+  // them.
+  const turnAttachments: UploadSummary[] = uploadIds.length > 0
+    ? sessionAttachments.summaries.filter(s => uploadIds.includes(s.id))
+    : [];
+  const attachmentsJson = turnAttachments.length > 0 ? JSON.stringify(turnAttachments) : '[]';
+
+  // Save the user turn before expensive retrieval/model work. That makes the
+  // chat durable the moment the backend accepts the turn, so navigating away
+  // no longer leaves the conversation invisible.
+  const userMessageId = crypto.randomUUID();
+  await env.D1.prepare(
+    `INSERT INTO agent_messages (id, session_id, turn_index, role, content, attachments, created_at)
+     VALUES (?, ?, ?, 'user', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+  ).bind(userMessageId, session.id, turnIndex, query, attachmentsJson).run();
+
+  // Persist a durable assistant placeholder before retrieval starts. If the
+  // user navigates away, the session can still show that MARTy is working and
+  // can poll this row until it is finalized by the waitUntil capture path.
+  const assistantMessageId = crypto.randomUUID();
+  await env.D1.prepare(
+    `INSERT INTO agent_messages (id, session_id, turn_index, role, content, metadata, created_at)
+     VALUES (?, ?, ?, 'assistant', '', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+  ).bind(
+    assistantMessageId,
+    session.id,
+    turnIndex + 1,
+    JSON.stringify({ status: 'running', request_id: requestId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
+  ).run();
+
   // --- Pre-process query & retrieve RAG context ---
   const t0 = Date.now();
-  const pq = await preprocessQuery(query, session, env, retrievalOptions);
-
-  if (session.context_entity_id && !pq.entityIds.includes(session.context_entity_id)) {
-    pq.entityIds.push(session.context_entity_id);
-  }
-
+  let pq: Awaited<ReturnType<typeof preprocessQuery>>;
   let internal: any[];
   let news: any[];
   let stats: { emails: number; meetings: number; documents: number; contacts: number; companies: number } | undefined;
   try {
+    pq = await preprocessQuery(query, session, env, retrievalOptions);
+    if (session.context_entity_id && !pq.entityIds.includes(session.context_entity_id)) {
+      pq.entityIds.push(session.context_entity_id);
+    }
     const result = await retrieveContext(pq, env, retrievalOptions);
     internal = result.internal;
     news = result.news;
@@ -973,27 +1052,17 @@ export async function queryAgent(
     const errMsg = String(e?.message || e);
     console.error('[agent] retrieval failed:', errMsg);
 
-    // Persist a friendly assistant message so the session doesn't show a hanging user turn.
-    // We've already saved the user's turn (or are about to); record the assistant side here
-    // before returning so reloads show a complete exchange.
-    const userTurnIndex = session.turn_count;
-    const assistantTurnIndex = session.turn_count + 1;
-    const userMessageId = crypto.randomUUID();
-    const assistantMessageId = crypto.randomUUID();
     await env.D1.prepare(
-      `INSERT INTO agent_messages (id, session_id, turn_index, role, content, created_at)
-       VALUES (?, ?, ?, 'user', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-    ).bind(userMessageId, session.id, userTurnIndex, query).run().catch(() => {});
-    await env.D1.prepare(
-      `INSERT INTO agent_messages (id, session_id, turn_index, role, content, metadata, created_at)
-       VALUES (?, ?, ?, 'assistant', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+      `UPDATE agent_messages SET content = ?, metadata = ? WHERE id = ?`
     ).bind(
-      assistantMessageId,
-      session.id,
-      assistantTurnIndex,
       'I ran into a problem retrieving context for that question. Try again, or rephrase.',
-      JSON.stringify({ retrieval_failed: true, deep_dive: deepDive, error: errMsg, runtime_fingerprint: runtimeFingerprint })
+      JSON.stringify({ status: 'error', retrieval_failed: true, request_id: requestId, deep_dive: deepDive, error: errMsg, runtime_fingerprint: runtimeFingerprint }),
+      assistantMessageId
     ).run().catch(() => {});
+    await env.D1.prepare(
+      `UPDATE agent_sessions SET turn_count = turn_count + 2, last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+    ).bind(session.id).run().catch(() => {});
+    unregisterRequest(requestId);
 
     // Defense-in-depth refund: even though we moved the increment to post-retrieval,
     // any future code path that increments earlier still gets refunded here.
@@ -1024,8 +1093,8 @@ export async function queryAgent(
   // fill remaining token budget with older context.
   const MIN_RECENT_MESSAGES = 6;
   const historyMsgs = await env.D1.prepare(
-    'SELECT role, content, turn_index FROM agent_messages WHERE session_id = ? ORDER BY turn_index DESC LIMIT 20'
-  ).bind(session.id).all<{ role: string; content: string; turn_index: number }>();
+    'SELECT role, content, turn_index FROM agent_messages WHERE session_id = ? AND turn_index < ? ORDER BY turn_index DESC LIMIT 20'
+  ).bind(session.id, turnIndex).all<{ role: string; content: string; turn_index: number }>();
 
   const allHistory = historyMsgs.results.reverse();
   const recentCount = Math.min(MIN_RECENT_MESSAGES, allHistory.length);
@@ -1062,8 +1131,6 @@ export async function queryAgent(
     { deepDive }
   );
 
-  // --- Per-session attachment replay (Approach A + 50 MB cap) ---
-  const sessionAttachments = await assembleSessionAttachments(session.id, ctx.userId, env);
   const userText = `${contextBlock}\n\n--- QUERY ---\n${query}`;
   if (sessionAttachments.contentBlocks.length > 0) {
     // Multi-block content: PDFs/images/text-extracted attachments first, then
@@ -1079,48 +1146,50 @@ export async function queryAgent(
     messages.push({ role: 'user', content: userText });
   }
 
-  // --- Save user turn ---
-  const turnIndex = session.turn_count;
-  const userMessageId = crypto.randomUUID();
-  // Filter the summaries down to only the uploads referenced by this turn —
-  // those are what we render under the user message bubble. Aged-out and
-  // older session attachments still ride along in `sessionAttachments` for
-  // the model's benefit, but the message bubble shouldn't be cluttered with
-  // them.
-  const turnAttachments: UploadSummary[] = uploadIds.length > 0
-    ? sessionAttachments.summaries.filter(s => uploadIds.includes(s.id))
-    : [];
-  const attachmentsJson = turnAttachments.length > 0 ? JSON.stringify(turnAttachments) : '[]';
-  await env.D1.prepare(
-    `INSERT INTO agent_messages (id, session_id, turn_index, role, content, attachments, created_at)
-     VALUES (?, ?, ?, 'user', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-  ).bind(userMessageId, session.id, turnIndex, query, attachmentsJson).run();
-
   // --- Stream Claude response with tool use ---
   let systemPrompt = buildMartyBaseSystemPrompt(ctx, new Date());
   if (deepDive) systemPrompt += buildMartyMaxModePrompt(stats);
 
-  // ---- Wave-1 cancellation: per-request AbortController ----
-  // Generated server-side and emitted to the client as the first stream
-  // event so the client can POST /api/agent/cancel with this ID. Same-isolate
-  // cancellation is sub-50ms; cross-isolate falls back to the KV marker.
-  const requestId = crypto.randomUUID();
-  const cancelController = registerActiveRequest(requestId);
-
-  const stream = await callClaudeStreaming(
-    {
-      system: systemPrompt,
-      messages,
-      model: deepDive ? (env.MARTY_MAX_MODEL || MAX_MODE_MODEL) : undefined,
-      max_tokens: deepDive ? MAX_MODE_LIMITS.outputTokens : NORMAL_MODE_LIMITS.outputTokens,
-      fallbackMaxTokens: deepDive ? MAX_MODE_LIMITS.fallbackOutputTokens : undefined,
-      maxIterations: deepDive ? MAX_MODE_LIMITS.toolIterations : NORMAL_MODE_LIMITS.toolIterations,
-      tools: AGENT_TOOLS,
-      onToolCall: (name, input) => executeTool(name, input, ctx, env, { deepDive }),
-      signal: cancelController.signal,
-    },
-    env
-  );
+  let stream: ReadableStream<Uint8Array>;
+  try {
+    stream = await callClaudeStreaming(
+      {
+        system: systemPrompt,
+        messages,
+        model: deepDive ? (env.MARTY_MAX_MODEL || MAX_MODE_MODEL) : undefined,
+        max_tokens: deepDive ? MAX_MODE_LIMITS.outputTokens : NORMAL_MODE_LIMITS.outputTokens,
+        fallbackMaxTokens: deepDive ? MAX_MODE_LIMITS.fallbackOutputTokens : undefined,
+        maxIterations: deepDive ? MAX_MODE_LIMITS.toolIterations : NORMAL_MODE_LIMITS.toolIterations,
+        tools: AGENT_TOOLS,
+        onToolCall: (name, input) => executeTool(name, input, ctx, env, { deepDive }),
+        signal: cancelController.signal,
+      },
+      env
+    );
+  } catch (e: any) {
+    unregisterRequest(requestId);
+    await env.D1.prepare(
+      `UPDATE agent_messages SET content = ?, metadata = ? WHERE id = ?`
+    ).bind(
+      'I ran into a problem starting that MARTy response. Try again, or rephrase.',
+      JSON.stringify({
+        status: 'error',
+        request_id: requestId,
+        runtime_fingerprint: runtimeFingerprint,
+        deep_dive: deepDive,
+        error: String(e?.message || e),
+      }),
+      assistantMessageId
+    ).run().catch(() => {});
+    await env.D1.prepare(
+      `UPDATE agent_sessions SET turn_count = turn_count + 2, last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+    ).bind(session.id).run().catch(() => {});
+    return jsonResponse({
+      error: 'Generation failed',
+      message: 'I ran into a problem starting that MARTy response. Try again, or rephrase.',
+      retryable: true,
+    }, 500);
+  }
 
   // Tee stream to capture full response
   const [rawClientStream, captureStream] = stream.tee();
@@ -1239,27 +1308,33 @@ export async function queryAgent(
         });
       }
 
-      const persistedContent = normalizeMartySentenceSpacing(strippedContent);
-      let assistantMessageId: string | null = null;
-      if (persistedContent) {
-        assistantMessageId = crypto.randomUUID();
-        const sourcesJson = sources.length > 0 ? JSON.stringify(sources) : null;
-        const metadataObj: Record<string, any> = { runtime_fingerprint: runtimeFingerprint };
-        if (cancelled) metadataObj.cancelled = true;
-        if (invalidCitationsStripped > 0) {
-          metadataObj.invalid_citations_stripped = invalidCitationsStripped;
-        }
-        if (documentCards.length > 0) {
-          metadataObj.document_cards = documentCards;
-        }
-        const metadataJson = Object.keys(metadataObj).length > 0 ? JSON.stringify(metadataObj) : null;
-        await env.D1.prepare(
-          `INSERT INTO agent_messages (id, session_id, turn_index, role, content, sources_json, metadata, created_at)
-           VALUES (?, ?, ?, 'assistant', ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-        ).bind(assistantMessageId, session.id, turnIndex + 1, persistedContent, sourcesJson, metadataJson).run();
-        if (documentCards.length > 0) {
-          await linkDocumentCardsToMessage(documentCards, assistantMessageId, ctx, env);
-        }
+      const persistedContent = normalizeMartySentenceSpacing(
+        strippedContent || (
+          cancelled
+            ? '_(cancelled before MARTy started generating)_'
+            : 'Something went wrong — no response was received. Please try again.'
+        )
+      );
+      const sourcesJson = sources.length > 0 ? JSON.stringify(sources) : null;
+      const metadataObj: Record<string, any> = {
+        status: cancelled ? 'cancelled' : (fullText || documentCards.length > 0 ? 'done' : 'error'),
+        request_id: requestId,
+        runtime_fingerprint: runtimeFingerprint,
+        deep_dive: deepDive,
+      };
+      if (cancelled) metadataObj.cancelled = true;
+      if (invalidCitationsStripped > 0) {
+        metadataObj.invalid_citations_stripped = invalidCitationsStripped;
+      }
+      if (documentCards.length > 0) {
+        metadataObj.document_cards = documentCards;
+      }
+      const metadataJson = JSON.stringify(metadataObj);
+      await env.D1.prepare(
+        `UPDATE agent_messages SET content = ?, sources_json = ?, metadata = ? WHERE id = ?`
+      ).bind(persistedContent, sourcesJson, metadataJson, assistantMessageId).run();
+      if (documentCards.length > 0) {
+        await linkDocumentCardsToMessage(documentCards, assistantMessageId, ctx, env);
       }
       // Free the in-isolate controller entry (KV marker ages out on its own).
       unregisterRequest(requestId);

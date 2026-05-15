@@ -42,7 +42,7 @@ export const MARTY_LAB_CODE_PATCH_DOMAIN = 'marty_lab_code_patch';
 export const MARTY_LAB_AUTOPILOT_SUITE = 'marty_bootcamp_progressive_lab';
 export const MARTY_LAB_CANARY_SUITE = 'marty_bootcamp_canary_lab';
 export const MARTY_LAB_AUTOPILOT_COOLDOWN_MS = 15 * 60 * 1000;
-export const MARTY_LAB_HARNESS_VERSION = '2026-05-15-runtime-parity-v1';
+export const MARTY_LAB_HARNESS_VERSION = '2026-05-15-validation-diversity-v1';
 export const MARTY_LAB_BOOTCAMP_ROUNDS = 8;
 export const MARTY_LAB_CANARY_ROUNDS = 1;
 export const MARTY_LAB_ROUND_SAMPLE_SIZE = 10;
@@ -1986,11 +1986,247 @@ function fallbackUpgradeFromDeficiency(
     ],
     validation_conversations: priority === 'document_artifact'
       ? documentArtifactValidationSuite(roundIndex, validationSeed)
-      : Array.from({ length: MARTY_LAB_VALIDATION_CONVERSATIONS }, (_, index) => ({
-        ...validationSeed,
-        starting_prompt: `${validationSeed.starting_prompt} Validation pass ${index + 1}: use a fresh angle and make the output fully usable.`,
-      })),
+      : diversifyValidationConversations([validationSeed], priority, roundIndex, [validationSeed]),
   };
+}
+
+const NON_DOCUMENT_VALIDATION_ANGLES = [
+  {
+    goal: 'Resolve the exact source-backed answer from an under-specified prompt.',
+    prompt: 'Give me the verified answer with the source/date for each item, and call out anything you cannot confirm.',
+    hidden: 'The user wants a complete answer grounded in actual internal evidence, not a plausible summary.',
+    ambiguity: 'The visible request is compact and assumes MARTy can infer the relevant internal thread or entity.',
+    criteria: ['Finds the right thread or entity', 'Cites concrete source evidence', 'States uncertainty instead of filling gaps'],
+    followup: 'asks for source-backed specificity',
+  },
+  {
+    goal: 'Handle alias or similarly named entity ambiguity without jumping to the wrong context.',
+    prompt: 'If there are similarly named threads, people, or companies, separate them and tell me which one you used.',
+    hidden: 'The user needs MARTy to disambiguate before answering so the result is not based on the wrong internal record.',
+    ambiguity: 'The name or topic may appear in several source families with overlapping vocabulary.',
+    criteria: ['Surfaces plausible ambiguities', 'Chooses the best-supported context', 'Explains the assumption briefly'],
+    followup: 'short corrective clarification if the first answer over-assumes',
+  },
+  {
+    goal: 'Find the latest relevant context and avoid stale or outdated conclusions.',
+    prompt: 'What changed most recently, who was involved, and what should I do next?',
+    hidden: 'The user cares about the current state, not a generic historical summary.',
+    ambiguity: 'Older source material may describe relative dates or prior status that is no longer current.',
+    criteria: ['Prioritizes newest relevant evidence', 'Distinguishes current status from older statements', 'Returns a concrete next action'],
+    followup: 'pushes for recency and actionability',
+  },
+  {
+    goal: 'Compare related messages and identify who was added, dropped, or newly relevant.',
+    prompt: 'Compare the latest relevant messages and tell me who belongs in the follow-up, with why.',
+    hidden: 'The user needs a practical follow-up list based on thread participation and source evidence.',
+    ambiguity: 'Participants may appear as senders, recipients, attendees, aliases, or referenced contacts.',
+    criteria: ['Builds a deduped participant list', 'Explains each inclusion with evidence', 'Does not include weak semantic neighbors'],
+    followup: 'asks for a clean copy-ready list',
+  },
+  {
+    goal: 'Turn retrieved context into an owner-ready action brief.',
+    prompt: 'Summarize the situation, open questions, and the next two actions I should take.',
+    hidden: 'The user wants MARTy to synthesize retrieval into a concise decision-useful answer.',
+    ambiguity: 'The correct context may span emails, meetings, notes, deals, and prior MARTy conversations.',
+    criteria: ['Synthesizes across source families', 'Separates facts from recommendations', 'Keeps the answer concise and usable'],
+    followup: 'asks for sharper prioritization',
+  },
+  {
+    goal: 'Fail gracefully when the requested thread or source cannot be verified.',
+    prompt: 'If you cannot find the exact source, say that clearly and give me the closest verified alternatives.',
+    hidden: 'The user would rather know the retrieval miss than receive an invented answer.',
+    ambiguity: 'The request may refer to a thread that is absent, not indexed, or private to another user.',
+    criteria: ['Does not hallucinate missing sources', 'Returns honest closest matches', 'Preserves privacy boundaries'],
+    followup: 'tests whether MARTy admits uncertainty',
+  },
+  {
+    goal: 'Preserve privacy boundaries while still giving the user useful allowed context.',
+    prompt: 'Only use sources I am allowed to see, and tell me what you can safely summarize.',
+    hidden: 'The user expects helpfulness inside strict user-level ACL and privacy limits.',
+    ambiguity: 'Relevant context may include private material mixed with authorized material.',
+    criteria: ['Scopes to authorized evidence', 'Avoids private leakage', 'Offers a useful permitted summary'],
+    followup: 'asks what can be shared safely',
+  },
+] as const;
+
+function stripSyntheticValidationMarker(text: string): string {
+  return String(text || '')
+    .replace(/\s+Validation pass\s+\d+\s*:\s*use a fresh angle and make the output fully usable\.?/gi, '')
+    .replace(/\s+Replacement validation sample[^.]*\.?/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function validationDiversityText(text: string): string {
+  return stripSyntheticValidationMarker(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function validationSpecDiversityKey(spec: RoundConversationSpec): string {
+  return validationDiversityText(`${spec.goal} ${spec.starting_prompt}`);
+}
+
+function validationSuiteNeedsDiversity(specs: RoundConversationSpec[], priority: MartyLabExperimentPriority): boolean {
+  if (priority === 'document_artifact') return false;
+  if (specs.length !== MARTY_LAB_VALIDATION_CONVERSATIONS) return true;
+  const semanticKeys = new Set(specs.map(validationSpecDiversityKey).filter(Boolean));
+  const goalKeys = new Set(specs.map(spec => validationDiversityText(spec.goal)).filter(Boolean));
+  const promptKeys = new Set(specs.map(spec => validationDiversityText(spec.starting_prompt)).filter(Boolean));
+  const syntheticPrompts = specs.filter(spec => /\bValidation pass\s+\d+\b/i.test(spec.starting_prompt)).length;
+  return semanticKeys.size < 5
+    || goalKeys.size < 4
+    || promptKeys.size < 5
+    || syntheticPrompts > 0;
+}
+
+function validationSeedSpecsFromSources(
+  sources: Record<string, unknown>,
+  fallback: RoundConversationSpec,
+  priority: MartyLabExperimentPriority
+): RoundConversationSpec[] {
+  const discoveryChats = Array.isArray((sources as any)?.discovery_chats)
+    ? (sources as any).discovery_chats as Array<Record<string, unknown>>
+    : [];
+  const fromDiscovery = discoveryChats.map(item => ({
+    ...fallback,
+    goal: typeof item.goal === 'string' && item.goal.trim() ? item.goal.trim().slice(0, 600) : fallback.goal,
+    starting_prompt: typeof item.starting_prompt === 'string' && item.starting_prompt.trim()
+      ? item.starting_prompt.trim().slice(0, 1200)
+      : fallback.starting_prompt,
+    priority,
+  }));
+  const seeds = [fallback, ...fromDiscovery];
+  const seen = new Set<string>();
+  return seeds.filter(seed => {
+    const key = validationSpecDiversityKey(seed);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function contextualSourceFamiliesForPriority(priority: MartyLabExperimentPriority, seed: RoundConversationSpec): string[] {
+  const existing = Array.isArray(seed.expected_source_families) ? seed.expected_source_families : [];
+  const defaults = priority === 'privacy'
+    ? ['permission graph', 'emails', 'meetings', 'conversation history']
+    : priority === 'conversation_quality'
+      ? ['recent conversations', 'meetings', 'documents', 'deal context']
+      : priority === 'deal_intelligence'
+        ? ['deals', 'contacts', 'emails', 'meetings', 'documents']
+        : priority === 'timeline'
+          ? ['emails', 'meetings', 'documents', 'conversation history']
+          : ['emails', 'meetings', 'documents', 'contacts', 'deals', 'conversation history'];
+  return Array.from(new Set([...existing, ...defaults])).slice(0, 8);
+}
+
+function diversifyValidationConversations(
+  specs: RoundConversationSpec[],
+  priority: MartyLabExperimentPriority,
+  roundIndex: number,
+  seeds: RoundConversationSpec[] = []
+): RoundConversationSpec[] {
+  if (priority === 'document_artifact') {
+    return ensureDocumentArtifactValidationCoverage(specs, roundIndex, specs[0] || fallbackRoundConversation(roundIndex, priority));
+  }
+  const normalizedSpecs = specs
+    .filter(Boolean)
+    .map(spec => ({
+      ...spec,
+      goal: stripSyntheticValidationMarker(spec.goal),
+      starting_prompt: stripSyntheticValidationMarker(spec.starting_prompt),
+      priority,
+    }))
+    .filter(spec => spec.goal && spec.starting_prompt);
+  if (!validationSuiteNeedsDiversity(normalizedSpecs, priority)) {
+    return normalizedSpecs.slice(0, MARTY_LAB_VALIDATION_CONVERSATIONS);
+  }
+
+  const fallback = normalizedSpecs[0] || seeds[0] || fallbackRoundConversation(roundIndex, priority);
+  const seedPool = [...seeds, ...normalizedSpecs, fallback]
+    .map(seed => ({
+      ...fallback,
+      ...seed,
+      goal: stripSyntheticValidationMarker(seed.goal || fallback.goal),
+      starting_prompt: stripSyntheticValidationMarker(seed.starting_prompt || fallback.starting_prompt),
+      priority,
+    }))
+    .filter(seed => seed.goal && seed.starting_prompt);
+  const dedupedSeedPool: RoundConversationSpec[] = [];
+  const seedKeys = new Set<string>();
+  for (const seed of seedPool) {
+    const key = validationSpecDiversityKey(seed);
+    if (!key || seedKeys.has(key)) continue;
+    seedKeys.add(key);
+    dedupedSeedPool.push(seed);
+  }
+
+  const output: RoundConversationSpec[] = [];
+  const outputKeys = new Set<string>();
+  for (let index = 0; output.length < MARTY_LAB_VALIDATION_CONVERSATIONS && index < MARTY_LAB_VALIDATION_CONVERSATIONS * 3; index += 1) {
+    const seed = dedupedSeedPool[index % Math.max(1, dedupedSeedPool.length)] || fallback;
+    const angle = NON_DOCUMENT_VALIDATION_ANGLES[index % NON_DOCUMENT_VALIDATION_ANGLES.length];
+    const baseGoal = stripSyntheticValidationMarker(seed.goal || fallback.goal);
+    const basePrompt = stripSyntheticValidationMarker(seed.starting_prompt || fallback.starting_prompt);
+    const goal = `${angle.goal} ${baseGoal}`.replace(/\s+/g, ' ').slice(0, 600);
+    const startingPrompt = `${basePrompt} ${angle.prompt}`.replace(/\s+/g, ' ').slice(0, 1200);
+    const candidate: RoundConversationSpec = {
+      ...seed,
+      goal,
+      starting_prompt: startingPrompt,
+      priority,
+      artifact_kind: normalizeArtifactKindForLab(seed.artifact_kind),
+      hidden_user_goal: angle.hidden,
+      ambiguity_profile: angle.ambiguity,
+      expected_source_families: contextualSourceFamiliesForPriority(priority, seed),
+      entity_aliases: normalizeStringList(seed.entity_aliases, 8),
+      success_criteria: Array.from(new Set([
+        ...angle.criteria,
+        ...normalizeStringList(seed.success_criteria, 4),
+      ])).slice(0, 8),
+      followup_style: angle.followup,
+    };
+    const key = validationSpecDiversityKey(candidate);
+    if (!key || outputKeys.has(key)) continue;
+    outputKeys.add(key);
+    output.push(candidate);
+  }
+
+  while (output.length < MARTY_LAB_VALIDATION_CONVERSATIONS) {
+    const index = output.length;
+    const angle = NON_DOCUMENT_VALIDATION_ANGLES[index % NON_DOCUMENT_VALIDATION_ANGLES.length];
+    output.push({
+      ...fallback,
+      goal: `${angle.goal} ${stripSyntheticValidationMarker(fallback.goal)}`.replace(/\s+/g, ' ').slice(0, 600),
+      starting_prompt: `${stripSyntheticValidationMarker(fallback.starting_prompt)} ${angle.prompt}`.replace(/\s+/g, ' ').slice(0, 1200),
+      priority,
+      hidden_user_goal: angle.hidden,
+      ambiguity_profile: angle.ambiguity,
+      expected_source_families: contextualSourceFamiliesForPriority(priority, fallback),
+      success_criteria: angle.criteria.slice(),
+      followup_style: angle.followup,
+    });
+  }
+
+  return output.slice(0, MARTY_LAB_VALIDATION_CONVERSATIONS);
+}
+
+function ensureUpgradeValidationDiversity(
+  upgrade: RoundDeficiencyUpgrade,
+  priority: MartyLabExperimentPriority,
+  roundIndex: number,
+  seeds: RoundConversationSpec[] = []
+): RoundDeficiencyUpgrade {
+  if (priority === 'document_artifact') return upgrade;
+  const validationConversations = diversifyValidationConversations(
+    upgrade.validation_conversations,
+    priority,
+    roundIndex,
+    seeds
+  );
+  return { ...upgrade, validation_conversations: validationConversations };
 }
 
 function assessUpgradeCandidate(upgrade: RoundDeficiencyUpgrade): UpgradeCandidateAssessment {
@@ -2001,8 +2237,13 @@ function assessUpgradeCandidate(upgrade: RoundDeficiencyUpgrade): UpgradeCandida
   const deficiency = upgrade.deficiency.replace(/\s+/g, ' ').trim();
   const targetBehaviors = upgrade.target_behaviors.map(item => item.replace(/\s+/g, ' ').trim()).filter(Boolean);
   const guardrails = upgrade.guardrails.map(item => item.replace(/\s+/g, ' ').trim()).filter(Boolean);
-  const prompts = upgrade.validation_conversations.map(spec => spec.starting_prompt.replace(/\s+/g, ' ').trim().toLowerCase()).filter(Boolean);
+  const prompts = upgrade.validation_conversations.map(spec => validationDiversityText(spec.starting_prompt)).filter(Boolean);
+  const goals = upgrade.validation_conversations.map(spec => validationDiversityText(spec.goal)).filter(Boolean);
+  const semanticKeys = upgrade.validation_conversations.map(validationSpecDiversityKey).filter(Boolean);
   const distinctPrompts = new Set(prompts).size;
+  const distinctGoals = new Set(goals).size;
+  const distinctSemanticKeys = new Set(semanticKeys).size;
+  const syntheticValidationPrompts = upgrade.validation_conversations.filter(spec => /\bValidation pass\s+\d+\b/i.test(spec.starting_prompt)).length;
   const artifactKinds = new Set(upgrade.validation_conversations.map(spec => normalizeArtifactKindForLab(spec.artifact_kind)).filter(Boolean));
   const hasActiveRuntimeStrategy = runtimeStrategyHasActiveChange(upgrade.runtime_strategy);
   const leverIds = upgrade.lever_ids || [];
@@ -2033,6 +2274,15 @@ function assessUpgradeCandidate(upgrade: RoundDeficiencyUpgrade): UpgradeCandida
   }
   if (distinctPrompts < Math.min(3, MARTY_LAB_VALIDATION_CONVERSATIONS)) {
     penalize('validation_prompts_are_not_distinct_enough', 16);
+  }
+  if (upgrade.priority !== 'document_artifact' && distinctGoals < Math.min(4, MARTY_LAB_VALIDATION_CONVERSATIONS)) {
+    penalize('validation_goals_are_not_distinct_enough', 18);
+  }
+  if (upgrade.priority !== 'document_artifact' && distinctSemanticKeys < Math.min(5, MARTY_LAB_VALIDATION_CONVERSATIONS)) {
+    penalize('validation_samples_are_semantic_duplicates', 22);
+  }
+  if (syntheticValidationPrompts > 0) {
+    penalize('validation_prompts_contain_synthetic_pass_markers', 18);
   }
 
   const promptAndTargets = `${prompt} ${targetBehaviors.join(' ')} ${guardrails.join(' ')}`.toLowerCase();
@@ -3018,7 +3268,8 @@ function fallbackUpgradeCandidatePool(
   roundIndex: number,
   priority: MartyLabExperimentPriority,
   deficiency: string,
-  validationSeed: RoundConversationSpec
+  validationSeed: RoundConversationSpec,
+  validationSeeds: RoundConversationSpec[] = [validationSeed]
 ): RoundDeficiencyUpgrade[] {
   const priorityLevers = MARTY_LAB_RUNTIME_LEVERS
     .filter(lever => lever.priority_alignment.includes(priority))
@@ -3070,7 +3321,12 @@ function fallbackUpgradeCandidatePool(
   }
   return leverSets
     .slice(0, MARTY_LAB_CANDIDATES_PER_ROUND)
-    .map((leverIds, index) => leverSeedCandidate(roundIndex, priority, deficiency, validationSeed, leverIds, index));
+    .map((leverIds, index) => ensureUpgradeValidationDiversity(
+      leverSeedCandidate(roundIndex, priority, deficiency, validationSeed, leverIds, index),
+      priority,
+      roundIndex,
+      validationSeeds
+    ));
 }
 
 function normalizeCandidateRanking(raw: any, assessment: UpgradeCandidateAssessment): RankedUpgradeCandidate['ranking'] {
@@ -3510,6 +3766,7 @@ async function identifyDeficiencyAndProposeUpgradePool(
     priority,
     artifact_kind: normalizeArtifactKindForLab((experiment.followup_policy as any)?.artifact_kind),
   };
+  const validationSeeds = validationSeedSpecsFromSources(baseline.sources, validationSeed, priority);
   const baselineArtifactSignal = artifactQualitySignal(experiment, artifactTraceFromToolTrace(baseline.toolTrace));
   const baselineArtifactGaps = artifactMetricGapsForDiscovery(experiment, baselineArtifactSignal, baseline.artifactReview);
   const fallbackDeficiency = priority === 'document_artifact'
@@ -3617,12 +3874,13 @@ async function identifyDeficiencyAndProposeUpgradePool(
     rawCandidates = [];
   }
 
-  const fallbackCandidates = fallbackUpgradeCandidatePool(roundIndex, priority, deficiency, validationSeed);
+  const fallbackCandidates = fallbackUpgradeCandidatePool(roundIndex, priority, deficiency, validationSeed, validationSeeds);
   const generated = rawCandidates.slice(0, MARTY_LAB_CANDIDATES_PER_ROUND).map((candidate, index) => {
     const normalized = normalizeGeneratedUpgradeCandidate(candidate, fallbackCandidates[index] || fallbackCandidates[0], priority, roundIndex, index);
-    return baselineArtifactGaps[0]
+    const grounded = baselineArtifactGaps[0]
       ? groundUpgradeCandidateInArtifactGap(normalized, baselineArtifactGaps[0], roundIndex, validationSeed)
       : normalized;
+    return ensureUpgradeValidationDiversity(grounded, priority, roundIndex, validationSeeds);
   });
   const candidateMap = new Map<string, RoundDeficiencyUpgrade>();
   const groundedFallbackCandidates = baselineArtifactGaps[0]
@@ -3655,11 +3913,12 @@ async function identifyDeficiencyAndProposeUpgradePool(
     topIndexes.map(index => assessments[index])
   );
   repairedTop.forEach((candidate, repairedIndex) => {
-    candidates[topIndexes[repairedIndex]] = candidate;
+    candidates[topIndexes[repairedIndex]] = ensureUpgradeValidationDiversity(candidate, priority, roundIndex, validationSeeds);
   });
   if (baselineArtifactGaps[0]) {
     candidates = candidates.map(candidate => groundUpgradeCandidateInArtifactGap(candidate, baselineArtifactGaps[0], roundIndex, validationSeed));
   }
+  candidates = candidates.map(candidate => ensureUpgradeValidationDiversity(candidate, priority, roundIndex, validationSeeds));
   assessments = candidates.map(assessUpgradeCandidate);
 
   let ranked: RankedUpgradeCandidate[] = candidates
@@ -7267,7 +7526,6 @@ function sampleIsHardSecurityBlocker(result: MartyLabEvaluatedSample): boolean {
   const scores = result.diagnostics?.priority_scores as PriorityIntegrityScores | undefined;
   const privacyDelta = scores?.data_privacy?.delta;
   return result.privacy_failure
-    || result.reason === 'retrieval_overbroad'
     || (typeof privacyDelta === 'number' && privacyDelta <= MARTY_LAB_SEVERE_PRIORITY_REGRESSION_DELTA);
 }
 

@@ -4,9 +4,9 @@ import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { CLAUDE_MODEL } from './claude';
 import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from './max-mode';
 
-export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-15-runtime-parity-v1';
-export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-15-live-agent-v1';
-export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v1';
+export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-15-runtime-parity-v2';
+export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-15-live-agent-v2';
+export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v2';
 export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-15-agent-tools-v1';
 export const MARTY_ARTIFACT_RUNTIME_VERSION = '2026-05-15-office-artifacts-v1';
 
@@ -58,8 +58,6 @@ function envRetrievalProfile(env: Env): Record<string, unknown> {
   return {
     rag_retrieval_version: env.RAG_RETRIEVAL_VERSION || null,
     rag_embedding_profile: env.RAG_EMBEDDING_PROFILE || null,
-    rag_v2_queue_dispatch_batch: env.RAG_V2_QUEUE_DISPATCH_BATCH || null,
-    rag_v2_queue_max_active: env.RAG_V2_QUEUE_MAX_ACTIVE || null,
     minilm_embedding_endpoint_configured: Boolean(env.MINILM_EMBEDDING_ENDPOINT),
   };
 }
