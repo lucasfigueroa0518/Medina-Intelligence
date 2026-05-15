@@ -8,7 +8,7 @@ import {
   X as XIcon, Pencil, Check, Copy, RefreshCw,
   Search, Database, Globe, FileText,
   CheckCircle2, AlertCircle, ChevronDown, ChevronRight,
-  BarChart3, Users, Newspaper, PenLine, List, Radar,
+  BarChart3, Users, Newspaper, PenLine, List,
 } from 'lucide-react';
 import { MartyEmblem } from '@/components/marty-emblem';
 import { CitationPill } from '@/components/citation-pill';
@@ -56,6 +56,16 @@ function useThinkingVerb(active: boolean) {
   }, [active]);
 
   return display;
+}
+
+function normalizeMartySentenceSpacing(text: string): string {
+  if (!text) return text;
+  const fixProse = (part: string) =>
+    part.replace(/([a-z0-9\]\)"'`*_])([.!?])([*_~`]*)(?=[A-Z])/g, '$1$2$3 ');
+  return text
+    .split(/(```[\s\S]*?```|`[^`\n]*`)/g)
+    .map(part => part.startsWith('`') ? part : fixProse(part))
+    .join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +935,7 @@ export default function GodModePage() {
   const [copiedMsgId, setCopiedMsgId] = React.useState<string | null>(null);
   const [placeholderText, setPlaceholderText] = React.useState('Ask MARTy anything...');
   const [deepDive, setDeepDive] = React.useState(false);
+  const deepDiveShortcut = typeof navigator !== 'undefined' && navigator.platform?.includes('Mac') ? '⌘⇧D' : 'Ctrl⇧D';
 
   // Fix 4: Explicit isThinking state — only cleared on first text token
   const [isThinking, setIsThinking] = React.useState(false);
@@ -1092,7 +1103,11 @@ export default function GodModePage() {
           setActiveSessionId(sessionId);
           api.getSessionMessages(sessionId).then(d => {
             setMessages(d.messages.map((m: any) => ({
-              id: m.id, role: m.role, content: m.content, timestamp: m.created_at, sources: m.sources || undefined,
+              id: m.id,
+              role: m.role,
+              content: m.role === 'assistant' ? normalizeMartySentenceSpacing(m.content) : m.content,
+              timestamp: m.created_at,
+              sources: m.sources || undefined,
             })));
             localStorage.removeItem('marty_pending');
             window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
@@ -1175,7 +1190,7 @@ export default function GodModePage() {
             return {
               id: m.id,
               role: m.role,
-              content: m.content,
+              content: m.role === 'assistant' ? normalizeMartySentenceSpacing(m.content) : m.content,
               timestamp: m.created_at,
               attachments: m.attachments || undefined,
               sources: m.sources || undefined,
@@ -1251,7 +1266,8 @@ export default function GodModePage() {
   }
 
   function handleCopyMessage(msgId: string, content: string) {
-    navigator.clipboard.writeText(content);
+    const role = messages.find(m => m.id === msgId)?.role;
+    navigator.clipboard.writeText(role === 'assistant' ? normalizeMartySentenceSpacing(content) : content);
     setCopiedMsgId(msgId);
     setTimeout(() => setCopiedMsgId(null), 2000);
   }
@@ -1315,7 +1331,6 @@ export default function GodModePage() {
     const file = attachedFile;
     const isDeepDive = deepDive;
     setAttachedFile(null);
-    setDeepDive(false);
     setPendingUploads([]);
 
     if (demoMode) {
@@ -1360,13 +1375,13 @@ export default function GodModePage() {
           setMessages(m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
             if (wasCancelled) {
-              const placeholder = msg.content || '_(cancelled before MARTy started generating)_';
+              const placeholder = normalizeMartySentenceSpacing(msg.content || '_(cancelled before MARTy started generating)_');
               return { ...msg, content: placeholder, streaming: false, cancelled: true };
             }
             if (!msg.content && (!msg.toolCalls || msg.toolCalls.length === 0)) {
               return { ...msg, content: 'Something went wrong — no response was received. Please try again.', streaming: false, error: true };
             }
-            return { ...msg, streaming: false, justFinished: true };
+            return { ...msg, content: normalizeMartySentenceSpacing(msg.content), streaming: false, justFinished: true };
           }));
           setStreaming(false);
           if (pendingSessionIdRef.current) {
@@ -1768,7 +1783,7 @@ export default function GodModePage() {
                         <div className={`border-l-2 ${m.cancelled ? 'border-text-muted/40' : 'border-[#8B5CF6]/30'} pl-4`}>
                           {!m.streaming && <TableOfContents content={m.content} />}
                           <MarkdownMessage
-                            content={m.streaming ? trimPartialCitation(m.content) : m.content}
+                            content={normalizeMartySentenceSpacing(m.streaming ? trimPartialCitation(m.content) : m.content)}
                             sources={m.sources}
                             onCitationClick={handleCitationClick(m.id)}
                           />
@@ -1914,7 +1929,9 @@ export default function GodModePage() {
               {/* Deep Dive toggle */}
               <button
                 onClick={() => setDeepDive(d => !d)}
-                title={`Deep Dive — exhaustive search across all data (${navigator.platform?.includes('Mac') ? '⌘' : 'Ctrl'}⇧D)`}
+                aria-pressed={deepDive}
+                aria-label={deepDive ? 'Turn off Deep Dive' : 'Turn on Deep Dive'}
+                title={`Deep Dive — exhaustive search across all data (${deepDiveShortcut})`}
                 className="w-9 h-9 flex items-center justify-center rounded-lg shrink-0 transition-all"
                 style={{
                   color: deepDive ? '#A855F7' : 'rgba(255,255,255,0.4)',
@@ -1922,7 +1939,10 @@ export default function GodModePage() {
                   boxShadow: deepDive ? '0 0 12px rgba(168,85,247,0.3)' : 'none',
                 }}
               >
-                <Radar size={18} />
+                <span className="relative flex h-5 w-5 items-center justify-center" aria-hidden="true">
+                  <Search size={18} strokeWidth={2.25} />
+                  <Plus size={9} strokeWidth={3} className="absolute -right-0.5 -top-0.5" />
+                </span>
               </button>
 
               {/* Textarea — flex-1, auto-resizes */}

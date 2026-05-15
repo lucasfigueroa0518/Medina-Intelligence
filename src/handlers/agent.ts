@@ -80,6 +80,16 @@ ACCESS BOUNDARY - LOAD-BEARING:
 - Owner-level users may see firm-wide private interactions. Members and admins should be treated as participant-scoped unless the retrieved SOURCES explicitly show otherwise.`;
 }
 
+function normalizeMartySentenceSpacing(text: string): string {
+  if (!text) return text;
+  const fixProse = (part: string) =>
+    part.replace(/([a-z0-9\]\)"'`*_])([.!?])([*_~`]*)(?=[A-Z])/g, '$1$2$3 ');
+  return text
+    .split(/(```[\s\S]*?```|`[^`\n]*`)/g)
+    .map(part => part.startsWith('`') ? part : fixProse(part))
+    .join('');
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions for Claude
 // ---------------------------------------------------------------------------
@@ -1251,7 +1261,7 @@ export async function queryAgent(
         });
       }
 
-      const persistedContent = strippedContent;
+      const persistedContent = normalizeMartySentenceSpacing(strippedContent);
       let assistantMessageId: string | null = null;
       if (persistedContent) {
         assistantMessageId = crypto.randomUUID();
