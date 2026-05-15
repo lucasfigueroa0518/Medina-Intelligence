@@ -159,6 +159,7 @@ export function resolveChannel(source: string, ctx: ChannelContext = {}): string
     case 'llm_extraction':
     case 'web_enrichment':
     case 'web_enrichment_company':
+    case 'fallback_web_search':
     case 'news_article':
       return CHANNEL.LLM_EXTRACTION_INBOX(ctx.userId || 'unknown');
 

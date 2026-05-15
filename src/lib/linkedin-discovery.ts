@@ -249,7 +249,9 @@ function buildSearchStrategies(
 export async function discoverLinkedInUrl(
   contact: DiscoveryContactInput,
   orgId: string,
-  env: Env
+  env: Env,
+  priority: 'high' | 'low' = 'low',
+  maxStrategies?: number
 ): Promise<LinkedInDiscoveryResult> {
   if (contact.linkedin_url?.trim()) {
     return { status: 'skipped', reason: 'already_has_url' };
@@ -277,29 +279,34 @@ export async function discoverLinkedInUrl(
   }
 
   // Rate limits
-  if (!(await checkGeminiRateLimit(env, orgId, 'low'))) {
+  if (!(await checkGeminiRateLimit(env, orgId, priority))) {
     return { status: 'skipped', reason: 'gemini_rate_limited' };
   }
   if (!(await checkEnrichmentRateLimit('gemini_linkedin', orgId, env))) {
     return { status: 'skipped', reason: 'enrichment_backoff' };
   }
 
-  const strategies = buildSearchStrategies(
+  const allStrategies = buildSearchStrategies(
     contact.full_name,
     companyName,
     emailDomain,
     derivedCompany,
     contact.job_title || null,
   );
+  const requestedLimit = typeof maxStrategies === 'number' && Number.isFinite(maxStrategies)
+    ? Math.floor(maxStrategies)
+    : allStrategies.length;
+  const strategyLimit = Math.max(1, Math.min(allStrategies.length, requestedLimit));
+  const strategies = allStrategies.slice(0, strategyLimit);
 
   console.log(
-    `[linkedin-discovery] ${contact.id}: trying ${strategies.length} strategies for "${contact.full_name}" (company=${companyName || 'none'} domain=${emailDomain || 'none'} derived=${derivedCompany || 'none'})`
+    `[linkedin-discovery] ${contact.id}: trying ${strategies.length}/${allStrategies.length} strategies for "${contact.full_name}" (company=${companyName || 'none'} domain=${emailDomain || 'none'} derived=${derivedCompany || 'none'})`
   );
 
   // Try each strategy; stop at first URL found
   for (const strategy of strategies) {
     // Check rate limit before each call — we may exhaust RPM partway through
-    if (!(await checkGeminiRateLimit(env, orgId, 'low'))) {
+    if (!(await checkGeminiRateLimit(env, orgId, priority))) {
       console.log(`[linkedin-discovery] ${contact.id}: rate limited after strategy "${strategy.label}"`);
       break;
     }
@@ -330,7 +337,7 @@ URL: https://www.linkedin.com/in/johndoe-a1b2c3d4`;
           max_tokens: 400,
           orgId,
         },
-        'low',
+        priority,
         env
       );
       response = result.text;
@@ -390,6 +397,6 @@ URL: https://www.linkedin.com/in/johndoe-a1b2c3d4`;
     console.log(`[linkedin-discovery] ${contact.id}: strategy "${strategy.label}" returned no URLs — trying next`);
   }
 
-  console.log(`[linkedin-discovery] ${contact.id}: all ${strategies.length} strategies exhausted — not found`);
+  console.log(`[linkedin-discovery] ${contact.id}: ${strategies.length}/${allStrategies.length} strategies exhausted — not found`);
   return { status: 'not_found' };
 }

@@ -457,6 +457,8 @@ async function routeAuthenticated(
   if (path === '/api/conversations' && method === 'GET') {
     return Conversations.listConversations(request, ctx, env);
   }
+  m = path.match(/^\/api\/conversations\/([^/]+)\/thread$/);
+  if (m && method === 'GET') return Conversations.getConversationThread(m[1], ctx, env);
   m = path.match(/^\/api\/conversations\/([^/]+)$/);
   if (m && method === 'GET') return Conversations.getConversation(m[1], ctx, env);
 
@@ -602,9 +604,9 @@ async function routeAuthenticated(
   m = path.match(/^\/api\/audit-log\/([^/]+)\/([^/]+)$/);
   if (m && method === 'GET') return AuditLog.getEntityHistory(m[1], m[2], ctx, env);
 
-  // Progressive Firefly backfill (Phase F2) — owner-gated inside the handler.
-  // Registered here above the /api/admin role check; the owner check inside
-  // the handler is what actually enforces authorization.
+  // Progressive Firefly backfill (Phase F2) — self-service inside the handler.
+  // Registered here above the /api/admin role check so members can view/start
+  // their own import while owners can still manage org members.
   if (path === '/api/admin/firefly-progressive-backfill' && method === 'POST') {
     const { handleFireflyProgressiveBackfill } = await import('./handlers/firefly-backfill');
     return handleFireflyProgressiveBackfill(request, ctx, env);
@@ -646,6 +648,10 @@ async function routeAuthenticated(
 
     if (path === '/api/admin/marty-lab' && method === 'GET')
       return MartyLab.getMartyLabStatus(ctx, env);
+    if (path === '/api/admin/marty-lab/readiness' && method === 'GET')
+      return MartyLab.getMartyLabReadiness(ctx, env);
+    if (path === '/api/admin/marty-lab/repair-readiness' && method === 'POST')
+      return MartyLab.repairMartyLabReadinessHandler(request, ctx, env);
     if (path === '/api/admin/marty-lab/runs' && method === 'POST')
       return MartyLab.startMartyLabRunHandler(request, ctx, env);
     m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)$/);
@@ -654,6 +660,15 @@ async function routeAuthenticated(
     m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)\/cancel$/);
     if (m && method === 'POST')
       return MartyLab.cancelMartyLabRunHandler(m[1], ctx, env);
+    m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)\/decision$/);
+    if (m && method === 'POST')
+      return MartyLab.decideMartyLabRunHandler(request, m[1], ctx, env);
+    m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)\/round-review$/);
+    if (m && method === 'POST')
+      return MartyLab.reviewInconclusiveMartyLabRoundHandler(request, m[1], ctx, env);
+    m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)\/deep-work\/([^/]+)\/code-patch$/);
+    if (m && method === 'POST')
+      return MartyLab.startMartyLabCodePatchJobHandler(request, m[1], m[2], ctx, env);
     m = path.match(/^\/api\/admin\/marty-lab\/runs\/([^/]+)\/experiments\/([^/]+)\/result$/);
     if (m && method === 'POST')
       return MartyLab.recordMartyLabExperimentResultHandler(request, m[1], m[2], ctx, env);
@@ -769,6 +784,16 @@ async function routeAuthenticated(
       return Admin.getEmbedQueueHealth(ctx, env);
     if (path === '/api/admin/process-embed-queue' && method === 'POST')
       return Admin.processEmbedQueue(ctx, env);
+    if (path === '/api/admin/rag-v2/backfill/start' && method === 'POST')
+      return Admin.startRagV2Backfill(request, ctx, env);
+    if (path === '/api/admin/rag-v2/backfill/status' && method === 'GET')
+      return Admin.getRagV2BackfillStatus(ctx, env);
+    if (path === '/api/admin/rag-v2/eval/run' && method === 'POST')
+      return Admin.runRagV2Eval(request, ctx, env);
+    if (path === '/api/admin/rag-v2/cutover' && method === 'POST')
+      return Admin.cutoverRagV2(request, ctx, env);
+    if (path === '/api/admin/rag-v2/rollback' && method === 'POST')
+      return Admin.rollbackRagV2(request, ctx, env);
     if (path === '/api/admin/recover-deal-conversation-links' && method === 'POST')
       return Admin.recoverDealConversationLinks(request, ctx, env);
     if (path === '/api/admin/progressive-backfill' && method === 'POST')
@@ -1020,46 +1045,14 @@ export async function handleScheduled(
           catch (e) { console.error(`firefly progressive backfill drive failed for ${org.id}:`, e); }
         })());
 
-        // Phase 5 1b (2026-05-05) — Universal Work Queue driver.
-        //
-        // Runs every minute tick. With Phase 5's empty handler registry
-        // this is a live skeleton: the watchdog sweep runs (cheap; one
-        // SELECT for in_progress + expired-lock rows; usually zero) and
-        // the per-handler loop is a no-op. First real work appears when
-        // Phase 5.1+ pilots a domain (e.g. embed_retry) by appending to
-        // WORK_QUEUE_HANDLERS in src/lib/work-queue-driver.ts.
-        //
-        // SUBREQUEST BUDGET when domains plug in:
-        //   • CF cap is 1000 subrequests per worker invocation. This
-        //     minute tick already spends ~5–10 subrequests on
-        //     enrichment + daily gates plus the two progressive-backfill
-        //     drivers above. Workflow creates and D1 reads here count
-        //     toward the same cap.
-        //   • Each registered domain handler must keep its per-tick
-        //     batch ≤ 10 items AND total subrequest spend ≤ ~50 to
-        //     leave headroom for sibling minute-tick work. Heavier
-        //     domains run on a less frequent cadence (handler.cadence
-        //     = 'hour' — advisory today; wired in 5.1+ when needed)
-        //     or chunk via next_attempt_at scheduling.
-        //   • The driver itself spends 1 D1 read (open-circuit set) +
-        //     1 UPDATE…RETURNING per domain claim + N writes per
-        //     processed item. Sweep is one SELECT plus one write per
-        //     reclaimed row. Stays well under the cap.
-        //
-        // waitUntil wraps the call so a slow tick doesn't block the
-        // sibling progressive drivers' completion. Errors are caught
-        // INSIDE processWorkQueueTick (per-handler isolation); the
-        // outer try/catch here is defensive against driver-level
-        // throws (e.g. import failure).
         // Phase 6.1 (2026-05-05): calendar refresh scheduler.
         //
-        // Runs BEFORE processWorkQueueTick in the same tick so freshly
-        // enqueued calendar refresh rows can be claimed and processed
-        // immediately. Scans calendar_progressive_backfill_windows
-        // for never-synced + stale-completed rows and enqueues
-        // work_queue rows with idempotency_key keyed on last_synced_at
-        // (so concurrent staleness scans collapse cleanly while a
-        // fresh refresh after sync completes generates a new key).
+        // Scans calendar_progressive_backfill_windows for never-synced +
+        // stale-completed rows and enqueues work_queue rows with an
+        // idempotency_key keyed on last_synced_at, so concurrent staleness
+        // scans collapse cleanly while a fresh refresh after sync completes
+        // generates a new key. The global work_queue drain runs once after
+        // the org loop below.
         //
         // Subrequest cost: 1 SELECT + up to ~30 enqueueWork calls per
         // user worst case (full bootstrap). Steady state with most
@@ -1078,10 +1071,22 @@ export async function handleScheduled(
 
         ctxExec.waitUntil((async () => {
           try {
-            const { processWorkQueueTick } = await import('./lib/work-queue-driver');
-            await processWorkQueueTick(env);
+            const { enqueueDueContactEnrichment } = await import('./lib/contact-enrichment-queue');
+            await enqueueDueContactEnrichment(org.id, env);
           } catch (e) {
-            console.error(`work-queue tick failed for ${org.id}:`, e);
+            console.error(`contact-enrichment enqueue failed for ${org.id}:`, e);
+          }
+        })());
+
+        ctxExec.waitUntil((async () => {
+          try {
+            const { dispatchRagV2QueueBurst } = await import('./lib/rag-v2-queue-drain');
+            const result = await dispatchRagV2QueueBurst(env, org.id);
+            if (result.dispatched > 0) {
+              console.log(`[rag-v2-queue] dispatched org=${org.id} count=${result.dispatched}`);
+            }
+          } catch (e) {
+            console.error(`rag-v2 queue dispatch failed for ${org.id}:`, e);
           }
         })());
 
@@ -1150,6 +1155,45 @@ export async function handleScheduled(
       console.error(`Cron dispatch failed for org ${org.id}:`, e);
     }
   }
+
+  if (cron === '* * * * *') {
+    // Universal work_queue is a global table/driver, not an org-scoped
+    // task. Run exactly once per minute tick after org-specific enqueuers
+    // have been scheduled. The task_runs idempotency key also collapses
+    // duplicate Cloudflare scheduled deliveries for the same minute; without
+    // that, two global claim passes can overrun handler concurrency caps.
+    ctxExec.waitUntil((async () => {
+      try {
+        const scheduledAt = Number.isFinite(event.scheduledTime)
+          ? event.scheduledTime
+          : Date.now();
+        const minuteStart = new Date(Math.floor(scheduledAt / 60_000) * 60_000).toISOString();
+        const { withTaskRun } = await import('./lib/task-runs');
+        const { processWorkQueueTick } = await import('./lib/work-queue-driver');
+        await withTaskRun(env, 'system', 'work_queue_tick', async (taskRun) => {
+          const result = await processWorkQueueTick(env);
+          const completed = result.per_domain.reduce((sum, d) => sum + d.completed, 0);
+          const failed = result.per_domain.reduce((sum, d) => sum + d.failed, 0);
+          taskRun.report({
+            items_processed: completed,
+            items_failed: failed,
+            items_skipped: result.swept,
+            metadata: {
+              swept: result.swept,
+              open_circuits: result.open_circuits,
+              per_domain: result.per_domain,
+            },
+          });
+          return result;
+        }, {
+          idempotencyKey: `work_queue_tick:${minuteStart}`,
+          initialMetadata: { cron, minute_start: minuteStart },
+        });
+      } catch (e) {
+        console.error('work-queue tick failed:', e);
+      }
+    })());
+  }
 }
 
 // --- Queue handler ---
@@ -1168,6 +1212,9 @@ export async function handleQueue(
 
   if (queueName === 'audit-log-queue') {
     await handleAuditBatch(batch as MessageBatch<AuditEvent>, env);
+  } else if (queueName === 'rag-reindex-v2-queue') {
+    const { handleRagV2QueueBatch } = await import('./lib/rag-v2-queue-drain');
+    await handleRagV2QueueBatch(batch as any, env);
   } else if (queueName === 'webhook-intake-queue') {
     await handleWebhookBatch(batch as MessageBatch<WebhookQueueMessage>, env);
   } else if (queueName === 'webhook-dlq') {

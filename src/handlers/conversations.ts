@@ -140,3 +140,126 @@ export async function getConversation(
 
   return jsonResponse({ conversation: out });
 }
+
+export async function getConversationThread(
+  id: string,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const [anchor, sharingFlags] = await Promise.all([
+    env.D1.prepare(
+      `SELECT c.*, sc.is_private AS slack_is_private
+       FROM conversations c
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
+       WHERE c.id = ? AND c.org_id = ?`
+    ).bind(id, ctx.orgId).first<any>(),
+    getSharingFlags(ctx.orgId, env),
+  ]);
+
+  if (!anchor) return errorResponse('CONVERSATION_NOT_FOUND', 404);
+
+  const rows = anchor.external_thread_id
+    ? await env.D1.prepare(
+      `SELECT c.*, sc.is_private AS slack_is_private
+       FROM conversations c
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
+       WHERE c.org_id = ? AND c.external_thread_id = ?
+       ORDER BY c.sent_at ASC`
+    ).bind(ctx.orgId, anchor.external_thread_id).all<any>()
+    : await env.D1.prepare(
+      `SELECT c.*, sc.is_private AS slack_is_private
+       FROM conversations c
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
+       WHERE c.id = ? AND c.org_id = ?
+       ORDER BY c.sent_at ASC`
+    ).bind(id, ctx.orgId).all<any>();
+
+  const readableRows = rows.results.filter((row: any) => canReadConversationContent(
+    {
+      source: row.source,
+      participant_user_ids: row.participant_user_ids,
+      is_campaign_email: row.is_campaign_email,
+      slack_is_private: row.slack_is_private,
+    } as any,
+    ctx.userId,
+    ctx.userRole,
+    sharingFlags
+  ));
+
+  if (readableRows.length === 0) return errorResponse('CONVERSATION_NOT_FOUND', 404);
+
+  const contactIds = Array.from(new Set(
+    readableRows.map((row: any) => row.from_contact_id).filter((v: unknown): v is string => typeof v === 'string' && v.length > 0)
+  ));
+  const contactsById = new Map<string, { full_name: string | null; email: string | null }>();
+  if (contactIds.length > 0) {
+    const placeholders = contactIds.map(() => '?').join(',');
+    const contacts = await env.D1.prepare(
+      `SELECT id, full_name, email FROM contacts
+       WHERE org_id = ? AND id IN (${placeholders}) AND deleted_at IS NULL`
+    ).bind(ctx.orgId, ...contactIds).all<{ id: string; full_name: string | null; email: string | null }>();
+    for (const contact of contacts.results) {
+      contactsById.set(contact.id, { full_name: contact.full_name, email: contact.email });
+    }
+  }
+
+  const messages = await Promise.all(readableRows.map(async (row: any) => {
+    let body: string | null = null;
+    if (row.body_r2_key) {
+      try {
+        const bodyObj = await env.R2.get(row.body_r2_key);
+        if (bodyObj) body = await bodyObj.text();
+      } catch {
+        body = null;
+      }
+    }
+    const contact = row.from_contact_id ? contactsById.get(row.from_contact_id) : undefined;
+    return {
+      id: row.id,
+      source: row.source,
+      external_message_id: row.external_message_id,
+      subject: row.subject,
+      sent_at: row.sent_at,
+      direction: row.direction,
+      from_name: contact?.full_name || null,
+      from_email: contact?.email || row.from_email || null,
+      body_preview: row.body_preview,
+      body,
+      has_attachments: !!row.has_attachments,
+    };
+  }));
+
+  const last = messages[messages.length - 1];
+  return jsonResponse({
+    thread: {
+      anchor_id: id,
+      external_thread_id: anchor.external_thread_id || null,
+      subject: last?.subject || anchor.subject || '(no subject)',
+      source: anchor.source,
+      message_count: messages.length,
+      last_sent_at: last?.sent_at || anchor.sent_at || null,
+      messages,
+    },
+  });
+}

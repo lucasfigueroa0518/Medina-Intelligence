@@ -1,7 +1,8 @@
 // TRD §7.1 Workflow B — Enrichment (every 60 min)
 import type { Env } from '../types/env';
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
-import { triggerContactEnrichment, triggerCompanyEnrichment } from '../lib/enrichment';
+import { triggerCompanyEnrichment } from '../lib/enrichment';
+import { enqueueDueContactEnrichment } from '../lib/contact-enrichment-queue';
 import { extractEnrichmentSignals } from '../lib/extraction';
 import {
   promoteToStandalone,
@@ -170,32 +171,26 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
       });
       console.log(`[EnrichmentWorkflow] pending companies: ${companies.length}`);
 
-      // Step 3: enrich in batches of 10
-      const contactBatches = chunkArray(contacts, 10);
-      for (let i = 0; i < contactBatches.length; i++) {
-        console.log(`[EnrichmentWorkflow] step → enrich-contacts-${i} (${contactBatches[i].length} contacts)`);
-        await trackedStep(
-          this.env,
-          step,
-          syncJobId,
-          `enrich-contacts-${i}`,
-          { retries: { limit: 2, delay: '30 seconds' } },
-          async () => {
-            for (let j = 0; j < contactBatches[i].length; j++) {
-              const cid = contactBatches[i][j];
-              try {
-                await triggerContactEnrichment(cid, org_id!, this.env);
-              } catch (e) {
-                console.error(`[EnrichmentWorkflow] contact enrich failed ${cid}: ${errMessage(e)}`);
-              }
-              if (j < contactBatches[i].length - 1) {
-                await new Promise(r => setTimeout(r, 2000));
-              }
-            }
-            return { status: 'completed', count: contactBatches[i].length };
-          }
-        );
-      }
+      // Step 3: enqueue contact enrichment as durable per-contact work.
+      // The work_queue handler owns execution, retries, rate-limit deferral,
+      // heartbeat/lock recovery, DLQ visibility, association updates, and
+      // cache invalidation. The workflow remains responsible for discovery
+      // and the lighter enrichment-adjacent maintenance steps below.
+      console.log(`[EnrichmentWorkflow] step → enqueue-contact-enrichment (${contacts.length} contacts)`);
+      const queuedContacts = await trackedStep(
+        this.env,
+        step,
+        syncJobId,
+        'enqueue-contact-enrichment',
+        async () => enqueueDueContactEnrichment(org_id!, this.env, {
+          limit: Math.max(contacts.length, Math.floor(maxPerCycle * 0.6)),
+          targetBacklog: Math.max(100, maxPerCycle * 2),
+          contactIds: contacts,
+        })
+      );
+      console.log(
+        `[EnrichmentWorkflow] contact enrichment queued inserted=${queuedContacts.inserted} existing=${queuedContacts.existing}`
+      );
 
       const companyBatches = chunkArray(companies, 10);
       for (let i = 0; i < companyBatches.length; i++) {
@@ -334,7 +329,9 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
         await flagStaleOrphanedEvents(org_id!, this.env);
       });
 
-      // Step 7: update associations for enriched contacts
+      // Step 7: update associations for contacts that were enriched by the
+      // queue handler. Kept as a cheap backstop for any contact that completed
+      // before this workflow reaches the maintenance phase.
       console.log('[EnrichmentWorkflow] step → update-associations');
       await trackedStep(this.env, step, syncJobId, 'update-associations', async () => {
         for (const cid of contacts) {
@@ -359,7 +356,7 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
           `UPDATE sync_jobs SET status = 'completed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
              items_processed = ?
            WHERE org_id = ? AND workflow_type = 'enrichment' AND status = 'running'`
-        ).bind(contacts.length + companies.length, org_id!).run();
+        ).bind((queuedContacts.inserted || 0) + companies.length, org_id!).run();
       });
 
       console.log('[EnrichmentWorkflow] run completed successfully');

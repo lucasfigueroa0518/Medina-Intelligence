@@ -303,7 +303,11 @@ async function loadAccessibleDocuments(
             extracted_text_preview, contact_id, company_id, deal_id, uploaded_by,
             visibility, participant_user_ids, parent_document_id, version_number, created_at
        FROM documents
-      WHERE org_id = ? AND deleted_at IS NULL AND id IN (${ph})`
+      WHERE org_id = ?
+        AND deleted_at IS NULL
+        AND processing_status != 'excluded'
+        AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1
+        AND id IN (${ph})`
   ).bind(ctx.orgId, ...uniqueIds).all<DocumentRow>();
   const sharingSet = await sharingSetFor(ctx, env);
   return rows.results.filter(doc => isDocumentAccessibleToUser(doc, ctx.userId, ctx.userRole, sharingSet));
@@ -320,7 +324,12 @@ async function searchDocumentsByTitle(
   const terms = tokenizeQuery(query);
   if (terms.length === 0) return [];
 
-  const where = ['d.org_id = ?', 'd.deleted_at IS NULL'];
+  const where = [
+    'd.org_id = ?',
+    'd.deleted_at IS NULL',
+    "d.processing_status != 'excluded'",
+    "COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1",
+  ];
   const binds: any[] = [ctx.orgId];
   const likeClauses = terms.map(() => '(lower(d.title) LIKE ? OR lower(d.file_name) LIKE ?)');
   where.push(`(${likeClauses.join(' OR ')})`);
@@ -559,6 +568,27 @@ function tablesFrom(value: any): Array<{ title?: string; headers: string[]; rows
   return asArray(value).map(tableFromAny).filter((t): t is { title?: string; headers: string[]; rows: any[][] } => Boolean(t));
 }
 
+function slideTables(slide: any): Array<{ title?: string; headers: string[]; rows: any[][] }> {
+  return [
+    ...tablesFrom(slide?.tables),
+    ...tablesFrom(slide?.table ? [slide.table] : []),
+  ];
+}
+
+function slideEvidenceBlocks(slide: any): string[] {
+  return [
+    ...asArray(slide?.evidence_blocks),
+    ...asArray(slide?.evidence),
+    ...asArray(slide?.proof_points),
+  ].map((item: any) => {
+    if (typeof item === 'string') return cleanArtifactText(item);
+    if (item && typeof item === 'object') {
+      return cleanArtifactText(firstNonEmpty(item.headline, item.title, item.label, item.value, item.text, item.detail));
+    }
+    return cleanArtifactText(item);
+  }).filter(Boolean);
+}
+
 function plainTextFromStructured(content: any): string {
   if (typeof content === 'string') return content;
   if (!content || typeof content !== 'object') return '';
@@ -593,9 +623,18 @@ function plainTextFromStructured(content: any): string {
   }
   for (const slide of asArray(content.slides)) {
     if (slide?.title) parts.push(String(slide.title));
+    if (slide?.headline) parts.push(String(slide.headline));
+    if (slide?.takeaway) parts.push(String(slide.takeaway));
     if (slide?.subtitle) parts.push(String(slide.subtitle));
     if (slide?.body) parts.push(String(slide.body));
     for (const b of asArray(slide?.bullets)) parts.push(`- ${String(b)}`);
+    for (const e of slideEvidenceBlocks(slide)) parts.push(`Evidence: ${e}`);
+    for (const table of slideTables(slide)) {
+      if (table.title) parts.push(table.title);
+      if (table.headers.length > 0) parts.push(table.headers.join(' | '));
+      for (const row of table.rows) parts.push(row.map(cleanArtifactText).join(' | '));
+    }
+    if (slide?.speaker_notes) parts.push(String(slide.speaker_notes));
   }
   for (const sheet of asArray(content.sheets)) {
     if (sheet?.name) parts.push(`Sheet: ${sheet.name}`);
@@ -652,17 +691,25 @@ function contentQualityIssues(kind: ArtifactKind, content: any): string[] {
     const meaningfulSlides = slides.filter(s => {
       const slideText = [
         s?.title,
+        s?.headline,
+        s?.takeaway,
         s?.subtitle,
         s?.body,
         ...asArray(s?.bullets),
-        ...asArray(s?.table?.headers),
-        ...asArray(s?.table?.rows).flat(),
+        ...slideEvidenceBlocks(s),
+        ...slideTables(s).flatMap(t => [...t.headers, ...t.rows.flat()]),
       ].map(cleanArtifactText).filter(Boolean).join(' ');
-      return cleanArtifactText(s?.title) && slideText.length >= 35;
+      return firstNonEmpty(s?.title, s?.headline) && slideText.length >= 35;
     });
+    const visualSurfaceCount = slides.reduce((sum, s) => (
+      sum + slideTables(s).length + slideEvidenceBlocks(s).length + asArray(s?.metrics).length + asArray(s?.chart?.series).length
+    ), 0);
+    const noteCount = slides.filter(s => cleanArtifactText(s?.speaker_notes || s?.notes)).length;
     if (slides.length < 4) issues.push('presentation has too few slides');
     if (meaningfulSlides.length < 3) issues.push('presentation has too few content-rich slides');
     if (text.length < 300) issues.push('presentation content is too thin');
+    if (slides.length >= 6 && visualSurfaceCount < 3) issues.push('presentation needs more visual evidence surfaces');
+    if (slides.length >= 6 && noteCount < Math.max(3, Math.floor(slides.length / 2))) issues.push('presentation needs speaker notes');
     return issues;
   }
   const sectionCount = asArray(content?.sections).length;
@@ -716,12 +763,12 @@ function defaultArtifactContent(kind: ArtifactKind, title: string, seed: any): a
     return {
       subtitle: 'Prepared by MARTy',
       slides: [
-        { title, subtitle: 'Prepared by MARTy' },
-        { title: 'Executive Takeaway', bullets: [summary.slice(0, 220), 'Use this as a working draft and tighten details with source-specific inputs.'] },
-        { title: 'Recommended Workstreams', bullets: ['Define the highest-impact objective', 'Map ownership and sequencing', 'Identify data or source gaps', 'Prepare a concise follow-up package'] },
-        { title: 'Execution Plan', bullets: ['Prioritize the first 7 days of work', 'Assign owners', 'Create checkpoints', 'Track outputs in a single place'] },
-        { title: 'Risks And Watchouts', bullets: ['Avoid vague ownership', 'Do not overbuild before stakeholder review', 'Flag uncertain facts before distribution'] },
-        { title: 'Next Steps', bullets: ['Review this draft', 'Add company-specific detail', 'Confirm owners and dates', 'Send the final version'] },
+        { layout: 'cover', title, subtitle: 'Prepared by MARTy', headline: summary.slice(0, 140), speaker_notes: `Open by framing why ${title} matters and what decision the deck should support.` },
+        { layout: 'executive_summary', title: 'Executive Takeaway', headline: summary.slice(0, 150), bullets: ['Use this as a working draft.', 'Tighten details with source-specific inputs.', 'Keep each slide anchored to one decision-useful point.'], evidence_blocks: ['Decision-ready storyline', 'Editable PPTX output', 'Source-sensitive draft'], speaker_notes: 'Lead with the main conclusion, then identify which facts still need confirmation.' },
+        { layout: 'matrix', title: 'Recommended Workstreams', headline: 'Three workstreams turn the draft into an operating artifact.', table: { headers: ['Workstream', 'Priority', 'Output'], rows: [['Strategy', 'High', 'Decision-ready narrative'], ['Evidence', 'High', 'Confirmed facts and sources'], ['Execution', 'Medium', 'Owners and timing']] }, speaker_notes: 'Explain how each workstream maps to the intended audience and review cycle.' },
+        { layout: 'timeline', title: 'Execution Plan', headline: 'The first week should move from alignment to a reviewed draft.', bullets: ['Day 1: confirm objective', 'Days 2-3: fill evidence gaps', 'Days 4-5: review with stakeholders', 'Day 7: finalize and circulate'], speaker_notes: 'Use this slide to turn the recommendation into a concrete operating cadence.' },
+        { layout: 'risk', title: 'Risks And Watchouts', headline: 'The main risk is distributing a polished artifact with unverified assumptions.', evidence_blocks: ['Fact uncertainty', 'Unclear ownership', 'Premature distribution'], bullets: ['Flag uncertain facts before distribution', 'Assign a single owner for final edits', 'Separate source-backed claims from assumptions'], speaker_notes: 'Call out the difference between presentation polish and evidence confidence.' },
+        { layout: 'next_steps', title: 'Next Steps', headline: 'Move from MARTy draft to stakeholder-ready deck.', table: { headers: ['Step', 'Owner', 'Outcome'], rows: [['Review draft', 'Team', 'Corrections captured'], ['Add detail', 'Owner', 'Specific facts inserted'], ['Finalize', 'Owner', 'Ready to send']] }, speaker_notes: 'Close with a crisp ask: what should happen next and who owns it.' },
       ],
     };
   }
@@ -788,12 +835,12 @@ Quality bar:
 
 Schemas:
 - docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]}
-- pptx: {"subtitle":"","slides":[{"title":"","subtitle":"","body":"","bullets":[],"table":{"headers":[],"rows":[[]]}}]}
+- pptx: {"subtitle":"","slides":[{"layout":"cover|executive_summary|evidence|matrix|timeline|risk|next_steps","title":"","headline":"","subtitle":"","takeaway":"","body":"","bullets":[],"evidence_blocks":[],"metrics":[{"label":"","value":"","context":""}],"table":{"headers":[],"rows":[[]]},"speaker_notes":""}]}
 - xlsx: {"sheets":[{"name":"","title":"","rows":[[]]}]}
 
 Minimum richness:
 - docx/pdf: 5-8 sections, include at least one table or checklist when useful.
-- pptx: 6-10 slides, one idea per slide, no walls of text.
+- pptx: 6-10 slides, one idea per slide, Medina-dark executive style, speaker notes, and at least three visual evidence surfaces (tables, metrics, matrices, or evidence blocks).
 - xlsx: 2-4 sheets with headers, usable rows, and formulas where natural.`;
   const user = `Artifact kind: ${kind}
 Title: ${title}
@@ -832,7 +879,7 @@ Hard requirements:
 Required schemas:
 - docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]}
 - xlsx: {"sheets":[{"name":"","title":"","rows":[[]]}]} with 2-4 sheets, headers, meaningful rows, and formulas where useful.
-- pptx: {"subtitle":"","slides":[{"title":"","subtitle":"","body":"","bullets":[],"table":{"headers":[],"rows":[[]]}}]} with 6-10 slides.`;
+- pptx: {"subtitle":"","slides":[{"layout":"cover|executive_summary|evidence|matrix|timeline|risk|next_steps","title":"","headline":"","subtitle":"","takeaway":"","body":"","bullets":[],"evidence_blocks":[],"metrics":[{"label":"","value":"","context":""}],"table":{"headers":[],"rows":[[]]},"speaker_notes":""}]} with 6-10 slides, at least three visual evidence surfaces, and speaker notes.`;
   const user = `Artifact kind: ${kind}
 Title: ${title}
 Validation issues:
@@ -845,6 +892,42 @@ Source document context:
 ${sourceContext || '(none)'}`;
   const raw = await callClaude({ system, user, max_tokens: 7000, orgId: ctx.orgId }, 'low', env).catch(() => '');
   return parseJsonObject(raw) || defaultArtifactContent(kind, title, content);
+}
+
+async function planPremiumPptxDeck(
+  title: string,
+  content: any,
+  ctx: AuthContext,
+  env: Env,
+  sourceDocs: DocumentRow[]
+): Promise<any> {
+  const sourceContext = sourceDocs
+    .map(d => `- ${d.title || d.file_name || d.id}: ${d.extracted_text_preview || ''}`.slice(0, 1400))
+    .join('\n');
+  const system = `You are MARTy's deck director. Return strict JSON only, no markdown.
+Design an editable Medina-dark executive PowerPoint deck, not a bullet dump.
+
+Requirements:
+- 6-10 slides.
+- One clear headline or takeaway per slide.
+- Use Medina-dark polish: restrained, high-contrast, executive, no decorative fluff.
+- Include at least three visual evidence surfaces: table, matrix, metrics, timeline, risk list, or proof blocks.
+- Include speaker_notes on every substantive slide.
+- Preserve supplied facts. If facts are limited, use clearly marked working assumptions and useful placeholders.
+
+Schema:
+{"subtitle":"","slides":[{"layout":"cover|executive_summary|evidence|matrix|timeline|risk|next_steps|section","title":"","headline":"","subtitle":"","takeaway":"","body":"","bullets":[],"evidence_blocks":[],"metrics":[{"label":"","value":"","context":""}],"table":{"headers":[],"rows":[[]]},"speaker_notes":"","source_note":""}]}`;
+  const user = `Deck title: ${title}
+
+Current structured content:
+${JSON.stringify(content || {}, null, 2).slice(0, 18000)}
+
+Source document context:
+${sourceContext || '(none)'}`;
+  const raw = await callClaude({ system, user, max_tokens: 7000, orgId: ctx.orgId }, 'high', env).catch(() => '');
+  const planned = parseJsonObject(raw);
+  if (!planned || asArray(planned?.slides).length < 4) return content;
+  return planned;
 }
 
 async function prepareArtifactContent(
@@ -863,6 +946,12 @@ async function prepareArtifactContent(
   }
   if (issues.length > 0) {
     structuredContent = defaultArtifactContent(kind, title, structuredContent);
+  }
+  if (kind === 'pptx') {
+    structuredContent = await planPremiumPptxDeck(title, structuredContent, ctx, env, sourceDocs);
+    if (contentQualityIssues(kind, structuredContent).length > 0) {
+      structuredContent = await repairArtifactContent(kind, title, structuredContent, ctx, env, sourceDocs, contentQualityIssues(kind, structuredContent));
+    }
   }
   return structuredContent;
 }
@@ -1016,6 +1105,28 @@ function rowsFromSheet(sheet: any): any[][] {
   });
 }
 
+function safeXlsxSheetName(value: unknown, fallback: string): string {
+  const cleaned = cleanArtifactText(value || fallback)
+    .replace(/[\[\]\*\/\\\?:]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const name = cleaned || fallback || 'Sheet';
+  return name.slice(0, 31) || 'Sheet';
+}
+
+function uniqueXlsxSheetName(value: unknown, usedNames: Set<string>, fallback = 'Sheet'): string {
+  const base = safeXlsxSheetName(value, fallback);
+  let name = base;
+  let index = 2;
+  while (usedNames.has(name.toLowerCase())) {
+    const suffix = ` (${index})`;
+    name = `${base.slice(0, Math.max(1, 31 - suffix.length))}${suffix}`;
+    index += 1;
+  }
+  usedNames.add(name.toLowerCase());
+  return name;
+}
+
 async function makeXlsx(title: string, content: any): Promise<Uint8Array> {
   const XLSX = await import('xlsx');
   const wb = XLSX.utils.book_new();
@@ -1024,8 +1135,9 @@ async function makeXlsx(title: string, content: any): Promise<Uint8Array> {
     ? content
     : defaultArtifactContent('xlsx', title, content);
   const sheets = asArray(safeContent?.sheets);
+  const usedSheetNames = new Set<string>();
   if (sheets.length > 0) {
-    for (const sheet of sheets) {
+    for (const [index, sheet] of sheets.entries()) {
       const rows = rowsFromSheet(sheet);
       const aoa = rows.length > 0 ? rows : [[sheet?.title || title], ['No rows provided']];
       if (sheet?.title && cleanArtifactText(aoa[0]?.[0]) !== cleanArtifactText(sheet.title)) aoa.unshift([sheet.title]);
@@ -1040,7 +1152,7 @@ async function makeXlsx(title: string, content: any): Promise<Uint8Array> {
         ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: sheet?.title ? 1 : 0, c: 0 }, e: range.e }) };
       }
       (ws as any)['!freeze'] = { xSplit: 0, ySplit: sheet?.title ? 2 : 1 };
-      XLSX.utils.book_append_sheet(wb, ws, String(sheet?.name || 'Sheet').slice(0, 31));
+      XLSX.utils.book_append_sheet(wb, ws, uniqueXlsxSheetName(sheet?.name || sheet?.title, usedSheetNames, `Sheet ${index + 1}`));
     }
   } else {
     const rows = asArray(safeContent?.rows);
@@ -1049,33 +1161,80 @@ async function makeXlsx(title: string, content: any): Promise<Uint8Array> {
       : rowsFromSheet(defaultArtifactContent('xlsx', title, safeContent).sheets[0]);
     const ws = XLSX.utils.aoa_to_sheet(aoa);
     ws['!cols'] = [{ wch: 24 }, { wch: 70 }];
-    XLSX.utils.book_append_sheet(wb, ws, 'Summary');
+    XLSX.utils.book_append_sheet(wb, ws, uniqueXlsxSheetName('Summary', usedSheetNames));
   }
   const out = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
   return new Uint8Array(out);
 }
 
+function inferPptxLayout(slide: any, index: number): string {
+  const layout = cleanArtifactText(slide?.layout).toLowerCase();
+  if (layout) return layout;
+  if (index === 0) return 'cover';
+  if (slideTables(slide).length > 0) return index <= 2 ? 'matrix' : 'evidence';
+  if (slideEvidenceBlocks(slide).length >= 3) return 'evidence';
+  if (/\b(risk|watchout|concern)\b/i.test(cleanArtifactText(slide?.title))) return 'risk';
+  if (/\b(next|action|plan|step)\b/i.test(cleanArtifactText(slide?.title))) return 'next_steps';
+  return index === 1 ? 'executive_summary' : 'evidence';
+}
+
+function normalizePptxSlide(title: string, slide: any, index: number): any {
+  const bullets = [
+    ...asArray(slide?.bullets),
+    ...asArray(slide?.key_points),
+    ...asArray(slide?.recommendations),
+  ].map(cleanArtifactText).filter(Boolean).slice(0, 6);
+  const tables = slideTables(slide);
+  const headline = firstNonEmpty(slide?.headline, slide?.takeaway, slide?.callout, slide?.body, bullets[0]);
+  const normalized = {
+    ...slide,
+    layout: inferPptxLayout(slide, index),
+    title: firstNonEmpty(slide?.title, index === 0 ? title : `Slide ${index + 1}`),
+    subtitle: firstNonEmpty(slide?.subtitle, index === 0 ? 'Prepared by MARTy' : ''),
+    headline,
+    body: cleanArtifactText(slide?.body),
+    bullets,
+    evidence_blocks: slideEvidenceBlocks(slide).slice(0, 6),
+    metrics: asArray(slide?.metrics).filter(Boolean).slice(0, 4),
+    table: tables[0] || null,
+    source_note: cleanArtifactText(slide?.source_note || slide?.source),
+    speaker_notes: cleanArtifactText(slide?.speaker_notes || slide?.notes),
+  };
+  if (!normalized.speaker_notes && index > 0) {
+    normalized.speaker_notes = [
+      normalized.headline,
+      normalized.body,
+      bullets.length ? `Talk track: ${bullets.join('; ')}` : '',
+    ].filter(Boolean).join('\n');
+  }
+  return normalized;
+}
+
 function slidesFromContent(title: string, content: any): any[] {
   const explicit = asArray(content?.slides);
-  if (explicit.length > 0) return explicit;
-  const slides: any[] = [{ title, subtitle: content?.subtitle || 'Prepared by MARTy' }];
-  if (content?.summary) slides.push({ title: 'Executive Takeaway', body: content.summary });
-  for (const section of asArray(content?.sections)) {
-    slides.push({
-      title: section?.heading || 'Section',
-      body: section?.summary || asArray(section?.paragraphs)[0] || '',
-      bullets: [...asArray(section?.bullets), ...asArray(section?.numbered), ...asArray(section?.checklist)].slice(0, 6),
-      table: tableFromAny(section?.table || asArray(section?.tables)[0]),
-    });
+  let slides: any[] = explicit.length > 0 ? explicit : [];
+  if (slides.length === 0) {
+    slides = [{ layout: 'cover', title, subtitle: content?.subtitle || 'Prepared by MARTy' }];
+    if (content?.summary) slides.push({ layout: 'executive_summary', title: 'Executive Takeaway', headline: content.summary, body: content.summary });
+    for (const section of asArray(content?.sections)) {
+      slides.push({
+        title: section?.heading || 'Section',
+        headline: section?.summary || asArray(section?.paragraphs)[0] || '',
+        body: section?.summary || '',
+        bullets: [...asArray(section?.bullets), ...asArray(section?.numbered), ...asArray(section?.checklist)].slice(0, 6),
+        table: tableFromAny(section?.table || asArray(section?.tables)[0]),
+      });
+    }
   }
-  if (slides.length < 4) {
-    slides.push(
-      { title: 'Recommended Workstreams', bullets: ['Clarify the objective', 'Assign owners', 'Identify evidence gaps', 'Create a review cadence'] },
-      { title: 'Risks And Watchouts', bullets: ['Separate facts from assumptions', 'Avoid vague ownership', 'Keep the output decision-ready'] },
-      { title: 'Next Steps', bullets: ['Review the draft', 'Confirm dates and owners', 'Finalize and circulate'] },
-    );
+  if (slides.length < 6) {
+    const fallback = defaultArtifactContent('pptx', title, content).slides;
+    slides = [...slides, ...fallback.slice(slides.length)];
   }
-  return slides.slice(0, 12);
+  return slides.slice(0, 12).map((slide, index) => normalizePptxSlide(title, slide, index));
+}
+
+function pptxBulletText(items: string[]): string {
+  return items.map(item => cleanArtifactText(item)).filter(Boolean).join('\n');
 }
 
 async function makePptx(title: string, content: any): Promise<Uint8Array> {
@@ -1088,53 +1247,147 @@ async function makePptx(title: string, content: any): Promise<Uint8Array> {
   pptx.title = title;
   pptx.company = 'Medina Ventures';
   pptx.theme = { headFontFace: 'Aptos Display', bodyFontFace: 'Aptos', lang: 'en-US' };
+
+  const C = {
+    bg: '09090D',
+    panel: '141419',
+    panel2: '1C1C24',
+    border: '2D2D36',
+    magenta: 'D946A8',
+    purple: '8B5CF6',
+    cyan: '38BDF8',
+    amber: 'FBBF24',
+    text: 'F8FAFC',
+    muted: 'A1A1AA',
+    dim: '71717A',
+  };
   const normalizedSlides = slidesFromContent(title, content);
+
+  const addShell = (slide: any, idx: number, kicker?: string) => {
+    slide.background = { color: C.bg };
+    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 13.333, h: 7.5, fill: { color: C.bg }, line: { color: C.bg } });
+    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 0.1, h: 7.5, fill: { color: C.magenta }, line: { color: C.magenta } });
+    slide.addShape(pptx.ShapeType.rect, { x: 0.1, y: 0, w: 0.04, h: 7.5, fill: { color: C.purple }, line: { color: C.purple } });
+    if (idx > 0) {
+      slide.addText(kicker || `SLIDE ${idx + 1}`, { x: 0.52, y: 0.34, w: 2.0, h: 0.22, fontSize: 8.5, color: C.purple, charSpace: 1.6, margin: 0 });
+      slide.addText(`${idx + 1}/${normalizedSlides.length}`, { x: 12.0, y: 6.88, w: 0.72, h: 0.18, fontSize: 8, color: C.dim, align: 'right', margin: 0 });
+    }
+  };
+
+  const addHeadline = (slide: any, s: any, y = 0.72, w = 7.2) => {
+    slide.addText(s.title, { x: 0.52, y, w, h: 0.42, fontSize: 21, bold: true, color: C.text, margin: 0.01, fit: 'shrink' });
+    if (s.headline) {
+      slide.addText(s.headline, { x: 0.54, y: y + 0.62, w: Math.min(w + 1.6, 8.6), h: 0.72, fontSize: 14.5, bold: true, color: 'EDE9FE', margin: 0.02, fit: 'shrink' });
+    }
+  };
+
+  const addBullets = (slide: any, items: string[], x: number, y: number, w: number, h: number, fontSize = 12.5) => {
+    if (items.length === 0) return;
+    slide.addText(pptxBulletText(items), {
+      x, y, w, h,
+      fontSize,
+      color: 'D4D4D8',
+      bullet: { type: 'bullet' },
+      breakLine: false,
+      fit: 'shrink',
+      margin: 0.03,
+      paraSpaceAfterPt: 7,
+    });
+  };
+
+  const addEvidenceBlocks = (slide: any, blocks: string[], x: number, y: number, w: number, h: number) => {
+    const visible = blocks.slice(0, 4);
+    if (visible.length === 0) return;
+    const gap = 0.13;
+    const cardH = (h - gap * (visible.length - 1)) / visible.length;
+    visible.forEach((block, i) => {
+      const yy = y + i * (cardH + gap);
+      slide.addShape(pptx.ShapeType.rect, { x, y: yy, w, h: cardH, fill: { color: C.panel2 }, line: { color: C.border, transparency: 10 } });
+      slide.addShape(pptx.ShapeType.rect, { x, y: yy, w: 0.06, h: cardH, fill: { color: i % 2 ? C.purple : C.magenta }, line: { color: i % 2 ? C.purple : C.magenta } });
+      slide.addText(block, { x: x + 0.22, y: yy + 0.14, w: w - 0.42, h: cardH - 0.24, fontSize: 12.5, bold: true, color: C.text, margin: 0.02, fit: 'shrink' });
+    });
+  };
+
+  const addMetrics = (slide: any, metrics: any[], x: number, y: number, w: number) => {
+    const visible = metrics.slice(0, 4);
+    if (visible.length === 0) return;
+    const cardW = (w - 0.18 * (visible.length - 1)) / visible.length;
+    visible.forEach((metric, i) => {
+      const xx = x + i * (cardW + 0.18);
+      slide.addShape(pptx.ShapeType.rect, { x: xx, y, w: cardW, h: 0.92, fill: { color: C.panel }, line: { color: C.border } });
+      slide.addText(firstNonEmpty(metric?.value, metric?.metric, metric), { x: xx + 0.16, y: y + 0.14, w: cardW - 0.28, h: 0.28, fontSize: 17, bold: true, color: C.text, margin: 0, fit: 'shrink' });
+      slide.addText(firstNonEmpty(metric?.label, metric?.name, metric?.context), { x: xx + 0.16, y: y + 0.52, w: cardW - 0.28, h: 0.22, fontSize: 7.8, color: C.muted, margin: 0, fit: 'shrink' });
+    });
+  };
+
+  const addTable = (slide: any, table: any, x: number, y: number, w: number, h: number) => {
+    const t = tableFromAny(table);
+    if (!t || t.headers.length === 0) return false;
+    const rows = [t.headers, ...t.rows.slice(0, 6)].map(row => row.map(cleanArtifactText));
+    if (t.title) slide.addText(t.title, { x, y: y - 0.3, w, h: 0.2, fontSize: 8.5, color: C.muted, margin: 0 });
+    slide.addTable(rows, {
+      x, y, w, h,
+      fontSize: 8.5,
+      color: C.text,
+      border: { type: 'solid', color: C.border, pt: 0.45 },
+      fill: { color: C.panel },
+      margin: 0.06,
+      fit: 'shrink',
+    });
+    return true;
+  };
+
+  const addNotes = (slide: any, s: any) => {
+    const notes = cleanArtifactText(s.speaker_notes) || [s.headline, s.body, ...s.bullets].filter(Boolean).join('\n');
+    if (notes && typeof slide.addNotes === 'function') slide.addNotes(notes);
+  };
+
   normalizedSlides.forEach((s, idx) => {
     const slide = pptx.addSlide();
-    slide.background = { color: idx === 0 ? '0B0B10' : '111114' };
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 0.13, h: 7.5, fill: { color: 'C026D3' }, line: { color: 'C026D3' } });
-    slide.addText(String(s?.title || title), { x: 0.55, y: idx === 0 ? 2.25 : 0.42, w: 11.8, h: idx === 0 ? 0.85 : 0.5, fontSize: idx === 0 ? 34 : 25, bold: true, color: 'FFFFFF', margin: 0.02, fit: 'shrink' });
-    if (s?.subtitle) slide.addText(String(s.subtitle), { x: 0.58, y: idx === 0 ? 3.12 : 0.98, w: 10.8, h: 0.35, fontSize: idx === 0 ? 16 : 11, color: 'A1A1AA', margin: 0.02, fit: 'shrink' });
-    if (idx === 0) {
-      slide.addText('Prepared by MARTy', { x: 0.58, y: 6.65, w: 3.8, h: 0.3, fontSize: 10, color: 'A1A1AA', margin: 0.02 });
+    addShell(slide, idx, s.layout.replace(/_/g, ' ').toUpperCase());
+    addNotes(slide, s);
+
+    if (s.layout === 'cover') {
+      slide.addText('MEDINA INTELLIGENCE', { x: 0.56, y: 0.62, w: 3.0, h: 0.22, fontSize: 8.5, color: C.purple, charSpace: 1.8, margin: 0 });
+      slide.addText(s.title || title, { x: 0.58, y: 1.95, w: 8.6, h: 0.82, fontSize: 34, bold: true, color: C.text, margin: 0.01, fit: 'shrink' });
+      slide.addText(s.headline || s.subtitle || 'Prepared by MARTy', { x: 0.62, y: 2.93, w: 7.8, h: 0.72, fontSize: 15, color: 'E9D5FF', margin: 0.02, fit: 'shrink' });
+      addEvidenceBlocks(slide, s.evidence_blocks.length ? s.evidence_blocks : ['Executive storyline', 'Evidence-first structure', 'Editable PowerPoint'], 8.55, 1.48, 3.85, 3.1);
+      slide.addText(s.subtitle || 'Prepared by MARTy', { x: 0.62, y: 6.65, w: 4.0, h: 0.24, fontSize: 9.5, color: C.muted, margin: 0 });
       return;
     }
-    const bullets = asArray(s?.bullets).map(String);
-    if (s?.body) slide.addText(String(s.body), { x: 0.62, y: 1.38, w: 5.8, h: bullets.length > 0 ? 1.05 : 4.85, fontSize: 15, color: 'E5E7EB', margin: 0.04, breakLine: false, fit: 'shrink' });
-    if (bullets.length > 0) {
-      slide.addText(bullets.join('\n'), {
-        x: 0.76,
-        y: s?.body ? 2.55 : 1.42,
-        w: 5.75,
-        h: 4.25,
-        fontSize: 15,
-        color: 'D4D4D8',
-        bullet: { type: 'bullet' },
-        breakLine: false,
-        fit: 'shrink',
-        paraSpaceAfterPt: 8,
+
+    addHeadline(slide, s);
+    const table = s.table;
+    const metrics = s.metrics;
+    if (metrics.length > 0) addMetrics(slide, metrics, 0.56, 1.86, 5.9);
+
+    if (s.layout === 'matrix' || s.layout === 'evidence') {
+      const hasTable = addTable(slide, table, 6.62, 1.2, 5.85, 4.85);
+      if (!hasTable) addEvidenceBlocks(slide, s.evidence_blocks.length ? s.evidence_blocks : s.bullets, 6.82, 1.25, 5.35, 4.55);
+      if (s.body) slide.addText(s.body, { x: 0.56, y: metrics.length ? 3.05 : 2.0, w: 5.7, h: 1.05, fontSize: 12.5, color: 'E5E7EB', margin: 0.03, fit: 'shrink' });
+      addBullets(slide, s.bullets.slice(0, 4), 0.76, s.body ? 3.28 : (metrics.length ? 3.05 : 2.05), 5.5, 2.95);
+    } else if (s.layout === 'timeline' || s.layout === 'next_steps') {
+      const items: string[] = s.bullets.length ? s.bullets : s.evidence_blocks;
+      const visible = items.slice(0, 5);
+      visible.forEach((item: string, i: number) => {
+        const x = 0.76 + i * 2.42;
+        slide.addShape(pptx.ShapeType.rect, { x, y: 3.0, w: 2.02, h: 1.48, fill: { color: C.panel }, line: { color: i === 0 ? C.magenta : C.border } });
+        slide.addText(String(i + 1).padStart(2, '0'), { x: x + 0.15, y: 3.16, w: 0.45, h: 0.22, fontSize: 8.5, bold: true, color: C.magenta, margin: 0 });
+        slide.addText(item, { x: x + 0.15, y: 3.52, w: 1.68, h: 0.64, fontSize: 10.5, bold: true, color: C.text, margin: 0.02, fit: 'shrink' });
       });
-    }
-    const table = tableFromAny(s?.table);
-    if (table && table.headers.length > 0) {
-      const pptRows = [table.headers, ...table.rows.slice(0, 6)].map(row => row.map(cleanArtifactText));
-      slide.addTable(pptRows, {
-        x: 6.9,
-        y: 1.35,
-        w: 5.75,
-        h: 4.65,
-        fontSize: 9.5,
-        color: 'F4F4F5',
-        border: { type: 'solid', color: '3F3F46', pt: 0.5 },
-        fill: { color: '18181B' },
-        margin: 0.08,
-      });
+      addTable(slide, table, 6.76, 1.35, 5.6, 1.2);
+    } else if (s.layout === 'risk') {
+      addEvidenceBlocks(slide, s.evidence_blocks.length ? s.evidence_blocks : ['Primary risk', 'Mitigation', 'Owner'], 0.72, 2.05, 5.35, 3.8);
+      addBullets(slide, s.bullets, 7.0, 1.65, 5.05, 3.95, 13);
     } else {
-      slide.addShape(pptx.ShapeType.rect, { x: 7.0, y: 1.4, w: 5.3, h: 4.55, fill: { color: '18181B' }, line: { color: '27272A' } });
-      const pull = firstNonEmpty(s?.callout, asArray(s?.bullets)[0], s?.body, 'Review this slide and refine with source-specific detail.');
-      slide.addText(pull, { x: 7.35, y: 1.82, w: 4.65, h: 3.55, fontSize: 20, bold: true, color: 'F4F4F5', margin: 0.03, fit: 'shrink' });
+      if (s.body) slide.addText(s.body, { x: 0.58, y: 1.95, w: 5.9, h: 1.2, fontSize: 12.5, color: 'E5E7EB', margin: 0.03, fit: 'shrink' });
+      addBullets(slide, s.bullets, 0.78, s.body ? 3.3 : 2.0, 5.75, 3.1);
+      addEvidenceBlocks(slide, s.evidence_blocks.length ? s.evidence_blocks : s.bullets.slice(0, 3), 6.85, 1.35, 5.25, 4.55);
     }
-    slide.addText(`${idx + 1}/${normalizedSlides.length}`, { x: 11.9, y: 6.9, w: 0.7, h: 0.2, fontSize: 8.5, color: '71717A', align: 'right' });
+
+    if (s.source_note) {
+      slide.addText(`Source note: ${s.source_note}`, { x: 0.58, y: 6.75, w: 9.7, h: 0.2, fontSize: 7.5, color: C.dim, margin: 0, fit: 'shrink' });
+    }
   });
   const out = await pptx.write({ outputType: 'arraybuffer' });
   return new Uint8Array(out as ArrayBuffer);
@@ -1310,13 +1563,27 @@ async function validateGeneratedArtifact(kind: ArtifactKind, bytes: Uint8Array):
     if (kind === 'pptx') {
       if (!zip.file('ppt/presentation.xml')) issues.push('PPTX missing ppt/presentation.xml');
       const slideEntries = entries.filter(e => /^ppt\/slides\/slide\d+\.xml$/.test(e));
-      if (slideEntries.length < 4) issues.push('PPTX has too few slides');
+      if (slideEntries.length < 6) issues.push('PPTX has too few slides');
+      const notesEntries = entries.filter(e => /^ppt\/notesSlides\/notesSlide\d+\.xml$/.test(e));
+      if (slideEntries.length >= 6 && notesEntries.length < Math.max(3, Math.floor(slideEntries.length / 2))) {
+        issues.push('PPTX needs speaker notes');
+      }
       let slideText = '';
+      let tableSlideCount = 0;
+      let denseBulletSlideCount = 0;
       for (const entry of slideEntries.slice(0, 12)) {
         const xml = await zip.file(entry)?.async('string');
-        slideText += ` ${xml?.replace(/<[^>]+>/g, ' ') || ''}`;
+        const raw = xml || '';
+        slideText += ` ${raw.replace(/<[^>]+>/g, ' ')}`;
+        if (raw.includes('<a:tbl')) tableSlideCount++;
+        const bulletCount = (raw.match(/<a:bu/g) || []).length;
+        if (bulletCount > 6) denseBulletSlideCount++;
       }
       if (slideText.trim().length < 120) issues.push('PPTX contains too little readable slide text');
+      if (slideEntries.length >= 6 && tableSlideCount === 0 && notesEntries.length < slideEntries.length) {
+        issues.push('PPTX needs stronger visual evidence surfaces');
+      }
+      if (denseBulletSlideCount > Math.ceil(slideEntries.length / 2)) issues.push('PPTX is too bullet-heavy');
     }
   } catch (e: any) {
     issues.push(`could not open generated ${kind.toUpperCase()} file: ${e?.message || e}`);
@@ -1359,26 +1626,46 @@ async function persistArtifact(
     structuredContent: any;
     sourceDocs: DocumentRow[];
     parentDocumentId?: string | null;
+    embed?: boolean;
+    visibility?: DocumentVisibility;
+    customFields?: Record<string, unknown>;
   }
 ): Promise<{ card: MartyDocumentCard; document: { id: string; title: string; file_name: string; mime_type: string } }> {
   const inputContent = normalizeStructuredArtifactContent(opts.structuredContent);
   let structuredContent = await prepareArtifactContent(opts.kind, opts.title, inputContent, ctx, env, opts.sourceDocs);
-  let bytes = await artifactBytes(opts.kind, opts.title, structuredContent);
-  let validation = await validateGeneratedArtifact(opts.kind, bytes);
+  let bytes: Uint8Array | null = null;
+  let validation: { ok: boolean; issues: string[] };
+  try {
+    bytes = await artifactBytes(opts.kind, opts.title, structuredContent);
+    validation = await validateGeneratedArtifact(opts.kind, bytes);
+  } catch (error: any) {
+    validation = {
+      ok: false,
+      issues: [`artifact generation failed before validation: ${String(error?.message || error).slice(0, 220)}`],
+    };
+  }
   if (!validation.ok) {
     structuredContent = await repairArtifactContent(opts.kind, opts.title, structuredContent, ctx, env, opts.sourceDocs, validation.issues);
     if (contentQualityIssues(opts.kind, structuredContent).length > 0) {
       structuredContent = defaultArtifactContent(opts.kind, opts.title, structuredContent);
     }
-    bytes = await artifactBytes(opts.kind, opts.title, structuredContent);
-    validation = await validateGeneratedArtifact(opts.kind, bytes);
+    try {
+      bytes = await artifactBytes(opts.kind, opts.title, structuredContent);
+      validation = await validateGeneratedArtifact(opts.kind, bytes);
+    } catch (error: any) {
+      bytes = null;
+      validation = {
+        ok: false,
+        issues: [`artifact generation failed after repair: ${String(error?.message || error).slice(0, 220)}`],
+      };
+    }
   }
-  if (!validation.ok) {
+  if (!validation.ok || !bytes) {
     throw new Error(`MARTy could not create a valid ${opts.kind.toUpperCase()} file yet. ${validation.issues.join('; ')}`);
   }
   const fileName = fileTitle(opts.title, opts.kind);
   const file = new File([bytes], fileName, { type: MIME_BY_KIND[opts.kind] });
-  const visibility = restrictiveVisibility(opts.sourceDocs);
+  const visibility = opts.visibility || restrictiveVisibility(opts.sourceDocs);
   const participantUserIds = participantUnion(opts.sourceDocs, ctx, visibility);
   const links: DocumentLink[] = [];
   const primarySource = opts.sourceDocs.find(d => d.deal_id || d.company_id || d.contact_id);
@@ -1400,7 +1687,7 @@ async function persistArtifact(
     parentDocumentId: opts.parentDocumentId || undefined,
     preExtractedText: extractedText,
     dedupOnContentHash: false,
-    embed: true,
+    embed: opts.embed !== false,
   }, env);
   await persisted.finalize();
 
@@ -1411,6 +1698,7 @@ async function persistArtifact(
   ).bind(
     JSON.stringify({
       marty_generated: true,
+      ...(opts.customFields || {}),
       source_document_ids: opts.sourceDocs.map(d => d.id),
       artifact_kind: opts.kind,
       artifact_schema_version: 3,
@@ -1463,6 +1751,9 @@ export async function createDocumentArtifactTool(
     title: string;
     structured_content: any;
     source_document_ids?: string[];
+    embed?: boolean;
+    visibility?: DocumentVisibility;
+    custom_fields?: Record<string, unknown>;
   },
   env: Env
 ): Promise<any> {
@@ -1477,6 +1768,9 @@ export async function createDocumentArtifactTool(
     title,
     structuredContent: input.structured_content,
     sourceDocs,
+    embed: input.embed,
+    visibility: input.visibility,
+    customFields: input.custom_fields,
   });
   return {
     ok: true,
@@ -1543,12 +1837,12 @@ Do not return skeletal content. The edited copy must be useful as a standalone b
 Schemas:
 - docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]}
 - xlsx: {"sheets":[{"name":"","title":"","rows":[[]]}]}
-- pptx: {"subtitle":"","slides":[{"title":"","subtitle":"","body":"","bullets":[],"table":{"headers":[],"rows":[[]]}}]}
+- pptx: {"subtitle":"","slides":[{"layout":"cover|executive_summary|evidence|matrix|timeline|risk|next_steps","title":"","headline":"","subtitle":"","takeaway":"","body":"","bullets":[],"evidence_blocks":[],"metrics":[{"label":"","value":"","context":""}],"table":{"headers":[],"rows":[[]]},"speaker_notes":""}]}
 
 Quality bar:
 - DOCX/PDF: create a polished memo/report with 5-8 sections, clear headings, and at least one table or checklist when useful.
 - XLSX: create a usable workbook with 2-4 sheets, headers, clean rows, and formulas where natural.
-- PPTX: create a 6-10 slide deck with a cover, executive takeaway, one idea per slide, and concise bullets or tables.`;
+- PPTX: create a 6-10 slide Medina-dark executive deck with a cover, executive takeaway, one idea per slide, visual evidence surfaces, and speaker notes.`;
   const user = `Output kind: ${kind}
 New title: ${title}
 Instructions: ${String(input.instructions || '').slice(0, 4000)}

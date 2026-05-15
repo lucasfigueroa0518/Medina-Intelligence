@@ -145,12 +145,12 @@ export async function listContacts(
   }
 
   // Tag filtering — `tags` accepts comma-separated tag IDs (new behavior) OR
-  // the legacy `tags` multi-value with names. We detect IDs by the 32-hex
-  // pattern they use; otherwise fall back to name matching for compatibility.
+  // the legacy `tags` multi-value with names. Production tag IDs are UUIDs,
+  // while older local/dev rows may use dashless hex IDs.
   let tagJoin = '';
   const tagsParam = readMulti(sp, 'tags') ?? filter.tags;
   if (tagsParam?.length) {
-    const looksLikeIds = tagsParam.every(t => /^[a-f0-9]{16,}$/i.test(t));
+    const looksLikeIds = looksLikeTagIds(tagsParam);
     tagJoin = `JOIN contact_tags ct ON c.id = ct.contact_id
                JOIN tags t ON ct.tag_id = t.id`;
     if (looksLikeIds) {
@@ -256,6 +256,13 @@ function readMulti(sp: URLSearchParams, key: string): string[] | undefined {
   if (all.length === 0) return undefined;
   if (all.length === 1) return parseList(all[0]);
   return all;
+}
+
+function looksLikeTagIds(values: string[]): boolean {
+  return values.every(value =>
+    /^[a-f0-9]{16,}$/i.test(value)
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+  );
 }
 
 // Old `sort_by` values still used by some callers — translate to the new keys.
@@ -732,6 +739,7 @@ export async function getContactTimeline(
          JOIN document_links dl ON dl.document_id = d.id
         WHERE dl.entity_type = 'contact' AND dl.entity_id = ?
           AND dl.deleted_at IS NULL AND d.deleted_at IS NULL
+          AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1
           AND d.org_id = ?
         ORDER BY d.created_at DESC LIMIT ?`
     ).bind(id, ctx.orgId, sourceLimit).all(),
@@ -755,6 +763,7 @@ export async function getContactTimeline(
          JOIN document_links dl ON dl.document_id = d.id
         WHERE dl.entity_type = 'conversation' AND dl.entity_id IN (${placeholders})
           AND dl.deleted_at IS NULL AND d.deleted_at IS NULL
+          AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1
           AND d.org_id = ?
         ORDER BY d.created_at`
     ).bind(...conversationIds, ctx.orgId).all<{

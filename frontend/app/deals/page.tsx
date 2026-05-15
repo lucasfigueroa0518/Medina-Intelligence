@@ -3,6 +3,7 @@
 import React from 'react';
 import { useRouter } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
+import { ExpandableText } from '@/components/expandable-text';
 import { api, type DealReplayStatusSnapshot, type DetectedDealCandidate } from '@/lib/api';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 import { demoDeals, demoDetectedDeals, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
@@ -88,7 +89,9 @@ function DealCard({
       } ${selected ? 'ring-2 ring-accent-magenta/40' : ''}`}
       style={{ borderLeft: `3px solid ${stageColor}35` }}
     >
-      <div className="absolute right-2 top-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+      <div className={`absolute right-2 top-2 flex items-center gap-1 transition-opacity ${
+        selected ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100'
+      }`}>
         <button
           type="button"
           onClick={e => { e.stopPropagation(); onToggle(); }}
@@ -109,27 +112,35 @@ function DealCard({
       </div>
       <div className="min-w-0 pr-8">
         <div className="truncate text-sm font-semibold text-text-primary">{cardTitle(deal)}</div>
-        <p className="mt-1 line-clamp-2 text-xs leading-5 text-text-secondary">
-          {brief}
-        </p>
+        <ExpandableText
+          text={brief}
+          collapsedLines={2}
+          minToggleChars={120}
+          className="mt-1 text-xs leading-5 text-text-secondary"
+        />
         {stage === 'new' && (
-          <div className="mt-3 grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              disabled={busy}
-              onClick={e => { e.stopPropagation(); onYes(); }}
-              className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-2 py-1.5 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/[0.10] disabled:opacity-50"
-            >
-              Yes
-            </button>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={e => { e.stopPropagation(); onNo(); }}
-              className="rounded-lg border border-red-500/20 bg-red-500/[0.05] px-2 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/[0.10] disabled:opacity-50"
-            >
-              No
-            </button>
+          <div className="mt-3">
+            <div className="mb-2 rounded-md border border-accent-magenta/15 bg-accent-magenta/[0.06] px-2 py-1.5 text-[11px] leading-4 text-text-secondary">
+              Is this actually a deal? Yes moves it to Talking; drag it afterward if another stage fits better.
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={e => { e.stopPropagation(); onYes(); }}
+                className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-2 py-1.5 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/[0.10] disabled:opacity-50"
+              >
+                Yes, move
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={e => { e.stopPropagation(); onNo(); }}
+                className="rounded-lg border border-red-500/20 bg-red-500/[0.05] px-2 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/[0.10] disabled:opacity-50"
+              >
+                No, reject
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -352,10 +363,10 @@ export default function DealsPage() {
     if (demoMode) {
       if (decision === 'yes') {
         setDeals(prev => prev.map(deal => ids.includes(deal.id) ? { ...deal, stage: 'talking' } : deal));
-        setToast('Demo mode: moved to Talking locally');
+        setToast('Demo mode: confirmed and moved to Talking locally');
       } else {
         setDeals(prev => prev.filter(deal => !ids.includes(deal.id)));
-        setToast(demoToastMessage(decision === 'no' ? 'Denying suggestions' : 'Deleting deals'));
+        setToast(decision === 'no' ? 'Demo mode: rejected suggestion locally' : demoToastMessage('Deleting deals'));
       }
       setSelectedIds(new Set());
       setBusy(false);
@@ -364,7 +375,7 @@ export default function DealsPage() {
     try {
       await api.bulkDecideDeals({ deal_ids: ids, decision });
       setSelectedIds(new Set());
-      setToast(decision === 'yes' ? 'Moved to Talking' : decision === 'no' ? 'Suggestion denied' : 'Deals deleted');
+      setToast(decision === 'yes' ? 'Confirmed and moved to Talking' : decision === 'no' ? 'Rejected suggestion' : 'Deals deleted');
       await loadDeals();
       void loadDetectedCandidates();
     } catch (e: any) {
@@ -515,13 +526,18 @@ export default function DealsPage() {
                     </div>
 
                     {stage.key === 'new' && (
-                      <OtherDetectedDeals
-                        candidates={detectedCandidates}
-                        open={detectedOpen}
-                        busyCompanyId={detectedBusyId}
-                        onToggle={() => setDetectedOpen(v => !v)}
-                        onPromote={candidate => void promoteDetectedCandidate(candidate)}
-                      />
+                      <>
+                        <div className="mb-3 rounded-lg border border-accent-magenta/15 bg-accent-magenta/[0.05] px-3 py-2 text-[11px] leading-4 text-text-secondary">
+                          Review AI-surfaced suggestions. Yes confirms the deal and moves it to Talking; drag cards afterward to set the right stage.
+                        </div>
+                        <OtherDetectedDeals
+                          candidates={detectedCandidates}
+                          open={detectedOpen}
+                          busyCompanyId={detectedBusyId}
+                          onToggle={() => setDetectedOpen(v => !v)}
+                          onPromote={candidate => void promoteDetectedCandidate(candidate)}
+                        />
+                      </>
                     )}
 
                     <div className="space-y-2">
@@ -571,10 +587,10 @@ export default function DealsPage() {
           <span className="text-sm text-text-primary font-medium">{selected.length} selected</span>
           <div className="w-px h-5 bg-white/10" />
           <button disabled={busy} onClick={() => void decide(selected, 'yes')} className="btn-secondary text-xs py-1.5 px-3 disabled:opacity-50">
-            Yes
+            Confirm
           </button>
           <button disabled={busy} onClick={() => void decide(selected, 'no')} className="btn-secondary text-xs py-1.5 px-3 disabled:opacity-50">
-            No
+            Reject
           </button>
           <button disabled={busy} onClick={() => void decide(selected, 'delete')} className="inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs text-semantic-error hover:bg-red-500/10 disabled:opacity-50">
             <Trash2 size={12} /> Delete

@@ -3,8 +3,9 @@
 import React from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Check, X as XIcon, ChevronDown, ChevronUp, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2, Calendar, Mic, Lock, Unlock } from 'lucide-react';
+import { Check, X as XIcon, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Users, Briefcase, Target, Sparkles, Mail, Clock, Loader2, User as UserIcon, Camera, Shield, LogOut, Trash2, Calendar, Mic, Lock, Unlock } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
+import { ExpandableText } from '@/components/expandable-text';
 import {
   api,
   getAuthToken,
@@ -21,17 +22,19 @@ import {
   type BudgetSnapshotRow,
   type DealReplayEvidenceRow,
   type MartyLabStatusSnapshot,
+  type MartyLabRunSnapshot,
   type DealReplayStatusSnapshot,
 } from '@/lib/api';
 import { useBackgroundTasks } from '@/components/background-task-indicator';
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
 
-type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals' | 'system';
+type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals' | 'system' | 'marty-sandbox';
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: 'profile', label: 'Profile' },
   { id: 'system', label: 'System Status' },
+  { id: 'marty-sandbox', label: 'MARTy Sandbox' },
   { id: 'integrations', label: 'Sync & Integrations' },
   { id: 'security', label: 'Security' },
   { id: 'approvals', label: 'Approval Queue' },
@@ -110,9 +113,11 @@ function SettingsPageInner() {
 
   React.useEffect(() => {
     if (activeTab !== 'integrations') return;
-    if (typeof window === 'undefined' || window.location.hash !== '#sync-integrations') return;
+    if (typeof window === 'undefined') return;
+    const hashTarget = window.location.hash.replace(/^#/, '');
+    if (!['sync-integrations', 'live-outlook-sync', 'email-history-import', 'outlook-integration-refresh'].includes(hashTarget)) return;
     window.setTimeout(() => {
-      document.getElementById('sync-integrations')?.scrollIntoView({ block: 'start' });
+      document.getElementById(hashTarget)?.scrollIntoView({ block: 'start' });
     }, 80);
   }, [activeTab]);
 
@@ -164,7 +169,7 @@ function SettingsPageInner() {
         </div>
       </div>
 
-      <div className="p-4 md:p-8 max-w-4xl">
+      <div className={`p-4 md:p-8 w-full ${activeTab === 'marty-sandbox' ? 'max-w-[112rem]' : 'max-w-4xl'}`}>
         {banner && (
           <div
             className={`card border-l-4 mb-6 ${
@@ -190,6 +195,7 @@ function SettingsPageInner() {
         )}
         {activeTab === 'approvals' && <ApprovalQueueSection />}
         {activeTab === 'system' && <SystemStatusSection />}
+        {activeTab === 'marty-sandbox' && <MartySandboxSection />}
       </div>
 
       {showFirstConnect && (
@@ -238,7 +244,10 @@ function SyncIntegrationsTab({
 
       <EmailSyncSection outlook={status?.outlook ?? null} />
 
-      <EmailHistoricalBackfillSection isOutlookConnected={status?.outlook?.status === 'connected'} />
+      <EmailHistoricalBackfillSection
+        isOutlookConnected={status?.outlook?.status === 'connected' || status?.outlook?.status === 'auth_failed'}
+        needsOutlookRefresh={status?.outlook?.status === 'auth_failed'}
+      />
 
       <FireflyHistoricalBackfillSection />
 
@@ -268,12 +277,17 @@ function SyncIntegrationsTab({
         ) : status ? (
           <div className="space-y-3">
             <IntegrationRowView
+              anchorId="outlook-integration-refresh"
               name="Microsoft Outlook 365"
               description="Email, calendar, and contacts via Microsoft Graph. Also used for campaign sends."
               row={status.outlook}
               onPrimaryClick={connectOutlook}
               primaryLabel={
-                status.outlook.status === 'connected' ? 'Reconnect' : 'Connect'
+                status.outlook.status === 'auth_failed' || status.outlook.token_healthy === false
+                  ? 'Refresh'
+                  : status.outlook.status === 'connected'
+                    ? 'Reconnect'
+                  : 'Connect'
               }
             />
             <IntegrationRowView
@@ -357,18 +371,18 @@ function connectionTone(row: IntegrationRow | null): {
   }
   if (row.status === 'auth_failed' || row.token_healthy === false) {
     return {
-      label: 'Needs reconnect',
+      label: 'Refresh needed',
       dot: 'bg-semantic-error',
       bg: 'bg-semantic-error/10',
       text: 'text-semantic-error',
-      help: 'Outlook is not currently syncing. Reconnect Microsoft Outlook below to resume updates.',
+      help: 'Live updates are paused while Outlook waits for a refresh. Use the Microsoft Outlook refresh button in Integrations below to resume email and calendar activity.',
     };
   }
   return {
     label: 'Not connected',
-    dot: 'bg-semantic-error',
-    bg: 'bg-semantic-error/10',
-    text: 'text-semantic-error',
+    dot: 'bg-text-muted',
+    bg: 'bg-white/5',
+    text: 'text-text-muted',
     help: 'Connect Microsoft Outlook to sync email and meetings into MARTy.',
   };
 }
@@ -490,9 +504,10 @@ function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
 
   const tone = connectionTone(outlook);
   const isHealthy = outlook?.status === 'connected' && outlook.token_healthy !== false;
+  const needsRefresh = outlook?.status === 'auth_failed' || outlook?.token_healthy === false;
 
   return (
-    <div className="card">
+    <div id="live-outlook-sync" className="card scroll-mt-24">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between mb-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -513,7 +528,9 @@ function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
       <div className={`rounded-lg border px-3 py-2 text-xs mb-4 ${
         isHealthy
           ? 'border-semantic-success/20 bg-semantic-success/5 text-text-secondary'
-          : 'border-semantic-error/25 bg-semantic-error/10 text-semantic-error'
+          : needsRefresh
+          ? 'border-semantic-error/30 bg-semantic-error/10 text-text-secondary'
+          : 'border-border/60 bg-white/5 text-text-secondary'
       }`}>
         {tone.help}
         {outlook?.last_sync && (
@@ -525,7 +542,7 @@ function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
         <BackfillStat
           label="Mailbox"
           value={outlook?.connected_email || (isHealthy ? 'Connected' : 'Not connected')}
-          hint={outlook?.connected_email ? 'Connected Microsoft account' : 'Reconnect Outlook to identify the mailbox'}
+          hint={outlook?.connected_email ? 'Connected Microsoft account' : 'Connect Outlook to identify the mailbox'}
         />
         <BackfillStat
           label="First-time import"
@@ -535,7 +552,7 @@ function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
         <BackfillStat
           label="Live updates"
           value={isHealthy ? 'On' : 'Paused'}
-          hint={isHealthy ? 'New mail and calendar changes keep flowing' : 'Reconnect Outlook to resume automatic sync'}
+          hint={isHealthy ? 'New mail and calendar changes keep flowing' : needsRefresh ? 'Refresh Outlook to resume automatic sync' : 'Connect Outlook to start automatic sync'}
         />
       </div>
 
@@ -589,7 +606,13 @@ function fmtDuration(s: number | null | undefined): string {
   return `${h}h ${mm}m`;
 }
 
-function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConnected: boolean }) {
+function EmailHistoricalBackfillSection({
+  isOutlookConnected,
+  needsOutlookRefresh = false,
+}: {
+  isOutlookConnected: boolean;
+  needsOutlookRefresh?: boolean;
+}) {
   const [me, setMe] = React.useState<UserProfile | null>(null);
   const [eligibleUsers, setEligibleUsers] = React.useState<Array<{
     id: string; email: string; full_name: string | null; role: string;
@@ -700,7 +723,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
   const currentBatch = windows.find((w: any) => w.status === 'in_progress');
 
   return (
-    <div className="card">
+    <div id="email-history-import" className="card scroll-mt-24">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-4">
         <div>
           <div className="flex items-center gap-2">
@@ -718,6 +741,12 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
           </div>
         </div>
       </div>
+
+      {needsOutlookRefresh && (
+        <div className="mb-4 rounded-lg border border-semantic-error/30 bg-semantic-error/10 px-3 py-2 text-xs leading-5 text-text-secondary">
+          Refresh Outlook in the Integrations section below before starting a catch-up import.
+        </div>
+      )}
 
       {isOwner && eligibleUsers.length > 1 && (
         <div className="mb-4">
@@ -747,7 +776,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
               <button
                 key={d}
                 onClick={() => { setDays(d); setConfirmOpen(true); }}
-                disabled={loading}
+                disabled={loading || needsOutlookRefresh}
                 className="btn-secondary text-xs py-1.5 flex items-center gap-2"
               >
                 <Clock size={13} /> Last {d} days
@@ -755,7 +784,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
             ))}
             <button
               onClick={() => setDateRangeOpen(true)}
-              disabled={loading}
+              disabled={loading || needsOutlookRefresh}
               className="btn-secondary text-xs py-1.5 flex items-center gap-2"
             >
               <Calendar size={13} /> Custom Date Range
@@ -868,7 +897,7 @@ function EmailHistoricalBackfillSection({ isOutlookConnected }: { isOutlookConne
             </div>
             <div className="flex justify-end gap-3">
               <button className="btn-ghost" onClick={() => setConfirmOpen(false)}>Cancel</button>
-              <button className="btn-primary" disabled={loading} onClick={() => startBackfill(days)}>
+              <button className="btn-primary" disabled={loading || needsOutlookRefresh} onClick={() => startBackfill(days)}>
                 {loading ? 'Starting...' : 'Start'}
               </button>
             </div>
@@ -973,23 +1002,25 @@ function ProgressiveDateRangeModal({
 
 // ─── Fireflies Historical Backfill (progressive, server-side, cron-driven) ─
 //
-// Sibling to EmailHistoricalBackfillSection. Owner-gated entirely (the
-// underlying admin endpoints require role='owner'); the section returns null
-// for non-owners. UX mirrors the Outlook section but the trigger modal also
-// requires a Fireflies API key (one-time per backfill — encrypted server-side
-// via TOKEN_ENCRYPTION_KEY, nuked when the parent flips to completed/cancelled,
-// per Phase F's least-privilege design for transactional secrets).
-//
-// User-on-behalf-of selector reuses /backfill/eligible-users (lists Outlook-
-// connected users in the org). Tony, the only org user we expect to need
-// Fireflies recovery in this wave, is Outlook-connected, so this list is a
-// fine proxy for "active org users" without adding a new backend endpoint.
+// Every member gets a self-service import lane backed by their own stored
+// Fireflies API key. Owners can inspect/start imports for org members, but the
+// selected member's credential state drives the controls so Tony's key is never
+// implied to work for Alvaro.
 
 // Phase 4 1c (2026-05-04): dropped 180 — backend MAX_BACKFILL_DAYS is now
 // 120 (src/lib/firefly-progressive-backfill.ts); a 180-day request would
 // be rejected. Custom Date Range is the escape hatch for >90-day windows
 // up to the 120-day cap.
 const FIREFLY_PROGRESSIVE_DAYS_OPTIONS: Array<30 | 60 | 90> = [30, 60, 90];
+
+type FireflyCredentialStatus = {
+  exists: boolean;
+  user_id?: string;
+  created_at?: string | null;
+  rotation_count: number;
+  last_used_at: string | null;
+  updated_at: string | null;
+};
 
 function FireflyHistoricalBackfillSection() {
   const [me, setMe] = React.useState<UserProfile | null>(null);
@@ -1001,6 +1032,7 @@ function FireflyHistoricalBackfillSection() {
     parent: any | null;
     windows: any[];
   } | null>(null);
+  const [targetCredStatus, setTargetCredStatus] = React.useState<FireflyCredentialStatus | null>(null);
   const [days, setDays] = React.useState<30 | 60 | 90>(90);
   const [triggerOpen, setTriggerOpen] = React.useState(false);
   const [dateRangeOpen, setDateRangeOpen] = React.useState(false);
@@ -1010,14 +1042,9 @@ function FireflyHistoricalBackfillSection() {
 
   // Phase 4 1c (2026-05-04): persistent credential state. Drives the
   // Credentials sub-section UI and the disabled-state of all backfill
-  // buttons. Credential ownership is per-user — only the caller's own
-  // credential is queryable from here (backend auth-gates ctx.userId).
-  const [credStatus, setCredStatus] = React.useState<{
-    exists: boolean;
-    rotation_count: number;
-    last_used_at: string | null;
-    updated_at: string | null;
-  } | null>(null);
+  // buttons. Credential ownership is per-user; members can only manage their
+  // own key, while owners can see target-key status without plaintext.
+  const [credStatus, setCredStatus] = React.useState<FireflyCredentialStatus | null>(null);
   const [credLoading, setCredLoading] = React.useState(false);
   const [credInput, setCredInput] = React.useState('');
   const [credShowKey, setCredShowKey] = React.useState(false);
@@ -1043,7 +1070,11 @@ function FireflyHistoricalBackfillSection() {
     try {
       const r = await api.getFireflyProgressiveBackfillProgress(selectedUserId);
       setProgress({ parent: r.parent, windows: r.windows });
-    } catch { /* ignore — owner-gated, may 403 for non-owners */ }
+      setTargetCredStatus(r.credential_status ?? null);
+    } catch {
+      setProgress(null);
+      setTargetCredStatus(null);
+    }
   }, [selectedUserId]);
 
   React.useEffect(() => { fetchProgress(); }, [fetchProgress]);
@@ -1071,6 +1102,8 @@ function FireflyHistoricalBackfillSection() {
       const r = await api.getMyFireflyCredential();
       setCredStatus({
         exists: r.status.exists,
+        user_id: r.status.user_id,
+        created_at: r.status.created_at,
         rotation_count: r.status.rotation_count,
         last_used_at: r.status.last_used_at,
         updated_at: r.status.updated_at,
@@ -1089,6 +1122,7 @@ function FireflyHistoricalBackfillSection() {
       setCredEditOpen(false);
       setToast(r.stored === 'created' ? 'API key saved' : 'API key rotated');
       await fetchCredStatus();
+      await fetchProgress();
     } catch (e: any) {
       setToast(`Save failed: ${e?.message || 'unknown'}`);
     }
@@ -1102,6 +1136,7 @@ function FireflyHistoricalBackfillSection() {
       await api.revokeMyFireflyCredential();
       setToast('API key revoked');
       await fetchCredStatus();
+      await fetchProgress();
     } catch (e: any) {
       setToast(`Revoke failed: ${e?.message || 'unknown'}`);
     }
@@ -1110,7 +1145,8 @@ function FireflyHistoricalBackfillSection() {
 
   // Phase 4 1c: fireflies_api_key is no longer collected per-trigger.
   // Backend driver resolves the persistent credential row written by
-  // saveCredential above. Buttons disable when credStatus.exists is false.
+  // saveCredential above. Buttons disable when the selected member has no
+  // stored credential.
   async function startDaysBackfill(daysBack: 30 | 60 | 90) {
     if (!selectedUserId) return;
     setLoading(true);
@@ -1142,10 +1178,14 @@ function FireflyHistoricalBackfillSection() {
     setLoading(false);
   }
 
-  // Owner-only — backend endpoints all require role='owner'. Hide for
-  // members so we don't show controls that would 403 on every action.
-  if (!isOwner) return null;
-
+  const selectedIsSelf = selectedUserId === me?.id;
+  const selectedUser = eligibleUsers.find(u => u.id === selectedUserId);
+  const selectedName = selectedIsSelf
+    ? 'you'
+    : (selectedUser?.full_name || selectedUser?.email || 'this member');
+  const targetCredentialStatus = selectedIsSelf ? credStatus : targetCredStatus;
+  const credentialCheckLoading = selectedIsSelf ? credStatus === null : targetCredStatus === null;
+  const selectedHasCredential = targetCredentialStatus?.exists === true;
   const status = progress?.parent?.status;
   const windows = progress?.windows ?? [];
   const isActive = status === 'active';
@@ -1167,7 +1207,7 @@ function FireflyHistoricalBackfillSection() {
   const totalWindows = progress?.parent?.total_windows ?? windows.length;
   const targetUserLabel = selectedUserId === me?.id
     ? 'yourself'
-    : (eligibleUsers.find(u => u.id === selectedUserId)?.email ?? 'this user');
+    : (selectedUser?.full_name || selectedUser?.email || 'this member');
   const percentComplete = totalWindows > 0 ? Math.round((completedCount / totalWindows) * 100) : 0;
   const currentBatch = windows.find((w: any) => w.status === 'in_progress');
 
@@ -1196,7 +1236,11 @@ function FireflyHistoricalBackfillSection() {
           <div className="text-xs text-text-muted mb-1">Import for</div>
           <select
             value={selectedUserId ?? ''}
-            onChange={e => setSelectedUserId(e.target.value)}
+            onChange={e => {
+              setSelectedUserId(e.target.value);
+              setCredEditOpen(false);
+              setCredInput('');
+            }}
             className="input text-sm py-1.5 px-3 w-72"
           >
             {eligibleUsers.map(u => (
@@ -1214,42 +1258,56 @@ function FireflyHistoricalBackfillSection() {
           (modals asking for a key the backend already has). */}
       <div className="mb-4 rounded-lg p-3" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
         <div className="flex items-center justify-between gap-3 mb-2">
-          <div className="text-xs font-medium text-text-secondary uppercase tracking-wide">Fireflies API key</div>
-          {credStatus?.exists && (
+          <div className="text-xs font-medium text-text-secondary uppercase tracking-wide">
+            {selectedIsSelf ? 'Your Fireflies API key' : `${selectedName}'s Fireflies API key`}
+          </div>
+          {selectedHasCredential && (
             <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold"
               style={{ background: 'rgba(34,197,94,0.15)', color: '#86EFAC' }}>
               SAVED
             </span>
           )}
         </div>
-        {credStatus === null ? (
+        {credentialCheckLoading ? (
           <div className="text-xs text-text-muted">Checking credential…</div>
-        ) : credStatus.exists ? (
+        ) : selectedHasCredential ? (
           <div>
             <div className="text-xs text-text-secondary">
-              {credStatus.rotation_count > 0
-                ? `Rotated ${credStatus.rotation_count}× since first set.`
-                : 'Stored — encrypted at rest, used automatically by every meeting import below.'}
-              {credStatus.last_used_at && (
-                <> Last used {new Date(credStatus.last_used_at).toISOString().slice(0, 10)}.</>
+              {selectedIsSelf
+                ? (credStatus?.rotation_count && credStatus.rotation_count > 0
+                  ? `Rotated ${credStatus.rotation_count}x since first set.`
+                  : 'Stored, encrypted at rest, and used automatically by your meeting imports.')
+                : `Stored for ${selectedName}. Imports for this member use their own saved credential.`}
+              {targetCredentialStatus?.last_used_at && (
+                <> Last used {new Date(targetCredentialStatus.last_used_at).toISOString().slice(0, 10)}.</>
               )}
             </div>
-            <div className="flex gap-2 mt-2">
-              <button
-                onClick={() => { setCredInput(''); setCredEditOpen(true); }}
-                disabled={credLoading}
-                className="btn-ghost text-xs py-1.5"
-              >
-                Rotate
-              </button>
-              <button
-                onClick={() => setCredRevokeConfirmOpen(true)}
-                disabled={credLoading}
-                className="btn-ghost text-xs py-1.5 text-red-400 hover:text-red-300"
-              >
-                Revoke
-              </button>
-            </div>
+            {selectedIsSelf ? (
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={() => { setCredInput(''); setCredEditOpen(true); }}
+                  disabled={credLoading}
+                  className="btn-ghost text-xs py-1.5"
+                >
+                  Rotate
+                </button>
+                <button
+                  onClick={() => setCredRevokeConfirmOpen(true)}
+                  disabled={credLoading}
+                  className="btn-ghost text-xs py-1.5 text-red-400 hover:text-red-300"
+                >
+                  Revoke
+                </button>
+              </div>
+            ) : (
+              <div className="mt-2 text-xs text-text-muted">
+                Only this member can rotate or revoke their own key from their account.
+              </div>
+            )}
+          </div>
+        ) : !selectedIsSelf ? (
+          <div className="text-xs text-text-secondary">
+            {selectedName} needs to save their Fireflies API key from their own account before meeting transcripts can be imported for them.
           </div>
         ) : (
           <div>
@@ -1301,7 +1359,7 @@ function FireflyHistoricalBackfillSection() {
 
       {/* Rotate flow when credential already exists — shows the same input
           but submits as a rotation rather than a fresh save. */}
-      {credEditOpen && credStatus?.exists && (
+      {selectedIsSelf && credEditOpen && credStatus?.exists && (
         <div className="mb-4 rounded-lg p-3" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(139,92,246,0.3)' }}>
           <div className="text-xs font-medium text-text-secondary uppercase tracking-wide mb-2">Rotate API key</div>
           <div className="flex gap-2">
@@ -1339,9 +1397,11 @@ function FireflyHistoricalBackfillSection() {
           <div className="text-xs text-text-secondary mb-3">
             No meeting history import is running. Start one to recover older Fireflies transcripts
             in the background without keeping this page open.
-            {!credStatus?.exists && (
+            {!selectedHasCredential && (
               <span className="block mt-1 text-text-muted">
-                Save your API key above to enable meeting imports.
+                {selectedIsSelf
+                  ? 'Save your API key above to enable meeting imports.'
+                  : `${selectedName} needs to save their Fireflies API key before an import can start.`}
               </span>
             )}
           </div>
@@ -1350,7 +1410,7 @@ function FireflyHistoricalBackfillSection() {
               <button
                 key={d}
                 onClick={() => { setDays(d); setTriggerOpen(true); }}
-                disabled={loading || !credStatus?.exists}
+                disabled={loading || !selectedHasCredential}
                 className="btn-secondary text-xs py-1.5 flex items-center gap-2"
               >
                 <Mic size={13} /> Last {d} days
@@ -1358,7 +1418,7 @@ function FireflyHistoricalBackfillSection() {
             ))}
             <button
               onClick={() => setDateRangeOpen(true)}
-              disabled={loading || !credStatus?.exists}
+              disabled={loading || !selectedHasCredential}
               className="btn-secondary text-xs py-1.5 flex items-center gap-2"
             >
               <Calendar size={13} /> Custom Date Range
@@ -2948,6 +3008,7 @@ function statusColor(s: IntegrationRow['status']): string {
 }
 
 function IntegrationRowView({
+  anchorId,
   name,
   description,
   row,
@@ -2955,6 +3016,7 @@ function IntegrationRowView({
   onPrimaryClick,
   primaryDisabled,
 }: {
+  anchorId?: string;
   name: string;
   description: string;
   row: IntegrationRow;
@@ -2965,14 +3027,14 @@ function IntegrationRowView({
   const [copied, setCopied] = React.useState(false);
 
   const rateLimitColor =
-    row.rate_limit_status === 'auth_failed'
+    row.status === 'auth_failed' || row.rate_limit_status === 'auth_failed'
       ? 'text-semantic-error'
       : row.rate_limit_status === 'rate_limited'
         ? 'text-semantic-warning'
         : '';
 
   return (
-    <div className="flex items-start justify-between py-4 border-b border-border/50 last:border-0 gap-4">
+    <div id={anchorId} className="flex scroll-mt-28 items-start justify-between py-4 border-b border-border/50 last:border-0 gap-4">
       <div className="min-w-0 flex-1">
         <div className="text-sm font-medium text-text-primary">{name}</div>
         <div className="text-xs text-text-secondary mt-0.5">{description}</div>
@@ -3223,16 +3285,68 @@ function SystemStatusSection() {
         inventory={data.work_queue_inventory}
         stuck={data.stuck_work_queue}
       />
-      <MartyLabStatusCard lab={data.marty_lab || emptyMartyLab} onRefresh={load} />
       <DealReplayStatusCard replay={data.deal_replay || emptyDealReplay} onRefresh={load} />
+    </div>
+  );
+}
+
+function MartySandboxSection() {
+  const [data, setData] = React.useState<SystemStatusResponse | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const load = React.useCallback(() => {
+    api.getSettingsSystemStatus().then(setData).catch(e => setError(e?.message || 'Failed to load MARTy Sandbox'));
+  }, []);
+
+  React.useEffect(() => {
+    load();
+    const id = window.setInterval(load, 10_000);
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  if (error) {
+    return (
+      <div className="card p-6">
+        <div className="text-sm text-semantic-error">{error}</div>
+        <button onClick={load} className="btn-secondary text-xs mt-3">Retry</button>
+      </div>
+    );
+  }
+  if (!data) {
+    return <div className="card p-6 text-sm text-text-muted">Loading MARTy Sandbox...</div>;
+  }
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <div className="text-xl font-semibold text-text-primary">MARTy Sandbox</div>
+        <div className="mt-1 max-w-3xl text-sm leading-relaxed text-text-muted">
+          A controlled canary queue for testing one MARTy improvement at a time. Each canary waits for a human Ship or Reject decision before the next request starts.
+        </div>
+      </div>
+      <MartyLabStatusCard lab={data.marty_lab || emptyMartyLab} onRefresh={load} />
     </div>
   );
 }
 
 const emptyMartyLab: MartyLabStatusSnapshot = {
   run: null,
+  recent_runs: [],
+  queued_runs: [],
   experiments: [],
   upgrade_candidates: [],
+  versions: [],
+  upgrade_trials: [],
+  deep_work_items: [],
+  code_patch_jobs: [],
+  readiness: {
+    ok: false,
+    harness_version: 'unknown',
+    generated_at: new Date().toISOString(),
+    blockers: ['Readiness has not loaded yet.'],
+    warnings: [],
+    checks: [],
+  },
   generated_at: new Date().toISOString(),
 };
 
@@ -3277,14 +3391,17 @@ function ReplayStatusPill({ status }: { status: NonNullable<DealReplayStatusSnap
 }
 
 function MartyLabStatusPill({ status }: { status: string }) {
-  const cfg = status === 'running' || status === 'queued' || status === 'sandbox_applied'
+  const pretty = status.replace(/_/g, ' ');
+  const cfg = status === 'running' || status === 'queued' || status === 'sandbox_applied' || status === 'pending'
     ? { cls: 'bg-accent-purple/15 text-accent-purple', label: status === 'sandbox_applied' ? 'Sandbox applied' : status.charAt(0).toUpperCase() + status.slice(1) }
-    : status === 'completed' || status === 'graded' || status === 'validated'
+    : status === 'completed' || status === 'graded' || status === 'validated' || status === 'accepted'
       ? { cls: 'bg-semantic-success/15 text-semantic-success', label: status.charAt(0).toUpperCase() + status.slice(1) }
-      : status === 'blocked' || status === 'failed' || status === 'rejected'
+    : status === 'blocked' || status === 'failed' || status === 'rejected'
         ? { cls: 'bg-semantic-error/15 text-semantic-error', label: status.charAt(0).toUpperCase() + status.slice(1) }
+        : status === 'cancelled' || status === 'inconclusive'
+          ? { cls: 'bg-semantic-warning/15 text-semantic-warning', label: status.charAt(0).toUpperCase() + status.slice(1) }
         : { cls: 'bg-white/[0.06] text-text-muted', label: status.charAt(0).toUpperCase() + status.slice(1) };
-  return <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${cfg.cls}`}>{cfg.label.replace('_', ' ')}</span>;
+  return <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium capitalize ${cfg.cls}`}>{cfg.label.replace(/_/g, ' ') || pretty}</span>;
 }
 
 function formatLabScore(score: number | null | undefined): string {
@@ -3315,6 +3432,1618 @@ function labEvidenceList(evidence: Record<string, unknown> | null | undefined, k
   return Array.isArray(value) ? value.map(item => String(item)).filter(Boolean) : [];
 }
 
+type MartyLabExperimentRow = MartyLabStatusSnapshot['experiments'][number];
+type MartyLabTrialRow = MartyLabStatusSnapshot['upgrade_trials'][number];
+type MartyLabDeepWorkItemRow = MartyLabStatusSnapshot['deep_work_items'][number];
+type MartyLabCodePatchJobRow = MartyLabStatusSnapshot['code_patch_jobs'][number];
+
+function labRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function titleizeLabValue(value: unknown, fallback = 'Unknown'): string {
+  const raw = String(value || fallback).replace(/_/g, ' ');
+  return raw.replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function labNumber(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function labReadableEvidence(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() || null;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    const text = value.map(item => labReadableEvidence(item)).filter(Boolean).join('\n');
+    return text || null;
+  }
+  const record = labRecord(value);
+  if (record) {
+    const lines = Object.entries(record)
+      .slice(0, 8)
+      .map(([key, item]) => {
+        const text = labReadableEvidence(item);
+        return text ? `${titleizeLabValue(key)}: ${text}` : null;
+      })
+      .filter(Boolean);
+    return lines.length ? lines.join('\n') : null;
+  }
+  return null;
+}
+
+function labDeepWorkBody(item: MartyLabDeepWorkItemRow): string {
+  const evidence = labRecord(item.evidence) || {};
+  const keys = [
+    'recommended_implementation',
+    'implementation',
+    'why_it_matters',
+    'why_it_matters_for_user_experience',
+    'evidence_summary',
+    'summary',
+    'recommendation',
+    'acceptance_tests',
+    'root_cause',
+  ];
+  const parts = keys
+    .map(key => labReadableEvidence(evidence[key]))
+    .filter(Boolean) as string[];
+  if (parts.length > 0) return Array.from(new Set(parts)).join('\n\n');
+  return item.lever_ids.length > 0
+    ? `Candidate levers: ${item.lever_ids.join(', ')}`
+    : `Cluster: ${item.cluster_key}`;
+}
+
+function labCodePatchStatusLabel(status: MartyLabCodePatchJobRow['status']): string {
+  switch (status) {
+    case 'queued':
+      return 'Queued';
+    case 'planning':
+      return 'Writing patch brief';
+    case 'ready_for_agent':
+      return 'Ready for isolated agent';
+    case 'in_agent_worktree':
+      return 'In isolated worktree';
+    case 'ready_for_review':
+      return 'Ready for review';
+    case 'validated':
+      return 'Validated';
+    case 'rejected':
+      return 'Rejected';
+    case 'cancelled':
+      return 'Cancelled';
+    case 'failed':
+      return 'Failed';
+    default:
+      return titleizeLabValue(status);
+  }
+}
+
+function labCodePatchBody(job: MartyLabCodePatchJobRow): string {
+  const patchScope = labRecord(job.patch_scope) || {};
+  const validationPlan = labRecord(job.validation_plan) || {};
+  const evidence = labRecord(job.evidence) || {};
+  const brief = labRecord(patchScope.agent_brief)
+    || labRecord(evidence.planning_output)
+    || null;
+  const parts = [
+    brief?.summary ? `Summary: ${String(brief.summary)}` : null,
+    brief?.patch_plan ? `Patch plan: ${labReadableEvidence(brief.patch_plan)}` : null,
+    patchScope.recommended_files ? `Suggested files: ${labReadableEvidence(patchScope.recommended_files)}` : null,
+    validationPlan.human_like_prompts ? `Human-like prompts: ${labReadableEvidence(validationPlan.human_like_prompts)}` : null,
+    validationPlan.acceptance_tests ? `Acceptance tests: ${labReadableEvidence(validationPlan.acceptance_tests)}` : null,
+  ].filter(Boolean) as string[];
+  return parts.length > 0
+    ? parts.join('\n\n')
+    : 'This lane prepares an isolated code patch brief. It does not ship or deploy MARTy by itself.';
+}
+
+function labFailureClusterBody(cluster: Record<string, unknown>): string {
+  return labReadableEvidence({
+    failed_gate: cluster.failed_gate || cluster.failure_type,
+    reason: cluster.reason || cluster.summary || cluster.note,
+    affected_samples: cluster.count,
+    suggested_next_step: cluster.suggested_next_step || cluster.recommendation,
+  }) || 'Needs diagnosis before it can become a shippable upgrade.';
+}
+
+function labRoundPolicy(exp: MartyLabExperimentRow): { round: number; role: 'discovery' | 'validation' | 'global_guardrail'; sample: number } | null {
+  const meta = labRecord(exp.followup_policy?.lab_round);
+  if (!meta) return null;
+  const role = meta.sample_role === 'discovery' || meta.sample_role === 'validation' || meta.sample_role === 'global_guardrail'
+    ? meta.sample_role
+    : null;
+  const round = labNumber(meta.round_index, 0);
+  const sample = labNumber(meta.sample_index, 1);
+  return role && round > 0 ? { round, role, sample: sample > 0 ? sample : 1 } : null;
+}
+
+function labConversationRoleLabel(exp: MartyLabExperimentRow): string {
+  const meta = labRoundPolicy(exp);
+  if (!meta) return exp.variable_under_test ? 'Validation sample' : 'Discovery sample';
+  if (meta.role === 'discovery') return `Round ${meta.round} discovery`;
+  if (meta.role === 'global_guardrail') return `Round ${meta.round} golden ${meta.sample}`;
+  return `Round ${meta.round} validation ${Math.max(1, meta.sample - 3)}/7`;
+}
+
+function labCurrentRound(
+  run: MartyLabStatusSnapshot['run'],
+  experiments: MartyLabExperimentRow[],
+  fallbackTotal: number
+): number {
+  const fromSummary = labNumber(run?.summary?.current_round, 0);
+  if (fromSummary > 0) return Math.min(fromSummary, fallbackTotal);
+  const highestSeededRound = experiments.reduce((max, exp) => {
+    const meta = labRoundPolicy(exp);
+    return meta ? Math.max(max, meta.round) : max;
+  }, 0);
+  return highestSeededRound > 0 ? Math.min(highestSeededRound, fallbackTotal) : 1;
+}
+
+function labTrialDecisionText(trial: MartyLabTrialRow | null): string {
+  if (!trial) return 'No controlled trial has been created yet.';
+  const local = labRecord(trial.evidence?.local_validation);
+  const global = labRecord(trial.evidence?.global_guardrail);
+  const localSummary = labRecord(local?.summary);
+  const globalSummary = labRecord(global?.summary);
+  if (globalSummary) {
+    return `Global guardrail · ${Number(globalSummary.wins || 0)}W/${Number(globalSummary.losses || 0)}L · ${titleizeLabValue(global?.decision || trial.status)}`;
+  }
+  if (localSummary) {
+    return `Local validation · ${Number(localSummary.wins || 0)}W/${Number(localSummary.losses || 0)}L · ${titleizeLabValue(local?.decision || 'pending global')}`;
+  }
+  const pct = trial.valid_sample_size > 0 ? Math.round((trial.wins / trial.valid_sample_size) * 100) : null;
+  const passLabel = trial.status === 'accepted'
+    ? `${trial.wins}/${trial.valid_sample_size} clean measured wins (${pct ?? 0}%)`
+    : trial.status === 'rejected'
+      ? `${trial.wins}/${trial.valid_sample_size} clean measured wins`
+      : trial.status === 'inconclusive'
+        ? 'Inconclusive sample or regression guardrail'
+        : 'Validation in progress';
+  return `${titleizeLabValue(trial.status)} · ${passLabel}`;
+}
+
+function labTrialRoundIndex(trial: MartyLabTrialRow | null): number {
+  const evidence = labRecord(trial?.evidence);
+  return labNumber(evidence?.round_index, 0);
+}
+
+type MartyLabExperimentPage = {
+  round: number;
+  title: string;
+  trial: MartyLabTrialRow | null;
+  samples: MartyLabExperimentRow[];
+};
+
+const MARTY_LAB_UI_ROUND_SAMPLE_SIZE = 10;
+
+function buildMartyLabExperimentPages(
+  experiments: MartyLabExperimentRow[],
+  trials: MartyLabTrialRow[]
+): MartyLabExperimentPage[] {
+  const byRound = new Map<number, MartyLabExperimentRow[]>();
+  for (const exp of experiments) {
+    const meta = labRoundPolicy(exp);
+    if (!meta?.round) continue;
+    if (meta.role === 'validation' && meta.sample > MARTY_LAB_UI_ROUND_SAMPLE_SIZE) continue;
+    byRound.set(meta.round, [...(byRound.get(meta.round) || []), exp]);
+  }
+  return Array.from(byRound.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([round, samples]) => {
+      const orderedSamples = [...samples].sort((a, b) => {
+        const aMeta = labRoundPolicy(a);
+        const bMeta = labRoundPolicy(b);
+        return (aMeta?.sample || 0) - (bMeta?.sample || 0);
+      });
+      const trial = trials.find(item => labTrialRoundIndex(item) === round)
+        || trials.find(item => orderedSamples.some(sample => sample.replicate_group === item.id))
+        || null;
+      return {
+        round,
+        trial,
+        samples: orderedSamples,
+        title: trial?.title || orderedSamples[0]?.variable_under_test || `Experiment ${round}`,
+      };
+    });
+}
+
+function labDeltaText(delta: number | null): string {
+  if (delta === null) return 'Pending';
+  return `${delta > 0 ? '+' : ''}${Math.round(delta)}`;
+}
+
+function labExperimentOutcome(exp: MartyLabExperimentRow): { label: string; tone: 'good' | 'bad' | 'warn' | 'muted'; note: string } {
+  const meta = labRoundPolicy(exp);
+  const isDiscovery = meta?.role === 'discovery';
+  if (exp.status === 'queued') return { label: 'Queued', tone: 'muted', note: 'Waiting for worker' };
+  if (exp.status === 'running') return { label: 'Running', tone: 'warn', note: isDiscovery ? 'Finding deficiency' : 'Running paired test' };
+  if (exp.status === 'failed') return { label: 'Failed', tone: 'bad', note: exp.recommendation || 'Runner failed' };
+  if (exp.status === 'cancelled') return { label: 'Cancelled', tone: 'muted', note: 'Cancelled' };
+  if (isDiscovery) {
+    const finding = exp.findings.find(item => String((item as any)?.dimension || '') === 'bootcamp_discovery');
+    return { label: 'Discovery', tone: 'warn', note: String((finding as any)?.note || exp.recommendation || 'Discovery completed') };
+  }
+  if (exp.privacy_failure || exp.status === 'blocked') return { label: 'Privacy fail', tone: 'bad', note: exp.recommendation || 'Privacy gate blocked candidate' };
+
+  const baseline = typeof exp.baseline_score === 'number' ? exp.baseline_score : null;
+  const candidate = typeof exp.candidate_score === 'number' ? exp.candidate_score : null;
+  if (baseline === null || candidate === null) return { label: 'No grade', tone: 'warn', note: exp.recommendation || 'Missing paired grade' };
+  const delta = candidate - baseline;
+  const evaluator = labRecord(exp.tool_trace?.evaluator);
+  const regressions = Array.isArray(evaluator?.pareto_regressions) ? evaluator?.pareto_regressions : [];
+  const artifactReview = labRecord(exp.tool_trace?.artifact_review);
+  if (artifactReview?.required === true && artifactReview.pass !== true) {
+    return { label: 'Artifact loss', tone: 'bad', note: titleizeLabValue(artifactReview.decision || 'artifact did not beat baseline') };
+  }
+  if (regressions.length > 0) {
+    return { label: 'Regression', tone: 'bad', note: `${regressions.length} protected priority regression${regressions.length === 1 ? '' : 's'}` };
+  }
+  if (delta > 0) return { label: 'Win', tone: 'good', note: exp.recommendation || 'Candidate beat baseline' };
+  if (delta < 0) return { label: 'Loss', tone: 'bad', note: exp.recommendation || 'Baseline beat candidate' };
+  return { label: 'Tie', tone: 'muted', note: exp.recommendation || 'No clear improvement' };
+}
+
+function labArtifactResultText(exp: MartyLabExperimentRow): string {
+  const artifactReview = labRecord(exp.tool_trace?.artifact_review);
+  if (!artifactReview?.required) return '—';
+  const baseline = labRecord(artifactReview.baseline);
+  const candidate = labRecord(artifactReview.candidate);
+  const delta = Number(artifactReview.score_delta || 0);
+  const verdict = artifactReview.pass === true ? 'Win' : 'Loss';
+  return `${verdict} · ${String(baseline?.score ?? '—')}→${String(candidate?.score ?? '—')} (${delta > 0 ? '+' : ''}${delta})`;
+}
+
+function labApprovalAssessment(trial: MartyLabTrialRow | null): Record<string, unknown> | null {
+  return labRecord(trial?.evidence?.approval_assessment);
+}
+
+function labRationaleList(assessment: Record<string, unknown> | null): string[] {
+  const value = assessment?.rationale;
+  return Array.isArray(value) ? value.map(item => String(item)).filter(Boolean).slice(0, 4) : [];
+}
+
+function labExperimentTagline(page: MartyLabExperimentPage | null): string {
+  const title = [
+    page?.title,
+    page?.trial?.upgrade_key,
+    String(labRecord(page?.trial?.evidence?.upgrade)?.deficiency || ''),
+    String(labRecord(page?.trial?.evidence?.approval_assessment)?.target_kind || ''),
+  ].join(' ').toLowerCase();
+  if (title.includes('xlsx') || title.includes('excel') || title.includes('workbook') || title.includes('formula')) {
+    return 'Improves Excel artifact creation. Ensures workbook tabs, rows, and formulas are populated correctly.';
+  }
+  if (title.includes('docx') || title.includes('memo') || title.includes('document')) {
+    return 'Improves Word document creation. Produces richer, better-structured memos with usable tables and sections.';
+  }
+  if (title.includes('pptx') || title.includes('deck') || title.includes('presentation')) {
+    return 'Improves PowerPoint deck creation. Produces more complete slides with stronger narrative structure and notes.';
+  }
+  if (title.includes('privacy') || title.includes('permission')) {
+    return 'Improves privacy boundaries. Keeps answers useful while avoiding information the user should not see.';
+  }
+  if (title.includes('retrieval') || title.includes('source') || title.includes('document-first')) {
+    return 'Improves context retrieval. Finds the right source material before answering or creating artifacts.';
+  }
+  if (title.includes('conversation') || title.includes('memory') || title.includes('intent')) {
+    return 'Improves conversation carry. Helps MARTy remember the latest user intent across follow-up turns.';
+  }
+  return 'Improves MARTy response quality for this workflow while checking for regressions against the current baseline.';
+}
+
+type MartyLabTone = 'good' | 'warn' | 'bad' | 'purple' | 'muted';
+
+function martyToneClasses(tone: MartyLabTone): { box: string; text: string; border: string; soft: string } {
+  if (tone === 'good') return {
+    box: 'border-semantic-success/25 bg-semantic-success/10 text-semantic-success',
+    text: 'text-semantic-success',
+    border: 'border-semantic-success/25',
+    soft: 'bg-semantic-success/5',
+  };
+  if (tone === 'warn') return {
+    box: 'border-semantic-warning/25 bg-semantic-warning/10 text-semantic-warning',
+    text: 'text-semantic-warning',
+    border: 'border-semantic-warning/25',
+    soft: 'bg-semantic-warning/5',
+  };
+  if (tone === 'bad') return {
+    box: 'border-semantic-error/25 bg-semantic-error/10 text-semantic-error',
+    text: 'text-semantic-error',
+    border: 'border-semantic-error/25',
+    soft: 'bg-semantic-error/5',
+  };
+  if (tone === 'purple') return {
+    box: 'border-accent-purple/25 bg-accent-purple/10 text-accent-purple',
+    text: 'text-accent-purple',
+    border: 'border-accent-purple/25',
+    soft: 'bg-accent-purple/5',
+  };
+  return {
+    box: 'border-white/10 bg-white/[0.04] text-text-muted',
+    text: 'text-text-muted',
+    border: 'border-white/10',
+    soft: 'bg-white/[0.025]',
+  };
+}
+
+function labRunModeLabel(run: MartyLabRunSnapshot | null | undefined): string {
+  if (!run) return 'No run';
+  return run.upgrade_variable?.mode === 'canary' || run.suite_name.includes('canary') ? 'Canary' : 'Full lab';
+}
+
+function labRunShortTitle(run: MartyLabRunSnapshot | null | undefined): string {
+  if (!run) return 'Next sandbox request';
+  return run.upgrade_title || String(run.summary?.current_upgrade_title || '') || run.candidate_label || labRunModeLabel(run);
+}
+
+function labRunPhase(run: MartyLabRunSnapshot | null | undefined): string | null {
+  if (!run) return null;
+  return String(run.bootcamp_phase || run.summary?.current_phase || run.summary?.bootcamp_phase || '').trim() || null;
+}
+
+function labRunPhaseLabel(phase: string | null | undefined): string {
+  if (phase === 'round_discovery') return 'finding the next weakness';
+  if (phase === 'round_validation') return 'testing a candidate fix';
+  if (phase === 'round_inconclusive_needs_review') return 'waiting for review';
+  if (phase === 'bootcamp_complete') return 'ready for a decision';
+  if (phase === 'human_shipped') return 'shipped';
+  if (phase === 'human_rejected') return 'rejected';
+  return phase ? phase.replace(/_/g, ' ') : 'running';
+}
+
+function labRunNeedsDecision(run: MartyLabRunSnapshot | null | undefined): boolean {
+  return Boolean(run && run.status === 'completed' && !['human_shipped', 'human_rejected'].includes(labRunPhase(run) || ''));
+}
+
+function labRunChipState(run: MartyLabRunSnapshot, isCurrent: boolean): { label: string; tone: MartyLabTone } {
+  const phase = labRunPhase(run);
+  if (run.discarded_at || run.discard_reason) return { label: 'Archived', tone: 'warn' };
+  if (run.status === 'running' || run.status === 'configured') return { label: 'Active', tone: 'purple' };
+  if (run.status === 'queued') return { label: 'Queued', tone: 'purple' };
+  if (phase === 'human_shipped') return { label: 'Shipped', tone: 'good' };
+  if (phase === 'human_rejected') return { label: 'Rejected', tone: 'bad' };
+  if (labRunNeedsDecision(run)) return { label: 'Needs decision', tone: 'warn' };
+  if (run.status === 'cancelled') return { label: 'Cancelled', tone: 'muted' };
+  if (run.status === 'failed') return { label: 'Failed', tone: 'bad' };
+  return { label: isCurrent ? 'Current' : 'Finished', tone: 'muted' };
+}
+
+function labRunStateCopy(
+  run: MartyLabRunSnapshot | null,
+  args: {
+    activeTrial: MartyLabTrialRow | null;
+    isQuarantined: boolean;
+    isViewingCurrent: boolean;
+    pausedForRoundReview: boolean;
+    completed: number;
+    total: number;
+    currentRound: number;
+    roundTotal: number;
+    readinessOk: boolean;
+    readinessMessage: string;
+  }
+): { eyebrow: string; title: string; body: string; tone: MartyLabTone } {
+  if (!run) {
+    return {
+      eyebrow: 'Sandbox queue',
+      title: args.readinessOk ? 'Ready for the next controlled run' : 'Not ready to start',
+      body: args.readinessMessage,
+      tone: args.readinessOk ? 'good' : 'warn',
+    };
+  }
+  if (args.isQuarantined) {
+    return {
+      eyebrow: args.isViewingCurrent ? 'Historical run selected' : 'Viewing history',
+      title: 'Archived run: do not use for decisions',
+      body: run.discard_reason || 'This run is kept only as historical context. Use the current run for Ship or Reject decisions.',
+      tone: 'warn',
+    };
+  }
+  if (!args.isViewingCurrent) {
+    return {
+      eyebrow: 'Viewing older result',
+      title: `${labRunModeLabel(run)} from ${formatRelative(run.created_at)}`,
+      body: 'This is a past run. It is useful for learning what happened, but it is not the active run.',
+      tone: 'muted',
+    };
+  }
+  if (args.pausedForRoundReview) {
+    return {
+      eyebrow: 'Human review needed',
+      title: 'Review this experiment before the lab continues',
+      body: 'Approve and continue or reject this experiment to keep the lab moving. Nothing ships from this round by itself.',
+      tone: 'warn',
+    };
+  }
+  if (run.status === 'running' || run.status === 'configured') {
+    const phase = labRunPhaseLabel(labRunPhase(run));
+    return {
+      eyebrow: 'Current run',
+      title: `Experiment ${args.currentRound} of ${args.roundTotal}: ${phase}`,
+      body: `${labRunModeLabel(run)} is comparing a candidate fix against the accepted baseline. ${args.completed}/${args.total || run.total_experiments || 0} checks are complete. New sandbox requests can be queued while this finishes.`,
+      tone: 'purple',
+    };
+  }
+  if (labRunNeedsDecision(run)) {
+    const trialStatus = args.activeTrial?.status ? titleizeLabValue(args.activeTrial.status) : 'Review';
+    return {
+      eyebrow: 'Decision needed',
+      title: `${labRunModeLabel(run)} finished: ${trialStatus}`,
+      body: 'Review the cover page, then Ship or Reject the whole run. The next queued run will not begin until this decision is made.',
+      tone: args.activeTrial?.status === 'accepted' ? 'good' : args.activeTrial?.status === 'rejected' ? 'bad' : 'warn',
+    };
+  }
+  if (labRunPhase(run) === 'human_shipped') {
+    return {
+      eyebrow: 'Finished result',
+      title: 'This run was shipped',
+      body: 'Its accepted upgrade became part of the baseline for future MARTy Sandbox runs.',
+      tone: 'good',
+    };
+  }
+  if (labRunPhase(run) === 'human_rejected') {
+    return {
+      eyebrow: 'Finished result',
+      title: 'This run was rejected',
+      body: 'The existing baseline stayed in place. Use Deep Work or a focused canary for the next attempt.',
+      tone: 'bad',
+    };
+  }
+  return {
+    eyebrow: 'Finished result',
+    title: `${labRunModeLabel(run)} is closed`,
+    body: run.summary?.conclusion ? String(run.summary.conclusion) : 'This run is no longer active.',
+    tone: 'muted',
+  };
+}
+
+function MartyLabDecisionButtons({
+  disabled,
+  deciding,
+  onDecide,
+}: {
+  disabled: boolean;
+  deciding: 'ship' | 'reject' | null;
+  onDecide: (decision: 'ship' | 'reject') => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        onClick={() => onDecide('ship')}
+        disabled={disabled || deciding !== null}
+        className="inline-flex items-center gap-1 rounded-lg border border-semantic-success/25 bg-semantic-success/10 px-3 py-1.5 text-xs font-medium text-semantic-success hover:bg-semantic-success/15 disabled:opacity-45"
+      >
+        <Check size={13} /> {deciding === 'ship' ? 'Shipping...' : 'Ship'}
+      </button>
+      <button
+        type="button"
+        onClick={() => onDecide('reject')}
+        disabled={disabled || deciding !== null}
+        className="inline-flex items-center gap-1 rounded-lg border border-semantic-error/25 bg-semantic-error/10 px-3 py-1.5 text-xs font-medium text-semantic-error hover:bg-semantic-error/15 disabled:opacity-45"
+      >
+        <XIcon size={13} /> {deciding === 'reject' ? 'Rejecting...' : 'Reject'}
+      </button>
+    </div>
+  );
+}
+
+function MartyLabRoundReviewButtons({
+  disabled,
+  reviewing,
+  onReview,
+}: {
+  disabled: boolean;
+  reviewing: 'approve_continue' | 'reject_continue' | null;
+  onReview: (decision: 'approve_continue' | 'reject_continue') => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        onClick={() => onReview('approve_continue')}
+        disabled={disabled || reviewing !== null}
+        className="inline-flex items-center gap-1 rounded-lg border border-semantic-success/25 bg-semantic-success/10 px-3 py-1.5 text-xs font-medium text-semantic-success hover:bg-semantic-success/15 disabled:opacity-45"
+      >
+        <Check size={13} /> {reviewing === 'approve_continue' ? 'Continuing...' : 'Approve and continue lab'}
+      </button>
+      <button
+        type="button"
+        onClick={() => onReview('reject_continue')}
+        disabled={disabled || reviewing !== null}
+        className="inline-flex items-center gap-1 rounded-lg border border-semantic-error/25 bg-semantic-error/10 px-3 py-1.5 text-xs font-medium text-semantic-error hover:bg-semantic-error/15 disabled:opacity-45"
+      >
+        <XIcon size={13} /> {reviewing === 'reject_continue' ? 'Rejecting...' : 'Reject experiment'}
+      </button>
+    </div>
+  );
+}
+
+function MartyLabPageShell({
+  children,
+  pageIndex,
+  pageCount,
+  onPrev,
+  onNext,
+  onSelect,
+}: {
+  children: React.ReactNode;
+  pageIndex: number;
+  pageCount: number;
+  onPrev: () => void;
+  onNext: () => void;
+  onSelect: (index: number) => void;
+}) {
+  const pageLabel = pageIndex === 0 ? 'Cover' : `Experiment ${pageIndex}`;
+  return (
+    <section className="overflow-hidden rounded-lg border border-white/[0.06] bg-white/[0.015]">
+      <div className="flex items-center justify-between gap-3 border-b border-white/[0.05] px-4 py-3">
+        <button
+          type="button"
+          onClick={onPrev}
+          disabled={pageIndex <= 0}
+          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 text-text-secondary hover:bg-white/[0.04] disabled:opacity-40"
+          aria-label="Previous MARTy Lab page"
+        >
+          <ChevronLeft size={16} />
+        </button>
+        <div className="flex min-w-0 flex-1 items-center justify-center gap-3 px-2">
+          <div className="hidden shrink-0 text-[11px] font-medium uppercase tracking-wide text-text-muted sm:block">
+            {pageLabel}
+          </div>
+          <div className="flex min-w-0 items-center justify-center gap-1 overflow-x-auto">
+            {Array.from({ length: pageCount }).map((_, index) => (
+              <button
+                key={index}
+                type="button"
+                onClick={() => onSelect(index)}
+                className={`h-2.5 w-2.5 shrink-0 rounded-full border transition ${
+                  index === pageIndex
+                    ? 'border-accent-magenta bg-accent-magenta'
+                    : 'border-white/15 bg-white/[0.06] hover:bg-white/[0.12]'
+                }`}
+                aria-label={index === 0 ? 'MARTy Lab cover page' : `MARTy Lab experiment ${index}`}
+              />
+            ))}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onNext}
+          disabled={pageIndex >= pageCount - 1}
+          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 text-text-secondary hover:bg-white/[0.04] disabled:opacity-40"
+          aria-label="Next MARTy Lab page"
+        >
+          <ChevronRight size={16} />
+        </button>
+      </div>
+      <div className="min-h-[24rem] p-4">{children}</div>
+    </section>
+  );
+}
+
+function MartyLabMiniStat({
+  label,
+  value,
+  tone = 'default',
+}: {
+  label: string;
+  value: React.ReactNode;
+  tone?: 'default' | 'good' | 'warn' | 'bad' | 'purple';
+}) {
+  const color = tone === 'good'
+    ? 'text-semantic-success'
+    : tone === 'warn'
+      ? 'text-semantic-warning'
+      : tone === 'bad'
+        ? 'text-semantic-error'
+        : tone === 'purple'
+          ? 'text-accent-purple'
+          : 'text-text-primary';
+  return (
+    <div className="rounded-lg border border-white/[0.05] bg-white/[0.025] px-3 py-2">
+      <div className={`text-base font-semibold tabular-nums ${color}`}>{value}</div>
+      <div className="mt-0.5 text-[11px] text-text-muted">{label}</div>
+    </div>
+  );
+}
+
+function MartyLabRoundSampleCard({ sample }: { sample: MartyLabExperimentRow }) {
+  const outcome = labExperimentOutcome(sample);
+  const roundMeta = labRoundPolicy(sample);
+  const delta = typeof sample.candidate_score === 'number' && typeof sample.baseline_score === 'number'
+    ? sample.candidate_score - sample.baseline_score
+    : null;
+  const outcomeTone = outcome.tone === 'good'
+    ? 'bg-semantic-success/15 text-semantic-success'
+    : outcome.tone === 'bad'
+      ? 'bg-semantic-error/15 text-semantic-error'
+      : outcome.tone === 'warn'
+        ? 'bg-semantic-warning/15 text-semantic-warning'
+        : 'bg-white/[0.05] text-text-muted';
+  const label = roundMeta?.role === 'discovery'
+    ? 'Discovery'
+    : roundMeta?.role === 'global_guardrail'
+      ? `Guardrail ${roundMeta.sample}`
+      : `Validation ${Math.max(1, (roundMeta?.sample || 4) - 3)}/7`;
+  const artifactText = labArtifactResultText(sample);
+
+  return (
+    <article className="rounded-lg border border-white/[0.05] bg-black/10 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">{label}</div>
+          <div className="mt-1 text-sm font-medium leading-snug text-text-primary">{sample.goal}</div>
+        </div>
+        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${outcomeTone}`}>{outcome.label}</span>
+      </div>
+      <div className="mt-3 grid grid-cols-3 gap-2">
+        <MartyLabMiniStat label="Baseline" value={formatLabScore(sample.baseline_score)} />
+        <MartyLabMiniStat label="Candidate" value={formatLabScore(sample.candidate_score)} />
+        <MartyLabMiniStat
+          label="Delta"
+          value={labDeltaText(delta)}
+          tone={delta && delta > 0 ? 'good' : delta && delta < 0 ? 'bad' : 'default'}
+        />
+      </div>
+      <div className="mt-3 text-xs leading-relaxed text-text-secondary">{outcome.note}</div>
+      {artifactText !== '—' && <div className="mt-1 text-[11px] text-text-muted">{artifactText}</div>}
+      <details className="mt-3 rounded-md border border-white/[0.04] bg-white/[0.02] px-3 py-2">
+        <summary className="cursor-pointer text-[11px] font-medium uppercase tracking-wide text-text-muted">Prompt</summary>
+        <ExpandableText
+          text={sample.starting_prompt || sample.goal}
+          collapsedLines={4}
+          minToggleChars={220}
+          className="mt-2 text-xs leading-relaxed text-text-secondary"
+        />
+      </details>
+    </article>
+  );
+}
+
+function martyLabExperimentStats(page: MartyLabExperimentPage, expectedSamples = 10) {
+  const validationSamples = page.samples.filter(sample => labRoundPolicy(sample)?.role === 'validation');
+  const closedSamples = page.samples.filter(sample => !['queued', 'running'].includes(sample.status));
+  const scoredValidation = validationSamples.filter(sample => (
+    typeof sample.baseline_score === 'number'
+    && typeof sample.candidate_score === 'number'
+    && !sample.privacy_failure
+  ));
+  const computedDeltas = scoredValidation.map(sample => (sample.candidate_score || 0) - (sample.baseline_score || 0));
+  const computedWins = computedDeltas.filter(delta => delta > 0).length;
+  const computedLosses = computedDeltas.filter(delta => delta < 0).length;
+  const computedAverage = computedDeltas.length
+    ? computedDeltas.reduce((sum, delta) => sum + delta, 0) / computedDeltas.length
+    : null;
+  const trial = page.trial;
+  const useFinalTrialStats = Boolean(trial && trial.status !== 'pending' && trial.valid_sample_size > 0);
+  const validationTotal = Math.max(7, validationSamples.length);
+  const totalSamples = Math.max(expectedSamples, page.samples.length || expectedSamples);
+  const waiting = page.samples.length === 0;
+  const complete = closedSamples.length >= totalSamples;
+  return {
+    totalSamples,
+    closedSamples: closedSamples.length,
+    validationTotal,
+    validSamples: useFinalTrialStats ? trial!.valid_sample_size : scoredValidation.length,
+    wins: useFinalTrialStats ? trial!.wins : computedWins,
+    losses: useFinalTrialStats ? trial!.losses : computedLosses,
+    averageDelta: useFinalTrialStats ? trial!.average_delta : computedAverage,
+    decision: trial && trial.status !== 'pending'
+      ? titleizeLabValue(trial.status)
+      : waiting
+        ? 'Waiting'
+        : complete
+          ? 'Finalizing'
+          : 'Testing now',
+    };
+}
+
+type SandboxViewStateId =
+  | 'idle_ready'
+  | 'running_discovery'
+  | 'running_validation'
+  | 'paused_review'
+  | 'ready_decision'
+  | 'queued'
+  | 'needs_cleanup'
+  | 'historical'
+  | 'failed';
+
+type SandboxViewState = {
+  id: SandboxViewStateId;
+  eyebrow: string;
+  title: string;
+  body: string;
+  tone: MartyLabTone;
+};
+
+function sandboxCheckLabel(key: string): string {
+  const labels: Record<string, string> = {
+    lab_work_queue_clear: 'Stuck sandbox work',
+    round_inconclusive_needs_review: 'Needs your review',
+    no_active_lab_run: 'Another improvement is already running',
+    no_active_lab_run_race: 'Another improvement is already running',
+    one_active_lab_run_per_suite: 'Another improvement is already running',
+    human_decision_required: 'Waiting for Ship or Reject',
+    sandbox_queue_pending: 'Queued improvement waiting',
+  };
+  return labels[key] || titleizeLabValue(key);
+}
+
+function sandboxRunViewState(args: {
+  run: MartyLabRunSnapshot | null;
+  readiness: MartyLabStatusSnapshot['readiness'];
+  activeTrial: MartyLabTrialRow | null;
+  isViewingCurrent: boolean;
+  isQuarantined: boolean;
+  pausedForRoundReview: boolean;
+  canRepairLabQueue: boolean;
+  completed: number;
+  expectedTotal: number;
+  currentRound: number;
+  roundTotal: number;
+}): SandboxViewState {
+  const {
+    run,
+    readiness,
+    activeTrial,
+    isViewingCurrent,
+    isQuarantined,
+    pausedForRoundReview,
+    canRepairLabQueue,
+    completed,
+    expectedTotal,
+    currentRound,
+    roundTotal,
+  } = args;
+
+  if (!run) {
+    if (canRepairLabQueue) {
+      return {
+        id: 'needs_cleanup',
+        eyebrow: 'Sandbox cleanup',
+        title: 'Sandbox cleanup needed',
+        body: 'Some retryable sandbox work is still waiting even though no run is active. Clear it here, then start the next clean canary or lab.',
+        tone: 'warn',
+      };
+    }
+    if (!readiness.ok) {
+      const blocker = readiness.checks.find(check => check.status === 'block');
+      return {
+        id: 'queued',
+        eyebrow: 'Sandbox queue',
+        title: sandboxCheckLabel(blocker?.key || 'sandbox_queue_pending'),
+        body: readiness.blockers[0] || readiness.warnings[0] || 'The next improvement will wait until the current sandbox work finishes.',
+        tone: 'warn',
+      };
+    }
+    return {
+      id: 'idle_ready',
+      eyebrow: 'MARTy Improvement Studio',
+      title: 'Ready to improve MARTy',
+      body: 'Describe a MARTy problem or pick a focus area. The sandbox will test a candidate fix against the current accepted baseline.',
+      tone: 'good',
+    };
+  }
+
+  if (!isViewingCurrent || isQuarantined) {
+    return {
+      id: 'historical',
+      eyebrow: 'Past result',
+      title: 'Viewing a past sandbox result',
+      body: 'This result is useful for learning what happened, but Ship and Reject decisions only apply to the current completed run.',
+      tone: 'muted',
+    };
+  }
+
+  if (pausedForRoundReview) {
+    return {
+      id: 'paused_review',
+      eyebrow: 'Needs your review',
+      title: 'Review this experiment to continue',
+      body: 'The lab hit an inconclusive fix. Approve and continue or reject this experiment. Nothing ships from this decision by itself.',
+      tone: 'warn',
+    };
+  }
+
+  if (labRunNeedsDecision(run)) {
+    const status = activeTrial?.status ? titleizeLabValue(activeTrial.status) : 'Review';
+    return {
+      id: 'ready_decision',
+      eyebrow: 'Decision ready',
+      title: `${labRunModeLabel(run)} finished: ${status}`,
+      body: 'Review the evidence on the cover page, then Ship or Reject the whole run. The next queued request waits for that decision.',
+      tone: activeTrial?.status === 'accepted' ? 'good' : activeTrial?.status === 'rejected' ? 'warn' : 'warn',
+    };
+  }
+
+  if (run.status === 'failed') {
+    return {
+      id: 'failed',
+      eyebrow: 'Sandbox issue',
+      title: 'This run failed',
+      body: run.summary?.conclusion ? String(run.summary.conclusion) : 'The sandbox could not complete this run. Review details before starting another one.',
+      tone: 'bad',
+    };
+  }
+
+  if (run.status === 'running' || run.status === 'configured') {
+    const phase = labRunPhase(run);
+    if (phase === 'round_discovery') {
+      return {
+        id: 'running_discovery',
+        eyebrow: 'Live now',
+        title: `Finding weakness ${Math.max(1, currentRound)} of ${roundTotal}`,
+        body: `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks are complete. MARTy is looking for a real gap before it tests a fix.`,
+        tone: 'purple',
+      };
+    }
+    return {
+      id: 'running_validation',
+      eyebrow: 'Live now',
+      title: `Testing fix ${Math.max(1, currentRound)} of ${roundTotal}`,
+      body: `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks are complete. The current candidate is being compared against the accepted baseline.`,
+      tone: 'purple',
+    };
+  }
+
+  if (labRunPhase(run) === 'human_shipped') {
+    return {
+      id: 'historical',
+      eyebrow: 'Shipped',
+      title: 'This improvement was shipped',
+      body: 'The accepted upgrade became the baseline for future sandbox tests.',
+      tone: 'good',
+    };
+  }
+
+  if (labRunPhase(run) === 'human_rejected') {
+    return {
+      id: 'historical',
+      eyebrow: 'Rejected',
+      title: 'This improvement was rejected',
+      body: 'The existing baseline stayed in place. Use the queue or Bigger Fixes to try a deeper follow-up.',
+      tone: 'muted',
+    };
+  }
+
+  return {
+    id: 'historical',
+    eyebrow: 'Closed',
+    title: `${labRunModeLabel(run)} is closed`,
+    body: run.summary?.conclusion ? String(run.summary.conclusion) : 'This run is no longer active.',
+    tone: 'muted',
+  };
+}
+
+function SandboxHeroState({
+  state,
+  progressPct,
+  progressLabel,
+  contextLabel,
+  actions,
+}: {
+  state: SandboxViewState;
+  progressPct?: number | null;
+  progressLabel?: string | null;
+  contextLabel?: string | null;
+  actions?: React.ReactNode;
+}) {
+  const tone = martyToneClasses(state.tone);
+  return (
+    <section className={`rounded-xl border ${tone.border} ${tone.soft} p-5`}>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className={`text-[11px] font-semibold uppercase tracking-wide ${tone.text}`}>{state.eyebrow}</div>
+          <h3 className="mt-1 text-2xl font-semibold leading-tight text-text-primary">{state.title}</h3>
+          <p className="mt-2 max-w-4xl text-sm leading-relaxed text-text-secondary">{state.body}</p>
+          {contextLabel && (
+            <div className="mt-3 text-xs text-text-muted">{contextLabel}</div>
+          )}
+        </div>
+        {actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}
+      </div>
+      {typeof progressPct === 'number' && progressLabel && (
+        <div className="mt-5">
+          <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
+            <div className="h-full rounded-full bg-accent-magenta transition-all" style={{ width: `${Math.max(0, Math.min(100, progressPct))}%` }} />
+          </div>
+          <div className="mt-2 text-xs text-text-muted">{progressLabel}</div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SandboxFocusComposer({
+  value,
+  onChange,
+  onStart,
+  startDisabled,
+  startVerb,
+  startingMode,
+  isBusy,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onStart: () => void;
+  startDisabled: boolean;
+  startVerb: string;
+  startingMode: 'canary' | null;
+  isBusy: boolean;
+}) {
+  const chips = [
+    { label: 'Retrieval', prompt: 'Focus on MARTy finding the right database records, source docs, and prior conversation context before answering.' },
+    { label: 'Conversation carry', prompt: 'Focus on MARTy carrying user intent across short follow-ups and ambiguous messages.' },
+    { label: 'Artifacts', prompt: 'Focus on DOCX, XLSX, and PPTX artifact quality, including formulas, tables, formatting, and visual completeness.' },
+    { label: 'Privacy', prompt: 'Focus on privacy-safe answers that avoid leaking unrelated user or deal information.' },
+    { label: 'Prompt logic', prompt: 'Focus on MARTy system/runtime logic and instruction-following quality.' },
+  ];
+  const title = isBusy ? 'Queue the next focus' : 'What should MARTy improve?';
+  const body = isBusy
+    ? 'The current improvement keeps running. This request will wait its turn.'
+    : 'Use plain language, like you would when telling Codex what went wrong with MARTy.';
+
+  return (
+    <section className="rounded-xl border border-white/[0.08] bg-white/[0.02] p-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h4 className="text-sm font-semibold text-text-primary">{title}</h4>
+          <p className="mt-1 text-xs leading-relaxed text-text-muted">{body}</p>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {chips.map(chip => (
+            <button
+              key={chip.label}
+              type="button"
+              onClick={() => onChange(value.trim() ? `${value.trim()} ${chip.prompt}` : chip.prompt)}
+              className="rounded-full border border-white/10 px-2.5 py-1 text-[11px] text-text-secondary hover:border-accent-purple/30 hover:bg-accent-purple/10 hover:text-accent-purple"
+            >
+              {chip.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input
+          value={value}
+          onChange={event => onChange(event.target.value)}
+          placeholder="Example: MARTy missed the source doc and gave me a generic answer. Focus on retrieval."
+          className="min-w-[18rem] flex-1 rounded-lg border border-white/10 bg-bg-input px-3 py-2.5 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-magenta/50 focus:outline-none"
+        />
+        <button
+          type="button"
+          onClick={onStart}
+          disabled={startDisabled}
+          className="inline-flex items-center gap-1 rounded-lg border border-accent-magenta/25 bg-accent-magenta/10 px-3 py-2 text-xs font-medium text-accent-magenta hover:bg-accent-magenta/15 disabled:opacity-50"
+        >
+          <Sparkles size={14} /> {startingMode === 'canary' ? `${startVerb}ing...` : `${startVerb} canary`}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function SandboxEvidenceDrawer({
+  title = 'Evidence Details',
+  children,
+}: {
+  title?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <details className="rounded-lg border border-white/[0.06] bg-black/10">
+      <summary className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-xs font-medium text-text-primary">
+        <span>{title}</span>
+        <ChevronDown size={14} className="text-text-muted" />
+      </summary>
+      <div className="border-t border-white/[0.05] p-3">{children}</div>
+    </details>
+  );
+}
+
+function SandboxRunPager({
+  pageIndex,
+  pageCount,
+  onPrev,
+  onNext,
+  onSelect,
+  children,
+}: {
+  pageIndex: number;
+  pageCount: number;
+  onPrev: () => void;
+  onNext: () => void;
+  onSelect: (index: number) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-xl border border-white/[0.08] bg-white/[0.015]">
+      <div className="flex items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
+        <div>
+          <div className="text-xs font-semibold text-text-primary">Run workspace</div>
+          <div className="mt-0.5 text-[11px] text-text-muted">
+            {pageIndex === 0 ? 'Cover page' : `Experiment ${pageIndex} page`} · {pageCount} page{pageCount === 1 ? '' : 's'}
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={onPrev}
+            disabled={pageIndex <= 0}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 text-text-secondary hover:bg-white/[0.04] disabled:opacity-35"
+            aria-label="Previous sandbox page"
+          >
+            <ChevronLeft size={16} />
+          </button>
+          <div className="flex max-w-[18rem] items-center gap-1 overflow-x-auto">
+            {Array.from({ length: pageCount }).map((_, index) => (
+              <button
+                key={index}
+                type="button"
+                onClick={() => onSelect(index)}
+                className={`h-2.5 shrink-0 rounded-full border transition ${
+                  index === pageIndex
+                    ? 'w-6 border-accent-magenta bg-accent-magenta'
+                    : 'w-2.5 border-white/15 bg-white/[0.06] hover:bg-white/[0.12]'
+                }`}
+                aria-label={index === 0 ? 'Sandbox cover page' : `Sandbox experiment ${index}`}
+              />
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={onNext}
+            disabled={pageIndex >= pageCount - 1}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 text-text-secondary hover:bg-white/[0.04] disabled:opacity-35"
+            aria-label="Next sandbox page"
+          >
+            <ChevronRight size={16} />
+          </button>
+        </div>
+      </div>
+      <div className="p-5">{children}</div>
+    </section>
+  );
+}
+
+function labHumanPreferenceText(sample: MartyLabExperimentRow): string {
+  const evaluator = labRecord(sample.tool_trace?.evaluator);
+  const preference = labRecord(evaluator?.human_preference) || labRecord(sample.tool_trace?.human_preference);
+  const winner = String(preference?.winner || preference?.pick || preference?.preferred || '').toLowerCase();
+  if (winner.includes('candidate')) return 'Candidate';
+  if (winner.includes('baseline')) return 'Baseline';
+  if (winner.includes('tie')) return 'Tie';
+  return 'Pending';
+}
+
+function SandboxRoundCard({ sample }: { sample: MartyLabExperimentRow }) {
+  const outcome = labExperimentOutcome(sample);
+  const roundMeta = labRoundPolicy(sample);
+  const delta = typeof sample.candidate_score === 'number' && typeof sample.baseline_score === 'number'
+    ? sample.candidate_score - sample.baseline_score
+    : null;
+  const outcomeTone = outcome.tone === 'good'
+    ? 'bg-semantic-success/15 text-semantic-success'
+    : outcome.tone === 'bad'
+      ? 'bg-semantic-error/15 text-semantic-error'
+      : outcome.tone === 'warn'
+        ? 'bg-semantic-warning/15 text-semantic-warning'
+        : 'bg-white/[0.05] text-text-muted';
+  const label = roundMeta?.role === 'discovery'
+    ? 'Discovery'
+    : roundMeta?.role === 'global_guardrail'
+      ? `Guardrail ${roundMeta.sample}`
+      : `Validation ${Math.max(1, (roundMeta?.sample || 4) - 3)}/7`;
+  const artifactText = labArtifactResultText(sample);
+  const humanPick = labHumanPreferenceText(sample);
+
+  return (
+    <article className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">{label}</div>
+          <h5 className="mt-1 text-sm font-semibold leading-snug text-text-primary">{sample.goal}</h5>
+        </div>
+        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${outcomeTone}`}>{outcome.label}</span>
+      </div>
+      <div className="mt-4 grid gap-2 sm:grid-cols-4">
+        <MartyLabMiniStat label="Baseline" value={formatLabScore(sample.baseline_score)} />
+        <MartyLabMiniStat label="Candidate" value={formatLabScore(sample.candidate_score)} />
+        <MartyLabMiniStat
+          label="Delta"
+          value={labDeltaText(delta)}
+          tone={delta && delta > 0 ? 'good' : delta && delta < 0 ? 'bad' : 'default'}
+        />
+        <MartyLabMiniStat
+          label="Human pick"
+          value={humanPick}
+          tone={humanPick === 'Candidate' ? 'good' : humanPick === 'Baseline' ? 'bad' : 'default'}
+        />
+      </div>
+      <p className="mt-3 text-xs leading-relaxed text-text-secondary">{outcome.note}</p>
+      {artifactText !== '—' && <p className="mt-1 text-[11px] text-text-muted">{artifactText}</p>}
+      <SandboxEvidenceDrawer title="Round evidence">
+        <div className="space-y-3">
+          <div>
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Prompt</div>
+            <ExpandableText
+              text={sample.starting_prompt || sample.goal}
+              collapsedLines={4}
+              minToggleChars={220}
+              className="mt-1 text-xs leading-relaxed text-text-secondary"
+            />
+          </div>
+          {sample.recommendation && (
+            <div>
+              <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Outcome summary</div>
+              <p className="mt-1 text-xs leading-relaxed text-text-secondary">{sample.recommendation}</p>
+            </div>
+          )}
+        </div>
+      </SandboxEvidenceDrawer>
+    </article>
+  );
+}
+
+function SandboxCoverPage({
+  run,
+  viewState,
+  runIsCanary,
+  currentRound,
+  roundTotal,
+  visibleRoundTotal,
+  completed,
+  expectedTotal,
+  progressPct,
+  acceptedTrialCount,
+  rejectedTrialCount,
+  inconclusiveTrialCount,
+  privacyFailures,
+  activeTrial,
+  activeExperimentPage,
+  activeUpgrade,
+  activeLeverIds,
+  activeCandidatePool,
+  acceptedBaseline,
+  approvalRationale,
+  pausedForRoundReview,
+  canShowRunDecision,
+  decisionDisabled,
+  deciding,
+  reviewingRound,
+  onDecide,
+  onReview,
+}: {
+  run: MartyLabRunSnapshot;
+  viewState: SandboxViewState;
+  runIsCanary: boolean;
+  currentRound: number;
+  roundTotal: number;
+  visibleRoundTotal: number;
+  completed: number;
+  expectedTotal: number;
+  progressPct: number;
+  acceptedTrialCount: number;
+  rejectedTrialCount: number;
+  inconclusiveTrialCount: number;
+  privacyFailures: number;
+  activeTrial: MartyLabTrialRow | null;
+  activeExperimentPage: MartyLabExperimentPage | null;
+  activeUpgrade: Record<string, unknown> | null;
+  activeLeverIds: string[];
+  activeCandidatePool: Record<string, unknown> | null;
+  acceptedBaseline: MartyLabStatusSnapshot['versions'][number] | null;
+  approvalRationale: string[];
+  pausedForRoundReview: boolean;
+  canShowRunDecision: boolean;
+  decisionDisabled: boolean;
+  deciding: 'ship' | 'reject' | null;
+  reviewingRound: 'approve_continue' | 'reject_continue' | null;
+  onDecide: (decision: 'ship' | 'reject') => void;
+  onReview: (decision: 'approve_continue' | 'reject_continue') => void;
+}) {
+  const focusPrompt = typeof run.summary?.focus_prompt === 'string' ? run.summary.focus_prompt.trim() : '';
+  const recommendation = activeTrial?.status
+    ? titleizeLabValue(activeTrial.status)
+    : run.status === 'running' || run.status === 'configured'
+      ? 'Testing'
+      : titleizeLabValue(run.status);
+  const summary = run.summary?.conclusion ? String(run.summary.conclusion) : null;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="max-w-4xl">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
+            {runIsCanary ? 'Canary cover' : 'Legacy full lab cover'}
+          </div>
+          <h4 className="mt-1 text-2xl font-semibold leading-tight text-text-primary">
+            {activeTrial?.title || run.upgrade_title || labRunShortTitle(run)}
+          </h4>
+          <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+            {activeExperimentPage ? labExperimentTagline(activeExperimentPage) : 'The sandbox is testing a MARTy improvement against the accepted baseline.'}
+          </p>
+        </div>
+        {pausedForRoundReview ? (
+          <MartyLabRoundReviewButtons disabled={reviewingRound !== null} reviewing={reviewingRound} onReview={onReview} />
+        ) : canShowRunDecision ? (
+          <MartyLabDecisionButtons disabled={decisionDisabled} deciding={deciding} onDecide={onDecide} />
+        ) : null}
+      </div>
+
+      <div className="rounded-lg border border-white/[0.06] bg-black/10 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-xs font-semibold text-text-primary">{viewState.title}</div>
+            <div className="mt-1 text-xs leading-relaxed text-text-muted">
+              {runIsCanary
+                ? 'One focused experiment: three discovery chats and seven validation chats.'
+                : `Eight experiments run in sequence. The current page shows experiment ${Math.max(1, currentRound)} of ${roundTotal}.`}
+            </div>
+          </div>
+          <MartyLabStatusPill status={run.status} />
+        </div>
+        <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
+          <div className="h-full rounded-full bg-accent-magenta" style={{ width: `${progressPct}%` }} />
+        </div>
+        <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          <MartyLabMiniStat label="Experiments" value={`${Math.min(currentRound, visibleRoundTotal)}/${visibleRoundTotal}`} tone="purple" />
+          <MartyLabMiniStat label="Checks complete" value={`${completed}/${expectedTotal}`} tone="purple" />
+          <MartyLabMiniStat label="Recommendation" value={recommendation} tone={activeTrial?.status === 'accepted' ? 'good' : activeTrial?.status === 'rejected' ? 'warn' : 'default'} />
+          <MartyLabMiniStat label="Privacy issues" value={privacyFailures} tone={privacyFailures > 0 ? 'bad' : 'good'} />
+        </div>
+      </div>
+
+      {focusPrompt && (
+        <div className="rounded-lg border border-accent-purple/15 bg-accent-purple/5 px-4 py-3">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-accent-purple">Focus</div>
+          <p className="mt-1 text-sm leading-relaxed text-text-secondary">{focusPrompt}</p>
+        </div>
+      )}
+
+      {(summary || approvalRationale.length > 0) && (
+        <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+          <div className="text-sm font-semibold text-text-primary">What we learned</div>
+          {summary && <p className="mt-2 text-sm leading-relaxed text-text-secondary">{summary}</p>}
+          {approvalRationale.length > 0 && (
+            <ul className="mt-2 space-y-1 text-xs leading-relaxed text-text-secondary">
+              {approvalRationale.map(item => <li key={item}>{item}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <SandboxEvidenceDrawer>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] p-3">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Run decisions</div>
+            <div className="mt-2 grid grid-cols-3 gap-2">
+              <MartyLabMiniStat label="Accepted" value={acceptedTrialCount} tone="good" />
+              <MartyLabMiniStat label="Rejected" value={rejectedTrialCount} tone="warn" />
+              <MartyLabMiniStat label="Review" value={inconclusiveTrialCount} tone="warn" />
+            </div>
+          </div>
+          <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] p-3">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Current baseline</div>
+            <div className="mt-2 text-sm font-medium text-text-primary">{acceptedBaseline?.label || 'Accepted MARTy baseline'}</div>
+            <div className="mt-1 text-xs text-text-muted">Generation {acceptedBaseline?.generation ?? '—'}</div>
+          </div>
+          <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] p-3">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Candidate pool</div>
+            <div className="mt-2 text-xs leading-relaxed text-text-secondary">
+              Rank {String(activeCandidatePool?.selected_rank || activeCandidatePool?.rank || '—')} of {String(activeCandidatePool?.size || activeCandidatePool?.pool_size || '—')}
+            </div>
+          </div>
+          <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] p-3">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Upgrade levers</div>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {(activeLeverIds.length > 0 ? activeLeverIds : labEvidenceList(activeUpgrade, 'lever_ids')).slice(0, 6).map(lever => (
+                <span key={lever} className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10px] text-text-muted">{lever}</span>
+              ))}
+              {activeLeverIds.length === 0 && <span className="text-xs text-text-muted">No lever IDs recorded yet.</span>}
+            </div>
+          </div>
+        </div>
+      </SandboxEvidenceDrawer>
+    </div>
+  );
+}
+
+function SandboxExperimentPage({
+  page,
+  pageIndex,
+  pageCount,
+  expectedSamples,
+}: {
+  page: MartyLabExperimentPage;
+  pageIndex: number;
+  pageCount: number;
+  expectedSamples: number;
+}) {
+  const stats = martyLabExperimentStats(page, expectedSamples);
+  const tone = page.trial?.status === 'accepted'
+    ? 'good'
+    : page.trial?.status === 'rejected'
+      ? 'warn'
+      : page.trial?.status === 'inconclusive'
+        ? 'warn'
+        : 'purple';
+  const statusTone = martyToneClasses(tone);
+  const sortedSamples = [...page.samples].sort((a, b) => {
+    const aMeta = labRoundPolicy(a);
+    const bMeta = labRoundPolicy(b);
+    return (aMeta?.sample || 0) - (bMeta?.sample || 0);
+  });
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="max-w-5xl">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Experiment {pageIndex} of {pageCount}</div>
+          <h4 className="mt-1 text-2xl font-semibold leading-tight text-text-primary">{page.title}</h4>
+          <p className="mt-2 text-sm leading-relaxed text-text-secondary">{labExperimentTagline(page)}</p>
+          <p className="mt-2 text-xs text-text-muted">
+            Three discovery chats plus seven validation chats. The cards below compare baseline MARTy against the candidate fix.
+          </p>
+        </div>
+        <span className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${statusTone.box}`}>{stats.decision}</span>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <MartyLabMiniStat label="Checks shown" value={`${stats.closedSamples}/${stats.totalSamples}`} />
+        <MartyLabMiniStat label="Wins" value={stats.wins} tone="good" />
+        <MartyLabMiniStat label="Losses" value={stats.losses} tone={stats.losses > 0 ? 'warn' : 'default'} />
+        <MartyLabMiniStat
+          label="Average lift"
+          value={typeof stats.averageDelta === 'number' ? labDeltaText(stats.averageDelta) : 'Pending'}
+          tone={typeof stats.averageDelta === 'number' && stats.averageDelta > 0 ? 'good' : typeof stats.averageDelta === 'number' && stats.averageDelta < 0 ? 'bad' : 'default'}
+        />
+      </div>
+
+      <div className="max-h-[42rem] overflow-y-auto pr-2">
+        {sortedSamples.length > 0 ? (
+          <div className="grid gap-3 xl:grid-cols-2">
+            {sortedSamples.map(sample => <SandboxRoundCard key={sample.id} sample={sample} />)}
+          </div>
+        ) : (
+          <div className="rounded-lg border border-white/[0.06] bg-black/10 p-5 text-sm leading-relaxed text-text-muted">
+            This experiment has not started yet. It will fill with three discovery cards and seven validation cards when the lab reaches this step.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SandboxImprovementQueue({
+  run,
+  liveRun,
+  queuedRuns,
+  recentRuns,
+  readiness,
+  readinessMessage,
+  canRepairLabQueue,
+  repairingReadiness,
+  onRepairReadiness,
+  deepWorkItems,
+  activeFailureClusters,
+  codePatchJobs,
+  startDisabled,
+  startVerb,
+  startingCodePatchId,
+  onStartLab,
+  onStartCodePatch,
+  onSelectRun,
+  loadingRunId,
+  isViewingCurrent,
+}: {
+  run: MartyLabRunSnapshot | null;
+  liveRun: MartyLabRunSnapshot | null;
+  queuedRuns: MartyLabStatusSnapshot['queued_runs'];
+  recentRuns: MartyLabStatusSnapshot['recent_runs'];
+  readiness: MartyLabStatusSnapshot['readiness'];
+  readinessMessage: string;
+  canRepairLabQueue: boolean;
+  repairingReadiness: boolean;
+  onRepairReadiness: () => void;
+  deepWorkItems: MartyLabDeepWorkItemRow[];
+  activeFailureClusters: Array<Record<string, unknown>>;
+  codePatchJobs: MartyLabCodePatchJobRow[];
+  startDisabled: boolean;
+  startVerb: string;
+  startingCodePatchId: string | null;
+  onStartLab: (focusOverride?: string) => void;
+  onStartCodePatch: (item: MartyLabDeepWorkItemRow) => void;
+  onSelectRun: (runId: string | null) => void;
+  loadingRunId: string | null;
+  isViewingCurrent: boolean;
+}) {
+  const deepWorkCount = deepWorkItems.length || activeFailureClusters.length;
+
+  return (
+    <section className="rounded-xl border border-white/[0.08] bg-white/[0.015] p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h4 className="text-sm font-semibold text-text-primary">Improvement queue</h4>
+          <p className="mt-1 text-xs leading-relaxed text-text-muted">
+            Pending runs, bigger fixes, and isolated code patches live here. Details stay collapsed until you need them.
+          </p>
+        </div>
+        <span className="rounded-full border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] text-text-muted">
+          {queuedRuns.length} queued
+        </span>
+      </div>
+
+      <div className="mt-4 grid gap-3 xl:grid-cols-3">
+        <details className="rounded-lg border border-white/[0.06] bg-black/10" open={queuedRuns.length > 0}>
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-text-primary">Queued requests</summary>
+          <div className="space-y-2 border-t border-white/[0.05] p-3">
+            {queuedRuns.length > 0 ? queuedRuns.map((queued, index) => (
+              <div key={queued.id} className="rounded-md border border-white/[0.05] bg-white/[0.02] px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs font-medium text-text-primary">{index === 0 ? 'Next up' : `Queued ${index + 1}`}</div>
+                  <MartyLabStatusPill status={queued.status} />
+                </div>
+                <div className="mt-1 text-[11px] text-text-muted">{labRunModeLabel(queued)} · {queued.total_experiments.toLocaleString()} checks</div>
+                {typeof queued.summary?.focus_prompt === 'string' && queued.summary.focus_prompt.trim() && (
+                  <ExpandableText
+                    text={queued.summary.focus_prompt}
+                    collapsedLines={2}
+                    minToggleChars={110}
+                    className="mt-2 text-[11px] leading-relaxed text-text-secondary"
+                  />
+                )}
+              </div>
+            )) : (
+              <div className="text-xs leading-relaxed text-text-muted">No queued sandbox requests.</div>
+            )}
+          </div>
+        </details>
+
+        <details className="rounded-lg border border-semantic-warning/20 bg-semantic-warning/5" open={deepWorkCount > 0}>
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-text-primary">Bigger fixes MARTy found</summary>
+          <div className="max-h-[25rem] space-y-2 overflow-y-auto border-t border-semantic-warning/10 p-3 pr-2">
+            {deepWorkItems.map(item => {
+              const patchJob = codePatchJobs.find(job => job.deep_work_item_id === item.id);
+              const focus = `${item.title}. ${labDeepWorkBody(item)}`;
+              return (
+                <div key={item.id} className="rounded-md border border-semantic-warning/15 bg-black/10 px-3 py-2">
+                  <div className="text-xs font-medium leading-snug text-text-primary">{item.title}</div>
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-text-muted">
+                    <span>{titleizeLabValue(item.priority)}</span>
+                    <span>·</span>
+                    <span>{titleizeLabValue(item.failure_type)}</span>
+                    {patchJob && <span className="rounded border border-accent-magenta/20 bg-accent-magenta/10 px-1.5 py-0.5 text-[10px] text-accent-magenta">Patch {labCodePatchStatusLabel(patchJob.status)}</span>}
+                  </div>
+                  <ExpandableText text={labDeepWorkBody(item)} collapsedLines={3} minToggleChars={140} className="mt-2 text-[11px] leading-relaxed text-text-secondary" />
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onStartCodePatch(item)}
+                      disabled={Boolean(patchJob) || startingCodePatchId === item.id || !isViewingCurrent}
+                      className="rounded-md border border-accent-magenta/25 px-2 py-1 text-[10px] font-medium text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50"
+                    >
+                      {startingCodePatchId === item.id ? 'Starting patch' : patchJob ? 'Patch started' : 'Start code patch'}
+                    </button>
+                    <button type="button" onClick={() => onStartLab(focus)} disabled={startDisabled} className="rounded-md border border-white/10 px-2 py-1 text-[10px] font-medium text-text-secondary hover:bg-white/[0.04] disabled:opacity-50">{startVerb} canary</button>
+                  </div>
+                </div>
+              );
+            })}
+            {deepWorkItems.length === 0 && activeFailureClusters.map((cluster, index) => {
+              const focus = `${titleizeLabValue(cluster.failed_gate || cluster.failure_type)}. ${labFailureClusterBody(cluster)}`;
+              return (
+                <div key={`${String(cluster.cluster_key || index)}`} className="rounded-md border border-white/[0.05] bg-black/10 px-3 py-2">
+                  <div className="text-xs font-medium leading-snug text-text-primary">{titleizeLabValue(cluster.failed_gate || cluster.failure_type)}</div>
+                  <div className="mt-1 text-[11px] text-text-muted">{Number(cluster.count || 0)} affected check{Number(cluster.count || 0) === 1 ? '' : 's'}</div>
+                  <ExpandableText text={labFailureClusterBody(cluster)} collapsedLines={3} minToggleChars={140} className="mt-2 text-[11px] leading-relaxed text-text-secondary" />
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button type="button" onClick={() => onStartLab(focus)} disabled={startDisabled} className="rounded-md border border-accent-magenta/25 px-2 py-1 text-[10px] font-medium text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50">{startVerb} canary</button>
+                  </div>
+                </div>
+              );
+            })}
+            {deepWorkCount === 0 && <div className="text-xs leading-relaxed text-text-muted">No bigger fixes identified yet.</div>}
+          </div>
+        </details>
+
+        <details className="rounded-lg border border-white/[0.06] bg-black/10" open={codePatchJobs.length > 0}>
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-text-primary">Isolated code patches</summary>
+          <div className="max-h-[25rem] space-y-2 overflow-y-auto border-t border-white/[0.05] p-3 pr-2">
+            {codePatchJobs.length > 0 ? codePatchJobs.map(job => (
+              <div key={job.id} className="rounded-md border border-white/[0.05] bg-white/[0.02] px-3 py-2">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-medium leading-snug text-text-primary">{job.title}</div>
+                    <div className="mt-1 text-[11px] text-text-muted">{labCodePatchStatusLabel(job.status)} · {job.model}</div>
+                  </div>
+                  <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-text-muted">No deploy</span>
+                </div>
+                <SandboxEvidenceDrawer title="Patch details">
+                  <div className="space-y-2 text-[11px] leading-relaxed text-text-secondary">
+                    <div>Branch: {job.branch_name || 'pending'}</div>
+                    <div>Worktree: {job.worktree_path || 'pending'}</div>
+                    <ExpandableText text={labCodePatchBody(job)} collapsedLines={4} minToggleChars={180} />
+                  </div>
+                </SandboxEvidenceDrawer>
+              </div>
+            )) : (
+              <div className="text-xs leading-relaxed text-text-muted">No isolated code patches started yet.</div>
+            )}
+          </div>
+        </details>
+      </div>
+
+      <div className="mt-3 grid gap-3 lg:grid-cols-2">
+        <details className="rounded-lg border border-white/[0.06] bg-black/10">
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-text-primary">
+            Run history {loadingRunId ? '· loading' : ''}
+          </summary>
+          <div className="flex gap-2 overflow-x-auto border-t border-white/[0.05] p-3">
+            <button
+              type="button"
+              onClick={() => onSelectRun(null)}
+              className={`min-w-[13rem] rounded-lg border px-3 py-2 text-left transition ${!run ? 'border-accent-purple/25 bg-accent-purple/5' : 'border-white/[0.05] bg-white/[0.02] hover:bg-white/[0.04]'}`}
+            >
+              <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Current lane</div>
+              <div className="mt-1 truncate text-xs font-medium text-text-primary">{liveRun ? labRunShortTitle(liveRun) : 'Ready for next run'}</div>
+              <div className="mt-1 text-[11px] text-text-muted">{liveRun ? `${liveRun.completed_experiments}/${liveRun.total_experiments || 0} checks` : 'No active run'}</div>
+            </button>
+            {recentRuns.map(item => {
+              const selected = run?.id === item.id;
+              const current = liveRun?.id === item.id;
+              const chipState = labRunChipState(item, current);
+              const tone = martyToneClasses(chipState.tone);
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => onSelectRun(item.id)}
+                  className={`min-w-[13rem] rounded-lg border px-3 py-2 text-left transition ${selected ? `${tone.border} ${tone.soft}` : 'border-white/[0.05] bg-white/[0.02] hover:bg-white/[0.04]'}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">{current ? 'Current' : formatRelative(item.created_at)}</span>
+                    <span className={`rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${tone.box}`}>{chipState.label}</span>
+                  </div>
+                  <div className="mt-1 truncate text-xs font-medium text-text-primary">{labRunShortTitle(item)}</div>
+                  <div className="mt-1 text-[11px] text-text-muted">{labRunModeLabel(item)} · {item.completed_experiments}/{item.total_experiments || 0} checks</div>
+                </button>
+              );
+            })}
+          </div>
+        </details>
+
+        <details className="rounded-lg border border-white/[0.06] bg-black/10">
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-text-primary">Readiness details</summary>
+          <div className="space-y-2 border-t border-white/[0.05] p-3">
+            <div className="text-xs leading-relaxed text-text-muted">{readiness.ok ? 'Ready for a clean controlled run.' : readinessMessage}</div>
+            {canRepairLabQueue && (
+              <button
+                type="button"
+                onClick={onRepairReadiness}
+                disabled={repairingReadiness}
+                className="inline-flex items-center gap-1 rounded-md border border-semantic-warning/25 px-2 py-1 text-[10px] font-medium text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+              >
+                {repairingReadiness ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                {repairingReadiness ? 'Clearing stuck work' : 'Clear stuck sandbox work'}
+              </button>
+            )}
+            <div className="grid gap-1">
+              {readiness.checks.map(check => (
+                <div key={check.key} className="rounded border border-white/[0.04] bg-white/[0.02] px-2 py-1.5 text-[11px] leading-relaxed text-text-secondary">
+                  <span className="font-medium text-text-primary">{sandboxCheckLabel(check.key)}:</span> {check.detail}
+                </div>
+              ))}
+            </div>
+          </div>
+        </details>
+      </div>
+    </section>
+  );
+}
+
 function MartyLabStatusCard({
   lab,
   onRefresh,
@@ -3322,28 +5051,49 @@ function MartyLabStatusCard({
   lab: MartyLabStatusSnapshot;
   onRefresh: () => void;
 }) {
-  const [starting, setStarting] = React.useState(false);
+  const [startingMode, setStartingMode] = React.useState<'canary' | null>(null);
+  const [startingCodePatchId, setStartingCodePatchId] = React.useState<string | null>(null);
+  const [repairingReadiness, setRepairingReadiness] = React.useState(false);
   const [canceling, setCanceling] = React.useState(false);
-  const [openExperiment, setOpenExperiment] = React.useState<string | null>(null);
-  const [openUpgrade, setOpenUpgrade] = React.useState<string | null>(null);
+  const [deciding, setDeciding] = React.useState<'ship' | 'reject' | null>(null);
+  const [reviewingRound, setReviewingRound] = React.useState<'approve_continue' | 'reject_continue' | null>(null);
+  const [activePageIndex, setActivePageIndex] = React.useState(0);
+  const [focusPrompt, setFocusPrompt] = React.useState('');
+  const [viewLab, setViewLab] = React.useState<MartyLabStatusSnapshot | null>(null);
+  const [loadingRunId, setLoadingRunId] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
-  const run = lab.run;
+  const liveRun = lab.run;
+  const selectedLab = viewLab || lab;
+  const run = selectedLab.run;
+  const isViewingCurrent = !viewLab || viewLab.run?.id === liveRun?.id;
 
-  async function startLab() {
-    setStarting(true);
+  React.useEffect(() => {
+    if (viewLab?.run?.id && liveRun?.id === viewLab.run.id) setViewLab(null);
+  }, [liveRun?.id, viewLab?.run?.id]);
+
+  async function startLab(focusOverride?: string) {
+    setStartingMode('canary');
     setError(null);
     try {
-      await api.startMartyLabRun();
+      const requestedFocus = (focusOverride ?? focusPrompt).trim();
+      await api.startMartyLabRun({
+        mode: 'canary',
+        round_count: 1,
+        candidate_label: 'sandbox-canary',
+        focus_prompt: requestedFocus || undefined,
+        queue_if_blocked: true,
+      });
+      if (!focusOverride) setFocusPrompt('');
       onRefresh();
     } catch (e: any) {
       setError(e?.message || 'Failed to start MARTy Lab');
     } finally {
-      setStarting(false);
+      setStartingMode(null);
     }
   }
 
   async function cancelLab() {
-    if (!run || run.status !== 'running') return;
+    if (!run || !isViewingCurrent || run.status !== 'running') return;
     setCanceling(true);
     setError(null);
     try {
@@ -3356,77 +5106,679 @@ function MartyLabStatusCard({
     }
   }
 
-  const experiments = lab.experiments || [];
-  const upgrades = lab.upgrade_candidates || [];
+  async function decideLab(decision: 'ship' | 'reject') {
+    if (!run || !isViewingCurrent) return;
+    setDeciding(decision);
+    setError(null);
+    try {
+      await api.decideMartyLabRun(run.id, decision);
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || `Failed to ${decision} MARTy Lab candidate`);
+    } finally {
+      setDeciding(null);
+    }
+  }
+
+  async function reviewRound(decision: 'approve_continue' | 'reject_continue') {
+    if (!run || !isViewingCurrent) return;
+    setReviewingRound(decision);
+    setError(null);
+    try {
+      await api.reviewMartyLabRound(run.id, decision);
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to continue MARTy Lab');
+    } finally {
+      setReviewingRound(null);
+    }
+  }
+
+  async function repairReadiness() {
+    setRepairingReadiness(true);
+    setError(null);
+    try {
+      await api.repairMartyLabReadiness({ action: 'clear_orphaned_lab_queue' });
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to clear stuck sandbox work');
+    } finally {
+      setRepairingReadiness(false);
+    }
+  }
+
+  async function startCodePatch(item: MartyLabDeepWorkItemRow) {
+    if (!run || !isViewingCurrent) return;
+    setStartingCodePatchId(item.id);
+    setError(null);
+    try {
+      const requestedFocus = focusPrompt.trim();
+      await api.startMartyLabCodePatch(run.id, item.id, {
+        focus_prompt: requestedFocus || undefined,
+      });
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start isolated code patch');
+    } finally {
+      setStartingCodePatchId(null);
+    }
+  }
+
+  async function selectRun(runId: string | null) {
+    setError(null);
+    if (!runId || runId === liveRun?.id) {
+      setViewLab(null);
+      setActivePageIndex(0);
+      return;
+    }
+    setLoadingRunId(runId);
+    try {
+      const snapshot = await api.getMartyLabRun(runId);
+      setViewLab(snapshot);
+      setActivePageIndex(0);
+    } catch (e: any) {
+      setError(e?.message || 'Failed to load MARTy Sandbox run');
+    } finally {
+      setLoadingRunId(null);
+    }
+  }
+
+  const experiments = selectedLab.experiments || [];
+  const versions = selectedLab.versions || [];
+  const trials = selectedLab.upgrade_trials || [];
+  const deepWorkItems = selectedLab.deep_work_items || [];
+  const codePatchJobs = selectedLab.code_patch_jobs || [];
+  const queuedRuns = lab.queued_runs || [];
+  const recentRuns = lab.recent_runs || [];
+  const science = labRecord(run?.summary?.scientific_model);
+  const isQuarantined = Boolean(run?.discarded_at || run?.discard_reason);
+  const roundTotal = labNumber(science?.rounds, 8);
+  const roundSampleSize = labNumber(science?.sample_size_per_round, 10);
+  const completed = run?.completed_experiments || 0;
+  const total = run?.total_experiments || experiments.length || 0;
+  const expectedTotal = total || roundTotal * roundSampleSize;
+  const progressPct = expectedTotal > 0 ? Math.round((completed / expectedTotal) * 100) : 0;
+  const currentRound = run ? labCurrentRound(run, experiments, roundTotal) : 0;
+  const acceptedTrialCount = trials.filter(trial => trial.status === 'accepted').length;
+  const rejectedTrialCount = trials.filter(trial => trial.status === 'rejected').length;
+  const inconclusiveTrialCount = trials.filter(trial => trial.status === 'inconclusive').length;
+  const latestTrial = trials[0] || null;
+  const activeTrial = trials.find(trial => trial.status === 'pending') || latestTrial;
+  const activeUpgrade = labRecord(activeTrial?.evidence?.upgrade);
+  const approvalAssessment = labApprovalAssessment(activeTrial);
+  const approvalRationale = labRationaleList(approvalAssessment);
+  const activeCandidatePool = labRecord(activeTrial?.evidence?.candidate_pool_summary);
+  const activeLeverIds = labEvidenceList(activeUpgrade, 'lever_ids');
+  const acceptedBaseline = versions.find(version => version.status === 'accepted') || versions[0] || null;
+  const activeFailureClusters = Array.isArray(run?.summary?.active_failure_clusters)
+    ? run?.summary?.active_failure_clusters as Array<Record<string, unknown>>
+    : [];
+  const privacyFailures = experiments.filter(exp => exp.privacy_failure).length;
+  const experimentRows = [...experiments].sort((a, b) => {
+    const aMeta = labRoundPolicy(a);
+    const bMeta = labRoundPolicy(b);
+    const aRound = aMeta?.round || 0;
+    const bRound = bMeta?.round || 0;
+    if (aRound !== bRound) return aRound - bRound;
+    return (aMeta?.sample || 0) - (bMeta?.sample || 0);
+  });
+  const seededExperimentPages = buildMartyLabExperimentPages(experimentRows, trials);
+  const runIsCanary = Boolean(run && (run.upgrade_variable?.mode === 'canary' || run.suite_name.includes('canary')));
+  const visibleRoundTotal = run ? (runIsCanary ? 1 : roundTotal) : seededExperimentPages.length;
+  const experimentPages = run
+    ? Array.from({ length: Math.max(visibleRoundTotal, seededExperimentPages.length) }, (_, index) => {
+      const round = index + 1;
+      return seededExperimentPages.find(page => page.round === round) || {
+        round,
+        trial: null,
+        samples: [],
+        title: `Experiment ${round}`,
+      };
+    })
+    : seededExperimentPages;
+  const pageCount = Math.max(1, experimentPages.length + 1);
+
+  React.useEffect(() => {
+    setActivePageIndex(index => Math.min(index, pageCount - 1));
+  }, [pageCount, run?.id]);
+
+  const readiness = lab.readiness || emptyMartyLab.readiness;
+  const readinessMessage = readiness.blockers[0] || readiness.warnings[0] || 'Ready for a clean controlled run.';
+  const blockingKeys = readiness.checks.filter(check => check.status === 'block').map(check => check.key);
+  const labQueueBlocker = readiness.checks.find(check => check.key === 'lab_work_queue_clear' && check.status === 'block');
+  const canRepairLabQueue = Boolean(!liveRun && labQueueBlocker);
+  const canQueueWhenBlocked = !readiness.ok && blockingKeys.length > 0 && blockingKeys.every(key => [
+    'no_active_lab_run',
+    'human_decision_required',
+    'sandbox_queue_pending',
+    'no_active_lab_run_race',
+    'one_active_lab_run_per_suite',
+  ].includes(key));
+  const startDisabled = Boolean(startingMode || canRepairLabQueue || (!readiness.ok && !canQueueWhenBlocked));
+  const startVerb = readiness.ok && !liveRun ? 'Start' : 'Queue';
+  const currentRunPhase = labRunPhase(run);
+  const hasHumanDecision = currentRunPhase === 'human_shipped' || currentRunPhase === 'human_rejected';
+  const pausedForRoundReview = Boolean(run?.status === 'running' && currentRunPhase === 'round_inconclusive_needs_review' && run.summary?.needs_human_round_review);
+  const decisionDisabled = Boolean(!run || !isViewingCurrent || isQuarantined || run.status === 'running' || run.status === 'configured' || hasHumanDecision || !activeTrial?.candidate_version_id);
+  const canShowRunDecision = Boolean(run && labRunNeedsDecision(run) && isViewingCurrent && !pausedForRoundReview && !isQuarantined);
+  const activeTrialExperimentPage = experimentPages.find(page => page.trial?.id === activeTrial?.id)
+    || (currentRound > 0 ? experimentPages[currentRound - 1] : null)
+    || experimentPages[experimentPages.length - 1]
+    || null;
+  const selectedExperimentPage = activePageIndex > 0 ? experimentPages[activePageIndex - 1] || null : null;
+  const viewState = sandboxRunViewState({
+    run,
+    readiness,
+    activeTrial,
+    isViewingCurrent,
+    isQuarantined,
+    pausedForRoundReview,
+    canRepairLabQueue,
+    completed,
+    expectedTotal,
+    currentRound,
+    roundTotal,
+  });
+  const contextLabel = run
+    ? `${labRunModeLabel(run)} · ${isViewingCurrent ? 'current run' : `created ${formatRelative(run.created_at)}`}`
+    : readiness.ok ? 'No active run' : 'Waiting for the lane to clear';
+
+  return (
+    <div className="space-y-5">
+      <SandboxHeroState
+        state={viewState}
+        progressPct={run ? progressPct : null}
+        progressLabel={run ? `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks complete` : null}
+        contextLabel={contextLabel}
+        actions={(
+          <>
+            {canRepairLabQueue && (
+              <button
+                type="button"
+                onClick={repairReadiness}
+                disabled={repairingReadiness}
+                className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs font-medium text-semantic-warning hover:bg-semantic-warning/15 disabled:opacity-50"
+              >
+                {repairingReadiness ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                {repairingReadiness ? 'Clearing...' : 'Clear stuck work'}
+              </button>
+            )}
+            {!isViewingCurrent && (
+              <button
+                type="button"
+                onClick={() => selectRun(null)}
+                className="rounded-lg border border-white/10 px-3 py-2 text-xs font-medium text-text-secondary hover:bg-white/[0.04]"
+              >
+                Back to current
+              </button>
+            )}
+            {run?.status === 'running' && isViewingCurrent && (
+              <button
+                type="button"
+                onClick={cancelLab}
+                disabled={canceling}
+                className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 px-3 py-2 text-xs font-medium text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+              >
+                <XIcon size={13} /> {canceling ? 'Canceling...' : 'Cancel'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onRefresh}
+              className="rounded-lg border border-white/10 px-3 py-2 text-xs font-medium text-text-secondary hover:bg-white/[0.04]"
+            >
+              Refresh
+            </button>
+          </>
+        )}
+      />
+
+      {error && (
+        <div className="rounded-lg border border-semantic-error/20 bg-semantic-error/10 px-3 py-2 text-xs text-semantic-error">
+          {error}
+        </div>
+      )}
+
+      <SandboxFocusComposer
+        value={focusPrompt}
+        onChange={setFocusPrompt}
+        onStart={() => startLab()}
+        startDisabled={startDisabled}
+        startVerb={startVerb}
+        startingMode={startingMode}
+        isBusy={Boolean(liveRun || queuedRuns.length > 0 || !readiness.ok)}
+      />
+
+      {run ? (
+        <SandboxRunPager
+          pageIndex={activePageIndex}
+          pageCount={pageCount}
+          onPrev={() => setActivePageIndex(index => Math.max(0, index - 1))}
+          onNext={() => setActivePageIndex(index => Math.min(pageCount - 1, index + 1))}
+          onSelect={setActivePageIndex}
+        >
+          {activePageIndex === 0 ? (
+            <SandboxCoverPage
+              run={run}
+              viewState={viewState}
+              runIsCanary={runIsCanary}
+              currentRound={currentRound}
+              roundTotal={roundTotal}
+              visibleRoundTotal={visibleRoundTotal}
+              completed={completed}
+              expectedTotal={expectedTotal}
+              progressPct={progressPct}
+              acceptedTrialCount={acceptedTrialCount}
+              rejectedTrialCount={rejectedTrialCount}
+              inconclusiveTrialCount={inconclusiveTrialCount}
+              privacyFailures={privacyFailures}
+              activeTrial={activeTrial}
+              activeExperimentPage={activeTrialExperimentPage}
+              activeUpgrade={activeUpgrade}
+              activeLeverIds={activeLeverIds}
+              activeCandidatePool={activeCandidatePool}
+              acceptedBaseline={acceptedBaseline}
+              approvalRationale={approvalRationale}
+              pausedForRoundReview={pausedForRoundReview}
+              canShowRunDecision={canShowRunDecision}
+              decisionDisabled={decisionDisabled}
+              deciding={deciding}
+              reviewingRound={reviewingRound}
+              onDecide={decideLab}
+              onReview={reviewRound}
+            />
+          ) : selectedExperimentPage ? (
+            <SandboxExperimentPage
+              page={selectedExperimentPage}
+              pageIndex={activePageIndex}
+              pageCount={experimentPages.length}
+              expectedSamples={roundSampleSize}
+            />
+          ) : (
+            <div className="rounded-lg border border-white/[0.06] bg-black/10 p-5 text-sm text-text-muted">No experiment selected.</div>
+          )}
+        </SandboxRunPager>
+      ) : (
+        <section className="rounded-xl border border-white/[0.08] bg-white/[0.015] p-5">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Sandbox cover</div>
+          <h4 className="mt-1 text-2xl font-semibold text-text-primary">No active lab run</h4>
+          <p className="mt-2 max-w-3xl text-sm leading-relaxed text-text-secondary">
+            {canRepairLabQueue
+              ? 'Clear the stuck sandbox work above before starting another clean run.'
+              : 'Start a focused canary for one controlled improvement, or queue the next canary focus.'}
+          </p>
+        </section>
+      )}
+
+      <SandboxImprovementQueue
+        run={run}
+        liveRun={liveRun}
+        queuedRuns={queuedRuns}
+        recentRuns={recentRuns}
+        readiness={readiness}
+        readinessMessage={readinessMessage}
+        canRepairLabQueue={canRepairLabQueue}
+        repairingReadiness={repairingReadiness}
+        onRepairReadiness={repairReadiness}
+        deepWorkItems={deepWorkItems}
+        activeFailureClusters={activeFailureClusters}
+        codePatchJobs={codePatchJobs}
+        startDisabled={startDisabled}
+        startVerb={startVerb}
+        startingCodePatchId={startingCodePatchId}
+        onStartLab={startLab}
+        onStartCodePatch={startCodePatch}
+        onSelectRun={selectRun}
+        loadingRunId={loadingRunId}
+        isViewingCurrent={isViewingCurrent}
+      />
+    </div>
+  );
+}
+
+function MartyLabStatusCardLegacy({
+  lab,
+  onRefresh,
+}: {
+  lab: MartyLabStatusSnapshot;
+  onRefresh: () => void;
+}) {
+  const [startingMode, setStartingMode] = React.useState<'canary' | null>(null);
+  const [startingCodePatchId, setStartingCodePatchId] = React.useState<string | null>(null);
+  const [repairingReadiness, setRepairingReadiness] = React.useState(false);
+  const [canceling, setCanceling] = React.useState(false);
+  const [deciding, setDeciding] = React.useState<'ship' | 'reject' | null>(null);
+  const [reviewingRound, setReviewingRound] = React.useState<'approve_continue' | 'reject_continue' | null>(null);
+  const [activePageIndex, setActivePageIndex] = React.useState(0);
+  const [focusPrompt, setFocusPrompt] = React.useState('');
+  const [viewLab, setViewLab] = React.useState<MartyLabStatusSnapshot | null>(null);
+  const [loadingRunId, setLoadingRunId] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const liveRun = lab.run;
+  const selectedLab = viewLab || lab;
+  const run = selectedLab.run;
+  const isViewingCurrent = !viewLab || viewLab.run?.id === liveRun?.id;
+
+  React.useEffect(() => {
+    if (viewLab?.run?.id && liveRun?.id === viewLab.run.id) setViewLab(null);
+  }, [liveRun?.id, viewLab?.run?.id]);
+
+  async function startLab(focusOverride?: string) {
+    setStartingMode('canary');
+    setError(null);
+    try {
+      const requestedFocus = (focusOverride ?? focusPrompt).trim();
+      await api.startMartyLabRun({
+        mode: 'canary',
+        round_count: 1,
+        candidate_label: 'sandbox-canary',
+        focus_prompt: requestedFocus || undefined,
+        queue_if_blocked: true,
+      });
+      if (!focusOverride) setFocusPrompt('');
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start MARTy Lab');
+    } finally {
+      setStartingMode(null);
+    }
+  }
+
+  async function cancelLab() {
+    if (!run || !isViewingCurrent || run.status !== 'running') return;
+    setCanceling(true);
+    setError(null);
+    try {
+      await api.cancelMartyLabRun(run.id);
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to cancel MARTy Lab run');
+    } finally {
+      setCanceling(false);
+    }
+  }
+
+  async function decideLab(decision: 'ship' | 'reject') {
+    if (!run || !isViewingCurrent) return;
+    setDeciding(decision);
+    setError(null);
+    try {
+      await api.decideMartyLabRun(run.id, decision);
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || `Failed to ${decision} MARTy Lab candidate`);
+    } finally {
+      setDeciding(null);
+    }
+  }
+
+  async function reviewRound(decision: 'approve_continue' | 'reject_continue') {
+    if (!run || !isViewingCurrent) return;
+    setReviewingRound(decision);
+    setError(null);
+    try {
+      await api.reviewMartyLabRound(run.id, decision);
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to continue MARTy Lab');
+    } finally {
+      setReviewingRound(null);
+    }
+  }
+
+  async function repairReadiness() {
+    setRepairingReadiness(true);
+    setError(null);
+    try {
+      await api.repairMartyLabReadiness({ action: 'clear_orphaned_lab_queue' });
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to repair MARTy Sandbox readiness');
+    } finally {
+      setRepairingReadiness(false);
+    }
+  }
+
+  async function startCodePatch(item: MartyLabDeepWorkItemRow) {
+    if (!run || !isViewingCurrent) return;
+    setStartingCodePatchId(item.id);
+    setError(null);
+    try {
+      const requestedFocus = focusPrompt.trim();
+      await api.startMartyLabCodePatch(run.id, item.id, {
+        focus_prompt: requestedFocus || undefined,
+      });
+      onRefresh();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start isolated code-patch lane');
+    } finally {
+      setStartingCodePatchId(null);
+    }
+  }
+
+  async function selectRun(runId: string | null) {
+    setError(null);
+    if (!runId || runId === liveRun?.id) {
+      setViewLab(null);
+      setActivePageIndex(0);
+      return;
+    }
+    setLoadingRunId(runId);
+    try {
+      const snapshot = await api.getMartyLabRun(runId);
+      setViewLab(snapshot);
+      setActivePageIndex(0);
+    } catch (e: any) {
+      setError(e?.message || 'Failed to load MARTy Lab run');
+    } finally {
+      setLoadingRunId(null);
+    }
+  }
+
+  const experiments = selectedLab.experiments || [];
+  const versions = selectedLab.versions || [];
+  const trials = selectedLab.upgrade_trials || [];
+  const deepWorkItems = selectedLab.deep_work_items || [];
+  const codePatchJobs = selectedLab.code_patch_jobs || [];
+  const queuedRuns = lab.queued_runs || [];
+  const recentRuns = lab.recent_runs || [];
+  const science = labRecord(run?.summary?.scientific_model);
+  const isQuarantined = Boolean(run?.discarded_at || run?.discard_reason);
+  const roundTotal = labNumber(science?.rounds, 8);
+  const roundSampleSize = labNumber(science?.sample_size_per_round, 10);
+  const validationPerRound = labNumber(science?.validation_conversations_per_round, 7);
+  const discoveryPerRound = labNumber(science?.discovery_conversations_per_round, 1);
+  const candidatePoolSize = labNumber(science?.candidate_pool_size, 5);
+  const minCodeBackedCandidates = labNumber(science?.min_code_backed_candidates, 3);
   const completed = run?.completed_experiments || 0;
   const total = run?.total_experiments || experiments.length || 0;
   const progressPct = total > 0 ? Math.round((completed / total) * 100) : 0;
-  const scoreDelta = typeof run?.average_candidate_score === 'number' && typeof run?.average_baseline_score === 'number'
-    ? run.average_candidate_score - run.average_baseline_score
-    : null;
-  const candidateLosses = experiments.filter(exp =>
-    typeof exp.baseline_score === 'number'
-    && typeof exp.candidate_score === 'number'
-    && exp.candidate_score < exp.baseline_score
-  ).length;
+  const currentRound = run ? labCurrentRound(run, experiments, roundTotal) : 0;
+  const acceptedTrialCount = trials.filter(trial => trial.status === 'accepted').length;
+  const rejectedTrialCount = trials.filter(trial => trial.status === 'rejected').length;
+  const inconclusiveTrialCount = trials.filter(trial => trial.status === 'inconclusive').length;
+  const decidedTrialCount = acceptedTrialCount + rejectedTrialCount + inconclusiveTrialCount;
+  const latestTrial = trials[0] || null;
+  const activeTrial = trials.find(trial => trial.status === 'pending') || latestTrial;
   const summaryText = labSummaryText(run?.summary);
   const autopilot = run?.summary?.autopilot && typeof run.summary.autopilot === 'object'
     ? run.summary.autopilot as Record<string, unknown>
     : null;
   const autopilotEnabled = autopilot?.enabled === true;
   const nextRunAfter = typeof autopilot?.next_run_after === 'string' ? autopilot.next_run_after : null;
+  const activeFailureClusters = Array.isArray(run?.summary?.active_failure_clusters)
+    ? run?.summary?.active_failure_clusters as Array<Record<string, unknown>>
+    : [];
+  const experimentRows = [...experiments].sort((a, b) => {
+    const aMeta = labRoundPolicy(a);
+    const bMeta = labRoundPolicy(b);
+    const aRound = aMeta?.round || 0;
+    const bRound = bMeta?.round || 0;
+    if (aRound !== bRound) return aRound - bRound;
+    return (aMeta?.sample || 0) - (bMeta?.sample || 0);
+  });
+  const seededExperimentPages = buildMartyLabExperimentPages(experimentRows, trials);
+  const inferredRunIsCanary = Boolean(run && (run.upgrade_variable?.mode === 'canary' || run.suite_name.includes('canary')));
+  const visibleRoundTotal = run ? (inferredRunIsCanary ? 1 : roundTotal) : seededExperimentPages.length;
+  const experimentPages = run
+    ? Array.from({ length: Math.max(visibleRoundTotal, seededExperimentPages.length) }, (_, index) => {
+      const round = index + 1;
+      return seededExperimentPages.find(page => page.round === round) || {
+        round,
+        trial: null,
+        samples: [],
+        title: `Experiment ${round}`,
+      };
+    })
+    : seededExperimentPages;
+  const pageCount = Math.max(1, experimentPages.length + 1);
+  React.useEffect(() => {
+    setActivePageIndex(index => Math.min(index, pageCount - 1));
+  }, [pageCount, run?.id]);
+  const activeLocal = labRecord(activeTrial?.evidence?.local_validation);
+  const activeLocalSummary = labRecord(activeLocal?.summary);
+  const activeUpgrade = labRecord(activeTrial?.evidence?.upgrade);
+  const approvalAssessment = labApprovalAssessment(activeTrial);
+  const approvalTarget = labRecord(approvalAssessment?.target);
+  const approvalRegressions = labRecord(approvalAssessment?.regressions);
+  const approvalRationale = labRationaleList(approvalAssessment);
+  const activeCandidatePool = labRecord(activeTrial?.evidence?.candidate_pool_summary);
+  const activeLeverIds = labEvidenceList(activeUpgrade, 'lever_ids');
+  const acceptedBaseline = versions.find(version => version.status === 'accepted') || versions[0] || null;
+  const readiness = lab.readiness || emptyMartyLab.readiness;
+  const readinessTone = readiness.ok
+    ? readiness.warnings.length > 0 ? 'warn' : 'good'
+    : 'bad';
+  const readinessMessage = readiness.blockers[0] || readiness.warnings[0] || 'Ready for a clean controlled run.';
+  const blockingKeys = readiness.checks.filter(check => check.status === 'block').map(check => check.key);
+  const labQueueBlocker = readiness.checks.find(check => check.key === 'lab_work_queue_clear' && check.status === 'block');
+  const canRepairLabQueue = Boolean(!run && labQueueBlocker);
+  const canQueueWhenBlocked = !readiness.ok && blockingKeys.length > 0 && blockingKeys.every(key => [
+    'no_active_lab_run',
+    'lab_work_queue_clear',
+    'human_decision_required',
+    'sandbox_queue_pending',
+    'no_active_lab_run_race',
+    'one_active_lab_run_per_suite',
+  ].includes(key));
+  const startDisabled = Boolean(startingMode || (!readiness.ok && !canQueueWhenBlocked));
+  const startVerb = readiness.ok ? 'Start' : 'Queue';
+  const currentRunPhase = labRunPhase(run);
+  const hasHumanDecision = currentRunPhase === 'human_shipped' || currentRunPhase === 'human_rejected';
+  const decisionDisabled = Boolean(!run || !isViewingCurrent || isQuarantined || run.status === 'running' || run.status === 'configured' || hasHumanDecision || !activeTrial?.candidate_version_id);
+  const selectedExperimentPage = activePageIndex > 0 ? experimentPages[activePageIndex - 1] || null : null;
+  const selectedExperimentStats = selectedExperimentPage ? martyLabExperimentStats(selectedExperimentPage, roundSampleSize) : null;
+  const activeTrialExperimentPage = experimentPages.find(page => page.trial?.id === activeTrial?.id) || experimentPages[experimentPages.length - 1] || null;
+  const pausedForRoundReview = Boolean(run?.status === 'running' && currentRunPhase === 'round_inconclusive_needs_review' && run.summary?.needs_human_round_review);
+  const pausedReview = labRecord(run?.summary?.needs_human_round_review);
+  const stateCopy = labRunStateCopy(run, {
+    activeTrial,
+    isQuarantined,
+    isViewingCurrent,
+	    pausedForRoundReview,
+	    completed,
+	    total,
+	    currentRound,
+	    roundTotal,
+	    readinessOk: readiness.ok,
+	    readinessMessage,
+	  });
+  const stateTone = martyToneClasses(stateCopy.tone);
+  const selectedRunChip = run ? labRunChipState(run, isViewingCurrent) : null;
+  const selectedRunTone = selectedRunChip ? martyToneClasses(selectedRunChip.tone) : martyToneClasses(readiness.ok ? 'good' : 'warn');
+  const expectedTotal = total || roundTotal * roundSampleSize;
+  const runIsCanary = inferredRunIsCanary;
+  const canShowRunDecision = Boolean(run && labRunNeedsDecision(run) && !pausedForRoundReview);
+  const laneMessage = readiness.ok
+    ? 'Ready for a clean controlled run.'
+    : canQueueWhenBlocked
+      ? 'A run is already active. New requests will wait in the queue until the current run gets a Ship or Reject decision.'
+      : readinessMessage;
+  const labQueueBlockerQueue = Array.isArray(labRecord(labQueueBlocker?.data)?.queue)
+    ? labRecord(labQueueBlocker?.data)?.queue as Array<Record<string, unknown>>
+    : [];
 
   return (
     <div className="card p-5 space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <div className="flex items-center gap-2">
-            <div className="text-sm font-medium text-text-primary">MARTy Human Conversation Lab</div>
-            {run && <MartyLabStatusPill status={run.status} />}
-            {autopilotEnabled && (
-              <span className="rounded-full border border-accent-purple/30 bg-accent-purple/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-accent-purple">
-                Autopilot on
+      <div className={`rounded-xl border ${stateTone.border} bg-white/[0.02] p-4`}>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className={`text-[11px] font-semibold uppercase tracking-wide ${stateTone.text}`}>{stateCopy.eyebrow}</div>
+            <div className="mt-1 text-xl font-semibold leading-tight text-text-primary">{stateCopy.title}</div>
+            <div className="mt-2 max-w-4xl text-sm leading-relaxed text-text-secondary">{stateCopy.body}</div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              {run && <MartyLabStatusPill status={run.status} />}
+              {selectedRunChip && (
+                <span className={`rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${selectedRunTone.box}`}>
+                  {selectedRunChip.label}
+                </span>
+              )}
+              <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-text-muted">
+                {run ? labRunModeLabel(run) : readiness.ok ? 'Ready' : 'Waiting'}
               </span>
-            )}
-          </div>
-          <div className="mt-1 max-w-3xl text-xs leading-relaxed text-text-muted">
-            Sandbox-only evaluation for human conversation quality. Each experiment starts with a persona, a simple firm-user goal,
-            a generated rubric, and the same baseline-vs-candidate scoring criteria.
-          </div>
-          {autopilotEnabled && (
-            <div className="mt-2 max-w-3xl rounded-lg border border-accent-purple/15 bg-accent-purple/5 px-3 py-2 text-[11px] leading-relaxed text-text-secondary">
-              Autopilot is running one sandbox suite at a time and will restart after cooldown. Candidate upgrades stay sandbox-only until reviewed.
+              {run && (
+                <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-text-muted">
+                  Experiment {currentRound}/{roundTotal}
+                </span>
+              )}
+              {autopilotEnabled && (
+                <span className="rounded-full border border-accent-purple/30 bg-accent-purple/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-accent-purple">
+                  Autopilot
+                </span>
+              )}
+              {!isViewingCurrent && (
+                <button
+                  type="button"
+                  onClick={() => selectRun(null)}
+                  className="rounded-full border border-white/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-text-secondary hover:bg-white/[0.05]"
+                >
+                  Back to current run
+                </button>
+              )}
             </div>
-          )}
-          {summaryText && <div className="mt-2 text-xs text-text-secondary">{summaryText}</div>}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={startLab}
-            disabled={starting || run?.status === 'running'}
-            className="inline-flex items-center gap-1 rounded-lg border border-accent-magenta/25 px-2.5 py-1.5 text-[11px] text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50"
-          >
-            <Sparkles size={12} /> {starting ? 'Starting...' : run ? 'Start new suite' : 'Start suite'}
-          </button>
-          <button
-            type="button"
-            onClick={onRefresh}
-            className="rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-white/[0.04]"
-          >
-            Refresh
-          </button>
-          {run?.status === 'running' && (
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {canRepairLabQueue && (
+              <button
+                type="button"
+                onClick={repairReadiness}
+                disabled={repairingReadiness}
+                className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 px-2.5 py-1.5 text-[11px] text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+              >
+                {repairingReadiness ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                {repairingReadiness ? 'Clearing...' : 'Clear stuck queue'}
+              </button>
+            )}
+            {run?.status === 'running' && isViewingCurrent && (
+              <button
+                type="button"
+                onClick={cancelLab}
+                disabled={canceling}
+                className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 px-2.5 py-1.5 text-[11px] text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+              >
+                <XIcon size={12} /> {canceling ? 'Canceling...' : 'Cancel'}
+              </button>
+            )}
             <button
               type="button"
-              onClick={cancelLab}
-              disabled={canceling}
-              className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 px-2.5 py-1.5 text-[11px] text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+              onClick={onRefresh}
+              className="rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-white/[0.04]"
             >
-              <XIcon size={12} /> {canceling ? 'Canceling...' : 'Cancel'}
+              Refresh
             </button>
-          )}
+          </div>
         </div>
+        {run && (
+          <div className="mt-4">
+            <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+              <div className="h-full rounded-full bg-accent-magenta transition-all" style={{ width: `${progressPct}%` }} />
+            </div>
+            <div className="mt-1 flex flex-wrap justify-between gap-2 text-[11px] text-text-muted">
+              <span>{completed.toLocaleString()} of {expectedTotal.toLocaleString()} checks complete</span>
+              <span>{isViewingCurrent ? 'Current run' : `Viewing history from ${formatRelative(run.created_at)}`}</span>
+            </div>
+          </div>
+        )}
       </div>
 
       {error && (
@@ -3435,220 +5787,496 @@ function MartyLabStatusCard({
         </div>
       )}
 
+      {canRepairLabQueue && (
+        <div className="rounded-lg border border-semantic-warning/20 bg-semantic-warning/5 px-3 py-2">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="text-xs font-medium text-text-primary">Queue cleanup available</div>
+              <div className="mt-1 max-w-3xl text-xs leading-relaxed text-text-secondary">
+                The sandbox found leftover lab queue work, but there is no active lab run attached to it. Clearing it moves only retryable MARTy Lab queue rows to review history so a clean run can start.
+              </div>
+              {labQueueBlockerQueue.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {labQueueBlockerQueue.map((row, index) => (
+                    <span key={`${String(row.domain || 'lab')}-${String(row.status || index)}`} className="rounded-full border border-semantic-warning/15 bg-semantic-warning/10 px-2 py-0.5 text-[10px] text-semantic-warning">
+                      {titleizeLabValue(row.domain)} · {titleizeLabValue(row.status)} · {String(row.count || 0)}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={repairReadiness}
+              disabled={repairingReadiness}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border border-semantic-warning/25 px-2 py-1 text-[10px] font-medium text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+            >
+              {repairingReadiness ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+              {repairingReadiness ? 'Clearing' : 'Clear stuck queue'}
+            </button>
+          </div>
+        </div>
+      )}
+
       {!run ? (
-        <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-4">
-          <div className="text-sm font-medium text-text-primary">No lab run yet</div>
-          <div className="mt-1 text-xs leading-relaxed text-text-muted">
-            Start a suite to create ten goal-driven conversations covering follow-ups, meeting prep, document work, deal understanding,
-            weekly summaries, drafting, privacy, and timeline awareness. Nothing changes live MARTy automatically.
+        <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Sandbox cover</div>
+          <div className="mt-1 text-lg font-semibold text-text-primary">No active lab run</div>
+          <div className="mt-1 max-w-3xl text-sm leading-relaxed text-text-secondary">
+            {laneMessage} Start a focused canary for one controlled improvement, or queue the next canary focus.
           </div>
         </div>
       ) : (
-        <>
-          <div>
-            <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
-              <div className="h-full rounded-full bg-accent-magenta transition-all" style={{ width: `${progressPct}%` }} />
-            </div>
-            <div className="mt-1 flex flex-wrap justify-between gap-2 text-[11px] text-text-muted">
-              <span>{completed.toLocaleString()} of {total.toLocaleString()} experiments graded or closed</span>
-              <span>
-                {autopilotEnabled && nextRunAfter
-                  ? `Autopilot · next suite eligible ${formatRelative(nextRunAfter)}`
-                  : `${run.suite_name} · ${run.baseline_label} vs ${run.candidate_label}`}
-              </span>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
-            <ReplayMetric label="Experiments" value={`${completed}/${total}`} />
-            <ReplayMetric label="Baseline avg" value={formatLabScore(run.average_baseline_score)} />
-            <ReplayMetric
-              label="Candidate avg"
-              value={formatLabScore(run.average_candidate_score)}
-              tone={scoreDelta !== null && scoreDelta > 0 ? 'good' : scoreDelta !== null && scoreDelta < 0 ? 'bad' : 'default'}
-            />
-            <ReplayMetric label="Candidate wins" value={run.winning_candidate_count.toLocaleString()} tone="good" />
-            <ReplayMetric label="Candidate losses" value={candidateLosses.toLocaleString()} tone={candidateLosses > 0 ? 'warn' : 'default'} />
-            <ReplayMetric label="Privacy failures" value={run.privacy_failures.toLocaleString()} tone={run.privacy_failures > 0 ? 'bad' : 'default'} />
-          </div>
-        </>
-      )}
-
-      <div className="grid gap-3 xl:grid-cols-[minmax(0,1.35fr)_minmax(280px,0.65fr)]">
-        <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
-          <div className="flex items-center justify-between gap-2">
-            <div>
-              <div className="text-xs font-medium text-text-primary">Human Conversation Experiments</div>
-              <div className="mt-0.5 text-[11px] text-text-muted">Goal, persona, prompt, fixed rubric, and A/B outcome.</div>
-            </div>
-            <div className="text-[11px] text-text-muted">{experiments.length.toLocaleString()} configured</div>
-          </div>
-          {experiments.length === 0 ? (
-            <div className="mt-3 text-xs text-text-muted">Start a suite to seed human-style conversation experiments.</div>
-          ) : (
-            <div className="mt-3 max-h-[32rem] overflow-y-auto pr-1 space-y-2">
-              {experiments.map(exp => {
-                const isOpen = openExperiment === exp.id;
-                const delta = typeof exp.candidate_score === 'number' && typeof exp.baseline_score === 'number'
-                  ? exp.candidate_score - exp.baseline_score
-                  : null;
-                return (
-                  <div key={exp.id} className="rounded-lg border border-white/[0.04] bg-black/10">
-                    <button
-                      type="button"
-                      onClick={() => setOpenExperiment(isOpen ? null : exp.id)}
-                      className="flex w-full items-start justify-between gap-3 px-3 py-2.5 text-left hover:bg-white/[0.025]"
-                    >
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <MartyLabStatusPill status={exp.status} />
-                          {exp.privacy_failure && (
-                            <span className="rounded-full bg-semantic-error/15 px-2 py-0.5 text-[11px] font-medium text-semantic-error">Privacy fail</span>
-                          )}
-                          <span className="text-xs text-text-muted">{exp.persona.name} · {exp.persona.role}</span>
-                        </div>
-                        <div className="mt-1 text-sm font-medium text-text-primary line-clamp-1">{exp.goal}</div>
-                        <div className="mt-1 text-xs text-text-muted line-clamp-2">“{exp.starting_prompt}”</div>
-                      </div>
-                      <div className="shrink-0 text-right">
-                        <div className="text-xs text-text-primary">{formatLabScore(exp.baseline_score)} → {formatLabScore(exp.candidate_score)}</div>
-                        <div className={`mt-0.5 text-[11px] ${delta && delta > 0 ? 'text-semantic-success' : delta && delta < 0 ? 'text-semantic-error' : 'text-text-muted'}`}>
-                          {delta == null ? 'Pending score' : `${delta > 0 ? '+' : ''}${Math.round(delta)} delta`}
-                        </div>
-                      </div>
-                    </button>
-                    {isOpen && (
-                      <div className="border-t border-white/[0.04] px-3 py-3 space-y-3">
-                        <div className="grid gap-3 lg:grid-cols-2">
-                          <div>
-                            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Persona permissions</div>
-                            <div className="mt-1 text-xs leading-relaxed text-text-secondary">{exp.persona.permissions}</div>
-                          </div>
-                          <div>
-                            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Recommendation</div>
-                            <div className="mt-1 text-xs leading-relaxed text-text-secondary">{exp.recommendation || 'No recommendation recorded yet.'}</div>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Rubric</div>
-                          <div className="mt-2 grid gap-2 md:grid-cols-2">
-                            {exp.rubric.dimensions.map(dim => (
-                              <div key={dim.key} className="rounded-md bg-white/[0.025] px-2 py-1.5">
-                                <div className="flex items-center justify-between gap-2 text-xs">
-                                  <span className="font-medium text-text-primary">{dim.label}</span>
-                                  <span className="text-text-muted">{Math.round(dim.weight)}%</span>
-                                </div>
-                                <div className="mt-0.5 text-[11px] leading-relaxed text-text-muted line-clamp-2">{dim.success_criteria}</div>
-                              </div>
-                            ))}
-                          </div>
-                          <div className="mt-2 text-[11px] text-semantic-error">
-                            Auto-fail: {exp.rubric.automatic_failures.join(' · ')}
-                          </div>
-                        </div>
-
-                        <div className="grid gap-3 lg:grid-cols-2">
-                          <div>
-                            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Friction moments</div>
-                            {exp.friction.length === 0 ? (
-                              <div className="mt-1 text-xs text-text-muted">None recorded yet.</div>
-                            ) : (
-                              <div className="mt-1 space-y-1">
-                                {exp.friction.slice(0, 3).map((item, idx) => (
-                                  <div key={idx} className="text-xs leading-relaxed text-text-secondary">{formatLabNote(item)}</div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                          <div>
-                            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Findings</div>
-                            {exp.findings.length === 0 ? (
-                              <div className="mt-1 text-xs text-text-muted">None recorded yet.</div>
-                            ) : (
-                              <div className="mt-1 space-y-1">
-                                {exp.findings.slice(0, 3).map((item, idx) => (
-                                  <div key={idx} className="text-xs leading-relaxed text-text-secondary">{formatLabNote(item)}</div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    )}
+        <MartyLabPageShell
+          pageIndex={activePageIndex}
+          pageCount={pageCount}
+          onPrev={() => setActivePageIndex(index => Math.max(0, index - 1))}
+          onNext={() => setActivePageIndex(index => Math.min(pageCount - 1, index + 1))}
+          onSelect={setActivePageIndex}
+        >
+          {activePageIndex === 0 ? (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
+                    {runIsCanary ? 'Canary run cover' : 'Legacy full lab run cover'}
                   </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+                  <div className="mt-1 text-lg font-semibold text-text-primary">{activeTrial?.title || run.upgrade_title || labRunShortTitle(run)}</div>
+                  {activeTrialExperimentPage && (
+                    <div className="mt-1 max-w-3xl text-sm leading-relaxed text-text-secondary">{labExperimentTagline(activeTrialExperimentPage)}</div>
+                  )}
+                  <div className="mt-1 max-w-3xl text-xs leading-relaxed text-text-muted">
+                    {pausedForRoundReview
+                      ? 'The full lab is paused on an inconclusive experiment. Review the evidence, then continue without shipping or reject this experiment and continue.'
+                      : run.status === 'running'
+                      ? runIsCanary
+                        ? 'Three discovery chats find a real weakness, then seven validation chats compare one candidate against the accepted baseline.'
+                        : 'Eight controlled rounds run in sequence; each round discovers one weakness, validates one candidate, and compounds only approved improvements.'
+                      : run.summary?.conclusion
+                        ? String(run.summary.conclusion)
+                        : 'The run is closed and ready for review.'}
+                  </div>
+                  {typeof run.summary?.focus_prompt === 'string' && run.summary.focus_prompt.trim() && (
+                    <div className="mt-2 rounded-md border border-accent-purple/15 bg-accent-purple/5 px-3 py-2 text-xs leading-relaxed text-text-secondary">
+                      <span className="font-medium text-text-primary">Focus:</span> {run.summary.focus_prompt}
+                    </div>
+                  )}
+                </div>
+                {pausedForRoundReview ? (
+                  <MartyLabRoundReviewButtons
+                    disabled={reviewingRound !== null}
+                    reviewing={reviewingRound}
+                    onReview={reviewRound}
+                  />
+                ) : canShowRunDecision ? (
+                  <MartyLabDecisionButtons disabled={decisionDisabled} deciding={deciding} onDecide={decideLab} />
+                ) : null}
+              </div>
 
-        <div className="space-y-3">
-          <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
-            <div className="text-xs font-medium text-text-primary">Sandbox Upgrade Hypotheses</div>
-            <div className="mt-0.5 text-[11px] text-text-muted">Nothing promotes live automatically. Privacy failures block candidates.</div>
-            {upgrades.length === 0 ? (
-              <div className="mt-3 text-xs text-text-muted">Start a suite to seed upgrade hypotheses.</div>
-            ) : (
-              <div className="mt-3 max-h-80 overflow-y-auto pr-1 space-y-2">
-                {upgrades.map(upgrade => {
-                  const isOpen = openUpgrade === upgrade.id;
-                  return (
-                    <div key={upgrade.id} className="rounded-md border border-white/[0.04] bg-black/10">
-                      <button
-                        type="button"
-                        onClick={() => setOpenUpgrade(isOpen ? null : upgrade.id)}
-                        className="flex w-full items-start justify-between gap-2 px-2.5 py-2 text-left hover:bg-white/[0.025]"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <MartyLabStatusPill status={upgrade.status} />
-                            <span className="text-xs font-medium text-text-primary line-clamp-1">{upgrade.title}</span>
-                          </div>
-                          <div className="mt-1 text-[11px] text-text-muted line-clamp-2">{upgrade.hypothesis}</div>
+              {pausedForRoundReview && (
+                <div className="rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs leading-relaxed text-semantic-warning">
+                  Paused after experiment {String(pausedReview?.round_index || '—')}. Approve and continue keeps the current baseline and starts the next experiment. Reject experiment also keeps the current baseline, marks this candidate rejected, and starts the next experiment.
+                </div>
+              )}
+
+              <div className="grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_minmax(260px,0.75fr)]">
+                <div className="rounded-lg border border-white/[0.04] bg-black/10 p-3">
+                  <div className="text-xs font-medium text-text-primary">Run progress</div>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                    <MartyLabMiniStat label="Experiments" value={`${currentRound}/${roundTotal}`} tone={run.status === 'running' ? 'purple' : 'default'} />
+                    <MartyLabMiniStat label="Checks" value={`${completed}/${expectedTotal}`} />
+                    <MartyLabMiniStat label="Decided" value={`${decidedTrialCount}/${runIsCanary ? 1 : roundTotal}`} tone={decidedTrialCount > 0 ? 'good' : 'default'} />
+                  </div>
+                </div>
+                <div className="rounded-lg border border-white/[0.04] bg-black/10 p-3">
+                  <div className="text-xs font-medium text-text-primary">Run decisions</div>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    <MartyLabMiniStat label="Ship-ready" value={acceptedTrialCount.toLocaleString()} tone="good" />
+                    <MartyLabMiniStat label="Rejected" value={rejectedTrialCount.toLocaleString()} tone={rejectedTrialCount > 0 ? 'warn' : 'default'} />
+                    <MartyLabMiniStat label="Review" value={inconclusiveTrialCount.toLocaleString()} tone={inconclusiveTrialCount > 0 ? 'warn' : 'default'} />
+                  </div>
+                </div>
+              </div>
+
+              {(run.privacy_failures || 0) > 0 && (
+                <div className="rounded-lg border border-semantic-error/20 bg-semantic-error/10 px-3 py-2 text-xs leading-relaxed text-semantic-error">
+                  Privacy review found {run.privacy_failures.toLocaleString()} issue{run.privacy_failures === 1 ? '' : 's'} in this run.
+                </div>
+              )}
+
+              <div className="rounded-lg border border-white/[0.04] bg-black/10 p-3">
+                <div className="text-xs font-medium text-text-primary">{run.status === 'running' ? 'Current experiment' : 'Latest decision'}</div>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-medium text-text-primary">{String(approvalAssessment?.label || titleizeLabValue(activeTrial?.status || 'Pending'))}</div>
+                  {activeTrial && <MartyLabStatusPill status={activeTrial.status} />}
+                  {typeof approvalAssessment?.recommendation === 'string' && (
+                    <span className="rounded-full bg-white/[0.05] px-2 py-0.5 text-[10px] text-text-muted">{titleizeLabValue(approvalAssessment.recommendation)}</span>
+                  )}
+                </div>
+                <div className="mt-2 text-xs leading-relaxed text-text-secondary">
+                  {activeTrial?.conclusion || labTrialDecisionText(activeTrial)}
+                </div>
+              </div>
+
+              <details className="rounded-lg border border-white/[0.04] bg-white/[0.02] px-3 py-2">
+                <summary className="cursor-pointer text-xs font-medium text-text-primary">Evidence details</summary>
+                <div className="mt-3 space-y-3">
+                  <div className="grid gap-2 md:grid-cols-4">
+                    <MartyLabMiniStat label="Approval score" value={approvalAssessment ? String(approvalAssessment.approval_score ?? '—') : '—'} tone={activeTrial?.status === 'accepted' ? 'good' : activeTrial?.status === 'rejected' ? 'bad' : 'warn'} />
+                    <MartyLabMiniStat label="Valid signal" value={`${activeTrial?.valid_sample_size || labNumber(approvalAssessment?.valid_samples, 0)}/${validationPerRound}`} tone={(activeTrial?.valid_sample_size || 0) >= 5 ? 'good' : 'warn'} />
+                    <MartyLabMiniStat label="Wins / losses" value={`${activeTrial?.wins || 0}/${activeTrial?.losses || 0}`} tone={(activeTrial?.wins || 0) > (activeTrial?.losses || 0) ? 'good' : 'warn'} />
+                    <MartyLabMiniStat label="Target delta" value={approvalTarget?.average_delta !== undefined ? labDeltaText(Number(approvalTarget.average_delta)) : labDeltaText(activeTrial?.target_average_delta ?? null)} tone={(Number(approvalTarget?.average_delta ?? activeTrial?.target_average_delta ?? 0) > 0) ? 'good' : 'default'} />
+                  </div>
+                  {approvalRationale.length > 0 && (
+                    <div className="grid gap-2 md:grid-cols-2">
+                      {approvalRationale.map((item, index) => (
+                        <div key={index} className="rounded-md border border-white/[0.04] bg-black/10 px-3 py-2 text-xs leading-relaxed text-text-secondary">
+                          {item}
                         </div>
-                        {isOpen ? <ChevronUp size={13} className="shrink-0 text-text-muted" /> : <ChevronDown size={13} className="shrink-0 text-text-muted" />}
-                      </button>
-                      {isOpen && (
-                        <div className="border-t border-white/[0.04] px-2.5 py-2 text-[11px] leading-relaxed text-text-muted space-y-2">
-                          <div>
-                            <span className="text-text-secondary">Targets:</span> {formatLabList(labEvidenceList(upgrade.evidence, 'target_behaviors'))}
-                          </div>
-                          <div>
-                            <span className="text-text-secondary">Guardrails:</span> {formatLabList(labEvidenceList(upgrade.evidence, 'guardrails'))}
-                          </div>
-                          {upgrade.change_summary && (
-                            <div><span className="text-text-secondary">Patch:</span> {upgrade.change_summary}</div>
-                          )}
-                          {upgrade.expected_benefit && (
-                            <div><span className="text-text-secondary">Expected benefit:</span> {upgrade.expected_benefit}</div>
-                          )}
+                      ))}
+                    </div>
+                  )}
+                  <div className="text-[11px] leading-relaxed text-text-muted">
+                    Small unrelated losses: {String(approvalRegressions?.small_non_target_losses ?? 0)} · meaningful non-target losses: {String(approvalRegressions?.meaningful_non_target_losses ?? 0)} · severe: {String(activeTrial?.severe_regressions ?? 0)}
+                  </div>
+                  {acceptedBaseline && (
+                    <div className="rounded-md border border-white/[0.04] bg-black/10 px-3 py-2">
+                      <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Current baseline</div>
+                      <div className="mt-1 text-xs font-medium text-text-primary line-clamp-1">{acceptedBaseline.label}</div>
+                      <div className="mt-0.5 text-[11px] text-text-muted">Generation {acceptedBaseline.generation.toLocaleString()}</div>
+                    </div>
+                  )}
+                  {(activeLeverIds.length > 0 || activeCandidatePool) && (
+                    <div className="rounded-md border border-white/[0.04] bg-black/10 px-3 py-2">
+                      <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Candidate</div>
+                      {activeCandidatePool && (
+                        <div className="mt-1 text-[11px] text-text-muted">
+                          Rank {String(activeCandidatePool.selected_rank || '—')} of {String(activeCandidatePool.candidate_count || candidatePoolSize)}
+                          {' '}· code-backed {String(activeCandidatePool.code_backed_candidate_count || 0)}/{String(activeCandidatePool.required_code_backed_candidates || minCodeBackedCandidates)}
+                        </div>
+                      )}
+                      {activeLeverIds.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {activeLeverIds.map(leverId => (
+                            <span key={leverId} className="rounded-full bg-white/[0.05] px-1.5 py-0.5 text-[10px] text-text-muted">{leverId}</span>
+                          ))}
                         </div>
                       )}
                     </div>
-                  );
-                })}
+                  )}
+                </div>
+              </details>
+            </div>
+          ) : selectedExperimentPage ? (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
+                    Experiment {selectedExperimentPage.round} of {experimentPages.length}
+                  </div>
+                  <div className="mt-1 max-w-4xl text-lg font-semibold leading-snug text-text-primary">{selectedExperimentPage.title}</div>
+                  <div className="mt-1 max-w-3xl text-sm leading-relaxed text-text-secondary">{labExperimentTagline(selectedExperimentPage)}</div>
+                  <div className="mt-1 text-xs text-text-muted">
+                    {(selectedExperimentStats?.closedSamples ?? 0).toLocaleString()}/{(selectedExperimentStats?.totalSamples ?? roundSampleSize).toLocaleString()} checks complete · {selectedExperimentStats?.decision || 'Pending'}
+                  </div>
+                </div>
+                {selectedExperimentPage.trial && <MartyLabStatusPill status={selectedExperimentPage.trial.status} />}
               </div>
-            )}
+
+              <div className="grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_minmax(260px,0.75fr)]">
+                <div className="rounded-lg border border-white/[0.04] bg-black/10 p-3">
+                  <div className="text-xs font-medium text-text-primary">Experiment progress</div>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                    <MartyLabMiniStat label="Checks complete" value={`${selectedExperimentStats?.closedSamples ?? 0}/${selectedExperimentStats?.totalSamples ?? roundSampleSize}`} />
+                    <MartyLabMiniStat label="Validation graded" value={`${selectedExperimentStats?.validSamples ?? 0}/${selectedExperimentStats?.validationTotal ?? validationPerRound}`} />
+                    <MartyLabMiniStat label="Decision" value={selectedExperimentStats?.decision || 'Pending'} tone={selectedExperimentPage.trial?.status === 'accepted' ? 'good' : selectedExperimentPage.trial?.status === 'rejected' ? 'bad' : selectedExperimentPage.trial?.status === 'inconclusive' ? 'warn' : 'default'} />
+                  </div>
+                </div>
+                <div className="rounded-lg border border-white/[0.04] bg-black/10 p-3">
+                  <div className="text-xs font-medium text-text-primary">Validation outcome</div>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    <MartyLabMiniStat label="Wins" value={(selectedExperimentStats?.wins ?? 0).toLocaleString()} tone="good" />
+                    <MartyLabMiniStat label="Losses" value={(selectedExperimentStats?.losses ?? 0).toLocaleString()} tone={(selectedExperimentStats?.losses ?? 0) > 0 ? 'warn' : 'default'} />
+                    <MartyLabMiniStat label="Avg lift" value={labDeltaText(selectedExperimentStats?.averageDelta ?? null)} tone={(selectedExperimentStats?.averageDelta ?? 0) > 0 ? 'good' : (selectedExperimentStats?.averageDelta ?? 0) < 0 ? 'bad' : 'default'} />
+                  </div>
+                </div>
+              </div>
+
+              <div className="max-h-[36rem] overflow-y-auto rounded-lg border border-white/[0.04] bg-white/[0.01] p-2">
+                <div className="grid gap-2 xl:grid-cols-2">
+                  {selectedExperimentPage.samples.length > 0 ? (
+                    selectedExperimentPage.samples.map(sample => (
+                      <MartyLabRoundSampleCard key={sample.id} sample={sample} />
+                    ))
+                  ) : (
+                    <div className="rounded-lg border border-white/[0.04] bg-black/10 p-4 text-sm leading-relaxed text-text-muted xl:col-span-2">
+                      This experiment has not started yet. It will fill with three discovery cards and seven validation cards when the lab reaches this step.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs text-text-muted">No experiment selected.</div>
+          )}
+        </MartyLabPageShell>
+      )}
+
+      <details className="rounded-lg border border-white/[0.06] bg-white/[0.02]">
+        <summary className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-xs font-medium text-text-primary">
+          <span>Controls, queue, and history</span>
+          <span className="text-[11px] font-normal text-text-muted">{queuedRuns.length} queued</span>
+        </summary>
+        <div className="space-y-4 border-t border-white/[0.04] p-3">
+          <div>
+            <div className="text-xs font-medium text-text-primary">Focus the next run</div>
+            <div className="mt-1 text-[11px] leading-relaxed text-text-muted">
+              Add a concrete problem or target area. If a run is active, this request waits for the current run to get Ship or Reject.
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <input
+                value={focusPrompt}
+                onChange={event => setFocusPrompt(event.target.value)}
+                placeholder="Example: I had a problem with Excel artifacts missing formulas. Focus on that."
+                className="min-w-[18rem] flex-1 rounded-lg border border-white/10 bg-bg-input px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-magenta/50 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => startLab()}
+                disabled={startDisabled}
+                className="inline-flex items-center gap-1 rounded-lg border border-accent-magenta/25 px-2.5 py-1.5 text-[11px] text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50"
+              >
+                <Sparkles size={12} /> {startingMode === 'canary' ? `${startVerb}ing...` : `${startVerb} canary`}
+              </button>
+            </div>
           </div>
 
-          <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-3">
-            <div className="text-xs font-medium text-text-primary">Recent Lab Events</div>
-            {run?.recent_events?.length ? (
-              <div className="mt-2 max-h-44 overflow-y-auto pr-1 space-y-2">
-                {run.recent_events.map((event, idx) => (
-                  <div key={`${event.at}-${idx}`} className="text-xs">
-                    <div className="text-text-secondary">{event.message}</div>
-                    <div className="mt-0.5 text-[11px] text-text-muted">{formatRelative(event.at)}</div>
+          <div className="rounded-lg border border-white/[0.04] bg-black/10 px-3 py-2 text-xs leading-relaxed text-text-secondary">
+            <span className="font-medium text-text-primary">Queue state:</span> {laneMessage}
+            {readiness.ok && readiness.warnings.length > 0 ? ` Warning: ${readiness.warnings[0]}` : ''}
+          </div>
+
+          {queuedRuns.length > 0 && (
+            <div>
+              <div className="text-xs font-medium text-text-primary">Queued runs</div>
+              <div className="mt-2 grid gap-2 md:grid-cols-2">
+                {queuedRuns.map((queued, index) => (
+                  <div key={queued.id} className="rounded-md border border-white/[0.05] bg-black/10 px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-xs font-medium text-text-primary">{index === 0 ? 'Next' : `Queued ${index + 1}`}</div>
+                      <MartyLabStatusPill status={queued.status} />
+                    </div>
+                    <div className="mt-1 text-[11px] text-text-muted">
+                      {queued.upgrade_variable?.mode === 'canary' ? 'Canary' : 'Legacy full lab'} · {queued.total_experiments.toLocaleString()} checks
+                    </div>
+                    {typeof queued.summary?.focus_prompt === 'string' && queued.summary.focus_prompt.trim() && (
+                      <ExpandableText
+                        text={queued.summary.focus_prompt}
+                        collapsedLines={2}
+                        minToggleChars={110}
+                        className="mt-2 text-[11px] leading-relaxed text-text-secondary"
+                      />
+                    )}
                   </div>
                 ))}
               </div>
-            ) : (
-              <div className="mt-2 text-xs text-text-muted">Lab events will appear here as the sandbox runner reports results.</div>
-            )}
-          </div>
+            </div>
+          )}
+
+          {recentRuns.length > 0 && (
+            <div>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs font-medium text-text-primary">Past runs</div>
+                {loadingRunId && <div className="text-[11px] text-text-muted">Loading run...</div>}
+              </div>
+              <div className="mt-2 flex gap-2 overflow-x-auto pb-1">
+                <button
+                  type="button"
+                  onClick={() => selectRun(null)}
+                  className={`min-w-[14rem] rounded-lg border px-3 py-2 text-left transition ${!run ? `${stateTone.border} ${stateTone.soft}` : 'border-white/[0.05] bg-black/10 hover:bg-white/[0.03]'}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Current run</span>
+                    <span className={`rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${martyToneClasses(readiness.ok ? 'good' : 'warn').box}`}>
+                      {readiness.ok ? 'Ready' : 'Waiting'}
+                    </span>
+                  </div>
+                  <div className="mt-1 truncate text-xs font-medium text-text-primary">Next canary</div>
+                  <div className="mt-1 text-[11px] text-text-muted">Single controlled run at a time</div>
+                </button>
+                {recentRuns.map(item => {
+                  const selected = run?.id === item.id;
+                  const current = liveRun?.id === item.id;
+                  const chipState = labRunChipState(item, current);
+                  const tone = martyToneClasses(chipState.tone);
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => selectRun(item.id)}
+                      className={`min-w-[14rem] rounded-lg border px-3 py-2 text-left transition ${selected ? `${tone.border} ${tone.soft}` : 'border-white/[0.05] bg-black/10 hover:bg-white/[0.03]'}`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">{current ? 'Current run' : formatRelative(item.created_at)}</span>
+                        <span className={`rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${tone.box}`}>{chipState.label}</span>
+                      </div>
+                      <div className="mt-1 truncate text-xs font-medium text-text-primary">{labRunShortTitle(item)}</div>
+                      <div className="mt-1 text-[11px] text-text-muted">
+                        {labRunModeLabel(item)} · {item.completed_experiments}/{item.total_experiments || 0} closed
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {isQuarantined && (
+            <div className="rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs leading-relaxed text-semantic-warning">
+              This lab run is archived and should not drive Ship or Reject decisions. {run?.discard_reason || 'Its scorecards are kept only as historical context.'}
+            </div>
+          )}
         </div>
-      </div>
+      </details>
+
+      {(run && codePatchJobs.length > 0) && (
+        <details className="rounded-lg border border-white/[0.06] bg-white/[0.02]">
+          <summary className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2">
+            <div>
+              <div className="text-xs font-medium text-text-primary">Code Patch Lane</div>
+              <div className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
+                Isolated engineering briefs for Deep Work. These do not deploy or ship MARTy until a human reviews the patch and reruns a canary.
+              </div>
+            </div>
+            <span className="shrink-0 rounded-md border border-white/[0.08] bg-white/[0.03] px-2 py-1 text-[10px] font-medium text-text-secondary">
+              {codePatchJobs.length} job{codePatchJobs.length === 1 ? '' : 's'}
+            </span>
+          </summary>
+          <div className="grid max-h-[22rem] gap-2 overflow-y-auto border-t border-white/[0.06] p-3 pr-1 lg:grid-cols-2">
+            {codePatchJobs.map(job => (
+              <div key={job.id} className="rounded-md border border-white/[0.06] bg-black/10 px-2.5 py-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-medium leading-snug text-text-primary">{job.title}</div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-text-muted">
+                      <span>{labCodePatchStatusLabel(job.status)}</span>
+                      <span>·</span>
+                      <span>{titleizeLabValue(job.priority)}</span>
+                      <span>·</span>
+                      <span>{job.model}</span>
+                    </div>
+                  </div>
+                  <span className="shrink-0 rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-text-muted">
+                    No deploy
+                  </span>
+                </div>
+                <div className="mt-2 grid gap-1.5 text-[11px] text-text-muted sm:grid-cols-2">
+                  <div className="rounded border border-white/[0.05] bg-white/[0.02] px-2 py-1">
+                    Branch: <span className="text-text-secondary">{job.branch_name || 'pending'}</span>
+                  </div>
+                  <div className="rounded border border-white/[0.05] bg-white/[0.02] px-2 py-1">
+                    Worktree: <span className="text-text-secondary">{job.worktree_path || 'pending'}</span>
+                  </div>
+                </div>
+                <ExpandableText
+                  text={labCodePatchBody(job)}
+                  collapsedLines={4}
+                  minToggleChars={180}
+                  className="mt-2 text-[11px] leading-relaxed text-text-secondary"
+                />
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {(run && (deepWorkItems.length > 0 || activeFailureClusters.length > 0)) && (
+        <details className="rounded-lg border border-semantic-warning/20 bg-semantic-warning/5">
+          <summary className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2">
+            <div>
+              <div className="text-xs font-medium text-text-primary">Deep Work</div>
+              <div className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
+                Engineering follow-up found by the lab. These items need a focused canary or lab before they can ship.
+              </div>
+            </div>
+            <span className="shrink-0 rounded-md border border-semantic-warning/20 bg-semantic-warning/10 px-2 py-1 text-[10px] font-medium text-semantic-warning">
+              {deepWorkItems.length || activeFailureClusters.length} item{(deepWorkItems.length || activeFailureClusters.length) === 1 ? '' : 's'}
+            </span>
+          </summary>
+          <div className="grid max-h-[24rem] gap-2 overflow-y-auto border-t border-semantic-warning/10 p-3 pr-1 md:grid-cols-2 xl:grid-cols-3">
+            {deepWorkItems.map(item => {
+              const patchJob = codePatchJobs.find(job => job.deep_work_item_id === item.id);
+              return (
+                <div key={item.id} className="rounded-md border border-semantic-warning/15 bg-black/10 px-2.5 py-2">
+                  <div className="text-xs font-medium leading-snug text-text-primary">{item.title}</div>
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-text-muted">
+                    <span>{titleizeLabValue(item.priority)}</span>
+                    <span>·</span>
+                    <span>{titleizeLabValue(item.failure_type)}</span>
+                    <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-text-muted">Not included in Ship</span>
+                    {patchJob && (
+                      <span className="rounded border border-accent-magenta/20 bg-accent-magenta/10 px-1.5 py-0.5 text-[10px] text-accent-magenta">
+                        Patch {labCodePatchStatusLabel(patchJob.status)}
+                      </span>
+                    )}
+                  </div>
+                  <ExpandableText
+                    text={labDeepWorkBody(item)}
+                    collapsedLines={3}
+                    minToggleChars={140}
+                    className="mt-2 text-[11px] leading-relaxed text-text-secondary"
+                  />
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => startCodePatch(item)}
+                      disabled={Boolean(patchJob) || startingCodePatchId === item.id || !isViewingCurrent}
+                      className="rounded-md border border-accent-magenta/25 px-2 py-1 text-[10px] font-medium text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50"
+                    >
+                      {startingCodePatchId === item.id ? 'Starting patch' : patchJob ? 'Patch started' : 'Start code patch'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => startLab(`${item.title}. ${labDeepWorkBody(item)}`)}
+                      disabled={startDisabled}
+                      className="rounded-md border border-white/10 px-2 py-1 text-[10px] font-medium text-text-secondary hover:bg-white/[0.04] disabled:opacity-50"
+                    >
+                      {startVerb} canary
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            {deepWorkItems.length === 0 && activeFailureClusters.map((cluster, index) => (
+              <div key={`${String(cluster.cluster_key || index)}`} className="rounded-md border border-white/[0.04] bg-black/10 px-2.5 py-2">
+                <div className="text-xs font-medium leading-snug text-text-primary">{titleizeLabValue(cluster.failed_gate || cluster.failure_type)}</div>
+                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-text-muted">
+                  <span>{titleizeLabValue(cluster.priority)}</span>
+                  <span>·</span>
+                  <span>{Number(cluster.count || 0)} sample{Number(cluster.count || 0) === 1 ? '' : 's'}</span>
+                  <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-text-muted">Needs diagnosis</span>
+                </div>
+                <ExpandableText
+                  text={labFailureClusterBody(cluster)}
+                  collapsedLines={3}
+                  minToggleChars={140}
+                  className="mt-2 text-[11px] leading-relaxed text-text-secondary"
+                />
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => startLab(`${titleizeLabValue(cluster.failed_gate || cluster.failure_type)}. ${labFailureClusterBody(cluster)}`)}
+                    disabled={startDisabled}
+                    className="rounded-md border border-accent-magenta/25 px-2 py-1 text-[10px] font-medium text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50"
+                  >
+                    {startVerb} canary
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
     </div>
   );
 }

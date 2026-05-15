@@ -308,6 +308,8 @@ export const api = {
       truncated: boolean;
     }>(`/deals/${id}/conversations${q}`);
   },
+  getConversationThread: (id: string) =>
+    request<ConversationThreadResponse>(`/conversations/${id}/thread`),
   addDealContact: (dealId: string, data: { contact_id: string; role: string; side: string }) =>
     request<{ ok: boolean }>(`/deals/${dealId}/contacts`, { method: 'POST', body: JSON.stringify(data) }),
 
@@ -717,19 +719,22 @@ export const api = {
       users: Array<{ id: string; email: string; full_name: string | null; role: string }>;
     }>('/backfill/eligible-users'),
 
-  // Progressive Firefly backfill (Phase F + Phase 4, owner-gated).
+  // Progressive Firefly backfill (Phase F + Phase 4, self-service).
   //
   // Phase 4 (2026-05-04): fireflies_api_key is now OPTIONAL. When omitted,
   // the driver resolves the user's persistent credential row from
   // user_firefly_credentials (set via the /api/settings/firefly-credentials
   // endpoints below). If a key IS supplied, it dual-writes — legacy per-job
   // path AND persistent storage — for transition safety on in-flight jobs.
+  // Members may start/view/cancel their own import. Owners may inspect and
+  // start/cancel for org members, but the target user's stored credential is
+  // always the credential used by the backend driver.
   //
   // days_back ∈ {30,60,90}. The 180-day option was dropped in Phase 4 sub-
   // stage 1c (MAX_BACKFILL_DAYS lowered to 120 in src/lib/firefly-progressive
   // -backfill.ts; 180 would now be rejected at the backend).
   startFireflyProgressiveBackfill: (data: {
-    user_id: string;
+    user_id?: string;
     fireflies_api_key?: string;
     days_back?: 30 | 60 | 90;
     start_date?: string;
@@ -761,6 +766,14 @@ export const api = {
         updated_at: string;
         completed_at: string | null;
       };
+      credential_status?: {
+        exists: boolean;
+        user_id: string;
+        created_at: string | null;
+        updated_at: string | null;
+        last_used_at: string | null;
+        rotation_count: number;
+      };
       windows: Array<{
         id: string;
         window_index: number;
@@ -781,10 +794,10 @@ export const api = {
         ? `/admin/firefly-progressive-backfill?user_id=${encodeURIComponent(userId)}`
         : `/admin/firefly-progressive-backfill`
     ),
-  cancelFireflyProgressiveBackfill: (userId: string) =>
+  cancelFireflyProgressiveBackfill: (userId?: string) =>
     request<{ ok: boolean; result: 'cancelled' | 'not_found'; user_id: string }>(
       '/admin/firefly-progressive-backfill/cancel',
-      { method: 'POST', body: JSON.stringify({ user_id: userId }) }
+      { method: 'POST', body: JSON.stringify(userId ? { user_id: userId } : {}) }
     ),
 
   triggerSync: (workflow: 'ingestion' | 'enrichment') =>
@@ -804,7 +817,21 @@ export const api = {
   // hits /system/status for admin mode/cache info).
   getSettingsSystemStatus: () => request<SystemStatusResponse>('/settings/system-status'),
   getMartyLabStatus: () => request<MartyLabStatusSnapshot>('/admin/marty-lab'),
-  startMartyLabRun: (data?: { suite_name?: string; baseline_label?: string; candidate_label?: string }) =>
+  getMartyLabReadiness: () => request<MartyLabReadinessSnapshot>('/admin/marty-lab/readiness'),
+  repairMartyLabReadiness: (data?: { action?: 'clear_orphaned_lab_queue' }) =>
+    request<MartyLabStatusSnapshot>('/admin/marty-lab/repair-readiness', {
+      method: 'POST',
+      body: JSON.stringify(data || { action: 'clear_orphaned_lab_queue' }),
+    }),
+  startMartyLabRun: (data?: {
+    suite_name?: string;
+    baseline_label?: string;
+    candidate_label?: string;
+    mode?: MartyLabRunMode;
+    round_count?: number;
+    focus_prompt?: string;
+    queue_if_blocked?: boolean;
+  }) =>
     request<MartyLabStatusSnapshot>('/admin/marty-lab/runs', {
       method: 'POST',
       body: JSON.stringify(data || {}),
@@ -815,6 +842,28 @@ export const api = {
     request<MartyLabStatusSnapshot>(`/admin/marty-lab/runs/${encodeURIComponent(runId)}/cancel`, {
       method: 'POST',
     }),
+  decideMartyLabRun: (runId: string, decision: 'ship' | 'reject') =>
+    request<MartyLabStatusSnapshot>(`/admin/marty-lab/runs/${encodeURIComponent(runId)}/decision`, {
+      method: 'POST',
+      body: JSON.stringify({ decision }),
+    }),
+  reviewMartyLabRound: (runId: string, decision: 'approve_continue' | 'reject_continue') =>
+    request<MartyLabStatusSnapshot>(`/admin/marty-lab/runs/${encodeURIComponent(runId)}/round-review`, {
+      method: 'POST',
+      body: JSON.stringify({ decision }),
+    }),
+  startMartyLabCodePatch: (
+    runId: string,
+    deepWorkItemId: string,
+    data?: { focus_prompt?: string }
+  ) =>
+    request<MartyLabStatusSnapshot>(
+      `/admin/marty-lab/runs/${encodeURIComponent(runId)}/deep-work/${encodeURIComponent(deepWorkItemId)}/code-patch`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data || {}),
+      }
+    ),
   recordMartyLabExperimentResult: (
     runId: string,
     experimentId: string,
@@ -943,7 +992,7 @@ export const api = {
   logout: () =>
     request<{ success: boolean }>('/auth/logout', { method: 'POST' }),
   getMe: () =>
-    request<{ user: UserProfile }>('/auth/me'),
+    request<{ user: UserProfile; warnings?: UserWarning[] }>('/auth/me'),
 
   // Self-service profile
   updateMyProfile: (data: Partial<Pick<UserProfile, 'full_name' | 'phone' | 'job_title' | 'linkedin_url' | 'bio' | 'avatar_url'>>) =>
@@ -989,6 +1038,16 @@ export interface UserProfile {
   last_login_at: string | null;
   share_emails_org_wide: number | null;
   email_verified: number | null;
+}
+
+export interface UserWarning {
+  type: string;
+  message: string;
+  consecutive_failures?: number;
+  last_successful_sync?: string | null;
+  missed_days?: number;
+  suggest_backfill_days?: 30;
+  backfill_prompt?: string;
 }
 
 // Resolve avatar_url for display. The backend stores R2-backed avatars as `r2:<key>`
@@ -1040,6 +1099,32 @@ export interface IntegrationsStatusResponse {
   slack: IntegrationRow;
   reversecontact: IntegrationRow;
   firefly: IntegrationRow;
+}
+
+export interface ConversationThreadMessage {
+  id: string;
+  source: string;
+  external_message_id: string | null;
+  subject: string | null;
+  sent_at: string | null;
+  direction: string | null;
+  from_name: string | null;
+  from_email: string | null;
+  body_preview: string | null;
+  body: string | null;
+  has_attachments: boolean;
+}
+
+export interface ConversationThreadResponse {
+  thread: {
+    anchor_id: string;
+    external_thread_id: string | null;
+    subject: string;
+    source: string;
+    message_count: number;
+    last_sent_at: string | null;
+    messages: ConversationThreadMessage[];
+  };
 }
 
 // --- Settings → System Status types (mirror src/handlers/system-status.ts) ---
@@ -1099,9 +1184,19 @@ export interface BudgetSnapshotRow {
   last_429_at: string | null;
 }
 
-export type MartyLabRunStatus = 'configured' | 'running' | 'completed' | 'cancelled' | 'failed';
+export type MartyLabRunStatus = 'queued' | 'configured' | 'running' | 'completed' | 'cancelled' | 'failed';
 export type MartyLabExperimentStatus = 'queued' | 'running' | 'graded' | 'blocked' | 'failed' | 'cancelled';
 export type MartyLabUpgradeStatus = 'hypothesis' | 'sandbox_applied' | 'validated' | 'rejected';
+export type MartyLabExperimentPriority =
+  | 'context_retrieval'
+  | 'document_artifact'
+  | 'privacy'
+  | 'timeline'
+  | 'deal_intelligence'
+  | 'conversation_quality'
+  | 'drafting';
+export type MartyLabVersionStatus = 'accepted' | 'candidate' | 'rejected' | 'archived';
+export type MartyLabUpgradeTrialStatus = 'pending' | 'accepted' | 'rejected' | 'inconclusive';
 
 export interface MartyLabPersona {
   name: string;
@@ -1129,6 +1224,11 @@ export interface MartyLabRunSnapshot {
   suite_name: string;
   baseline_label: string;
   candidate_label: string;
+  baseline_version_id: string | null;
+  candidate_version_id: string | null;
+  upgrade_title: string | null;
+  upgrade_variable: Record<string, unknown>;
+  bootcamp_phase: string;
   total_experiments: number;
   completed_experiments: number;
   privacy_failures: number;
@@ -1139,6 +1239,8 @@ export interface MartyLabRunSnapshot {
   summary: Record<string, unknown>;
   completed_at: string | null;
   cancelled_at: string | null;
+  discarded_at: string | null;
+  discard_reason: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1150,6 +1252,9 @@ export interface MartyLabExperimentSnapshot {
   persona: MartyLabPersona;
   goal: string;
   starting_prompt: string;
+  priority: MartyLabExperimentPriority;
+  replicate_group: string | null;
+  variable_under_test: string | null;
   followup_policy: Record<string, unknown>;
   rubric: MartyLabRubric;
   baseline_transcript: Array<Record<string, unknown>>;
@@ -1179,10 +1284,124 @@ export interface MartyLabUpgradeCandidateSnapshot {
   updated_at: string;
 }
 
+export interface MartyLabVersionSnapshot {
+  id: string;
+  org_id: string;
+  status: MartyLabVersionStatus;
+  label: string;
+  generation: number;
+  parent_version_id: string | null;
+  prompt_addendum: string;
+  applied_upgrades: string[];
+  evidence: Record<string, unknown>;
+  source_run_id: string | null;
+  accepted_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MartyLabUpgradeTrialSnapshot {
+  id: string;
+  org_id: string;
+  run_id: string;
+  status: MartyLabUpgradeTrialStatus;
+  baseline_version_id: string | null;
+  candidate_version_id: string | null;
+  upgrade_key: string;
+  title: string;
+  sample_size: number;
+  valid_sample_size: number;
+  average_delta: number | null;
+  target_average_delta: number | null;
+  wins: number;
+  losses: number;
+  ties: number;
+  privacy_failures: number;
+  severe_regressions: number;
+  conclusion: string | null;
+  evidence: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MartyLabDeepWorkItemSnapshot {
+  id: string;
+  org_id: string;
+  run_id: string;
+  status: 'open' | 'closed';
+  cluster_key: string;
+  title: string;
+  priority: MartyLabExperimentPriority;
+  failure_type: string;
+  lever_ids: string[];
+  evidence: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export type MartyLabCodePatchStatus =
+  | 'queued'
+  | 'planning'
+  | 'ready_for_agent'
+  | 'in_agent_worktree'
+  | 'ready_for_review'
+  | 'validated'
+  | 'rejected'
+  | 'cancelled'
+  | 'failed';
+
+export interface MartyLabCodePatchJobSnapshot {
+  id: string;
+  org_id: string;
+  run_id: string;
+  deep_work_item_id: string | null;
+  status: MartyLabCodePatchStatus;
+  title: string;
+  priority: MartyLabExperimentPriority;
+  failure_type: string;
+  model: string;
+  branch_name: string;
+  worktree_path: string;
+  patch_scope: Record<string, unknown>;
+  validation_plan: Record<string, unknown>;
+  evidence: Record<string, unknown>;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export type MartyLabRunMode = 'bootcamp' | 'canary';
+export type MartyLabReadinessStatus = 'pass' | 'warn' | 'block';
+
+export interface MartyLabReadinessCheck {
+  key: string;
+  label: string;
+  status: MartyLabReadinessStatus;
+  detail: string;
+  data?: Record<string, unknown>;
+}
+
+export interface MartyLabReadinessSnapshot {
+  ok: boolean;
+  harness_version: string;
+  generated_at: string;
+  blockers: string[];
+  warnings: string[];
+  checks: MartyLabReadinessCheck[];
+}
+
 export interface MartyLabStatusSnapshot {
   run: MartyLabRunSnapshot | null;
+  recent_runs: MartyLabRunSnapshot[];
+  queued_runs: MartyLabRunSnapshot[];
   experiments: MartyLabExperimentSnapshot[];
   upgrade_candidates: MartyLabUpgradeCandidateSnapshot[];
+  versions: MartyLabVersionSnapshot[];
+  upgrade_trials: MartyLabUpgradeTrialSnapshot[];
+  deep_work_items: MartyLabDeepWorkItemSnapshot[];
+  code_patch_jobs: MartyLabCodePatchJobSnapshot[];
+  readiness: MartyLabReadinessSnapshot;
   generated_at: string;
 }
 

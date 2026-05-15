@@ -1,6 +1,7 @@
 // TRD §4.3 — Chunk embed + persist to Vectorize + KV
 import type { Env } from '../types/env';
 import type { ChunkMetadata, SpeakerTurn, VectorIndexEntry } from '../types/interfaces';
+import type { EmbeddingModelProfile, EmbeddingProfileId } from '../types/rag-v2';
 import {
   createSplitter,
   chunkTranscriptBySpeakerTurns,
@@ -137,19 +138,88 @@ async function withInFlightCap<T>(fn: () => Promise<T>): Promise<T> {
 // 20s is generous — typical p99 BGE latency is well under 2s.
 const BGE_REQUEST_TIMEOUT_MS = 20_000;
 
-async function bgeWithTimeout(env: Env, text: string): Promise<number[]> {
-  const aiPromise = env.AI.run('@cf/baai/bge-base-en-v1.5', {
-    text: [text],
+export const RAG_V2_EMBEDDING_PROFILES: Record<EmbeddingProfileId, EmbeddingModelProfile> = {
+  'bge-base-en-v1.5:cls:v3': {
+    id: 'bge-base-en-v1.5:cls:v3',
+    provider: 'workers-ai',
+    model: '@cf/baai/bge-base-en-v1.5',
+    dimensions: 768,
+    maxInputTokens: 512,
+    maxContentTokens: 448,
     pooling: 'cls',
-  } as any).then((result: any) =>
-    Array.isArray(result.data) ? result.data[0] : result.data
+    vectorBinding: 'VECTORIZE_RAG_V2_BGE',
+    vectorIndexName: 'medina-rag-v2-bge-768',
+    vectorColumn: 'vector_id_bge',
+    vectorStatusColumn: 'vectorize_status_bge',
+  },
+  'qwen3-embedding-0.6b:v3': {
+    id: 'qwen3-embedding-0.6b:v3',
+    provider: 'workers-ai',
+    model: '@cf/qwen/qwen3-embedding-0.6b',
+    dimensions: 1024,
+    maxInputTokens: 4096,
+    maxContentTokens: 900,
+    vectorBinding: 'VECTORIZE_RAG_V2_QWEN3',
+    vectorIndexName: 'medina-rag-v2-qwen3-1024',
+    vectorColumn: 'vector_id_qwen3',
+    vectorStatusColumn: 'vectorize_status_qwen3',
+  },
+  'all-MiniLM-L6-v2:v3': {
+    id: 'all-MiniLM-L6-v2:v3',
+    provider: 'external-http',
+    model: 'sentence-transformers/all-MiniLM-L6-v2',
+    dimensions: 384,
+    maxInputTokens: 256,
+    maxContentTokens: 220,
+    vectorBinding: 'VECTORIZE_RAG_V2_MINILM',
+    vectorIndexName: 'medina-rag-v2-minilm-384',
+    vectorColumn: 'vector_id_minilm',
+    vectorStatusColumn: 'vectorize_status_minilm',
+    benchmarkOnly: true,
+  },
+};
+
+export const DEFAULT_RAG_V2_EMBEDDING_PROFILE: EmbeddingProfileId = 'bge-base-en-v1.5:cls:v3';
+
+export function getEmbeddingProfile(profileId?: string | null): EmbeddingModelProfile {
+  if (profileId && profileId in RAG_V2_EMBEDDING_PROFILES) {
+    return RAG_V2_EMBEDDING_PROFILES[profileId as EmbeddingProfileId];
+  }
+  return RAG_V2_EMBEDDING_PROFILES[DEFAULT_RAG_V2_EMBEDDING_PROFILE];
+}
+
+function normalizeEmbeddingMatrix(payload: any, expectedCount: number): number[][] {
+  const data = payload?.data ?? payload?.embeddings ?? payload;
+  if (
+    Array.isArray(data) &&
+    Array.isArray(data[0]) &&
+    typeof data[0][0] === 'number'
+  ) {
+    return data.map((row: unknown[]) => row.map(Number));
+  }
+  if (expectedCount === 1 && Array.isArray(data) && typeof data[0] === 'number') {
+    return [data.map(Number)];
+  }
+  throw new Error('EMBEDDING_BAD_RESPONSE');
+}
+
+async function workersAiEmbeddingsWithTimeout(
+  env: Env,
+  model: string,
+  texts: string[],
+  pooling?: 'cls' | 'mean'
+): Promise<number[][]> {
+  const body: Record<string, unknown> = { text: texts };
+  if (pooling) body.pooling = pooling;
+  const aiPromise = env.AI.run(model as any, body as any).then((result: any) =>
+    normalizeEmbeddingMatrix(result, texts.length)
   );
 
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(
-      () => reject(new Error('BGE_TIMEOUT')),
-      BGE_REQUEST_TIMEOUT_MS
+      () => reject(new Error('EMBEDDING_TIMEOUT')),
+      Math.min(60_000, BGE_REQUEST_TIMEOUT_MS + texts.length * 1_000)
     );
   });
 
@@ -158,6 +228,76 @@ async function bgeWithTimeout(env: Env, text: string): Promise<number[]> {
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
+}
+
+async function workersAiEmbeddingWithTimeout(
+  env: Env,
+  model: string,
+  text: string,
+  pooling?: 'cls' | 'mean'
+): Promise<number[]> {
+  const [vector] = await workersAiEmbeddingsWithTimeout(env, model, [text], pooling);
+  return vector;
+}
+
+async function bgeWithTimeout(env: Env, text: string): Promise<number[]> {
+  return workersAiEmbeddingWithTimeout(env, '@cf/baai/bge-base-en-v1.5', text, 'cls');
+}
+
+async function miniLmExternalEmbeddings(env: Env, texts: string[]): Promise<number[][]> {
+  if (!env.MINILM_EMBEDDING_ENDPOINT) {
+    throw new Error('MINILM_EMBEDDING_ENDPOINT_NOT_CONFIGURED');
+  }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (env.MINILM_EMBEDDING_API_KEY) {
+    headers.Authorization = `Bearer ${env.MINILM_EMBEDDING_API_KEY}`;
+  }
+  const response = await fetch(env.MINILM_EMBEDDING_ENDPOINT, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ inputs: texts, text: texts }),
+  });
+  if (!response.ok) {
+    throw new Error(`MINILM_EMBEDDING_HTTP_${response.status}: ${await response.text()}`);
+  }
+  const payload: any = await response.json();
+  return normalizeEmbeddingMatrix(payload, texts.length);
+}
+
+export async function runEmbeddingsForProfile(
+  env: Env,
+  texts: string[],
+  orgId: string,
+  profileId?: string | null
+): Promise<number[][]> {
+  if (texts.length === 0) return [];
+  const profile = getEmbeddingProfile(profileId);
+  await acquireEmbedSlot(orgId, env);
+  return withInFlightCap(async () => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (profile.provider === 'external-http') {
+          return await miniLmExternalEmbeddings(env, texts);
+        }
+        return await workersAiEmbeddingsWithTimeout(env, profile.model, texts, profile.pooling);
+      } catch (e) {
+        lastErr = e;
+        if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+    throw lastErr;
+  });
+}
+
+export async function runEmbeddingForProfile(
+  env: Env,
+  text: string,
+  orgId: string,
+  profileId?: string | null
+): Promise<number[]> {
+  const [vector] = await runEmbeddingsForProfile(env, [text], orgId, profileId);
+  return vector;
 }
 
 export async function runEmbedding(env: Env, text: string, orgId: string): Promise<number[]> {

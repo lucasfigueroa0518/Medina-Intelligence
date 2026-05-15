@@ -1,5 +1,6 @@
 import type { AuditEvent } from './audit';
 import type { WebhookQueueMessage } from './webhooks';
+import type { RagReindexQueueMessage } from './rag-v2';
 
 export interface Env {
   // --- Storage ---
@@ -10,12 +11,16 @@ export interface Env {
   // --- AI & Vector ---
   AI: Ai;
   VECTORIZE: VectorizeIndex;
+  VECTORIZE_RAG_V2_BGE?: VectorizeIndex;
+  VECTORIZE_RAG_V2_QWEN3?: VectorizeIndex;
+  VECTORIZE_RAG_V2_MINILM?: VectorizeIndex;
 
   // --- Queues ---
   AUDIT_QUEUE: Queue<AuditEvent>;
   AUDIT_DLQ: Queue<AuditEvent>;
   WEBHOOK_QUEUE: Queue<WebhookQueueMessage>;
   WEBHOOK_DLQ: Queue<WebhookQueueMessage>;
+  RAG_REINDEX_QUEUE?: Queue<RagReindexQueueMessage>;
 
   // --- Workflows ---
   INGESTION_WORKFLOW: Workflow;
@@ -30,6 +35,9 @@ export interface Env {
   CLOUDFLARE_ACCOUNT_ID: string;
   CLOUDFLARE_AI_GATEWAY_SLUG: string;
   CLAUDE_MAX_RPM?: string;
+  MARTY_LAB_OPUS_MODEL?: string;
+  MARTY_LAB_HAIKU_MODEL?: string;
+  MARTY_LAB_CODE_PATCH_MODEL?: string;
   // Optional: gateway-level token. Only required when the AI Gateway has
   // "Authenticated Gateway" enabled. Set via `wrangler secret put CLOUDFLARE_AI_GATEWAY_TOKEN`.
   CLOUDFLARE_AI_GATEWAY_TOKEN?: string;
@@ -48,6 +56,12 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   GOOGLE_GEMINI_API_KEY: string;
   GEMINI_MAX_RPM?: string;
+  RAG_RETRIEVAL_VERSION?: string;
+  RAG_EMBEDDING_PROFILE?: string;
+  RAG_V2_QUEUE_DISPATCH_BATCH?: string;
+  RAG_V2_QUEUE_MAX_ACTIVE?: string;
+  MINILM_EMBEDDING_ENDPOINT?: string;
+  MINILM_EMBEDDING_API_KEY?: string;
 
   SLACK_CLIENT_ID: string;
   SLACK_CLIENT_SECRET: string;

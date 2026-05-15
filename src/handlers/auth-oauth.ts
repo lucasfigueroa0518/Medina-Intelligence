@@ -359,8 +359,10 @@ export async function outlookOAuthCallback(
       WHERE id = ?`
   ).bind(encrypted, record.user_id).run();
 
-  // Reset any prior token-refresh failure counter.
+  // Reset prior token-refresh failure and delta state so the post-refresh
+  // bootstrap uses the configured Outlook history window cleanly.
   await env.KV.delete(`token_failed:${record.user_id}:outlook`);
+  await env.KV.delete(`sent_delta:${record.user_id}`);
 
   // Read per-user sync window for first delta fetch logging
   const syncConfigRaw = await env.KV.get(`sync_config:${record.user_id}`, 'json') as { sync_history_days?: number } | null;

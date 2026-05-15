@@ -357,7 +357,7 @@ export interface TranscriptChunk {
 // --- Enrichment ---
 
 export interface EnrichmentSourceContribution {
-  source: 'reversecontact' | 'claude_web_search' | 'llm_extraction' | 'gemini_web_search' | 'transcript_extraction';
+  source: 'reversecontact' | 'claude_web_search' | 'llm_extraction' | 'gemini_web_search' | 'fallback_web_search' | 'transcript_extraction';
   text: string;
   sanitized_text?: string;
   visibility: 'private' | 'org_wide' | 'confidential';

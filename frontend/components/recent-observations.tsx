@@ -18,6 +18,7 @@
 
 import * as React from 'react';
 import { api } from '@/lib/api';
+import { ExpandableText } from '@/components/expandable-text';
 
 type EntityType = 'contact' | 'company' | 'deal';
 
@@ -280,7 +281,12 @@ export function RecentObservations({
               {display.evidence && (
                 <div className="mt-2 rounded-lg border border-white/[0.06] bg-white/[0.025] px-3 py-2 text-[11px] leading-relaxed text-text-muted">
                   <span className="font-semibold uppercase tracking-wide text-text-muted/80">Evidence: </span>
-                  <span className="line-clamp-2">{display.evidence}</span>
+                  <ExpandableText
+                    text={display.evidence}
+                    collapsedLines={2}
+                    minToggleChars={120}
+                    className="inline text-[11px] leading-relaxed text-text-muted"
+                  />
                 </div>
               )}
             </div>

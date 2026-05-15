@@ -148,7 +148,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         title: { type: 'string', description: 'Human-readable document title.' },
         structured_content: {
           type: 'object',
-          description: 'Complete structured content. docx/pdf: subtitle, summary, metadata, sections with paragraphs, bullets, numbered lists, checklists, and tables. xlsx: multiple sheets with headers, rows, and formulas where natural. pptx: 6-10 slides with cover, subtitles/body, bullets, and tables where useful.',
+          description: 'Complete structured content. docx/pdf: subtitle, summary, metadata, sections with paragraphs, bullets, numbered lists, checklists, and tables. xlsx: multiple sheets with headers, rows, and formulas where natural. pptx: 6-10 Medina-dark executive slides; use layout/headline/takeaway, evidence_blocks, metrics, tables, and speaker_notes where useful. Older simple title/body/bullets slides are still accepted.',
         },
         source_document_ids: {
           type: 'array',

@@ -18,6 +18,7 @@
 import React from 'react';
 import { Mail, Calendar, Hash, Lock, X, Plus, ExternalLink } from 'lucide-react';
 import { api, ApiError } from '@/lib/api';
+import { ExpandableText } from '@/components/expandable-text';
 
 // Map junction.source enum → human label + tone. The same mapping is
 // used by Citation chips elsewhere.
@@ -401,7 +402,12 @@ function EvidenceRow({
           )}
         </div>
         {item.type === 'conversation' && item.body_preview && (
-          <div className="text-xs text-text-muted mt-1 truncate">{item.body_preview}</div>
+          <ExpandableText
+            text={item.body_preview}
+            collapsedLines={2}
+            minToggleChars={120}
+            className="mt-1 text-xs leading-relaxed text-text-muted"
+          />
         )}
       </div>
       <div className="flex items-center gap-2 shrink-0">

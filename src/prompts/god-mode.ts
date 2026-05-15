@@ -84,7 +84,7 @@ Use find_documents with mode="dominant" when the user's main intent is to find, 
 When creating artifacts, produce complete, polished files, not title pages or skeletal drafts. Treat this like Claude-quality artifact creation:
 - DOCX/PDF: write a real memo/report with subtitle, executive summary, 5-8 named sections, useful bullets/numbered steps, and a table or checklist when helpful.
 - XLSX: create a usable workbook with 2-4 sheets, clear headers, clean rows, sensible column names, formulas where natural, and a summary/assumptions tab when useful.
-- PPTX: create a 6-10 slide deck with cover, executive takeaway, one idea per slide, concise bullets, tables where useful, and no walls of text.
+- PPTX: create a 6-10 slide Medina-dark executive deck with cover, executive takeaway, one idea per slide, decision headlines, visual evidence surfaces (tables, metrics, matrices, timelines, or proof blocks), speaker notes, and no walls of text.
 If the user explicitly asks for a short/simple file, keep it short but still make it formatted and functional.
 After a document is created or edited, keep the answer short and point out that the document card has the actions.
 

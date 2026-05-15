@@ -9,6 +9,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
+import { getFireflyKeyStatus } from '../lib/firefly-credentials';
 import {
   createFireflyProgressiveBackfill,
   createFireflyProgressiveBackfillRange,
@@ -27,12 +28,17 @@ interface ProgressiveBody {
   window_size_days?: number;
 }
 
+function canManageFireflyBackfill(ctx: AuthContext, userId: string): boolean {
+  return userId === ctx.userId || ctx.userRole === 'owner' || ctx.userRole === 'super_admin';
+}
+
 /**
  * POST /api/admin/firefly-progressive-backfill
  *
  * Body: { user_id, fireflies_api_key, days_back? | (start_date,end_date)?, window_size_days? }
  *
- * Owner-gated. Seeds a parent job + N×10-day windows backwards from now (or
+ * Self-service for the target user; owners may start on behalf of org users.
+ * Seeds a parent job + N×10-day windows backwards from now (or
  * from the provided end_date). Cron driver picks it up on the next every-
  * minute tick and advances one window per tick until exhausted. Encrypts the api_key
  * with TOKEN_ENCRYPTION_KEY (AES-256-GCM via src/lib/encryption.ts) and
@@ -43,13 +49,11 @@ export async function handleFireflyProgressiveBackfill(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  if (ctx.userRole !== 'owner') {
-    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can start a progressive Firefly backfill.');
-  }
-
   const body = await parseJsonBody<ProgressiveBody>(request);
-  if (!body?.user_id) {
-    return errorResponse('VALIDATION_ERROR', 400, 'user_id required');
+  if (!body) return errorResponse('INVALID_BODY', 400);
+  const targetUserId = body?.user_id || ctx.userId;
+  if (!canManageFireflyBackfill(ctx, targetUserId)) {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Members can only import their own Fireflies transcripts.');
   }
 
   // Phase 4 fix (2026-05-04): the handler used to hard-reject when
@@ -69,7 +73,7 @@ export async function handleFireflyProgressiveBackfill(
 
   const userExists = await env.D1.prepare(
     'SELECT id FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
-  ).bind(body.user_id, ctx.orgId).first();
+  ).bind(targetUserId, ctx.orgId).first();
   if (!userExists) {
     return errorResponse('USER_NOT_FOUND', 404, 'User not in your org');
   }
@@ -97,7 +101,7 @@ export async function handleFireflyProgressiveBackfill(
       );
     }
     const result = await createFireflyProgressiveBackfill(
-      ctx.orgId, body.user_id, body.days_back!, windowSize, apiKey, env
+      ctx.orgId, targetUserId, body.days_back!, windowSize, apiKey, env
     );
     if (!result.created) {
       return errorResponse('FIREFLY_PROGRESSIVE_BLOCKED', 409, result.reason || 'cannot create');
@@ -111,7 +115,7 @@ export async function handleFireflyProgressiveBackfill(
       metadata: {
         kind: 'firefly_progressive_backfill',
         triggered_by: ctx.userId,
-        target_user: body.user_id,
+        target_user: targetUserId,
         mode: 'days_back',
         days_back: body.days_back,
         window_size_days: windowSize,
@@ -138,7 +142,7 @@ export async function handleFireflyProgressiveBackfill(
     return errorResponse('VALIDATION_ERROR', 400, 'start_date / end_date must be ISO 8601');
   }
   const result = await createFireflyProgressiveBackfillRange(
-    ctx.orgId, body.user_id, body.start_date, body.end_date, windowSize, apiKey, env
+    ctx.orgId, targetUserId, body.start_date, body.end_date, windowSize, apiKey, env
   );
   if (!result.created) {
     return errorResponse('FIREFLY_PROGRESSIVE_BLOCKED', 409, result.reason || 'cannot create');
@@ -152,7 +156,7 @@ export async function handleFireflyProgressiveBackfill(
     metadata: {
       kind: 'firefly_progressive_backfill',
       triggered_by: ctx.userId,
-      target_user: body.user_id,
+      target_user: targetUserId,
       mode: 'date_range',
       start_date: body.start_date,
       end_date: body.end_date,
@@ -177,24 +181,31 @@ export async function handleFireflyProgressiveBackfill(
 /**
  * GET /api/admin/firefly-progressive-backfill[?user_id=...]
  *
- * No params: org-wide list of recent progressive Firefly backfills.
+ * No params: owners get org-wide list of recent progressive Firefly backfills;
+ * members get their own progress.
  * ?user_id=...: parent + windows for that user.
  *
- * Owner-gated only because it surfaces the parent's encrypted api_key column
- * (which is '' when cleared, but kept owner-gated as a defense-in-depth
- * default). Strips api_key_encrypted from the wire response either way.
+ * Strips api_key_encrypted from the wire response either way.
  */
 export async function handleFireflyProgressiveBackfillStatus(
   request: Request,
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  if (ctx.userRole !== 'owner') {
-    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can view progressive Firefly backfill status.');
-  }
   const url = new URL(request.url);
   const userId = url.searchParams.get('user_id');
   if (!userId) {
+    if (ctx.userRole !== 'owner' && ctx.userRole !== 'super_admin') {
+      const status = await getFireflyProgressiveStatus(ctx.orgId, ctx.userId, env);
+      if (status.parent) {
+        status.parent.api_key_encrypted = status.parent.api_key_encrypted ? '<redacted>' : '';
+      }
+      return jsonResponse({
+        ok: true,
+        ...status,
+        credential_status: await getFireflyKeyStatus(ctx.userId, env),
+      });
+    }
     const all = await listFireflyProgressiveBackfills(ctx.orgId, env);
     const stripped = all.map(j => ({
       ...j,
@@ -202,11 +213,18 @@ export async function handleFireflyProgressiveBackfillStatus(
     }));
     return jsonResponse({ ok: true, jobs: stripped });
   }
+  if (!canManageFireflyBackfill(ctx, userId)) {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Members can only view their own Fireflies import status.');
+  }
   const status = await getFireflyProgressiveStatus(ctx.orgId, userId, env);
   if (status.parent) {
     status.parent.api_key_encrypted = status.parent.api_key_encrypted ? '<redacted>' : '';
   }
-  return jsonResponse({ ok: true, ...status });
+  return jsonResponse({
+    ok: true,
+    ...status,
+    credential_status: await getFireflyKeyStatus(userId, env),
+  });
 }
 
 /**
@@ -214,7 +232,8 @@ export async function handleFireflyProgressiveBackfillStatus(
  *
  * Body: { user_id }
  *
- * Owner-gated. Cancels the user's active progressive Firefly backfill,
+ * Self-service for the target user; owners may cancel for org users.
+ * Cancels the user's active progressive Firefly backfill,
  * marks in-progress windows as failed, and nukes api_key_encrypted.
  */
 export async function handleFireflyProgressiveBackfillCancel(
@@ -222,15 +241,13 @@ export async function handleFireflyProgressiveBackfillCancel(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  if (ctx.userRole !== 'owner') {
-    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can cancel progressive Firefly backfills.');
-  }
   const body = await parseJsonBody<{ user_id?: string }>(request);
-  if (!body?.user_id) {
-    return errorResponse('VALIDATION_ERROR', 400, 'user_id required');
+  const targetUserId = body?.user_id || ctx.userId;
+  if (!canManageFireflyBackfill(ctx, targetUserId)) {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Members can only cancel their own Fireflies import.');
   }
   const result = await cancelFireflyProgressiveBackfill(
-    ctx.orgId, body.user_id, env, `cancelled by owner ${ctx.email}`
+    ctx.orgId, targetUserId, env, targetUserId === ctx.userId ? `cancelled by ${ctx.email}` : `cancelled by owner ${ctx.email}`
   );
-  return jsonResponse({ ...result, user_id: body.user_id });
+  return jsonResponse({ ...result, user_id: targetUserId });
 }

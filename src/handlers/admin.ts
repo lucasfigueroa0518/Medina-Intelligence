@@ -15,7 +15,14 @@ import { rebuildEntityIndex } from '../lib/entity-index';
 // universal work-queue tick which iterates every registered domain
 // (currently only embed_retry; future pilots transparently included).
 import { processWorkQueueTick } from '../lib/work-queue-driver';
+import { enqueueWork } from '../lib/work-queue';
 import { parseParticipantUserIds } from '../lib/helpers';
+import {
+  getRagV2Status,
+  RAG_V2_WORK_QUEUE_DOMAIN,
+  type RagV2ReindexPayload,
+} from '../lib/rag-v2';
+import { getEmbeddingProfile, RAG_V2_EMBEDDING_PROFILES } from '../lib/embedding';
 import {
   createProgressiveBackfill as libCreateProgressiveBackfill,
   getProgressiveStatus,
@@ -101,6 +108,172 @@ export async function clearRateLimit(
   if (!source) return errorResponse('VALIDATION_ERROR', 400);
   await clearEnrichmentRateLimit(source, ctx.orgId, env);
   return jsonResponse({ ok: true });
+}
+
+type RagV2SourceTable = RagV2ReindexPayload['source_table'];
+
+const RAG_V2_SOURCE_TABLES: RagV2SourceTable[] = [
+  'conversations',
+  'events',
+  'documents',
+  'contacts',
+  'companies',
+  'deals',
+  'news_articles',
+];
+
+async function listRagV2SourceIds(
+  env: Env,
+  orgId: string,
+  sourceTable: RagV2SourceTable,
+  limit: number
+): Promise<string[]> {
+  const sqlByTable: Record<RagV2SourceTable, string> = {
+    conversations: `SELECT id FROM conversations WHERE org_id = ? AND body_r2_key IS NOT NULL ORDER BY sent_at DESC LIMIT ?`,
+    events: `SELECT id FROM events WHERE org_id = ? AND deleted_at IS NULL AND (transcript_r2_key IS NOT NULL OR length(coalesce(summary,'')) > 20) ORDER BY start_time DESC LIMIT ?`,
+    documents: `SELECT id FROM documents WHERE org_id = ? AND deleted_at IS NULL AND processing_status = 'completed' ORDER BY created_at DESC LIMIT ?`,
+    contacts: `SELECT id FROM contacts WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL AND length(coalesce(bio_summary,'')) > 20 ORDER BY updated_at DESC LIMIT ?`,
+    companies: `SELECT id FROM companies WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL AND length(coalesce(description,'')) > 20 ORDER BY updated_at DESC LIMIT ?`,
+    deals: `SELECT id FROM deals WHERE org_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT ?`,
+    news_articles: `SELECT id FROM news_articles WHERE org_id = ? AND length(coalesce(summary,'')) > 20 ORDER BY published_at DESC LIMIT ?`,
+  };
+  const rows = await env.D1.prepare(sqlByTable[sourceTable]).bind(orgId, limit).all<{ id: string }>();
+  return rows.results.map(r => r.id);
+}
+
+export async function startRagV2Backfill(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    source_tables?: RagV2SourceTable[];
+    limit?: number;
+    profiles?: string[];
+    dry_run?: boolean;
+  }>(request);
+  const limit = Math.max(1, Math.min(body?.limit ?? 100, 1000));
+  const sourceTables = (body?.source_tables?.length ? body.source_tables : RAG_V2_SOURCE_TABLES)
+    .filter((table): table is RagV2SourceTable => RAG_V2_SOURCE_TABLES.includes(table as RagV2SourceTable));
+  const profiles = (body?.profiles || ['bge-base-en-v1.5:cls:v3'])
+    .map(id => getEmbeddingProfile(id).id);
+  const dryRun = body?.dry_run === true;
+
+  const perTable: Array<{ source_table: string; candidate_count: number; enqueued: number }> = [];
+  for (const sourceTable of sourceTables) {
+    const ids = await listRagV2SourceIds(env, ctx.orgId, sourceTable, limit);
+    let enqueued = 0;
+    if (!dryRun) {
+      for (const sourceId of ids) {
+        const payload: RagV2ReindexPayload = { source_table: sourceTable, source_id: sourceId, profiles };
+        const result = await enqueueWork(env, ctx.orgId, RAG_V2_WORK_QUEUE_DOMAIN, payload, {
+          upstream: 'bge',
+          idempotency_key: `${ctx.orgId}:${sourceTable}:${sourceId}:${profiles.join('+')}:v3`,
+          max_attempts: 5,
+          priority: sourceTable === 'documents' || sourceTable === 'conversations' ? 10 : 0,
+        });
+        if (result.inserted) enqueued++;
+      }
+    }
+    perTable.push({ source_table: sourceTable, candidate_count: ids.length, enqueued });
+  }
+
+  return jsonResponse({
+    ok: true,
+    dry_run: dryRun,
+    profiles,
+    profile_catalog: Object.values(RAG_V2_EMBEDDING_PROFILES).map(p => ({
+      id: p.id,
+      dimensions: p.dimensions,
+      max_content_tokens: p.maxContentTokens,
+      benchmark_only: !!p.benchmarkOnly,
+    })),
+    per_table: perTable,
+  });
+}
+
+export async function getRagV2BackfillStatus(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  return jsonResponse(await getRagV2Status(env, ctx.orgId));
+}
+
+export async function runRagV2Eval(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ limit?: number }>(request);
+  const limit = Math.max(1, Math.min(body?.limit ?? 25, 120));
+  const cases = await env.D1.prepare(
+    `SELECT id, category, privacy_scope, question, expected_source_ids
+       FROM rag_retrieval_eval_cases
+      WHERE org_id = ? AND enabled = 1
+      ORDER BY created_at ASC
+      LIMIT ?`
+  ).bind(ctx.orgId, limit).all();
+  const recent = await env.D1.prepare(
+    `SELECT embedding_profile, status, COUNT(*) AS count,
+            AVG(latency_total_ms) AS avg_latency_total_ms,
+            AVG(fused_count) AS avg_fused_count,
+            AVG(reranker_output_count) AS avg_reranker_output_count
+       FROM rag_retrieval_traces_v2
+      WHERE org_id = ?
+        AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')
+      GROUP BY embedding_profile, status
+      ORDER BY embedding_profile, status`
+  ).bind(ctx.orgId).all();
+  return jsonResponse({
+    ok: true,
+    eval_cases_loaded: cases.results.length,
+    cases: cases.results,
+    recent_trace_summary: recent.results,
+    note: 'RAG V2 eval cases are persisted; live scoring uses rag_retrieval_traces_v2 emitted by shadow or v2 retrieval runs.',
+  });
+}
+
+export async function cutoverRagV2(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ embedding_profile?: string; shadow?: boolean; notes?: string }>(request);
+  const profile = getEmbeddingProfile(body?.embedding_profile).id;
+  const version = body?.shadow ? 'shadow' : 'v2';
+  await env.D1.prepare(
+    `INSERT INTO rag_retrieval_config
+       (org_id, retrieval_version, embedding_profile, shadow_enabled, notes, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(org_id) DO UPDATE SET
+       retrieval_version = excluded.retrieval_version,
+       embedding_profile = excluded.embedding_profile,
+       shadow_enabled = excluded.shadow_enabled,
+       notes = excluded.notes,
+       updated_by = excluded.updated_by,
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(ctx.orgId, version, profile, body?.shadow ? 1 : 0, body?.notes || null, ctx.userId).run();
+  return jsonResponse({ ok: true, retrieval_version: version, embedding_profile: profile });
+}
+
+export async function rollbackRagV2(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{ notes?: string }>(request);
+  await env.D1.prepare(
+    `INSERT INTO rag_retrieval_config
+       (org_id, retrieval_version, embedding_profile, shadow_enabled, notes, updated_by)
+     VALUES (?, 'v1', 'bge-base-en-v1.5:cls:v3', 0, ?, ?)
+     ON CONFLICT(org_id) DO UPDATE SET
+       retrieval_version = 'v1',
+       shadow_enabled = 0,
+       notes = excluded.notes,
+       updated_by = excluded.updated_by,
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(ctx.orgId, body?.notes || null, ctx.userId).run();
+  return jsonResponse({ ok: true, retrieval_version: 'v1' });
 }
 
 // Manual trigger for the daily cron handler (matches the 0 0 * * * cron).

@@ -47,6 +47,13 @@ function readMulti(sp: URLSearchParams, key: string): string[] | undefined {
   return all;
 }
 
+function looksLikeTagIds(values: string[]): boolean {
+  return values.every(value =>
+    /^[a-f0-9]{16,}$/i.test(value)
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+  );
+}
+
 export async function listCompanies(
   request: Request,
   ctx: AuthContext,
@@ -62,7 +69,20 @@ export async function listCompanies(
   // Type filter — new comma-separated `type` OR legacy multi-value `company_types`.
   const typeList = readMulti(sp, 'type') ?? f.company_types;
   if (typeList?.length) {
-    where.push(`co.company_type IN (${typeList.map(() => '?').join(',')})`);
+    const typePredicates = [`co.company_type IN (${typeList.map(() => '?').join(',')})`];
+    // Historical UI exposed "Portfolio" under Type, while production data
+    // currently models portfolio membership as a company tag. Keep the legacy
+    // URL/filter useful by matching either representation.
+    if (typeList.includes('portfolio')) {
+      typePredicates.push(
+        `EXISTS (SELECT 1 FROM company_tags type_ct
+                  JOIN tags type_t ON type_ct.tag_id = type_t.id
+                 WHERE type_ct.company_id = co.id
+                   AND type_t.org_id = co.org_id
+                   AND LOWER(type_t.name) = 'portfolio')`
+      );
+    }
+    where.push(`(${typePredicates.join(' OR ')})`);
     binds.push(...typeList);
   }
 
@@ -125,7 +145,7 @@ export async function listCompanies(
   let tagJoin = '';
   const tagsParam = readMulti(sp, 'tags') ?? f.tags;
   if (tagsParam?.length) {
-    const looksLikeIds = tagsParam.every(t => /^[a-f0-9]{16,}$/i.test(t));
+    const looksLikeIds = looksLikeTagIds(tagsParam);
     tagJoin = `JOIN company_tags ctg ON co.id = ctg.company_id
                JOIN tags t ON ctg.tag_id = t.id`;
     if (looksLikeIds) {

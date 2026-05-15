@@ -8,7 +8,7 @@ import type {
   VectorMatch,
 } from '../types/interfaces';
 import { hydrateChunks } from './hydration';
-import { runEmbedding } from './embedding';
+import { runEmbedding, runEmbeddingForProfile } from './embedding';
 import { truncateToTokens } from './tokens';
 import {
   canReadConversationContent,
@@ -19,6 +19,17 @@ import {
 } from './helpers';
 import { getEntityIndex } from './entity-index';
 import { isDocumentAccessibleToUser } from './document-acl';
+import type { EmbeddingProfileId } from '../types/rag-v2';
+import {
+  applySourceDiversity,
+  buildRagV2VectorMatches,
+  fuseHybridCandidates,
+  getRagV2RuntimeConfig,
+  hydrateRagV2Matches,
+  persistRagV2Trace,
+  queryDenseRagV2Candidates,
+} from './rag-v2';
+import { searchRagChunksD1Fts } from './rag-v2-lexical';
 
 export interface RetrievalOptions {
   deepDive?: boolean;
@@ -421,6 +432,111 @@ function rebalanceRerankedByPrimaryFamilies(
 
   for (const chunk of reranked) take(chunk);
   return selected.slice(0, limit);
+}
+
+async function retrieveContextV2(
+  pq: ProcessedQuery,
+  env: Env,
+  options: RetrievalOptions,
+  embeddingProfile: EmbeddingProfileId
+): Promise<{ internal: HydratedChunk[]; news: HydratedChunk[]; stats?: { emails: number; meetings: number; documents: number; contacts: number; companies: number } }> {
+  const t0 = Date.now();
+  const queryEmbedding = embeddingProfile === 'bge-base-en-v1.5:cls:v3'
+    ? pq.embeddedQuery
+    : await runEmbeddingForProfile(env, pq.originalQuery, pq.orgId, embeddingProfile);
+
+  const denseStart = Date.now();
+  const denseCandidates = await queryDenseRagV2Candidates(
+    env,
+    pq.orgId,
+    queryEmbedding,
+    embeddingProfile,
+    pq.entityIds
+  );
+  const denseMs = Date.now() - denseStart;
+
+  const lexicalStart = Date.now();
+  const lexicalCandidates = await searchRagChunksD1Fts(env, pq.originalQuery, {
+    orgId: pq.orgId,
+    topK: 100,
+    entityIds: pq.entityIds,
+  });
+  const lexicalMs = Date.now() - lexicalStart;
+
+  const fusionStart = Date.now();
+  const fused = applySourceDiversity(
+    fuseHybridCandidates(denseCandidates, lexicalCandidates, {
+      denseBroad: 1.0,
+      denseEntity: 1.2,
+      lexical: 1.0,
+    }),
+    options.deepDive ? 80 : 50
+  );
+  const vectorMatches = await buildRagV2VectorMatches(env, embeddingProfile, fused);
+  const aclFiltered = await filterMatchesByAuthoritativeAcl(vectorMatches, pq, env);
+  const fusionMs = Date.now() - fusionStart;
+
+  const hydrationStart = Date.now();
+  const { chunks: hydrated, summary: hydrationSummary } = await hydrateRagV2Matches(aclFiltered, env);
+  const hydrationMs = Date.now() - hydrationStart;
+
+  const rerankStart = Date.now();
+  let reranked = await crossEncoderRerank(
+    hydrated.slice(0, options.deepDive ? 80 : 50),
+    pq.originalQuery,
+    pq.orgId,
+    env
+  );
+  const rerankLimit = options.deepDive ? 20 : 10;
+  reranked = reranked.slice(0, rerankLimit);
+  const rerankMs = Date.now() - rerankStart;
+
+  await persistRagV2Trace(env, {
+    orgId: pq.orgId,
+    userId: pq.userId,
+    query: pq.originalQuery,
+    embeddingProfile,
+    denseCount: denseCandidates.length,
+    lexicalCount: lexicalCandidates.length,
+    fusedCount: fused.length,
+    aclAllowedCount: aclFiltered.length,
+    rerankerInputCount: hydrated.length,
+    rerankerOutputCount: reranked.length,
+    hydrationSummary,
+    topCandidates: fused.slice(0, 12),
+    latencies: {
+      dense: denseMs,
+      lexical: lexicalMs,
+      fusion: fusionMs,
+      hydration: hydrationMs,
+      rerank: rerankMs,
+      total: Date.now() - t0,
+    },
+  });
+
+  if (options.deepDive) {
+    let emails = 0;
+    let meetings = 0;
+    let documents = 0;
+    const entitySet = new Set<string>();
+    for (const c of reranked) {
+      const dt = c.metadata.document_type as string;
+      if (dt === 'email') emails++;
+      else if (dt === 'transcript') meetings++;
+      else if (dt !== 'news') documents++;
+      if (c.metadata.primary_entity_id) entitySet.add(c.metadata.primary_entity_id as string);
+    }
+    return {
+      internal: reranked.filter(c => c.metadata.document_type !== 'news'),
+      news: reranked.filter(c => c.metadata.document_type === 'news'),
+      stats: { emails, meetings, documents, contacts: entitySet.size, companies: 0 },
+    };
+  }
+
+  return {
+    internal: reranked.filter(c => c.metadata.document_type !== 'news'),
+    news: reranked.filter(c => c.metadata.document_type === 'news'),
+  };
 }
 
 function targetedMembershipSample(
@@ -1222,6 +1338,50 @@ export async function retrieveContext(
   env: Env,
   options: RetrievalOptions = {}
 ): Promise<{ internal: HydratedChunk[]; news: HydratedChunk[]; stats?: { emails: number; meetings: number; documents: number; contacts: number; companies: number } }> {
+  const ragV2Config = await getRagV2RuntimeConfig(env, pq.orgId);
+  if (ragV2Config.retrievalVersion === 'v2') {
+    try {
+      return await retrieveContextV2(pq, env, options, ragV2Config.embeddingProfile);
+    } catch (e) {
+      console.error('[retrieve:v2] fallback to v1:', e instanceof Error ? e.message : e);
+      await persistRagV2Trace(env, {
+        orgId: pq.orgId,
+        userId: pq.userId,
+        query: pq.originalQuery,
+        embeddingProfile: ragV2Config.embeddingProfile,
+        denseCount: 0,
+        lexicalCount: 0,
+        fusedCount: 0,
+        aclAllowedCount: 0,
+        rerankerInputCount: 0,
+        rerankerOutputCount: 0,
+        status: 'fallback',
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  if (ragV2Config.retrievalVersion === 'shadow' || ragV2Config.shadowEnabled) {
+    try {
+      await retrieveContextV2(pq, env, options, ragV2Config.embeddingProfile);
+    } catch (e) {
+      console.error('[retrieve:v2-shadow] trace failed:', e instanceof Error ? e.message : e);
+      await persistRagV2Trace(env, {
+        orgId: pq.orgId,
+        userId: pq.userId,
+        query: pq.originalQuery,
+        embeddingProfile: ragV2Config.embeddingProfile,
+        denseCount: 0,
+        lexicalCount: 0,
+        fusedCount: 0,
+        aclAllowedCount: 0,
+        rerankerInputCount: 0,
+        rerankerOutputCount: 0,
+        status: 'fallback',
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   const filter: any = {
     org_id: pq.orgId,
     document_type: { $nin: ['news'] },

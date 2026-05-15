@@ -63,6 +63,18 @@ index_name = "medina-ventures-main"
 #   npx wrangler vectorize create-metadata-index medina-ventures-main \
 #     --property-name=<field> --type=string
 
+[[vectorize]]
+binding = "VECTORIZE_RAG_V2_BGE"
+index_name = "medina-rag-v2-bge-768"
+
+[[vectorize]]
+binding = "VECTORIZE_RAG_V2_QWEN3"
+index_name = "medina-rag-v2-qwen3-1024"
+
+[[vectorize]]
+binding = "VECTORIZE_RAG_V2_MINILM"
+index_name = "medina-rag-v2-minilm-384"
+
 # --- Workflows ---
 #
 # Phase 8 strip (2026-05-06): 6 [[workflows]] declarations removed.

@@ -84,7 +84,11 @@ export async function listDocuments(
     : conversationId ? { type: 'conversation', id: conversationId }
     : null;
 
-  const where: string[] = ['d.org_id = ?', 'd.deleted_at IS NULL'];
+  const where: string[] = [
+    'd.org_id = ?',
+    'd.deleted_at IS NULL',
+    "COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1",
+  ];
   const binds: unknown[] = [ctx.orgId];
 
   if (!includeExcluded) {
@@ -224,12 +228,14 @@ export async function getDocumentFilterCounts(
     env.D1.prepare(
       `SELECT source, COUNT(*) as cnt FROM documents
         WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'
+          AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1
         GROUP BY source`
     ).bind(ctx.orgId).all<{ source: string; cnt: number }>(),
 
     env.D1.prepare(
       `SELECT document_type, COUNT(*) as cnt FROM documents
         WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'
+          AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1
         GROUP BY document_type`
     ).bind(ctx.orgId).all<{ document_type: string; cnt: number }>(),
 
@@ -239,12 +245,14 @@ export async function getDocumentFilterCounts(
          SUM(CASE WHEN created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') THEN 1 ELSE 0 END) as last_30d,
          SUM(CASE WHEN created_at <  strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') THEN 1 ELSE 0 END) as older
        FROM documents
-       WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'`
+       WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'
+         AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1`
     ).bind(ctx.orgId).first<{ last_7d: number; last_30d: number; older: number }>(),
 
     env.D1.prepare(
       `SELECT COUNT(*) as cnt FROM documents
         WHERE org_id = ? AND deleted_at IS NULL AND processing_status != 'excluded'
+          AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1
           AND uploaded_by = ?`
     ).bind(ctx.orgId, ctx.userId).first<{ cnt: number }>(),
   ]);

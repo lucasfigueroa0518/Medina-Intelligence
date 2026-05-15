@@ -10,6 +10,24 @@ import { sendResetEmail } from '../lib/reset-email';
 const PBKDF2_ITERATIONS = 100_000;
 const SALT_BYTES = 32;
 const HASH_BYTES = 32;
+const SEVERAL_MISSED_SYNC_DAYS = 3;
+
+type UserWarning = {
+  type: string;
+  message: string;
+  consecutive_failures?: number;
+  last_successful_sync?: string | null;
+  missed_days?: number;
+  suggest_backfill_days?: 30;
+  backfill_prompt?: string;
+};
+
+function daysSince(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return null;
+  return Math.max(0, Math.floor((Date.now() - ts) / 86400000));
+}
 
 async function hashPassword(password: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
@@ -287,17 +305,32 @@ export async function me(ctx: AuthContext, env: Env): Promise<Response> {
     return errorResponse('USER_NOT_FOUND', 404);
   }
 
-  const warnings: Array<{ type: string; message: string; consecutive_failures?: number }> = [];
+  const warnings: UserWarning[] = [];
 
   const tokenFailState = await env.KV.get<{ count: number; last_failed?: string }>(
     `token_failed:${ctx.userId}:outlook`,
     'json'
   );
   if (tokenFailState && tokenFailState.count >= 3) {
+    const lastSync = await env.D1.prepare(
+      `SELECT completed_at FROM sync_jobs
+        WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'completed'
+        ORDER BY completed_at DESC LIMIT 1`
+    ).bind(ctx.orgId).first<{ completed_at: string | null }>();
+    const missedDays = daysSince(lastSync?.completed_at);
+
     warnings.push({
       type: 'outlook_token_expired',
-      message: 'Your Outlook connection has stopped syncing. Go to Settings → Sync & Integrations to reconnect.',
+      message: 'Outlook needs a quick refresh to keep email and calendar updates flowing.',
       consecutive_failures: tokenFailState.count,
+      last_successful_sync: lastSync?.completed_at || null,
+      ...(missedDays !== null && missedDays >= SEVERAL_MISSED_SYNC_DAYS
+        ? {
+            missed_days: missedDays,
+            suggest_backfill_days: 30 as const,
+            backfill_prompt: `It looks like about ${missedDays} day${missedDays === 1 ? '' : 's'} may need a catch-up import. Refresh Outlook first, then start a 30-day backfill.`,
+          }
+        : {}),
     });
   }
 

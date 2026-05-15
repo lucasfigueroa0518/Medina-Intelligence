@@ -138,7 +138,7 @@ function dedupeSources(sources: WebSearchSource[], limit: number): WebSearchSour
   return deduped;
 }
 
-async function fallbackWebSearch(query: string, numResults?: number): Promise<any> {
+export async function fallbackWebSearch(query: string, numResults?: number): Promise<any> {
   const limit = clampResultLimit(numResults);
   const settled = await Promise.allSettled([
     searchGoogleNewsRss(query, limit),
@@ -192,7 +192,7 @@ export async function webSearch(
         grounding: true,
         temperature: 0.3,
       },
-      'high',
+      'low',
       env
     );
 

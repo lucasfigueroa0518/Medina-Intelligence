@@ -22,6 +22,7 @@ import {
 import { TopBar } from '@/components/top-bar';
 import { DocumentActions } from '@/components/document-actions';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
+import { ExpandableText } from '@/components/expandable-text';
 import { ApiError, api } from '@/lib/api';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 import { demoDealDetailFixture, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
@@ -262,7 +263,7 @@ export default function DealDetailPage() {
           ...(current || {}),
           deal: { ...(current?.deal || {}), stage: 'talking' },
         }));
-        setToast(demoToastMessage('Deal approval'));
+        setToast('Demo mode: confirmed and moved to Talking locally');
       } else {
         router.push('/deals');
       }
@@ -273,7 +274,7 @@ export default function DealDetailPage() {
       await api.bulkDecideDeals({ deal_ids: [dealId], decision });
       if (decision === 'yes') {
         await load();
-        setToast('Moved to Talking');
+        setToast('Confirmed and moved to Talking');
       } else {
         router.push('/deals');
       }
@@ -391,13 +392,16 @@ export default function DealDetailPage() {
           <div className="flex flex-wrap items-center justify-end gap-2">
             {stage === 'new' && (
               <>
+                <span className="max-w-[220px] text-right text-[11px] leading-4 text-text-muted">
+                  Confirm the suggestion. Yes moves it to Talking; drag later if another stage fits better.
+                </span>
                 <button
                   disabled={busy}
                   onClick={() => void decide('yes')}
                   className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all hover:scale-[1.03] disabled:opacity-40"
                   style={{ background: 'rgba(34,197,94,0.12)', color: '#4ADE80', border: '1px solid rgba(34,197,94,0.25)' }}
                 >
-                  <Check size={13} /> Yes
+                  <Check size={13} /> Yes, move
                 </button>
                 <button
                   disabled={busy}
@@ -405,7 +409,7 @@ export default function DealDetailPage() {
                   className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all hover:scale-[1.03] disabled:opacity-40"
                   style={{ background: 'rgba(239,68,68,0.12)', color: '#F87171', border: '1px solid rgba(239,68,68,0.25)' }}
                 >
-                  <X size={13} /> No
+                  <X size={13} /> No, reject
                 </button>
               </>
             )}
@@ -567,9 +571,12 @@ export default function DealDetailPage() {
                             <span className="truncate">{message.sender_name || message.sender_email || 'Unknown sender'}</span>
                             <span className="shrink-0">{dateLabel(message.sent_at)}</span>
                           </div>
-                          <p className="text-sm leading-5 text-text-secondary">
-                            {message.can_read_body ? (message.body_preview || 'No preview available.') : 'Private message unavailable.'}
-                          </p>
+                          <ExpandableText
+                            text={message.can_read_body ? (message.body_preview || 'No preview available.') : 'Private message unavailable.'}
+                            collapsedLines={3}
+                            minToggleChars={160}
+                            className="text-sm leading-5 text-text-secondary"
+                          />
                         </div>
                       ))}
                     </div>

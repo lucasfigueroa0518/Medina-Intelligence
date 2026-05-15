@@ -5,7 +5,7 @@
 
 import type { Env } from '../types/env';
 import { checkGeminiRateLimit } from './rate-limit';
-import { recordRateLimit, type Upstream } from './upstream-budget';
+import { recordBudgetSuccess, recordRateLimit, type Upstream } from './upstream-budget';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -112,10 +112,13 @@ export async function callGemini(
       // Pre-3.2 the KV-backed limiter could only observe its own
       // counter; the ledger gives us upstream-driven evidence.
       await recordRateLimit(env, orgId, userId, budgetSource, 'minute');
-      throw new Error('GEMINI_RATE_LIMITED');
+      const detail = errTxt.slice(0, 500);
+      console.warn(`[gemini] 429 org=${orgId} source=${budgetSource}: ${detail}`);
+      throw new Error(`GEMINI_RATE_LIMITED: ${detail}`);
     }
     throw new Error(`Gemini API error ${resp.status}: ${errTxt.slice(0, 400)}`);
   }
+  await recordBudgetSuccess(env, orgId, userId, budgetSource, 'minute');
 
   const data = (await resp.json()) as GeminiApiResponse;
   if (data.error) {

@@ -11,6 +11,7 @@ import {
   FileText,
   Paperclip,
 } from 'lucide-react';
+import { ExpandableText } from '@/components/expandable-text';
 
 export interface TimelineEntry {
   id: string;
@@ -168,9 +169,12 @@ function TimelineEntryRow({ entry }: { entry: TimelineEntry }) {
               You are not a participant in this email
             </div>
           ) : entry.body_preview ? (
-            <div className="text-sm text-text-secondary mt-1 line-clamp-2">
-              {entry.body_preview}
-            </div>
+            <ExpandableText
+              text={entry.body_preview}
+              collapsedLines={2}
+              minToggleChars={140}
+              className="mt-1 text-sm leading-relaxed text-text-secondary"
+            />
           ) : null}
           {entry.has_attachments && entry.attachment_count ? (
             <div className="flex items-center gap-1.5 mt-1.5">

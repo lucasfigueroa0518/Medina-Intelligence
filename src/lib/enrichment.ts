@@ -23,6 +23,7 @@ import { hashShort } from './helpers';
 import { GEMINI_ENRICHMENT_PROMPT, buildGeminiEnrichmentUserPrompt } from '../prompts/gemini-enrichment';
 import { enrichContactFromLinkedIn } from '../integrations/reversecontact';
 import { discoverLinkedInUrl, assessLinkedInUrlAuthenticity } from './linkedin-discovery';
+import { fallbackWebSearch } from './agent-web-search';
 import { findCompanyByDomain, findOrCreateCompanyByDomain, PERSONAL_DOMAINS } from './discovery';
 import { proposeEntityUpdate, proposeMultipleUpdates } from './progressive-enrichment';
 import { jaroWinkler } from './dedup';
@@ -441,18 +442,43 @@ export function aggregateEnrichmentResult(
   return { text, visibility: hasRestricted ? 'confidential' : 'org_wide' };
 }
 
+export interface ContactEnrichmentResult {
+  status: 'enriched' | 'no_contributions' | 'not_found' | 'rate_limited' | 'transient_error';
+  contributions: number;
+  reason?: string;
+}
+
+export interface ContactEnrichmentOptions {
+  /** Supplemental LinkedIn URL discovery costs a Gemini grounded-search call.
+   *  Queue drains can disable it so scarce Gemini capacity goes to the
+   *  actual contact dossier first. */
+  linkedinDiscovery?: boolean;
+}
+
+function buildContactFallbackSearchQuery(contact: any, company: any | null): string {
+  return [
+    contact.full_name,
+    contact.job_title,
+    company?.name,
+    contact.email ? contact.email.split('@')[1] : null,
+    'profile',
+    'professional background',
+  ].filter(Boolean).join(' ');
+}
+
 export async function triggerContactEnrichment(
   contactId: string,
   orgId: string,
-  env: Env
-): Promise<void> {
+  env: Env,
+  opts: ContactEnrichmentOptions = {}
+): Promise<ContactEnrichmentResult> {
   const contact = await env.D1.prepare(
     `SELECT id, full_name, email, linkedin_url, company_id, job_title
      FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
   ).bind(contactId, orgId).first<any>();
   if (!contact) {
     console.log(`[enrichment] ${contactId}: not found — skipping`);
-    return;
+    return { status: 'not_found', contributions: 0, reason: 'contact_not_found' };
   }
 
   console.log(
@@ -462,6 +488,9 @@ export async function triggerContactEnrichment(
   const contributions: EnrichmentSourceContribution[] = [];
   let discoveredLinkedinUrl: string | null = null;
   let rcVerifiedUrl = false;
+  let blockedByRateLimit = false;
+  const rateLimitReasons: string[] = [];
+  const transientErrors: string[] = [];
 
   // ── Circuit breaker gate ──
   const rcOpen = isRcCircuitOpen ? await isRcCircuitOpen(orgId, env) : false;
@@ -472,10 +501,11 @@ export async function triggerContactEnrichment(
   // ── Step 0: LinkedIn URL discovery ──
   // Discovery no longer writes directly to DB — we verify with RC first.
   let skipReverseContact = rcOpen;
-  if (!rcOpen && !contact.linkedin_url) {
+  const linkedinDiscoveryEnabled = opts.linkedinDiscovery !== false;
+  if (!rcOpen && !contact.linkedin_url && linkedinDiscoveryEnabled) {
     console.log(`[enrichment] ${contactId}: no linkedin_url → LinkedIn discovery`);
     try {
-      const discovery = await discoverLinkedInUrl(contact, orgId, env);
+      const discovery = await discoverLinkedInUrl(contact, orgId, env, 'high', 1);
       console.log(`[enrichment] ${contactId}: discovery → ${discovery.status} url=${discovery.linkedin_url || 'none'}`);
       if (discovery.status === 'found' && discovery.linkedin_url) {
         contact.linkedin_url = discovery.linkedin_url;
@@ -497,6 +527,11 @@ export async function triggerContactEnrichment(
   if (!skipReverseContact) {
     const claudeOk = await checkClaudeRateLimit(env, orgId, 'low');
     const rcOk = await checkEnrichmentRateLimit('reversecontact', orgId, env);
+    if (!claudeOk || !rcOk) {
+      blockedByRateLimit = true;
+      if (!claudeOk) rateLimitReasons.push('claude_budget_gate');
+      if (!rcOk) rateLimitReasons.push('reversecontact_cooldown');
+    }
     if (claudeOk && rcOk) {
       try {
         const result = await enrichContactFromLinkedIn(contact, orgId, env);
@@ -514,6 +549,7 @@ export async function triggerContactEnrichment(
           contact.linkedin_url = null;
           discoveredLinkedinUrl = null;
         }
+        transientErrors.push(`reversecontact: ${e.message || String(e)}`);
       }
     }
   }
@@ -541,60 +577,124 @@ export async function triggerContactEnrichment(
   }
 
   // ── Source 2: Gemini web search (grounded) ──
-  if (await checkEnrichmentRateLimit('gemini_enrichment', orgId, env)) {
-    try {
-      const company = contact.company_id
-        ? await env.D1.prepare('SELECT name, sector, website FROM companies WHERE id = ?')
-            .bind(contact.company_id).first<any>()
-        : null;
+  let company: any | null = null;
+  try {
+    company = contact.company_id
+      ? await env.D1.prepare('SELECT name, sector, website FROM companies WHERE id = ?')
+          .bind(contact.company_id).first<any>()
+      : null;
 
-      // Feed any RC payload we gathered above into Gemini so it can merge
-      // verified LinkedIn data with live web findings in a single dossier.
-      const rcContrib = contributions.find(c => c.source === 'reversecontact');
+    // Feed any RC payload we gathered above into Gemini so it can merge
+    // verified LinkedIn data with live web findings in a single dossier.
+    const rcContrib = contributions.find(c => c.source === 'reversecontact');
 
-      const { text, sources } = await callGemini(
-        {
-          system: GEMINI_ENRICHMENT_PROMPT,
-          user: buildGeminiEnrichmentUserPrompt({
-            entityName: contact.full_name,
-            entityType: 'contact',
-            sector: company?.sector,
-            emailDomain: contact.email ? contact.email.split('@')[1] : undefined,
-            knownContacts: company ? [company.name] : [],
-            jobTitle: contact.job_title || undefined,
-            reverseContactPayload: rcContrib?.text,
-          }),
-          max_tokens: 5000,
-          orgId,
-        },
-        'low',
-        env
-      );
+    const { text, sources } = await callGemini(
+      {
+        system: GEMINI_ENRICHMENT_PROMPT,
+        user: buildGeminiEnrichmentUserPrompt({
+          entityName: contact.full_name,
+          entityType: 'contact',
+          sector: company?.sector,
+          emailDomain: contact.email ? contact.email.split('@')[1] : undefined,
+          knownContacts: company ? [company.name] : [],
+          jobTitle: contact.job_title || undefined,
+          reverseContactPayload: rcContrib?.text,
+        }),
+        max_tokens: 5000,
+        orgId,
+      },
+      'high',
+      env
+    );
 
-      console.log(`[enrichment] ${contactId}: Gemini web search → ${text.length} chars, ${sources.length} sources`);
-      contributions.push({
-        source: 'gemini_web_search',
-        text: text,
-        visibility: 'org_wide',
-      });
-      await clearEnrichmentRateLimit('gemini_enrichment', orgId, env);
-    } catch (e: any) {
-      console.error(`[enrichment] ${contactId}: Gemini failed: ${e.message}`);
-      if (String(e.message).includes('GEMINI_RATE_LIMITED')) {
-        await recordEnrichmentRateLimit('gemini_enrichment', orgId, env);
+    console.log(`[enrichment] ${contactId}: Gemini web search → ${text.length} chars, ${sources.length} sources`);
+    contributions.push({
+      source: 'gemini_web_search',
+      text: text,
+      visibility: 'org_wide',
+    });
+    await clearEnrichmentRateLimit('gemini_enrichment', orgId, env);
+  } catch (e: any) {
+    console.error(`[enrichment] ${contactId}: Gemini failed: ${e.message}`);
+    if (String(e.message).includes('GEMINI_RATE_LIMITED')) {
+      // callGemini already records the upstream_budget_ledger 429. Contact
+      // enrichment has its own durable work_queue pause, so do not set the
+      // legacy org-wide gemini_enrichment KV cooldown here; that older gate
+      // blocks the priority contact lane even when the ledger has capacity.
+      blockedByRateLimit = true;
+      rateLimitReasons.push(String(e.message).trim() === 'GEMINI_RATE_LIMITED'
+        ? 'gemini_budget_gate'
+        : 'gemini_rate_limited');
+      try {
+        const query = buildContactFallbackSearchQuery(contact, company);
+        const fallback = await fallbackWebSearch(query, 5);
+        if (!fallback.error && fallback.summary) {
+          const sources = Array.isArray(fallback.sources)
+            ? fallback.sources.map((s: any, i: number) => `${i + 1}. ${s.title}: ${s.uri}`).join('\n')
+            : '';
+          contributions.push({
+            source: 'fallback_web_search',
+            text: [
+              `Fallback web/news enrichment for ${contact.full_name}.`,
+              `Query: ${query}`,
+              '',
+              fallback.summary,
+              sources ? `\nSources:\n${sources}` : '',
+            ].filter(Boolean).join('\n'),
+            visibility: 'org_wide',
+          });
+          console.log(`[enrichment] ${contactId}: fallback web search contributed after Gemini 429`);
+        }
+      } catch (fallbackErr: any) {
+        console.error(`[enrichment] ${contactId}: fallback web search failed:`, fallbackErr?.message || fallbackErr);
       }
+    } else {
+      transientErrors.push(`gemini: ${e.message || String(e)}`);
     }
   }
 
   console.log(`[enrichment] ${contactId}: ${contributions.length} contributions from [${contributions.map(c => c.source).join(', ')}]`);
-  if (contributions.length === 0) return;
+  if (contributions.length === 0) {
+    if (blockedByRateLimit) {
+      return {
+        status: 'rate_limited',
+        contributions: 0,
+        reason: rateLimitReasons.length > 0
+          ? [...new Set(rateLimitReasons)].join(';')
+          : 'upstream_rate_limit_or_budget_gate',
+      };
+    }
+    if (transientErrors.length > 0) {
+      return { status: 'transient_error', contributions: 0, reason: transientErrors.join('; ').slice(0, 500) };
+    }
+    await env.D1.prepare(
+      `UPDATE contacts
+          SET enrichment_confidence = 0,
+              enrichment_last_run = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(contactId).run();
+    await emitAudit(env, {
+      org_id: orgId,
+      action: 'enrich',
+      entity_type: 'contact',
+      entity_id: contactId,
+      metadata: { sources: [], visibility: 'none', result: 'no_contributions' },
+      created_at: new Date().toISOString(),
+    });
+    return { status: 'no_contributions', contributions: 0, reason: 'no_public_enrichment_sources_found' };
+  }
 
   // ── Aggregate for Vectorize ──
   const { text: aggText, visibility } = aggregateEnrichmentResult(contributions);
 
   // ── Pick the best bio text (longest web search contribution) ──
   const bestBio = contributions
-    .filter(c => (c.source === 'gemini_web_search' || c.source === 'claude_web_search') && c.text.length > 200)
+    .filter(c => (
+      c.source === 'gemini_web_search'
+      || c.source === 'claude_web_search'
+      || c.source === 'fallback_web_search'
+    ) && c.text.length > 200)
     .sort((a, b) => b.text.length - a.text.length)[0]?.text || aggText;
 
   // ── R2: full enrichment payload ──
@@ -667,6 +767,8 @@ export async function triggerContactEnrichment(
     metadata: { sources: contributions.map(c => c.source), visibility },
     created_at: new Date().toISOString(),
   });
+
+  return { status: 'enriched', contributions: contributions.length };
 }
 
 export async function triggerCompanyEnrichment(

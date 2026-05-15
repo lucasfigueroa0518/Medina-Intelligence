@@ -1,6 +1,6 @@
 import type { Env } from '../types/env';
 import { checkClaudeRateLimit } from './rate-limit';
-import { recordRateLimit } from './upstream-budget';
+import { recordBudgetSuccess, recordRateLimit } from './upstream-budget';
 
 interface ClaudeResponse {
   content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
@@ -78,6 +78,7 @@ export async function callClaude(
     }
     throw new Error(`Claude API error ${response.status}: ${errorBody}`);
   }
+  await recordBudgetSuccess(env, orgId, null, 'claude', 'minute');
 
   const data = (await response.json()) as ClaudeResponse;
   const textBlock = data.content.find(b => b.type === 'text');

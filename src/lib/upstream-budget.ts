@@ -297,6 +297,66 @@ export async function recordUsage(
   ).run();
 }
 
+/** Reserve a unit in the current budget window before making the upstream
+ *  call. This intentionally does NOT reset consecutive_429s because no
+ *  upstream success has happened yet; wrappers should call
+ *  recordBudgetSuccess after a 2xx response. */
+export async function reserveBudget(
+  env: Env,
+  orgId: string,
+  userId: string | null | undefined,
+  upstream: Upstream,
+  window: BudgetWindow,
+  units = 1
+): Promise<void> {
+  const uid = userKey(userId);
+  const cap = defaultCapFor(upstream, window);
+  const windowMs = WINDOW_LENGTH_MS[window];
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const rolloverThresholdIso = new Date(now - windowMs).toISOString();
+
+  await env.D1.prepare(
+    `INSERT INTO upstream_budget_ledger
+       (org_id, user_id, upstream, bucket_window, bucket_start, used, cap, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (org_id, user_id, upstream, bucket_window) DO UPDATE SET
+       used = CASE
+         WHEN bucket_start < ? THEN ?
+         ELSE used + ?
+       END,
+       bucket_start = CASE
+         WHEN bucket_start < ? THEN ?
+         ELSE bucket_start
+       END,
+       updated_at = ?`
+  ).bind(
+    orgId, uid, upstream, window, nowIso, units, cap, nowIso,
+    rolloverThresholdIso, units, units,
+    rolloverThresholdIso, nowIso,
+    nowIso
+  ).run();
+}
+
+/** Record that a reserved upstream call actually succeeded. This keeps
+ *  usage accounting single-counted while allowing real successes, not mere
+ *  pre-flight reservations, to reset the breaker counter. */
+export async function recordBudgetSuccess(
+  env: Env,
+  orgId: string,
+  userId: string | null | undefined,
+  upstream: Upstream,
+  window: BudgetWindow
+): Promise<void> {
+  const uid = userKey(userId);
+  await env.D1.prepare(
+    `UPDATE upstream_budget_ledger
+        SET consecutive_429s = 0,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE org_id = ? AND user_id = ? AND upstream = ? AND bucket_window = ?`
+  ).bind(orgId, uid, upstream, window).run();
+}
+
 /** Record a RATE-LIMIT response (HTTP 429 or upstream-equivalent). On the
  *  CIRCUIT_TRIP_THRESHOLD-th consecutive 429, lowers cap by CAP_DECAY_RATIO
  *  and opens the circuit for CIRCUIT_OPEN_MS.

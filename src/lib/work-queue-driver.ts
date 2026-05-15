@@ -169,6 +169,10 @@ import { fireflyWindowHandler } from './work-queue-handlers/firefly-window';
 import { dealReplayEvidenceHandler } from './work-queue-handlers/deal-replay-evidence';
 import { intelligentImportHandler } from './work-queue-handlers/intelligent-import';
 import { martyLabExperimentHandler } from './work-queue-handlers/marty-lab-experiment';
+import { martyLabArtifactReviewHandler } from './work-queue-handlers/marty-lab-artifact-review';
+import { martyLabCodePatchHandler } from './work-queue-handlers/marty-lab-code-patch';
+import { contactEnrichmentHandler } from './work-queue-handlers/contact-enrichment';
+import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -200,7 +204,11 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   fireflyWindowHandler,
   dealReplayEvidenceHandler,
   intelligentImportHandler,
+  contactEnrichmentHandler,
   martyLabExperimentHandler,
+  martyLabArtifactReviewHandler,
+  martyLabCodePatchHandler,
+  ragReindexV2Handler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────
@@ -214,6 +222,41 @@ export interface ProcessTickResult {
     completed: number;
     failed: number;
   }>;
+}
+
+export interface ProcessClaimedWorkItemResult {
+  completed: boolean;
+  failed: boolean;
+  error?: string;
+}
+
+export async function processClaimedWorkItem(
+  env: Env,
+  handler: WorkQueueHandler,
+  item: WorkQueueRow
+): Promise<ProcessClaimedWorkItemResult> {
+  try {
+    // Phase 6.0.1: wrap handler in auto-heartbeat. Lock keepalive is
+    // the driver's responsibility; alternate dispatch paths such as
+    // queue consumers use this same helper so long RAG jobs do not get
+    // reclaimed while they are still actively writing.
+    await withHeartbeat(env, item.id, AUTO_HEARTBEAT_INTERVAL_MS,
+      () => handler.process(item, env));
+    await completeWork(env, item.id);
+    return { completed: true, failed: false };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    try {
+      await failWork(env, item.id, msg);
+      return { completed: false, failed: true, error: msg };
+    } catch (innerE) {
+      console.error(
+        `[work-queue] failWork failed for ${item.id} (original: ${msg}):`,
+        innerE instanceof Error ? innerE.message : innerE
+      );
+      throw innerE;
+    }
+  }
 }
 
 /**
@@ -296,33 +339,15 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
 
     for (const item of claimed) {
       try {
-        // Phase 6.0.1: wrap handler in auto-heartbeat. Lock keepalive
-        // is the driver's responsibility; handlers no longer need to
-        // remember to call recordHeartbeat for that purpose. They MAY
-        // still call it for finer-grained checkpointing.
-        await withHeartbeat(env, item.id, AUTO_HEARTBEAT_INTERVAL_MS,
-          () => handler.process(item, env));
-        // Domain may have already transitioned via deadLetterWork; the
-        // completeWork UPDATE is no-op idempotent on terminal statuses
-        // (the WHERE clause matches by id only — completed status
-        // self-overwrite is benign).
-        await completeWork(env, item.id);
-        stats.completed++;
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        try {
-          await failWork(env, item.id, msg);
-          stats.failed++;
-        } catch (innerE) {
-          // Failure in failWork itself — surface BOTH errors so the
-          // operator sees the full chain. The row stays in_progress
-          // but the watchdog's stale-lock sweep will reclaim it next
-          // tick once locked_until elapses.
-          console.error(
-            `[work-queue] failWork failed for ${item.id} (original: ${msg}):`,
-            innerE instanceof Error ? innerE.message : innerE
-          );
-        }
+        const itemResult = await processClaimedWorkItem(env, handler, item);
+        if (itemResult.completed) stats.completed++;
+        if (itemResult.failed) stats.failed++;
+      } catch {
+        // Failure in failWork itself — processClaimedWorkItem already
+        // logged the full chain. The row stays in_progress but the
+        // watchdog's stale-lock sweep will reclaim it next tick once
+        // locked_until elapses.
+        stats.failed++;
       }
     }
     result.per_domain.push(stats);

@@ -1,6 +1,6 @@
 // TRD §5.3 — Claude + enrichment rate limiters
 import type { Env } from '../types/env';
-import { checkBudget, recordUsage, recordRateLimit, type Upstream } from './upstream-budget';
+import { checkBudget, recordUsage, reserveBudget, recordRateLimit, type Upstream } from './upstream-budget';
 
 interface ClaudeRateState {
   count: number;
@@ -39,10 +39,9 @@ export async function checkClaudeRateLimit(
   const reserve = Math.floor(result.cap / 3);
   const effectiveCap = priority === 'high' ? result.cap : result.cap - reserve;
   if (result.used >= effectiveCap) return false;
-  // Pre-record to mirror the KV impl's check-and-increment behavior;
-  // existing callers expect a successful check to count toward the
-  // window total.
-  await recordUsage(env, orgId, null, 'claude', 'minute');
+  // Reserve budget now, but do not reset upstream 429 state until the
+  // Claude wrapper observes a real 2xx response.
+  await reserveBudget(env, orgId, null, 'claude', 'minute');
   return true;
 }
 
@@ -88,10 +87,9 @@ export async function checkGeminiRateLimit(
   const reserve = Math.floor(result.cap / 3);
   const effectiveCap = priority === 'high' ? result.cap : result.cap - reserve;
   if (result.used >= effectiveCap) return false;
-  // Pre-record to mirror the KV impl's check-and-increment behavior;
-  // existing callers expect a successful check to count toward the
-  // window total.
-  await recordUsage(env, orgId, userId, upstream, 'minute');
+  // Reserve budget now, but do not reset upstream 429 state until the
+  // Gemini wrapper observes a real 2xx response.
+  await reserveBudget(env, orgId, userId, upstream, 'minute');
   return true;
 }
 const MAX_BACKOFF = 86400;
@@ -155,7 +153,7 @@ export async function clearEnrichmentRateLimit(
 // with no vectors. Backoff-and-wait keeps work moving; it just paces it.
 //
 // Tuned to ~10 RPS per org (CF Workers AI BGE published soft limit ~12 RPS).
-// 30s ceiling on a single acquire — if we wait longer than that, surface the
+// 90s ceiling on a single acquire — if we wait longer than that, surface the
 // failure explicitly so the caller can record it (the gap is then caught by
 // detect-embed-gaps in the finalizer and recovered via embed_retry_queue).
 
@@ -163,11 +161,37 @@ const EMBED_MAX_RPS = 10;
 const EMBED_WINDOW_MS = 1000;
 const EMBED_BACKOFF_BASE_MS = 100;
 const EMBED_BACKOFF_MAX_MS = 5000;
-const EMBED_MAX_WAIT_MS = 30_000;
+const EMBED_MAX_WAIT_MS = 90_000;
 
 interface EmbedRateState {
   window_start: number;
   count: number;
+}
+
+function isTransientKvBackpressure(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return msg.includes('429') || msg.includes('Too Many Requests') || /overloaded/i.test(msg);
+}
+
+async function waitForEmbedLimiterRetry(
+  startedAt: number,
+  attempt: number,
+  reason: string
+): Promise<void> {
+  const baseBackoff = Math.min(
+    EMBED_BACKOFF_BASE_MS * Math.pow(2, attempt),
+    EMBED_BACKOFF_MAX_MS
+  );
+  const jitter = (Math.random() - 0.5) * baseBackoff;
+  const backoff = Math.max(50, baseBackoff + jitter);
+
+  if (Date.now() - startedAt + backoff > EMBED_MAX_WAIT_MS) {
+    throw new Error(
+      `EMBED_RATE_LIMIT_TIMEOUT after ${Math.round((Date.now() - startedAt) / 1000)}s waiting for slot (${reason})`
+    );
+  }
+
+  await new Promise(resolve => setTimeout(resolve, backoff));
 }
 
 export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number> {
@@ -177,7 +201,14 @@ export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number>
 
   while (true) {
     const now = Date.now();
-    const raw = await env.KV.get(key);
+    let raw: string | null;
+    try {
+      raw = await env.KV.get(key);
+    } catch (e) {
+      if (!isTransientKvBackpressure(e)) throw e;
+      await waitForEmbedLimiterRetry(startedAt, attempt++, 'kv_get_backpressure');
+      continue;
+    }
     let state: EmbedRateState;
     try {
       state = raw ? JSON.parse(raw) : { window_start: now, count: 0 };
@@ -196,7 +227,13 @@ export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number>
       // is just disaster-recovery cleanup. Cloudflare KV minimum TTL is 60s; passing
       // less than that throws KV PUT 400 Invalid expiration_ttl on every write,
       // which previously crashed every embed-touching path (news, Deep Dive, ingestion).
-      await env.KV.put(key, JSON.stringify(state), { expirationTtl: 60 });
+      try {
+        await env.KV.put(key, JSON.stringify(state), { expirationTtl: 60 });
+      } catch (e) {
+        if (!isTransientKvBackpressure(e)) throw e;
+        await waitForEmbedLimiterRetry(startedAt, attempt++, 'kv_put_backpressure');
+        continue;
+      }
       return Date.now() - startedAt;
     }
 

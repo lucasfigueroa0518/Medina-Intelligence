@@ -2,7 +2,7 @@
 import type { Env } from '../types/env';
 import { chunkArray, parseParticipantUserIds } from './helpers';
 import { promoteToStandalone, flagStaleOrphanedEvents } from './reconciliation';
-import { triggerContactEnrichment, triggerCompanyEnrichment, isDomainShapedName } from './enrichment';
+import { triggerCompanyEnrichment, isDomainShapedName } from './enrichment';
 import { checkClaudeRateLimit } from './rate-limit';
 import { recalculateAllAssociations } from './associations';
 import { calculateAllRelationshipStatuses } from './relationship-status';
@@ -14,6 +14,7 @@ import { checkBudget, recordUsage, recordRateLimit } from './upstream-budget';
 import { proposeMultipleUpdates } from './progressive-enrichment';
 import { callClaude } from './claude';
 import { rebuildEntityIndex } from './entity-index';
+import { enqueueDueContactEnrichment } from './contact-enrichment-queue';
 
 // Mirrors the visibility logic in classification.ts:233 — emails are always
 // 'private' regardless of source-side hint, transcripts/manual notes are
@@ -151,12 +152,7 @@ export async function applyNewsScoreDecay(orgId: string, env: Env): Promise<void
 export async function scheduleReEnrichment(orgId: string, env: Env): Promise<void> {
   const thirtyDaysAgo = new Date(Date.now() - 2592000000).toISOString();
 
-  const contacts = await env.D1.prepare(
-    `SELECT id FROM contacts WHERE org_id = ? AND deleted_at IS NULL
-       AND (enrichment_last_run IS NULL OR enrichment_last_run < ?)
-       AND total_interactions > 0
-     ORDER BY total_interactions DESC LIMIT 100`
-  ).bind(orgId, thirtyDaysAgo).all<{ id: string }>();
+  await enqueueDueContactEnrichment(orgId, env, { limit: 100, targetBacklog: 200 });
 
   // Signal-driven cadence for companies. Hot companies (active deals or news
   // velocity) get re-enriched faster; cold passed/exited get re-enriched
@@ -223,10 +219,6 @@ export async function scheduleReEnrichment(orgId: string, env: Env): Promise<voi
     /* default 30-day stale cutoff */ thirtyDaysAgo,
   ).all<{ id: string }>();
 
-  for (const c of contacts.results) {
-    if (!(await checkClaudeRateLimit(env, orgId, 'low'))) break;
-    await triggerContactEnrichment(c.id, orgId, env);
-  }
   for (const c of companies.results) {
     if (!(await checkClaudeRateLimit(env, orgId, 'low'))) break;
     await triggerCompanyEnrichment(c.id, orgId, env);

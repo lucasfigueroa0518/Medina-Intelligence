@@ -8,7 +8,10 @@
     "dev:api": "wrangler dev --remote",
     "dev:web": "npm --prefix frontend run dev",
     "deploy": "wrangler deploy",
+    "deploy:pipelines": "wrangler deploy --config wrangler.pipelines.toml",
+    "deploy:all-workers": "npm run deploy && npm run deploy:pipelines",
     "deploy:dry": "wrangler deploy --dry-run",
+    "deploy:pipelines:dry": "wrangler deploy --config wrangler.pipelines.toml --dry-run",
     "migrate:local": "wrangler d1 migrations apply medina-ventures-db --local",
     "migrate:remote": "wrangler d1 migrations apply medina-ventures-db --remote",
     "typecheck": "tsc --noEmit"

@@ -90,6 +90,11 @@ export async function getIntegrationsStatus(
       )
     : null;
   const tokenHealthy = !failState || (failState.count || 0) < 3;
+  const outlookStatus: IntegrationStatus = !outlookConnected
+    ? 'not_connected'
+    : tokenHealthy
+      ? 'connected'
+      : 'auth_failed';
 
   // Last ingestion sync for this org (proxy for "last email sync ran")
   const lastSync = outlookConnected
@@ -103,13 +108,17 @@ export async function getIntegrationsStatus(
     : null;
 
   const outlook: IntegrationRow = {
-    status: outlookConnected ? 'connected' : 'not_connected',
-    label: outlookConnected ? 'Connected' : 'Not connected',
-    detail: outlookConnected
-      ? tokenHealthy
-        ? `Signed in as ${user?.email || 'unknown'}`
-        : `Signed in as ${user?.email || 'unknown'} — token refresh failing`
-      : 'Click Connect to authorize email, calendar, and Sent-folder access.',
+    status: outlookStatus,
+    label: outlookStatus === 'connected'
+      ? 'Connected'
+      : outlookStatus === 'auth_failed'
+        ? 'Refresh needed'
+        : 'Not connected',
+    detail: outlookStatus === 'connected'
+      ? `Signed in as ${user?.email || 'unknown'}`
+      : outlookStatus === 'auth_failed'
+        ? `Refresh Microsoft Outlook for ${user?.email || 'this mailbox'} to resume live email and calendar updates.`
+        : 'Click Connect to authorize email, calendar, and Sent-folder access.',
     last_sync: lastSync?.completed_at || null,
     connected_email: outlookConnected ? user?.email || null : null,
     token_healthy: outlookConnected ? tokenHealthy : undefined,
