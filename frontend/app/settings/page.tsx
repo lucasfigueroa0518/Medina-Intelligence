@@ -3321,7 +3321,7 @@ function MartySandboxSection() {
       <div>
         <div className="text-xl font-semibold text-text-primary">MARTy Sandbox</div>
         <div className="mt-1 max-w-3xl text-sm leading-relaxed text-text-muted">
-          A controlled canary queue for testing one MARTy improvement at a time. Each canary waits for a human Ship or Reject decision before the next request starts.
+          A controlled experiment studio for testing one MARTy improvement at a time. Each experiment runs discovery, applies one candidate upgrade, tests it, then waits for Ship or Reject.
         </div>
       </div>
       <MartyLabStatusCard lab={data.marty_lab || emptyMartyLab} onRefresh={load} />
@@ -3653,6 +3653,13 @@ function labDeltaText(delta: number | null): string {
   return `${delta > 0 ? '+' : ''}${Math.round(delta)}`;
 }
 
+function labFriendlyOutcomeNote(note: string | null | undefined): string {
+  const text = String(note || '').trim();
+  if (!text) return 'No observation recorded yet.';
+  if (/^[a-z0-9_]+$/i.test(text)) return titleizeLabValue(text);
+  return text.replace(/\b[a-z]+(?:_[a-z0-9]+)+\b/gi, match => titleizeLabValue(match).toLowerCase());
+}
+
 function labExperimentOutcome(exp: MartyLabExperimentRow): { label: string; tone: 'good' | 'bad' | 'warn' | 'muted'; note: string } {
   const meta = labRoundPolicy(exp);
   const isDiscovery = meta?.role === 'discovery';
@@ -3710,10 +3717,13 @@ function labExperimentTagline(page: MartyLabExperimentPage | null): string {
     String(labRecord(page?.trial?.evidence?.upgrade)?.deficiency || ''),
     String(labRecord(page?.trial?.evidence?.approval_assessment)?.target_kind || ''),
   ].join(' ').toLowerCase();
+  if (title.includes('retrieval') || title.includes('source') || title.includes('grounding') || title.includes('context') || title.includes('document-first')) {
+    return 'Improves context retrieval. Finds the right source material before answering or creating artifacts.';
+  }
   if (title.includes('xlsx') || title.includes('excel') || title.includes('workbook') || title.includes('formula')) {
     return 'Improves Excel artifact creation. Ensures workbook tabs, rows, and formulas are populated correctly.';
   }
-  if (title.includes('docx') || title.includes('memo') || title.includes('document')) {
+  if (title.includes('docx') || title.includes('memo') || title.includes('word') || (title.includes('document') && !title.includes('document-first'))) {
     return 'Improves Word document creation. Produces richer, better-structured memos with usable tables and sections.';
   }
   if (title.includes('pptx') || title.includes('deck') || title.includes('presentation')) {
@@ -3722,9 +3732,6 @@ function labExperimentTagline(page: MartyLabExperimentPage | null): string {
   if (title.includes('privacy') || title.includes('permission')) {
     return 'Improves privacy boundaries. Keeps answers useful while avoiding information the user should not see.';
   }
-  if (title.includes('retrieval') || title.includes('source') || title.includes('document-first')) {
-    return 'Improves context retrieval. Finds the right source material before answering or creating artifacts.';
-  }
   if (title.includes('conversation') || title.includes('memory') || title.includes('intent')) {
     return 'Improves conversation carry. Helps MARTy remember the latest user intent across follow-up turns.';
   }
@@ -3732,6 +3739,7 @@ function labExperimentTagline(page: MartyLabExperimentPage | null): string {
 }
 
 type MartyLabTone = 'good' | 'warn' | 'bad' | 'purple' | 'muted';
+type MartyLabRepairAction = 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts';
 
 function martyToneClasses(tone: MartyLabTone): { box: string; text: string; border: string; soft: string } {
   if (tone === 'good') return {
@@ -3768,12 +3776,37 @@ function martyToneClasses(tone: MartyLabTone): { box: string; text: string; bord
 
 function labRunModeLabel(run: MartyLabRunSnapshot | null | undefined): string {
   if (!run) return 'No run';
-  return run.upgrade_variable?.mode === 'canary' || run.suite_name.includes('canary') ? 'Canary' : 'Full lab';
+  return labRunIsCanary(run) ? 'Experiment' : 'Legacy full lab';
+}
+
+function labRunHarnessVersion(run: MartyLabRunSnapshot | null | undefined): string {
+  if (!run) return '';
+  return String(run.summary?.harness_version || run.upgrade_variable?.harness_version || '').trim();
+}
+
+function labRunIsCanary(run: MartyLabRunSnapshot | null | undefined): boolean {
+  if (!run) return false;
+  return Boolean(
+    run.upgrade_variable?.mode === 'canary'
+    || run.summary?.mode === 'canary'
+    || run.suite_name.includes('canary')
+  );
+}
+
+function labRunIsLegacyFullLab(run: MartyLabRunSnapshot | null | undefined, currentHarnessVersion?: string): boolean {
+  if (!run || labRunIsCanary(run)) return false;
+  const harness = labRunHarnessVersion(run);
+  return !harness || !currentHarnessVersion || harness !== currentHarnessVersion;
 }
 
 function labRunShortTitle(run: MartyLabRunSnapshot | null | undefined): string {
   if (!run) return 'Next sandbox request';
-  return run.upgrade_title || String(run.summary?.current_upgrade_title || '') || run.candidate_label || labRunModeLabel(run);
+  return cleanExperimentTitle(run.upgrade_title || String(run.summary?.current_upgrade_title || '') || run.candidate_label || labRunModeLabel(run));
+}
+
+function cleanExperimentTitle(value: unknown): string {
+  const text = String(value || 'Experiment').trim();
+  return text.replace(/^Round\s+\d+\s*:\s*/i, '').replace(/^Canary\s*:\s*/i, '').trim() || 'Experiment';
 }
 
 function labRunPhase(run: MartyLabRunSnapshot | null | undefined): string | null {
@@ -4161,10 +4194,13 @@ type SandboxViewState = {
 function sandboxCheckLabel(key: string): string {
   const labels: Record<string, string> = {
     lab_work_queue_clear: 'Stuck sandbox work',
+    legacy_full_lab_active: 'Legacy sandbox cleanup',
+    sandbox_artifact_isolation: 'Sandbox artifact cleanup',
     round_inconclusive_needs_review: 'Needs your review',
     no_active_lab_run: 'Another improvement is already running',
     no_active_lab_run_race: 'Another improvement is already running',
     one_active_lab_run_per_suite: 'Another improvement is already running',
+    one_active_lab_run_per_org: 'Another improvement is already running',
     human_decision_required: 'Waiting for Ship or Reject',
     sandbox_queue_pending: 'Queued improvement waiting',
   };
@@ -4179,10 +4215,15 @@ function sandboxRunViewState(args: {
   isQuarantined: boolean;
   pausedForRoundReview: boolean;
   canRepairLabQueue: boolean;
+  canArchiveLegacyRun: boolean;
+  canQuarantineLabArtifacts: boolean;
+  runIsCanary: boolean;
   completed: number;
   expectedTotal: number;
   currentRound: number;
   roundTotal: number;
+  discoveryCompleted: number;
+  validationCompleted: number;
 }): SandboxViewState {
   const {
     run,
@@ -4192,19 +4233,43 @@ function sandboxRunViewState(args: {
     isQuarantined,
     pausedForRoundReview,
     canRepairLabQueue,
+    canArchiveLegacyRun,
+    canQuarantineLabArtifacts,
+    runIsCanary,
     completed,
     expectedTotal,
     currentRound,
     roundTotal,
+    discoveryCompleted,
+    validationCompleted,
   } = args;
 
+  if (canArchiveLegacyRun) {
+    return {
+      id: 'needs_cleanup',
+      eyebrow: 'Legacy sandbox cleanup',
+      title: 'Archive the old full lab',
+      body: 'This is an old full-lab result from before the experiment-only harness. Archive it to unblock clean experiments; nothing will ship.',
+      tone: 'warn',
+    };
+  }
+
   if (!run) {
+    if (canQuarantineLabArtifacts) {
+      return {
+        id: 'needs_cleanup',
+        eyebrow: 'Sandbox cleanup',
+        title: 'Quarantine old sandbox artifacts',
+        body: 'Old sandbox-generated documents are still stored in the document table. They are hidden from MARTy retrieval, but quarantine them before starting a clean experiment.',
+        tone: 'warn',
+      };
+    }
     if (canRepairLabQueue) {
       return {
         id: 'needs_cleanup',
         eyebrow: 'Sandbox cleanup',
         title: 'Sandbox cleanup needed',
-        body: 'Some retryable sandbox work is still waiting even though no run is active. Clear it here, then start the next clean canary or lab.',
+        body: 'Some retryable sandbox work is still waiting even though no experiment is active. Clear it here, then start the next clean experiment.',
         tone: 'warn',
       };
     }
@@ -4253,7 +4318,7 @@ function sandboxRunViewState(args: {
       id: 'ready_decision',
       eyebrow: 'Decision ready',
       title: `${labRunModeLabel(run)} finished: ${status}`,
-      body: 'Review the evidence on the cover page, then Ship or Reject the whole run. The next queued request waits for that decision.',
+      body: 'Review the cover page, then Ship or Reject this experiment. The next queued request waits for that decision.',
       tone: activeTrial?.status === 'accepted' ? 'good' : activeTrial?.status === 'rejected' ? 'warn' : 'warn',
     };
   }
@@ -4274,16 +4339,24 @@ function sandboxRunViewState(args: {
       return {
         id: 'running_discovery',
         eyebrow: 'Live now',
-        title: `Finding weakness ${Math.max(1, currentRound)} of ${roundTotal}`,
-        body: `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks are complete. MARTy is looking for a real gap before it tests a fix.`,
+        title: runIsCanary
+          ? `Finding weakness: discovery chat ${Math.min(3, discoveryCompleted + 1)} of 3`
+          : `Finding weakness ${Math.max(1, currentRound)} of ${roundTotal}`,
+        body: runIsCanary
+          ? `${Math.min(3, discoveryCompleted)} of 3 discovery rounds are complete. MARTy is looking for a real gap before it tests a fix.`
+          : `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks are complete. MARTy is looking for a real gap before it tests a fix.`,
         tone: 'purple',
       };
     }
     return {
       id: 'running_validation',
       eyebrow: 'Live now',
-      title: `Testing fix ${Math.max(1, currentRound)} of ${roundTotal}`,
-      body: `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks are complete. The current candidate is being compared against the accepted baseline.`,
+      title: runIsCanary
+        ? `Testing fix: validation chat ${Math.min(7, validationCompleted + 1)} of 7`
+        : `Testing fix ${Math.max(1, currentRound)} of ${roundTotal}`,
+      body: runIsCanary
+        ? `${Math.min(7, validationCompleted)} of 7 testing rounds are complete. The current candidate is being compared against the accepted baseline.`
+        : `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks are complete. The current candidate is being compared against the accepted baseline.`,
       tone: 'purple',
     };
   }
@@ -4303,7 +4376,7 @@ function sandboxRunViewState(args: {
       id: 'historical',
       eyebrow: 'Rejected',
       title: 'This improvement was rejected',
-      body: 'The existing baseline stayed in place. Use the queue or Bigger Fixes to try a deeper follow-up.',
+      body: 'The existing baseline stayed in place. Start another focused experiment with a sharper problem statement.',
       tone: 'muted',
     };
   }
@@ -4380,7 +4453,7 @@ function SandboxFocusComposer({
     { label: 'Privacy', prompt: 'Focus on privacy-safe answers that avoid leaking unrelated user or deal information.' },
     { label: 'Prompt logic', prompt: 'Focus on MARTy system/runtime logic and instruction-following quality.' },
   ];
-  const title = isBusy ? 'Queue the next focus' : 'What should MARTy improve?';
+  const title = isBusy ? 'Queue the next experiment focus' : 'What should MARTy improve?';
   const body = isBusy
     ? 'The current improvement keeps running. This request will wait its turn.'
     : 'Use plain language, like you would when telling Codex what went wrong with MARTy.';
@@ -4418,7 +4491,7 @@ function SandboxFocusComposer({
           disabled={startDisabled}
           className="inline-flex items-center gap-1 rounded-lg border border-accent-magenta/25 bg-accent-magenta/10 px-3 py-2 text-xs font-medium text-accent-magenta hover:bg-accent-magenta/15 disabled:opacity-50"
         >
-          <Sparkles size={14} /> {startingMode === 'canary' ? `${startVerb}ing...` : `${startVerb} canary`}
+          <Sparkles size={14} /> {startingMode === 'canary' ? `${startVerb}ing...` : `${startVerb} experiment`}
         </button>
       </div>
     </section>
@@ -4462,9 +4535,9 @@ function SandboxRunPager({
     <section className="rounded-xl border border-white/[0.08] bg-white/[0.015]">
       <div className="flex items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
         <div>
-          <div className="text-xs font-semibold text-text-primary">Run workspace</div>
+          <div className="text-xs font-semibold text-text-primary">Experiment workspace</div>
           <div className="mt-0.5 text-[11px] text-text-muted">
-            {pageIndex === 0 ? 'Cover page' : `Experiment ${pageIndex} page`} · {pageCount} page{pageCount === 1 ? '' : 's'}
+            {pageIndex === 0 ? 'Experiment cover' : 'Rounds page'} · {pageCount} page{pageCount === 1 ? '' : 's'}
           </div>
         </div>
         <div className="flex items-center gap-3">
@@ -4488,7 +4561,7 @@ function SandboxRunPager({
                     ? 'w-6 border-accent-magenta bg-accent-magenta'
                     : 'w-2.5 border-white/15 bg-white/[0.06] hover:bg-white/[0.12]'
                 }`}
-                aria-label={index === 0 ? 'Sandbox cover page' : `Sandbox experiment ${index}`}
+                aria-label={index === 0 ? 'Experiment cover page' : 'Experiment rounds page'}
               />
             ))}
           </div>
@@ -4518,6 +4591,86 @@ function labHumanPreferenceText(sample: MartyLabExperimentRow): string {
   return 'Pending';
 }
 
+function labSampleIsClosed(sample: MartyLabExperimentRow): boolean {
+  return !['queued', 'running'].includes(sample.status);
+}
+
+function labPlainExperimentConclusion(
+  run: MartyLabRunSnapshot,
+  trial: MartyLabTrialRow | null,
+  rationale: string[]
+): string {
+  const status = trial?.status || run.status;
+  if (labRunPhase(run) === 'human_shipped') {
+    return 'This experiment was shipped. Its upgrade became the baseline for future MARTy tests.';
+  }
+  if (labRunPhase(run) === 'human_rejected') {
+    return 'This experiment was rejected. The existing MARTy baseline stayed unchanged.';
+  }
+  if (run.status === 'running' || run.status === 'configured') {
+    return 'This experiment is still running. Wait for the testing rounds to finish before making a Ship or Reject decision.';
+  }
+  if (status === 'accepted') {
+    return 'The candidate produced enough evidence to recommend shipping. Review the testing rounds, then decide whether to make it the new baseline.';
+  }
+  if (status === 'rejected') {
+    return 'The candidate did not improve MARTy enough to ship. The baseline should stay unchanged.';
+  }
+  if (status === 'inconclusive') {
+    return 'The experiment found some signal, but not enough clean evidence to ship automatically. The baseline stays unchanged unless a human chooses otherwise.';
+  }
+  if (rationale.length > 0) return rationale[0];
+  return run.summary?.conclusion ? String(run.summary.conclusion) : 'No conclusion has been recorded yet.';
+}
+
+function labUpgradeSummary(activeUpgrade: Record<string, unknown> | null, trial: MartyLabTrialRow | null): string {
+  const upgrade = activeUpgrade || labRecord(trial?.evidence?.upgrade);
+  const fields = [
+    upgrade?.title,
+    upgrade?.name,
+    upgrade?.runtime_strategy,
+    upgrade?.strategy,
+    trial?.upgrade_key,
+    trial?.title,
+  ];
+  const text = fields.map(item => String(item || '').trim()).find(Boolean);
+  return cleanExperimentTitle(text || 'Candidate upgrade');
+}
+
+function labHypothesisSummary(activeUpgrade: Record<string, unknown> | null, trial: MartyLabTrialRow | null): string {
+  const evidence = labRecord(trial?.evidence);
+  const upgrade = activeUpgrade || labRecord(evidence?.upgrade);
+  const fields = [
+    upgrade?.hypothesis,
+    upgrade?.deficiency,
+    evidence?.hypothesis,
+    evidence?.discovery_synthesis,
+    evidence?.deficiency_summary,
+  ];
+  const text = fields.map(item => labReadableEvidence(item)).find(Boolean);
+  return text || 'MARTy may be missing the user’s real intent or source context, so the experiment tests one focused upgrade against the current baseline.';
+}
+
+function ExperimentCoverSection({
+  title,
+  status,
+  children,
+}: {
+  title: string;
+  status?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
+      <div className="flex items-start justify-between gap-3">
+        <h5 className="text-sm font-semibold text-text-primary">{title}</h5>
+        {status && <span className="shrink-0 rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] text-text-muted">{status}</span>}
+      </div>
+      <div className="mt-2 text-sm leading-relaxed text-text-secondary">{children}</div>
+    </section>
+  );
+}
+
 function SandboxRoundCard({ sample }: { sample: MartyLabExperimentRow }) {
   const outcome = labExperimentOutcome(sample);
   const roundMeta = labRoundPolicy(sample);
@@ -4538,34 +4691,50 @@ function SandboxRoundCard({ sample }: { sample: MartyLabExperimentRow }) {
       : `Validation ${Math.max(1, (roundMeta?.sample || 4) - 3)}/7`;
   const artifactText = labArtifactResultText(sample);
   const humanPick = labHumanPreferenceText(sample);
+  const note = labFriendlyOutcomeNote(outcome.note);
+  const observation = roundMeta?.role === 'discovery'
+    ? note || 'Discovery captured baseline behavior for this experiment.'
+    : delta === null
+      ? note
+      : delta > 0
+        ? `Improved by ${labDeltaText(delta)}. ${note}`
+        : delta < 0
+          ? `Regressed by ${labDeltaText(delta)}. ${note}`
+          : `No measured lift. ${note}`;
 
   return (
-    <article className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">{label}</div>
-          <h5 className="mt-1 text-sm font-semibold leading-snug text-text-primary">{sample.goal}</h5>
+    <details className="rounded-lg border border-white/[0.06] bg-white/[0.02]">
+      <summary className="cursor-pointer list-none px-4 py-3 marker:hidden">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">{label}</div>
+            <h5 className="mt-1 text-sm font-semibold leading-snug text-text-primary">{sample.goal}</h5>
+            <p className="mt-2 text-xs leading-relaxed text-text-secondary">{observation}</p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {delta !== null && <span className={`text-sm font-semibold tabular-nums ${delta > 0 ? 'text-semantic-success' : delta < 0 ? 'text-semantic-error' : 'text-text-muted'}`}>{labDeltaText(delta)}</span>}
+            <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${outcomeTone}`}>{outcome.label}</span>
+            <ChevronDown size={14} className="text-text-muted" />
+          </div>
         </div>
-        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${outcomeTone}`}>{outcome.label}</span>
-      </div>
-      <div className="mt-4 grid gap-2 sm:grid-cols-4">
-        <MartyLabMiniStat label="Baseline" value={formatLabScore(sample.baseline_score)} />
-        <MartyLabMiniStat label="Candidate" value={formatLabScore(sample.candidate_score)} />
-        <MartyLabMiniStat
-          label="Delta"
-          value={labDeltaText(delta)}
-          tone={delta && delta > 0 ? 'good' : delta && delta < 0 ? 'bad' : 'default'}
-        />
-        <MartyLabMiniStat
-          label="Human pick"
-          value={humanPick}
-          tone={humanPick === 'Candidate' ? 'good' : humanPick === 'Baseline' ? 'bad' : 'default'}
-        />
-      </div>
-      <p className="mt-3 text-xs leading-relaxed text-text-secondary">{outcome.note}</p>
-      {artifactText !== '—' && <p className="mt-1 text-[11px] text-text-muted">{artifactText}</p>}
-      <SandboxEvidenceDrawer title="Round evidence">
-        <div className="space-y-3">
+      </summary>
+      <div className="space-y-3 border-t border-white/[0.05] px-4 py-3">
+        <div className="grid gap-2 sm:grid-cols-4">
+          <MartyLabMiniStat label="Baseline" value={formatLabScore(sample.baseline_score)} />
+          <MartyLabMiniStat label="Candidate" value={formatLabScore(sample.candidate_score)} />
+          <MartyLabMiniStat
+            label="Delta"
+            value={labDeltaText(delta)}
+            tone={delta && delta > 0 ? 'good' : delta && delta < 0 ? 'bad' : 'default'}
+          />
+          <MartyLabMiniStat
+            label="Human pick"
+            value={humanPick}
+            tone={humanPick === 'Candidate' ? 'good' : humanPick === 'Baseline' ? 'bad' : 'default'}
+          />
+        </div>
+        {artifactText !== '—' && <p className="text-[11px] text-text-muted">{artifactText}</p>}
+        <div className="rounded-md border border-white/[0.05] bg-black/10 px-3 py-2">
           <div>
             <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Prompt</div>
             <ExpandableText
@@ -4578,18 +4747,17 @@ function SandboxRoundCard({ sample }: { sample: MartyLabExperimentRow }) {
           {sample.recommendation && (
             <div>
               <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Outcome summary</div>
-              <p className="mt-1 text-xs leading-relaxed text-text-secondary">{sample.recommendation}</p>
+              <p className="mt-1 text-xs leading-relaxed text-text-secondary">{labFriendlyOutcomeNote(sample.recommendation)}</p>
             </div>
           )}
         </div>
-      </SandboxEvidenceDrawer>
-    </article>
+      </div>
+    </details>
   );
 }
 
 function SandboxCoverPage({
   run,
-  viewState,
   runIsCanary,
   currentRound,
   roundTotal,
@@ -4617,7 +4785,6 @@ function SandboxCoverPage({
   onReview,
 }: {
   run: MartyLabRunSnapshot;
-  viewState: SandboxViewState;
   runIsCanary: boolean;
   currentRound: number;
   roundTotal: number;
@@ -4645,22 +4812,48 @@ function SandboxCoverPage({
   onReview: (decision: 'approve_continue' | 'reject_continue') => void;
 }) {
   const focusPrompt = typeof run.summary?.focus_prompt === 'string' ? run.summary.focus_prompt.trim() : '';
-  const recommendation = activeTrial?.status
-    ? titleizeLabValue(activeTrial.status)
-    : run.status === 'running' || run.status === 'configured'
-      ? 'Testing'
-      : titleizeLabValue(run.status);
+  const samples = activeExperimentPage?.samples || [];
+  const discoverySamples = samples.filter(sample => labRoundPolicy(sample)?.role === 'discovery');
+  const validationSamples = samples.filter(sample => labRoundPolicy(sample)?.role === 'validation');
+  const discoveryDone = discoverySamples.filter(labSampleIsClosed).length;
+  const validationDone = validationSamples.filter(labSampleIsClosed).length;
+  const validationOutcomes = validationSamples.map(sample => labExperimentOutcome(sample));
+  const validationWins = validationOutcomes.filter(outcome => outcome.label === 'Win').length;
+  const validationLosses = validationOutcomes.filter(outcome => ['Loss', 'Regression', 'Artifact loss', 'Privacy fail'].includes(outcome.label)).length;
+  const validationTies = validationOutcomes.filter(outcome => outcome.label === 'Tie').length;
+  const validationStopped = validationSamples.filter(sample => ['cancelled', 'failed', 'blocked'].includes(sample.status)).length;
+  const experimentProgressPct = Math.max(0, Math.min(100, Math.round(((discoveryDone + validationDone) / 10) * 100)));
+  const recommendation = activeTrial?.status ? titleizeLabValue(activeTrial.status) : titleizeLabValue(run.status);
   const summary = run.summary?.conclusion ? String(run.summary.conclusion) : null;
+  const title = cleanExperimentTitle(activeTrial?.title || run.upgrade_title || labRunShortTitle(run));
+  const hypothesis = labHypothesisSummary(activeUpgrade, activeTrial);
+  const appliedUpgrade = labUpgradeSummary(activeUpgrade, activeTrial);
+  const conclusion = labPlainExperimentConclusion(run, activeTrial, approvalRationale);
+  const phase = labRunPhase(run);
+  const stageLabel = run.status === 'running' || run.status === 'configured'
+    ? phase === 'round_discovery'
+      ? `Discovery ${Math.min(3, discoveryDone + 1)} of 3`
+      : `Testing ${Math.min(7, validationDone + 1)} of 7`
+    : labRunNeedsDecision(run)
+      ? 'Ready for decision'
+      : labRunPhase(run) === 'human_shipped'
+        ? 'Shipped'
+        : labRunPhase(run) === 'human_rejected'
+          ? 'Rejected'
+          : titleizeLabValue(activeTrial?.status || run.status);
+  const validationSummary = validationSamples.length > 0
+    ? `${validationDone}/7 testing rounds recorded: ${validationWins} improved, ${validationLosses} regressed, ${validationTies} tied${validationStopped > 0 ? `, ${validationStopped} stopped early` : ''}.`
+    : 'Testing rounds have not started yet. They will compare baseline MARTy against the candidate upgrade across seven human-like conversations.';
 
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="max-w-4xl">
           <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
-            {runIsCanary ? 'Canary cover' : 'Legacy full lab cover'}
+            {runIsCanary ? 'Experiment' : 'Legacy full lab'}
           </div>
           <h4 className="mt-1 text-2xl font-semibold leading-tight text-text-primary">
-            {activeTrial?.title || run.upgrade_title || labRunShortTitle(run)}
+            {title}
           </h4>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">
             {activeExperimentPage ? labExperimentTagline(activeExperimentPage) : 'The sandbox is testing a MARTy improvement against the accepted baseline.'}
@@ -4676,49 +4869,68 @@ function SandboxCoverPage({
       <div className="rounded-lg border border-white/[0.06] bg-black/10 p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <div className="text-xs font-semibold text-text-primary">{viewState.title}</div>
+            <div className="text-xs font-semibold text-text-primary">{stageLabel}</div>
             <div className="mt-1 text-xs leading-relaxed text-text-muted">
-              {runIsCanary
-                ? 'One focused experiment: three discovery chats and seven validation chats.'
-                : `Eight experiments run in sequence. The current page shows experiment ${Math.max(1, currentRound)} of ${roundTotal}.`}
+              Three discovery rounds shape one hypothesis. Seven testing rounds compare the applied upgrade against the current baseline.
             </div>
           </div>
           <MartyLabStatusPill status={run.status} />
         </div>
         <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
-          <div className="h-full rounded-full bg-accent-magenta" style={{ width: `${progressPct}%` }} />
+          <div className="h-full rounded-full bg-accent-magenta" style={{ width: `${experimentProgressPct || progressPct}%` }} />
         </div>
-        <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-          <MartyLabMiniStat label="Experiments" value={`${Math.min(currentRound, visibleRoundTotal)}/${visibleRoundTotal}`} tone="purple" />
-          <MartyLabMiniStat label="Checks complete" value={`${completed}/${expectedTotal}`} tone="purple" />
-          <MartyLabMiniStat label="Recommendation" value={recommendation} tone={activeTrial?.status === 'accepted' ? 'good' : activeTrial?.status === 'rejected' ? 'warn' : 'default'} />
-          <MartyLabMiniStat label="Privacy issues" value={privacyFailures} tone={privacyFailures > 0 ? 'bad' : 'good'} />
+        <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-muted">
+          <span>{discoveryDone}/3 discovery rounds</span>
+          <span>{validationDone}/7 testing rounds</span>
+          <span>Recommendation: {recommendation}</span>
+          {privacyFailures > 0 && <span className="text-semantic-error">{privacyFailures} privacy issue{privacyFailures === 1 ? '' : 's'}</span>}
         </div>
       </div>
 
-      {focusPrompt && (
-        <div className="rounded-lg border border-accent-purple/15 bg-accent-purple/5 px-4 py-3">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-accent-purple">Focus</div>
-          <p className="mt-1 text-sm leading-relaxed text-text-secondary">{focusPrompt}</p>
-        </div>
-      )}
+      <div className="grid gap-3 lg:grid-cols-2">
+        <ExperimentCoverSection title="Discovery rounds" status={`${discoveryDone}/3`}>
+          {discoveryDone < 3
+            ? 'The sandbox is still gathering baseline MARTy behavior from realistic user conversations.'
+            : 'The discovery rounds captured where baseline MARTy struggled before proposing one focused upgrade.'}
+        </ExperimentCoverSection>
 
-      {(summary || approvalRationale.length > 0) && (
-        <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
-          <div className="text-sm font-semibold text-text-primary">What we learned</div>
-          {summary && <p className="mt-2 text-sm leading-relaxed text-text-secondary">{summary}</p>}
-          {approvalRationale.length > 0 && (
-            <ul className="mt-2 space-y-1 text-xs leading-relaxed text-text-secondary">
+        <ExperimentCoverSection title="Hypothesis" status={activeTrial?.status === 'pending' ? 'Forming' : 'Set'}>
+          {hypothesis}
+        </ExperimentCoverSection>
+
+        <ExperimentCoverSection title="Applied upgrade" status={activeLeverIds.length > 0 ? `${activeLeverIds.length} lever${activeLeverIds.length === 1 ? '' : 's'}` : undefined}>
+          {appliedUpgrade}
+        </ExperimentCoverSection>
+
+        <ExperimentCoverSection title="Testing rounds" status={`${validationDone}/7`}>
+          {validationSummary}
+        </ExperimentCoverSection>
+      </div>
+
+      <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+        <div className="text-sm font-semibold text-text-primary">Findings and conclusion</div>
+        <p className="mt-2 text-sm leading-relaxed text-text-secondary">{conclusion}</p>
+        {summary && summary !== conclusion && <p className="mt-2 text-xs leading-relaxed text-text-muted">{summary}</p>}
+        {focusPrompt && (
+          <div className="mt-3 rounded-md border border-accent-purple/15 bg-accent-purple/5 px-3 py-2">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-accent-purple">User focus</div>
+            <p className="mt-1 text-xs leading-relaxed text-text-secondary">{focusPrompt}</p>
+          </div>
+        )}
+        {approvalRationale.length > 0 && (
+          <div className="mt-3">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Why</div>
+            <ul className="mt-1 space-y-1 text-xs leading-relaxed text-text-secondary">
               {approvalRationale.map(item => <li key={item}>{item}</li>)}
             </ul>
-          )}
+          </div>
+        )}
         </div>
-      )}
 
       <SandboxEvidenceDrawer>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] p-3">
-            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Run decisions</div>
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Raw run decisions</div>
             <div className="mt-2 grid grid-cols-3 gap-2">
               <MartyLabMiniStat label="Accepted" value={acceptedTrialCount} tone="good" />
               <MartyLabMiniStat label="Rejected" value={rejectedTrialCount} tone="warn" />
@@ -4734,6 +4946,9 @@ function SandboxCoverPage({
             <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Candidate pool</div>
             <div className="mt-2 text-xs leading-relaxed text-text-secondary">
               Rank {String(activeCandidatePool?.selected_rank || activeCandidatePool?.rank || '—')} of {String(activeCandidatePool?.size || activeCandidatePool?.pool_size || '—')}
+            </div>
+            <div className="mt-2 text-[11px] text-text-muted">
+              Run checks: {completed}/{expectedTotal} · Experiment {Math.max(1, currentRound)}/{Math.max(1, visibleRoundTotal || roundTotal)}
             </div>
           </div>
           <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] p-3">
@@ -4753,13 +4968,9 @@ function SandboxCoverPage({
 
 function SandboxExperimentPage({
   page,
-  pageIndex,
-  pageCount,
   expectedSamples,
 }: {
   page: MartyLabExperimentPage;
-  pageIndex: number;
-  pageCount: number;
   expectedSamples: number;
 }) {
   const stats = martyLabExperimentStats(page, expectedSamples);
@@ -4776,35 +4987,30 @@ function SandboxExperimentPage({
     const bMeta = labRoundPolicy(b);
     return (aMeta?.sample || 0) - (bMeta?.sample || 0);
   });
+  const discoveryDone = sortedSamples.filter(sample => labRoundPolicy(sample)?.role === 'discovery' && labSampleIsClosed(sample)).length;
+  const validationDone = sortedSamples.filter(sample => labRoundPolicy(sample)?.role === 'validation' && labSampleIsClosed(sample)).length;
+  const cleanTitle = cleanExperimentTitle(page.title);
+  const liftText = typeof stats.averageDelta === 'number'
+    ? `Average lift ${labDeltaText(stats.averageDelta)}`
+    : 'Average lift pending';
 
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="max-w-5xl">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Experiment {pageIndex} of {pageCount}</div>
-          <h4 className="mt-1 text-2xl font-semibold leading-tight text-text-primary">{page.title}</h4>
+          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Experiment rounds</div>
+          <h4 className="mt-1 text-2xl font-semibold leading-tight text-text-primary">{cleanTitle}</h4>
           <p className="mt-2 text-sm leading-relaxed text-text-secondary">{labExperimentTagline(page)}</p>
-          <p className="mt-2 text-xs text-text-muted">
-            Three discovery chats plus seven validation chats. The cards below compare baseline MARTy against the candidate fix.
+          <p className="mt-2 text-xs leading-relaxed text-text-muted">
+            Discovery {discoveryDone}/3 · Testing {validationDone}/7 · {stats.wins} improved · {stats.losses} regressed · {liftText}
           </p>
         </div>
         <span className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${statusTone.box}`}>{stats.decision}</span>
       </div>
 
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-        <MartyLabMiniStat label="Checks shown" value={`${stats.closedSamples}/${stats.totalSamples}`} />
-        <MartyLabMiniStat label="Wins" value={stats.wins} tone="good" />
-        <MartyLabMiniStat label="Losses" value={stats.losses} tone={stats.losses > 0 ? 'warn' : 'default'} />
-        <MartyLabMiniStat
-          label="Average lift"
-          value={typeof stats.averageDelta === 'number' ? labDeltaText(stats.averageDelta) : 'Pending'}
-          tone={typeof stats.averageDelta === 'number' && stats.averageDelta > 0 ? 'good' : typeof stats.averageDelta === 'number' && stats.averageDelta < 0 ? 'bad' : 'default'}
-        />
-      </div>
-
-      <div className="max-h-[42rem] overflow-y-auto pr-2">
+      <div className="max-h-[42rem] overflow-y-auto rounded-lg border border-white/[0.06] bg-black/10 p-2 pr-3">
         {sortedSamples.length > 0 ? (
-          <div className="grid gap-3 xl:grid-cols-2">
+          <div className="space-y-2">
             {sortedSamples.map(sample => <SandboxRoundCard key={sample.id} sample={sample} />)}
           </div>
         ) : (
@@ -4825,7 +5031,8 @@ function SandboxImprovementQueue({
   readiness,
   readinessMessage,
   canRepairLabQueue,
-  repairingReadiness,
+  canQuarantineLabArtifacts,
+  repairingAction,
   onRepairReadiness,
   deepWorkItems,
   activeFailureClusters,
@@ -4846,8 +5053,9 @@ function SandboxImprovementQueue({
   readiness: MartyLabStatusSnapshot['readiness'];
   readinessMessage: string;
   canRepairLabQueue: boolean;
-  repairingReadiness: boolean;
-  onRepairReadiness: () => void;
+  canQuarantineLabArtifacts: boolean;
+  repairingAction: MartyLabRepairAction | null;
+  onRepairReadiness: (action?: MartyLabRepairAction) => void;
   deepWorkItems: MartyLabDeepWorkItemRow[];
   activeFailureClusters: Array<Record<string, unknown>>;
   codePatchJobs: MartyLabCodePatchJobRow[];
@@ -4988,8 +5196,8 @@ function SandboxImprovementQueue({
               className={`min-w-[13rem] rounded-lg border px-3 py-2 text-left transition ${!run ? 'border-accent-purple/25 bg-accent-purple/5' : 'border-white/[0.05] bg-white/[0.02] hover:bg-white/[0.04]'}`}
             >
               <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Current lane</div>
-              <div className="mt-1 truncate text-xs font-medium text-text-primary">{liveRun ? labRunShortTitle(liveRun) : 'Ready for next run'}</div>
-              <div className="mt-1 text-[11px] text-text-muted">{liveRun ? `${liveRun.completed_experiments}/${liveRun.total_experiments || 0} checks` : 'No active run'}</div>
+              <div className="mt-1 truncate text-xs font-medium text-text-primary">{liveRun ? labRunShortTitle(liveRun) : 'Ready for next canary'}</div>
+              <div className="mt-1 text-[11px] text-text-muted">{liveRun ? `${liveRun.completed_experiments}/${liveRun.total_experiments || 0} checks` : 'No active canary'}</div>
             </button>
             {recentRuns.map(item => {
               const selected = run?.id === item.id;
@@ -5018,16 +5226,27 @@ function SandboxImprovementQueue({
         <details className="rounded-lg border border-white/[0.06] bg-black/10">
           <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-text-primary">Readiness details</summary>
           <div className="space-y-2 border-t border-white/[0.05] p-3">
-            <div className="text-xs leading-relaxed text-text-muted">{readiness.ok ? 'Ready for a clean controlled run.' : readinessMessage}</div>
+            <div className="text-xs leading-relaxed text-text-muted">{readiness.ok ? 'Ready for a clean canary.' : readinessMessage}</div>
             {canRepairLabQueue && (
               <button
                 type="button"
-                onClick={onRepairReadiness}
-                disabled={repairingReadiness}
+                onClick={() => onRepairReadiness('clear_orphaned_lab_queue')}
+                disabled={repairingAction !== null}
                 className="inline-flex items-center gap-1 rounded-md border border-semantic-warning/25 px-2 py-1 text-[10px] font-medium text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
               >
-                {repairingReadiness ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
-                {repairingReadiness ? 'Clearing stuck work' : 'Clear stuck sandbox work'}
+                {repairingAction === 'clear_orphaned_lab_queue' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                {repairingAction === 'clear_orphaned_lab_queue' ? 'Clearing stuck work' : 'Clear stuck sandbox work'}
+              </button>
+            )}
+            {canQuarantineLabArtifacts && (
+              <button
+                type="button"
+                onClick={() => onRepairReadiness('quarantine_lab_artifacts')}
+                disabled={repairingAction !== null}
+                className="ml-2 inline-flex items-center gap-1 rounded-md border border-semantic-warning/25 px-2 py-1 text-[10px] font-medium text-semantic-warning hover:bg-semantic-warning/10 disabled:opacity-50"
+              >
+                {repairingAction === 'quarantine_lab_artifacts' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                {repairingAction === 'quarantine_lab_artifacts' ? 'Quarantining artifacts' : 'Quarantine sandbox artifacts'}
               </button>
             )}
             <div className="grid gap-1">
@@ -5053,7 +5272,7 @@ function MartyLabStatusCard({
 }) {
   const [startingMode, setStartingMode] = React.useState<'canary' | null>(null);
   const [startingCodePatchId, setStartingCodePatchId] = React.useState<string | null>(null);
-  const [repairingReadiness, setRepairingReadiness] = React.useState(false);
+  const [repairingAction, setRepairingAction] = React.useState<MartyLabRepairAction | null>(null);
   const [canceling, setCanceling] = React.useState(false);
   const [deciding, setDeciding] = React.useState<'ship' | 'reject' | null>(null);
   const [reviewingRound, setReviewingRound] = React.useState<'approve_continue' | 'reject_continue' | null>(null);
@@ -5079,7 +5298,7 @@ function MartyLabStatusCard({
       await api.startMartyLabRun({
         mode: 'canary',
         round_count: 1,
-        candidate_label: 'sandbox-canary',
+        candidate_label: 'sandbox-experiment',
         focus_prompt: requestedFocus || undefined,
         queue_if_blocked: true,
       });
@@ -5134,16 +5353,21 @@ function MartyLabStatusCard({
     }
   }
 
-  async function repairReadiness() {
-    setRepairingReadiness(true);
+  async function repairReadiness(action: MartyLabRepairAction = 'clear_orphaned_lab_queue') {
+    setRepairingAction(action);
     setError(null);
     try {
-      await api.repairMartyLabReadiness({ action: 'clear_orphaned_lab_queue' });
+      await api.repairMartyLabReadiness({ action });
       onRefresh();
     } catch (e: any) {
-      setError(e?.message || 'Failed to clear stuck sandbox work');
+      const fallback = action === 'archive_legacy_full_lab'
+        ? 'Failed to archive legacy sandbox run'
+        : action === 'quarantine_lab_artifacts'
+          ? 'Failed to quarantine sandbox artifacts'
+          : 'Failed to clear stuck sandbox work';
+      setError(e?.message || fallback);
     } finally {
-      setRepairingReadiness(false);
+      setRepairingAction(null);
     }
   }
 
@@ -5222,8 +5446,11 @@ function MartyLabStatusCard({
     if (aRound !== bRound) return aRound - bRound;
     return (aMeta?.sample || 0) - (bMeta?.sample || 0);
   });
+  const closedExperimentRows = experimentRows.filter(exp => !['queued', 'running'].includes(exp.status));
+  const discoveryCompleted = closedExperimentRows.filter(exp => labRoundPolicy(exp)?.role === 'discovery').length;
+  const validationCompleted = closedExperimentRows.filter(exp => labRoundPolicy(exp)?.role === 'validation').length;
   const seededExperimentPages = buildMartyLabExperimentPages(experimentRows, trials);
-  const runIsCanary = Boolean(run && (run.upgrade_variable?.mode === 'canary' || run.suite_name.includes('canary')));
+  const runIsCanary = labRunIsCanary(run);
   const visibleRoundTotal = run ? (runIsCanary ? 1 : roundTotal) : seededExperimentPages.length;
   const experimentPages = run
     ? Array.from({ length: Math.max(visibleRoundTotal, seededExperimentPages.length) }, (_, index) => {
@@ -5246,6 +5473,14 @@ function MartyLabStatusCard({
   const readinessMessage = readiness.blockers[0] || readiness.warnings[0] || 'Ready for a clean controlled run.';
   const blockingKeys = readiness.checks.filter(check => check.status === 'block').map(check => check.key);
   const labQueueBlocker = readiness.checks.find(check => check.key === 'lab_work_queue_clear' && check.status === 'block');
+  const artifactIsolationCheck = readiness.checks.find(check => check.key === 'sandbox_artifact_isolation' && check.status !== 'pass');
+  const legacyRunBlocker = readiness.checks.find(check => check.key === 'legacy_full_lab_active' && check.status === 'block');
+  const labQueueHasStaleRows = Array.isArray((labQueueBlocker?.data as any)?.stale_queue)
+    && ((labQueueBlocker?.data as any)?.stale_queue as unknown[]).length > 0;
+  const liveRunIsLegacyFullLab = labRunIsLegacyFullLab(liveRun, readiness.harness_version);
+  const selectedRunIsLegacyFullLab = labRunIsLegacyFullLab(run, readiness.harness_version);
+  const canArchiveLegacyRun = Boolean(isViewingCurrent && liveRun && selectedRunIsLegacyFullLab && liveRunIsLegacyFullLab && legacyRunBlocker);
+  const canQuarantineLabArtifacts = Boolean(!liveRun && artifactIsolationCheck);
   const canRepairLabQueue = Boolean(!liveRun && labQueueBlocker);
   const canQueueWhenBlocked = !readiness.ok && blockingKeys.length > 0 && blockingKeys.every(key => [
     'no_active_lab_run',
@@ -5253,14 +5488,15 @@ function MartyLabStatusCard({
     'sandbox_queue_pending',
     'no_active_lab_run_race',
     'one_active_lab_run_per_suite',
-  ].includes(key));
-  const startDisabled = Boolean(startingMode || canRepairLabQueue || (!readiness.ok && !canQueueWhenBlocked));
+    'one_active_lab_run_per_org',
+  ].includes(key) || (key === 'lab_work_queue_clear' && Boolean(liveRun) && !labQueueHasStaleRows));
+  const startDisabled = Boolean(startingMode || canRepairLabQueue || canArchiveLegacyRun || canQuarantineLabArtifacts || (!readiness.ok && !canQueueWhenBlocked));
   const startVerb = readiness.ok && !liveRun ? 'Start' : 'Queue';
   const currentRunPhase = labRunPhase(run);
   const hasHumanDecision = currentRunPhase === 'human_shipped' || currentRunPhase === 'human_rejected';
   const pausedForRoundReview = Boolean(run?.status === 'running' && currentRunPhase === 'round_inconclusive_needs_review' && run.summary?.needs_human_round_review);
-  const decisionDisabled = Boolean(!run || !isViewingCurrent || isQuarantined || run.status === 'running' || run.status === 'configured' || hasHumanDecision || !activeTrial?.candidate_version_id);
-  const canShowRunDecision = Boolean(run && labRunNeedsDecision(run) && isViewingCurrent && !pausedForRoundReview && !isQuarantined);
+  const decisionDisabled = Boolean(!run || !runIsCanary || selectedRunIsLegacyFullLab || !isViewingCurrent || isQuarantined || run.status === 'running' || run.status === 'configured' || hasHumanDecision || !activeTrial?.candidate_version_id);
+  const canShowRunDecision = Boolean(run && runIsCanary && !selectedRunIsLegacyFullLab && labRunNeedsDecision(run) && isViewingCurrent && !pausedForRoundReview && !isQuarantined);
   const activeTrialExperimentPage = experimentPages.find(page => page.trial?.id === activeTrial?.id)
     || (currentRound > 0 ? experimentPages[currentRound - 1] : null)
     || experimentPages[experimentPages.length - 1]
@@ -5274,33 +5510,66 @@ function MartyLabStatusCard({
     isQuarantined,
     pausedForRoundReview,
     canRepairLabQueue,
+    canArchiveLegacyRun,
+    canQuarantineLabArtifacts,
+    runIsCanary,
     completed,
     expectedTotal,
     currentRound,
     roundTotal,
+    discoveryCompleted,
+    validationCompleted,
   });
   const contextLabel = run
     ? `${labRunModeLabel(run)} · ${isViewingCurrent ? 'current run' : `created ${formatRelative(run.created_at)}`}`
-    : readiness.ok ? 'No active run' : 'Waiting for the lane to clear';
+    : readiness.ok ? 'No active experiment' : 'Waiting for the sandbox to clear';
+  const experimentProgressPct = runIsCanary
+    ? Math.max(0, Math.min(100, Math.round(((Math.min(discoveryCompleted, 3) + Math.min(validationCompleted, 7)) / 10) * 100)))
+    : progressPct;
+  const experimentProgressLabel = runIsCanary
+    ? `${Math.min(discoveryCompleted, 3)}/3 discovery rounds · ${Math.min(validationCompleted, 7)}/7 testing rounds`
+    : `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks complete`;
 
   return (
     <div className="space-y-5">
       <SandboxHeroState
         state={viewState}
-        progressPct={run ? progressPct : null}
-        progressLabel={run ? `${completed.toLocaleString()} of ${expectedTotal.toLocaleString()} checks complete` : null}
+        progressPct={run ? experimentProgressPct : null}
+        progressLabel={run ? experimentProgressLabel : null}
         contextLabel={contextLabel}
         actions={(
           <>
+            {canArchiveLegacyRun && (
+              <button
+                type="button"
+                onClick={() => repairReadiness('archive_legacy_full_lab')}
+                disabled={repairingAction !== null}
+                className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs font-medium text-semantic-warning hover:bg-semantic-warning/15 disabled:opacity-50"
+              >
+                {repairingAction === 'archive_legacy_full_lab' ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                {repairingAction === 'archive_legacy_full_lab' ? 'Archiving...' : 'Archive legacy run'}
+              </button>
+            )}
+            {canQuarantineLabArtifacts && (
+              <button
+                type="button"
+                onClick={() => repairReadiness('quarantine_lab_artifacts')}
+                disabled={repairingAction !== null}
+                className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs font-medium text-semantic-warning hover:bg-semantic-warning/15 disabled:opacity-50"
+              >
+                {repairingAction === 'quarantine_lab_artifacts' ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                {repairingAction === 'quarantine_lab_artifacts' ? 'Quarantining...' : 'Quarantine artifacts'}
+              </button>
+            )}
             {canRepairLabQueue && (
               <button
                 type="button"
-                onClick={repairReadiness}
-                disabled={repairingReadiness}
+                onClick={() => repairReadiness('clear_orphaned_lab_queue')}
+                disabled={repairingAction !== null}
                 className="inline-flex items-center gap-1 rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs font-medium text-semantic-warning hover:bg-semantic-warning/15 disabled:opacity-50"
               >
-                {repairingReadiness ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
-                {repairingReadiness ? 'Clearing...' : 'Clear stuck work'}
+                {repairingAction === 'clear_orphaned_lab_queue' ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                {repairingAction === 'clear_orphaned_lab_queue' ? 'Clearing...' : 'Clear stuck work'}
               </button>
             )}
             {!isViewingCurrent && (
@@ -5312,7 +5581,7 @@ function MartyLabStatusCard({
                 Back to current
               </button>
             )}
-            {run?.status === 'running' && isViewingCurrent && (
+            {run?.status === 'running' && isViewingCurrent && !canArchiveLegacyRun && (
               <button
                 type="button"
                 onClick={cancelLab}
@@ -5349,7 +5618,23 @@ function MartyLabStatusCard({
         isBusy={Boolean(liveRun || queuedRuns.length > 0 || !readiness.ok)}
       />
 
-      {run ? (
+      {run && canArchiveLegacyRun ? (
+        <section className="rounded-xl border border-semantic-warning/20 bg-semantic-warning/5 p-5">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-semantic-warning">Cleanup required</div>
+          <h4 className="mt-1 text-2xl font-semibold text-text-primary">Old full lab is blocking clean experiments</h4>
+          <p className="mt-2 max-w-3xl text-sm leading-relaxed text-text-secondary">
+            This run came from the retired full-lab harness. Archive it to clear the sandbox lane. The action only discards the stale lab record; it does not ship or reject a MARTy upgrade.
+          </p>
+          <SandboxEvidenceDrawer title="Legacy run details">
+            <div className="space-y-2 text-xs leading-relaxed text-text-secondary">
+              <div>Run: {run.id}</div>
+              <div>Harness: {labRunHarnessVersion(run) || 'Legacy harness'}</div>
+              <div>Phase: {labRunPhaseLabel(labRunPhase(run))}</div>
+              {run.discard_reason && <div>{run.discard_reason}</div>}
+            </div>
+          </SandboxEvidenceDrawer>
+        </section>
+      ) : run ? (
         <SandboxRunPager
           pageIndex={activePageIndex}
           pageCount={pageCount}
@@ -5360,7 +5645,6 @@ function MartyLabStatusCard({
           {activePageIndex === 0 ? (
             <SandboxCoverPage
               run={run}
-              viewState={viewState}
               runIsCanary={runIsCanary}
               currentRound={currentRound}
               roundTotal={roundTotal}
@@ -5390,8 +5674,6 @@ function MartyLabStatusCard({
           ) : selectedExperimentPage ? (
             <SandboxExperimentPage
               page={selectedExperimentPage}
-              pageIndex={activePageIndex}
-              pageCount={experimentPages.length}
               expectedSamples={roundSampleSize}
             />
           ) : (
@@ -5400,38 +5682,17 @@ function MartyLabStatusCard({
         </SandboxRunPager>
       ) : (
         <section className="rounded-xl border border-white/[0.08] bg-white/[0.015] p-5">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Sandbox cover</div>
-          <h4 className="mt-1 text-2xl font-semibold text-text-primary">No active lab run</h4>
+          <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Experiment</div>
+          <h4 className="mt-1 text-2xl font-semibold text-text-primary">No active experiment</h4>
           <p className="mt-2 max-w-3xl text-sm leading-relaxed text-text-secondary">
-            {canRepairLabQueue
-              ? 'Clear the stuck sandbox work above before starting another clean run.'
-              : 'Start a focused canary for one controlled improvement, or queue the next canary focus.'}
+            {canQuarantineLabArtifacts
+              ? 'Quarantine old sandbox artifacts above before starting a clean experiment.'
+              : canRepairLabQueue
+                ? 'Clear the stuck sandbox work above before starting another clean experiment.'
+                : 'Start a focused experiment for one controlled improvement, or queue the next experiment focus.'}
           </p>
         </section>
       )}
-
-      <SandboxImprovementQueue
-        run={run}
-        liveRun={liveRun}
-        queuedRuns={queuedRuns}
-        recentRuns={recentRuns}
-        readiness={readiness}
-        readinessMessage={readinessMessage}
-        canRepairLabQueue={canRepairLabQueue}
-        repairingReadiness={repairingReadiness}
-        onRepairReadiness={repairReadiness}
-        deepWorkItems={deepWorkItems}
-        activeFailureClusters={activeFailureClusters}
-        codePatchJobs={codePatchJobs}
-        startDisabled={startDisabled}
-        startVerb={startVerb}
-        startingCodePatchId={startingCodePatchId}
-        onStartLab={startLab}
-        onStartCodePatch={startCodePatch}
-        onSelectRun={selectRun}
-        loadingRunId={loadingRunId}
-        isViewingCurrent={isViewingCurrent}
-      />
     </div>
   );
 }

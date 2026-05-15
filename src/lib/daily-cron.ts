@@ -660,6 +660,7 @@ export async function enqueueBackfillDocuments(orgId: string, env: Env): Promise
       WHERE d.org_id = ?
         AND d.deleted_at IS NULL
         AND d.processing_status = 'completed'
+        AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1
         AND d.r2_key IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM vector_entity_index vei
@@ -1256,7 +1257,11 @@ export async function embedDocumentItem(
   const row = await env.D1.prepare(
     `SELECT id, title, document_type, r2_key, created_at,
             contact_id, company_id, conversation_id
-       FROM documents WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+       FROM documents
+      WHERE id = ?
+        AND org_id = ?
+        AND deleted_at IS NULL
+        AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1`
   ).bind(entityId, orgId).first<{
     id: string; title: string; document_type: string; r2_key: string;
     created_at: string; contact_id: string | null; company_id: string | null; conversation_id: string | null;

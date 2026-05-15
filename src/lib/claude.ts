@@ -1,6 +1,7 @@
 import type { Env } from '../types/env';
 import { checkClaudeRateLimit } from './rate-limit';
 import { recordBudgetSuccess, recordRateLimit } from './upstream-budget';
+import { NORMAL_MODE_LIMITS } from './max-mode';
 
 interface ClaudeResponse {
   content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
@@ -10,6 +11,10 @@ interface ClaudeResponse {
 
 const ANTHROPIC_VERSION = '2023-06-01';
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
+
+function isMaxTokenRejection(status: number, body: string): boolean {
+  return status === 400 && /max_tokens|maximum.*tokens|tokens.*maximum|output.*tokens/i.test(body);
+}
 
 function buildGatewayUrl(env: Env): string {
   if (!env.CLOUDFLARE_ACCOUNT_ID) {
@@ -99,6 +104,9 @@ export async function callClaudeStreaming(
     system: string;
     messages: Array<{ role: 'user' | 'assistant'; content: any }>;
     max_tokens: number;
+    model?: string;
+    fallbackMaxTokens?: number;
+    maxIterations?: number;
     tools?: ToolDefinition[];
     onToolCall?: ToolExecutor;
     // Wave-1 cancellation: when this signal aborts, the streaming fetch is
@@ -118,7 +126,9 @@ export async function callClaudeStreaming(
   const runLoop = async () => {
     const messages = [...params.messages];
     let iterations = 0;
-    const maxIterations = 10;
+    const maxIterations = params.maxIterations ?? NORMAL_MODE_LIMITS.toolIterations;
+    let activeMaxTokens = params.max_tokens;
+    let usedMaxTokenFallback = false;
 
     while (iterations < maxIterations) {
       // Cooperative cancellation between iterations: a Cmd+Backspace / stop
@@ -131,13 +141,14 @@ export async function callClaudeStreaming(
       iterations++;
       console.log(`[claude-stream] iteration ${iterations}/${maxIterations}, messages: ${messages.length}`);
 
-      const body: any = {
-        model: CLAUDE_MODEL,
-        max_tokens: params.max_tokens,
+      const buildBody = (maxTokens: number): any => ({
+        model: params.model || CLAUDE_MODEL,
+        max_tokens: maxTokens,
         stream: true,
         system: params.system,
         messages,
-      };
+      });
+      const body = buildBody(activeMaxTokens);
       if (params.tools?.length) body.tools = params.tools;
 
       let response: Response;
@@ -158,8 +169,48 @@ export async function callClaudeStreaming(
         throw fetchErr;
       }
 
+      let finalErrorBody: string | null = null;
       if (!response.ok) {
-        const errorBody = await response.text();
+        finalErrorBody = await response.text();
+        if (
+          params.fallbackMaxTokens &&
+          !usedMaxTokenFallback &&
+          isMaxTokenRejection(response.status, finalErrorBody)
+        ) {
+          usedMaxTokenFallback = true;
+          activeMaxTokens = params.fallbackMaxTokens;
+          await emit({
+            type: 'model_fallback',
+            reason: 'max_tokens_rejected',
+            requested_max_tokens: params.max_tokens,
+            fallback_max_tokens: params.fallbackMaxTokens,
+          });
+          const fallbackBody = buildBody(activeMaxTokens);
+          if (params.tools?.length) fallbackBody.tools = params.tools;
+          try {
+            response = await fetch(buildGatewayUrl(env), {
+              method: 'POST',
+              headers: buildGatewayHeaders(env),
+              body: JSON.stringify(fallbackBody),
+              signal: params.signal,
+            });
+            if (!response.ok) {
+              finalErrorBody = await response.text();
+            } else {
+              finalErrorBody = null;
+            }
+          } catch (fetchErr: any) {
+            if (fetchErr?.name === 'AbortError' || params.signal?.aborted) {
+              console.log('[claude-stream] fallback fetch aborted');
+              break;
+            }
+            throw fetchErr;
+          }
+        }
+      }
+
+      if (!response.ok) {
+        const errorBody = finalErrorBody ?? await response.text();
         console.error(`[claude-stream] API error ${response.status}: ${errorBody.slice(0, 200)}`);
         await emit({ text: `\n\n[Error: Claude API ${response.status}]` });
         break;

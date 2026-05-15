@@ -69,7 +69,7 @@ export async function searchRagChunksD1Fts(
   const matchQuery = buildFtsMatchQuery(query);
   if (!matchQuery) return [];
 
-  const topK = Math.max(1, Math.min(options.topK || 100, 100));
+  const topK = Math.max(1, Math.min(options.topK || 100, 200));
   const where = ['c.org_id = ?'];
   const params: unknown[] = [options.orgId];
 

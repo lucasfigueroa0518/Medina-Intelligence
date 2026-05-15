@@ -818,7 +818,9 @@ export const api = {
   getSettingsSystemStatus: () => request<SystemStatusResponse>('/settings/system-status'),
   getMartyLabStatus: () => request<MartyLabStatusSnapshot>('/admin/marty-lab'),
   getMartyLabReadiness: () => request<MartyLabReadinessSnapshot>('/admin/marty-lab/readiness'),
-  repairMartyLabReadiness: (data?: { action?: 'clear_orphaned_lab_queue' }) =>
+  repairMartyLabReadiness: (data?: {
+    action?: 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts';
+  }) =>
     request<MartyLabStatusSnapshot>('/admin/marty-lab/repair-readiness', {
       method: 'POST',
       body: JSON.stringify(data || { action: 'clear_orphaned_lab_queue' }),

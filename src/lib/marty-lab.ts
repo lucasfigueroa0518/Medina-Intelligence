@@ -1446,6 +1446,30 @@ async function fetchMartyLabRunShape(
   );
 }
 
+function martyLabHarnessFromRecords(
+  summaryJson: string | null | undefined,
+  upgradeVariableJson: string | null | undefined
+): string {
+  const summary = safeJson<Record<string, unknown>>(summaryJson, {});
+  const variable = safeJson<Record<string, unknown>>(upgradeVariableJson, {});
+  return String(summary.harness_version || variable.harness_version || '');
+}
+
+function isLegacyFullLabRunRecord(row: {
+  suite_name?: string | null;
+  summary_json?: string | null;
+  upgrade_variable_json?: string | null;
+} | null | undefined): boolean {
+  if (!row) return false;
+  const summary = safeJson<Record<string, unknown>>(row.summary_json, {});
+  const variable = safeJson<Record<string, unknown>>(row.upgrade_variable_json, {});
+  const shape = martyLabRunShapeFromRecords(row.suite_name, variable, summary);
+  const harness = String(summary.harness_version || variable.harness_version || '');
+  return shape.mode === 'bootcamp'
+    && harness !== MARTY_LAB_HARNESS_VERSION
+    && (row.suite_name === MARTY_LAB_AUTOPILOT_SUITE || row.suite_name !== MARTY_LAB_CANARY_SUITE);
+}
+
 function isRecoverableControlledRunStatus(row: {
   status?: string | null;
   bootcamp_phase?: string | null;
@@ -1624,6 +1648,7 @@ function priorityFromFocusPrompt(focusPrompt: string | null): MartyLabExperiment
 
 function roundPriorityForFocus(roundIndex: number, focusPrompt: string | null, mode: MartyLabRunMode): MartyLabExperimentPriority {
   const focused = priorityFromFocusPrompt(focusPrompt);
+  if (!focused && mode === 'canary') return 'context_retrieval';
   if (!focused) return roundPriority(roundIndex);
   if (mode === 'canary') return focused;
   // Scope-specific full labs should lean into the user-provided focus while
@@ -1635,14 +1660,25 @@ function roundPriorityForFocus(roundIndex: number, focusPrompt: string | null, m
 function martyLabReadinessBlocksAreQueueable(readiness: MartyLabReadinessSnapshot): boolean {
   const blockers = readiness.checks.filter(check => check.status === 'block').map(check => check.key);
   if (blockers.length === 0) return false;
+  const activeRunBlocked = blockers.some(key => [
+    'no_active_lab_run',
+    'no_active_lab_run_race',
+    'one_active_lab_run_per_suite',
+    'one_active_lab_run_per_org',
+    'human_decision_required',
+    'sandbox_queue_pending',
+  ].includes(key));
+  const queueCheck = readiness.checks.find(check => check.key === 'lab_work_queue_clear');
+  const hasStaleQueue = Array.isArray((queueCheck?.data as any)?.stale_queue)
+    && ((queueCheck?.data as any)?.stale_queue as unknown[]).length > 0;
   return blockers.every(key => [
     'no_active_lab_run',
-    'lab_work_queue_clear',
     'human_decision_required',
     'sandbox_queue_pending',
     'no_active_lab_run_race',
     'one_active_lab_run_per_suite',
-  ].includes(key));
+    'one_active_lab_run_per_org',
+  ].includes(key) || (key === 'lab_work_queue_clear' && activeRunBlocked && !hasStaleQueue));
 }
 
 function labRoundMeta(experiment: MartyLabExperimentSnapshot): LabRoundMeta | null {
@@ -3813,6 +3849,82 @@ const MARTY_LAB_REQUIRED_TABLES = [
   'work_queue',
 ] as const;
 
+async function countMartyLabRagChunks(env: Env, orgId: string): Promise<number> {
+  try {
+    const row = await env.D1.prepare(
+      `SELECT COUNT(*) AS count
+         FROM rag_chunks_v2 c
+        WHERE c.org_id = ?
+          AND c.source_table = 'documents'
+          AND EXISTS (
+            SELECT 1
+              FROM documents d
+             WHERE d.id = c.source_id
+               AND d.org_id = c.org_id
+               AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) = 1
+          )`
+    ).bind(orgId).first<{ count: number }>();
+    return Number(row?.count || 0);
+  } catch {
+    return 0;
+  }
+}
+
+async function getMartyLabSandboxArtifactIsolation(
+  env: Env,
+  orgId: string
+): Promise<{
+  active_lab_documents: number;
+  open_embed_jobs: number;
+  vector_rows: number;
+  rag_chunks: number;
+}> {
+  const [activeDocs, openEmbedJobs, vectorRows, ragChunks] = await Promise.all([
+    env.D1.prepare(
+      `SELECT COUNT(*) AS count
+         FROM documents
+        WHERE org_id = ?
+          AND deleted_at IS NULL
+          AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) = 1`
+    ).bind(orgId).first<{ count: number }>(),
+    env.D1.prepare(
+      `SELECT COUNT(*) AS count
+         FROM work_queue
+        WHERE org_id = ?
+          AND domain = 'embed_retry'
+          AND status IN ('pending','in_progress','failed')
+          AND json_extract(payload, '$.source_table') = 'documents'
+          AND EXISTS (
+            SELECT 1
+              FROM documents d
+             WHERE d.id = json_extract(work_queue.payload, '$.entity_id')
+               AND d.org_id = work_queue.org_id
+               AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) = 1
+          )`
+    ).bind(orgId).first<{ count: number }>(),
+    env.D1.prepare(
+      `SELECT COUNT(*) AS count
+         FROM vector_entity_index vei
+        WHERE vei.org_id = ?
+          AND vei.source_table = 'documents'
+          AND EXISTS (
+            SELECT 1
+              FROM documents d
+             WHERE d.id = vei.entity_id
+               AND d.org_id = vei.org_id
+               AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) = 1
+          )`
+    ).bind(orgId).first<{ count: number }>(),
+    countMartyLabRagChunks(env, orgId),
+  ]);
+  return {
+    active_lab_documents: Number(activeDocs?.count || 0),
+    open_embed_jobs: Number(openEmbedJobs?.count || 0),
+    vector_rows: Number(vectorRows?.count || 0),
+    rag_chunks: Number(ragChunks || 0),
+  };
+}
+
 export async function checkMartyLabReadiness(
   env: Env,
   orgId: string
@@ -3857,26 +3969,53 @@ export async function checkMartyLabReadiness(
   }
 
   const activeRuns = await env.D1.prepare(
-    `SELECT id, status, suite_name, bootcamp_phase, updated_at
+    `SELECT id, status, suite_name, bootcamp_phase, summary_json, upgrade_variable_json, updated_at
        FROM marty_lab_runs
       WHERE org_id = ?
         AND status IN ('configured','running')
       ORDER BY created_at DESC
       LIMIT 5`
-  ).bind(orgId).all<{ id: string; status: string; suite_name: string | null; bootcamp_phase: string | null; updated_at: string | null }>();
-  checks.push((activeRuns.results || []).length > 0
-    ? martyLabReadinessCheck(
-      'no_active_lab_run',
-      'Active run',
-      'block',
-      'A lab run is already configured or running. Cancel or finish it before starting another run.',
-      { runs: activeRuns.results || [] }
-    )
+  ).bind(orgId).all<{
+    id: string;
+    status: string;
+    suite_name: string | null;
+    bootcamp_phase: string | null;
+    summary_json: string | null;
+    upgrade_variable_json: string | null;
+    updated_at: string | null;
+  }>();
+  const activeRunRows = activeRuns.results || [];
+  const legacyActiveRuns = activeRunRows.filter(isLegacyFullLabRunRecord);
+  const activeRunDetails = activeRunRows.map(row => ({
+    id: row.id,
+    status: row.status,
+    suite_name: row.suite_name,
+    bootcamp_phase: row.bootcamp_phase,
+    updated_at: row.updated_at,
+    harness_version: martyLabHarnessFromRecords(row.summary_json, row.upgrade_variable_json) || null,
+    legacy_full_lab: isLegacyFullLabRunRecord(row),
+  }));
+  checks.push(activeRunRows.length > 0
+    ? legacyActiveRuns.length === activeRunRows.length
+      ? martyLabReadinessCheck(
+        'legacy_full_lab_active',
+        'Legacy full lab',
+        'block',
+        'A stale full-lab run from the old sandbox is blocking new canaries. Archive it; it will not ship anything.',
+        { runs: activeRunDetails }
+      )
+      : martyLabReadinessCheck(
+        'no_active_lab_run',
+        'Active run',
+        'block',
+        'A canary is already running or configured. Finish, cancel, or review it before starting another canary.',
+        { runs: activeRunDetails }
+      )
     : martyLabReadinessCheck(
       'no_active_lab_run',
       'Active run',
       'pass',
-      'No active MARTy Lab run is blocking a new controlled run.'
+      'No active MARTy Sandbox run is blocking a new canary.'
     ));
 
   const queuedRuns = await env.D1.prepare(
@@ -3943,6 +4082,31 @@ export async function checkMartyLabReadiness(
         'Lab queue',
         'pass',
         'No pending, running, or retryable MARTy Lab queue rows are present.'
+      ));
+
+  const isolation = await getMartyLabSandboxArtifactIsolation(env, orgId);
+  const isolationLeakCount = isolation.open_embed_jobs + isolation.vector_rows + isolation.rag_chunks;
+  checks.push(isolationLeakCount > 0
+    ? martyLabReadinessCheck(
+      'sandbox_artifact_isolation',
+      'Sandbox artifacts',
+      'block',
+      'Sandbox-generated artifacts have entered an embedding or retrieval surface. Quarantine them before starting a clean canary.',
+      isolation
+    )
+    : isolation.active_lab_documents > 0
+      ? martyLabReadinessCheck(
+        'sandbox_artifact_isolation',
+        'Sandbox artifacts',
+        'warn',
+        'Old sandbox-generated documents are still stored as document rows. They are hidden from retrieval, but should be quarantined for a cleaner sandbox.',
+        isolation
+      )
+      : martyLabReadinessCheck(
+        'sandbox_artifact_isolation',
+        'Sandbox artifacts',
+        'pass',
+        'No sandbox-generated artifacts are visible to document search, embeddings, or RAG retrieval.'
       ));
 
   const undecidedCompletedRun = await env.D1.prepare(
@@ -4072,21 +4236,153 @@ export async function repairMartyLabReadinessBlocker(
   env: Env,
   orgId: string,
   userId: string,
-  opts: { action?: 'clear_orphaned_lab_queue' } = {}
+  opts: { action?: 'clear_orphaned_lab_queue' | 'archive_legacy_full_lab' | 'quarantine_lab_artifacts' } = {}
 ): Promise<MartyLabStatusSnapshot> {
   const action = opts.action || 'clear_orphaned_lab_queue';
-  if (action !== 'clear_orphaned_lab_queue') {
+  if (!['clear_orphaned_lab_queue', 'archive_legacy_full_lab', 'quarantine_lab_artifacts'].includes(action)) {
     throw new Error('Unsupported MARTy Sandbox repair action');
   }
 
   const activeRun = await env.D1.prepare(
-    `SELECT id, status, bootcamp_phase
+    `SELECT id, status, suite_name, bootcamp_phase, summary_json, upgrade_variable_json
        FROM marty_lab_runs
       WHERE org_id = ?
         AND status IN ('configured','running')
       ORDER BY created_at DESC
       LIMIT 1`
-  ).bind(orgId).first<{ id: string; status: string; bootcamp_phase: string | null }>();
+  ).bind(orgId).first<{
+    id: string;
+    status: string;
+    suite_name: string | null;
+    bootcamp_phase: string | null;
+    summary_json: string | null;
+    upgrade_variable_json: string | null;
+  }>();
+  const activeRunIsLegacyFullLab = isLegacyFullLabRunRecord(activeRun);
+
+  if (action === 'archive_legacy_full_lab') {
+    if (!activeRun?.id || !activeRunIsLegacyFullLab) {
+      throw new Error('No stale legacy full-lab run is available to archive.');
+    }
+    const now = nowIso();
+    const reason = `Archived stale legacy full-lab run from MARTy Sandbox UI by ${userId} at ${now}; canary-only harness does not ship legacy full-lab results.`;
+    await env.D1.batch([
+      env.D1.prepare(
+        `UPDATE marty_lab_runs
+            SET status = 'cancelled',
+                cancelled_at = COALESCE(cancelled_at, ?),
+                discarded_at = COALESCE(discarded_at, ?),
+                discard_reason = ?,
+                bootcamp_phase = 'legacy_full_lab_archived',
+                updated_at = ?
+          WHERE org_id = ? AND id = ? AND status IN ('configured','running')`
+      ).bind(now, now, reason, now, orgId, activeRun.id),
+      env.D1.prepare(
+        `UPDATE marty_lab_experiments
+            SET status = 'cancelled',
+                updated_at = ?
+          WHERE org_id = ?
+            AND run_id = ?
+            AND status IN ('queued','running')`
+      ).bind(now, orgId, activeRun.id),
+      env.D1.prepare(
+        `UPDATE work_queue
+            SET status = 'dead_letter',
+                last_error = ?,
+                locked_until = NULL,
+                heartbeat_at = NULL,
+                next_attempt_at = NULL,
+                completed_at = COALESCE(completed_at, ?)
+          WHERE org_id = ?
+            AND domain IN (?, ?, ?)
+            AND status IN ('pending','in_progress','failed')
+            AND json_extract(payload, '$.run_id') = ?`
+      ).bind(
+        reason,
+        now,
+        orgId,
+        MARTY_LAB_EXPERIMENT_DOMAIN,
+        MARTY_LAB_ARTIFACT_REVIEW_DOMAIN,
+        MARTY_LAB_CODE_PATCH_DOMAIN,
+        activeRun.id
+      ),
+    ]);
+    return getMartyLabStatusSnapshot(env, orgId);
+  }
+
+  if (action === 'quarantine_lab_artifacts') {
+    if (activeRun?.id && !activeRunIsLegacyFullLab) {
+      throw new Error('Cannot quarantine sandbox artifacts while a current canary is active. Finish or cancel it first.');
+    }
+    const now = nowIso();
+    const reason = `Quarantined MARTy Sandbox generated artifact rows from UI by ${userId} at ${now}.`;
+    const ids = await env.D1.prepare(
+      `SELECT id
+         FROM documents
+        WHERE org_id = ?
+          AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) = 1`
+    ).bind(orgId).all<{ id: string }>();
+    const docIds = (ids.results || []).map(row => row.id).filter(Boolean);
+    if (docIds.length > 0) {
+      await env.D1.prepare(
+        `UPDATE documents
+            SET deleted_at = COALESCE(deleted_at, ?),
+                processing_status = CASE WHEN processing_status = 'excluded' THEN processing_status ELSE 'excluded' END,
+                custom_fields = json_set(
+                  CASE WHEN json_valid(COALESCE(custom_fields, '')) THEN custom_fields ELSE '{}' END,
+                  '$.marty_lab_quarantined_at',
+                  ?,
+                  '$.marty_lab_quarantine_reason',
+                  ?
+                )
+          WHERE org_id = ?
+            AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) = 1`
+      ).bind(now, now, reason, orgId).run();
+      await env.D1.prepare(
+        `DELETE FROM vector_entity_index
+          WHERE org_id = ?
+            AND source_table = 'documents'
+            AND entity_id IN (${docIds.map(() => '?').join(',')})`
+      ).bind(orgId, ...docIds).run().catch(() => undefined);
+      await env.D1.prepare(
+        `DELETE FROM rag_chunks_v2_fts
+          WHERE chunk_id IN (
+            SELECT id FROM rag_chunks_v2
+             WHERE org_id = ?
+               AND source_table = 'documents'
+               AND source_id IN (${docIds.map(() => '?').join(',')})
+          )`
+      ).bind(orgId, ...docIds).run().catch(() => undefined);
+      await env.D1.prepare(
+        `DELETE FROM rag_chunks_v2
+          WHERE org_id = ?
+            AND source_table = 'documents'
+            AND source_id IN (${docIds.map(() => '?').join(',')})`
+      ).bind(orgId, ...docIds).run().catch(() => undefined);
+    }
+    await env.D1.prepare(
+      `UPDATE work_queue
+          SET status = 'dead_letter',
+              last_error = ?,
+              locked_until = NULL,
+              heartbeat_at = NULL,
+              next_attempt_at = NULL,
+              completed_at = COALESCE(completed_at, ?)
+        WHERE org_id = ?
+          AND domain = 'embed_retry'
+          AND status IN ('pending','in_progress','failed')
+          AND json_extract(payload, '$.source_table') = 'documents'
+          AND EXISTS (
+            SELECT 1
+              FROM documents d
+             WHERE d.id = json_extract(work_queue.payload, '$.entity_id')
+               AND d.org_id = work_queue.org_id
+               AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) = 1
+          )`
+    ).bind(reason, now, orgId).run();
+    return getMartyLabStatusSnapshot(env, orgId);
+  }
+
   if (activeRun?.id) {
     throw new Error('Cannot clear MARTy Lab queue rows while a lab run is active. Cancel or finish the run first.');
   }
@@ -5045,7 +5341,6 @@ export async function startMartyLabRun(
         SELECT 1
           FROM marty_lab_runs
          WHERE org_id = ?
-           AND suite_name = ?
            AND status IN ('configured','running')
       )
      RETURNING id`
@@ -5135,8 +5430,7 @@ export async function startMartyLabRun(
     JSON.stringify(events),
     now,
     now,
-    orgId,
-    suiteName
+    orgId
   ).first<{ id: string }>();
   if (!insertedRun?.id) {
     if (opts.queue_if_blocked) {
@@ -5146,18 +5440,17 @@ export async function startMartyLabRun(
       `SELECT id, status, suite_name
          FROM marty_lab_runs
         WHERE org_id = ?
-          AND suite_name = ?
           AND status IN ('configured','running')
         ORDER BY created_at DESC
         LIMIT 1`
-    ).bind(orgId, suiteName).first<{ id: string; status: string; suite_name: string }>();
+    ).bind(orgId).first<{ id: string; status: string; suite_name: string }>();
     throw new MartyLabReadinessError(finalizeMartyLabReadiness(nowIso(), [
       ...readiness.checks,
       martyLabReadinessCheck(
-        'one_active_lab_run_per_suite',
-        'Active suite run',
+        'one_active_lab_run_per_org',
+        'Active sandbox run',
         'block',
-        'Another MARTy Lab run for this suite became active before this start request could create a clean run.',
+        'Another MARTy Sandbox run became active before this start request could create a clean canary.',
         active || { suite_name: suiteName }
       ),
     ]));
@@ -8604,6 +8897,52 @@ async function readLabArtifactValidation(
   };
 }
 
+async function quarantineGeneratedLabDocument(
+  env: Env,
+  orgId: string,
+  documentId: string | undefined,
+  reason: string
+): Promise<void> {
+  if (!documentId) return;
+  const now = nowIso();
+  await env.D1.prepare(
+    `UPDATE documents
+        SET deleted_at = COALESCE(deleted_at, ?),
+            processing_status = CASE WHEN processing_status = 'excluded' THEN processing_status ELSE 'excluded' END,
+            custom_fields = json_set(
+              CASE WHEN json_valid(COALESCE(custom_fields, '')) THEN custom_fields ELSE '{}' END,
+              '$.marty_lab_quarantined_at',
+              ?,
+              '$.marty_lab_quarantine_reason',
+              ?
+            )
+      WHERE org_id = ?
+        AND id = ?
+        AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) = 1`
+  ).bind(now, now, reason, orgId, documentId).run().catch(() => undefined);
+  await env.D1.prepare(
+    `DELETE FROM vector_entity_index
+      WHERE org_id = ?
+        AND source_table = 'documents'
+        AND entity_id = ?`
+  ).bind(orgId, documentId).run().catch(() => undefined);
+  await env.D1.prepare(
+    `DELETE FROM rag_chunks_v2_fts
+      WHERE chunk_id IN (
+        SELECT id FROM rag_chunks_v2
+         WHERE org_id = ?
+           AND source_table = 'documents'
+           AND source_id = ?
+      )`
+  ).bind(orgId, documentId).run().catch(() => undefined);
+  await env.D1.prepare(
+    `DELETE FROM rag_chunks_v2
+      WHERE org_id = ?
+        AND source_table = 'documents'
+        AND source_id = ?`
+  ).bind(orgId, documentId).run().catch(() => undefined);
+}
+
 async function createLabArtifactFromConversation(
   env: Env,
   ctx: AuthContext,
@@ -8675,6 +9014,12 @@ async function createLabArtifactFromConversation(
       },
     }, env);
     const validation = await readLabArtifactValidation(env, ctx.orgId, result?.document?.id);
+    await quarantineGeneratedLabDocument(
+      env,
+      ctx.orgId,
+      result?.document?.id,
+      `Generated for MARTy Sandbox ${experiment.run_id}/${experiment.id}; metrics were captured before quarantine.`
+    );
     return {
       requested: true,
       mode,
@@ -8713,6 +9058,10 @@ async function runControlledTools(
   const sources: Record<string, unknown> = {};
   const contextBlocks: string[] = [];
   const retrievalLimit = runtimeStrategy.retrieval?.recall_limit || 10;
+  const ragRuntime = {
+    retrieval_version: env.RAG_RETRIEVAL_VERSION || null,
+    embedding_profile: env.RAG_EMBEDDING_PROFILE || null,
+  };
   const documentFirst = Boolean(runtimeStrategy.retrieval?.document_first || runtimeStrategy.retrieval?.mode === 'document_first');
   const documentSearchLimit = documentFirst
     ? 6
@@ -8723,9 +9072,10 @@ async function runControlledTools(
   try {
     const result = await recall(ctx, { query: prompt, limit: retrievalLimit }, env);
     const resultCount = extractResultCount(result);
-    trace.push({ mode, tool: 'recall', query: prompt, status: 'ok', result_count: resultCount, runtime_strategy: runtimeStrategy.retrieval || null });
+    trace.push({ mode, tool: 'recall', query: prompt, status: 'ok', result_count: resultCount, runtime_strategy: runtimeStrategy.retrieval || null, rag_runtime: ragRuntime });
     sources.recall = {
       count: resultCount,
+      rag_runtime: ragRuntime,
       doc_type_counts: result?.doc_type_counts || result?.diagnostics?.doc_type_counts || null,
       source_type_counts: result?.source_type_counts || null,
       sample_sources: Array.isArray(result?.sources)
@@ -8759,10 +9109,11 @@ async function runControlledTools(
     try {
       const result = await recall(ctx, { query, limit: retrievalLimit }, env);
       const resultCount = extractResultCount(result);
-      trace.push({ mode, tool: 'recall', query, status: 'ok', result_count: resultCount, planned_by_candidate_upgrade: true, runtime_strategy: runtimeStrategy.retrieval || null });
+      trace.push({ mode, tool: 'recall', query, status: 'ok', result_count: resultCount, planned_by_candidate_upgrade: true, runtime_strategy: runtimeStrategy.retrieval || null, rag_runtime: ragRuntime });
       const key = `recall_extra_${trace.filter(t => t.tool === 'recall' && (t as any).planned_by_candidate_upgrade).length}`;
       sources[key] = {
         count: resultCount,
+        rag_runtime: ragRuntime,
         doc_type_counts: result?.doc_type_counts || result?.diagnostics?.doc_type_counts || null,
         source_type_counts: result?.source_type_counts || null,
         sample_sources: Array.isArray(result?.sources)
@@ -8788,9 +9139,10 @@ async function runControlledTools(
         mode: 'dominant',
       }, env);
       const resultCount = extractResultCount(result);
-      trace.push({ mode, tool: 'find_documents', query: prompt, status: 'ok', result_count: resultCount, runtime_strategy: runtimeStrategy.retrieval || null });
+      trace.push({ mode, tool: 'find_documents', query: prompt, status: 'ok', result_count: resultCount, runtime_strategy: runtimeStrategy.retrieval || null, rag_runtime: ragRuntime });
       sources.find_documents = {
         count: resultCount,
+        rag_runtime: ragRuntime,
         diagnostics: result?.diagnostics || null,
         documents: Array.isArray(result?.documents)
           ? result.documents.slice(0, 5).map((d: any) => ({
@@ -8816,10 +9168,11 @@ async function runControlledTools(
           mode: 'dominant',
         }, env);
         const resultCount = extractResultCount(result);
-        trace.push({ mode, tool: 'find_documents', query, status: 'ok', result_count: resultCount, planned_by_candidate_upgrade: true, runtime_strategy: runtimeStrategy.retrieval || null });
+        trace.push({ mode, tool: 'find_documents', query, status: 'ok', result_count: resultCount, planned_by_candidate_upgrade: true, runtime_strategy: runtimeStrategy.retrieval || null, rag_runtime: ragRuntime });
         const key = `find_documents_extra_${trace.filter(t => t.tool === 'find_documents' && (t as any).planned_by_candidate_upgrade).length}`;
         sources[key] = {
           count: resultCount,
+          rag_runtime: ragRuntime,
           diagnostics: result?.diagnostics || null,
           documents: Array.isArray(result?.documents)
             ? result.documents.slice(0, 5).map((d: any) => ({

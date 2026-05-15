@@ -200,14 +200,18 @@ async function loadRagV2Source(payload: RagV2ReindexPayload, orgId: string, env:
   if (payload.source_table === 'documents') {
     const row = await env.D1.prepare(
       `SELECT id, title, document_type, r2_key, extracted_text_preview, created_at,
-              contact_id, company_id, deal_id, visibility, participant_user_ids, uploaded_by
+              contact_id, company_id, deal_id, visibility, participant_user_ids, uploaded_by,
+              custom_fields
          FROM documents
-        WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+        WHERE id = ?
+          AND org_id = ?
+          AND deleted_at IS NULL
+          AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1`
     ).bind(payload.source_id, orgId).first<{
       id: string; title: string; document_type: string; r2_key: string | null;
       extracted_text_preview: string | null; created_at: string; contact_id: string | null;
       company_id: string | null; deal_id: string | null; visibility: any; participant_user_ids: string | null;
-      uploaded_by: string | null;
+      uploaded_by: string | null; custom_fields: string | null;
     }>();
     if (!row) return null;
     let text = row.extracted_text_preview || '';
@@ -549,22 +553,26 @@ export async function queryDenseRagV2Candidates(
   orgId: string,
   queryEmbedding: number[],
   profileId: EmbeddingProfileId,
-  entityIds: string[]
+  entityIds: string[],
+  options: { entityLimit?: number; entityTopK?: number; broadTopK?: number } = {}
 ): Promise<DenseCandidate[]> {
   const index = getVectorBinding(env, profileId);
   if (!index) return [];
   const filter = { org_id: orgId, document_type: { $nin: ['news'] } } as any;
+  const broadTopK = Math.max(1, Math.min(options.broadTopK ?? 100, 100));
+  const entityTopK = Math.max(1, Math.min(options.entityTopK ?? 50, 50));
+  const entityLimit = Math.max(0, options.entityLimit ?? 10);
 
   const results = await Promise.all([
     index.query(queryEmbedding, {
-      topK: 100,
+      topK: broadTopK,
       filter,
       returnValues: false,
       returnMetadata: 'indexed',
     } as any),
-    ...entityIds.slice(0, 10).map(entityId =>
+    ...entityIds.slice(0, entityLimit).map(entityId =>
       index.query(queryEmbedding, {
-        topK: 50,
+        topK: entityTopK,
         filter: { ...filter, primary_entity_id: entityId },
         returnValues: false,
         returnMetadata: 'indexed',
@@ -588,6 +596,37 @@ export async function queryDenseRagV2Candidates(
   };
   add(results[0]?.matches || [], 'vectorize_broad');
   for (const result of results.slice(1)) add(result?.matches || [], 'vectorize_entity');
+  return candidates;
+}
+
+export async function queryDenseRagV2NewsCandidates(
+  env: Env,
+  orgId: string,
+  queryEmbedding: number[],
+  profileId: EmbeddingProfileId,
+  topK = 20
+): Promise<DenseCandidate[]> {
+  const index = getVectorBinding(env, profileId);
+  if (!index) return [];
+  const result = await index.query(queryEmbedding, {
+    topK: Math.max(1, Math.min(topK, 50)),
+    filter: { org_id: orgId, document_type: 'news' },
+    returnValues: false,
+    returnMetadata: 'indexed',
+  } as any);
+
+  const candidates: DenseCandidate[] = [];
+  ((result.matches || []) as any[]).forEach((match, index) => {
+    const chunkId = String(match.metadata?.rag_chunk_id || '');
+    if (!chunkId) return;
+    candidates.push({
+      chunkId,
+      vectorId: String(match.id),
+      score: Number(match.score || 0),
+      rank: index + 1,
+      source: 'vectorize_broad',
+    });
+  });
   return candidates;
 }
 

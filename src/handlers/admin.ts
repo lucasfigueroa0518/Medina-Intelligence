@@ -131,7 +131,13 @@ async function listRagV2SourceIds(
   const sqlByTable: Record<RagV2SourceTable, string> = {
     conversations: `SELECT id FROM conversations WHERE org_id = ? AND body_r2_key IS NOT NULL ORDER BY sent_at DESC LIMIT ?`,
     events: `SELECT id FROM events WHERE org_id = ? AND deleted_at IS NULL AND (transcript_r2_key IS NOT NULL OR length(coalesce(summary,'')) > 20) ORDER BY start_time DESC LIMIT ?`,
-    documents: `SELECT id FROM documents WHERE org_id = ? AND deleted_at IS NULL AND processing_status = 'completed' ORDER BY created_at DESC LIMIT ?`,
+    documents: `SELECT id FROM documents
+                  WHERE org_id = ?
+                    AND deleted_at IS NULL
+                    AND processing_status = 'completed'
+                    AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1
+                  ORDER BY created_at DESC
+                  LIMIT ?`,
     contacts: `SELECT id FROM contacts WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL AND length(coalesce(bio_summary,'')) > 20 ORDER BY updated_at DESC LIMIT ?`,
     companies: `SELECT id FROM companies WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL AND length(coalesce(description,'')) > 20 ORDER BY updated_at DESC LIMIT ?`,
     deals: `SELECT id FROM deals WHERE org_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT ?`,

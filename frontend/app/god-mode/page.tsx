@@ -935,7 +935,7 @@ export default function GodModePage() {
   const [copiedMsgId, setCopiedMsgId] = React.useState<string | null>(null);
   const [placeholderText, setPlaceholderText] = React.useState('Ask MARTy anything...');
   const [deepDive, setDeepDive] = React.useState(false);
-  const deepDiveShortcut = typeof navigator !== 'undefined' && navigator.platform?.includes('Mac') ? '⌘⇧D' : 'Ctrl⇧D';
+  const maxModeShortcut = typeof navigator !== 'undefined' && navigator.platform?.includes('Mac') ? '⌘⇧D' : 'Ctrl⇧D';
 
   // Fix 4: Explicit isThinking state — only cleared on first text token
   const [isThinking, setIsThinking] = React.useState(false);
@@ -1926,12 +1926,12 @@ export default function GodModePage() {
                 />
               </label>
 
-              {/* Deep Dive toggle */}
+              {/* MAX mode toggle */}
               <button
                 onClick={() => setDeepDive(d => !d)}
                 aria-pressed={deepDive}
-                aria-label={deepDive ? 'Turn off Deep Dive' : 'Turn on Deep Dive'}
-                title={`Deep Dive — exhaustive search across all data (${deepDiveShortcut})`}
+                aria-label={deepDive ? 'Turn off MAX mode' : 'Turn on MAX mode'}
+                title={`MAX mode — maximum sweep across all data (${maxModeShortcut})`}
                 className="w-9 h-9 flex items-center justify-center rounded-lg shrink-0 transition-all"
                 style={{
                   color: deepDive ? '#A855F7' : 'rgba(255,255,255,0.4)',
@@ -1954,7 +1954,7 @@ export default function GodModePage() {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); }
                   if (e.key === 'd' && (e.metaKey || e.ctrlKey) && e.shiftKey) { e.preventDefault(); setDeepDive(d => !d); }
                 }}
-                placeholder={deepDive ? 'Deep dive — searching everything...' : placeholderText}
+                placeholder={deepDive ? 'MAX mode — sweeping across everything...' : placeholderText}
                 onBlur={() => {
                   setTimeout(() => {
                     if (document.activeElement !== inputRef.current) {

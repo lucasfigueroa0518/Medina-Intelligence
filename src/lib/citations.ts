@@ -5,6 +5,7 @@
 import type { Env } from '../types/env';
 import type { HydratedChunk } from '../types/interfaces';
 import { estimateTokens, truncateToTokens } from './tokens';
+import { MAX_MODE_LIMITS } from './max-mode';
 
 export type CitationSourceType =
   | 'email'
@@ -563,7 +564,8 @@ export async function buildSourcesAndContext(
   uploadedDoc: string | undefined,
   orgId: string,
   env: Env,
-  query?: string
+  query?: string,
+  options: { deepDive?: boolean } = {}
 ): Promise<BuildSourcesResult> {
   // Assign one source number per unique (source_table, source_id) — multiple
   // chunks from the same email/meeting collapse to a single citation.
@@ -591,6 +593,7 @@ export async function buildSourcesAndContext(
     unique_sources_count: sources.length,
     ordered_chunks_count: orderedChunks.length,
     source_type_counts: countSourcesByType(sources),
+    max_mode: !!options.deepDive,
   });
 
   // SOURCES list at the top of the context — Claude reads this as the lookup
@@ -644,7 +647,10 @@ TIMELINE SAFETY:
   const docTokens = uploadedDoc
     ? Math.min(estimateTokens(uploadedDoc), UPLOAD_TOKEN_BUDGET)
     : 0;
-  const retrievedBudget = CONTEXT_TOKEN_BUDGET - docTokens;
+  const contextTokenBudget = options.deepDive ? MAX_MODE_LIMITS.contextTokenBudget : CONTEXT_TOKEN_BUDGET;
+  const perChunkMax = options.deepDive ? MAX_MODE_LIMITS.perSourceTokenBudget : PER_CHUNK_MAX;
+  const newsTokenBudget = options.deepDive ? MAX_MODE_LIMITS.newsTokenBudget : NEWS_TOKEN_BUDGET;
+  const retrievedBudget = contextTokenBudget - docTokens;
 
   let body = '\nCONTEXT FROM SOURCES:\n';
   let tokens = 0;
@@ -654,16 +660,17 @@ TIMELINE SAFETY:
     if (isNews) continue; // news rendered separately below with UNVERIFIED tag
     const sourceId = sourceIdByKey.get(ref.sourceKey)!;
     const t = estimateTokens(ref.chunk.hydrated_text);
-    if (tokens + t > retrievedBudget) break;
     const text =
-      t > PER_CHUNK_MAX
-        ? truncateToTokens(ref.chunk.hydrated_text, PER_CHUNK_MAX)
+      t > perChunkMax
+        ? truncateToTokens(ref.chunk.hydrated_text, perChunkMax)
         : ref.chunk.hydrated_text;
+    const textTokens = estimateTokens(text);
+    if (tokens + textTokens > retrievedBudget) break;
     const timelineNote = hasRelativeTimeLanguage(text)
       ? timelineNoteForSource(sourceId, sourceById.get(sourceId), nowMs)
       : '';
     body += `\n[${sourceId}]${timelineNote}\n${text}\n`;
-    tokens += estimateTokens(text);
+    tokens += textTokens;
   }
 
   if (uploadedDoc) {
@@ -681,7 +688,7 @@ TIMELINE SAFETY:
     if (!isNews) continue;
     const sourceId = sourceIdByKey.get(ref.sourceKey)!;
     const t = estimateTokens(ref.chunk.hydrated_text);
-    if (nt + t > NEWS_TOKEN_BUDGET) break;
+    if (nt + t > newsTokenBudget) break;
     const timelineNote = hasRelativeTimeLanguage(ref.chunk.hydrated_text)
       ? timelineNoteForSource(sourceId, sourceById.get(sourceId), nowMs)
       : '';

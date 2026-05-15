@@ -44,6 +44,7 @@ import {
   unregisterRequest,
   wasCancelledIncludingKV,
 } from '../lib/agent-cancellation';
+import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from '../lib/max-mode';
 
 function formatCurrentDateForMarty(now: Date): string {
   return now.toLocaleDateString('en-US', {
@@ -108,7 +109,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           items: { type: 'string', enum: ['email', 'slack', 'meeting', 'document'] },
           description: 'Filter to specific source types. Use this when the user asked about a specific channel (Slack, email, meetings, docs). Default: all types.',
         },
-        limit: { type: 'number', description: 'Max results. Default 20, max 50.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 50. Max 50.' },
       },
       required: ['query'],
     },
@@ -184,7 +185,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         keyword: { type: 'string', description: 'Search by name, email, or company name' },
         contact_type: { type: 'string', enum: ['individual', 'family', 'institutional_investor', 'company'] },
         has_followup_overdue: { type: 'boolean', description: 'Only show contacts with overdue follow-ups' },
-        limit: { type: 'number', description: 'Max results (default 20, max 50)' },
+        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
       },
     },
   },
@@ -197,7 +198,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         keyword: { type: 'string', description: 'Search by name, domain, or description' },
         company_type: { type: 'string' },
         sector: { type: 'string' },
-        limit: { type: 'number', description: 'Max results (default 20, max 50)' },
+        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
       },
     },
   },
@@ -210,7 +211,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         keyword: { type: 'string', description: 'Search by title or company name' },
         stage: { type: 'string', description: 'Filter by stage: prospect, initial_contact, due_diligence, term_sheet, negotiation, closed_won, closed_lost, on_hold' },
         company_id: { type: 'string' },
-        limit: { type: 'number' },
+        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
       },
     },
   },
@@ -224,8 +225,8 @@ const AGENT_TOOLS: ToolDefinition[] = [
         source: { type: 'string', enum: ['outlook', 'slack', 'firefly', 'all'], description: 'Filter by communication channel. Default: all' },
         contact_id: { type: 'string', description: 'Filter conversations involving a specific contact' },
         direction: { type: 'string', enum: ['inbound', 'outbound', 'all'], description: 'Filter by direction. Default: all' },
-        days_back: { type: 'number', description: 'How many days back to search. Default: 30' },
-        limit: { type: 'number', description: 'Max results. Default: 20' },
+        days_back: { type: 'number', description: 'How many days back to search. Default: 30, or 365 in MAX mode.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
       },
     },
   },
@@ -634,13 +635,14 @@ async function executeTool(
   toolName: string,
   toolInput: any,
   ctx: AuthContext,
-  env: Env
+  env: Env,
+  toolContext: { deepDive?: boolean } = {}
 ): Promise<any> {
   switch (toolName) {
-    case 'search_contacts': return searchContacts(ctx, toolInput, env);
-    case 'search_companies': return searchCompanies(ctx, toolInput, env);
-    case 'search_deals': return searchDeals(ctx, toolInput, env);
-    case 'search_conversations': return searchConversations(ctx, toolInput, env);
+    case 'search_contacts': return searchContacts(ctx, toolInput, env, toolContext);
+    case 'search_companies': return searchCompanies(ctx, toolInput, env, toolContext);
+    case 'search_deals': return searchDeals(ctx, toolInput, env, toolContext);
+    case 'search_conversations': return searchConversations(ctx, toolInput, env, toolContext);
     case 'find_documents': return findDocumentsTool(ctx, toolInput, env);
     case 'create_document_artifact': return createDocumentArtifactTool(ctx, toolInput, env);
     case 'edit_document_artifact': return editDocumentArtifactTool(ctx, toolInput, env);
@@ -650,10 +652,10 @@ async function executeTool(
         source_types: Array.isArray(toolInput?.source_types) ? toolInput.source_types : null,
         limit: typeof toolInput?.limit === 'number' ? toolInput.limit : null,
       })}`);
-      return recall(ctx, toolInput, env);
-    case 'get_contact_detail': return getContactDetail(ctx, toolInput.contact_id, env);
-    case 'get_company_detail': return getCompanyDetail(ctx, toolInput.company_id, env);
-    case 'get_deal_detail': return getDealDetail(ctx, toolInput.deal_id, env);
+      return recall(ctx, toolInput, env, toolContext);
+    case 'get_contact_detail': return getContactDetail(ctx, toolInput.contact_id, env, toolContext);
+    case 'get_company_detail': return getCompanyDetail(ctx, toolInput.company_id, env, toolContext);
+    case 'get_deal_detail': return getDealDetail(ctx, toolInput.deal_id, env, toolContext);
     case 'web_search': return webSearch(toolInput.query, toolInput.num_results, ctx, env);
     case 'read_url': return readUrl(toolInput.url);
     // Phase 1 refactor — these now take ctx (with userRole) so the
@@ -965,7 +967,7 @@ export async function queryAgent(
     ).bind(session.id, ...uploadIds, ctx.userId, session.id).run().catch(() => {});
   }
 
-  // --- Deep Dive rate limiting (check only — increment moved post-retrieval) ---
+  // --- MAX mode rate limiting (check only — increment moved post-retrieval) ---
   const retrievalOptions: RetrievalOptions = { deepDive };
   const ddKey = deepDive
     ? `deep_dive:${ctx.userId}:${new Date().toISOString().slice(0, 13)}`
@@ -974,8 +976,8 @@ export async function queryAgent(
     const ddCount = parseInt(await env.KV.get(ddKey) || '0');
     if (ddCount >= 10) {
       return jsonResponse({
-        error: 'Deep dive limit reached',
-        message: "You've hit your hourly Deep Dive limit. Try again in a few minutes — normal queries still work.",
+        error: 'MAX mode limit reached',
+        message: "You've hit your hourly MAX mode limit. Try again in a few minutes — normal queries still work.",
         retryable: false,
       }, 429);
     }
@@ -1040,7 +1042,7 @@ export async function queryAgent(
   }
   const tRetrieve = Date.now() - t0;
 
-  // --- Increment Deep Dive quota only after retrieval succeeded ---
+  // --- Increment MAX mode quota only after retrieval succeeded ---
   if (ddKey) {
     const ddCount = parseInt(await env.KV.get(ddKey) || '0');
     await env.KV.put(ddKey, String(ddCount + 1), { expirationTtl: 7200 }).catch(() => {});
@@ -1086,7 +1088,8 @@ export async function queryAgent(
     uploadedText,
     ctx.orgId,
     env,
-    query
+    query,
+    { deepDive }
   );
 
   // --- Per-session attachment replay (Approach A + 50 MB cap) ---
@@ -1126,7 +1129,18 @@ export async function queryAgent(
   // --- Stream Claude response with tool use ---
   let systemPrompt = `${GOD_MODE_SYSTEM_PROMPT}\n\n${buildTimelineAwarenessPrompt(new Date())}\n\n${buildCurrentUserPrivacyPrompt(ctx)}`;
   if (deepDive && stats) {
-    systemPrompt += `\n\nYou are in Deep Dive mode. Begin your response with a single brief line summarizing the scope, formatted as:\n🔍 Deep dive: Searched ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts.\nThen proceed with your thorough analysis. Be exhaustive — reference every relevant piece of evidence you find. Cite specific emails, meetings, and documents by name and date. Don't summarize — be thorough.`;
+    systemPrompt += `\n\nYou are in MAX mode, powered by Claude Opus 4.7 for a maximum sweep across the user's permitted Medina data.
+
+Begin your response with one brief scope line formatted as:
+MAX: Searched ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts.
+
+Then write a cited evidence memo:
+- Key findings
+- Supporting evidence
+- Conflicts, gaps, and unknowns
+- Recommended next actions
+
+Use multiple retrieval angles before finalizing when the question calls for it: broad recall, source-specific recall, structured entity search, and search_conversations for deterministic date/channel filters. Be thorough, but synthesize instead of dumping raw sources. Cite specific emails, meetings, Slack messages, and documents by name/date where available.`;
   }
 
   // ---- Wave-1 cancellation: per-request AbortController ----
@@ -1140,9 +1154,12 @@ export async function queryAgent(
     {
       system: systemPrompt,
       messages,
-      max_tokens: deepDive ? 8192 : 4096,
+      model: deepDive ? (env.MARTY_MAX_MODEL || MAX_MODE_MODEL) : undefined,
+      max_tokens: deepDive ? MAX_MODE_LIMITS.outputTokens : NORMAL_MODE_LIMITS.outputTokens,
+      fallbackMaxTokens: deepDive ? MAX_MODE_LIMITS.fallbackOutputTokens : undefined,
+      maxIterations: deepDive ? MAX_MODE_LIMITS.toolIterations : NORMAL_MODE_LIMITS.toolIterations,
       tools: AGENT_TOOLS,
-      onToolCall: (name, input) => executeTool(name, input, ctx, env),
+      onToolCall: (name, input) => executeTool(name, input, ctx, env, { deepDive }),
       signal: cancelController.signal,
     },
     env

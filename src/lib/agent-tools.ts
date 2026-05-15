@@ -15,6 +15,21 @@ import {
 import { linkConversationToDeal, linkEventToDeal } from './deal-association';
 import { preprocessQuery, retrieveContext } from './retrieval';
 import { buildSourcesAndContext } from './citations';
+import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
+
+export interface AgentToolContext {
+  deepDive?: boolean;
+}
+
+function structuredLimit(inputLimit: number | undefined, toolContext?: AgentToolContext): number {
+  const fallback = toolContext?.deepDive
+    ? MAX_MODE_LIMITS.structuredDefault
+    : NORMAL_MODE_LIMITS.structuredDefault;
+  const max = toolContext?.deepDive
+    ? MAX_MODE_LIMITS.structuredMax
+    : NORMAL_MODE_LIMITS.structuredMax;
+  return Math.min(Math.max(inputLimit ?? fallback, 1), max);
+}
 
 // ACL redaction: nulls fields whose value may have been derived from private
 // conversation content (LLM-extracted topics, auto-populated deal notes,
@@ -72,7 +87,8 @@ export async function searchConversations(
     days_back?: number;
     limit?: number;
   },
-  env: Env
+  env: Env,
+  toolContext: AgentToolContext = {}
 ): Promise<any> {
   const where: string[] = ['c.org_id = ?'];
   const binds: unknown[] = [ctx.orgId];
@@ -87,7 +103,11 @@ export async function searchConversations(
     binds.push(input.direction);
   }
 
-  const daysBack = input.days_back || 30;
+  const daysBack = input.days_back || (
+    toolContext.deepDive
+      ? MAX_MODE_LIMITS.conversationDaysBackDefault
+      : NORMAL_MODE_LIMITS.conversationDaysBackDefault
+  );
   where.push(`c.sent_at >= datetime('now', '-${Math.min(daysBack, 365)} days')`);
 
   if (input.contact_id) {
@@ -102,10 +122,12 @@ export async function searchConversations(
     binds.push(`%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`);
   }
 
-  const limit = Math.min(input.limit || 20, 50);
-  // Over-fetch so post-filter list still approximates `limit`. Capped at 100
-  // to keep the work bounded when most rows are visible to the requester.
-  const fetchLimit = Math.min(limit * 2, 100);
+  const limit = structuredLimit(input.limit, toolContext);
+  // Over-fetch so post-filter list still approximates `limit`. MAX mode gets
+  // a larger fetch window while preserving the same post-filter privacy gate.
+  const fetchLimit = toolContext.deepDive
+    ? Math.min(limit * MAX_MODE_LIMITS.conversationOverfetchMultiplier, MAX_MODE_LIMITS.conversationFetchMax)
+    : Math.min(limit * 2, 100);
 
   const [result, sharingFlags] = await Promise.all([
     env.D1.prepare(
@@ -200,7 +222,8 @@ export async function searchConversations(
 export async function searchContacts(
   ctx: AuthContext,
   input: { keyword?: string; contact_type?: string; has_followup_overdue?: boolean; limit?: number },
-  env: Env
+  env: Env,
+  toolContext: AgentToolContext = {}
 ): Promise<any> {
   const where: string[] = ['c.org_id = ?', 'c.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
@@ -217,7 +240,7 @@ export async function searchContacts(
     where.push("c.next_followup_date IS NOT NULL AND c.next_followup_date < strftime('%Y-%m-%dT%H:%M:%fZ','now')");
   }
 
-  const limit = Math.min(input.limit || 20, 50);
+  const limit = structuredLimit(input.limit, toolContext);
   const result = await env.D1.prepare(
     `SELECT c.id, c.full_name, c.email, c.phone, c.contact_type, c.job_title,
             c.engagement_status, c.relationship_status, c.total_interactions,
@@ -253,7 +276,8 @@ export async function searchContacts(
 export async function searchCompanies(
   ctx: AuthContext,
   input: { keyword?: string; company_type?: string; sector?: string; limit?: number },
-  env: Env
+  env: Env,
+  toolContext: AgentToolContext = {}
 ): Promise<any> {
   const where: string[] = ['org_id = ?', 'deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
@@ -271,7 +295,7 @@ export async function searchCompanies(
     binds.push(`%${input.sector}%`);
   }
 
-  const limit = Math.min(input.limit || 20, 50);
+  const limit = structuredLimit(input.limit, toolContext);
   const result = await env.D1.prepare(
     `SELECT id, name, domain, website, sector, company_type, stage,
             investment_status, current_valuation, news_relevance_score,
@@ -290,7 +314,8 @@ export async function searchCompanies(
 export async function searchDeals(
   ctx: AuthContext,
   input: { keyword?: string; stage?: string; company_id?: string; limit?: number },
-  env: Env
+  env: Env,
+  toolContext: AgentToolContext = {}
 ): Promise<any> {
   const where: string[] = ['d.org_id = ?', 'd.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
@@ -308,7 +333,7 @@ export async function searchDeals(
     binds.push(input.company_id);
   }
 
-  const limit = Math.min(input.limit || 20, 50);
+  const limit = structuredLimit(input.limit, toolContext);
   const result = await env.D1.prepare(
     `SELECT d.id, d.title, d.stage, d.amount, d.currency, d.valuation,
             d.probability, d.expected_close, d.days_in_stage,
@@ -384,7 +409,8 @@ export async function recall(
     source_types?: Array<'email' | 'slack' | 'meeting' | 'document'>;
     limit?: number;
   },
-  env: Env
+  env: Env,
+  toolContext: AgentToolContext = {}
 ): Promise<any> {
   if (!input.query || input.query.trim().length === 0) {
     return { sources: [], count: 0, message: 'recall: query is required' };
@@ -433,8 +459,9 @@ export async function recall(
     limit: input.limit ?? null,
   });
 
-  const pq = await preprocessQuery(input.query, session, env, {});
+  const pq = await preprocessQuery(input.query, session, env, { deepDive: !!toolContext.deepDive });
   const result = await retrieveContext(pq, env, {
+    deepDive: !!toolContext.deepDive,
     forceDocTypes: forceDocTypes.length > 0 ? forceDocTypes : undefined,
   });
 
@@ -444,7 +471,8 @@ export async function recall(
     undefined,
     ctx.orgId,
     env,
-    input.query
+    input.query,
+    { deepDive: !!toolContext.deepDive }
   );
 
   // Post-hydration source-type filter — applied AFTER D1 enrichment
@@ -458,25 +486,47 @@ export async function recall(
     filtered = sources.filter(s => wanted.has(s.type as any));
   }
 
-  const limit = Math.min(Math.max(input.limit ?? 20, 1), 50);
+  const defaultLimit = toolContext.deepDive
+    ? MAX_MODE_LIMITS.recallDefault
+    : NORMAL_MODE_LIMITS.recallDefault;
+  const maxLimit = toolContext.deepDive
+    ? MAX_MODE_LIMITS.recallMax
+    : NORMAL_MODE_LIMITS.recallMax;
+  const limit = Math.min(Math.max(input.limit ?? defaultLimit, 1), maxLimit);
   const trimmed = filtered.slice(0, limit);
+  const sourceTypeCountsAfterFilter = countRecallSourceTypes(filtered);
+  const sourceTypeCountsBeforeFilter = countRecallSourceTypes(sources);
+  const internalDocTypeCounts = countRecallDocTypes(result.internal);
   recallLog('result', {
     query: input.query.slice(0, 80),
     source_types: input.source_types || null,
     force_doc_types: forceDocTypes,
     internal_count: result.internal.length,
-    internal_doc_type_counts: countRecallDocTypes(result.internal),
+    internal_doc_type_counts: internalDocTypeCounts,
     news_count: result.news.length,
     sources_before_filter_count: sources.length,
-    source_type_counts_before_filter: countRecallSourceTypes(sources),
+    source_type_counts_before_filter: sourceTypeCountsBeforeFilter,
     sources_after_filter_count: filtered.length,
-    source_type_counts_after_filter: countRecallSourceTypes(filtered),
+    source_type_counts_after_filter: sourceTypeCountsAfterFilter,
     trimmed_count: trimmed.length,
     limit,
+    max_mode: !!toolContext.deepDive,
   });
 
   return {
     count: trimmed.length,
+    coverage: {
+      mode: toolContext.deepDive ? 'max' : 'normal',
+      total_matched: filtered.length,
+      returned_count: trimmed.length,
+      requested_limit: input.limit ?? null,
+      effective_limit: limit,
+      filtered_by_source_type: !!(input.source_types && input.source_types.length > 0),
+      source_type_counts_before_filter: sourceTypeCountsBeforeFilter,
+      source_type_counts_after_filter: sourceTypeCountsAfterFilter,
+      internal_doc_type_counts: internalDocTypeCounts,
+      news_count: result.news.length,
+    },
     current_date: new Date().toISOString(),
     timeline_note: 'Dates are source dates. Relative phrases in excerpts such as "next week", "currently", "today", or "now" are relative to each source date, not the current date.',
     sources: trimmed.map(s => ({
@@ -502,7 +552,8 @@ export async function recall(
 export async function getContactDetail(
   ctx: AuthContext,
   contactId: string,
-  env: Env
+  env: Env,
+  toolContext: AgentToolContext = {}
 ): Promise<any> {
   const contactRow = await env.D1.prepare(
     `SELECT c.*, co.name AS company_name
@@ -530,8 +581,14 @@ export async function getContactDetail(
           ELSE c.external_message_id
         END
        WHERE c.from_contact_id = ? AND c.org_id = ?
-       ORDER BY sent_at DESC LIMIT 20`
-    ).bind(contactId, ctx.orgId).all(),
+       ORDER BY sent_at DESC LIMIT ?`
+    ).bind(
+      contactId,
+      ctx.orgId,
+      toolContext.deepDive
+        ? MAX_MODE_LIMITS.contactDetailConversationFetch
+        : 20
+    ).all(),
     env.D1.prepare(
       `SELECT d.id, d.title, d.stage, d.amount, d.valuation, dc.role, dc.side
        FROM deal_contacts dc JOIN deals d ON dc.deal_id = d.id
@@ -564,7 +621,7 @@ export async function getContactDetail(
         sharingFlags
       )
     )
-    .slice(0, 10);
+    .slice(0, toolContext.deepDive ? MAX_MODE_LIMITS.contactDetailConversationReturn : 10);
 
   for (const c of recentConvos) {
     delete c.participant_user_ids;
@@ -586,7 +643,8 @@ export async function getContactDetail(
 export async function getCompanyDetail(
   ctx: AuthContext,
   companyId: string,
-  env: Env
+  env: Env,
+  toolContext: AgentToolContext = {}
 ): Promise<any> {
   const company = await env.D1.prepare(
     'SELECT * FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
@@ -597,20 +655,26 @@ export async function getCompanyDetail(
     env.D1.prepare(
       `SELECT id, full_name, email, job_title, contact_type, last_contact_date, total_interactions
        FROM contacts WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
-       ORDER BY total_interactions DESC LIMIT 20`
-    ).bind(companyId, ctx.orgId).all(),
-    env.D1.prepare(
-      `SELECT id, title, stage, amount, valuation, probability, expected_close, days_in_stage
-       FROM deals WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
-       ORDER BY created_at DESC`
-    ).bind(companyId, ctx.orgId).all(),
+       ORDER BY total_interactions DESC LIMIT ?`
+    ).bind(companyId, ctx.orgId, toolContext.deepDive ? MAX_MODE_LIMITS.relatedEntityReturn : 20).all(),
+    toolContext.deepDive
+      ? env.D1.prepare(
+          `SELECT id, title, stage, amount, valuation, probability, expected_close, days_in_stage
+           FROM deals WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
+           ORDER BY created_at DESC LIMIT ?`
+        ).bind(companyId, ctx.orgId, MAX_MODE_LIMITS.relatedEntityReturn).all()
+      : env.D1.prepare(
+          `SELECT id, title, stage, amount, valuation, probability, expected_close, days_in_stage
+           FROM deals WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
+           ORDER BY created_at DESC`
+        ).bind(companyId, ctx.orgId).all(),
     env.D1.prepare(
       'SELECT t.id, t.name, t.color FROM company_tags ct JOIN tags t ON ct.tag_id = t.id WHERE ct.company_id = ?'
     ).bind(companyId).all(),
     env.D1.prepare(
       `SELECT id, title, source, published_at, summary, relevance_score
-       FROM news_articles WHERE company_id = ? ORDER BY published_at DESC LIMIT 10`
-    ).bind(companyId).all().catch(() => ({ results: [] })),
+       FROM news_articles WHERE company_id = ? ORDER BY published_at DESC LIMIT ?`
+    ).bind(companyId, toolContext.deepDive ? MAX_MODE_LIMITS.ragV1NewsReturn : 10).all().catch(() => ({ results: [] })),
   ]);
 
   return {
@@ -631,7 +695,8 @@ export async function getCompanyDetail(
 export async function getDealDetail(
   ctx: AuthContext,
   dealId: string,
-  env: Env
+  env: Env,
+  toolContext: AgentToolContext = {}
 ): Promise<any> {
   const dealRow = await env.D1.prepare(
     `SELECT d.*, co.name AS company_name, co.sector AS company_sector, u.full_name AS owner_name
@@ -655,8 +720,8 @@ export async function getDealDetail(
     ).bind(dealId).all(),
     env.D1.prepare(
       `SELECT id, content, author_id, created_at
-       FROM deal_notes WHERE deal_id = ? ORDER BY created_at DESC LIMIT 10`
-    ).bind(dealId).all(),
+       FROM deal_notes WHERE deal_id = ? ORDER BY created_at DESC LIMIT ?`
+    ).bind(dealId, toolContext.deepDive ? MAX_MODE_LIMITS.detailNotesReturn : 10).all(),
   ]);
 
   return {

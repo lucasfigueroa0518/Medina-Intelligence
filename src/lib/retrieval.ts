@@ -28,8 +28,19 @@ import {
   hydrateRagV2Matches,
   persistRagV2Trace,
   queryDenseRagV2Candidates,
+  queryDenseRagV2NewsCandidates,
 } from './rag-v2';
 import { searchRagChunksD1Fts } from './rag-v2-lexical';
+import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
+
+function safeJson<T>(raw: string | null | undefined, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
 
 export interface RetrievalOptions {
   deepDive?: boolean;
@@ -210,7 +221,7 @@ async function filterMatchesByAuthoritativeAcl(
   const documentAccess = new Map<string, boolean>();
   if (documentIds.length > 0) {
     const rows = await env.D1.prepare(
-      `SELECT id, visibility, participant_user_ids, uploaded_by
+      `SELECT id, visibility, participant_user_ids, uploaded_by, custom_fields
          FROM documents
         WHERE org_id = ? AND deleted_at IS NULL AND id IN (${placeholders(documentIds.length)})`
     ).bind(pq.orgId, ...documentIds).all<{
@@ -218,10 +229,15 @@ async function filterMatchesByAuthoritativeAcl(
       visibility: string | null;
       participant_user_ids: string | null;
       uploaded_by: string | null;
+      custom_fields: string | null;
     }>();
 
     for (const id of documentIds) documentAccess.set(id, false);
     for (const row of rows.results || []) {
+      if (row.custom_fields && safeJson<{ marty_lab_generated?: unknown }>(row.custom_fields, {}).marty_lab_generated) {
+        documentAccess.set(row.id, false);
+        continue;
+      }
       documentAccess.set(
         row.id,
         isDocumentAccessibleToUser(row, pq.userId, pq.userRole, sharingSet)
@@ -451,14 +467,21 @@ async function retrieveContextV2(
     pq.orgId,
     queryEmbedding,
     embeddingProfile,
-    pq.entityIds
+    pq.entityIds,
+    options.deepDive
+      ? {
+          entityLimit: MAX_MODE_LIMITS.ragV1EntityFanout,
+          entityTopK: 50,
+          broadTopK: 100,
+        }
+      : undefined
   );
   const denseMs = Date.now() - denseStart;
 
   const lexicalStart = Date.now();
   const lexicalCandidates = await searchRagChunksD1Fts(env, pq.originalQuery, {
     orgId: pq.orgId,
-    topK: 100,
+    topK: options.deepDive ? MAX_MODE_LIMITS.ragV2LexicalTopK : 100,
     entityIds: pq.entityIds,
   });
   const lexicalMs = Date.now() - lexicalStart;
@@ -470,26 +493,64 @@ async function retrieveContextV2(
       denseEntity: 1.2,
       lexical: 1.0,
     }),
-    options.deepDive ? 80 : 50
+    options.deepDive ? MAX_MODE_LIMITS.ragV2FusionCandidates : 50
   );
   const vectorMatches = await buildRagV2VectorMatches(env, embeddingProfile, fused);
   const aclFiltered = await filterMatchesByAuthoritativeAcl(vectorMatches, pq, env);
   const fusionMs = Date.now() - fusionStart;
 
   const hydrationStart = Date.now();
-  const { chunks: hydrated, summary: hydrationSummary } = await hydrateRagV2Matches(aclFiltered, env);
+  const hydrateInput = options.deepDive
+    ? aclFiltered.slice(0, MAX_MODE_LIMITS.ragV2HydrateCandidates)
+    : aclFiltered;
+  const { chunks: hydrated, summary: hydrationSummary } = await hydrateRagV2Matches(hydrateInput, env);
   const hydrationMs = Date.now() - hydrationStart;
 
   const rerankStart = Date.now();
   let reranked = await crossEncoderRerank(
-    hydrated.slice(0, options.deepDive ? 80 : 50),
+    hydrated.slice(0, options.deepDive ? MAX_MODE_LIMITS.ragV2RerankInput : 50),
     pq.originalQuery,
     pq.orgId,
-    env
+    env,
+    undefined,
+    options.deepDive
+      ? {
+          outputLimit: MAX_MODE_LIMITS.ragV2RerankOutput,
+          batchSize: MAX_MODE_LIMITS.rerankBatchSize,
+        }
+      : undefined
   );
-  const rerankLimit = options.deepDive ? 20 : 10;
+  const rerankLimit = options.deepDive ? MAX_MODE_LIMITS.ragV2RerankOutput : NORMAL_MODE_LIMITS.rerankOutput;
   reranked = reranked.slice(0, rerankLimit);
   const rerankMs = Date.now() - rerankStart;
+
+  let newsChunks: HydratedChunk[] = [];
+  if (options.deepDive) {
+    const newsCandidates = await queryDenseRagV2NewsCandidates(
+      env,
+      pq.orgId,
+      queryEmbedding,
+      embeddingProfile,
+      MAX_MODE_LIMITS.ragV1NewsTopK
+    );
+    const newsMatches = await buildRagV2VectorMatches(
+      env,
+      embeddingProfile,
+      newsCandidates.map(candidate => ({
+        chunkId: candidate.chunkId,
+        score: candidate.score,
+        denseScore: candidate.score,
+        denseRank: candidate.rank,
+        sources: [candidate.source],
+      }))
+    );
+    const newsAclFiltered = await filterMatchesByAuthoritativeAcl(newsMatches, pq, env);
+    const hydratedNews = await hydrateRagV2Matches(
+      newsAclFiltered.slice(0, MAX_MODE_LIMITS.ragV1NewsReturn),
+      env
+    );
+    newsChunks = hydratedNews.chunks;
+  }
 
   await persistRagV2Trace(env, {
     orgId: pq.orgId,
@@ -528,7 +589,7 @@ async function retrieveContextV2(
     }
     return {
       internal: reranked.filter(c => c.metadata.document_type !== 'news'),
-      news: reranked.filter(c => c.metadata.document_type === 'news'),
+      news: newsChunks,
       stats: { emails, meetings, documents, contacts: entitySet.size, companies: 0 },
     };
   }
@@ -1011,7 +1072,7 @@ export async function preprocessQuery(
 ): Promise<ProcessedQuery> {
   const queryLower = query.toLowerCase();
   const entityIds: string[] = [];
-  const maxEntities = options.deepDive ? 20 : 5;
+  const maxEntities = options.deepDive ? MAX_MODE_LIMITS.ragV1EntityFanout : 5;
 
   if (options.deepDive) {
     const [contacts, companies] = await Promise.all([
@@ -1392,14 +1453,14 @@ export async function retrieveContext(
   // We use returnMetadata='all' here for ACL filtering (visibility, participant_user_ids,
   // user_id, reconciliation_status — none of which are indexed) and for chunk hydration
   // (r2_key, chunk_index, text_preview — also not indexed). So 50 is our ceiling.
-  // Deep Dive's real value comes from per-entity boosts (×20), document-type queries, and
+  // MAX mode's real value comes from per-entity boosts, document-type queries, and
   // cross-entity bridging — not raw broad topK. (See: VECTOR_QUERY_ERROR 40025)
   // TODO: to raise broad topK above 50, declare metadata indexes for the four ACL fields,
   // re-upsert all existing vectors (Vectorize indexes are not retroactive), refactor
   // hydration.ts to read r2_key/chunk_index/text_preview from D1, and move ACL filtering
   // from post-retrieval JS to a D1 join. Multi-day project, not a hotfix.
   const broadTopK = options.deepDive ? 50 : (aggregation ? 50 : 30);
-  const hydrateLimit = options.deepDive ? 50 : (aggregation ? 30 : 20);
+  const hydrateLimit = options.deepDive ? MAX_MODE_LIMITS.ragV1HydrateCandidates : (aggregation ? 30 : 20);
 
   let internalMatches: VectorMatch[];
   let broadRawMatches: VectorMatch[] = [];
@@ -1511,7 +1572,7 @@ export async function retrieveContext(
     const docResults = await Promise.all(
       docTypes.map(dt =>
         env.VECTORIZE.query(pq.embeddedQuery, {
-          topK: 20,
+          topK: options.deepDive ? MAX_MODE_LIMITS.ragV1DocTypeTopK : 20,
           filter: { org_id: pq.orgId, document_type: dt },
           returnValues: false,
           returnMetadata: 'all',
@@ -1578,9 +1639,9 @@ export async function retrieveContext(
 
   if (options.deepDive && pq.entityIds.length > 0) {
     const seen = new Set(internalMatches.map(m => m.id));
-    const entityQueries = pq.entityIds.slice(0, 20).map(id =>
+    const entityQueries = pq.entityIds.slice(0, MAX_MODE_LIMITS.ragV1EntityFanout).map(id =>
       env.VECTORIZE.query(pq.embeddedQuery, {
-        topK: 10,
+        topK: MAX_MODE_LIMITS.ragV1EntityTopK,
         filter: { ...filter, primary_entity_id: id },
         returnValues: false,
         returnMetadata: 'all',
@@ -1650,9 +1711,22 @@ export async function retrieveContext(
     hydrated_target_id_type: typeof hydratedTargetSample?.id,
     sample_set_has: hydratedTargetSample ? targetedIds.has(hydratedTargetSample.id) : null,
   });
-  let reranked = await crossEncoderRerank(hydrated, pq.originalQuery, pq.orgId, env, targetedIds);
+  let reranked = await crossEncoderRerank(
+    hydrated,
+    pq.originalQuery,
+    pq.orgId,
+    env,
+    targetedIds,
+    options.deepDive
+      ? {
+          outputLimit: MAX_MODE_LIMITS.ragV1RerankOutput,
+          batchSize: MAX_MODE_LIMITS.rerankBatchSize,
+          targetedReserve: MAX_MODE_LIMITS.rerankTargetedReserve,
+        }
+      : undefined
+  );
 
-  const rerankedLimit = options.deepDive ? 20 : 10;
+  const rerankedLimit = options.deepDive ? MAX_MODE_LIMITS.ragV1RerankOutput : NORMAL_MODE_LIMITS.rerankOutput;
   reranked = rebalanceRerankedByPrimaryFamilies(reranked, hydrated, evidencePlan, rerankedLimit);
   if (pq.entityIds.length > 0) {
     const entitySet = new Set(pq.entityIds);
@@ -1681,14 +1755,14 @@ export async function retrieveContext(
   });
 
   const newsResult = await env.VECTORIZE.query(pq.embeddedQuery, {
-    topK: 10,
+    topK: options.deepDive ? MAX_MODE_LIMITS.ragV1NewsTopK : 10,
     filter: { org_id: pq.orgId, document_type: 'news' },
     returnValues: false,
     returnMetadata: 'all',
   });
   const newsMatches = ((newsResult.matches || []) as VectorMatch[])
     .filter(m => m.score >= 0.55)
-    .slice(0, 5);
+    .slice(0, options.deepDive ? MAX_MODE_LIMITS.ragV1NewsReturn : 5);
   const { chunks: newsChunks } = await hydrateChunks(newsMatches, env);
 
   if (options.deepDive) {
@@ -1759,7 +1833,7 @@ function chunkAgeInDays(chunk: HydratedChunk): number {
 //   3. Send query + chunk previews to bge-reranker-base, get per-chunk scores.
 //   4. Optionally apply recency multiplier when the query is temporal.
 //   5. Sort by combined score, return topK.
-//   6. Any failure path falls back to the input order capped at 10 — never
+//   6. Any failure path falls back to the input order capped at the caller's limit — never
 //      throws, retrieval must keep working.
 export async function crossEncoderRerank(
   chunks: HydratedChunk[],
@@ -1769,13 +1843,21 @@ export async function crossEncoderRerank(
   // Vector ids of chunks that came from the doc-type-targeted secondary
   // query in retrieveContext (or from a recall() tool call with explicit
   // source_types). Targeted chunks bypass the recency floor and get
-  // dedicated reserved slots in the final top-10. Without this, short
+  // dedicated reserved slots in the final output window. Without this, short
   // Slack messages and the like get cut by the floor or crowded out by
   // higher-scoring semantic-neighbor email matches in the broad query
   // — the audit-2026-05-05 regression after chunk 1 shipped the floor.
   // Pass undefined / empty Set when caller wants pre-2026-05-05 behavior.
-  targetedIds?: Set<string>
+  targetedIds?: Set<string>,
+  options: { outputLimit?: number; batchSize?: number; targetedReserve?: number } = {}
 ): Promise<HydratedChunk[]> {
+  const outputLimit = Math.max(1, options.outputLimit ?? NORMAL_MODE_LIMITS.rerankOutput);
+  const batchSize = Math.max(1, options.batchSize ?? NORMAL_MODE_LIMITS.rerankBatchSize);
+  const targetedReserve = Math.max(
+    0,
+    Math.min(options.targetedReserve ?? NORMAL_MODE_LIMITS.rerankTargetedReserve, outputLimit)
+  );
+
   if (chunks.length <= 3) {
     retrievalLog('rerank', {
       query: query.slice(0, 80),
@@ -1783,17 +1865,17 @@ export async function crossEncoderRerank(
       input_count: chunks.length,
       input_doc_type_counts: countByDocType(chunks),
       targeted_ids_count: targetedIds?.size || 0,
-      final_count: chunks.length,
+      final_count: Math.min(chunks.length, outputLimit),
       final_doc_type_counts: countByDocType(chunks),
       final_targeted_count: countTargetedIds(chunks, targetedIds),
       ...targetedMembershipSample(chunks, targetedIds),
     });
-    return chunks;
+    return chunks.slice(0, outputLimit);
   }
 
   const settings = await getOrgSettings(orgId, env);
   if (!settings.reranker_enabled) {
-    const finalChunks = chunks.slice(0, 10);
+    const finalChunks = chunks.slice(0, outputLimit);
     retrievalLog('rerank', {
       query: query.slice(0, 80),
       reason: 'disabled',
@@ -1810,25 +1892,34 @@ export async function crossEncoderRerank(
   }
 
   try {
-    // BGE reranker accepts up to ~16K tokens of context combined; cap each
-    // chunk at ~500 tokens so 30+ chunks fit comfortably.
-    const contexts = chunks.map(c => ({
-      text: truncateToTokens(c.hydrated_text, 500),
-    }));
+    const scoresArr: Array<{ id: number; score: number }> = [];
+    for (let offset = 0; offset < chunks.length; offset += batchSize) {
+      // BGE reranker accepts up to ~16K tokens of context combined; cap each
+      // chunk at ~500 tokens and score large MAX-mode sets in batches.
+      const batch = chunks.slice(offset, offset + batchSize);
+      const contexts = batch.map(c => ({
+        text: truncateToTokens(c.hydrated_text, 500),
+      }));
 
-    const response = await env.AI.run('@cf/baai/bge-reranker-base' as any, {
-      query,
-      contexts,
-    } as any);
+      const response = await env.AI.run('@cf/baai/bge-reranker-base' as any, {
+        query,
+        contexts,
+      } as any);
 
-    // Workers AI shape: { response: [{ id: number, score: number }, ...] }
-    // where id is the index into our `contexts` array.
-    const scoresArr: Array<{ id: number; score: number }> =
-      Array.isArray((response as any)?.response) ? (response as any).response : [];
+      // Workers AI shape: { response: [{ id: number, score: number }, ...] }
+      // where id is the index into the submitted `contexts` batch.
+      const batchScores: Array<{ id: number; score: number }> =
+        Array.isArray((response as any)?.response) ? (response as any).response : [];
+      for (const score of batchScores) {
+        if (typeof score.id === 'number') {
+          scoresArr.push({ id: offset + score.id, score: score.score });
+        }
+      }
+    }
 
     if (scoresArr.length === 0) {
       // Defensive: model returned nothing usable. Fall back.
-      const finalChunks = chunks.slice(0, 10);
+      const finalChunks = chunks.slice(0, outputLimit);
       retrievalLog('rerank', {
         query: query.slice(0, 80),
         reason: 'empty_scores',
@@ -1891,8 +1982,7 @@ export async function crossEncoderRerank(
     //     for queries where source-type wasn't explicit.
     //   - Targeted chunks get dedicated reserved slots so they're not
     //     crowded out by broad's higher-scoring semantic neighbors.
-    const TOTAL_SLOTS = 10;
-    const TARGETED_RESERVE = 5;
+    const TOTAL_SLOTS = outputLimit;
     const targeted = targetedIds && targetedIds.size > 0
       ? scored.filter(s => targetedIds.has((s.chunk as any).id))
       : [];
@@ -1907,7 +1997,7 @@ export async function crossEncoderRerank(
     if (targeted.length > 0) {
       const targetedTake = Math.min(
         targeted.length,
-        broad.length === 0 ? TOTAL_SLOTS : TARGETED_RESERVE
+        broad.length === 0 ? TOTAL_SLOTS : targetedReserve
       );
       const broadTake = TOTAL_SLOTS - targetedTake;
       finalChunks = [
@@ -1927,6 +2017,8 @@ export async function crossEncoderRerank(
       input_count: chunks.length,
       input_doc_type_counts: countByDocType(chunks),
       scores_count: scoresArr.length,
+      output_limit: outputLimit,
+      batch_size: batchSize,
       targeted_ids_count: targetedIds?.size || 0,
       targeted_scored_count: targeted.length,
       broad_scored_count: broad.length,
@@ -1940,7 +2032,7 @@ export async function crossEncoderRerank(
     return finalChunks;
   } catch (e) {
     console.error('[rerank] BGE reranker fallback:', e);
-    const finalChunks = chunks.slice(0, 10);
+    const finalChunks = chunks.slice(0, outputLimit);
     retrievalLog('rerank', {
       query: query.slice(0, 80),
       reason: 'fallback',
