@@ -5014,6 +5014,9 @@ function SandboxExperimentPage({
   page: MartyLabExperimentPage;
   expectedSamples: number;
 }) {
+  const [activeSampleIndex, setActiveSampleIndex] = React.useState(0);
+  const roundsListRef = React.useRef<HTMLDivElement | null>(null);
+  const roundCardRefs = React.useRef<Array<HTMLDivElement | null>>([]);
   const stats = martyLabExperimentStats(page, expectedSamples);
   const tone = page.trial?.status === 'accepted'
     ? 'good'
@@ -5028,12 +5031,53 @@ function SandboxExperimentPage({
     const bMeta = labRoundPolicy(b);
     return (aMeta?.sample || 0) - (bMeta?.sample || 0);
   });
+  React.useEffect(() => {
+    roundCardRefs.current = roundCardRefs.current.slice(0, sortedSamples.length);
+    setActiveSampleIndex(0);
+    if (roundsListRef.current) roundsListRef.current.scrollTop = 0;
+  }, [page.round, sortedSamples.length]);
+  const handleRoundsScroll = React.useCallback(() => {
+    const container = roundsListRef.current;
+    if (!container || sortedSamples.length === 0) return;
+    const targetTop = container.scrollTop + 8;
+    let closestIndex = 0;
+    let closestDistance = Number.POSITIVE_INFINITY;
+    roundCardRefs.current.forEach((card, index) => {
+      if (!card) return;
+      const distance = Math.abs(card.offsetTop - targetTop);
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        closestIndex = index;
+      }
+    });
+    setActiveSampleIndex(closestIndex);
+  }, [sortedSamples.length]);
+  const scrollToRound = React.useCallback((index: number) => {
+    const container = roundsListRef.current;
+    const target = roundCardRefs.current[index];
+    if (!container || !target) return;
+    container.scrollTo({
+      top: Math.max(0, target.offsetTop - 8),
+      behavior: 'smooth',
+    });
+    setActiveSampleIndex(index);
+  }, []);
   const discoveryDone = sortedSamples.filter(sample => labRoundPolicy(sample)?.role === 'discovery' && labSampleIsClosed(sample)).length;
   const validationDone = sortedSamples.filter(sample => labRoundPolicy(sample)?.role === 'validation' && labSampleIsClosed(sample)).length;
   const cleanTitle = cleanExperimentTitle(page.title);
   const liftText = typeof stats.averageDelta === 'number'
     ? `Average lift ${labDeltaText(stats.averageDelta)}`
     : 'Average lift pending';
+  const activeSample = sortedSamples[activeSampleIndex] || sortedSamples[0] || null;
+  const activeSampleMeta = activeSample ? labRoundPolicy(activeSample) : null;
+  const activeRoundLabel = activeSampleMeta?.role === 'discovery'
+    ? `Discovery ${activeSampleMeta.sample}/3`
+    : activeSampleMeta?.role === 'validation'
+      ? `Testing ${Math.max(1, (activeSampleMeta.sample || 4) - 3)}/7`
+      : 'Round position';
+  const scrollProgressPct = sortedSamples.length > 0
+    ? Math.round(((activeSampleIndex + 1) / sortedSamples.length) * 100)
+    : 0;
 
   return (
     <div className="space-y-5">
@@ -5049,10 +5093,71 @@ function SandboxExperimentPage({
         <span className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${statusTone.box}`}>{stats.decision}</span>
       </div>
 
-      <div className="max-h-[42rem] overflow-y-auto rounded-lg border border-white/[0.06] bg-black/10 p-2 pr-3">
+      {sortedSamples.length > 0 && (
+        <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Round position</div>
+            <div className="text-xs font-medium text-text-primary">{activeRoundLabel}</div>
+          </div>
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
+            <div
+              className="h-full rounded-full bg-accent-magenta transition-[width] duration-150"
+              style={{ width: `${scrollProgressPct}%` }}
+            />
+          </div>
+          <div className="mt-3 flex gap-1 overflow-x-auto pb-1">
+            {sortedSamples.map((sample, index) => {
+              const meta = labRoundPolicy(sample);
+              const outcome = labExperimentOutcome(sample);
+              const isActive = index === activeSampleIndex;
+              const isClosed = labSampleIsClosed(sample);
+              const label = meta?.role === 'discovery'
+                ? `D${meta.sample}`
+                : meta?.role === 'validation'
+                  ? `T${Math.max(1, (meta.sample || 4) - 3)}`
+                  : `${index + 1}`;
+              const toneClass = isActive
+                ? 'border-accent-magenta bg-accent-magenta text-white'
+                : outcome.tone === 'good'
+                  ? 'border-semantic-success/30 bg-semantic-success/10 text-semantic-success'
+                  : outcome.tone === 'bad'
+                    ? 'border-semantic-error/30 bg-semantic-error/10 text-semantic-error'
+                    : isClosed
+                      ? 'border-white/15 bg-white/[0.08] text-text-secondary'
+                      : 'border-white/10 bg-white/[0.03] text-text-muted';
+              return (
+                <button
+                  key={sample.id}
+                  type="button"
+                  onClick={() => scrollToRound(index)}
+                  className={`h-7 min-w-9 shrink-0 rounded-md border px-2 text-[11px] font-medium transition ${toneClass}`}
+                  aria-label={`Jump to ${label}`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <div
+        ref={roundsListRef}
+        onScroll={handleRoundsScroll}
+        className="max-h-[42rem] overflow-y-auto rounded-lg border border-white/[0.06] bg-black/10 p-2 pr-3"
+      >
         {sortedSamples.length > 0 ? (
           <div className="space-y-2">
-            {sortedSamples.map(sample => <SandboxRoundCard key={sample.id} sample={sample} />)}
+            {sortedSamples.map((sample, index) => (
+              <div
+                key={sample.id}
+                ref={element => {
+                  roundCardRefs.current[index] = element;
+                }}
+              >
+                <SandboxRoundCard sample={sample} />
+              </div>
+            ))}
           </div>
         ) : (
           <div className="rounded-lg border border-white/[0.06] bg-black/10 p-5 text-sm leading-relaxed text-text-muted">
