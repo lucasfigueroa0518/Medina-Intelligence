@@ -14,25 +14,29 @@
     "deploy:pipelines:dry": "wrangler deploy --config wrangler.pipelines.toml --dry-run",
     "migrate:local": "wrangler d1 migrations apply medina-ventures-db --local",
     "migrate:remote": "wrangler d1 migrations apply medina-ventures-db --remote",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:max": "vitest run tests/max-set-builder.test.ts"
   },
   "dependencies": {
-    "@langchain/textsplitters": "^0.1.0",
+    "@e965/xlsx": "^0.20.3",
+    "@langchain/textsplitters": "^1.0.1",
     "@types/papaparse": "^5.5.2",
+    "@xmldom/xmldom": "^0.8.13",
     "docx": "^9.6.1",
     "jszip": "^3.10.1",
     "mammoth": "^1.8.0",
     "papaparse": "^5.5.3",
     "pdf-lib": "^1.17.1",
     "pptxgenjs": "^4.0.1",
-    "unpdf": "^1.6.2",
-    "xlsx": "^0.18.5"
+    "unpdf": "^1.6.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240924.0",
     "@types/node": "^20.14.0",
     "concurrently": "^9.0.1",
     "typescript": "^5.6.0",
+    "vitest": "^4.1.6",
     "wrangler": "^4.85.0"
   }
 }

@@ -6914,7 +6914,7 @@ async function inspectPptxVisualSurface(bytes: Uint8Array): Promise<Record<strin
 }
 
 async function inspectXlsxVisualSurface(bytes: Uint8Array): Promise<Record<string, unknown>> {
-  const XLSX = await import('xlsx');
+  const XLSX = await import('@e965/xlsx');
   const workbook = XLSX.read(bytes, { type: 'array', cellFormula: true, cellNF: false, cellStyles: false });
   const sheetNames = workbook.SheetNames || [];
   if (sheetNames.length === 0) {

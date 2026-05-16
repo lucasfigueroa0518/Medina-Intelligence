@@ -106,7 +106,7 @@ export async function extractTextFromFile(file: File): Promise<string> {
     fileName.endsWith('.xls')
   ) {
     try {
-      const XLSX = await import('xlsx');
+      const XLSX = await import('@e965/xlsx');
       const buffer = await file.arrayBuffer();
       const workbook = XLSX.read(buffer, { type: 'array' });
       const rows: string[] = [];

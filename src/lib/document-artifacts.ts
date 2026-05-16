@@ -1128,7 +1128,7 @@ function uniqueXlsxSheetName(value: unknown, usedNames: Set<string>, fallback = 
 }
 
 async function makeXlsx(title: string, content: any): Promise<Uint8Array> {
-  const XLSX = await import('xlsx');
+  const XLSX = await import('@e965/xlsx');
   const wb = XLSX.utils.book_new();
   wb.Props = { Title: title, Author: 'MARTy', Company: 'Medina Ventures' };
   const safeContent = asArray(content?.sheets).length > 0 || asArray(content?.rows).length > 0
@@ -1549,7 +1549,7 @@ async function validateGeneratedArtifact(kind: ArtifactKind, bytes: Uint8Array):
       if (!zip.file('xl/workbook.xml')) issues.push('XLSX missing xl/workbook.xml');
       const worksheetEntries = entries.filter(e => /^xl\/worksheets\/sheet\d+\.xml$/.test(e));
       if (worksheetEntries.length < 1) issues.push('XLSX has no worksheets');
-      const XLSX = await import('xlsx');
+      const XLSX = await import('@e965/xlsx');
       const wb = XLSX.read(bytes, { type: 'array' });
       if (wb.SheetNames.length < 1) issues.push('XLSX workbook has no sheet names');
       let nonEmptyCells = 0;

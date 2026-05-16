@@ -14,6 +14,10 @@ export type MaxSetTaskType =
   | 'funding_interest_gap'
   | 'firm_involvement'
   | 'open_loops'
+  | 'account_map'
+  | 'campaign_response_set'
+  | 'document_list_reconstruction'
+  | 'deal_process_history'
   | 'generic_set';
 
 export type MaxSetEntityKind =
@@ -36,6 +40,29 @@ export type MaxSetSourceFamily =
   | 'tasks';
 
 type MaxSetConfidence = 'confirmed' | 'probable' | 'needs_review';
+export type MaxSetSafetyStatus = 'complete' | 'tiered_with_gaps' | 'unsafe_incomplete';
+type MaxSetAnchorType =
+  | 'event'
+  | 'conversation_thread'
+  | 'campaign'
+  | 'document'
+  | 'deal'
+  | 'company'
+  | 'date_window'
+  | 'person'
+  | 'domain';
+
+type MaxSetEvidenceType =
+  | 'direct_recipient'
+  | 'campaign_recipient'
+  | 'document_row'
+  | 'event_attendee'
+  | 'touchpoint'
+  | 'task_action_item'
+  | 'crm_record'
+  | 'deal_record'
+  | 'text_mention'
+  | 'exclusion_record';
 
 export interface BuildMaxSetInput {
   task_type?: MaxSetTaskType;
@@ -65,16 +92,20 @@ interface SearchProfile {
   dateRange: { start?: string; end?: string };
   wantsArtifact: boolean;
   outputColumns: string[];
+  plan?: MaxSetJobPlan;
 }
 
 interface MaxSetEvidence {
   source_family: MaxSetSourceFamily;
   source_table: string;
   source_id: string;
+  anchor_id?: string;
+  evidence_type: MaxSetEvidenceType;
   title?: string | null;
   date?: string | null;
   detail: string;
   strength: MaxSetConfidence;
+  satisfies_membership: boolean;
 }
 
 interface MaxSetCandidate {
@@ -86,14 +117,18 @@ interface MaxSetCandidate {
   company?: string | null;
   domain?: string | null;
   confidence: MaxSetConfidence;
+  membership_predicate_satisfied: boolean;
   source_count: number;
   source_families: MaxSetSourceFamily[];
   evidence: MaxSetEvidence[];
   why_included: string[];
+  why_excluded?: string[];
+  unresolved_fields: string[];
 }
 
 interface SourceStat {
   source_family: MaxSetSourceFamily;
+  role?: 'authoritative' | 'supporting' | 'enrichment' | 'disallowed';
   rows_scanned: number;
   rows_returned: number;
   candidates_added: number;
@@ -117,6 +152,68 @@ interface CandidateDraft {
   exclusionReason?: string;
 }
 
+interface MaxSetNamedPerson {
+  name?: string;
+  email?: string;
+  role: 'inviter' | 'target' | 'excluded' | 'unknown';
+}
+
+interface MaxSetAnchor {
+  type: MaxSetAnchorType;
+  id?: string;
+  label: string;
+  confidence: MaxSetConfidence;
+  source_family: MaxSetSourceFamily;
+  why: string;
+}
+
+interface MaxSetSourcePolicy {
+  authoritative: MaxSetSourceFamily[];
+  supporting: MaxSetSourceFamily[];
+  enrichment: MaxSetSourceFamily[];
+  disallowed_candidate_sources: MaxSetSourceFamily[];
+  required_success_any_of: MaxSetSourceFamily[][];
+}
+
+interface MaxSetArtifactPolicy {
+  wants_artifact: boolean;
+  artifact_kind: 'xlsx' | 'none';
+  require_quality_gate: boolean;
+}
+
+interface MaxSetQualityPolicy {
+  block_on_authoritative_errors: boolean;
+  block_on_caps: boolean;
+  require_authoritative_candidates: boolean;
+  suppress_generated_artifact_sources: boolean;
+}
+
+export interface MaxSetJobPlan {
+  task_type: MaxSetTaskType;
+  entity_kind: MaxSetEntityKind;
+  original_query: string;
+  target_scope: {
+    title_terms: string[];
+    date_range?: { start?: string; end?: string };
+    named_people: MaxSetNamedPerson[];
+    domains: string[];
+    aliases: string[];
+  };
+  anchors: MaxSetAnchor[];
+  membership_predicate: string;
+  source_policy: MaxSetSourcePolicy;
+  artifact_policy: MaxSetArtifactPolicy;
+  quality_policy: MaxSetQualityPolicy;
+}
+
+export interface MaxSetQualityGateResult {
+  passed: boolean;
+  status: MaxSetSafetyStatus;
+  reasons: string[];
+  artifact_allowed: boolean;
+  artifact_suppressed_reason?: string;
+}
+
 interface CommunicationLinkedContact {
   conversation_id: string;
   contact_id: string;
@@ -135,6 +232,7 @@ const CONFIDENCE_RANK: Record<MaxSetConfidence, number> = {
 const MAX_TEXT_TERMS = 14;
 const INTERNAL_DOMAINS = new Set(['medinavc.com', 'medinaventures.ai', 'medinaventures.com']);
 const DOCUMENT_TEXT_EXTRACT_LIMIT = 25;
+const D1_IN_BATCH_SIZE = 50;
 const SOURCE_FAMILIES: MaxSetSourceFamily[] = [
   'communications',
   'events',
@@ -154,6 +252,134 @@ const STOP_WORDS = new Set([
   'touchpoints', 'want', 'were', 'what', 'with', 'you',
   'company', 'companies', 'startup', 'startups', 'firm', 'firms', 'vc', 'venture',
 ]);
+
+function chunkArray<T>(values: T[], size = D1_IN_BATCH_SIZE): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < values.length; i += size) chunks.push(values.slice(i, i + size));
+  return chunks;
+}
+
+async function queryRowsInBatches<T>(
+  env: Env,
+  ids: string[],
+  makeSql: (placeholders: string) => string,
+  bindPrefix: unknown[] = [],
+  bindSuffix: unknown[] = []
+): Promise<T[]> {
+  const uniqueIds = [...new Set(ids.filter(Boolean))];
+  const rows: T[] = [];
+  for (const batch of chunkArray(uniqueIds)) {
+    if (batch.length === 0) continue;
+    const placeholders = batch.map(() => '?').join(',');
+    const res = await env.D1.prepare(makeSql(placeholders))
+      .bind(...bindPrefix, ...batch, ...bindSuffix)
+      .all<T>();
+    rows.push(...(res.results || []));
+  }
+  return rows;
+}
+
+function sourcePolicyForTask(taskType: MaxSetTaskType): MaxSetSourcePolicy {
+  switch (taskType) {
+    case 'invite_roster':
+      return {
+        authoritative: ['communications', 'campaigns', 'documents'],
+        supporting: ['events'],
+        enrichment: ['contacts', 'companies'],
+        disallowed_candidate_sources: ['events', 'contacts'],
+        required_success_any_of: [['communications', 'campaigns', 'documents']],
+      };
+    case 'touchpoint_roster':
+      return {
+        authoritative: ['communications', 'events', 'tasks'],
+        supporting: ['documents'],
+        enrichment: ['contacts', 'companies', 'deals'],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['communications', 'events', 'tasks']],
+      };
+    case 'entity_theme_set':
+      return {
+        authoritative: ['companies', 'deals', 'documents'],
+        supporting: ['communications', 'events'],
+        enrichment: ['contacts'],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['companies', 'deals', 'documents']],
+      };
+    case 'firm_involvement':
+      return {
+        authoritative: ['deals', 'communications', 'documents'],
+        supporting: ['events'],
+        enrichment: ['contacts', 'companies'],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['deals', 'communications', 'documents']],
+      };
+    case 'funding_interest_gap':
+      return {
+        authoritative: ['communications', 'events', 'tasks', 'contacts', 'documents'],
+        supporting: ['companies', 'deals'],
+        enrichment: [],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['communications', 'events', 'tasks', 'contacts', 'documents']],
+      };
+    case 'open_loops':
+      return {
+        authoritative: ['tasks', 'events', 'communications'],
+        supporting: ['documents'],
+        enrichment: ['contacts', 'companies'],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['tasks', 'events', 'communications']],
+      };
+    case 'account_map':
+      return {
+        authoritative: ['contacts', 'communications', 'events'],
+        supporting: ['companies', 'deals', 'documents'],
+        enrichment: [],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['contacts', 'communications', 'events']],
+      };
+    case 'campaign_response_set':
+      return {
+        authoritative: ['campaigns', 'communications'],
+        supporting: ['contacts', 'companies'],
+        enrichment: [],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['campaigns'], ['communications']],
+      };
+    case 'document_list_reconstruction':
+      return {
+        authoritative: ['documents'],
+        supporting: ['communications'],
+        enrichment: ['contacts', 'companies', 'deals'],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['documents']],
+      };
+    case 'deal_process_history':
+      return {
+        authoritative: ['deals', 'communications', 'events', 'tasks'],
+        supporting: ['documents'],
+        enrichment: ['contacts', 'companies'],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['deals'], ['communications', 'events', 'tasks']],
+      };
+    default:
+      return {
+        authoritative: ['communications', 'events', 'campaigns', 'contacts', 'companies', 'deals', 'documents', 'tasks'],
+        supporting: [],
+        enrichment: [],
+        disallowed_candidate_sources: [],
+        required_success_any_of: [['communications', 'events', 'campaigns', 'contacts', 'companies', 'deals', 'documents', 'tasks']],
+      };
+  }
+}
+
+function sourceRole(plan: MaxSetJobPlan | undefined, family: MaxSetSourceFamily): SourceStat['role'] {
+  if (!plan) return undefined;
+  if (plan.source_policy.disallowed_candidate_sources.includes(family)) return 'disallowed';
+  if (plan.source_policy.authoritative.includes(family)) return 'authoritative';
+  if (plan.source_policy.supporting.includes(family)) return 'supporting';
+  if (plan.source_policy.enrichment.includes(family)) return 'enrichment';
+  return undefined;
+}
 
 function cleanText(value: unknown): string {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -272,12 +498,16 @@ function expandAliases(query: string, aliases: string[], domains: string[]): { a
 }
 
 function defaultSourceFamilies(taskType: MaxSetTaskType): MaxSetSourceFamily[] {
-  if (taskType === 'invite_roster') return ['communications', 'events', 'campaigns', 'documents', 'contacts'];
+  if (taskType === 'invite_roster') return ['communications', 'campaigns', 'documents'];
   if (taskType === 'touchpoint_roster') return ['communications', 'events', 'tasks', 'documents', 'contacts', 'companies'];
   if (taskType === 'entity_theme_set') return ['companies', 'deals', 'documents', 'communications', 'events'];
-  if (taskType === 'funding_interest_gap') return ['contacts', 'companies', 'deals', 'communications', 'events', 'documents', 'tasks'];
-  if (taskType === 'firm_involvement') return ['companies', 'contacts', 'deals', 'communications', 'events', 'documents'];
+  if (taskType === 'funding_interest_gap') return ['communications', 'events', 'tasks', 'contacts', 'documents', 'companies', 'deals'];
+  if (taskType === 'firm_involvement') return ['deals', 'communications', 'documents', 'events', 'contacts', 'companies'];
   if (taskType === 'open_loops') return ['tasks', 'communications', 'events'];
+  if (taskType === 'account_map') return ['contacts', 'communications', 'events', 'companies'];
+  if (taskType === 'campaign_response_set') return ['campaigns', 'communications', 'contacts', 'companies'];
+  if (taskType === 'document_list_reconstruction') return ['documents', 'communications'];
+  if (taskType === 'deal_process_history') return ['deals', 'communications', 'events', 'tasks', 'documents'];
   return SOURCE_FAMILIES;
 }
 
@@ -288,6 +518,10 @@ function inferTaskType(query: string): MaxSetTaskType {
   if (/\b(showed interest|interested|funding|fund the funds|committed|invested money|never.*invest)\b/.test(lower)) return 'funding_interest_gap';
   if (/\b(vc firm|venture firm|coinvestor|co-investor|firm involved|firms involved)\b/.test(lower)) return 'firm_involvement';
   if (/\b(open loop|follow up|follow-up|action item|promised|owed)\b/.test(lower)) return 'open_loops';
+  if (/\b(account map|everyone we know at|all people at|all contacts at|who do we know at)\b/.test(lower)) return 'account_map';
+  if (/\b(campaign|blast|mailing list|replied positively|positive replies)\b/.test(lower)) return 'campaign_response_set';
+  if (/\b(source workbook|source spreadsheet|find the list|reconstruct.*list|document list)\b/.test(lower)) return 'document_list_reconstruction';
+  if (/\b(deal process|deal history|who touched|touched this deal)\b/.test(lower)) return 'deal_process_history';
   if (/\b(startup|company|companies|sector|theme|quantum|robotics|defense|infrastructure)\b/.test(lower)) return 'entity_theme_set';
   return 'generic_set';
 }
@@ -303,6 +537,253 @@ function inferEntityKind(query: string, taskType: MaxSetTaskType): MaxSetEntityK
   return 'mixed';
 }
 
+function inferDateRangeFromQuery(query: string, taskType: MaxSetTaskType): { start?: string; end?: string } {
+  const lower = query.toLowerCase();
+  const monthMap: Record<string, number> = {
+    january: 0, jan: 0, february: 1, feb: 1, march: 2, mar: 2, april: 3, apr: 3,
+    may: 4, june: 5, jun: 5, july: 6, jul: 6, august: 7, aug: 7, september: 8, sep: 8,
+    october: 9, oct: 9, november: 10, nov: 10, december: 11, dec: 11,
+  };
+  const match = lower.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\b/);
+  if (!match) return {};
+  const month = monthMap[match[1]];
+  const day = Number(match[2]);
+  if (!Number.isFinite(month) || !Number.isFinite(day)) return {};
+  const year = match[3] ? Number(match[3]) : new Date().getUTCFullYear();
+  const target = new Date(Date.UTC(year, month, day));
+  if (Number.isNaN(target.getTime())) return {};
+  const start = new Date(target);
+  const end = new Date(target);
+  if (taskType === 'invite_roster') {
+    start.setUTCDate(start.getUTCDate() - 45);
+    end.setUTCDate(end.getUTCDate() + 2);
+  } else {
+    start.setUTCDate(start.getUTCDate() - 7);
+    end.setUTCDate(end.getUTCDate() + 7);
+  }
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function titleTermsForTask(query: string, taskType: MaxSetTaskType, namedPeople: string[]): string[] {
+  const namedParts = new Set(namedPeople.flatMap(person => compactText(person).split(/\s+/)).filter(Boolean));
+  return termsFromQuery(query)
+    .filter(term => {
+      const compact = compactText(term);
+      if (!compact || namedParts.has(compact)) return false;
+      if (taskType === 'invite_roster' && /^(raul|henriquez|tony|jimenez|myself|invited|invite|webinar|mail|merge|emails?|names?|excel)$/.test(compact)) return false;
+      return true;
+    })
+    .slice(0, MAX_TEXT_TERMS);
+}
+
+function namedPeopleForPlan(input: BuildMaxSetInput, taskType: MaxSetTaskType): MaxSetNamedPerson[] {
+  const role: MaxSetNamedPerson['role'] = taskType === 'invite_roster' ? 'inviter' : 'target';
+  return unique(input.named_people || []).map(value => ({
+    email: normalizeEmail(value) || undefined,
+    name: normalizeEmail(value) ? undefined : cleanText(value),
+    role,
+  })).filter(person => person.email || person.name);
+}
+
+export function planMaxSetJob(input: BuildMaxSetInput, profile: SearchProfile): MaxSetJobPlan {
+  const inferredDateRange = input.date_range || inferDateRangeFromQuery(profile.query, profile.taskType);
+  const titleTerms = titleTermsForTask(profile.query, profile.taskType, input.named_people || []);
+  const sourcePolicy = sourcePolicyForTask(profile.taskType);
+  const anchors: MaxSetAnchor[] = [];
+  if (inferredDateRange.start || inferredDateRange.end) {
+    anchors.push({
+      type: 'date_window',
+      label: [inferredDateRange.start, inferredDateRange.end].filter(Boolean).join(' to '),
+      confidence: 'probable',
+      source_family: 'communications',
+      why: 'Date window inferred from the user request',
+    });
+  }
+  for (const domain of profile.domains) {
+    anchors.push({
+      type: 'domain',
+      label: domain,
+      confidence: 'confirmed',
+      source_family: 'contacts',
+      why: 'Domain supplied or inferred as an entity alias',
+    });
+  }
+  for (const person of namedPeopleForPlan(input, profile.taskType)) {
+    anchors.push({
+      type: 'person',
+      label: person.email || person.name || 'Named person',
+      confidence: person.email ? 'confirmed' : 'probable',
+      source_family: 'contacts',
+      why: profile.taskType === 'invite_roster' ? 'Named inviter constraint' : 'Named person/entity constraint',
+    });
+  }
+  return {
+    task_type: profile.taskType,
+    entity_kind: profile.entityKind,
+    original_query: profile.query,
+    target_scope: {
+      title_terms: titleTerms.length > 0 ? titleTerms : profile.includeTerms.slice(0, 5),
+      date_range: inferredDateRange.start || inferredDateRange.end ? inferredDateRange : undefined,
+      named_people: namedPeopleForPlan(input, profile.taskType),
+      domains: profile.domains,
+      aliases: profile.aliases,
+    },
+    anchors,
+    membership_predicate: membershipPredicateForTask(profile.taskType),
+    source_policy: sourcePolicy,
+    artifact_policy: {
+      wants_artifact: profile.wantsArtifact,
+      artifact_kind: profile.wantsArtifact ? 'xlsx' : 'none',
+      require_quality_gate: true,
+    },
+    quality_policy: {
+      block_on_authoritative_errors: true,
+      block_on_caps: true,
+      require_authoritative_candidates: true,
+      suppress_generated_artifact_sources: true,
+    },
+  };
+}
+
+function membershipPredicateForTask(taskType: MaxSetTaskType): string {
+  if (taskType === 'invite_roster') return 'Candidate was a recipient of an anchored outbound invite, campaign recipient, or row in an authoritative invite/registrant spreadsheet for the target event.';
+  if (taskType === 'touchpoint_roster') return 'Candidate is a communication, event, task, or note touchpoint tied to the requested account/entity scope.';
+  if (taskType === 'funding_interest_gap') return 'Candidate has positive funding-interest evidence and no investment/commitment exclusion evidence.';
+  if (taskType === 'firm_involvement') return 'Firm is directly involved through deal, communication, document, or meeting evidence tied to the requested process.';
+  if (taskType === 'open_loops') return 'Candidate is an unresolved action item, task, promise, or follow-up tied to the requested scope.';
+  return 'Candidate is included by direct structured evidence or strong anchored evidence tied to the requested set.';
+}
+
+async function discoverAnchors(
+  ctx: AuthContext,
+  env: Env,
+  profile: SearchProfile,
+  plan: MaxSetJobPlan
+): Promise<void> {
+  const terms = unique([...(plan.target_scope.title_terms || []), ...profile.includeTerms]).slice(0, 8);
+  if (terms.length === 0 && !plan.target_scope.date_range && plan.target_scope.domains.length === 0) return;
+  const pushAnchor = (anchor: MaxSetAnchor) => {
+    const key = `${anchor.type}:${anchor.source_family}:${anchor.id || anchor.label}`;
+    if (plan.anchors.some(existing => `${existing.type}:${existing.source_family}:${existing.id || existing.label}` === key)) return;
+    plan.anchors.push(anchor);
+  };
+
+  if (profile.sourceFamilies.includes('communications')) {
+    const sharingFlags = await getSharingFlags(ctx.orgId, env);
+    const where = ['org_id = ?'];
+    const binds: unknown[] = [ctx.orgId];
+    addLikeTermClauses(where, binds, ['subject', 'body_preview'], terms);
+    if (profile.taskType === 'invite_roster') {
+      const inviterEmails = plan.target_scope.named_people.filter(p => p.role === 'inviter' && p.email).map(p => p.email!.toLowerCase());
+      where.push("source = 'outlook'");
+      if (inviterEmails.length > 0) {
+        where.push(`LOWER(from_email) IN (${inviterEmails.map(() => '?').join(',')})`);
+        binds.push(...inviterEmails);
+      }
+    }
+    addDateRange(where, binds, 'sent_at', profile);
+    const rows = await env.D1.prepare(
+      `SELECT c.id, c.external_thread_id, c.subject, c.sent_at, c.from_email, c.source,
+              c.participant_user_ids, c.is_campaign_email, c.external_message_id,
+              sc.is_private AS slack_is_private
+         FROM conversations c
+         LEFT JOIN slack_channels sc
+           ON c.source = 'slack'
+          AND sc.org_id = c.org_id
+          AND sc.channel_id = CASE
+            WHEN instr(c.external_message_id, ':') > 0
+            THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+            ELSE c.external_message_id
+          END
+        WHERE ${where.map(clause => clause.replace(/\borg_id\b/g, 'c.org_id').replace(/\bsubject\b/g, 'c.subject').replace(/\bbody_preview\b/g, 'c.body_preview').replace(/\bsource\b/g, 'c.source').replace(/\bfrom_email\b/g, 'c.from_email').replace(/\bsent_at\b/g, 'c.sent_at')).join(' AND ')}
+        ORDER BY c.sent_at DESC
+        LIMIT 30`
+    ).bind(...binds).all<any>().catch(() => ({ results: [] as any[] }));
+    const seenThreads = new Set<string>();
+    for (const row of rows.results || []) {
+      const canRead = canReadConversationContent({
+        source: row.source,
+        participant_user_ids: row.participant_user_ids,
+        is_campaign_email: row.is_campaign_email,
+        slack_is_private: row.slack_is_private,
+      }, ctx.userId, ctx.userRole, sharingFlags);
+      if (!canRead) continue;
+      const id = row.external_thread_id || row.id;
+      if (seenThreads.has(id)) continue;
+      seenThreads.add(id);
+      pushAnchor({
+        type: 'conversation_thread',
+        id,
+        label: cleanText(row.subject || row.from_email || id).slice(0, 160),
+        confidence: row.external_thread_id ? 'confirmed' : 'probable',
+        source_family: 'communications',
+        why: profile.taskType === 'invite_roster' ? 'Matching outbound invite-thread candidate' : 'Matching communication thread candidate',
+      });
+    }
+  }
+
+  if (profile.sourceFamilies.includes('campaigns')) {
+    const where = ['org_id = ?', 'deleted_at IS NULL'];
+    const binds: unknown[] = [ctx.orgId];
+    addLikeTermClauses(where, binds, ['title', 'subject', 'body_template'], terms);
+    addDateRange(where, binds, 'COALESCE(sent_at, scheduled_at, created_at)', profile);
+    const rows = await env.D1.prepare(
+      `SELECT id, title, subject, created_at
+         FROM email_campaigns
+        WHERE ${where.join(' AND ')}
+        ORDER BY created_at DESC
+        LIMIT 20`
+    ).bind(...binds).all<any>().catch(() => ({ results: [] as any[] }));
+    for (const row of rows.results || []) {
+      pushAnchor({
+        type: 'campaign',
+        id: row.id,
+        label: cleanText(row.title || row.subject || row.id).slice(0, 160),
+        confidence: 'confirmed',
+        source_family: 'campaigns',
+        why: 'Matching campaign anchor',
+      });
+    }
+  }
+
+  if (profile.sourceFamilies.includes('documents')) {
+    const sharingSet = new Set(Object.keys(await getSharingFlags(ctx.orgId, env)));
+    const where = [
+      'org_id = ?',
+      'deleted_at IS NULL',
+      "processing_status != 'excluded'",
+      "COALESCE(source, '') != 'marty_generated'",
+      "COALESCE(json_extract(custom_fields, '$.marty_generated'), 0) != 1",
+      "COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1",
+      "COALESCE(json_extract(custom_fields, '$.max_mode_set_builder'), 0) != 1",
+    ];
+    const binds: unknown[] = [ctx.orgId];
+    addLikeTermClauses(where, binds, ['title', 'file_name', 'document_type', 'extracted_text_preview'], [
+      ...terms,
+      ...(profile.taskType === 'invite_roster' ? ['invite', 'attendee', 'registrant', 'webinar'] : []),
+    ]);
+    addDateRange(where, binds, 'created_at', profile);
+    const rows = await env.D1.prepare(
+      `SELECT id, title, file_name, document_type, created_at, visibility, participant_user_ids, uploaded_by
+         FROM documents
+        WHERE ${where.join(' AND ')}
+        ORDER BY created_at DESC
+        LIMIT 20`
+    ).bind(...binds).all<any>().catch(() => ({ results: [] as any[] }));
+    for (const row of rows.results || []) {
+      if (!isDocumentAccessibleToUser(row, ctx.userId, ctx.userRole, sharingSet)) continue;
+      pushAnchor({
+        type: 'document',
+        id: row.id,
+        label: cleanText(row.title || row.file_name || row.id).slice(0, 160),
+        confidence: /invite|attendee|registrant|spreadsheet|xlsx|csv/i.test([row.title, row.file_name, row.document_type].join(' ')) ? 'confirmed' : 'probable',
+        source_family: 'documents',
+        why: 'Matching document/list anchor',
+      });
+    }
+  }
+}
+
 function wantsArtifact(query: string, artifactKind: unknown, createArtifact: unknown): boolean {
   if (artifactKind === 'none' || createArtifact === false) return false;
   if (createArtifact === true || artifactKind === 'xlsx') return true;
@@ -314,12 +795,19 @@ function buildProfile(input: BuildMaxSetInput): SearchProfile {
   const taskType = input.task_type || inferTaskType(query);
   const entityKind = input.entity_kind || inferEntityKind(query, taskType);
   const expanded = expandAliases(query, input.aliases || [], input.domains || []);
+  const namedPersonParts = new Set((input.named_people || [])
+    .flatMap(value => compactText(value).split(/\s+/))
+    .filter(Boolean));
   const includeTerms = unique([
     ...(input.include_terms || []),
     ...expanded.aliases,
     ...termsFromQuery(query),
-    ...(input.named_people || []),
-  ]).slice(0, MAX_TEXT_TERMS);
+    ...(taskType === 'invite_roster' ? [] : (input.named_people || [])),
+  ]).filter(term => {
+    if (taskType !== 'invite_roster') return true;
+    const compact = compactText(term);
+    return !namedPersonParts.has(compact) && !/^raul$|^henriquez$|^tony$|^jimenez$|^raul medinavc com$/.test(compact);
+  }).slice(0, MAX_TEXT_TERMS);
   const excludeTerms = unique(input.exclude_terms || []);
   const families = Array.isArray(input.source_families) && input.source_families.length > 0
     ? input.source_families.filter((f): f is MaxSetSourceFamily => SOURCE_FAMILIES.includes(f as MaxSetSourceFamily))
@@ -336,7 +824,7 @@ function buildProfile(input: BuildMaxSetInput): SearchProfile {
     aliases: expanded.aliases,
     domains: expanded.domains,
     sourceFamilies: families,
-    dateRange: input.date_range || {},
+    dateRange: input.date_range || inferDateRangeFromQuery(query, taskType),
     wantsArtifact: wantsArtifact(query, input.artifact_kind, input.create_artifact),
     outputColumns: Array.isArray(input.output_columns) && input.output_columns.length > 0
       ? input.output_columns.map(cleanText).filter(Boolean)
@@ -435,10 +923,13 @@ function safeEvidence(evidence: MaxSetEvidence): MaxSetEvidence {
     source_family: evidence.source_family,
     source_table: evidence.source_table,
     source_id: evidence.source_id,
+    anchor_id: evidence.anchor_id || undefined,
+    evidence_type: evidence.evidence_type || 'text_mention',
     title: evidence.title || undefined,
     date: evidence.date || undefined,
     detail: cleanText(evidence.detail).slice(0, 500),
     strength: evidence.strength,
+    satisfies_membership: Boolean(evidence.satisfies_membership),
   };
 }
 
@@ -455,6 +946,8 @@ function addCandidate(
   const name = cleanText(draft.name || draft.email || draft.domain || 'Unknown');
   const kind = draft.entityKind || profile.entityKind;
   const existing = target.get(key);
+  const evidence = safeEvidence(draft.evidence);
+  const satisfiesMembership = Boolean(evidence.satisfies_membership);
   if (!existing) {
     target.set(key, {
       canonical_id: key,
@@ -464,24 +957,39 @@ function addCandidate(
       first_name: firstNameFrom(name, email),
       company: cleanText(draft.company) || null,
       domain: domain || null,
-      confidence: draft.confidence,
+      confidence: satisfiesMembership ? draft.confidence : draft.confidence === 'confirmed' ? 'probable' : draft.confidence,
+      membership_predicate_satisfied: satisfiesMembership,
       source_count: 1,
-      source_families: [draft.evidence.source_family],
-      evidence: [safeEvidence(draft.evidence)],
+      source_families: [evidence.source_family],
+      evidence: [evidence],
       why_included: [draft.exclude ? (draft.exclusionReason || draft.why) : draft.why],
+      why_excluded: draft.exclude ? [draft.exclusionReason || draft.why] : undefined,
+      unresolved_fields: [
+        kind === 'person' && !email ? 'email' : '',
+        !name || name === 'Unknown' ? 'name' : '',
+      ].filter(Boolean),
     });
     return;
   }
-  existing.confidence = confidenceMax(existing.confidence, draft.confidence);
-  existing.source_count += 1;
+  existing.confidence = confidenceMax(existing.confidence, satisfiesMembership ? draft.confidence : draft.confidence === 'confirmed' ? 'probable' : draft.confidence);
+  existing.membership_predicate_satisfied = existing.membership_predicate_satisfied || satisfiesMembership;
+  const sourceKey = `${evidence.source_table}:${evidence.source_id}:${evidence.evidence_type}`;
+  const existingSourceKeys = new Set(existing.evidence.map(e => `${e.source_table}:${e.source_id}:${e.evidence_type}`));
+  if (!existingSourceKeys.has(sourceKey)) existing.source_count += 1;
   if (!existing.email && email) existing.email = email;
   if (!existing.first_name) existing.first_name = firstNameFrom(existing.canonical_name, existing.email);
   if (!existing.company && draft.company) existing.company = cleanText(draft.company);
   if (!existing.domain && domain) existing.domain = domain;
-  if (!existing.source_families.includes(draft.evidence.source_family)) existing.source_families.push(draft.evidence.source_family);
-  if (existing.evidence.length < MAX_MODE_LIMITS.setBuilderEvidencePerCandidate) existing.evidence.push(safeEvidence(draft.evidence));
+  if (!existing.source_families.includes(evidence.source_family)) existing.source_families.push(evidence.source_family);
+  if (existing.evidence.length < MAX_MODE_LIMITS.setBuilderEvidencePerCandidate && !existingSourceKeys.has(sourceKey)) existing.evidence.push(evidence);
   const why = draft.exclude ? (draft.exclusionReason || draft.why) : draft.why;
   if (why && !existing.why_included.includes(why)) existing.why_included.push(why);
+  if (draft.exclude) {
+    existing.why_excluded = existing.why_excluded || [];
+    if (why && !existing.why_excluded.includes(why)) existing.why_excluded.push(why);
+  }
+  if (kind === 'person' && email) existing.unresolved_fields = existing.unresolved_fields.filter(f => f !== 'email');
+  if (name && name !== 'Unknown') existing.unresolved_fields = existing.unresolved_fields.filter(f => f !== 'name');
 }
 
 function companyFromEmail(email: string | null, displayName?: string | null): string | null {
@@ -708,16 +1216,17 @@ async function loadConversationContactMap(
   const ids = [...new Set(conversationIds.filter(Boolean))];
   const out = new Map<string, CommunicationLinkedContact[]>();
   if (ids.length === 0) return out;
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = await env.D1.prepare(
-    `SELECT cc.conversation_id, cc.contact_id, c.full_name, c.email,
+  const rows = await queryRowsInBatches<CommunicationLinkedContact>(
+    env,
+    ids,
+    placeholders => `SELECT cc.conversation_id, cc.contact_id, c.full_name, c.email,
             co.name AS company_name, co.domain AS company_domain
        FROM conversation_contacts cc
        JOIN contacts c ON c.id = cc.contact_id
        LEFT JOIN companies co ON co.id = c.company_id
       WHERE cc.conversation_id IN (${placeholders})`
-  ).bind(...ids).all<CommunicationLinkedContact>();
-  for (const row of rows.results || []) {
+  );
+  for (const row of rows) {
     const list = out.get(row.conversation_id) || [];
     list.push(row);
     out.set(row.conversation_id, list);
@@ -769,6 +1278,7 @@ function addCommunicationCandidatesFromMatch(
     }
     for (const contact of linkedContacts) {
       if (isInternalEmail(contact.email)) continue;
+      const linkedSatisfiesInvite = Boolean(contact.email && headerEmails.has(contact.email.toLowerCase()));
       addCandidate(candidates, excluded, {
         entityKind: 'person',
         id: contact.contact_id,
@@ -776,9 +1286,11 @@ function addCommunicationCandidatesFromMatch(
         email: contact.email,
         company: contact.company_name || companyFromEmail(contact.email),
         domain: contact.company_domain || domainFromEmail(contact.email || undefined),
-        confidence: contact.email && headerEmails.has(contact.email.toLowerCase()) ? 'confirmed' : 'probable',
+        confidence: linkedSatisfiesInvite ? 'confirmed' : 'probable',
         why: 'Linked through conversation_contacts on a matching communication',
-        evidence,
+        evidence: profile.taskType === 'invite_roster'
+          ? { ...evidence, satisfies_membership: linkedSatisfiesInvite, evidence_type: linkedSatisfiesInvite ? 'direct_recipient' : 'text_mention', strength: linkedSatisfiesInvite ? 'confirmed' : 'probable' }
+          : evidence,
         exclude: excludedByText,
         exclusionReason: 'Matched explicit exclusion terms',
       }, profile);
@@ -791,9 +1303,9 @@ function addCommunicationCandidatesFromMatch(
           name: entry.display_name || entry.email,
           email: entry.email,
           company: companyFromEmail(entry.email, entry.display_name),
-          confidence: 'probable',
+          confidence: 'needs_review',
           why: 'Email address appeared in the full body of a matching invite/thread',
-          evidence: { ...evidence, strength: 'probable' },
+          evidence: { ...evidence, strength: 'needs_review', evidence_type: 'text_mention', satisfies_membership: false },
           exclude: excludedByText,
           exclusionReason: 'Matched explicit exclusion terms',
         }, profile);
@@ -859,11 +1371,33 @@ async function scanCommunications(
   const stat: SourceStat = { source_family: 'communications', rows_scanned: 0, rows_returned: 0, candidates_added: 0, cap_hit: false, errors: [] };
   const where = ['c.org_id = ?'];
   const binds: unknown[] = [ctx.orgId];
-  addLikeTermClauses(where, binds, ['c.subject', 'c.body_preview', 'c.from_email', 'c.to_emails', 'c.cc_emails'], [
-    ...profile.includeTerms,
-    ...profile.domains,
-    ...(profile.taskType === 'funding_interest_gap' ? fundingInterestTerms() : []),
-  ]);
+  const inviterEmails = profile.plan?.target_scope.named_people
+    .filter(person => person.role === 'inviter' && person.email)
+    .map(person => person.email!.toLowerCase()) || [];
+  const communicationTerms = profile.taskType === 'invite_roster'
+    ? unique([...(profile.plan?.target_scope.title_terms || []), ...profile.includeTerms]).slice(0, 8)
+    : [
+        ...profile.includeTerms,
+        ...profile.domains,
+        ...(profile.taskType === 'funding_interest_gap' ? fundingInterestTerms() : []),
+      ];
+  addLikeTermClauses(
+    where,
+    binds,
+    profile.taskType === 'invite_roster'
+      ? ['c.subject', 'c.body_preview']
+      : ['c.subject', 'c.body_preview', 'c.from_email', 'c.to_emails', 'c.cc_emails'],
+    communicationTerms
+  );
+  if (profile.taskType === 'invite_roster') {
+    where.push("c.source = 'outlook'");
+    if (inviterEmails.length > 0) {
+      where.push(`LOWER(c.from_email) IN (${inviterEmails.map(() => '?').join(',')})`);
+      binds.push(...inviterEmails);
+    } else {
+      where.push("(c.direction = 'outbound' OR LOWER(c.from_email) LIKE '%@medinavc.com')");
+    }
+  }
   addDateRange(where, binds, 'c.sent_at', profile);
   const limit = MAX_MODE_LIMITS.setBuilderRowCap;
   const [rows, sharingFlags] = await Promise.all([
@@ -921,10 +1455,12 @@ async function scanCommunications(
       source_family: 'communications',
       source_table: 'conversations',
       source_id: row.id,
+      evidence_type: profile.taskType === 'invite_roster' ? 'direct_recipient' : profile.entityKind === 'touchpoint' ? 'touchpoint' : 'text_mention',
       title: row.subject,
       date: row.sent_at,
       detail: `${row.source} ${row.direction || ''} ${row.subject || ''}${bodyText ? ' (full body checked)' : ''}`.trim(),
       strength: profile.taskType === 'invite_roster' ? 'confirmed' : 'probable',
+      satisfies_membership: true,
     };
     stat.candidates_added += addCommunicationCandidatesFromMatch(
       row,
@@ -948,12 +1484,13 @@ async function scanCommunications(
     stat.errors.push(`rag_chunks_v2_fts: ${String(error?.message || error).slice(0, 220)}`);
     return [];
   });
-  if (ragCandidates.length > 0) {
+  if (ragCandidates.length > 0 && profile.taskType !== 'invite_roster') {
     stat.cap_hit = stat.cap_hit || ragCandidates.length >= 200;
     const chunkIds = ragCandidates.map(c => c.chunkId).slice(0, 200);
-    const placeholders = chunkIds.map(() => '?').join(',');
-    const chunkRows = await env.D1.prepare(
-      `SELECT rc.id AS chunk_id, rc.text_preview,
+    const chunkRows = await queryRowsInBatches<any>(
+      env,
+      chunkIds,
+      placeholders => `SELECT rc.id AS chunk_id, rc.text_preview,
               c.id, c.subject, c.from_email, c.from_contact_id, c.to_emails, c.cc_emails,
               c.body_preview, c.source, c.direction, c.sent_at, c.participant_user_ids,
               c.is_campaign_email, c.external_message_id,
@@ -971,11 +1508,12 @@ async function scanCommunications(
             ELSE c.external_message_id
           END
         WHERE rc.org_id = ?
-          AND rc.id IN (${placeholders})`
-    ).bind(ctx.orgId, ...chunkIds).all<any>();
-    const ragLinkedMap = await loadConversationContactMap(env, chunkRows.results.map(row => row.id));
-    stat.rows_scanned += chunkRows.results.length;
-    for (const row of chunkRows.results) {
+          AND rc.id IN (${placeholders})`,
+      [ctx.orgId]
+    );
+    const ragLinkedMap = await loadConversationContactMap(env, chunkRows.map(row => row.id));
+    stat.rows_scanned += chunkRows.length;
+    for (const row of chunkRows) {
       const canRead = canReadConversationContent({
         source: row.source,
         participant_user_ids: row.participant_user_ids,
@@ -990,10 +1528,12 @@ async function scanCommunications(
         source_family: 'communications',
         source_table: 'rag_chunks_v2',
         source_id: row.chunk_id,
+        evidence_type: profile.entityKind === 'touchpoint' ? 'touchpoint' : 'text_mention',
         title: row.subject,
         date: row.sent_at,
         detail: `Conversation content match: ${cleanText(row.text_preview).slice(0, 220)}`,
-        strength: profile.taskType === 'invite_roster' ? 'probable' : 'probable',
+        strength: 'probable',
+        satisfies_membership: true,
       };
       stat.candidates_added += addCommunicationCandidatesFromMatch(
         row,
@@ -1059,10 +1599,12 @@ async function scanEvents(
         source_family: 'events',
         source_table: 'events',
         source_id: event.id,
+        evidence_type: 'event_attendee',
         title: event.title,
         date: event.start_time,
         detail: `Event attendee (${attendee.role || 'attendee'})`,
         strength: 'confirmed',
+        satisfies_membership: profile.taskType !== 'invite_roster',
       };
       const before = candidates.size + excluded.size;
       if (profile.entityKind === 'person' || profile.entityKind === 'mixed') {
@@ -1132,10 +1674,12 @@ async function scanCampaigns(
       source_family: 'campaigns',
       source_table: 'email_campaigns',
       source_id: row.campaign_id,
+      evidence_type: 'campaign_recipient',
       title: row.title || row.subject,
       date: row.sent_at || row.created_at,
       detail: `Campaign recipient (${row.status || 'pending'})`,
       strength: 'confirmed',
+      satisfies_membership: true,
     };
     const before = candidates.size + excluded.size;
     addCandidate(candidates, excluded, {
@@ -1192,9 +1736,11 @@ async function scanContacts(
       source_family: 'contacts',
       source_table: 'contacts',
       source_id: row.id,
+      evidence_type: invested && profile.taskType === 'funding_interest_gap' ? 'exclusion_record' : 'crm_record',
       title: row.full_name,
       detail: `Contact record: ${[row.contact_type, row.relationship_status, row.job_title].filter(Boolean).join(', ')}`,
       strength: invested && profile.taskType === 'funding_interest_gap' ? 'confirmed' : 'probable',
+      satisfies_membership: profile.taskType === 'funding_interest_gap' ? !invested : profile.taskType === 'account_map',
     };
     const before = candidates.size + excluded.size;
     addCandidate(candidates, excluded, {
@@ -1247,9 +1793,11 @@ async function scanCompanies(
       source_family: 'companies',
       source_table: 'companies',
       source_id: row.id,
+      evidence_type: 'crm_record',
       title: row.name,
       detail: `Company record: ${[row.company_type, row.sector, row.investment_status].filter(Boolean).join(', ')}`,
       strength: row.domain || row.company_type ? 'confirmed' : 'probable',
+      satisfies_membership: profile.taskType === 'entity_theme_set' || profile.taskType === 'account_map',
     };
     const before = candidates.size + excluded.size;
     addCandidate(candidates, excluded, {
@@ -1299,9 +1847,11 @@ async function scanDeals(
       source_family: 'deals',
       source_table: 'deals',
       source_id: row.id,
+      evidence_type: 'deal_record',
       title: row.title,
       detail: `Deal record: ${[row.stage, row.company_name].filter(Boolean).join(', ')}`,
       strength: 'confirmed',
+      satisfies_membership: true,
     };
     const before = candidates.size + excluded.size;
     if (profile.entityKind === 'deal') {
@@ -1346,8 +1896,10 @@ async function scanDocuments(
     'd.org_id = ?',
     'd.deleted_at IS NULL',
     "d.processing_status != 'excluded'",
+    "COALESCE(d.source, '') != 'marty_generated'",
     "COALESCE(json_extract(d.custom_fields, '$.marty_generated'), 0) != 1",
     "COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1",
+    "COALESCE(json_extract(d.custom_fields, '$.max_mode_set_builder'), 0) != 1",
   ];
   const binds: unknown[] = [ctx.orgId];
   const documentMatchWhere: string[] = [];
@@ -1402,10 +1954,12 @@ async function scanDocuments(
       source_family: 'documents',
       source_table: 'documents',
       source_id: row.id,
+      evidence_type: 'text_mention',
       title: row.title || row.file_name,
       date: row.created_at,
       detail: `Document match (${row.document_type || 'document'})`,
       strength: row.company_id || row.contact_id || row.deal_id ? 'probable' : 'needs_review',
+      satisfies_membership: profile.taskType === 'document_list_reconstruction',
     };
     const before = candidates.size + excluded.size;
     if ((profile.entityKind === 'person' || profile.entityKind === 'mixed') && row.contact_id) {
@@ -1465,10 +2019,12 @@ async function scanDocuments(
             source_family: 'documents',
             source_table: 'documents',
             source_id: row.id,
+            evidence_type: 'document_row',
             title: row.title || row.file_name,
             date: row.created_at,
             detail: person.detail,
             strength: person.confidence,
+            satisfies_membership: true,
           },
           exclude: hasExcludedText([text, person.name, person.email, person.company].join(' '), profile),
           exclusionReason: 'Matched explicit exclusion terms',
@@ -1487,12 +2043,13 @@ async function scanDocuments(
     stat.errors.push(`rag_chunks_v2_fts: ${String(error?.message || error).slice(0, 220)}`);
     return [];
   });
-  if (ragCandidates.length > 0) {
+  if (ragCandidates.length > 0 && profile.taskType !== 'invite_roster') {
     stat.cap_hit = stat.cap_hit || ragCandidates.length >= 200;
     const ids = ragCandidates.map(c => c.chunkId).slice(0, 200);
-    const ph = ids.map(() => '?').join(',');
-    const chunkRows = await env.D1.prepare(
-      `SELECT rc.id AS chunk_id, rc.source_id, rc.title AS chunk_title, rc.text_preview,
+    const chunkRows = await queryRowsInBatches<any>(
+      env,
+      ids,
+      ph => `SELECT rc.id AS chunk_id, rc.source_id, rc.title AS chunk_title, rc.text_preview,
               d.id, d.title, d.file_name, d.document_type, d.created_at,
               d.contact_id, d.company_id, d.deal_id, d.visibility, d.participant_user_ids, d.uploaded_by,
               c.full_name AS contact_name, c.email AS contact_email,
@@ -1507,11 +2064,14 @@ async function scanDocuments(
           AND rc.id IN (${ph})
           AND d.deleted_at IS NULL
           AND d.processing_status != 'excluded'
+          AND COALESCE(d.source, '') != 'marty_generated'
           AND COALESCE(json_extract(d.custom_fields, '$.marty_generated'), 0) != 1
-          AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1`
-    ).bind(ctx.orgId, ...ids).all<any>();
-    stat.rows_scanned += chunkRows.results.length;
-    for (const row of chunkRows.results) {
+          AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1
+          AND COALESCE(json_extract(d.custom_fields, '$.max_mode_set_builder'), 0) != 1`,
+      [ctx.orgId]
+    );
+    stat.rows_scanned += chunkRows.length;
+    for (const row of chunkRows) {
       if (!isDocumentAccessibleToUser(row, ctx.userId, ctx.userRole, sharingSet)) continue;
       const text = [row.title, row.file_name, row.document_type, row.chunk_title, row.text_preview, row.contact_name, row.company_name, row.deal_title].join(' ');
       if (!textMatchesProfile(text, profile)) continue;
@@ -1520,10 +2080,12 @@ async function scanDocuments(
         source_family: 'documents',
         source_table: 'rag_chunks_v2',
         source_id: row.chunk_id,
+        evidence_type: 'text_mention',
         title: row.title || row.file_name || row.chunk_title,
         date: row.created_at,
         detail: `Document content match: ${cleanText(row.text_preview).slice(0, 220)}`,
         strength: row.company_id || row.contact_id || row.deal_id ? 'probable' : 'needs_review',
+        satisfies_membership: false,
       };
       const before = candidates.size + excluded.size;
       if ((profile.entityKind === 'person' || profile.entityKind === 'mixed') && row.contact_id) {
@@ -1562,7 +2124,7 @@ async function scanDocuments(
           exclusionReason: 'Matched explicit exclusion terms',
         }, profile);
       }
-      if (profile.entityKind === 'person' || profile.entityKind === 'mixed' || profile.taskType === 'invite_roster') {
+      if (profile.entityKind === 'person' || profile.entityKind === 'mixed') {
         for (const person of extractPersonRowsFromTabularText(row.text_preview || '')) {
           if (isInternalEmail(person.email)) continue;
           addCandidate(candidates, excluded, {
@@ -1622,10 +2184,12 @@ async function scanTasks(
       source_family: 'tasks',
       source_table: 'tasks',
       source_id: row.id,
+      evidence_type: 'task_action_item',
       title: row.title,
       date: row.created_at,
       detail: `Task ${row.status || ''}${row.due_date ? ` due ${row.due_date}` : ''}`,
       strength: row.status === 'pending' || row.status === 'in_progress' ? 'confirmed' : 'probable',
+      satisfies_membership: profile.taskType === 'open_loops' || profile.entityKind === 'touchpoint',
     };
     const before = candidates.size + excluded.size;
     if (profile.taskType === 'open_loops' || profile.entityKind === 'touchpoint') {
@@ -1687,6 +2251,74 @@ function partitionCandidates(candidates: MaxSetCandidate[]): Record<MaxSetConfid
   };
 }
 
+export function evaluateMaxSetQuality(
+  plan: MaxSetJobPlan,
+  stats: SourceStat[],
+  buckets: Record<MaxSetConfidence, MaxSetCandidate[]>,
+  excluded: MaxSetCandidate[]
+): MaxSetQualityGateResult {
+  const reasons: string[] = [];
+  const all = [...buckets.confirmed, ...buckets.probable, ...buckets.needs_review];
+  const authoritative = new Set(plan.source_policy.authoritative);
+  const attemptedAuthoritative = stats.filter(s => authoritative.has(s.source_family));
+  const authoritativeErrors = attemptedAuthoritative.filter(s => s.errors.length > 0);
+  const capHits = stats.filter(s => s.cap_hit);
+  const authoritativeCandidateCount = all.filter(c => c.evidence.some(e => authoritative.has(e.source_family) && e.satisfies_membership)).length;
+  const membershipSatisfiedCount = all.filter(c => c.membership_predicate_satisfied).length;
+  const needsReviewRatio = all.length > 0 ? buckets.needs_review.length / all.length : 0;
+
+  if (plan.quality_policy.block_on_authoritative_errors && authoritativeErrors.length > 0) {
+    reasons.push(`Authoritative source errors: ${authoritativeErrors.map(s => `${s.source_family}: ${s.errors.join('; ')}`).join(' | ')}`);
+  }
+
+  if (plan.quality_policy.block_on_caps && capHits.length > 0) {
+    reasons.push(`Caps hit before exhaustive coverage: ${capHits.map(s => s.source_family).join(', ')}`);
+  }
+
+  if (plan.quality_policy.require_authoritative_candidates && authoritativeCandidateCount === 0) {
+    reasons.push('No authoritative source produced candidates satisfying the membership predicate.');
+  }
+
+  for (const group of plan.source_policy.required_success_any_of) {
+    const groupSucceeded = group.some(family => {
+      const stat = stats.find(s => s.source_family === family);
+      return stat && stat.errors.length === 0 && stat.candidates_added > 0;
+    });
+    if (!groupSucceeded) reasons.push(`Required source group did not produce a clean candidate set: ${group.join(' or ')}`);
+  }
+
+  if (plan.task_type === 'invite_roster') {
+    const contaminating = all.filter(c => c.evidence.some(e =>
+      (e.source_family === 'events' || e.source_family === 'contacts') && !e.satisfies_membership
+    ));
+    if (contaminating.length > 0) reasons.push(`Invite roster contains ${contaminating.length} candidates from non-authoritative event/contact evidence.`);
+    if (all.length > 1000) reasons.push(`Invite roster candidate count (${all.length}) is implausibly broad for a targeted mail-merge request.`);
+  }
+
+  if (all.length > 0 && membershipSatisfiedCount / all.length < 0.5) {
+    reasons.push('Most candidates do not satisfy the explicit membership predicate.');
+  }
+
+  if (all.length > 0 && needsReviewRatio > 0.6) {
+    reasons.push('Most candidates are weak or unresolved matches.');
+  }
+
+  const hasGaps = reasons.length > 0 || excluded.length > 0 || buckets.probable.length > 0 || buckets.needs_review.length > 0;
+  const status: MaxSetSafetyStatus = reasons.length > 0
+    ? 'unsafe_incomplete'
+    : hasGaps
+      ? 'tiered_with_gaps'
+      : 'complete';
+  const artifactAllowed = status !== 'unsafe_incomplete';
+  return {
+    passed: status === 'complete',
+    status,
+    reasons,
+    artifact_allowed: artifactAllowed,
+    artifact_suppressed_reason: artifactAllowed ? undefined : reasons[0] || 'MAX quality gate suppressed artifact creation.',
+  };
+}
+
 function buildArtifactContent(
   profile: SearchProfile,
   buckets: Record<MaxSetConfidence, MaxSetCandidate[]>,
@@ -1716,38 +2348,84 @@ async function persistTelemetry(
   ctx: AuthContext,
   runId: string,
   profile: SearchProfile,
+  plan: MaxSetJobPlan,
   stats: SourceStat[],
   buckets: Record<MaxSetConfidence, MaxSetCandidate[]>,
   excluded: MaxSetCandidate[],
+  qualityGate: MaxSetQualityGateResult,
   artifactDocumentId: string | null,
   latencyMs: number
 ): Promise<void> {
   const capsHit = stats.filter(s => s.cap_hit).map(s => s.source_family);
   const candidateCount = buckets.confirmed.length + buckets.probable.length + buckets.needs_review.length;
-  await env.D1.prepare(
-    `INSERT INTO max_mode_runs
-       (id, org_id, user_id, query, task_type, entity_kind, source_families,
-        confirmed_count, probable_count, needs_review_count, excluded_count,
-        candidate_count, deduped_count, caps_hit, artifact_document_id, latency_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
-    runId,
-    ctx.orgId,
-    ctx.userId,
-    profile.query,
-    profile.taskType,
-    profile.entityKind,
-    JSON.stringify(profile.sourceFamilies),
-    buckets.confirmed.length,
-    buckets.probable.length,
-    buckets.needs_review.length,
-    excluded.length,
-    candidateCount,
-    candidateCount,
-    JSON.stringify(capsHit),
-    artifactDocumentId,
-    latencyMs
-  ).run();
+  const authoritative = new Set(plan.source_policy.authoritative);
+  const supporting = new Set(plan.source_policy.supporting);
+  const enrichment = new Set(plan.source_policy.enrichment);
+  const countByRole = (families: Set<MaxSetSourceFamily>) =>
+    [...buckets.confirmed, ...buckets.probable, ...buckets.needs_review]
+      .filter(candidate => candidate.evidence.some(e => families.has(e.source_family)))
+      .length;
+  try {
+    await env.D1.prepare(
+      `INSERT INTO max_mode_runs
+         (id, org_id, user_id, query, task_type, entity_kind, source_families,
+          confirmed_count, probable_count, needs_review_count, excluded_count,
+          candidate_count, deduped_count, caps_hit, artifact_document_id, latency_ms,
+          safety_status, quality_gate_passed, artifact_suppressed_reason, plan_json,
+          anchor_count, authoritative_candidate_count, supporting_candidate_count, enrichment_candidate_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      runId,
+      ctx.orgId,
+      ctx.userId,
+      profile.query,
+      profile.taskType,
+      profile.entityKind,
+      JSON.stringify(profile.sourceFamilies),
+      buckets.confirmed.length,
+      buckets.probable.length,
+      buckets.needs_review.length,
+      excluded.length,
+      candidateCount,
+      candidateCount,
+      JSON.stringify(capsHit),
+      artifactDocumentId,
+      latencyMs,
+      qualityGate.status,
+      qualityGate.passed ? 1 : 0,
+      qualityGate.artifact_suppressed_reason || null,
+      JSON.stringify(plan),
+      plan.anchors.length,
+      countByRole(authoritative),
+      countByRole(supporting),
+      countByRole(enrichment)
+    ).run();
+  } catch {
+    await env.D1.prepare(
+      `INSERT INTO max_mode_runs
+         (id, org_id, user_id, query, task_type, entity_kind, source_families,
+          confirmed_count, probable_count, needs_review_count, excluded_count,
+          candidate_count, deduped_count, caps_hit, artifact_document_id, latency_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      runId,
+      ctx.orgId,
+      ctx.userId,
+      profile.query,
+      profile.taskType,
+      profile.entityKind,
+      JSON.stringify(profile.sourceFamilies),
+      buckets.confirmed.length,
+      buckets.probable.length,
+      buckets.needs_review.length,
+      excluded.length,
+      candidateCount,
+      candidateCount,
+      JSON.stringify(capsHit),
+      artifactDocumentId,
+      latencyMs
+    ).run();
+  }
 
   if (stats.length > 0) {
     await env.D1.batch(stats.map(stat =>
@@ -1771,6 +2449,31 @@ async function persistTelemetry(
       )
     ));
   }
+
+  if (plan.anchors.length > 0) {
+    try {
+      await env.D1.batch(plan.anchors.map(anchor =>
+        env.D1.prepare(
+          `INSERT INTO max_mode_run_anchors
+             (id, run_id, org_id, anchor_type, source_family, source_id, label, confidence, why)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          crypto.randomUUID(),
+          runId,
+          ctx.orgId,
+          anchor.type,
+          anchor.source_family,
+          anchor.id || null,
+          anchor.label,
+          anchor.confidence,
+          anchor.why
+        )
+      ));
+    } catch {
+      // Older deployments may not have the anchor table yet; the main run
+      // telemetry above is still enough to debug safely.
+    }
+  }
 }
 
 async function runAdapter(
@@ -1781,18 +2484,35 @@ async function runAdapter(
   candidates: Map<string, MaxSetCandidate>,
   excluded: Map<string, MaxSetCandidate>
 ): Promise<SourceStat> {
+  const role = sourceRole(profile.plan, family);
+  if (role === 'disallowed' || role === 'enrichment' && profile.taskType === 'invite_roster') {
+    return {
+      source_family: family,
+      role,
+      rows_scanned: 0,
+      rows_returned: 0,
+      candidates_added: 0,
+      cap_hit: false,
+      errors: [`${family} is ${role} for ${profile.taskType}; it cannot generate candidates for this MAX job.`],
+    };
+  }
   try {
-    if (family === 'communications') return await scanCommunications(ctx, env, profile, candidates, excluded);
-    if (family === 'events') return await scanEvents(ctx, env, profile, candidates, excluded);
-    if (family === 'campaigns') return await scanCampaigns(ctx, env, profile, candidates, excluded);
-    if (family === 'contacts') return await scanContacts(ctx, env, profile, candidates, excluded);
-    if (family === 'companies') return await scanCompanies(ctx, env, profile, candidates, excluded);
-    if (family === 'deals') return await scanDeals(ctx, env, profile, candidates, excluded);
-    if (family === 'documents') return await scanDocuments(ctx, env, profile, candidates, excluded);
-    if (family === 'tasks') return await scanTasks(ctx, env, profile, candidates, excluded);
+    let stat: SourceStat;
+    if (family === 'communications') stat = await scanCommunications(ctx, env, profile, candidates, excluded);
+    else if (family === 'events') stat = await scanEvents(ctx, env, profile, candidates, excluded);
+    else if (family === 'campaigns') stat = await scanCampaigns(ctx, env, profile, candidates, excluded);
+    else if (family === 'contacts') stat = await scanContacts(ctx, env, profile, candidates, excluded);
+    else if (family === 'companies') stat = await scanCompanies(ctx, env, profile, candidates, excluded);
+    else if (family === 'deals') stat = await scanDeals(ctx, env, profile, candidates, excluded);
+    else if (family === 'documents') stat = await scanDocuments(ctx, env, profile, candidates, excluded);
+    else if (family === 'tasks') stat = await scanTasks(ctx, env, profile, candidates, excluded);
+    else stat = { source_family: family, rows_scanned: 0, rows_returned: 0, candidates_added: 0, cap_hit: false, errors: ['unknown source family'] };
+    stat.role = role;
+    return stat;
   } catch (error: any) {
     return {
       source_family: family,
+      role,
       rows_scanned: 0,
       rows_returned: 0,
       candidates_added: 0,
@@ -1800,7 +2520,6 @@ async function runAdapter(
       errors: [String(error?.message || error).slice(0, 500)],
     };
   }
-  return { source_family: family, rows_scanned: 0, rows_returned: 0, candidates_added: 0, cap_hit: false, errors: ['unknown source family'] };
 }
 
 export function detectMaxSetIntent(
@@ -1812,7 +2531,7 @@ export function detectMaxSetIntent(
   const exhaustive =
     /\b(all|every|everyone|everybody|list|roster|export|xlsx|excel|spreadsheet|file|mail merge|count|how many|touchpoints?|ever talked|ever showed|ever involved|all firms|all startups|all people)\b/.test(lower);
   const setNoun =
-    /\b(invite|invited|attendee|attendees|registrant|webinar|town hall|names?|emails?|people|contacts?|companies|startups?|firms?|vc|touchpoints?|interested|funding|invested|open loops?)\b/.test(lower);
+    /\b(invite|invited|attendee|attendees|registrant|webinar|town hall|names?|emails?|people|contacts?|companies|startups?|firms?|vc|touchpoints?|interested|funding|invested|open loops?|account map|campaign|deal history|who touched|source spreadsheet|source workbook)\b/.test(lower);
   const shouldBuild = exhaustive && setNoun;
   if (!shouldBuild) return { shouldBuild: false, reason: null, input: null };
 
@@ -1826,7 +2545,7 @@ export function detectMaxSetIntent(
     namedPeople.push(opts.currentUserEmail);
   }
   if (/\braul\b/.test(lower)) {
-    aliases.push('Raul', 'Henriquez', 'Raul Henriquez', 'raul@medinavc.com');
+    if (taskType !== 'invite_roster') aliases.push('Raul', 'Henriquez', 'Raul Henriquez', 'raul@medinavc.com');
     namedPeople.push('Raul Henriquez', 'raul@medinavc.com');
   }
   return {
@@ -1866,6 +2585,14 @@ export function compactMaxSetResultForContext(result: any): Record<string, unkno
     run_id: result?.run_id,
     task_type: result?.task_type,
     entity_kind: result?.entity_kind,
+    safety_status: result?.safety_status,
+    quality_gate: result?.quality_gate,
+    plan: result?.plan ? {
+      membership_predicate: result.plan.membership_predicate,
+      anchors: result.plan.anchors,
+      source_policy: result.plan.source_policy,
+      target_scope: result.plan.target_scope,
+    } : undefined,
     counts: {
       confirmed: confirmed.length,
       probable: probable.length,
@@ -1888,7 +2615,9 @@ export function compactMaxSetResultForContext(result: any): Record<string, unkno
       needs_review: needsReview.slice(0, 20).map(compactCandidateForContext),
       excluded: excluded.slice(0, 15).map(compactCandidateForContext),
     },
-    instruction: 'Use this deterministic MAX set-builder result as the source of truth. If an artifact_card exists, do not create a duplicate roster workbook from recall snippets.',
+    instruction: result?.safety_status === 'unsafe_incomplete'
+      ? 'The deterministic MAX set-builder marked this run unsafe/incomplete. Do not claim the set is complete and do not create a duplicate workbook from recall snippets; explain the quality gate reasons and real gaps.'
+      : 'Use this deterministic MAX set-builder result as the source of truth. If an artifact_card exists, do not create a duplicate roster workbook from recall snippets.',
   };
 }
 
@@ -1905,6 +2634,8 @@ export async function buildMaxSetTool(
     };
   }
   const profile = buildProfile(input);
+  const plan = planMaxSetJob(input, profile);
+  profile.plan = plan;
   if (!profile.query && profile.includeTerms.length === 0 && profile.domains.length === 0) {
     return { error: 'query is required' };
   }
@@ -1914,11 +2645,13 @@ export async function buildMaxSetTool(
   const candidates = new Map<string, MaxSetCandidate>();
   const excludedMap = new Map<string, MaxSetCandidate>();
   const stats: SourceStat[] = [];
+  await discoverAnchors(ctx, env, profile, plan);
 
   for (const family of profile.sourceFamilies) {
     if (candidates.size >= MAX_MODE_LIMITS.setBuilderCandidateCap) {
       stats.push({
         source_family: family,
+        role: sourceRole(plan, family),
         rows_scanned: 0,
         rows_returned: 0,
         candidates_added: 0,
@@ -1933,19 +2666,29 @@ export async function buildMaxSetTool(
   const allCandidates = sortCandidates([...candidates.values()]).slice(0, MAX_MODE_LIMITS.setBuilderCandidateCap);
   const buckets = partitionCandidates(allCandidates);
   const excluded = sortCandidates([...excludedMap.values()]).slice(0, MAX_MODE_LIMITS.setBuilderCandidateCap);
+  const qualityGate = evaluateMaxSetQuality(plan, stats, buckets, excluded);
   const capFamilies = stats.filter(s => s.cap_hit).map(s => s.source_family);
   const gaps = [
+    ...qualityGate.reasons,
     ...capFamilies.map(f => `${f} hit the MAX row cap; rerun with narrower filters or pagination for full certainty.`),
     ...stats.flatMap(s => s.errors.map(e => `${s.source_family}: ${e}`)),
   ];
   const coverageRows = [
-    ['source_family', 'rows_scanned', 'rows_returned', 'candidates_added', 'body_fetches', 'documents_extracted', 'cap_hit', 'errors'],
-    ...stats.map(s => [s.source_family, s.rows_scanned, s.rows_returned, s.candidates_added, s.body_fetches || 0, s.documents_extracted || 0, s.cap_hit ? 'yes' : 'no', s.errors.join('; ')]),
+    ['quality_status', qualityGate.status],
+    ['quality_gate_passed', qualityGate.passed ? 'yes' : 'no'],
+    ['artifact_allowed', qualityGate.artifact_allowed ? 'yes' : 'no'],
+    ['artifact_suppressed_reason', qualityGate.artifact_suppressed_reason || ''],
+    ['quality_reasons', qualityGate.reasons.join(' | ')],
+    [],
+    ['source_family', 'role', 'rows_scanned', 'rows_returned', 'candidates_added', 'body_fetches', 'documents_extracted', 'cap_hit', 'errors'],
+    ...stats.map(s => [s.source_family, s.role || '', s.rows_scanned, s.rows_returned, s.candidates_added, s.body_fetches || 0, s.documents_extracted || 0, s.cap_hit ? 'yes' : 'no', s.errors.join('; ')]),
     [],
     ['run_id', runId],
     ['query', profile.query],
     ['task_type', profile.taskType],
     ['entity_kind', profile.entityKind],
+    ['membership_predicate', plan.membership_predicate],
+    ['anchors', plan.anchors.map(a => `${a.type}:${a.label}`).join(' | ')],
     ['include_terms', profile.includeTerms.join(', ')],
     ['domains', profile.domains.join(', ')],
   ];
@@ -1954,7 +2697,7 @@ export async function buildMaxSetTool(
   let artifactDocumentId: string | null = null;
   const totalReturned = buckets.confirmed.length + buckets.probable.length + buckets.needs_review.length;
   const shouldCreateArtifact = profile.wantsArtifact || totalReturned > 50;
-  if (shouldCreateArtifact) {
+  if (shouldCreateArtifact && qualityGate.artifact_allowed) {
     try {
       const artifact = await createDocumentArtifactTool(ctx, {
         kind: 'xlsx',
@@ -1977,13 +2720,16 @@ export async function buildMaxSetTool(
   }
 
   const latencyMs = Date.now() - t0;
-  await persistTelemetry(env, ctx, runId, profile, stats, buckets, excluded, artifactDocumentId, latencyMs)
+  await persistTelemetry(env, ctx, runId, profile, plan, stats, buckets, excluded, qualityGate, artifactDocumentId, latencyMs)
     .catch(error => console.warn('[max-set-builder] telemetry failed:', error?.message || error));
 
   return {
     run_id: runId,
     task_type: profile.taskType,
     entity_kind: profile.entityKind,
+    plan,
+    safety_status: qualityGate.status,
+    quality_gate: qualityGate,
     coverage: {
       source_families: profile.sourceFamilies,
       stats,
@@ -1994,6 +2740,8 @@ export async function buildMaxSetTool(
       total_candidates: totalReturned,
       excluded_count: excluded.length,
       latency_ms: latencyMs,
+      authoritative_candidate_count: [...buckets.confirmed, ...buckets.probable, ...buckets.needs_review]
+        .filter(c => c.evidence.some(e => plan.source_policy.authoritative.includes(e.source_family) && e.satisfies_membership)).length,
     },
     confirmed: buckets.confirmed,
     probable: buckets.probable,
@@ -2005,7 +2753,21 @@ export async function buildMaxSetTool(
     note: shouldCreateArtifact
       ? artifactCard
         ? 'Created an XLSX workbook with Confirmed, Probable, Needs Review, Excluded, and Coverage & Gaps tabs.'
-        : 'Attempted to create an XLSX workbook, but artifact creation failed; see gaps.'
+        : qualityGate.artifact_allowed
+          ? 'Attempted to create an XLSX workbook, but artifact creation failed; see gaps.'
+          : `No XLSX workbook was created because MAX marked this run ${qualityGate.status}: ${qualityGate.artifact_suppressed_reason || 'quality gate failed.'}`
       : 'No artifact was created because the result set was small and no export/mail-merge intent was detected.',
   };
 }
+
+export const __maxSetTestHooks = {
+  buildProfile,
+  chunkArray,
+  collectEmailEntries,
+  defaultSourceFamilies,
+  evaluateMaxSetQuality,
+  expandAliases,
+  extractPersonRowsFromTabularText,
+  planMaxSetJob,
+  sourcePolicyForTask,
+};

@@ -4,10 +4,10 @@ import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { CLAUDE_MODEL } from './claude';
 import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from './max-mode';
 
-export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-16-max-set-builder-v2-forced';
-export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-16-live-agent-max-set-builder-v2-forced';
+export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-16-max-exhaustive-job-system-v1';
+export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-16-live-agent-max-exhaustive-job-system-v1';
 export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v2';
-export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-16-agent-tools-max-set-builder-v2-forced';
+export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-16-agent-tools-max-exhaustive-job-system-v1';
 export const MARTY_ARTIFACT_RUNTIME_VERSION = '2026-05-15-office-artifacts-v1';
 
 export interface MartyRuntimeFingerprint {
@@ -118,10 +118,10 @@ ${scope}
 
 MAX mode is built for exhaustive database work, not just richer prose:
 - If the user asks for "all", "every", "list everyone", a mail merge/export, a count, all touchpoints, "ever talked to", or a broad roster of people/firms/startups, do not rely on the initial SOURCES list or recall() alone.
-- Use build_max_set for exhaustive rosters and set queries. It searches communications, events, campaigns, CRM entities, documents, and tasks; deduplicates entities; returns confirmed/probable/needs_review/excluded buckets; reports coverage/gaps; and creates XLSX files for large/export/mail-merge results.
+- Use build_max_set for exhaustive rosters and set queries. It plans the typed MAX job, applies source authority rules, deduplicates entities, returns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and creates XLSX files only when the quality gate says the set is safe to export.
 - Some exhaustive MAX turns include a FORCED MAX SET BUILDER RESULT injected before you answer. When present, that deterministic result supersedes initial SOURCES and recall samples.
 - Use sweep_conversations only as a lower-level fallback when you need a narrower communications-only pass after build_max_set.
-- If build_max_set reports caps_hit or gaps, surface those as real coverage limits. Do not write "I have enough coverage" while a source family is capped or errored.
+- If build_max_set reports safety_status=unsafe_incomplete, artifact_allowed=false, caps_hit, or gaps, surface those as real coverage limits. Do not write "I have enough coverage" while a source family is capped, errored, or blocked by the quality gate.
 - Treat missing Bcc/attachments/export files as explicit data boundaries, but only after build_max_set has swept the available rows. Do not install a tracker/export gap as the primary answer when available source families can answer the user.
 
 Then write a cited evidence memo:

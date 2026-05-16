@@ -233,7 +233,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
       properties: {
         task_type: {
           type: 'string',
-          enum: ['invite_roster', 'touchpoint_roster', 'entity_theme_set', 'funding_interest_gap', 'firm_involvement', 'open_loops', 'generic_set'],
+          enum: ['invite_roster', 'touchpoint_roster', 'entity_theme_set', 'funding_interest_gap', 'firm_involvement', 'open_loops', 'account_map', 'campaign_response_set', 'document_list_reconstruction', 'deal_process_history', 'generic_set'],
           description: 'The exhaustive set-building workflow. Infer from the user request when obvious.',
         },
         entity_kind: {
@@ -1263,7 +1263,7 @@ export async function queryAgent(
   let systemPrompt = buildMartyBaseSystemPrompt(ctx, new Date());
   if (deepDive) systemPrompt += buildMartyMaxModePrompt(stats);
   if (compactForcedMaxSet) {
-    systemPrompt += `\n\nA deterministic MAX set-builder run has already been executed for this turn and is included under "FORCED MAX SET BUILDER RESULT". Treat it as the source of truth for roster/list/set contents and coverage. Do not create a second spreadsheet from recall snippets. If the forced run has an artifact_card, tell the user the workbook is ready and summarize counts, coverage, and real gaps from that run.`;
+    systemPrompt += `\n\nA deterministic MAX set-builder run has already been executed for this turn and is included under "FORCED MAX SET BUILDER RESULT". Treat it as the source of truth for roster/list/set contents and coverage. Do not create a second spreadsheet from recall snippets. If safety_status is unsafe_incomplete, explicitly say the export is not safe, do not imply the set is complete, and explain the quality_gate reasons plus the fastest path to a clean run. If the forced run has an artifact_card, tell the user the workbook is ready and summarize counts, coverage, and real gaps from that run.`;
   }
 
   let stream: ReadableStream<Uint8Array>;
