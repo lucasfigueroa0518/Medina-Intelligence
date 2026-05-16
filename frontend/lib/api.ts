@@ -571,10 +571,10 @@ export const api = {
   renameSession: (id: string, title: string) =>
     request<{ ok: boolean }>(`/agent/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
   cancelAgentQuery: (request_id: string) =>
-    request<{ ok: boolean; local: boolean }>('/agent/cancel', {
+    request<{ ok: boolean; local: boolean; cancelled_rows?: number }>('/agent/cancel', {
       method: 'POST',
       body: JSON.stringify({ request_id }),
-    }).catch(() => ({ ok: false, local: false })),
+    }).catch(() => ({ ok: false, local: false, cancelled_rows: 0 })),
   logCitationClick: (payload: {
     message_id?: string;
     source_id: number;
@@ -1557,7 +1557,12 @@ export async function streamAgentQuery(
   onDone: () => void,
   onError: (err: string, opts?: { retryable?: boolean; code?: string; sessionId?: string | null; requestId?: string | null }) => void,
   onToolEvent?: (event: any) => void,
-  uploadIds?: string[]
+  uploadIds?: string[],
+  opts?: {
+    clientRequestId?: string;
+    interruptRequestId?: string | null;
+    abortSignal?: AbortSignal;
+  }
 ): Promise<void> {
   const form = new FormData();
   form.append('query', query);
@@ -1567,6 +1572,11 @@ export async function streamAgentQuery(
   if (file) form.append('file', file);
   if (deepDive) form.append('deep_dive', 'true');
   if (uploadIds && uploadIds.length > 0) form.append('upload_ids', JSON.stringify(uploadIds));
+  if (opts?.clientRequestId) form.append('client_request_id', opts.clientRequestId);
+  if (opts?.interruptRequestId) {
+    form.append('interrupt_request_id', opts.interruptRequestId);
+    form.append('interrupt_running', 'true');
+  }
 
   const token = getAuthToken();
 
@@ -1578,8 +1588,13 @@ export async function streamAgentQuery(
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: form,
+      signal: opts?.abortSignal,
     });
   } catch (e) {
+    if ((e as Error)?.name === 'AbortError' || opts?.abortSignal?.aborted) {
+      onError('Cancelled', { code: 'CLIENT_ABORT', retryable: false, sessionId, requestId: opts?.clientRequestId || opts?.interruptRequestId || null });
+      return;
+    }
     onError(`Network error: ${(e as Error).message || 'failed to connect'}`, { code: 'NETWORK_ERROR', sessionId });
     return;
   }
@@ -1662,6 +1677,10 @@ export async function streamAgentQuery(
       }
     }
   } catch (e) {
+    if ((e as Error)?.name === 'AbortError' || opts?.abortSignal?.aborted) {
+      onError('Cancelled', { code: 'CLIENT_ABORT', retryable: false, sessionId, requestId: opts?.clientRequestId || opts?.interruptRequestId || null });
+      return;
+    }
     onError(`Stream interrupted: ${(e as Error).message || 'connection lost'}`, { code: 'STREAM_INTERRUPTED', sessionId });
     return;
   }

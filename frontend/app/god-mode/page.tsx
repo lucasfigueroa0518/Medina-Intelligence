@@ -125,7 +125,7 @@ interface ToolCall {
   tool: string;
   input?: any;
   result?: any;
-  status: 'started' | 'executing' | 'done' | 'error';
+  status: 'started' | 'executing' | 'done' | 'error' | 'cancelled';
   collapsed: boolean;
   runs?: ToolRun[];
   activeRunId?: string;
@@ -136,7 +136,7 @@ interface ToolRun {
   id: string;
   input?: any;
   result?: any;
-  status: 'started' | 'executing' | 'done' | 'error';
+  status: 'started' | 'executing' | 'done' | 'error' | 'cancelled';
 }
 
 interface MartyDocumentCard {
@@ -383,7 +383,7 @@ function toolActionLabel(name: string): string {
 }
 
 function isTerminalToolStatus(status: ToolCall['status']): boolean {
-  return status === 'done' || status === 'error';
+  return status === 'done' || status === 'error' || status === 'cancelled';
 }
 
 function getToolRuns(tool: ToolCall): ToolRun[] {
@@ -399,6 +399,7 @@ function getToolRuns(tool: ToolCall): ToolRun[] {
 function aggregateToolStatus(runs: ToolRun[]): ToolCall['status'] {
   if (runs.some(run => run.status === 'executing')) return 'executing';
   if (runs.some(run => run.status === 'started')) return 'started';
+  if (runs.length > 0 && runs.every(run => run.status === 'cancelled')) return 'cancelled';
   if (runs.length > 0 && runs.every(run => run.status === 'error')) return 'error';
   return 'done';
 }
@@ -516,6 +517,24 @@ function upsertToolEvent(toolCalls: ToolCall[], event: any): ToolCall[] {
   return next;
 }
 
+function cancelRunningToolCalls(toolCalls: ToolCall[] | undefined): ToolCall[] | undefined {
+  if (!toolCalls?.length) return toolCalls;
+  return toolCalls.map(tool => {
+    const runs = getToolRuns(tool).map(run => (
+      isTerminalToolStatus(run.status)
+        ? run
+        : { ...run, status: 'cancelled' as const, result: { ...(run.result || {}), cancelled: true } }
+    ));
+    return {
+      ...tool,
+      status: aggregateToolStatus(runs),
+      runs,
+      activeRunId: undefined,
+      pulseKey: (tool.pulseKey || 0) + 1,
+    };
+  });
+}
+
 function toolStatusText(tool: ToolCall): string {
   const runs = getToolRuns(tool);
   const runCount = runs.length;
@@ -527,6 +546,7 @@ function toolStatusText(tool: ToolCall): string {
     return `${toolActionLabel(tool.tool)}${runCount > 1 ? ` · ${runCount} runs` : ''}${priorCount}...`;
   }
   if (tool.status === 'error') return runCount > 1 ? `${runCount} runs failed` : 'Failed';
+  if (tool.status === 'cancelled') return 'Stopped';
   if (totalCount !== null) return `Found ${totalCount} ${resultNoun(tool.tool)}${suffix}`;
   if ((tool.tool === 'create_document_artifact' || tool.tool === 'edit_document_artifact') && tool.result?.document?.file_name) {
     return tool.result.document.file_name;
@@ -734,6 +754,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
   const Icon = TOOL_ICONS[tool.tool] || FileText;
   const isRunning = tool.status === 'started' || tool.status === 'executing';
   const isError = tool.status === 'error';
+  const isCancelled = tool.status === 'cancelled';
   const isDone = tool.status === 'done';
   const runs = getToolRuns(tool);
   const totalCount = aggregateResultCount(tool);
@@ -741,6 +762,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
   return (
     <div className={`tool-slide-in rounded-lg border my-2 overflow-hidden transition-all ${
       isError ? 'border-semantic-error/30 bg-semantic-error/5' :
+      isCancelled ? 'border-text-muted/20 bg-white/[0.02]' :
       isRunning ? 'border-[#8B5CF6]/30 tool-shimmer' :
       'border-border bg-[#111114]/80 backdrop-blur-sm'
     }`}>
@@ -749,6 +771,8 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
           <MartyEmblem size={16} animate />
         ) : isError ? (
           <AlertCircle size={14} className="text-semantic-error shrink-0" />
+        ) : isCancelled ? (
+          <span className="h-3.5 w-3.5 rounded-[3px] bg-text-muted/70 shrink-0" />
         ) : (
           <CheckCircle2 size={14} className="text-semantic-success shrink-0 check-pop" />
         )}
@@ -767,7 +791,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
           </span>
         )}
         <span className={`text-[10px] ${
-          isError ? 'text-semantic-error' : isDone ? 'text-semantic-success' : 'text-text-muted'
+          isError ? 'text-semantic-error' : isDone ? 'text-semantic-success' : isCancelled ? 'text-text-muted' : 'text-text-muted'
         }`} style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
           {isDone && '\u2713 '}{toolStatusText(tool)}
         </span>
@@ -784,6 +808,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
                 <div className={`text-[10px] ${
                   run.status === 'error' ? 'text-semantic-error' :
                   run.status === 'done' ? 'text-semantic-success' :
+                  run.status === 'cancelled' ? 'text-text-muted' :
                   'text-text-muted'
                 }`}>
                   {run.status === 'done' && resultCountForRun(run) !== null
@@ -1000,6 +1025,8 @@ export default function GodModePage() {
   const activeSessionIdRef = React.useRef<string | null>(null);
   const streamSessionIdRef = React.useRef<string | null>(null);
   const streamRequestIdRef = React.useRef<string | null>(null);
+  const streamAssistantMessageIdRef = React.useRef<string | null>(null);
+  const streamAbortControllerRef = React.useRef<AbortController | null>(null);
   const sessionDraftsRef = React.useRef<Record<string, Message[]>>({});
   const messagesSnapshotRef = React.useRef<Message[]>([]);
   const streamingRef = React.useRef(false);
@@ -1029,13 +1056,49 @@ export default function GodModePage() {
   const activeRequestIdRef = React.useRef<string | null>(null);
   const cancelledLocallyRef = React.useRef(false);
 
-  const cancelActiveStream = React.useCallback(() => {
-    const reqId = activeSessionIdRef.current === streamSessionIdRef.current
-      ? streamRequestIdRef.current
-      : null;
-    if (!reqId) return;
+  const cancelActiveStream = React.useCallback((): string | null => {
+    const reqId = streamRequestIdRef.current;
+    const sessionId = streamSessionIdRef.current;
+    const assistantMessageId = streamAssistantMessageIdRef.current;
+    if (!reqId) return null;
     cancelledLocallyRef.current = true;
     api.cancelAgentQuery(reqId);
+    streamAbortControllerRef.current?.abort();
+
+    if (sessionId) {
+      const markCancelled = (current: Message[]) => current.map(msg => {
+        const isTarget = assistantMessageId ? msg.id === assistantMessageId : (msg.role === 'assistant' && msg.streaming);
+        if (!isTarget) return msg;
+        return {
+          ...msg,
+          content: msg.content || '_(stopped)_',
+          streaming: false,
+          cancelled: true,
+          toolCalls: cancelRunningToolCalls(msg.toolCalls),
+        };
+      });
+      const current = sessionDraftsRef.current[sessionId]
+        || (activeSessionIdRef.current === sessionId ? messagesSnapshotRef.current : []);
+      const next = markCancelled(current);
+      sessionDraftsRef.current = { ...sessionDraftsRef.current, [sessionId]: next };
+      if (activeSessionIdRef.current === sessionId) setMessages(next);
+    }
+
+    activeRequestIdRef.current = null;
+    streamRequestIdRef.current = null;
+    streamSessionIdRef.current = null;
+    streamAssistantMessageIdRef.current = null;
+    streamAbortControllerRef.current = null;
+    setStreamSessionId(null);
+    setIsThinking(false);
+    setStreaming(false);
+    pendingSessionIdRef.current = null;
+    liveSessionIdRef.current = null;
+    try {
+      localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+      window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+    } catch { /* ignore */ }
+    return reqId;
   }, []);
 
   // Global Esc / Cmd+Backspace cancel while streaming. Esc only fires when
@@ -1046,7 +1109,6 @@ export default function GodModePage() {
       if (
         !streamingRef.current
         || !streamRequestIdRef.current
-        || activeSessionIdRef.current !== streamSessionIdRef.current
       ) return;
       const target = e.target as HTMLElement | null;
       const inField = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
@@ -1264,6 +1326,7 @@ export default function GodModePage() {
       if (sessionIdForPending) {
         streamSessionIdRef.current = sessionIdForPending;
         streamRequestIdRef.current = runningMessage.pendingRequestId;
+        streamAssistantMessageIdRef.current = runningMessage.id;
         setStreamSessionId(sessionIdForPending);
       }
       if (!sessionIdForPending || activeSessionIdRef.current === sessionIdForPending) {
@@ -1287,6 +1350,7 @@ export default function GodModePage() {
     if (runningMessage?.pendingRequestId) {
       streamSessionIdRef.current = sessionId;
       streamRequestIdRef.current = runningMessage.pendingRequestId;
+      streamAssistantMessageIdRef.current = runningMessage.id;
       setStreamSessionId(sessionId);
       if (activeSessionIdRef.current === sessionId) {
         activeRequestIdRef.current = runningMessage.pendingRequestId;
@@ -1298,6 +1362,8 @@ export default function GodModePage() {
         activeRequestIdRef.current = null;
         streamRequestIdRef.current = null;
         streamSessionIdRef.current = null;
+        streamAssistantMessageIdRef.current = null;
+        streamAbortControllerRef.current = null;
         setStreamSessionId(null);
         setIsThinking(false);
         setStreaming(false);
@@ -1453,11 +1519,22 @@ export default function GodModePage() {
         setMessages(nextMessages);
         if (stillRunning?.pendingRequestId) {
           activeRequestIdRef.current = stillRunning.pendingRequestId;
+          streamSessionIdRef.current = activeSessionId;
+          streamRequestIdRef.current = stillRunning.pendingRequestId;
+          streamAssistantMessageIdRef.current = stillRunning.id;
+          setStreamSessionId(activeSessionId);
           setIsThinking(true);
           setStreaming(true);
           return;
         }
         activeRequestIdRef.current = null;
+        if (streamSessionIdRef.current === activeSessionId) {
+          streamRequestIdRef.current = null;
+          streamSessionIdRef.current = null;
+          streamAssistantMessageIdRef.current = null;
+          streamAbortControllerRef.current = null;
+          setStreamSessionId(null);
+        }
         setIsThinking(false);
         setStreaming(false);
         localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
@@ -1467,6 +1544,13 @@ export default function GodModePage() {
         if (isSessionNotFoundError(e)) {
           const missingSessionId = activeSessionId;
           activeRequestIdRef.current = null;
+          if (streamSessionIdRef.current === missingSessionId) {
+            streamRequestIdRef.current = null;
+            streamSessionIdRef.current = null;
+            streamAssistantMessageIdRef.current = null;
+            streamAbortControllerRef.current = null;
+            setStreamSessionId(null);
+          }
           setIsThinking(false);
           setStreaming(false);
           setActiveSessionId(current => current === missingSessionId ? null : current);
@@ -1565,11 +1649,20 @@ export default function GodModePage() {
   }
 
   const sendMessage = async (queryText: string) => {
-    if (!queryText || streaming) return;
+    const trimmedQuery = queryText.trim();
+    if (!trimmedQuery) return;
+
+    // Blue-chip interrupt behavior: a new prompt is an explicit steer. If any
+    // MARTy turn is currently running in this browser, stop it locally and ask
+    // the server to replace it with the new turn instead of making the user wait.
+    let interruptRequestId: string | null = null;
+    if (streamingRef.current && streamRequestIdRef.current) {
+      interruptRequestId = cancelActiveStream();
+    }
 
     // Trust the server before accepting a new turn. A previous Deep request can
-    // keep working after the browser stream has dropped; if so, resume polling
-    // that turn instead of appending duplicate optimistic messages.
+    // keep working after the browser stream has dropped; if so, treat this
+    // prompt as a server-side interrupt and continue with the replacement turn.
     if (!demoMode && activeSessionId) {
       try {
         const d = await api.getSessionMessages(activeSessionId);
@@ -1577,7 +1670,10 @@ export default function GodModePage() {
         const runningMessage = getRunningAssistantMessage(serverMessages);
         if (runningMessage?.pendingRequestId) {
           applyServerMessages(d.messages, activeSessionId);
-          return;
+          streamSessionIdRef.current = activeSessionId;
+          streamRequestIdRef.current = runningMessage.pendingRequestId;
+          streamAssistantMessageIdRef.current = runningMessage.id;
+          interruptRequestId = cancelActiveStream() || runningMessage.pendingRequestId;
         }
       } catch {
         // Existing recovery paths handle stale sessions below.
@@ -1585,7 +1681,8 @@ export default function GodModePage() {
     }
 
     setStreaming(true);
-    lastSentQueryRef.current = queryText;
+    cancelledLocallyRef.current = false;
+    lastSentQueryRef.current = trimmedQuery;
 
     // Fix 4: Set isThinking immediately on send
     setIsThinking(true);
@@ -1598,6 +1695,8 @@ export default function GodModePage() {
 
     const userMsgId = crypto.randomUUID();
     const assistantMsgId = crypto.randomUUID();
+    const clientRequestId = crypto.randomUUID();
+    const abortController = new AbortController();
     const now = new Date().toISOString();
 
     // Snapshot pending uploads for this turn — only those that finished
@@ -1607,11 +1706,14 @@ export default function GodModePage() {
       .map(u => u.summary!) as ChatUploadSummary[];
     const uploadIds = turnUploads.map(u => u.id);
 
+    const baseMessages = activeSessionId
+      ? (sessionDraftsRef.current[activeSessionId] || messagesSnapshotRef.current)
+      : messagesSnapshotRef.current;
     const optimisticMessages = [
-      ...messagesSnapshotRef.current,
-      { id: userMsgId, role: 'user', content: queryText, timestamp: now,
+      ...baseMessages,
+      { id: userMsgId, role: 'user', content: trimmedQuery, timestamp: now,
         attachments: turnUploads.length > 0 ? turnUploads : undefined },
-      { id: assistantMsgId, role: 'assistant', content: '', streaming: true, toolCalls: [], timestamp: now },
+      { id: assistantMsgId, role: 'assistant', content: '', streaming: true, toolCalls: [], timestamp: now, pendingRequestId: clientRequestId },
     ] as Message[];
     setMessages(optimisticMessages);
     setInput('');
@@ -1660,14 +1762,14 @@ export default function GodModePage() {
         const establishedAt = new Date().toISOString();
         upsertSessionInSidebar({
           ...created.session,
-          title: created.session.title || optimisticSessionTitle(queryText),
+          title: created.session.title || optimisticSessionTitle(trimmedQuery),
           last_activity_at: created.session.last_activity_at || establishedAt,
           created_at: created.session.created_at || establishedAt,
         });
         sessionDraftsRef.current = { ...sessionDraftsRef.current, [requestSessionId as string]: optimisticMessages };
         activeSessionIdRef.current = requestSessionId;
         setActiveSessionId(requestSessionId);
-        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId }));
+        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId, requestId: clientRequestId }));
         window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
       } else {
         upsertSessionInSidebar({
@@ -1679,11 +1781,21 @@ export default function GodModePage() {
         sessionDraftsRef.current = { ...sessionDraftsRef.current, [requestSessionId as string]: optimisticMessages };
       }
       streamSessionIdRef.current = requestSessionId;
+      streamRequestIdRef.current = clientRequestId;
+      streamAssistantMessageIdRef.current = assistantMsgId;
+      streamAbortControllerRef.current = abortController;
+      if (activeSessionIdRef.current === requestSessionId) {
+        activeRequestIdRef.current = clientRequestId;
+      }
       setStreamSessionId(requestSessionId);
       setStreaming(true);
+      try {
+        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId, requestId: clientRequestId }));
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+      } catch { /* ignore */ }
 
       await streamAgentQuery(
-        queryText, requestSessionId, null, null, file, isDeepDive,
+        trimmedQuery, requestSessionId, null, null, file, isDeepDive,
         token => {
           if (typeof token === 'string') {
             setIsThinking(false);
@@ -1693,31 +1805,37 @@ export default function GodModePage() {
           }
         },
         () => {
-          const wasCancelled = cancelledLocallyRef.current;
-          cancelledLocallyRef.current = false;
-          if (streamSessionIdRef.current === requestSessionId) {
+          const finishedCurrentStream = streamRequestIdRef.current === clientRequestId
+            || streamAssistantMessageIdRef.current === assistantMsgId;
+          const wasCancelled = !finishedCurrentStream || cancelledLocallyRef.current;
+          if (finishedCurrentStream) cancelledLocallyRef.current = false;
+          if (finishedCurrentStream && streamSessionIdRef.current === requestSessionId) {
             activeRequestIdRef.current = null;
             streamRequestIdRef.current = null;
             streamSessionIdRef.current = null;
+            streamAssistantMessageIdRef.current = null;
+            streamAbortControllerRef.current = null;
             setStreamSessionId(null);
           }
-          setIsThinking(false);
+          if (finishedCurrentStream) setIsThinking(false);
           updateSessionDraft(requestSessionId!, m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
             if (wasCancelled) {
               const placeholder = normalizeMartySentenceSpacing(msg.content || '_(cancelled before MARTy started generating)_');
-              return { ...msg, content: placeholder, streaming: false, cancelled: true };
+              return { ...msg, content: placeholder, streaming: false, pendingRequestId: undefined, cancelled: true, toolCalls: cancelRunningToolCalls(msg.toolCalls) };
             }
             if (!msg.content && (!msg.toolCalls || msg.toolCalls.length === 0)) {
-              return { ...msg, content: 'Something went wrong — no response was received. Please try again.', streaming: false, error: true };
+              return { ...msg, content: 'Something went wrong — no response was received. Please try again.', streaming: false, pendingRequestId: undefined, error: true };
             }
-            return { ...msg, content: normalizeMartySentenceSpacing(msg.content), streaming: false, justFinished: true };
+            return { ...msg, content: normalizeMartySentenceSpacing(msg.content), streaming: false, pendingRequestId: undefined, justFinished: true };
           }));
-          setStreaming(false);
-          pendingSessionIdRef.current = null;
-          liveSessionIdRef.current = null;
-          localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-          window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          if (finishedCurrentStream) {
+            setStreaming(false);
+            pendingSessionIdRef.current = null;
+            liveSessionIdRef.current = null;
+            localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          }
           api.listSessions().then(d => setSessions(d.sessions));
           setTimeout(() => {
             updateSessionDraft(requestSessionId!, m => m.map(msg =>
@@ -1726,12 +1844,49 @@ export default function GodModePage() {
           }, 1000);
         },
         (err, opts: AgentSendErrorOptions = {}) => {
+          const isCurrentStream = streamRequestIdRef.current === clientRequestId
+            || streamAssistantMessageIdRef.current === assistantMsgId
+            || (opts.requestId ? streamRequestIdRef.current === opts.requestId : false);
+          if (opts.code === 'CLIENT_ABORT' || cancelledLocallyRef.current) {
+            if (isCurrentStream) {
+              cancelledLocallyRef.current = false;
+              setIsThinking(false);
+            }
+            updateSessionDraft(requestSessionId!, m => m.map(msg =>
+              msg.id === assistantMsgId
+                ? {
+                    ...msg,
+                    content: msg.content || '_(stopped)_',
+                    streaming: false,
+                    pendingRequestId: undefined,
+                    cancelled: true,
+                    toolCalls: cancelRunningToolCalls(msg.toolCalls),
+                  }
+                : msg
+            ));
+            if (isCurrentStream) setStreaming(false);
+            if (isCurrentStream && streamSessionIdRef.current === requestSessionId) {
+              activeRequestIdRef.current = null;
+              streamRequestIdRef.current = null;
+              streamSessionIdRef.current = null;
+              streamAssistantMessageIdRef.current = null;
+              streamAbortControllerRef.current = null;
+              setStreamSessionId(null);
+            }
+            if (isCurrentStream) {
+              pendingSessionIdRef.current = null;
+              liveSessionIdRef.current = null;
+              localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+              window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+            }
+            return;
+          }
           const staleSession = opts.code === 'SESSION_NOT_FOUND' || err.includes('SESSION_NOT_FOUND') || err.includes('no longer exists');
           const serverMayHaveAcceptedTurn = Boolean(
             opts.sessionId
             && (opts.code === 'NETWORK_ERROR' || opts.code === 'STREAM_INTERRUPTED' || opts.code === 'AGENT_TURN_RUNNING')
           );
-          setIsThinking(false);
+          if (isCurrentStream) setIsThinking(false);
           updateSessionDraft(requestSessionId!, m => m.map(msg =>
             msg.id === assistantMsgId
               ? {
@@ -1742,19 +1897,22 @@ export default function GodModePage() {
                     ? 'That MARTy session was stale. I cleared it so you can retry in a clean session.'
                     : err),
                   streaming: false,
+                  pendingRequestId: undefined,
                   error: !msg.content,
                   retryable: opts?.retryable !== false,
                 }
               : msg
           ));
-          setStreaming(false);
-          if (streamSessionIdRef.current === requestSessionId) {
+          if (isCurrentStream) setStreaming(false);
+          if (isCurrentStream && streamSessionIdRef.current === requestSessionId) {
             activeRequestIdRef.current = null;
             streamRequestIdRef.current = null;
             streamSessionIdRef.current = null;
+            streamAssistantMessageIdRef.current = null;
+            streamAbortControllerRef.current = null;
             setStreamSessionId(null);
           }
-          if (serverMayHaveAcceptedTurn && opts.sessionId) {
+          if (isCurrentStream && serverMayHaveAcceptedTurn && opts.sessionId) {
             refreshSessionFromServer(opts.sessionId).catch(() => {
               updateSessionDraft(requestSessionId!, m => m.map(msg =>
                 msg.id === assistantMsgId
@@ -1775,10 +1933,12 @@ export default function GodModePage() {
             setBytesTotal(0);
             api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
           }
-          pendingSessionIdRef.current = null;
-          liveSessionIdRef.current = null;
-          localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-          window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          if (isCurrentStream) {
+            pendingSessionIdRef.current = null;
+            liveSessionIdRef.current = null;
+            localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          }
         },
         (event: any) => {
           if (event.type === 'session' && event.session_id) {
@@ -1791,7 +1951,7 @@ export default function GodModePage() {
                 sessionDraftsRef.current = nextDrafts;
               }
               requestSessionId = event.session_id;
-              upsertSessionInSidebar({ id: event.session_id, title: optimisticSessionTitle(queryText), last_activity_at: new Date().toISOString() });
+              upsertSessionInSidebar({ id: event.session_id, title: optimisticSessionTitle(trimmedQuery), last_activity_at: new Date().toISOString() });
               if (previousSessionId && activeSessionIdRef.current === previousSessionId) {
                 activeSessionIdRef.current = event.session_id;
                 setActiveSessionId(event.session_id);
@@ -1809,6 +1969,7 @@ export default function GodModePage() {
           }
           if (event.type === 'request' && event.request_id) {
             streamRequestIdRef.current = event.request_id;
+            streamAssistantMessageIdRef.current = assistantMsgId;
             if (activeSessionIdRef.current === requestSessionId) {
               activeRequestIdRef.current = event.request_id;
             }
@@ -1862,6 +2023,7 @@ export default function GodModePage() {
           }));
         },
         uploadIds.length > 0 ? uploadIds : undefined,
+        { clientRequestId, interruptRequestId, abortSignal: abortController.signal },
       );
     } catch (e) {
       setIsThinking(false);
@@ -1871,6 +2033,7 @@ export default function GodModePage() {
               ...msg,
               content: msg.content || ((e as Error).message || 'I ran into a problem with that question. Try again or rephrase.'),
               streaming: false,
+              pendingRequestId: undefined,
               error: !msg.content,
               retryable: true,
             }
@@ -1883,6 +2046,8 @@ export default function GodModePage() {
         activeRequestIdRef.current = null;
         streamRequestIdRef.current = null;
         streamSessionIdRef.current = null;
+        streamAssistantMessageIdRef.current = null;
+        streamAbortControllerRef.current = null;
         setStreamSessionId(null);
       }
       pendingSessionIdRef.current = null;
@@ -1905,7 +2070,8 @@ export default function GodModePage() {
   const isEmptyState = messages.length === 0;
   const hasInput = input.trim().length > 0;
   const activeSessionIsStreaming = Boolean(streaming && activeSessionId && activeSessionId === streamSessionId);
-  const canSend = hasInput && !streaming;
+  const showStopButton = activeSessionIsStreaming && !hasInput;
+  const canSend = hasInput;
 
   return (
     <div className="h-full flex overflow-hidden">
@@ -2390,7 +2556,7 @@ export default function GodModePage() {
               />
 
               {/* Send button — fixed 36x36 */}
-              {activeSessionIsStreaming ? (
+              {showStopButton ? (
                 <button
                   onClick={cancelActiveStream}
                   title="Stop generating (Esc, ⌘⌫)"
@@ -2411,7 +2577,7 @@ export default function GodModePage() {
                 <button
                   onClick={() => sendMessage(input)}
                   disabled={!canSend}
-                  title={streaming ? 'MARTy is finishing another conversation' : 'Send'}
+                  title={streaming ? 'Stop current response and send' : 'Send'}
                   className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
                   style={{
                     borderRadius: 10,

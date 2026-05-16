@@ -779,6 +779,13 @@ function normalizeSessionId(value: unknown): string | null {
   return trimmed;
 }
 
+function normalizeRequestId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === 'null' || trimmed === 'undefined') return null;
+  return /^[a-f0-9-]{16,80}$/i.test(trimmed) ? trimmed : null;
+}
+
 async function createAgentSessionRecord(
   ctx: AuthContext,
   env: Env,
@@ -964,6 +971,62 @@ async function getRunningAssistantTurn(
   return row || null;
 }
 
+async function markAgentTurnCancelled(
+  env: Env,
+  ctx: AuthContext,
+  opts: {
+    requestId?: string | null;
+    assistantMessageId?: string | null;
+    sessionId?: string | null;
+    reason?: string;
+  }
+): Promise<number> {
+  const now = new Date().toISOString();
+  const message = opts.reason || 'Stopped by user.';
+  const predicates = [
+    `m.role = 'assistant'`,
+    `json_extract(m.metadata, '$.status') = 'running'`,
+    `EXISTS (
+       SELECT 1
+       FROM agent_sessions s
+       LEFT JOIN users u ON u.id = s.user_id
+       WHERE s.id = m.session_id
+         AND s.org_id = ?
+         AND s.deleted_at IS NULL
+         AND (s.user_id = ? OR lower(u.email) = lower(?))
+     )`,
+  ];
+  const binds: any[] = [message, ctx.userId, now, ctx.orgId, ctx.userId, ctx.email || ''];
+  if (opts.requestId) {
+    predicates.push(`json_extract(m.metadata, '$.request_id') = ?`);
+    binds.push(opts.requestId);
+  }
+  if (opts.assistantMessageId) {
+    predicates.push(`m.id = ?`);
+    binds.push(opts.assistantMessageId);
+  }
+  if (opts.sessionId) {
+    predicates.push(`m.session_id = ?`);
+    binds.push(opts.sessionId);
+  }
+  if (!opts.requestId && !opts.assistantMessageId && !opts.sessionId) return 0;
+
+  const result = await env.D1.prepare(
+    `UPDATE agent_messages AS m
+        SET content = CASE WHEN trim(COALESCE(m.content, '')) = '' THEN ? ELSE m.content END,
+            metadata = json_set(
+              CASE WHEN json_valid(COALESCE(m.metadata, '{}')) THEN COALESCE(m.metadata, '{}') ELSE '{}' END,
+              '$.status', 'cancelled',
+              '$.cancelled', 1,
+              '$.cancelled_by', ?,
+              '$.cancelled_at', ?,
+              '$.retryable', 1
+            )
+      WHERE ${predicates.join(' AND ')}`
+  ).bind(...binds).run();
+  return Number(result.meta?.changes || 0);
+}
+
 async function reserveAgentTurn(
   env: Env,
   sessionId: string,
@@ -1137,6 +1200,7 @@ function createStreamingMaxSetResponse(args: {
   turnAttachments: UploadSummary[];
   sessionAttachments: Awaited<ReturnType<typeof assembleSessionAttachments>>;
   turnIndex: number;
+  signal?: AbortSignal;
 }): Response {
   const {
     ctx,
@@ -1150,6 +1214,7 @@ function createStreamingMaxSetResponse(args: {
     turnAttachments,
     sessionAttachments,
     turnIndex,
+    signal,
   } = args;
 
   const stream = new ReadableStream<Uint8Array>({
@@ -1169,6 +1234,7 @@ function createStreamingMaxSetResponse(args: {
           bytes_used: sessionAttachments.bytesUsed,
           bytes_total: sessionAttachments.bytesTotal,
         });
+        if (signal?.aborted) throw new Error('MARTy request cancelled');
         emit({ type: 'tool_call', tool: 'build_max_set', input, status: 'executing', forced: true });
 
         heartbeat = setInterval(() => {
@@ -1186,11 +1252,22 @@ function createStreamingMaxSetResponse(args: {
           }
         }, 15_000);
 
-        const result = await withTimeout(
-          buildMaxSetTool(ctx, input, env, { deepDive: true }),
+        const abortPromise = new Promise<never>((_, reject) => {
+          if (!signal) return;
+          if (signal.aborted) reject(new Error('MARTy request cancelled'));
+          else signal.addEventListener('abort', () => reject(new Error('MARTy request cancelled')), { once: true });
+        });
+        const result: any = await withTimeout(
+          Promise.race([
+            buildMaxSetTool(ctx, input, env, { deepDive: true }),
+            abortPromise,
+          ]),
           STREAMING_MAX_SET_TIMEOUT_MS,
           `Deep set-builder exceeded ${Math.round(STREAMING_MAX_SET_TIMEOUT_MS / 1000)}s before returning.`
         );
+        if (signal?.aborted || await wasCancelledIncludingKV(requestId, env)) {
+          throw new Error('MARTy request cancelled');
+        }
         if (heartbeat) clearInterval(heartbeat);
 
         const compact = compactMaxSetResultForContext(result);
@@ -1225,6 +1302,17 @@ function createStreamingMaxSetResponse(args: {
       } catch (error: any) {
         if (heartbeat) clearInterval(heartbeat);
         const message = String(error?.message || error);
+        if (signal?.aborted || /cancelled/i.test(message)) {
+          const finalText = '_(cancelled before MARTy finished the Deep set-builder run)_';
+          emit({ type: 'tool_result', tool: 'build_max_set', result: { cancelled: true }, status: 'cancelled', forced: true });
+          emit({ text: finalText });
+          await markAgentTurnCancelled(env, ctx, {
+            assistantMessageId,
+            sessionId: session.id,
+            reason: 'Stopped by user.',
+          }).catch(() => 0);
+          return;
+        }
         const finalText = [
           `Deep mode failed before it could return the set-builder result: ${message}`,
           '',
@@ -1443,11 +1531,17 @@ export async function cancelAgentRequest(
   if (!body?.request_id || typeof body.request_id !== 'string') {
     return errorResponse('VALIDATION_ERROR', 400, 'request_id required');
   }
-  const result = await cancelRequest(body.request_id, env);
+  const requestId = normalizeRequestId(body.request_id);
+  if (!requestId) return errorResponse('VALIDATION_ERROR', 400, 'valid request_id required');
+  const result = await cancelRequest(requestId, env);
+  const cancelledRows = await markAgentTurnCancelled(env, ctx, {
+    requestId,
+    reason: 'Stopped by user.',
+  }).catch(() => 0);
   // Audit the cancel for debugging — keeps a trace in case Lucas reports
   // "I clicked stop and nothing happened."
-  console.log(`[agent:cancel] request=${body.request_id} user=${ctx.userId} local=${result.local}`);
-  return jsonResponse({ ok: true, local: result.local });
+  console.log(`[agent:cancel] request=${requestId} user=${ctx.userId} local=${result.local} rows=${cancelledRows}`);
+  return jsonResponse({ ok: true, local: result.local, cancelled_rows: cancelledRows });
 }
 
 export async function getSessionTrace(
@@ -1480,6 +1574,9 @@ export async function queryAgent(
   let uploadedText: string | undefined;
   let deepDive = false;
   let uploadIds: string[] = [];
+  let clientRequestId: string | null = null;
+  let interruptRequestId: string | null = null;
+  let interruptRunning = false;
 
   if (contentType.includes('multipart/form-data')) {
     const form = await request.formData();
@@ -1488,6 +1585,9 @@ export async function queryAgent(
     contextEntityType = (form.get('context_entity_type') as string) || null;
     contextEntityId = (form.get('context_entity_id') as string) || null;
     deepDive = (form.get('deep_dive') as string) === 'true';
+    clientRequestId = normalizeRequestId(form.get('client_request_id'));
+    interruptRequestId = normalizeRequestId(form.get('interrupt_request_id'));
+    interruptRunning = (form.get('interrupt_running') as string) === 'true' || Boolean(interruptRequestId);
     // Legacy single-file path — kept until the multi-upload flow is verified
     // end-to-end. New clients should pre-upload via /api/agent/upload-file and
     // pass `upload_ids` instead.
@@ -1515,6 +1615,9 @@ export async function queryAgent(
     contextEntityType = body.context_entity_type || null;
     contextEntityId = body.context_entity_id || null;
     deepDive = !!body.deep_dive;
+    clientRequestId = normalizeRequestId(body.client_request_id);
+    interruptRequestId = normalizeRequestId(body.interrupt_request_id);
+    interruptRunning = !!body.interrupt_running || Boolean(interruptRequestId);
     if (Array.isArray(body.upload_ids)) {
       uploadIds = body.upload_ids.filter((x: unknown): x is string => typeof x === 'string');
     }
@@ -1571,22 +1674,36 @@ export async function queryAgent(
 
   const runningTurn = await getRunningAssistantTurn(session.id, env);
   if (runningTurn) {
-    return jsonResponse({
-      error: 'AGENT_TURN_RUNNING',
-      message: 'MARTy is already working on this session. I re-synced the conversation instead of starting a duplicate turn.',
-      retryable: false,
-      session_id: session.id,
-      request_id: runningTurn.request_id,
-      assistant_message_id: runningTurn.id,
-    }, 409);
+    const interruptMatches = interruptRunning
+      && (!interruptRequestId || runningTurn.request_id === interruptRequestId);
+    if (interruptMatches) {
+      if (runningTurn.request_id) {
+        await cancelRequest(runningTurn.request_id, env).catch(() => ({ local: false }));
+      }
+      await markAgentTurnCancelled(env, ctx, {
+        assistantMessageId: runningTurn.id,
+        sessionId: session.id,
+        reason: 'Stopped because the user sent a new prompt.',
+      }).catch(() => 0);
+      await repairAgentSessionTurnCount(session.id, env);
+    } else {
+      return jsonResponse({
+        error: 'AGENT_TURN_RUNNING',
+        message: 'MARTy is already working on this session. Send again to interrupt the current response, or press Stop first.',
+        retryable: false,
+        session_id: session.id,
+        request_id: runningTurn.request_id,
+        assistant_message_id: runningTurn.id,
+      }, 409);
+    }
   }
 
-  const turnIndex = await getNextAgentTurnIndex(session.id, env);
+  let turnIndex = await getNextAgentTurnIndex(session.id, env);
 
   // ---- Wave-1 cancellation: per-request AbortController ----
   // Create this before retrieval so the durable placeholder can expose a
   // cancellation handle even if the user navigates away before streaming starts.
-  const requestId = crypto.randomUUID();
+  const requestId = clientRequestId || crypto.randomUUID();
   const cancelController = registerActiveRequest(requestId);
 
   // --- Per-session attachment replay (Approach A + 50 MB cap) ---
@@ -1618,19 +1735,63 @@ export async function queryAgent(
       JSON.stringify({ status: 'running', request_id: requestId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
     );
   } catch (e) {
-    unregisterRequest(requestId);
     if (isAgentRunningReservationConflict(e)) {
       const activeTurn = await getRunningAssistantTurn(session.id, env);
-      return jsonResponse({
-        error: 'AGENT_TURN_RUNNING',
-        message: 'MARTy is already working on this session. I re-synced the conversation instead of starting a duplicate turn.',
-        retryable: false,
-        session_id: session.id,
-        request_id: activeTurn?.request_id || null,
-        assistant_message_id: activeTurn?.id || null,
-      }, 409);
+      const interruptMatches = interruptRunning
+        && activeTurn
+        && (!interruptRequestId || activeTurn.request_id === interruptRequestId);
+      if (interruptMatches) {
+        if (activeTurn.request_id) {
+          await cancelRequest(activeTurn.request_id, env).catch(() => ({ local: false }));
+        }
+        await markAgentTurnCancelled(env, ctx, {
+          assistantMessageId: activeTurn.id,
+          sessionId: session.id,
+          reason: 'Stopped because the user sent a new prompt.',
+        }).catch(() => 0);
+        await repairAgentSessionTurnCount(session.id, env);
+        turnIndex = await getNextAgentTurnIndex(session.id, env);
+        try {
+          await reserveAgentTurn(
+            env,
+            session.id,
+            userMessageId,
+            assistantMessageId,
+            turnIndex,
+            query,
+            attachmentsJson,
+            JSON.stringify({ status: 'running', request_id: requestId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
+          );
+        } catch (retryError) {
+          unregisterRequest(requestId);
+          if (isAgentRunningReservationConflict(retryError)) {
+            const stillActive = await getRunningAssistantTurn(session.id, env);
+            return jsonResponse({
+              error: 'AGENT_TURN_RUNNING',
+              message: 'MARTy is still stopping the previous response. Try again in a moment.',
+              retryable: true,
+              session_id: session.id,
+              request_id: stillActive?.request_id || null,
+              assistant_message_id: stillActive?.id || null,
+            }, 409);
+          }
+          throw retryError;
+        }
+      } else {
+        unregisterRequest(requestId);
+        return jsonResponse({
+          error: 'AGENT_TURN_RUNNING',
+          message: 'MARTy is already working on this session. Send again to interrupt the current response, or press Stop first.',
+          retryable: false,
+          session_id: session.id,
+          request_id: activeTurn?.request_id || null,
+          assistant_message_id: activeTurn?.id || null,
+        }, 409);
+      }
+    } else {
+      unregisterRequest(requestId);
+      throw e;
     }
-    throw e;
   }
 
   if (maxSetIntent.shouldBuild && maxSetIntent.input) {
@@ -1650,6 +1811,7 @@ export async function queryAgent(
       turnAttachments,
       sessionAttachments,
       turnIndex,
+      signal: cancelController.signal,
     });
   }
 
@@ -1698,6 +1860,31 @@ export async function queryAgent(
     }, 500);
   }
   const tRetrieve = Date.now() - t0;
+
+  if (cancelController.signal.aborted || await wasCancelledIncludingKV(requestId, env)) {
+    await markAgentTurnCancelled(env, ctx, {
+      assistantMessageId,
+      sessionId: session.id,
+      reason: 'Stopped by user.',
+    }).catch(() => 0);
+    unregisterRequest(requestId);
+    const cancelledStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encodeSseEvent({ type: 'session', session_id: session.id }));
+        controller.enqueue(encodeSseEvent({ type: 'request', request_id: requestId }));
+        controller.enqueue(encodeSseEvent({ text: '_(stopped)_' }));
+        controller.enqueue(encodeSseDone());
+        controller.close();
+      },
+    });
+    return new Response(cancelledStream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      },
+    });
+  }
 
   // --- Increment Deep mode quota only after retrieval succeeded ---
   if (ddKey) {

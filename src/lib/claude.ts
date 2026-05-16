@@ -99,6 +99,35 @@ export interface ToolDefinition {
 
 export type ToolExecutor = (name: string, input: any) => Promise<any>;
 
+function abortError(): Error {
+  const err = new Error('MARTy request cancelled');
+  err.name = 'AbortError';
+  return err;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      value => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      error => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
 export async function callClaudeStreaming(
   params: {
     system: string;
@@ -334,7 +363,9 @@ export async function callClaudeStreaming(
           await emit({ type: 'tool_call', tool: block.name, input: block.input, status: 'executing' });
 
           try {
-            const result = await params.onToolCall(block.name, block.input);
+            throwIfAborted(params.signal);
+            const result = await abortable(params.onToolCall(block.name, block.input), params.signal);
+            throwIfAborted(params.signal);
             const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
 
             if (result && typeof result === 'object' && Array.isArray((result as any).document_cards)) {
@@ -348,6 +379,10 @@ export async function callClaudeStreaming(
               content: resultStr,
             });
           } catch (e: any) {
+            if (e?.name === 'AbortError' || params.signal?.aborted) {
+              console.log('[claude-stream] tool execution aborted');
+              break;
+            }
             const errorResult = JSON.stringify({ error: e.message });
             await emit({ type: 'tool_result', tool: block.name, result: { error: e.message }, status: 'error' });
             toolResults.push({
@@ -359,6 +394,7 @@ export async function callClaudeStreaming(
           }
         }
 
+        if (params.signal?.aborted) break;
         messages.push({ role: 'user', content: toolResults });
         continue;
       }
