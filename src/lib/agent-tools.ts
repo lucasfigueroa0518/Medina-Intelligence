@@ -244,7 +244,7 @@ export async function searchConversations(
   }
 
   const limit = structuredLimit(input.limit, toolContext);
-  // Over-fetch so post-filter list still approximates `limit`. MAX mode gets
+  // Over-fetch so post-filter list still approximates `limit`. Deep mode gets
   // a larger fetch window while preserving the same post-filter privacy gate.
   const fetchLimit = toolContext.deepDive
     ? Math.min(limit * MAX_MODE_LIMITS.conversationOverfetchMultiplier, MAX_MODE_LIMITS.conversationFetchMax)
@@ -336,7 +336,7 @@ export async function searchConversations(
   return { conversations, count: conversations.length };
 }
 
-// MAX-mode deterministic conversation sweep. Unlike recall(), this is not a
+// Deep-mode deterministic conversation sweep. Unlike recall(), this is not a
 // top-N semantic retriever: it walks the conversations table with SQL filters
 // and returns large, structured row sets plus optional recipient aggregation.
 // This is the path for "all/every/list/export/count" questions where missing

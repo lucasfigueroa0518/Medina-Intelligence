@@ -109,17 +109,17 @@ export function buildMartyMaxModePrompt(stats?: {
   companies: number;
 }): string {
   const scope = stats
-    ? `MAX: Initial retrieval surfaced ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts before tool sweeps.`
-    : 'MAX: Starting from the broad Medina retrieval context; tool sweeps define exhaustive coverage.';
-  return `\n\nYou are in MAX mode, powered by Claude Opus 4.7 for a maximum sweep across the user's permitted Medina data.
+    ? `Deep: Initial retrieval surfaced ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts before tool sweeps.`
+    : 'Deep: Starting from the broad Medina retrieval context; tool sweeps define exhaustive coverage.';
+  return `\n\nYou are in Deep mode, powered by Claude Opus 4.7 for a maximum sweep across the user's permitted Medina data.
 
 Begin your response with one brief scope line. If you used sweep_conversations or another structured sweep, report the actual sweep coverage and aggregation counts from the tool result. If you did not use a sweep, use:
 ${scope}
 
-MAX mode is built for exhaustive database work, not just richer prose:
+Deep mode is built for exhaustive database work, not just richer prose:
 - If the user asks for "all", "every", "list everyone", a mail merge/export, a count, all touchpoints, "ever talked to", or a broad roster of people/firms/startups, do not rely on the initial SOURCES list or recall() alone.
-- Use build_max_set for exhaustive rosters and set queries. It plans the typed MAX job, applies source authority rules, deduplicates entities, returns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and creates XLSX files only when the quality gate says the set is safe to export.
-- Some exhaustive MAX turns include a FORCED MAX SET BUILDER RESULT injected before you answer. When present, that deterministic result supersedes initial SOURCES and recall samples.
+- Use build_max_set for exhaustive rosters and set queries. It plans the typed Deep job, applies source authority rules, deduplicates entities, returns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and creates XLSX files only when the quality gate says the set is safe to export.
+- Some exhaustive Deep turns include a FORCED DEEP SET BUILDER RESULT injected before you answer. When present, that deterministic result supersedes initial SOURCES and recall samples.
 - Use sweep_conversations only as a lower-level fallback when you need a narrower communications-only pass after build_max_set.
 - If build_max_set reports safety_status=unsafe_incomplete, artifact_allowed=false, caps_hit, or gaps, surface those as real coverage limits. Do not write "I have enough coverage" while a source family is capped, errored, or blocked by the quality gate.
 - Treat missing Bcc/attachments/export files as explicit data boundaries, but only after build_max_set has swept the available rows. Do not install a tracker/export gap as the primary answer when available source families can answer the user.

@@ -79,7 +79,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           items: { type: 'string', enum: ['email', 'slack', 'meeting', 'document'] },
           description: 'Filter to specific source types. Use this when the user asked about a specific channel (Slack, email, meetings, docs). Default: all types.',
         },
-        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 50. Max 50.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in Deep mode default 50. Max 50.' },
       },
       required: ['query'],
     },
@@ -155,7 +155,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         keyword: { type: 'string', description: 'Search by name, email, or company name' },
         contact_type: { type: 'string', enum: ['individual', 'family', 'institutional_investor', 'company'] },
         has_followup_overdue: { type: 'boolean', description: 'Only show contacts with overdue follow-ups' },
-        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in Deep mode default 100. Max 50 normally, 200 in Deep mode.' },
       },
     },
   },
@@ -168,7 +168,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         keyword: { type: 'string', description: 'Search by name, domain, or description' },
         company_type: { type: 'string' },
         sector: { type: 'string' },
-        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in Deep mode default 100. Max 50 normally, 200 in Deep mode.' },
       },
     },
   },
@@ -181,13 +181,13 @@ const AGENT_TOOLS: ToolDefinition[] = [
         keyword: { type: 'string', description: 'Search by title or company name' },
         stage: { type: 'string', description: 'Filter by stage: prospect, initial_contact, due_diligence, term_sheet, negotiation, closed_won, closed_lost, on_hold' },
         company_id: { type: 'string' },
-        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in Deep mode default 100. Max 50 normally, 200 in Deep mode.' },
       },
     },
   },
   {
     name: 'search_conversations',
-    description: 'Search emails, Slack messages, and meeting transcripts stored in the CRM. Use this for normal communication lookup. In MAX mode, prefer sweep_conversations for exhaustive all/every/list/export/count jobs.',
+    description: 'Search emails, Slack messages, and meeting transcripts stored in the CRM. Use this for normal communication lookup. In Deep mode, prefer sweep_conversations for exhaustive all/every/list/export/count jobs.',
     input_schema: {
       type: 'object',
       properties: {
@@ -195,14 +195,14 @@ const AGENT_TOOLS: ToolDefinition[] = [
         source: { type: 'string', enum: ['outlook', 'slack', 'firefly', 'all'], description: 'Filter by communication channel. Default: all' },
         contact_id: { type: 'string', description: 'Filter conversations involving a specific contact' },
         direction: { type: 'string', enum: ['inbound', 'outbound', 'all'], description: 'Filter by direction. Default: all' },
-        days_back: { type: 'number', description: 'How many days back to search. Default: 30, or 365 in MAX mode.' },
-        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 250. Max 50 normally, 1000 in MAX mode.' },
+        days_back: { type: 'number', description: 'How many days back to search. Default: 30, or 365 in Deep mode.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in Deep mode default 250. Max 50 normally, 1000 in Deep mode.' },
       },
     },
   },
   {
     name: 'sweep_conversations',
-    description: 'MAX-mode deterministic sweep over the conversations table for exhaustive all/every/list/export/count tasks. Use this instead of recall when the user needs a broad roster or aggregation across many touchpoints, such as invite lists, all Bank of America touchpoints, everyone who showed funding interest, or every startup mention in a sector. It can return hundreds of SQL-filtered rows and optionally deduplicate To/Cc recipients. Use a few high-signal terms like event name/company/sector, plus exact sender/date filters when known; do not pass the whole user request as the only search strategy if better filters are available.',
+    description: 'Deep-mode deterministic sweep over the conversations table for exhaustive all/every/list/export/count tasks. Use this instead of recall when the user needs a broad roster or aggregation across many touchpoints, such as invite lists, all Bank of America touchpoints, everyone who showed funding interest, or every startup mention in a sector. It can return hundreds of SQL-filtered rows and optionally deduplicate To/Cc recipients. Use a few high-signal terms like event name/company/sector, plus exact sender/date filters when known; do not pass the whole user request as the only search strategy if better filters are available.',
     input_schema: {
       type: 'object',
       properties: {
@@ -218,16 +218,16 @@ const AGENT_TOOLS: ToolDefinition[] = [
         days_back: { type: 'number', description: 'Optional relative lookback. Omit for all-time sweeps.' },
         include_recipients: { type: 'boolean', description: 'When true, deduplicates To/Cc recipients into first_name/email rows for mail merges.' },
         include_body: { type: 'boolean', description: 'When true, fetches fuller R2 body excerpts for returned rows. Keep false for pure recipient/export sweeps.' },
-        body_fetch_limit: { type: 'number', description: 'Max full bodies to fetch when include_body is true. Default 80, max 200 in MAX mode.' },
+        body_fetch_limit: { type: 'number', description: 'Max full bodies to fetch when include_body is true. Default 80, max 200 in Deep mode.' },
         exclude_domains: { type: 'array', items: { type: 'string' }, description: 'Optional recipient domains to exclude from rollup, e.g. medinavc.com.' },
-        limit: { type: 'number', description: 'Rows to return. Default 300 in MAX mode, max 1000.' },
+        limit: { type: 'number', description: 'Rows to return. Default 300 in Deep mode, max 1000.' },
         offset: { type: 'number', description: 'Pagination offset. If has_more is true, call again with the next offset before finalizing exhaustive answers.' },
       },
     },
   },
   {
     name: 'build_max_set',
-    description: 'MAX-only exhaustive set builder for all/every/list/export/count/touchpoint/ever-involved questions. Prefer this over recall and lower-level sweeps whenever the user needs a complete roster or broad aggregation across communications, events, campaigns, CRM entities, documents, and tasks. It deduplicates candidates, assigns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and auto-creates an XLSX for large or export/mail-merge outputs.',
+    description: 'Deep-only exhaustive set builder for all/every/list/export/count/touchpoint/ever-involved questions. Prefer this over recall and lower-level sweeps whenever the user needs a complete roster or broad aggregation across communications, events, campaigns, CRM entities, documents, and tasks. It deduplicates candidates, assigns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and auto-creates an XLSX for large or export/mail-merge outputs.',
     input_schema: {
       type: 'object',
       properties: {
@@ -985,7 +985,7 @@ function titleFromQuery(query: string): string {
     .replace(/\s+/g, ' ')
     .replace(/^(please|can you|could you|i need you to|i need to)\s+/i, '')
     .trim();
-  if (!cleaned) return 'MARTy MAX Request';
+  if (!cleaned) return 'MARTy Deep Request';
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1, 80);
 }
 
@@ -1004,7 +1004,7 @@ function formatSourceStats(result: any): string {
 function formatMaxSetAnswer(result: any, elapsedMs: number): string {
   if (result?.error) {
     return [
-      `MAX set-builder failed before it could complete: ${result.error}`,
+      `Deep set-builder failed before it could complete: ${result.error}`,
       '',
       'I did not create an export because the deterministic set-builder did not return a safe result.',
     ].join('\n');
@@ -1020,14 +1020,14 @@ function formatMaxSetAnswer(result: any, elapsedMs: number): string {
   const gaps = Array.isArray(result?.gaps) ? result.gaps.filter(Boolean).slice(0, 8) : [];
 
   const lines = [
-    `MAX set-builder finished in ${Math.round(elapsedMs / 1000)}s.`,
+    `Deep set-builder finished in ${Math.round(elapsedMs / 1000)}s.`,
     '',
     `Status: **${safety}**`,
     `Counts: **${confirmed} confirmed**, **${probable} probable**, **${needsReview} needs review**, **${excluded} excluded**.`,
   ];
 
   if (artifact) {
-    lines.push('', `Workbook: **${artifact.title || 'MAX export'}** is ready in the card above.`);
+    lines.push('', `Workbook: **${artifact.title || 'Deep export'}** is ready in the card above.`);
   } else if (gate.artifact_allowed === false || result?.note) {
     lines.push('', `Artifact: ${gate.artifact_suppressed_reason || result.note || 'No workbook was created.'}`);
   }
@@ -1145,7 +1145,7 @@ function createStreamingMaxSetResponse(args: {
         const result = await withTimeout(
           buildMaxSetTool(ctx, input, env, { deepDive: true }),
           STREAMING_MAX_SET_TIMEOUT_MS,
-          `MAX set-builder exceeded ${Math.round(STREAMING_MAX_SET_TIMEOUT_MS / 1000)}s before returning.`
+          `Deep set-builder exceeded ${Math.round(STREAMING_MAX_SET_TIMEOUT_MS / 1000)}s before returning.`
         );
         if (heartbeat) clearInterval(heartbeat);
 
@@ -1182,7 +1182,7 @@ function createStreamingMaxSetResponse(args: {
         if (heartbeat) clearInterval(heartbeat);
         const message = String(error?.message || error);
         const finalText = [
-          `MAX mode failed before it could return the set-builder result: ${message}`,
+          `Deep mode failed before it could return the set-builder result: ${message}`,
           '',
           'I did not create an export because the run did not complete safely.',
         ].join('\n');
@@ -1508,7 +1508,7 @@ export async function queryAgent(
     ).bind(session.id, ...uploadIds, ctx.userId, session.id).run().catch(() => {});
   }
 
-  // --- MAX mode rate limiting (check only — increment moved post-retrieval) ---
+  // --- Deep mode rate limiting (check only — increment moved post-retrieval) ---
   const retrievalOptions: RetrievalOptions = { deepDive };
   const ddKey = deepDive
     ? `deep_dive:${ctx.userId}:${new Date().toISOString().slice(0, 13)}`
@@ -1517,8 +1517,8 @@ export async function queryAgent(
     const ddCount = parseInt(await env.KV.get(ddKey) || '0');
     if (ddCount >= 10) {
       return jsonResponse({
-        error: 'MAX mode limit reached',
-        message: "You've hit your hourly MAX mode limit. Try again in a few minutes — normal queries still work.",
+        error: 'Deep mode limit reached',
+        message: "You've hit your hourly Deep mode limit. Try again in a few minutes — Agile queries still work.",
         retryable: false,
       }, 429);
     }
@@ -1558,7 +1558,7 @@ export async function queryAgent(
   const attachmentsJson = turnAttachments.length > 0 ? JSON.stringify(turnAttachments) : '[]';
 
   // Save the user turn before expensive retrieval/model work and reserve the
-  // next two turn indexes immediately. Without this, a disconnected MAX run
+    // next two turn indexes immediately. Without this, a disconnected Deep run
   // can leave turn_count stale and later retries will duplicate turn indexes.
   const userMessageId = crypto.randomUUID();
   const assistantMessageId = crypto.randomUUID();
@@ -1655,7 +1655,7 @@ export async function queryAgent(
   }
   const tRetrieve = Date.now() - t0;
 
-  // --- Increment MAX mode quota only after retrieval succeeded ---
+  // --- Increment Deep mode quota only after retrieval succeeded ---
   if (ddKey) {
     const ddCount = parseInt(await env.KV.get(ddKey) || '0');
     await env.KV.put(ddKey, String(ddCount + 1), { expirationTtl: 7200 }).catch(() => {});
@@ -1720,7 +1720,7 @@ export async function queryAgent(
       forcedMaxSetResult = await withTimeout(
         buildMaxSetTool(ctx, maxSetIntent.input, env, { deepDive: true }),
         FORCED_MAX_SET_TIMEOUT_MS,
-        `Forced MAX set-builder exceeded ${Math.round(FORCED_MAX_SET_TIMEOUT_MS / 1000)}s before returning.`
+        `Forced Deep set-builder exceeded ${Math.round(FORCED_MAX_SET_TIMEOUT_MS / 1000)}s before returning.`
       );
       compactForcedMaxSet = compactMaxSetResultForContext(forcedMaxSetResult);
       if (Array.isArray(forcedMaxSetResult?.document_cards) && forcedMaxSetResult.document_cards.length > 0) {
@@ -1736,7 +1736,7 @@ export async function queryAgent(
     } catch (error: any) {
       compactForcedMaxSet = {
         error: String(error?.message || error),
-        instruction: 'The forced MAX set-builder failed. Do not fabricate a complete roster from recall snippets; report the failure and the available retrieval coverage.',
+        instruction: 'The forced Deep set-builder failed. Do not fabricate a complete roster from recall snippets; report the failure and the available retrieval coverage.',
       };
       preludeEvents.push({
         type: 'tool_result',
@@ -1749,7 +1749,7 @@ export async function queryAgent(
   }
 
   const maxSetContext = compactForcedMaxSet
-    ? `\n\n--- FORCED MAX SET BUILDER RESULT ---\n${JSON.stringify(compactForcedMaxSet, null, 2)}\n--- END FORCED MAX SET BUILDER RESULT ---`
+    ? `\n\n--- FORCED DEEP SET BUILDER RESULT ---\n${JSON.stringify(compactForcedMaxSet, null, 2)}\n--- END FORCED DEEP SET BUILDER RESULT ---`
     : '';
 
   const userText = `${contextBlock}${maxSetContext}\n\n--- QUERY ---\n${query}`;
@@ -1771,7 +1771,7 @@ export async function queryAgent(
   let systemPrompt = buildMartyBaseSystemPrompt(ctx, new Date());
   if (deepDive) systemPrompt += buildMartyMaxModePrompt(stats);
   if (compactForcedMaxSet) {
-    systemPrompt += `\n\nA deterministic MAX set-builder run has already been executed for this turn and is included under "FORCED MAX SET BUILDER RESULT". Treat it as the source of truth for roster/list/set contents and coverage. Do not create a second spreadsheet from recall snippets. If safety_status is unsafe_incomplete, explicitly say the export is not safe, do not imply the set is complete, and explain the quality_gate reasons plus the fastest path to a clean run. If the forced run has an artifact_card, tell the user the workbook is ready and summarize counts, coverage, and real gaps from that run.`;
+    systemPrompt += `\n\nA deterministic Deep set-builder run has already been executed for this turn and is included under "FORCED DEEP SET BUILDER RESULT". Treat it as the source of truth for roster/list/set contents and coverage. Do not create a second spreadsheet from recall snippets. If safety_status is unsafe_incomplete, explicitly say the export is not safe, do not imply the set is complete, and explain the quality_gate reasons plus the fastest path to a clean run. If the forced run has an artifact_card, tell the user the workbook is ready and summarize counts, coverage, and real gaps from that run.`;
   }
 
   let stream: ReadableStream<Uint8Array>;
@@ -1792,7 +1792,7 @@ export async function queryAgent(
             return Promise.resolve({
               ok: false,
               error: 'MAX_SET_ARTIFACT_ALREADY_CREATED',
-              message: 'A deterministic build_max_set workbook already exists for this exhaustive MAX query. Use that artifact instead of creating a model-authored duplicate from recall snippets.',
+              message: 'A deterministic build_max_set workbook already exists for this exhaustive Deep query. Use that artifact instead of creating a model-authored duplicate from recall snippets.',
               document_cards: forcedMaxSetResult.document_cards || [],
               max_set_run_id: forcedMaxSetResult.run_id,
             });

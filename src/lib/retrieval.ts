@@ -1453,7 +1453,7 @@ export async function retrieveContext(
   // We use returnMetadata='all' here for ACL filtering (visibility, participant_user_ids,
   // user_id, reconciliation_status — none of which are indexed) and for chunk hydration
   // (r2_key, chunk_index, text_preview — also not indexed). So 50 is our ceiling.
-  // MAX mode's real value comes from per-entity boosts, document-type queries, and
+  // Deep mode's real value comes from per-entity boosts, document-type queries, and
   // cross-entity bridging — not raw broad topK. (See: VECTOR_QUERY_ERROR 40025)
   // TODO: to raise broad topK above 50, declare metadata indexes for the four ACL fields,
   // re-upsert all existing vectors (Vectorize indexes are not retroactive), refactor
@@ -1895,7 +1895,7 @@ export async function crossEncoderRerank(
     const scoresArr: Array<{ id: number; score: number }> = [];
     for (let offset = 0; offset < chunks.length; offset += batchSize) {
       // BGE reranker accepts up to ~16K tokens of context combined; cap each
-      // chunk at ~500 tokens and score large MAX-mode sets in batches.
+      // chunk at ~500 tokens and score large Deep-mode sets in batches.
       const batch = chunks.slice(offset, offset + batchSize);
       const contexts = batch.map(c => ({
         text: truncateToTokens(c.hydrated_text, 500),
