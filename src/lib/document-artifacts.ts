@@ -88,6 +88,11 @@ const MIME_BY_KIND: Record<ArtifactKind, string> = {
   pdf: 'application/pdf',
 };
 
+const DOCX_PAGE_MARGIN_DXA = 1080;
+const DOCX_TABLE_WIDTH_DXA = 9360;
+const DOCX_CALLOUT_INDENT_DXA = 540;
+const DOCX_CALLOUT_BORDER_SPACE = 14;
+
 function clampLimit(limit: unknown, fallback = 8): number {
   const n = typeof limit === 'number' && Number.isFinite(limit) ? Math.floor(limit) : fallback;
   return Math.min(Math.max(n, 1), 20);
@@ -670,6 +675,65 @@ function allSheetRows(content: any): any[][] {
   return rows;
 }
 
+function rawMarkupLeakDetected(text: string): boolean {
+  return /<\/?(?:w|a|r|wp|xml|table|thead|tbody|tr|td|th):?\b/i.test(text)
+    || /&lt;\/?(?:w|a|r|wp|xml|table|thead|tbody|tr|td|th):?\b/i.test(text);
+}
+
+function sectionTextParts(section: any): string[] {
+  const parts: string[] = [];
+  if (section?.summary) parts.push(String(section.summary));
+  for (const p of asArray(section?.paragraphs)) parts.push(String(p));
+  for (const b of asArray(section?.bullets)) parts.push(String(b));
+  for (const n of asArray(section?.numbered)) parts.push(String(n));
+  for (const c of asArray(section?.checklist)) parts.push(String(c));
+  for (const table of tablesFrom(section?.tables || section?.table)) {
+    if (table.title) parts.push(table.title);
+    parts.push(...table.headers);
+    for (const row of table.rows) parts.push(...row.map(cleanArtifactText));
+  }
+  return parts.map(cleanArtifactText).filter(Boolean);
+}
+
+function docLikeQualityIssues(kind: ArtifactKind, content: any, text: string): string[] {
+  const issues: string[] = [];
+  if (rawMarkupLeakDetected(text)) {
+    issues.push(`${kind.toUpperCase()} contains raw markup instead of clean document content`);
+  }
+  const sections = asArray(content?.sections);
+  const emptyHeadings: string[] = [];
+  const promiseOnlyHeadings: string[] = [];
+  for (const section of sections) {
+    const heading = cleanArtifactText(section?.heading);
+    if (!heading) continue;
+    const parts = sectionTextParts(section);
+    const bodyText = parts.join(' ');
+    const tableCount = tablesFrom(section?.tables || section?.table).length;
+    const listCount = asArray(section?.bullets).length
+      + asArray(section?.numbered).length
+      + asArray(section?.checklist).length;
+    if (parts.length === 0 && tableCount === 0) {
+      emptyHeadings.push(heading);
+      continue;
+    }
+    const promisesSpecificList = /\b(these are|there are|below are|following are)\b.*\b(two|three|four|five|several|key|main|primary|critical)\b/i.test(bodyText);
+    if (promisesSpecificList && listCount === 0 && tableCount === 0 && parts.length <= 1) {
+      promiseOnlyHeadings.push(heading);
+    }
+  }
+  if (emptyHeadings.length > 0) {
+    issues.push(`${kind.toUpperCase()} has empty section headings: ${emptyHeadings.slice(0, 3).join(', ')}`);
+  }
+  if (promiseOnlyHeadings.length > 0) {
+    issues.push(`${kind.toUpperCase()} has setup-only sections that promise details but do not list them: ${promiseOnlyHeadings.slice(0, 3).join(', ')}`);
+  }
+  const summary = cleanArtifactText(content?.summary);
+  if (summary.length > 700) {
+    issues.push(`${kind.toUpperCase()} lead summary is too long for the callout; move detail into the executive summary`);
+  }
+  return issues;
+}
+
 function contentQualityIssues(kind: ArtifactKind, content: any): string[] {
   const issues: string[] = [];
   const text = plainTextFromStructured(content).trim();
@@ -722,6 +786,7 @@ function contentQualityIssues(kind: ArtifactKind, content: any): string[] {
   if (text.length < 450) issues.push(`${kind.toUpperCase()} content is too thin`);
   if (sectionCount + paragraphCount < 4) issues.push(`${kind.toUpperCase()} needs more structured sections or paragraphs`);
   if (kind === 'docx' && sectionCount === 0 && tableCount === 0) issues.push('DOCX needs sections or tables');
+  issues.push(...docLikeQualityIssues(kind, content, text));
   return issues;
 }
 
@@ -829,9 +894,11 @@ Your job is to turn a weak draft into a fully usable, polished business artifact
 
 Quality bar:
 - No title-only or placeholder artifacts.
+- No empty headings, placeholder sections, raw XML/HTML/markdown table markup, or section titles that promise detail without delivering it.
 - Use concrete headings, useful body copy, and skimmable structure.
 - Preserve any facts supplied by the draft or source context. Do not invent external facts.
 - If source facts are limited, create a high-quality editable template with clear placeholders and next-step fields instead of a blank file.
+- For investment, diligence, board, risk, or deal memos, include a decision-ready executive summary, evidence-backed key facts, risk/concern register, open questions, owners/actions, and a source/gaps note when possible.
 
 Schemas:
 - docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]}
@@ -839,7 +906,7 @@ Schemas:
 - xlsx: {"sheets":[{"name":"","title":"","rows":[[]]}]}
 
 Minimum richness:
-- docx/pdf: 5-8 sections, include at least one table or checklist when useful.
+- docx/pdf: 5-8 substantive sections, concise lead summary, at least one useful table or checklist when helpful, and every section must have body content.
 - pptx: 6-10 slides, one idea per slide, Medina-dark executive style, speaker notes, and at least three visual evidence surfaces (tables, metrics, matrices, or evidence blocks).
 - xlsx: 2-4 sheets with headers, usable rows, and formulas where natural.`;
   const user = `Artifact kind: ${kind}
@@ -873,11 +940,13 @@ The previous artifact request failed validation. Repair it into a real structure
 Hard requirements:
 - Never return plain prose as the root object.
 - Never return a title/content dump for spreadsheets.
+- Never return empty headings, placeholder sections, raw XML/HTML/markdown table markup, or a section that says "these are the three..." without listing the actual items.
 - Preserve user-provided facts; if facts are limited, create a polished editable template with useful fields.
 - No unsupported external facts.
+- For investment, diligence, board, risk, or deal memos, include a decision-ready executive summary, evidence-backed key facts, risk/concern register, open questions, owners/actions, and a source/gaps note when possible.
 
 Required schemas:
-- docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]}
+- docx/pdf: {"subtitle":"","summary":"","metadata":[{"label":"","value":""}],"sections":[{"heading":"","paragraphs":[],"bullets":[],"numbered":[],"checklist":[],"tables":[{"title":"","headers":[],"rows":[[]]}]}]} with every section populated.
 - xlsx: {"sheets":[{"name":"","title":"","rows":[[]]}]} with 2-4 sheets, headers, meaningful rows, and formulas where useful.
 - pptx: {"subtitle":"","slides":[{"layout":"cover|executive_summary|evidence|matrix|timeline|risk|next_steps","title":"","headline":"","subtitle":"","takeaway":"","body":"","bullets":[],"evidence_blocks":[],"metrics":[{"label":"","value":"","context":""}],"table":{"headers":[],"rows":[[]]},"speaker_notes":""}]} with 6-10 slides, at least three visual evidence surfaces, and speaker notes.`;
   const user = `Artifact kind: ${kind}
@@ -980,27 +1049,89 @@ function makeDocxParagraph(docx: any, text: string, opts: { style?: string; bull
   });
 }
 
-function makeDocxTable(docx: any, table: { title?: string; headers: string[]; rows: any[][] }): any[] {
-  const headers = table.headers.length > 0 ? table.headers : table.rows[0]?.map((_, i) => `Column ${i + 1}`) || [];
-  const rows = table.headers.length > 0 ? table.rows : table.rows.slice(1);
+function normalizeDocxTableRows(headers: string[], rows: any[][]): { headers: string[]; rows: any[][] } {
+  const columnCount = Math.max(headers.length, ...rows.map(row => Array.isArray(row) ? row.length : 1), 0);
+  const normalizedHeaders = Array.from({ length: columnCount }, (_, i) => cleanArtifactText(headers[i]) || `Column ${i + 1}`);
+  const normalizedRows = rows.map(row => Array.from({ length: columnCount }, (_, i) => Array.isArray(row) ? row[i] : (i === 0 ? row : '')));
+  return { headers: normalizedHeaders, rows: normalizedRows };
+}
+
+function docxTableColumnWidths(headers: string[], rows: any[][]): number[] {
   if (headers.length === 0) return [];
-  const cells = (values: any[], isHeader = false) => values.map(value => new docx.TableCell({
-    shading: isHeader ? { fill: 'F3E8FF' } : undefined,
-    margins: { top: 120, bottom: 120, left: 140, right: 140 },
-    children: [new docx.Paragraph({
-      children: [new docx.TextRun({
-        text: cleanArtifactText(value) || ' ',
-        bold: isHeader,
-        color: isHeader ? '581C87' : '111827',
-        size: 19,
+  const compactColumn = (header: string) => /^(#|id|no\.?|tier|status|owner|date|stage|size|probability|priority)$/i.test(header.trim());
+  const weights = headers.map((header, index) => {
+    const lower = header.toLowerCase();
+    let weight = 2;
+    if (/^(#|id|no\.?)$/.test(lower)) weight = 0.45;
+    else if (/\b(tier|status|owner|date|stage|size|probability|priority)\b/.test(lower)) weight = 1.25;
+    else if (/\b(concern|detail|summary|description|action|notes?|evidence|rationale|open question)\b/.test(lower)) weight = 3.7;
+    const longest = Math.max(cleanArtifactText(header).length, ...rows.map(row => cleanArtifactText(row[index]).length));
+    return weight + Math.min(2.4, Math.max(0, longest - 12) / 28);
+  });
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+  const mins = headers.map(header => compactColumn(header) ? 520 : 820);
+  const maxes = headers.map(header => compactColumn(header) ? 1500 : 4300);
+  const widths = weights.map((weight, index) => Math.min(maxes[index], Math.max(mins[index], Math.round((weight / totalWeight) * DOCX_TABLE_WIDTH_DXA))));
+  let delta = DOCX_TABLE_WIDTH_DXA - widths.reduce((sum, width) => sum + width, 0);
+  let guard = 0;
+  while (delta !== 0 && guard < 1000) {
+    const direction = Math.sign(delta);
+    const eligible = widths
+      .map((width, index) => ({ width, index }))
+      .filter(({ width, index }) => direction > 0 ? width < maxes[index] : width > mins[index]);
+    if (eligible.length === 0) break;
+    for (const { index } of eligible) {
+      const capacity = direction > 0 ? maxes[index] - widths[index] : widths[index] - mins[index];
+      const step = Math.min(Math.abs(delta), capacity, 40);
+      widths[index] += direction * step;
+      delta -= direction * step;
+      if (delta === 0) break;
+    }
+    guard++;
+  }
+  return widths;
+}
+
+function makeDocxTable(docx: any, table: { title?: string; headers: string[]; rows: any[][] }): any[] {
+  const rawHeaders = table.headers.length > 0 ? table.headers : table.rows[0]?.map((_, i) => `Column ${i + 1}`) || [];
+  const rawRows = table.headers.length > 0 ? table.rows : table.rows.slice(1);
+  if (rawHeaders.length === 0) return [];
+  const { headers, rows } = normalizeDocxTableRows(rawHeaders.map(cleanArtifactText), rawRows);
+  const columnWidths = docxTableColumnWidths(headers, rows);
+  const cells = (values: any[], isHeader = false) => values.map((value, index) => {
+    const header = headers[index] || '';
+    const isCompact = columnWidths[index] <= 900 || /^(#|id|no\.?|tier|status|owner|date)$/i.test(header);
+    return new docx.TableCell({
+      width: { size: columnWidths[index] || Math.floor(DOCX_TABLE_WIDTH_DXA / headers.length), type: docx.WidthType.DXA },
+      shading: isHeader ? { fill: 'F3E8FF' } : undefined,
+      verticalAlign: docx.VerticalAlign.CENTER,
+      margins: { top: 140, bottom: 140, left: 170, right: 170 },
+      children: [new docx.Paragraph({
+        children: [new docx.TextRun({
+          text: cleanArtifactText(value) || ' ',
+          bold: isHeader,
+          color: isHeader ? '581C87' : '111827',
+          size: 18,
+        })],
+        alignment: isCompact ? docx.AlignmentType.CENTER : docx.AlignmentType.LEFT,
+        spacing: { after: 0, line: 240 },
       })],
-      spacing: { after: 0, line: 240 },
-    })],
-  }));
+    });
+  });
   const out: any[] = [];
   if (table.title) out.push(makeDocxParagraph(docx, table.title, { style: 'Caption', bold: true }));
   out.push(new docx.Table({
-    width: { size: 100, type: docx.WidthType.PERCENTAGE },
+    width: { size: DOCX_TABLE_WIDTH_DXA, type: docx.WidthType.DXA },
+    layout: docx.TableLayoutType.FIXED,
+    columnWidths,
+    borders: {
+      top: { style: docx.BorderStyle.SINGLE, size: 1, color: 'D1D5DB' },
+      bottom: { style: docx.BorderStyle.SINGLE, size: 1, color: 'D1D5DB' },
+      left: { style: docx.BorderStyle.SINGLE, size: 1, color: 'D1D5DB' },
+      right: { style: docx.BorderStyle.SINGLE, size: 1, color: 'D1D5DB' },
+      insideHorizontal: { style: docx.BorderStyle.SINGLE, size: 1, color: 'E5E7EB' },
+      insideVertical: { style: docx.BorderStyle.SINGLE, size: 1, color: 'E5E7EB' },
+    },
     rows: [
       new docx.TableRow({ tableHeader: true, children: cells(headers, true) }),
       ...rows.map(row => new docx.TableRow({ children: cells(row, false) })),
@@ -1029,10 +1160,10 @@ async function makeDocx(title: string, content: any): Promise<Uint8Array> {
   if (content?.summary) {
     children.push(new docx.Paragraph({
       style: 'Callout',
-      children: paragraphRuns(String(content.summary), docx, { bold: true, color: '581C87' }),
-      spacing: { before: 120, after: 220, line: 276 },
-      border: { left: { color: 'C026D3', size: 18, style: docx.BorderStyle.SINGLE } },
-      indent: { left: 220 },
+      children: paragraphRuns(String(content.summary), docx, { color: '374151' }),
+      spacing: { before: 160, after: 260, line: 286 },
+      border: { left: { color: 'A855F7', size: 16, space: DOCX_CALLOUT_BORDER_SPACE, style: docx.BorderStyle.SINGLE } },
+      indent: { left: DOCX_CALLOUT_INDENT_DXA },
     }));
   }
 
@@ -1075,11 +1206,11 @@ async function makeDocx(title: string, content: any): Promise<Uint8Array> {
         { id: 'Lead', name: 'Lead', basedOn: 'Normal', run: { font: 'Aptos', size: 22, color: '374151' }, paragraph: { spacing: { after: 170, line: 288 } } },
         { id: 'Body', name: 'Body', basedOn: 'Normal', run: { font: 'Aptos', size: 21, color: '111827' }, paragraph: { spacing: { after: 170, line: 276 } } },
         { id: 'Caption', name: 'Caption', basedOn: 'Normal', run: { font: 'Aptos', size: 18, color: '6B7280' }, paragraph: { spacing: { before: 80, after: 80 } } },
-        { id: 'Callout', name: 'Callout', basedOn: 'Normal', run: { font: 'Aptos', size: 21, color: '581C87' }, paragraph: { spacing: { after: 190, line: 276 } } },
+        { id: 'Callout', name: 'Callout', basedOn: 'Normal', run: { font: 'Aptos', size: 21, color: '374151' }, paragraph: { spacing: { after: 220, line: 286 } } },
       ],
     },
     sections: [{
-      properties: { page: { margin: { top: 900, right: 900, bottom: 900, left: 900 } } },
+      properties: { page: { margin: { top: DOCX_PAGE_MARGIN_DXA, right: DOCX_PAGE_MARGIN_DXA, bottom: DOCX_PAGE_MARGIN_DXA, left: DOCX_PAGE_MARGIN_DXA } } },
       children,
     }],
   });
@@ -1542,7 +1673,25 @@ async function validateGeneratedArtifact(kind: ArtifactKind, bytes: Uint8Array):
     if (kind === 'docx') {
       const xml = await zip.file('word/document.xml')?.async('string');
       if (!xml) issues.push('DOCX missing word/document.xml');
-      else if (xml.replace(/<[^>]+>/g, '').trim().length < 80) issues.push('DOCX contains too little readable content');
+      else {
+        if (xml.replace(/<[^>]+>/g, '').trim().length < 80) issues.push('DOCX contains too little readable content');
+        const calloutBlocks = xml.match(/<w:p\b[\s\S]*?<w:pStyle[^>]+w:val="Callout"[\s\S]*?<\/w:p>/g) || [];
+        for (const block of calloutBlocks) {
+          const indent = Number(block.match(/<w:ind[^>]+w:left="(\d+)"/)?.[1] || 0);
+          if (indent > 0 && indent < 420) issues.push('DOCX callout left border is too close to the text');
+        }
+        const gridMatches = [...xml.matchAll(/<w:tblGrid\b[\s\S]*?<\/w:tblGrid>/g)];
+        for (const match of gridMatches) {
+          const widths = [...match[0].matchAll(/<w:gridCol[^>]+w:w="(\d+)"/g)].map(m => Number(m[1]));
+          if (widths.length > 1 && widths.every(w => w <= 200)) issues.push('DOCX table grid columns are too narrow to be readable');
+        }
+        if (/<w:tblW[^>]+w:type="pct"[^>]+w:w="100%"/.test(xml)) {
+          issues.push('DOCX table uses ambiguous 100% percentage width instead of fixed page-safe geometry');
+        }
+        if (/&lt;\/?(?:w|a|r|wp|xml|table|thead|tbody|tr|td|th):?\b/i.test(xml)) {
+          issues.push('DOCX contains escaped raw markup text');
+        }
+      }
     }
 
     if (kind === 'xlsx') {
@@ -1879,3 +2028,9 @@ ${sourceForModel}`;
     message: `Created edited copy ${result.document.file_name}`,
   };
 }
+
+export const __documentArtifactsTestHooks = {
+  contentQualityIssues,
+  docxTableColumnWidths,
+  makeDocx,
+};

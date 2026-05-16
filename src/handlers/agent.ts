@@ -127,7 +127,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'create_document_artifact',
-    description: 'Create a polished, fully usable editable document artifact and save it to Documents. Supports docx, xlsx, pptx, and pdf. Use when the user asks MARTy to prepare, draft, build, create, generate, or export a memo/model/deck/summary/file. Never create title-only or skeletal files.',
+    description: 'Create a polished, fully usable editable document artifact and save it to Documents. Supports docx, xlsx, pptx, and pdf. Use when the user asks MARTy to prepare, draft, build, create, generate, or export a memo/model/deck/summary/file. Never create title-only, skeletal, placeholder, or empty-section files. For memos, include a concise executive frame, evidence-backed body sections, risk/open-question/action structure where relevant, and no raw markup.',
     input_schema: {
       type: 'object',
       properties: {
@@ -135,7 +135,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         title: { type: 'string', description: 'Human-readable document title.' },
         structured_content: {
           type: 'object',
-          description: 'Complete structured content. docx/pdf: subtitle, summary, metadata, sections with paragraphs, bullets, numbered lists, checklists, and tables. xlsx: multiple sheets with headers, rows, and formulas where natural. pptx: 6-10 Medina-dark executive slides; use layout/headline/takeaway, evidence_blocks, metrics, tables, and speaker_notes where useful. Older simple title/body/bullets slides are still accepted.',
+          description: 'Complete structured content. docx/pdf: subtitle, concise summary, metadata, and substantive sections with paragraphs, bullets, numbered lists, checklists, and tables; no empty headings or placeholder sections. xlsx: multiple sheets with headers, rows, and formulas where natural. pptx: 6-10 Medina-dark executive slides; use layout/headline/takeaway, evidence_blocks, metrics, tables, and speaker_notes where useful. Older simple title/body/bullets slides are still accepted.',
         },
         source_document_ids: {
           type: 'array',
