@@ -732,6 +732,7 @@ async function executeTool(
 // ---------------------------------------------------------------------------
 
 const STALE_AGENT_TURN_MINUTES = 10;
+const FORCED_MAX_SET_TIMEOUT_MS = 120_000;
 
 function normalizeSessionId(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -872,6 +873,24 @@ async function markStaleRunningAgentTurns(
     if (row.session_id) {
       await repairAgentSessionTurnCount(row.session_id, env);
     }
+  }
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -1335,7 +1354,11 @@ export async function queryAgent(
       forced: true,
     });
     try {
-      forcedMaxSetResult = await buildMaxSetTool(ctx, maxSetIntent.input, env, { deepDive: true });
+      forcedMaxSetResult = await withTimeout(
+        buildMaxSetTool(ctx, maxSetIntent.input, env, { deepDive: true }),
+        FORCED_MAX_SET_TIMEOUT_MS,
+        `Forced MAX set-builder exceeded ${Math.round(FORCED_MAX_SET_TIMEOUT_MS / 1000)}s before returning.`
+      );
       compactForcedMaxSet = compactMaxSetResultForContext(forcedMaxSetResult);
       if (Array.isArray(forcedMaxSetResult?.document_cards) && forcedMaxSetResult.document_cards.length > 0) {
         preludeEvents.push({ type: 'document_cards', document_cards: forcedMaxSetResult.document_cards });
