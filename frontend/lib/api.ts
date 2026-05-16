@@ -93,7 +93,17 @@ async function request<T>(
 
   if (!res.ok) {
     const err = await res.text();
-    throw new ApiError(res.status, err);
+    try {
+      const parsed = JSON.parse(err);
+      throw new ApiError(
+        res.status,
+        parsed.message || parsed.details || parsed.error || err,
+        parsed.error
+      );
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw new ApiError(res.status, err);
+    }
   }
   return res.json();
 }

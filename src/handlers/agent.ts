@@ -728,17 +728,167 @@ async function executeTool(
 }
 
 // ---------------------------------------------------------------------------
-// Session endpoints (unchanged)
+// Session endpoints
 // ---------------------------------------------------------------------------
+
+const STALE_AGENT_TURN_MINUTES = 10;
+
+function normalizeSessionId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === 'null' || trimmed === 'undefined') return null;
+  return trimmed;
+}
+
+async function createAgentSessionRecord(
+  ctx: AuthContext,
+  env: Env,
+  contextEntityType: string | null = null,
+  contextEntityId: string | null = null
+): Promise<AgentSession> {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  await env.D1.prepare(
+    `INSERT INTO agent_sessions (id, org_id, user_id, context_entity_type, context_entity_id, turn_count, last_activity_at, created_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
+  ).bind(id, ctx.orgId, ctx.userId, contextEntityType, contextEntityId, now, now).run();
+
+  return {
+    id,
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    context_entity_type: contextEntityType,
+    context_entity_id: contextEntityId,
+    turn_count: 0,
+    user_role: ctx.userRole,
+    last_activity_at: now,
+    created_at: now,
+  };
+}
+
+async function loadAccessibleAgentSession(
+  id: string,
+  ctx: AuthContext,
+  env: Env
+): Promise<AgentSession | null> {
+  const exact = await env.D1.prepare(
+    `SELECT * FROM agent_sessions
+     WHERE id = ? AND org_id = ? AND user_id = ? AND deleted_at IS NULL`
+  ).bind(id, ctx.orgId, ctx.userId).first<AgentSession>();
+  if (exact) return exact;
+
+  // Some long-lived browser tokens can outlive a user-id normalization. Keep
+  // tenant isolation, but allow the same verified email inside the same org to
+  // recover its own sessions.
+  if (ctx.email) {
+    const sameEmail = await env.D1.prepare(
+      `SELECT s.*
+       FROM agent_sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.id = ?
+         AND s.org_id = ?
+         AND lower(u.email) = lower(?)
+         AND s.deleted_at IS NULL`
+    ).bind(id, ctx.orgId, ctx.email).first<AgentSession>();
+    if (sameEmail) return sameEmail;
+  }
+
+  return null;
+}
+
+async function repairAgentSessionTurnCount(
+  sessionId: string,
+  env: Env
+): Promise<void> {
+  await env.D1.prepare(
+    `UPDATE agent_sessions
+     SET turn_count = (
+       SELECT COALESCE(MAX(turn_index) + 1, 0)
+       FROM agent_messages
+       WHERE session_id = ?
+     )
+     WHERE id = ?
+       AND turn_count < (
+         SELECT COALESCE(MAX(turn_index) + 1, 0)
+         FROM agent_messages
+         WHERE session_id = ?
+       )`
+  ).bind(sessionId, sessionId, sessionId).run().catch(() => {});
+}
+
+async function markStaleRunningAgentTurns(
+  ctx: AuthContext,
+  env: Env,
+  sessionId?: string
+): Promise<void> {
+  const cutoffExpr = `strftime('%Y-%m-%dT%H:%M:%fZ','now','-${STALE_AGENT_TURN_MINUTES} minutes')`;
+  const staleMessage = `This MARTy response stopped before completion. I marked it as stale so the session can be used again. Please retry the request.`;
+  const sessionFilter = sessionId ? 'AND m.session_id = ?' : '';
+  const accessPredicate = `EXISTS (
+         SELECT 1
+         FROM agent_sessions s
+         LEFT JOIN users u ON u.id = s.user_id
+         WHERE s.id = m.session_id
+           AND s.org_id = ?
+           AND s.deleted_at IS NULL
+           AND (s.user_id = ? OR lower(u.email) = lower(?))
+       )`;
+  const staleSessionRows = await env.D1.prepare(
+    `SELECT DISTINCT m.session_id
+     FROM agent_messages m
+     WHERE m.role = 'assistant'
+       AND json_extract(m.metadata, '$.status') = 'running'
+       AND m.created_at < ${cutoffExpr}
+       AND ${accessPredicate}
+       ${sessionFilter}
+     LIMIT 50`
+  ).bind(
+    ...(sessionId
+      ? [ctx.orgId, ctx.userId, ctx.email || '', sessionId]
+      : [ctx.orgId, ctx.userId, ctx.email || ''])
+  ).all<{ session_id: string }>().catch(() => ({ results: [] as { session_id: string }[] }));
+
+  const bindValues = sessionId
+    ? [staleMessage, ctx.orgId, ctx.userId, ctx.email || '', sessionId]
+    : [staleMessage, ctx.orgId, ctx.userId, ctx.email || ''];
+
+  await env.D1.prepare(
+    `UPDATE agent_messages AS m
+     SET content = CASE WHEN m.content = '' THEN ? ELSE m.content END,
+         metadata = json_set(
+           CASE WHEN json_valid(COALESCE(m.metadata, '{}')) THEN COALESCE(m.metadata, '{}') ELSE '{}' END,
+           '$.status', 'error',
+           '$.error', 'REQUEST_STALE',
+           '$.retryable', 1
+         )
+     WHERE m.role = 'assistant'
+       AND json_extract(m.metadata, '$.status') = 'running'
+       AND m.created_at < ${cutoffExpr}
+       AND ${accessPredicate}
+       ${sessionFilter}`
+  ).bind(...bindValues).run().catch(() => {});
+
+  for (const row of staleSessionRows.results) {
+    if (row.session_id) {
+      await repairAgentSessionTurnCount(row.session_id, env);
+    }
+  }
+}
 
 export async function listSessions(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
+  await markStaleRunningAgentTurns(ctx, env);
   const rows = await env.D1.prepare(
-    `SELECT * FROM agent_sessions WHERE org_id = ? AND user_id = ? AND deleted_at IS NULL
+    `SELECT DISTINCT s.*
+     FROM agent_sessions s
+     LEFT JOIN users u ON u.id = s.user_id
+     WHERE s.org_id = ?
+       AND s.deleted_at IS NULL
+       AND (s.user_id = ? OR lower(u.email) = lower(?))
      ORDER BY last_activity_at DESC LIMIT 100`
-  ).bind(ctx.orgId, ctx.userId).all();
+  ).bind(ctx.orgId, ctx.userId, ctx.email || '').all();
   return jsonResponse({ sessions: rows.results });
 }
 
@@ -758,25 +908,8 @@ export async function createSession(
     // create a durable chat target before handing a turn to the stream.
   }
 
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  await env.D1.prepare(
-    `INSERT INTO agent_sessions (id, org_id, user_id, context_entity_type, context_entity_id, turn_count, last_activity_at, created_at)
-     VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
-  ).bind(id, ctx.orgId, ctx.userId, contextEntityType, contextEntityId, now, now).run();
-
-  return jsonResponse({
-    session: {
-      id,
-      org_id: ctx.orgId,
-      user_id: ctx.userId,
-      context_entity_type: contextEntityType,
-      context_entity_id: contextEntityId,
-      turn_count: 0,
-      last_activity_at: now,
-      created_at: now,
-    },
-  });
+  const session = await createAgentSessionRecord(ctx, env, contextEntityType, contextEntityId);
+  return jsonResponse({ session });
 }
 
 export async function getSessionMessages(
@@ -784,14 +917,15 @@ export async function getSessionMessages(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const session = await env.D1.prepare(
-    'SELECT * FROM agent_sessions WHERE id = ? AND org_id = ? AND user_id = ?'
-  ).bind(id, ctx.orgId, ctx.userId).first();
-  if (!session) return errorResponse('SESSION_NOT_FOUND', 404);
+  const normalizedId = normalizeSessionId(id);
+  if (!normalizedId) return errorResponse('SESSION_NOT_FOUND', 404, 'That MARTy session no longer exists.');
+  await markStaleRunningAgentTurns(ctx, env, normalizedId);
+  const session = await loadAccessibleAgentSession(normalizedId, ctx, env);
+  if (!session) return errorResponse('SESSION_NOT_FOUND', 404, 'That MARTy session no longer exists.');
 
   const messages = await env.D1.prepare(
     'SELECT * FROM agent_messages WHERE session_id = ? ORDER BY turn_index ASC'
-  ).bind(id).all<Record<string, any>>();
+  ).bind(normalizedId).all<Record<string, any>>();
   const hydratedMessages = messages.results.map(m => ({
     ...m,
     sources: m.sources_json ? safeParseJson<CitationSource[]>(m.sources_json) : null,
@@ -841,15 +975,14 @@ export async function deleteSession(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const session = await env.D1.prepare(
-    'SELECT id FROM agent_sessions WHERE id = ? AND org_id = ? AND user_id = ?'
-  ).bind(id, ctx.orgId, ctx.userId).first();
+  const normalizedId = normalizeSessionId(id);
+  const session = normalizedId ? await loadAccessibleAgentSession(normalizedId, ctx, env) : null;
   if (!session) return errorResponse('SESSION_NOT_FOUND', 404);
 
   await env.D1.batch([
-    env.D1.prepare('DELETE FROM agent_messages WHERE session_id = ?').bind(id),
-    env.D1.prepare('DELETE FROM rag_query_logs WHERE session_id = ?').bind(id),
-    env.D1.prepare('DELETE FROM agent_sessions WHERE id = ?').bind(id),
+    env.D1.prepare('DELETE FROM agent_messages WHERE session_id = ?').bind(normalizedId),
+    env.D1.prepare('DELETE FROM rag_query_logs WHERE session_id = ?').bind(normalizedId),
+    env.D1.prepare('DELETE FROM agent_sessions WHERE id = ?').bind(normalizedId),
   ]);
   return jsonResponse({ ok: true });
 }
@@ -863,9 +996,13 @@ export async function updateSessionTitle(
   const body = await parseJsonBody<{ title: string }>(request);
   if (!body?.title) return errorResponse('VALIDATION_ERROR', 400, 'title required');
 
+  const normalizedId = normalizeSessionId(id);
+  const session = normalizedId ? await loadAccessibleAgentSession(normalizedId, ctx, env) : null;
+  if (!session) return errorResponse('SESSION_NOT_FOUND', 404);
+
   await env.D1.prepare(
-    'UPDATE agent_sessions SET title = ? WHERE id = ? AND org_id = ? AND user_id = ?'
-  ).bind(body.title.trim().slice(0, 80), id, ctx.orgId, ctx.userId).run();
+    'UPDATE agent_sessions SET title = ? WHERE id = ?'
+  ).bind(body.title.trim().slice(0, 80), normalizedId).run();
   return jsonResponse({ ok: true });
 }
 
@@ -960,7 +1097,7 @@ export async function queryAgent(
   if (contentType.includes('multipart/form-data')) {
     const form = await request.formData();
     query = (form.get('query') as string) || '';
-    sessionId = (form.get('session_id') as string) || null;
+    sessionId = normalizeSessionId(form.get('session_id'));
     contextEntityType = (form.get('context_entity_type') as string) || null;
     contextEntityId = (form.get('context_entity_id') as string) || null;
     deepDive = (form.get('deep_dive') as string) === 'true';
@@ -987,7 +1124,7 @@ export async function queryAgent(
     const body = await parseJsonBody<any>(request);
     if (!body?.query) return errorResponse('VALIDATION_ERROR', 400);
     query = body.query;
-    sessionId = body.session_id || null;
+    sessionId = normalizeSessionId(body.session_id);
     contextEntityType = body.context_entity_type || null;
     contextEntityId = body.context_entity_id || null;
     deepDive = !!body.deep_dive;
@@ -1002,31 +1139,16 @@ export async function queryAgent(
   // --- Load or create session ---
   let session: AgentSession;
   if (sessionId) {
-    const existing = await env.D1.prepare(
-      'SELECT * FROM agent_sessions WHERE id = ? AND org_id = ? AND user_id = ?'
-    ).bind(sessionId, ctx.orgId, ctx.userId).first<any>();
-    if (!existing) return errorResponse('SESSION_NOT_FOUND', 404);
-    session = existing;
+    await markStaleRunningAgentTurns(ctx, env, sessionId);
+    const existing = await loadAccessibleAgentSession(sessionId, ctx, env);
+    if (existing) {
+      session = existing;
+    } else {
+      console.warn(`[agent] client supplied missing/stale session ${sessionId}; creating a replacement`);
+      session = await createAgentSessionRecord(ctx, env, contextEntityType, contextEntityId);
+    }
   } else {
-    const newId = crypto.randomUUID();
-    const now = new Date().toISOString();
-    await env.D1.prepare(
-      `INSERT INTO agent_sessions (id, org_id, user_id, context_entity_type, context_entity_id, turn_count, last_activity_at, created_at)
-       VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
-    )
-      .bind(newId, ctx.orgId, ctx.userId, contextEntityType, contextEntityId, now, now)
-      .run();
-    session = {
-      id: newId,
-      org_id: ctx.orgId,
-      user_id: ctx.userId,
-      context_entity_type: contextEntityType,
-      context_entity_id: contextEntityId,
-      turn_count: 0,
-      user_role: ctx.userRole,
-      last_activity_at: now,
-      created_at: now,
-    };
+    session = await createAgentSessionRecord(ctx, env, contextEntityType, contextEntityId);
   }
   session.user_role = ctx.userRole;
 

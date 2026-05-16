@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { MarkdownMessage } from '@/components/markdown-message';
-import { api, streamAgentQuery } from '@/lib/api';
+import { ApiError, api, streamAgentQuery } from '@/lib/api';
 import {
   ArrowUp, Paperclip, Plus, Trash2,
   X as XIcon, Pencil, Check, Copy, RefreshCw,
@@ -632,6 +632,14 @@ function getRunningAssistantMessage(messages: Message[]): Message | undefined {
   return [...messages].reverse().find(m => m.role === 'assistant' && m.streaming && m.pendingRequestId);
 }
 
+function isSessionNotFoundError(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    return error.status === 404 && (error.code === 'SESSION_NOT_FOUND' || error.message.includes('SESSION_NOT_FOUND'));
+  }
+  const message = error instanceof Error ? error.message : String(error || '');
+  return message.includes('SESSION_NOT_FOUND');
+}
+
 function DocumentCardList({
   cards,
   sessionId,
@@ -1187,8 +1195,14 @@ export default function GodModePage() {
               localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
               window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
             }
-          }).catch(() => {
+          }).catch(e => {
             localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+            if (isSessionNotFoundError(e)) {
+              setActiveSessionId(current => current === sessionId ? null : current);
+              setMessages([]);
+              api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
+            }
           });
         }
       }
@@ -1254,6 +1268,18 @@ export default function GodModePage() {
         if (!streamingRef.current) {
           applyServerMessages(d.messages, activeSessionId);
         }
+      }).catch(e => {
+        if (isSessionNotFoundError(e)) {
+          const missingSessionId = activeSessionId;
+          setActiveSessionId(current => current === missingSessionId ? null : current);
+          setMessages([]);
+          setSessionUploads([]);
+          setBytesUsed(0);
+          setBytesTotal(0);
+          localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+          window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
+        }
       });
       api.listSessionUploads(activeSessionId).then(d => {
         setSessionUploads(d.uploads);
@@ -1294,7 +1320,19 @@ export default function GodModePage() {
         localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
         window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
         api.listSessions().then(d2 => setSessions(d2.sessions)).catch(() => {});
-      } catch {
+      } catch (e) {
+        if (isSessionNotFoundError(e)) {
+          const missingSessionId = activeSessionId;
+          activeRequestIdRef.current = null;
+          setIsThinking(false);
+          setStreaming(false);
+          setActiveSessionId(current => current === missingSessionId ? null : current);
+          setMessages([]);
+          localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+          window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          api.listSessions().then(d2 => setSessions(d2.sessions)).catch(() => {});
+          return;
+        }
         // Keep the visible pending state. A later poll or manual refresh can
         // recover the finalized assistant turn.
       }
@@ -1504,12 +1542,15 @@ export default function GodModePage() {
           }, 1000);
         },
         (err, opts) => {
+          const staleSession = err.includes('SESSION_NOT_FOUND') || err.includes('no longer exists');
           setIsThinking(false);
           setMessages(m => m.map(msg =>
             msg.id === assistantMsgId
               ? {
                   ...msg,
-                  content: msg.content || err,
+                  content: msg.content || (staleSession
+                    ? 'That MARTy session was stale. I cleared it so you can retry in a clean session.'
+                    : err),
                   streaming: false,
                   error: !msg.content,
                   retryable: opts?.retryable !== false,
@@ -1517,6 +1558,13 @@ export default function GodModePage() {
               : msg
           ));
           setStreaming(false);
+          if (staleSession) {
+            setActiveSessionId(null);
+            setSessionUploads([]);
+            setBytesUsed(0);
+            setBytesTotal(0);
+            api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
+          }
           if (pendingSessionIdRef.current) {
             setActiveSessionId(pendingSessionIdRef.current);
             pendingSessionIdRef.current = null;
@@ -1528,7 +1576,7 @@ export default function GodModePage() {
         (event: any) => {
           if (event.type === 'session' && event.session_id) {
             liveSessionIdRef.current = event.session_id;
-            if (!activeSessionId) {
+            if (!activeSessionId || event.session_id !== requestSessionId) {
               pendingSessionIdRef.current = event.session_id;
             }
             localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: event.session_id }));
