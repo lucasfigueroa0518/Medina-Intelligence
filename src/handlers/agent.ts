@@ -894,6 +894,83 @@ async function withTimeout<T>(
   }
 }
 
+async function getNextAgentTurnIndex(
+  sessionId: string,
+  env: Env
+): Promise<number> {
+  const row = await env.D1.prepare(
+    `SELECT
+       COALESCE(s.turn_count, 0) AS turn_count,
+       COALESCE(MAX(m.turn_index) + 1, 0) AS next_message_index
+     FROM agent_sessions s
+     LEFT JOIN agent_messages m ON m.session_id = s.id
+     WHERE s.id = ?
+     GROUP BY s.id`
+  ).bind(sessionId).first<{ turn_count: number; next_message_index: number }>();
+  return Math.max(Number(row?.turn_count || 0), Number(row?.next_message_index || 0));
+}
+
+async function getRunningAssistantTurn(
+  sessionId: string,
+  env: Env
+): Promise<{ id: string; request_id: string | null; created_at: string } | null> {
+  const row = await env.D1.prepare(
+    `SELECT id, json_extract(metadata, '$.request_id') AS request_id, created_at
+     FROM agent_messages
+     WHERE session_id = ?
+       AND role = 'assistant'
+       AND json_extract(metadata, '$.status') = 'running'
+     ORDER BY created_at DESC
+     LIMIT 1`
+  ).bind(sessionId).first<{ id: string; request_id: string | null; created_at: string }>();
+  return row || null;
+}
+
+async function reserveAgentTurn(
+  env: Env,
+  sessionId: string,
+  userMessageId: string,
+  assistantMessageId: string,
+  turnIndex: number,
+  query: string,
+  attachmentsJson: string,
+  metadataJson: string
+): Promise<void> {
+  await env.D1.batch([
+    env.D1.prepare(
+      `INSERT INTO agent_messages (id, session_id, turn_index, role, content, attachments, created_at)
+       VALUES (?, ?, ?, 'user', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+    ).bind(userMessageId, sessionId, turnIndex, query, attachmentsJson),
+    env.D1.prepare(
+      `INSERT INTO agent_messages (id, session_id, turn_index, role, content, metadata, created_at)
+       VALUES (?, ?, ?, 'assistant', '', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+    ).bind(assistantMessageId, sessionId, turnIndex + 1, metadataJson),
+    env.D1.prepare(
+      `UPDATE agent_sessions
+       SET turn_count = CASE WHEN turn_count < ? THEN ? ELSE turn_count END,
+           last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE id = ?`
+    ).bind(turnIndex + 2, turnIndex + 2, sessionId),
+  ]);
+}
+
+function isAgentRunningReservationConflict(error: unknown): boolean {
+  const message = String((error as any)?.message || error || '');
+  return message.includes('idx_agent_messages_one_running_assistant_per_session')
+    || (message.includes('UNIQUE constraint failed') && message.includes('agent_messages'));
+}
+
+async function touchAgentSessionActivity(
+  env: Env,
+  sessionId: string
+): Promise<void> {
+  await env.D1.prepare(
+    `UPDATE agent_sessions
+     SET last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id = ?`
+  ).bind(sessionId).run().catch(() => {});
+}
+
 export async function listSessions(
   ctx: AuthContext,
   env: Env
@@ -1200,7 +1277,19 @@ export async function queryAgent(
     }
   }
 
-  const turnIndex = session.turn_count;
+  const runningTurn = await getRunningAssistantTurn(session.id, env);
+  if (runningTurn) {
+    return jsonResponse({
+      error: 'AGENT_TURN_RUNNING',
+      message: 'MARTy is already working on this session. I re-synced the conversation instead of starting a duplicate turn.',
+      retryable: false,
+      session_id: session.id,
+      request_id: runningTurn.request_id,
+      assistant_message_id: runningTurn.id,
+    }, 409);
+  }
+
+  const turnIndex = await getNextAgentTurnIndex(session.id, env);
 
   // ---- Wave-1 cancellation: per-request AbortController ----
   // Create this before retrieval so the durable placeholder can expose a
@@ -1220,28 +1309,37 @@ export async function queryAgent(
     : [];
   const attachmentsJson = turnAttachments.length > 0 ? JSON.stringify(turnAttachments) : '[]';
 
-  // Save the user turn before expensive retrieval/model work. That makes the
-  // chat durable the moment the backend accepts the turn, so navigating away
-  // no longer leaves the conversation invisible.
+  // Save the user turn before expensive retrieval/model work and reserve the
+  // next two turn indexes immediately. Without this, a disconnected MAX run
+  // can leave turn_count stale and later retries will duplicate turn indexes.
   const userMessageId = crypto.randomUUID();
-  await env.D1.prepare(
-    `INSERT INTO agent_messages (id, session_id, turn_index, role, content, attachments, created_at)
-     VALUES (?, ?, ?, 'user', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-  ).bind(userMessageId, session.id, turnIndex, query, attachmentsJson).run();
-
-  // Persist a durable assistant placeholder before retrieval starts. If the
-  // user navigates away, the session can still show that MARTy is working and
-  // can poll this row until it is finalized by the waitUntil capture path.
   const assistantMessageId = crypto.randomUUID();
-  await env.D1.prepare(
-    `INSERT INTO agent_messages (id, session_id, turn_index, role, content, metadata, created_at)
-     VALUES (?, ?, ?, 'assistant', '', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-  ).bind(
-    assistantMessageId,
-    session.id,
-    turnIndex + 1,
-    JSON.stringify({ status: 'running', request_id: requestId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
-  ).run();
+  try {
+    await reserveAgentTurn(
+      env,
+      session.id,
+      userMessageId,
+      assistantMessageId,
+      turnIndex,
+      query,
+      attachmentsJson,
+      JSON.stringify({ status: 'running', request_id: requestId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
+    );
+  } catch (e) {
+    unregisterRequest(requestId);
+    if (isAgentRunningReservationConflict(e)) {
+      const activeTurn = await getRunningAssistantTurn(session.id, env);
+      return jsonResponse({
+        error: 'AGENT_TURN_RUNNING',
+        message: 'MARTy is already working on this session. I re-synced the conversation instead of starting a duplicate turn.',
+        retryable: false,
+        session_id: session.id,
+        request_id: activeTurn?.request_id || null,
+        assistant_message_id: activeTurn?.id || null,
+      }, 409);
+    }
+    throw e;
+  }
 
   // --- Pre-process query & retrieve RAG context ---
   const t0 = Date.now();
@@ -1269,9 +1367,7 @@ export async function queryAgent(
       JSON.stringify({ status: 'error', retrieval_failed: true, request_id: requestId, deep_dive: deepDive, error: errMsg, runtime_fingerprint: runtimeFingerprint }),
       assistantMessageId
     ).run().catch(() => {});
-    await env.D1.prepare(
-      `UPDATE agent_sessions SET turn_count = turn_count + 2, last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-    ).bind(session.id).run().catch(() => {});
+    await touchAgentSessionActivity(env, session.id);
     unregisterRequest(requestId);
 
     // Defense-in-depth refund: even though we moved the increment to post-retrieval,
@@ -1455,9 +1551,7 @@ export async function queryAgent(
       }),
       assistantMessageId
     ).run().catch(() => {});
-    await env.D1.prepare(
-      `UPDATE agent_sessions SET turn_count = turn_count + 2, last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-    ).bind(session.id).run().catch(() => {});
+    await touchAgentSessionActivity(env, session.id);
     return jsonResponse({
       error: 'Generation failed',
       message: 'I ran into a problem starting that MARTy response. Try again, or rephrase.',
@@ -1657,12 +1751,10 @@ export async function queryAgent(
       }
 
       // Update session
-      await env.D1.prepare(
-        `UPDATE agent_sessions SET turn_count = turn_count + 2, last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-      ).bind(session.id).run();
+      await touchAgentSessionActivity(env, session.id);
 
       // Auto-generate title on first turn
-      if (session.turn_count === 0 && !session.title) {
+      if (turnIndex === 0 && !session.title) {
         try {
           const title = await callClaude(
             { system: SESSION_TITLE_PROMPT, user: query, max_tokens: 20, orgId: ctx.orgId, model: 'claude-haiku-4-5-20251001' },

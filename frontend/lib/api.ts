@@ -1555,7 +1555,7 @@ export async function streamAgentQuery(
   deepDive: boolean,
   onToken: (token: string) => void,
   onDone: () => void,
-  onError: (err: string, opts?: { retryable?: boolean }) => void,
+  onError: (err: string, opts?: { retryable?: boolean; code?: string; sessionId?: string | null; requestId?: string | null }) => void,
   onToolEvent?: (event: any) => void,
   uploadIds?: string[]
 ): Promise<void> {
@@ -1580,7 +1580,7 @@ export async function streamAgentQuery(
       body: form,
     });
   } catch (e) {
-    onError(`Network error: ${(e as Error).message || 'failed to connect'}`);
+    onError(`Network error: ${(e as Error).message || 'failed to connect'}`, { code: 'NETWORK_ERROR', sessionId });
     return;
   }
 
@@ -1596,14 +1596,20 @@ export async function streamAgentQuery(
     const body = await res.text();
     let friendly = body;
     let retryable: boolean | undefined;
+    let code: string | undefined;
+    let responseSessionId: string | null | undefined;
+    let responseRequestId: string | null | undefined;
     try {
       const parsed = JSON.parse(body);
       friendly = parsed.message || parsed.error || body;
       retryable = parsed.retryable;
+      code = parsed.error;
+      responseSessionId = parsed.session_id;
+      responseRequestId = parsed.request_id;
     } catch {
       // Plain-text body — leave as-is.
     }
-    onError(friendly, { retryable });
+    onError(friendly, { retryable, code, sessionId: responseSessionId ?? sessionId, requestId: responseRequestId });
     return;
   }
   if (!res.body) {
@@ -1656,7 +1662,7 @@ export async function streamAgentQuery(
       }
     }
   } catch (e) {
-    onError(`Stream interrupted: ${(e as Error).message || 'connection lost'}`);
+    onError(`Stream interrupted: ${(e as Error).message || 'connection lost'}`, { code: 'STREAM_INTERRUPTED', sessionId });
     return;
   }
 

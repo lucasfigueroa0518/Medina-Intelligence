@@ -640,6 +640,13 @@ function isSessionNotFoundError(error: unknown): boolean {
   return message.includes('SESSION_NOT_FOUND');
 }
 
+type AgentSendErrorOptions = {
+  retryable?: boolean;
+  code?: string;
+  sessionId?: string | null;
+  requestId?: string | null;
+};
+
 function DocumentCardList({
   cards,
   sessionId,
@@ -1172,6 +1179,24 @@ export default function GodModePage() {
     return runningMessage;
   }, []);
 
+  const refreshSessionFromServer = React.useCallback(async (sessionId: string) => {
+    const d = await api.getSessionMessages(sessionId);
+    const runningMessage = applyServerMessages(d.messages, sessionId);
+    if (runningMessage?.pendingRequestId) {
+      activeRequestIdRef.current = runningMessage.pendingRequestId;
+      setIsThinking(true);
+      setStreaming(true);
+    } else {
+      activeRequestIdRef.current = null;
+      setIsThinking(false);
+      setStreaming(false);
+      localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+      window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+    }
+    api.listSessions().then(d2 => setSessions(d2.sessions)).catch(() => {});
+    return runningMessage;
+  }, [applyServerMessages]);
+
   React.useEffect(() => {
     document.title = 'MARTy \u2014 Medina Intelligence';
     setSessionsLoading(true);
@@ -1423,6 +1448,24 @@ export default function GodModePage() {
 
   const sendMessage = async (queryText: string) => {
     if (!queryText || streaming) return;
+
+    // Trust the server before accepting a new turn. A previous MAX request can
+    // keep working after the browser stream has dropped; if so, resume polling
+    // that turn instead of appending duplicate optimistic messages.
+    if (!demoMode && activeSessionId) {
+      try {
+        const d = await api.getSessionMessages(activeSessionId);
+        const serverMessages = hydrateAgentMessages(d.messages);
+        const runningMessage = getRunningAssistantMessage(serverMessages);
+        if (runningMessage?.pendingRequestId) {
+          applyServerMessages(d.messages, activeSessionId);
+          return;
+        }
+      } catch {
+        // Existing recovery paths handle stale sessions below.
+      }
+    }
+
     setStreaming(true);
     lastSentQueryRef.current = queryText;
 
@@ -1541,14 +1584,20 @@ export default function GodModePage() {
             ));
           }, 1000);
         },
-        (err, opts) => {
-          const staleSession = err.includes('SESSION_NOT_FOUND') || err.includes('no longer exists');
+        (err, opts: AgentSendErrorOptions = {}) => {
+          const staleSession = opts.code === 'SESSION_NOT_FOUND' || err.includes('SESSION_NOT_FOUND') || err.includes('no longer exists');
+          const serverMayHaveAcceptedTurn = Boolean(
+            opts.sessionId
+            && (opts.code === 'NETWORK_ERROR' || opts.code === 'STREAM_INTERRUPTED' || opts.code === 'AGENT_TURN_RUNNING')
+          );
           setIsThinking(false);
           setMessages(m => m.map(msg =>
             msg.id === assistantMsgId
               ? {
                   ...msg,
-                  content: msg.content || (staleSession
+                  content: msg.content || (serverMayHaveAcceptedTurn
+                    ? 'Re-syncing MARTy with the server...'
+                    : staleSession
                     ? 'That MARTy session was stale. I cleared it so you can retry in a clean session.'
                     : err),
                   streaming: false,
@@ -1558,6 +1607,17 @@ export default function GodModePage() {
               : msg
           ));
           setStreaming(false);
+          if (serverMayHaveAcceptedTurn && opts.sessionId) {
+            refreshSessionFromServer(opts.sessionId).catch(() => {
+              setMessages(m => m.map(msg =>
+                msg.id === assistantMsgId
+                  ? { ...msg, content: err, streaming: false, error: true, retryable: opts.retryable !== false }
+                  : msg
+              ));
+              setIsThinking(false);
+              setStreaming(false);
+            });
+          }
           if (staleSession) {
             setActiveSessionId(null);
             setSessionUploads([]);
