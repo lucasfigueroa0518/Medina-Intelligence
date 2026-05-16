@@ -941,7 +941,7 @@ function SessionItem({
                 {session.title || 'New Session'}
               </div>
               <div className="text-[10px] text-text-muted mt-0.5" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
-                {formatRelative(session.last_activity_at)}
+                {session._running ? 'Working...' : formatRelative(session.last_activity_at)}
               </div>
             </>
           )}
@@ -997,8 +997,14 @@ export default function GodModePage() {
   const [emptyMounted, setEmptyMounted] = React.useState(false);
   const liveSessionIdRef = React.useRef<string | null>(null);
   const pendingSessionIdRef = React.useRef<string | null>(null);
+  const activeSessionIdRef = React.useRef<string | null>(null);
+  const streamSessionIdRef = React.useRef<string | null>(null);
+  const streamRequestIdRef = React.useRef<string | null>(null);
+  const sessionDraftsRef = React.useRef<Record<string, Message[]>>({});
+  const messagesSnapshotRef = React.useRef<Message[]>([]);
   const streamingRef = React.useRef(false);
   const skipNextFetchRef = React.useRef(false);
+  const [streamSessionId, setStreamSessionId] = React.useState<string | null>(null);
 
   const [sidebarSearch, setSidebarSearch] = React.useState('');
   const [mobileSessionsOpen, setMobileSessionsOpen] = React.useState(false);
@@ -1024,7 +1030,9 @@ export default function GodModePage() {
   const cancelledLocallyRef = React.useRef(false);
 
   const cancelActiveStream = React.useCallback(() => {
-    const reqId = activeRequestIdRef.current;
+    const reqId = activeSessionIdRef.current === streamSessionIdRef.current
+      ? streamRequestIdRef.current
+      : null;
     if (!reqId) return;
     cancelledLocallyRef.current = true;
     api.cancelAgentQuery(reqId);
@@ -1035,7 +1043,11 @@ export default function GodModePage() {
   // Escape behavior. Cmd+Backspace works regardless (power-user shortcut).
   React.useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!streamingRef.current || !activeRequestIdRef.current) return;
+      if (
+        !streamingRef.current
+        || !streamRequestIdRef.current
+        || activeSessionIdRef.current !== streamSessionIdRef.current
+      ) return;
       const target = e.target as HTMLElement | null;
       const inField = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
       if (e.key === 'Escape' && !inField) {
@@ -1158,15 +1170,105 @@ export default function GodModePage() {
     []
   );
 
+  React.useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+    if (activeSessionId === streamSessionIdRef.current) {
+      activeRequestIdRef.current = streamRequestIdRef.current;
+    } else {
+      activeRequestIdRef.current = null;
+    }
+  }, [activeSessionId]);
+
+  React.useEffect(() => {
+    messagesSnapshotRef.current = messages;
+  }, [messages]);
+
+  const upsertSessionInSidebar = React.useCallback((session: any) => {
+    if (!session?.id) return;
+    setSessions(prev => {
+      const merged = {
+        ...session,
+        last_activity_at: session.last_activity_at || new Date().toISOString(),
+        created_at: session.created_at || session.last_activity_at || new Date().toISOString(),
+      };
+      const next = [merged, ...prev.filter(s => s.id !== merged.id)];
+      return next.sort((a, b) => {
+        const at = Date.parse(a.last_activity_at || a.created_at || '') || 0;
+        const bt = Date.parse(b.last_activity_at || b.created_at || '') || 0;
+        return bt - at;
+      });
+    });
+  }, []);
+
+  const optimisticSessionTitle = React.useCallback((text: string) => {
+    const cleaned = text
+      .replace(/\s+/g, ' ')
+      .replace(/^(please|can you|could you|i need you to|i need to)\s+/i, '')
+      .trim();
+    return cleaned ? cleaned.slice(0, 72) : 'New Session';
+  }, []);
+
+  const updateSessionDraft = React.useCallback((
+    sessionId: string,
+    updater: Message[] | ((current: Message[]) => Message[])
+  ) => {
+    const current = sessionDraftsRef.current[sessionId]
+      || (activeSessionIdRef.current === sessionId ? messagesSnapshotRef.current : []);
+    const next = typeof updater === 'function' ? updater(current) : updater;
+    sessionDraftsRef.current = { ...sessionDraftsRef.current, [sessionId]: next };
+    if (activeSessionIdRef.current === sessionId) {
+      setMessages(next);
+    }
+    return next;
+  }, []);
+
+  const selectSession = React.useCallback((sessionId: string) => {
+    activeSessionIdRef.current = sessionId;
+    setActiveSessionId(sessionId);
+    setMobileSessionsOpen(false);
+    const draft = sessionDraftsRef.current[sessionId];
+    if (draft && streamSessionIdRef.current === sessionId) {
+      setMessages(draft);
+      skipNextFetchRef.current = true;
+    } else {
+      setMessages([]);
+    }
+  }, []);
+
+  const startNewSessionView = React.useCallback(() => {
+    activeSessionIdRef.current = null;
+    setActiveSessionId(null);
+    setMessages([]);
+    setSessionUploads([]);
+    setBytesUsed(0);
+    setBytesTotal(0);
+    setPendingUploads([]);
+    setMobileSessionsOpen(false);
+    setShowSparkles(true);
+    setTimeout(() => setShowSparkles(false), 1200);
+  }, []);
+
   // Fix 1: Agile auto-scroll — respect user's scroll position
   const userScrolledUpRef = React.useRef(false);
 
   const applyServerMessages = React.useCallback((rows: any[], sessionIdForPending?: string | null) => {
     const nextMessages = hydrateAgentMessages(rows);
-    setMessages(nextMessages);
+    if (sessionIdForPending) {
+      sessionDraftsRef.current = { ...sessionDraftsRef.current, [sessionIdForPending]: nextMessages };
+    }
+    if (!sessionIdForPending || activeSessionIdRef.current === sessionIdForPending) {
+      setMessages(nextMessages);
+    }
     const runningMessage = getRunningAssistantMessage(nextMessages);
     if (runningMessage?.pendingRequestId) {
-      activeRequestIdRef.current = runningMessage.pendingRequestId;
+      if (sessionIdForPending) {
+        streamSessionIdRef.current = sessionIdForPending;
+        streamRequestIdRef.current = runningMessage.pendingRequestId;
+        setStreamSessionId(sessionIdForPending);
+      }
+      if (!sessionIdForPending || activeSessionIdRef.current === sessionIdForPending) {
+        activeRequestIdRef.current = runningMessage.pendingRequestId;
+      }
       setIsThinking(true);
       setStreaming(true);
       try {
@@ -1183,15 +1285,25 @@ export default function GodModePage() {
     const d = await api.getSessionMessages(sessionId);
     const runningMessage = applyServerMessages(d.messages, sessionId);
     if (runningMessage?.pendingRequestId) {
-      activeRequestIdRef.current = runningMessage.pendingRequestId;
+      streamSessionIdRef.current = sessionId;
+      streamRequestIdRef.current = runningMessage.pendingRequestId;
+      setStreamSessionId(sessionId);
+      if (activeSessionIdRef.current === sessionId) {
+        activeRequestIdRef.current = runningMessage.pendingRequestId;
+      }
       setIsThinking(true);
       setStreaming(true);
     } else {
-      activeRequestIdRef.current = null;
-      setIsThinking(false);
-      setStreaming(false);
-      localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-      window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+      if (streamSessionIdRef.current === sessionId) {
+        activeRequestIdRef.current = null;
+        streamRequestIdRef.current = null;
+        streamSessionIdRef.current = null;
+        setStreamSessionId(null);
+        setIsThinking(false);
+        setStreaming(false);
+        localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+      }
     }
     api.listSessions().then(d2 => setSessions(d2.sessions)).catch(() => {});
     return runningMessage;
@@ -1288,15 +1400,20 @@ export default function GodModePage() {
       skipNextFetchRef.current = false;
       return;
     }
-    if (activeSessionId && !streamingRef.current) {
-      api.getSessionMessages(activeSessionId).then(d => {
-        if (!streamingRef.current) {
+    if (activeSessionId) {
+      const draft = sessionDraftsRef.current[activeSessionId];
+      const activeSessionIsStreaming = streamSessionIdRef.current === activeSessionId;
+      if (draft && activeSessionIsStreaming) {
+        setMessages(draft);
+      } else {
+        api.getSessionMessages(activeSessionId).then(d => {
           applyServerMessages(d.messages, activeSessionId);
-        }
-      }).catch(e => {
+          if (d.session) upsertSessionInSidebar(d.session);
+        }).catch(e => {
         if (isSessionNotFoundError(e)) {
           const missingSessionId = activeSessionId;
           setActiveSessionId(current => current === missingSessionId ? null : current);
+          if (activeSessionIdRef.current === missingSessionId) activeSessionIdRef.current = null;
           setMessages([]);
           setSessionUploads([]);
           setBytesUsed(0);
@@ -1306,6 +1423,7 @@ export default function GodModePage() {
           api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
         }
       });
+      }
       api.listSessionUploads(activeSessionId).then(d => {
         setSessionUploads(d.uploads);
         setBytesTotal(d.uploads.reduce((acc, u) => acc + u.size_bytes, 0));
@@ -1318,7 +1436,7 @@ export default function GodModePage() {
       setBytesTotal(0);
       setPendingUploads([]);
     }
-  }, [activeSessionId, applyServerMessages, demoMode]);
+  }, [activeSessionId, applyServerMessages, demoMode, upsertSessionInSidebar]);
 
   React.useEffect(() => {
     if (demoMode || !activeSessionId) return;
@@ -1489,12 +1607,13 @@ export default function GodModePage() {
       .map(u => u.summary!) as ChatUploadSummary[];
     const uploadIds = turnUploads.map(u => u.id);
 
-    setMessages(m => [
-      ...m,
+    const optimisticMessages = [
+      ...messagesSnapshotRef.current,
       { id: userMsgId, role: 'user', content: queryText, timestamp: now,
         attachments: turnUploads.length > 0 ? turnUploads : undefined },
       { id: assistantMsgId, role: 'assistant', content: '', streaming: true, toolCalls: [], timestamp: now },
-    ]);
+    ] as Message[];
+    setMessages(optimisticMessages);
     setInput('');
     setPlaceholderText('Ask MARTy anything...');
 
@@ -1531,23 +1650,44 @@ export default function GodModePage() {
       return;
     }
 
+    let requestSessionId: string | null = activeSessionId;
     try {
-      let requestSessionId = activeSessionId ?? liveSessionIdRef.current;
       if (!requestSessionId) {
         const created = await api.createSession();
         requestSessionId = created.session.id;
         liveSessionIdRef.current = requestSessionId;
         pendingSessionIdRef.current = requestSessionId;
+        const establishedAt = new Date().toISOString();
+        upsertSessionInSidebar({
+          ...created.session,
+          title: created.session.title || optimisticSessionTitle(queryText),
+          last_activity_at: created.session.last_activity_at || establishedAt,
+          created_at: created.session.created_at || establishedAt,
+        });
+        sessionDraftsRef.current = { ...sessionDraftsRef.current, [requestSessionId as string]: optimisticMessages };
+        activeSessionIdRef.current = requestSessionId;
+        setActiveSessionId(requestSessionId);
         localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId }));
         window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+      } else {
+        upsertSessionInSidebar({
+          id: requestSessionId,
+          title: sessions.find(s => s.id === requestSessionId)?.title,
+          last_activity_at: now,
+          created_at: sessions.find(s => s.id === requestSessionId)?.created_at || now,
+        });
+        sessionDraftsRef.current = { ...sessionDraftsRef.current, [requestSessionId as string]: optimisticMessages };
       }
+      streamSessionIdRef.current = requestSessionId;
+      setStreamSessionId(requestSessionId);
+      setStreaming(true);
 
       await streamAgentQuery(
         queryText, requestSessionId, null, null, file, isDeepDive,
         token => {
           if (typeof token === 'string') {
             setIsThinking(false);
-            setMessages(m => m.map(msg =>
+            updateSessionDraft(requestSessionId!, m => m.map(msg =>
               msg.id === assistantMsgId ? { ...msg, content: msg.content + token } : msg
             ));
           }
@@ -1555,9 +1695,14 @@ export default function GodModePage() {
         () => {
           const wasCancelled = cancelledLocallyRef.current;
           cancelledLocallyRef.current = false;
-          activeRequestIdRef.current = null;
+          if (streamSessionIdRef.current === requestSessionId) {
+            activeRequestIdRef.current = null;
+            streamRequestIdRef.current = null;
+            streamSessionIdRef.current = null;
+            setStreamSessionId(null);
+          }
           setIsThinking(false);
-          setMessages(m => m.map(msg => {
+          updateSessionDraft(requestSessionId!, m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
             if (wasCancelled) {
               const placeholder = normalizeMartySentenceSpacing(msg.content || '_(cancelled before MARTy started generating)_');
@@ -1569,17 +1714,13 @@ export default function GodModePage() {
             return { ...msg, content: normalizeMartySentenceSpacing(msg.content), streaming: false, justFinished: true };
           }));
           setStreaming(false);
-          if (pendingSessionIdRef.current) {
-            skipNextFetchRef.current = true;
-            setActiveSessionId(pendingSessionIdRef.current);
-            pendingSessionIdRef.current = null;
-          }
+          pendingSessionIdRef.current = null;
           liveSessionIdRef.current = null;
           localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
           window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
           api.listSessions().then(d => setSessions(d.sessions));
           setTimeout(() => {
-            setMessages(m => m.map(msg =>
+            updateSessionDraft(requestSessionId!, m => m.map(msg =>
               msg.id === assistantMsgId ? { ...msg, justFinished: false } : msg
             ));
           }, 1000);
@@ -1591,7 +1732,7 @@ export default function GodModePage() {
             && (opts.code === 'NETWORK_ERROR' || opts.code === 'STREAM_INTERRUPTED' || opts.code === 'AGENT_TURN_RUNNING')
           );
           setIsThinking(false);
-          setMessages(m => m.map(msg =>
+          updateSessionDraft(requestSessionId!, m => m.map(msg =>
             msg.id === assistantMsgId
               ? {
                   ...msg,
@@ -1607,9 +1748,15 @@ export default function GodModePage() {
               : msg
           ));
           setStreaming(false);
+          if (streamSessionIdRef.current === requestSessionId) {
+            activeRequestIdRef.current = null;
+            streamRequestIdRef.current = null;
+            streamSessionIdRef.current = null;
+            setStreamSessionId(null);
+          }
           if (serverMayHaveAcceptedTurn && opts.sessionId) {
             refreshSessionFromServer(opts.sessionId).catch(() => {
-              setMessages(m => m.map(msg =>
+              updateSessionDraft(requestSessionId!, m => m.map(msg =>
                 msg.id === assistantMsgId
                   ? { ...msg, content: err, streaming: false, error: true, retryable: opts.retryable !== false }
                   : msg
@@ -1619,24 +1766,41 @@ export default function GodModePage() {
             });
           }
           if (staleSession) {
-            setActiveSessionId(null);
+            if (activeSessionIdRef.current === requestSessionId) {
+              activeSessionIdRef.current = null;
+              setActiveSessionId(null);
+            }
             setSessionUploads([]);
             setBytesUsed(0);
             setBytesTotal(0);
             api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
           }
-          if (pendingSessionIdRef.current) {
-            setActiveSessionId(pendingSessionIdRef.current);
-            pendingSessionIdRef.current = null;
-          }
+          pendingSessionIdRef.current = null;
           liveSessionIdRef.current = null;
           localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
           window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
         },
         (event: any) => {
           if (event.type === 'session' && event.session_id) {
+            if (event.session_id !== requestSessionId) {
+              const previousSessionId = requestSessionId;
+              const draft = previousSessionId ? sessionDraftsRef.current[previousSessionId] : undefined;
+              if (draft) {
+                const nextDrafts: Record<string, Message[]> = { ...sessionDraftsRef.current, [event.session_id]: draft };
+                delete nextDrafts[previousSessionId!];
+                sessionDraftsRef.current = nextDrafts;
+              }
+              requestSessionId = event.session_id;
+              upsertSessionInSidebar({ id: event.session_id, title: optimisticSessionTitle(queryText), last_activity_at: new Date().toISOString() });
+              if (previousSessionId && activeSessionIdRef.current === previousSessionId) {
+                activeSessionIdRef.current = event.session_id;
+                setActiveSessionId(event.session_id);
+              }
+            }
             liveSessionIdRef.current = event.session_id;
-            if (!activeSessionId || event.session_id !== requestSessionId) {
+            streamSessionIdRef.current = event.session_id;
+            setStreamSessionId(event.session_id);
+            if (!activeSessionIdRef.current || event.session_id !== requestSessionId) {
               pendingSessionIdRef.current = event.session_id;
             }
             localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: event.session_id }));
@@ -1644,13 +1808,17 @@ export default function GodModePage() {
             return;
           }
           if (event.type === 'request' && event.request_id) {
-            activeRequestIdRef.current = event.request_id;
+            streamRequestIdRef.current = event.request_id;
+            if (activeSessionIdRef.current === requestSessionId) {
+              activeRequestIdRef.current = event.request_id;
+            }
             cancelledLocallyRef.current = false;
+            localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId, requestId: event.request_id }));
             return;
           }
           if (event.type === 'sources') {
             const sources = (event.sources || []) as CitationSource[];
-            setMessages(m => m.map(msg =>
+            updateSessionDraft(requestSessionId!, m => m.map(msg =>
               msg.id === assistantMsgId ? { ...msg, sources } : msg
             ));
             return;
@@ -1658,14 +1826,16 @@ export default function GodModePage() {
           if (event.type === 'attachments') {
             const sessionAtt = (event.session_attachments || []) as ChatUploadSummary[];
             const turnAtt = (event.turn_attachments || []) as ChatUploadSummary[];
-            setSessionUploads(sessionAtt);
-            setBytesUsed(event.bytes_used || 0);
-            setBytesTotal(event.bytes_total || 0);
+            if (activeSessionIdRef.current === requestSessionId) {
+              setSessionUploads(sessionAtt);
+              setBytesUsed(event.bytes_used || 0);
+              setBytesTotal(event.bytes_total || 0);
+            }
             // Replace the optimistic snapshot we set on send with the
             // server's authoritative list (in_context flag is computed
             // server-side and may differ from what the client guessed).
             if (turnAtt.length > 0) {
-              setMessages(m => m.map(msg =>
+              updateSessionDraft(requestSessionId!, m => m.map(msg =>
                 msg.id === userMsgId ? { ...msg, attachments: turnAtt } : msg
               ));
             }
@@ -1674,7 +1844,7 @@ export default function GodModePage() {
           if (event.type === 'document_cards') {
             const incoming = mergeDocumentCards(undefined, event.document_cards);
             if (incoming?.length) {
-              setMessages(m => m.map(msg =>
+              updateSessionDraft(requestSessionId!, m => m.map(msg =>
                 msg.id === assistantMsgId
                   ? { ...msg, documentCards: mergeDocumentCards(msg.documentCards, incoming) }
                   : msg
@@ -1682,7 +1852,7 @@ export default function GodModePage() {
             }
             return;
           }
-          setMessages(m => m.map(msg => {
+          updateSessionDraft(requestSessionId!, m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
             const toolCalls = upsertToolEvent(msg.toolCalls || [], event);
             const documentCards = event.result?.document_cards
@@ -1695,7 +1865,7 @@ export default function GodModePage() {
       );
     } catch (e) {
       setIsThinking(false);
-      setMessages(m => m.map(msg =>
+      const markFailed = (m: Message[]) => m.map(msg =>
         msg.id === assistantMsgId
           ? {
               ...msg,
@@ -1705,12 +1875,17 @@ export default function GodModePage() {
               retryable: true,
             }
           : msg
-      ));
+      );
+      if (requestSessionId) updateSessionDraft(requestSessionId, markFailed);
+      else setMessages(markFailed);
       setStreaming(false);
-      if (pendingSessionIdRef.current) {
-        setActiveSessionId(pendingSessionIdRef.current);
-        pendingSessionIdRef.current = null;
+      if (streamSessionIdRef.current === requestSessionId) {
+        activeRequestIdRef.current = null;
+        streamRequestIdRef.current = null;
+        streamSessionIdRef.current = null;
+        setStreamSessionId(null);
       }
+      pendingSessionIdRef.current = null;
       liveSessionIdRef.current = null;
       localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
       window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
@@ -1729,6 +1904,8 @@ export default function GodModePage() {
 
   const isEmptyState = messages.length === 0;
   const hasInput = input.trim().length > 0;
+  const activeSessionIsStreaming = Boolean(streaming && activeSessionId && activeSessionId === streamSessionId);
+  const canSend = hasInput && !streaming;
 
   return (
     <div className="h-full flex overflow-hidden">
@@ -1764,7 +1941,7 @@ export default function GodModePage() {
 
         <div className="px-4 pb-3">
           <button
-            onClick={() => { setActiveSessionId(null); setMessages([]); setMobileSessionsOpen(false); setShowSparkles(true); setTimeout(() => setShowSparkles(false), 1200); }}
+            onClick={startNewSessionView}
             className="new-session-btn btn-secondary w-full flex items-center justify-center gap-2"
           >
             <Plus size={16} /> New Session
@@ -1817,10 +1994,10 @@ export default function GodModePage() {
                     return (
                       <SessionItem
                         key={s.id}
-                        session={s}
+                        session={{ ...s, _running: s.id === streamSessionId }}
                         isActive={activeSessionId === s.id}
                         index={idx}
-                        onSelect={() => { setActiveSessionId(s.id); setMobileSessionsOpen(false); }}
+                        onSelect={() => selectSession(s.id)}
                         onDelete={() => handleDeleteSession(s.id)}
                         onRename={() => handleRenameSession(s.id)}
                         deleteConfirmId={deleteConfirmId}
@@ -1852,7 +2029,7 @@ export default function GodModePage() {
           </button>
           <button
             type="button"
-            onClick={() => { setActiveSessionId(null); setMessages([]); setShowSparkles(true); setTimeout(() => setShowSparkles(false), 1200); inputRef.current?.focus(); }}
+            onClick={() => { startNewSessionView(); inputRef.current?.focus(); }}
             className="h-10 px-3 rounded-lg bg-accent-magenta/15 text-accent-magenta text-sm"
           >
             New
@@ -2213,10 +2390,9 @@ export default function GodModePage() {
               />
 
               {/* Send button — fixed 36x36 */}
-              {streaming ? (
+              {activeSessionIsStreaming ? (
                 <button
                   onClick={cancelActiveStream}
-                  disabled={!activeRequestIdRef.current}
                   title="Stop generating (Esc, ⌘⌫)"
                   aria-label="Stop generating"
                   className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
@@ -2234,17 +2410,18 @@ export default function GodModePage() {
               ) : (
                 <button
                   onClick={() => sendMessage(input)}
-                  disabled={!hasInput}
+                  disabled={!canSend}
+                  title={streaming ? 'MARTy is finishing another conversation' : 'Send'}
                   className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
                   style={{
                     borderRadius: 10,
-                    background: hasInput
+                    background: canSend
                       ? 'linear-gradient(135deg, #A855F7 0%, #EC4899 100%)'
                       : 'rgba(255,255,255,0.08)',
-                    cursor: hasInput ? 'pointer' : 'not-allowed',
+                    cursor: canSend ? 'pointer' : 'not-allowed',
                     transform: sendPulse ? 'scale(0.95)' : 'scale(1)',
                   }}
-                  onMouseEnter={e => { if (hasInput) { (e.currentTarget as HTMLElement).style.filter = 'brightness(1.15)'; (e.currentTarget as HTMLElement).style.transform = 'scale(1.05)'; } }}
+                  onMouseEnter={e => { if (canSend) { (e.currentTarget as HTMLElement).style.filter = 'brightness(1.15)'; (e.currentTarget as HTMLElement).style.transform = 'scale(1.05)'; } }}
                   onMouseLeave={e => { (e.currentTarget as HTMLElement).style.filter = ''; (e.currentTarget as HTMLElement).style.transform = ''; }}
                 >
                   <ArrowUp size={18} color="#ffffff" />
