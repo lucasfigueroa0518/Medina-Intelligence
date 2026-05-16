@@ -1028,6 +1028,8 @@ export default function GodModePage() {
   const streamAssistantMessageIdRef = React.useRef<string | null>(null);
   const streamAbortControllerRef = React.useRef<AbortController | null>(null);
   const sessionDraftsRef = React.useRef<Record<string, Message[]>>({});
+  const provisionalSessionIdsRef = React.useRef<Set<string>>(new Set());
+  const deletedSessionIdsRef = React.useRef<Set<string>>(new Set());
   const messagesSnapshotRef = React.useRef<Message[]>([]);
   const streamingRef = React.useRef(false);
   const skipNextFetchRef = React.useRef(false);
@@ -1245,21 +1247,81 @@ export default function GodModePage() {
     messagesSnapshotRef.current = messages;
   }, [messages]);
 
+  const sortSidebarSessions = React.useCallback((items: any[]) => {
+    return [...items].sort((a, b) => {
+      const at = Date.parse(a.last_activity_at || a.created_at || '') || 0;
+      const bt = Date.parse(b.last_activity_at || b.created_at || '') || 0;
+      return bt - at;
+    });
+  }, []);
+
   const upsertSessionInSidebar = React.useCallback((session: any) => {
     if (!session?.id) return;
     setSessions(prev => {
+      if (deletedSessionIdsRef.current.has(session.id)) return prev;
+      const existing = prev.find(s => s.id === session.id);
       const merged = {
+        ...(existing || {}),
         ...session,
+        title: session.title || existing?.title,
         last_activity_at: session.last_activity_at || new Date().toISOString(),
-        created_at: session.created_at || session.last_activity_at || new Date().toISOString(),
+        created_at: session.created_at || existing?.created_at || session.last_activity_at || new Date().toISOString(),
       };
       const next = [merged, ...prev.filter(s => s.id !== merged.id)];
-      return next.sort((a, b) => {
-        const at = Date.parse(a.last_activity_at || a.created_at || '') || 0;
-        const bt = Date.parse(b.last_activity_at || b.created_at || '') || 0;
-        return bt - at;
-      });
+      return sortSidebarSessions(next);
     });
+  }, [sortSidebarSessions]);
+
+  const mergeSessionsFromServer = React.useCallback((serverSessions: any[]) => {
+    setSessions(prev => {
+      const serverById = new Map<string, any>();
+      for (const session of serverSessions || []) {
+        if (!session?.id || deletedSessionIdsRef.current.has(session.id)) continue;
+        serverById.set(session.id, session);
+      }
+
+      const mergedById = new Map<string, any>();
+      for (const existing of prev) {
+        if (!existing?.id || deletedSessionIdsRef.current.has(existing.id)) continue;
+        const server = serverById.get(existing.id);
+        if (server) {
+          mergedById.set(existing.id, {
+            ...existing,
+            ...server,
+            title: server.title || existing.title,
+            created_at: server.created_at || existing.created_at,
+            last_activity_at: server.last_activity_at || existing.last_activity_at,
+            _optimistic: false,
+          });
+          serverById.delete(existing.id);
+          continue;
+        }
+
+        const hasLocalDraft = Array.isArray(sessionDraftsRef.current[existing.id]);
+        const isLive = existing.id === streamSessionIdRef.current
+          || existing.id === activeSessionIdRef.current
+          || provisionalSessionIdsRef.current.has(existing.id)
+          || existing._optimistic;
+        if (hasLocalDraft || isLive) {
+          mergedById.set(existing.id, existing);
+        }
+      }
+
+      for (const server of serverById.values()) {
+        mergedById.set(server.id, { ...server, _optimistic: false });
+      }
+
+      return sortSidebarSessions(Array.from(mergedById.values()));
+    });
+  }, [sortSidebarSessions]);
+
+  const removeSessionFromSidebar = React.useCallback((sessionId: string) => {
+    deletedSessionIdsRef.current.add(sessionId);
+    provisionalSessionIdsRef.current.delete(sessionId);
+    const nextDrafts = { ...sessionDraftsRef.current };
+    delete nextDrafts[sessionId];
+    sessionDraftsRef.current = nextDrafts;
+    setSessions(prev => prev.filter(s => s.id !== sessionId));
   }, []);
 
   const optimisticSessionTitle = React.useCallback((text: string) => {
@@ -1289,9 +1351,9 @@ export default function GodModePage() {
     setActiveSessionId(sessionId);
     setMobileSessionsOpen(false);
     const draft = sessionDraftsRef.current[sessionId];
-    if (draft && streamSessionIdRef.current === sessionId) {
+    if (draft) {
       setMessages(draft);
-      skipNextFetchRef.current = true;
+      skipNextFetchRef.current = provisionalSessionIdsRef.current.has(sessionId) || streamSessionIdRef.current === sessionId;
     } else {
       setMessages([]);
     }
@@ -1371,9 +1433,9 @@ export default function GodModePage() {
         window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
       }
     }
-    api.listSessions().then(d2 => setSessions(d2.sessions)).catch(() => {});
+    api.listSessions().then(d2 => mergeSessionsFromServer(d2.sessions)).catch(() => {});
     return runningMessage;
-  }, [applyServerMessages]);
+  }, [applyServerMessages, mergeSessionsFromServer]);
 
   React.useEffect(() => {
     document.title = 'MARTy \u2014 Medina Intelligence';
@@ -1382,7 +1444,7 @@ export default function GodModePage() {
       setSessions(demoMartySessions);
       setSessionsLoading(false);
     } else {
-      api.listSessions().then(d => { setSessions(d.sessions); setSessionsLoading(false); }).catch(() => setSessionsLoading(false));
+      api.listSessions().then(d => { mergeSessionsFromServer(d.sessions); setSessionsLoading(false); }).catch(() => setSessionsLoading(false));
     }
     const t = setTimeout(() => setShowSparkles(false), 1200);
 
@@ -1404,7 +1466,8 @@ export default function GodModePage() {
             if (isSessionNotFoundError(e)) {
               setActiveSessionId(current => current === sessionId ? null : current);
               setMessages([]);
-              api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
+              removeSessionFromSidebar(sessionId);
+              api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
             }
           });
         }
@@ -1437,7 +1500,7 @@ export default function GodModePage() {
     } catch { /* ignore */ }
 
     return () => clearTimeout(t);
-  }, [applyServerMessages, demoMode]);
+  }, [applyServerMessages, demoMode, mergeSessionsFromServer, removeSessionFromSidebar]);
 
   React.useEffect(() => {
     if (!activeSessionId && messages.length === 0) {
@@ -1468,10 +1531,11 @@ export default function GodModePage() {
     }
     if (activeSessionId) {
       const draft = sessionDraftsRef.current[activeSessionId];
-      const activeSessionIsStreaming = streamSessionIdRef.current === activeSessionId;
-      if (draft && activeSessionIsStreaming) {
+      const isProvisional = provisionalSessionIdsRef.current.has(activeSessionId);
+      if (draft) {
         setMessages(draft);
-      } else {
+      }
+      if (!isProvisional) {
         api.getSessionMessages(activeSessionId).then(d => {
           applyServerMessages(d.messages, activeSessionId);
           if (d.session) upsertSessionInSidebar(d.session);
@@ -1484,11 +1548,12 @@ export default function GodModePage() {
           setSessionUploads([]);
           setBytesUsed(0);
           setBytesTotal(0);
+          removeSessionFromSidebar(missingSessionId);
           localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
           window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
-          api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
+          api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
         }
-      });
+        });
       }
       api.listSessionUploads(activeSessionId).then(d => {
         setSessionUploads(d.uploads);
@@ -1502,7 +1567,7 @@ export default function GodModePage() {
       setBytesTotal(0);
       setPendingUploads([]);
     }
-  }, [activeSessionId, applyServerMessages, demoMode, upsertSessionInSidebar]);
+  }, [activeSessionId, applyServerMessages, demoMode, mergeSessionsFromServer, removeSessionFromSidebar, upsertSessionInSidebar]);
 
   React.useEffect(() => {
     if (demoMode || !activeSessionId) return;
@@ -1539,7 +1604,7 @@ export default function GodModePage() {
         setStreaming(false);
         localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
         window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
-        api.listSessions().then(d2 => setSessions(d2.sessions)).catch(() => {});
+        api.listSessions().then(d2 => mergeSessionsFromServer(d2.sessions)).catch(() => {});
       } catch (e) {
         if (isSessionNotFoundError(e)) {
           const missingSessionId = activeSessionId;
@@ -1555,9 +1620,10 @@ export default function GodModePage() {
           setStreaming(false);
           setActiveSessionId(current => current === missingSessionId ? null : current);
           setMessages([]);
+          removeSessionFromSidebar(missingSessionId);
           localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
           window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
-          api.listSessions().then(d2 => setSessions(d2.sessions)).catch(() => {});
+          api.listSessions().then(d2 => mergeSessionsFromServer(d2.sessions)).catch(() => {});
           return;
         }
         // Keep the visible pending state. A later poll or manual refresh can
@@ -1571,7 +1637,7 @@ export default function GodModePage() {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [activeSessionId, demoMode, messages]);
+  }, [activeSessionId, demoMode, mergeSessionsFromServer, messages, removeSessionFromSidebar]);
 
   // Fix 1: Auto-scroll only when user hasn't scrolled up
   React.useEffect(() => {
@@ -1599,12 +1665,12 @@ export default function GodModePage() {
     setDeletingId(sessionId);
     try {
       if (demoMode) {
-        setSessions(prev => prev.filter(s => s.id !== sessionId));
+        removeSessionFromSidebar(sessionId);
         if (activeSessionId === sessionId) { setActiveSessionId(null); setMessages([]); }
         return;
       }
       await api.deleteSession(sessionId);
-      setSessions(prev => prev.filter(s => s.id !== sessionId));
+      removeSessionFromSidebar(sessionId);
       if (activeSessionId === sessionId) { setActiveSessionId(null); setMessages([]); }
     } catch { /* ignore */ }
     finally { setDeletingId(null); setDeleteConfirmId(null); }
@@ -1698,6 +1764,8 @@ export default function GodModePage() {
     const clientRequestId = crypto.randomUUID();
     const abortController = new AbortController();
     const now = new Date().toISOString();
+    const creatingNewSession = !activeSessionId;
+    let requestSessionId: string | null = activeSessionId || crypto.randomUUID();
 
     // Snapshot pending uploads for this turn — only those that finished
     // uploading without error make it into the message bubble + the request.
@@ -1706,7 +1774,7 @@ export default function GodModePage() {
       .map(u => u.summary!) as ChatUploadSummary[];
     const uploadIds = turnUploads.map(u => u.id);
 
-    const baseMessages = activeSessionId
+    const baseMessages = !creatingNewSession && activeSessionId
       ? (sessionDraftsRef.current[activeSessionId] || messagesSnapshotRef.current)
       : messagesSnapshotRef.current;
     const optimisticMessages = [
@@ -1718,6 +1786,27 @@ export default function GodModePage() {
     setMessages(optimisticMessages);
     setInput('');
     setPlaceholderText('Ask MARTy anything...');
+
+    if (!demoMode && creatingNewSession && requestSessionId) {
+      const provisionalSession = {
+        id: requestSessionId,
+        title: optimisticSessionTitle(trimmedQuery),
+        last_activity_at: now,
+        created_at: now,
+        _optimistic: true,
+      };
+      provisionalSessionIdsRef.current.add(requestSessionId);
+      sessionDraftsRef.current = { ...sessionDraftsRef.current, [requestSessionId]: optimisticMessages };
+      activeSessionIdRef.current = requestSessionId;
+      setActiveSessionId(requestSessionId);
+      pendingSessionIdRef.current = requestSessionId;
+      liveSessionIdRef.current = requestSessionId;
+      upsertSessionInSidebar(provisionalSession);
+      try {
+        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId, requestId: clientRequestId }));
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+      } catch { /* ignore */ }
+    }
 
     // Reset textarea height
     if (inputRef.current) {
@@ -1752,24 +1841,42 @@ export default function GodModePage() {
       return;
     }
 
-    let requestSessionId: string | null = activeSessionId;
     try {
-      if (!requestSessionId) {
-        const created = await api.createSession();
-        requestSessionId = created.session.id;
-        liveSessionIdRef.current = requestSessionId;
-        pendingSessionIdRef.current = requestSessionId;
+      if (creatingNewSession) {
+        const provisionalId = requestSessionId!;
+        const created = await api.createSession({ client_session_id: provisionalId });
+        requestSessionId = created.session.id as string;
+        const confirmedSessionId = requestSessionId;
+        provisionalSessionIdsRef.current.delete(provisionalId);
+        liveSessionIdRef.current = confirmedSessionId;
+        pendingSessionIdRef.current = confirmedSessionId;
         const establishedAt = new Date().toISOString();
+        if (confirmedSessionId !== provisionalId) {
+          const draft = sessionDraftsRef.current[provisionalId];
+          if (draft) {
+            const nextDrafts = { ...sessionDraftsRef.current, [confirmedSessionId]: draft };
+            delete nextDrafts[provisionalId];
+            sessionDraftsRef.current = nextDrafts;
+          }
+          setSessions(prev => prev.filter(s => s.id !== provisionalId));
+          if (activeSessionIdRef.current === provisionalId) {
+            activeSessionIdRef.current = confirmedSessionId;
+            setActiveSessionId(confirmedSessionId);
+          }
+        }
         upsertSessionInSidebar({
           ...created.session,
           title: created.session.title || optimisticSessionTitle(trimmedQuery),
           last_activity_at: created.session.last_activity_at || establishedAt,
           created_at: created.session.created_at || establishedAt,
+          _optimistic: false,
         });
-        sessionDraftsRef.current = { ...sessionDraftsRef.current, [requestSessionId as string]: optimisticMessages };
-        activeSessionIdRef.current = requestSessionId;
-        setActiveSessionId(requestSessionId);
-        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId, requestId: clientRequestId }));
+        sessionDraftsRef.current = { ...sessionDraftsRef.current, [confirmedSessionId]: optimisticMessages };
+        if (activeSessionIdRef.current === provisionalId || activeSessionIdRef.current === confirmedSessionId) {
+          activeSessionIdRef.current = confirmedSessionId;
+          setActiveSessionId(confirmedSessionId);
+        }
+        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: confirmedSessionId, requestId: clientRequestId }));
         window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
       } else {
         upsertSessionInSidebar({
@@ -1836,7 +1943,7 @@ export default function GodModePage() {
             localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
             window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
           }
-          api.listSessions().then(d => setSessions(d.sessions));
+          api.listSessions().then(d => mergeSessionsFromServer(d.sessions));
           setTimeout(() => {
             updateSessionDraft(requestSessionId!, m => m.map(msg =>
               msg.id === assistantMsgId ? { ...msg, justFinished: false } : msg
@@ -1928,10 +2035,11 @@ export default function GodModePage() {
               activeSessionIdRef.current = null;
               setActiveSessionId(null);
             }
+            if (requestSessionId) removeSessionFromSidebar(requestSessionId);
             setSessionUploads([]);
             setBytesUsed(0);
             setBytesTotal(0);
-            api.listSessions().then(d => setSessions(d.sessions)).catch(() => {});
+            api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
           }
           if (isCurrentStream) {
             pendingSessionIdRef.current = null;
@@ -1963,7 +2071,7 @@ export default function GodModePage() {
             if (!activeSessionIdRef.current || event.session_id !== requestSessionId) {
               pendingSessionIdRef.current = event.session_id;
             }
-            localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: event.session_id }));
+            localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: event.session_id, requestId: streamRequestIdRef.current || clientRequestId }));
             window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
             return;
           }

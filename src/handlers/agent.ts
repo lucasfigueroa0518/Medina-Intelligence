@@ -779,6 +779,14 @@ function normalizeSessionId(value: unknown): string | null {
   return trimmed;
 }
 
+function normalizeClientSessionId(value: unknown): string | null {
+  const id = normalizeSessionId(value);
+  if (!id) return null;
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(id)
+    ? id
+    : null;
+}
+
 function normalizeRequestId(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
@@ -790,9 +798,10 @@ async function createAgentSessionRecord(
   ctx: AuthContext,
   env: Env,
   contextEntityType: string | null = null,
-  contextEntityId: string | null = null
+  contextEntityId: string | null = null,
+  preferredId: string | null = null
 ): Promise<AgentSession> {
-  const id = crypto.randomUUID();
+  const id = preferredId || crypto.randomUUID();
   const now = new Date().toISOString();
   await env.D1.prepare(
     `INSERT INTO agent_sessions (id, org_id, user_id, context_entity_type, context_entity_id, turn_count, last_activity_at, created_at)
@@ -1374,16 +1383,23 @@ export async function createSession(
 ): Promise<Response> {
   let contextEntityType: string | null = null;
   let contextEntityId: string | null = null;
+  let clientSessionId: string | null = null;
   try {
     const body = await parseJsonBody<any>(request);
     contextEntityType = typeof body?.context_entity_type === 'string' ? body.context_entity_type : null;
     contextEntityId = typeof body?.context_entity_id === 'string' ? body.context_entity_id : null;
+    clientSessionId = normalizeClientSessionId(body?.client_session_id);
   } catch {
     // Empty bodies are allowed; this endpoint mostly exists so the client can
     // create a durable chat target before handing a turn to the stream.
   }
 
-  const session = await createAgentSessionRecord(ctx, env, contextEntityType, contextEntityId);
+  if (clientSessionId) {
+    const existing = await loadAccessibleAgentSession(clientSessionId, ctx, env);
+    if (existing) return jsonResponse({ session: existing });
+  }
+
+  const session = await createAgentSessionRecord(ctx, env, contextEntityType, contextEntityId, clientSessionId);
   return jsonResponse({ session });
 }
 
