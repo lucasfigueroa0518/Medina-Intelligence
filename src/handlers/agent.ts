@@ -20,7 +20,7 @@ import { estimateTokens, truncateToTokens } from '../lib/tokens';
 import { emitAudit } from '../lib/audit';
 import {
   searchContacts, searchCompanies, searchDeals, searchConversations,
-  recall,
+  recall, sweepConversations,
   getContactDetail, getCompanyDetail, getDealDetail,
   createContactTool, updateContactTool,
   createCompanyTool, updateCompanyTool,
@@ -49,6 +49,7 @@ import {
   buildMartyBaseSystemPrompt,
   buildMartyMaxModePrompt,
 } from '../lib/marty-runtime';
+import { buildMaxSetTool, compactMaxSetResultForContext, detectMaxSetIntent } from '../lib/max-set-builder';
 
 function normalizeMartySentenceSpacing(text: string): string {
   if (!text) return text;
@@ -186,17 +187,83 @@ const AGENT_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'search_conversations',
-    description: 'Search emails, Slack messages, and meeting transcripts stored in the CRM. Use this when the user asks about recent communications, email threads, Slack discussions, or wants to know what was discussed.',
+    description: 'Search emails, Slack messages, and meeting transcripts stored in the CRM. Use this for normal communication lookup. In MAX mode, prefer sweep_conversations for exhaustive all/every/list/export/count jobs.',
     input_schema: {
       type: 'object',
       properties: {
-        keyword: { type: 'string', description: 'Search by subject, body content, or participant name' },
+        keyword: { type: 'string', description: 'Search by subject, body preview, sender, To, or Cc' },
         source: { type: 'string', enum: ['outlook', 'slack', 'firefly', 'all'], description: 'Filter by communication channel. Default: all' },
         contact_id: { type: 'string', description: 'Filter conversations involving a specific contact' },
         direction: { type: 'string', enum: ['inbound', 'outbound', 'all'], description: 'Filter by direction. Default: all' },
         days_back: { type: 'number', description: 'How many days back to search. Default: 30, or 365 in MAX mode.' },
-        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 250. Max 50 normally, 1000 in MAX mode.' },
       },
+    },
+  },
+  {
+    name: 'sweep_conversations',
+    description: 'MAX-mode deterministic sweep over the conversations table for exhaustive all/every/list/export/count tasks. Use this instead of recall when the user needs a broad roster or aggregation across many touchpoints, such as invite lists, all Bank of America touchpoints, everyone who showed funding interest, or every startup mention in a sector. It can return hundreds of SQL-filtered rows and optionally deduplicate To/Cc recipients. Use a few high-signal terms like event name/company/sector, plus exact sender/date filters when known; do not pass the whole user request as the only search strategy if better filters are available.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Optional broad query text. If all_terms/any_terms are omitted, high-signal terms are derived and OR-matched across subject/body preview/sender/To/Cc.' },
+        all_terms: { type: 'array', items: { type: 'string' }, description: 'Every term/phrase must appear somewhere in subject/body preview/sender/To/Cc. Use sparingly for precise anchors.' },
+        any_terms: { type: 'array', items: { type: 'string' }, description: 'At least one term/phrase must appear. Good for aliases like ["Intelligent Infrastructure", "Virtual Town Hall", "May 7"].' },
+        source: { type: 'string', enum: ['outlook', 'email', 'slack', 'manual', 'all'], description: 'Filter communication source. Use email/outlook for email invite lists.' },
+        direction: { type: 'string', enum: ['inbound', 'outbound', 'internal', 'all'], description: 'Optional direction filter.' },
+        from_emails: { type: 'array', items: { type: 'string' }, description: 'Exact sender emails, e.g. Tony/Raul, for invite-list sweeps.' },
+        participant_emails: { type: 'array', items: { type: 'string' }, description: 'Emails that must appear as sender, To, or Cc.' },
+        start_date: { type: 'string', description: 'Inclusive ISO/date lower bound on sent_at.' },
+        end_date: { type: 'string', description: 'Inclusive ISO/date upper bound on sent_at.' },
+        days_back: { type: 'number', description: 'Optional relative lookback. Omit for all-time sweeps.' },
+        include_recipients: { type: 'boolean', description: 'When true, deduplicates To/Cc recipients into first_name/email rows for mail merges.' },
+        include_body: { type: 'boolean', description: 'When true, fetches fuller R2 body excerpts for returned rows. Keep false for pure recipient/export sweeps.' },
+        body_fetch_limit: { type: 'number', description: 'Max full bodies to fetch when include_body is true. Default 80, max 200 in MAX mode.' },
+        exclude_domains: { type: 'array', items: { type: 'string' }, description: 'Optional recipient domains to exclude from rollup, e.g. medinavc.com.' },
+        limit: { type: 'number', description: 'Rows to return. Default 300 in MAX mode, max 1000.' },
+        offset: { type: 'number', description: 'Pagination offset. If has_more is true, call again with the next offset before finalizing exhaustive answers.' },
+      },
+    },
+  },
+  {
+    name: 'build_max_set',
+    description: 'MAX-only exhaustive set builder for all/every/list/export/count/touchpoint/ever-involved questions. Prefer this over recall and lower-level sweeps whenever the user needs a complete roster or broad aggregation across communications, events, campaigns, CRM entities, documents, and tasks. It deduplicates candidates, assigns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and auto-creates an XLSX for large or export/mail-merge outputs.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task_type: {
+          type: 'string',
+          enum: ['invite_roster', 'touchpoint_roster', 'entity_theme_set', 'funding_interest_gap', 'firm_involvement', 'open_loops', 'generic_set'],
+          description: 'The exhaustive set-building workflow. Infer from the user request when obvious.',
+        },
+        entity_kind: {
+          type: 'string',
+          enum: ['person', 'company', 'firm', 'startup', 'deal', 'touchpoint', 'mixed'],
+          description: 'The thing being collected.',
+        },
+        query: { type: 'string', description: 'Original user goal or concise search objective.' },
+        include_terms: { type: 'array', items: { type: 'string' }, description: 'High-signal required/positive terms, event names, company names, sectors, or intent phrases.' },
+        exclude_terms: { type: 'array', items: { type: 'string' }, description: 'Terms that should push candidates into Excluded.' },
+        aliases: { type: 'array', items: { type: 'string' }, description: 'Aliases/variants such as BofA, Merrill, or abbreviated event names.' },
+        domains: { type: 'array', items: { type: 'string' }, description: 'Email/web domains that identify relevant entities, without @ when possible.' },
+        date_range: {
+          type: 'object',
+          properties: {
+            start: { type: 'string', description: 'Inclusive lower date/ISO bound.' },
+            end: { type: 'string', description: 'Inclusive upper date/ISO bound.' },
+          },
+        },
+        named_people: { type: 'array', items: { type: 'string' }, description: 'Named people that should anchor the search.' },
+        source_families: {
+          type: 'array',
+          items: { type: 'string', enum: ['communications', 'events', 'campaigns', 'contacts', 'companies', 'deals', 'documents', 'tasks'] },
+          description: 'Optional source families to search. Omit for task-specific defaults.',
+        },
+        output_columns: { type: 'array', items: { type: 'string' }, description: 'Optional XLSX/chat columns. Defaults to mail-merge columns for invite/mail-merge tasks.' },
+        artifact_kind: { type: 'string', enum: ['xlsx', 'none'], description: 'Use xlsx for exports/mail merge, none to suppress artifacts.' },
+        create_artifact: { type: 'boolean', description: 'Force artifact creation on/off. By default large/export/mail-merge results create XLSX automatically.' },
+      },
+      required: ['query'],
     },
   },
   {
@@ -612,6 +679,8 @@ async function executeTool(
     case 'search_companies': return searchCompanies(ctx, toolInput, env, toolContext);
     case 'search_deals': return searchDeals(ctx, toolInput, env, toolContext);
     case 'search_conversations': return searchConversations(ctx, toolInput, env, toolContext);
+    case 'sweep_conversations': return sweepConversations(ctx, toolInput, env, toolContext);
+    case 'build_max_set': return buildMaxSetTool(ctx, toolInput, env, toolContext);
     case 'find_documents': return findDocumentsTool(ctx, toolInput, env);
     case 'create_document_artifact': return createDocumentArtifactTool(ctx, toolInput, env);
     case 'edit_document_artifact': return editDocumentArtifactTool(ctx, toolInput, env);
@@ -1131,7 +1200,51 @@ export async function queryAgent(
     { deepDive }
   );
 
-  const userText = `${contextBlock}\n\n--- QUERY ---\n${query}`;
+  const maxSetIntent = deepDive ? detectMaxSetIntent(query, { currentUserEmail: ctx.email }) : { shouldBuild: false, reason: null, input: null };
+  let forcedMaxSetResult: any = null;
+  let compactForcedMaxSet: Record<string, unknown> | null = null;
+  const preludeEvents: any[] = [];
+  if (maxSetIntent.shouldBuild && maxSetIntent.input) {
+    preludeEvents.push({
+      type: 'tool_call',
+      tool: 'build_max_set',
+      input: maxSetIntent.input,
+      status: 'executing',
+      forced: true,
+    });
+    try {
+      forcedMaxSetResult = await buildMaxSetTool(ctx, maxSetIntent.input, env, { deepDive: true });
+      compactForcedMaxSet = compactMaxSetResultForContext(forcedMaxSetResult);
+      if (Array.isArray(forcedMaxSetResult?.document_cards) && forcedMaxSetResult.document_cards.length > 0) {
+        preludeEvents.push({ type: 'document_cards', document_cards: forcedMaxSetResult.document_cards });
+      }
+      preludeEvents.push({
+        type: 'tool_result',
+        tool: 'build_max_set',
+        result: compactForcedMaxSet,
+        status: 'done',
+        forced: true,
+      });
+    } catch (error: any) {
+      compactForcedMaxSet = {
+        error: String(error?.message || error),
+        instruction: 'The forced MAX set-builder failed. Do not fabricate a complete roster from recall snippets; report the failure and the available retrieval coverage.',
+      };
+      preludeEvents.push({
+        type: 'tool_result',
+        tool: 'build_max_set',
+        result: compactForcedMaxSet,
+        status: 'error',
+        forced: true,
+      });
+    }
+  }
+
+  const maxSetContext = compactForcedMaxSet
+    ? `\n\n--- FORCED MAX SET BUILDER RESULT ---\n${JSON.stringify(compactForcedMaxSet, null, 2)}\n--- END FORCED MAX SET BUILDER RESULT ---`
+    : '';
+
+  const userText = `${contextBlock}${maxSetContext}\n\n--- QUERY ---\n${query}`;
   if (sessionAttachments.contentBlocks.length > 0) {
     // Multi-block content: PDFs/images/text-extracted attachments first, then
     // the RAG context + the user's actual query as the final text block.
@@ -1149,6 +1262,9 @@ export async function queryAgent(
   // --- Stream Claude response with tool use ---
   let systemPrompt = buildMartyBaseSystemPrompt(ctx, new Date());
   if (deepDive) systemPrompt += buildMartyMaxModePrompt(stats);
+  if (compactForcedMaxSet) {
+    systemPrompt += `\n\nA deterministic MAX set-builder run has already been executed for this turn and is included under "FORCED MAX SET BUILDER RESULT". Treat it as the source of truth for roster/list/set contents and coverage. Do not create a second spreadsheet from recall snippets. If the forced run has an artifact_card, tell the user the workbook is ready and summarize counts, coverage, and real gaps from that run.`;
+  }
 
   let stream: ReadableStream<Uint8Array>;
   try {
@@ -1161,7 +1277,20 @@ export async function queryAgent(
         fallbackMaxTokens: deepDive ? MAX_MODE_LIMITS.fallbackOutputTokens : undefined,
         maxIterations: deepDive ? MAX_MODE_LIMITS.toolIterations : NORMAL_MODE_LIMITS.toolIterations,
         tools: AGENT_TOOLS,
-        onToolCall: (name, input) => executeTool(name, input, ctx, env, { deepDive }),
+        preludeEvents,
+        onToolCall: (name, input) => {
+          if (forcedMaxSetResult && name === 'build_max_set') return Promise.resolve(forcedMaxSetResult);
+          if (forcedMaxSetResult && name === 'create_document_artifact' && !input?.custom_fields?.max_mode_set_builder) {
+            return Promise.resolve({
+              ok: false,
+              error: 'MAX_SET_ARTIFACT_ALREADY_CREATED',
+              message: 'A deterministic build_max_set workbook already exists for this exhaustive MAX query. Use that artifact instead of creating a model-authored duplicate from recall snippets.',
+              document_cards: forcedMaxSetResult.document_cards || [],
+              max_set_run_id: forcedMaxSetResult.run_id,
+            });
+          }
+          return executeTool(name, input, ctx, env, { deepDive });
+        },
         signal: cancelController.signal,
       },
       env

@@ -31,6 +31,127 @@ function structuredLimit(inputLimit: number | undefined, toolContext?: AgentTool
   return Math.min(Math.max(inputLimit ?? fallback, 1), max);
 }
 
+function sweepLimit(inputLimit: number | undefined, toolContext?: AgentToolContext): number {
+  const fallback = toolContext?.deepDive
+    ? MAX_MODE_LIMITS.conversationSweepDefault
+    : NORMAL_MODE_LIMITS.structuredDefault;
+  const max = toolContext?.deepDive
+    ? MAX_MODE_LIMITS.conversationSweepMax
+    : NORMAL_MODE_LIMITS.structuredMax;
+  return Math.min(Math.max(inputLimit ?? fallback, 1), max);
+}
+
+function normalizeEmail(value: unknown): string | null {
+  const text = String(value || '').trim().toLowerCase();
+  const match = text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  return match ? match[0].toLowerCase() : null;
+}
+
+function cleanTerm(term: unknown): string | null {
+  const text = String(term || '').trim().toLowerCase();
+  if (!text) return null;
+  return text.replace(/[%_]/g, '').slice(0, 120) || null;
+}
+
+const SWEEP_STOP_WORDS = new Set([
+  'all', 'and', 'are', 'associated', 'can', 'could', 'every', 'excel', 'file',
+  'first', 'for', 'from', 'get', 'give', 'have', 'individuals', 'list', 'mail',
+  'merge', 'myself', 'names', 'need', 'people', 'pull', 'that', 'the', 'their',
+  'them', 'this', 'took', 'type', 'want', 'with', 'you', 'your',
+]);
+
+function deriveSweepTerms(query: string | undefined): string[] {
+  if (!query) return [];
+  const tokens = query
+    .toLowerCase()
+    .match(/[a-z0-9][a-z0-9._@-]{2,}/gi) || [];
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const token of tokens) {
+    const cleaned = token.replace(/^[-_.]+|[-_.]+$/g, '');
+    if (cleaned.length < 3 || SWEEP_STOP_WORDS.has(cleaned) || seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    terms.push(cleaned);
+    if (terms.length >= 12) break;
+  }
+  return terms;
+}
+
+function parseMaybeJson(value: string): unknown {
+  try { return JSON.parse(value); } catch { return value; }
+}
+
+function collectEmailEntries(value: unknown): Array<{ email: string; display_name?: string }> {
+  if (value == null) return [];
+  if (typeof value === 'string') {
+    const parsed = value.trim().startsWith('[') || value.trim().startsWith('{')
+      ? parseMaybeJson(value)
+      : value;
+    if (parsed !== value) return collectEmailEntries(parsed);
+    const entries: Array<{ email: string; display_name?: string }> = [];
+    const emailRegex = /(?:"?([^"<,;]+?)"?\s*)?<?([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})>?/gi;
+    let match: RegExpExecArray | null;
+    while ((match = emailRegex.exec(value)) !== null) {
+      const email = normalizeEmail(match[2]);
+      if (!email) continue;
+      const display = String(match[1] || '').trim().replace(/^"|"$/g, '');
+      entries.push({ email, display_name: display || undefined });
+    }
+    return entries;
+  }
+  if (Array.isArray(value)) return value.flatMap(collectEmailEntries);
+  if (typeof value === 'object') {
+    const record = value as Record<string, any>;
+    const email =
+      normalizeEmail(record.email) ||
+      normalizeEmail(record.address) ||
+      normalizeEmail(record.emailAddress?.address) ||
+      normalizeEmail(record.email_address);
+    const display = String(
+      record.name ||
+      record.displayName ||
+      record.emailAddress?.name ||
+      ''
+    ).trim();
+    return email ? [{ email, display_name: display || undefined }] : [];
+  }
+  const email = normalizeEmail(value);
+  return email ? [{ email }] : [];
+}
+
+function firstNameFrom(fullName: string | undefined, email: string): string {
+  const name = String(fullName || '').trim();
+  if (name) return name.split(/\s+/)[0];
+  const local = email.split('@')[0] || email;
+  return local
+    .split(/[._+-]+/)
+    .find(part => part.length > 0)
+    ?.replace(/^\w/, c => c.toUpperCase()) || email;
+}
+
+async function lookupContactsByEmail(
+  orgId: string,
+  emails: string[],
+  env: Env
+): Promise<Map<string, { full_name: string; company_name?: string | null }>> {
+  const out = new Map<string, { full_name: string; company_name?: string | null }>();
+  const unique = [...new Set(emails.map(e => e.toLowerCase()).filter(Boolean))];
+  for (let i = 0; i < unique.length; i += 80) {
+    const batch = unique.slice(i, i + 80);
+    const ph = batch.map(() => '?').join(',');
+    const rows = await env.D1.prepare(
+      `SELECT LOWER(c.email) AS email, c.full_name, co.name AS company_name
+       FROM contacts c
+       LEFT JOIN companies co ON co.id = c.company_id
+       WHERE c.org_id = ? AND c.deleted_at IS NULL AND LOWER(c.email) IN (${ph})`
+    ).bind(orgId, ...batch).all<{ email: string; full_name: string; company_name: string | null }>();
+    for (const row of rows.results || []) {
+      if (row.email) out.set(row.email, { full_name: row.full_name, company_name: row.company_name });
+    }
+  }
+  return out;
+}
+
 // ACL redaction: nulls fields whose value may have been derived from private
 // conversation content (LLM-extracted topics, auto-populated deal notes,
 // raw-data R2 keys). Owner gets the full row. Membership-aware filtering of
@@ -118,8 +239,8 @@ export async function searchConversations(
   }
 
   if (input.keyword) {
-    where.push('(c.subject LIKE ? OR c.body_preview LIKE ? OR c.from_email LIKE ?)');
-    binds.push(`%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`);
+    where.push('(c.subject LIKE ? OR c.body_preview LIKE ? OR c.from_email LIKE ? OR c.to_emails LIKE ? OR c.cc_emails LIKE ?)');
+    binds.push(`%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`);
   }
 
   const limit = structuredLimit(input.limit, toolContext);
@@ -213,6 +334,303 @@ export async function searchConversations(
   }
 
   return { conversations, count: conversations.length };
+}
+
+// MAX-mode deterministic conversation sweep. Unlike recall(), this is not a
+// top-N semantic retriever: it walks the conversations table with SQL filters
+// and returns large, structured row sets plus optional recipient aggregation.
+// This is the path for "all/every/list/export/count" questions where missing
+// the long tail is worse than returning a few extra rows for MARTy to classify.
+export async function sweepConversations(
+  ctx: AuthContext,
+  input: {
+    query?: string;
+    all_terms?: string[];
+    any_terms?: string[];
+    source?: 'outlook' | 'email' | 'slack' | 'manual' | 'all';
+    direction?: string;
+    from_emails?: string[];
+    participant_emails?: string[];
+    start_date?: string;
+    end_date?: string;
+    days_back?: number;
+    include_recipients?: boolean;
+    include_body?: boolean;
+    body_fetch_limit?: number;
+    exclude_domains?: string[];
+    limit?: number;
+    offset?: number;
+  },
+  env: Env,
+  toolContext: AgentToolContext = {}
+): Promise<any> {
+  const where: string[] = ['c.org_id = ?'];
+  const binds: unknown[] = [ctx.orgId];
+  const searchable = [
+    'LOWER(COALESCE(c.subject, \'\'))',
+    'LOWER(COALESCE(c.body_preview, \'\'))',
+    'LOWER(COALESCE(c.from_email, \'\'))',
+    'LOWER(COALESCE(c.to_emails, \'\'))',
+    'LOWER(COALESCE(c.cc_emails, \'\'))',
+  ];
+  const addRequiredTermClause = (term: string): void => {
+    const cleaned = cleanTerm(term);
+    if (!cleaned) return;
+    const clause = `(${searchable.map(expr => `${expr} LIKE ?`).join(' OR ')})`;
+    where.push(clause);
+    for (let i = 0; i < searchable.length; i++) binds.push(`%${cleaned}%`);
+  };
+
+  const allTerms = (input.all_terms || []).map(cleanTerm).filter((x): x is string => Boolean(x));
+  const anyTerms = (input.any_terms || []).map(cleanTerm).filter((x): x is string => Boolean(x));
+  const derivedTerms = allTerms.length === 0 && anyTerms.length === 0
+    ? deriveSweepTerms(input.query)
+    : [];
+
+  for (const term of allTerms) addRequiredTermClause(term);
+  const groupedAnyTerms = anyTerms.length > 0 ? anyTerms : derivedTerms;
+  if (groupedAnyTerms.length > 0) {
+    const clauses: string[] = [];
+    for (const term of groupedAnyTerms) {
+      const cleaned = cleanTerm(term);
+      if (!cleaned) continue;
+      clauses.push(`(${searchable.map(expr => `${expr} LIKE ?`).join(' OR ')})`);
+      for (let i = 0; i < searchable.length; i++) binds.push(`%${cleaned}%`);
+    }
+    if (clauses.length > 0) where.push(`(${clauses.join(' OR ')})`);
+  }
+
+  const source = input.source === 'email' ? 'outlook' : input.source;
+  if (source && source !== 'all') {
+    where.push('c.source = ?');
+    binds.push(source);
+  }
+  if (input.direction && input.direction !== 'all') {
+    where.push('c.direction = ?');
+    binds.push(input.direction);
+  }
+  if (input.start_date) {
+    where.push('c.sent_at >= ?');
+    binds.push(input.start_date);
+  }
+  if (input.end_date) {
+    where.push('c.sent_at <= ?');
+    binds.push(input.end_date);
+  }
+  if (!input.start_date && !input.end_date && input.days_back && input.days_back > 0) {
+    const daysBack = Math.min(Math.max(input.days_back, 1), 3650);
+    where.push(`c.sent_at >= datetime('now', '-${daysBack} days')`);
+  }
+
+  const fromEmails = (input.from_emails || []).map(normalizeEmail).filter((x): x is string => Boolean(x));
+  if (fromEmails.length > 0) {
+    where.push(`LOWER(c.from_email) IN (${fromEmails.map(() => '?').join(',')})`);
+    binds.push(...fromEmails);
+  }
+
+  const participantEmails = (input.participant_emails || []).map(normalizeEmail).filter((x): x is string => Boolean(x));
+  if (participantEmails.length > 0) {
+    const clauses: string[] = [];
+    for (const email of participantEmails) {
+      clauses.push('(LOWER(c.from_email) = ? OR LOWER(c.to_emails) LIKE ? OR LOWER(c.cc_emails) LIKE ?)');
+      binds.push(email, `%${email}%`, `%${email}%`);
+    }
+    where.push(`(${clauses.join(' OR ')})`);
+  }
+
+  const limit = sweepLimit(input.limit, toolContext);
+  const offset = Math.max(0, input.offset || 0);
+  const fetchLimit = Math.min(
+    limit * (toolContext.deepDive ? MAX_MODE_LIMITS.conversationOverfetchMultiplier : 2),
+    toolContext.deepDive ? MAX_MODE_LIMITS.conversationFetchMax : 200
+  );
+  const whereClause = where.join(' AND ');
+
+  const [rowsResult, countResult, sharingFlags] = await Promise.all([
+    env.D1.prepare(
+      `SELECT c.id, c.subject, c.from_email, c.direction, c.source, c.sent_at,
+              c.body_preview, c.body_r2_key, c.to_emails, c.cc_emails,
+              c.participant_user_ids, c.is_campaign_email, c.external_message_id,
+              sc.is_private AS slack_is_private,
+              fc.full_name AS from_name
+       FROM conversations c
+       LEFT JOIN contacts fc ON c.from_contact_id = fc.id
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
+       WHERE ${whereClause}
+       ORDER BY c.sent_at DESC
+       LIMIT ? OFFSET ?`
+    ).bind(...binds, fetchLimit, offset).all(),
+    env.D1.prepare(`SELECT COUNT(*) AS total FROM conversations c WHERE ${whereClause}`)
+      .bind(...binds).first<{ total: number }>(),
+    getSharingFlags(ctx.orgId, env),
+  ]);
+
+  const accessibleRows = (rowsResult.results as any[])
+    .filter(c =>
+      canReadConversationContent(
+        {
+          source: c.source,
+          participant_user_ids: c.participant_user_ids,
+          is_campaign_email: c.is_campaign_email,
+          slack_is_private: c.slack_is_private,
+        },
+        ctx.userId,
+        ctx.userRole,
+        sharingFlags
+      )
+    );
+  const accessible = accessibleRows.slice(0, limit);
+  const rawCandidateCount = countResult?.total || 0;
+  const canReportRawCandidateCount = hasOrgWidePrivateDataAccess(ctx.userRole);
+  const hasMore = canReportRawCandidateCount
+    ? rawCandidateCount > offset + fetchLimit || accessibleRows.length > limit
+    : accessibleRows.length > limit || (rowsResult.results as any[]).length === fetchLimit;
+
+  const conversationIds = accessible.map(c => c.id);
+  const participantMap = new Map<string, Array<{ full_name: string; email?: string | null }>>();
+  if (conversationIds.length > 0) {
+    const ph = conversationIds.map(() => '?').join(',');
+    const participants = await env.D1.prepare(
+      `SELECT cc.conversation_id, ct.full_name, ct.email
+       FROM conversation_contacts cc
+       JOIN contacts ct ON cc.contact_id = ct.id
+       WHERE cc.conversation_id IN (${ph})`
+    ).bind(...conversationIds).all<{ conversation_id: string; full_name: string; email: string | null }>();
+    for (const row of participants.results || []) {
+      const list = participantMap.get(row.conversation_id) || [];
+      list.push({ full_name: row.full_name, email: row.email });
+      participantMap.set(row.conversation_id, list);
+    }
+  }
+
+  const bodyFetchLimit = Math.min(
+    Math.max(input.body_fetch_limit || 80, 0),
+    toolContext.deepDive ? 200 : 40,
+    accessible.length
+  );
+  if (input.include_body && bodyFetchLimit > 0) {
+    await Promise.all(accessible.slice(0, bodyFetchLimit).map(async row => {
+      if (!row.body_r2_key) return;
+      try {
+        const obj = await env.R2.get(row.body_r2_key);
+        if (!obj) return;
+        const body = await obj.text();
+        row.body_preview = body.slice(0, 2000);
+        if (body.length > 2000) row.body_preview += '...';
+      } catch { /* keep existing preview */ }
+    }));
+  }
+
+  const excludeDomains = new Set((input.exclude_domains || []).map(d => d.toLowerCase().replace(/^@/, '')));
+  const recipientEntries = new Map<string, {
+    email: string;
+    display_name?: string;
+    source_count: number;
+    source_conversations: Array<{ id: string; subject?: string | null; date?: string; via: 'to' | 'cc' }>;
+  }>();
+
+  if (input.include_recipients) {
+    for (const row of accessible) {
+      const to = collectEmailEntries(row.to_emails).map(e => ({ ...e, via: 'to' as const }));
+      const cc = collectEmailEntries(row.cc_emails).map(e => ({ ...e, via: 'cc' as const }));
+      for (const entry of [...to, ...cc]) {
+        const domain = entry.email.split('@')[1] || '';
+        if (excludeDomains.has(domain)) continue;
+        const existing = recipientEntries.get(entry.email) || {
+          email: entry.email,
+          display_name: entry.display_name,
+          source_count: 0,
+          source_conversations: [],
+        };
+        existing.source_count += 1;
+        if (!existing.display_name && entry.display_name) existing.display_name = entry.display_name;
+        if (existing.source_conversations.length < 8) {
+          existing.source_conversations.push({
+            id: row.id,
+            subject: row.subject,
+            date: row.sent_at,
+            via: entry.via,
+          });
+        }
+        recipientEntries.set(entry.email, existing);
+      }
+    }
+  }
+
+  const contactNames = input.include_recipients
+    ? await lookupContactsByEmail(ctx.orgId, [...recipientEntries.keys()], env)
+    : new Map<string, { full_name: string; company_name?: string | null }>();
+
+  const recipients = [...recipientEntries.values()]
+    .slice(0, MAX_MODE_LIMITS.recipientRollupMax)
+    .map(entry => {
+      const contact = contactNames.get(entry.email);
+      const fullName = contact?.full_name || entry.display_name;
+      return {
+        email: entry.email,
+        first_name: firstNameFrom(fullName, entry.email),
+        full_name: fullName || null,
+        company_name: contact?.company_name || null,
+        source_count: entry.source_count,
+        source_conversations: entry.source_conversations,
+      };
+    })
+    .sort((a, b) => a.email.localeCompare(b.email));
+
+  return {
+    mode: toolContext.deepDive ? 'max' : 'normal',
+    query_terms: {
+      all_terms: allTerms,
+      any_terms: groupedAnyTerms,
+      derived_from_query: derivedTerms.length > 0,
+    },
+    filters: {
+      source: source || 'all',
+      direction: input.direction || 'all',
+      from_emails: fromEmails,
+      participant_emails: participantEmails,
+      start_date: input.start_date || null,
+      end_date: input.end_date || null,
+      days_back: input.days_back || null,
+    },
+    candidate_count_matching_filters: canReportRawCandidateCount ? rawCandidateCount : undefined,
+    returned_count: accessible.length,
+    effective_limit: limit,
+    offset,
+    has_more: hasMore,
+    body_fetch_limit: input.include_body ? bodyFetchLimit : 0,
+    conversations: accessible.map(row => ({
+      id: row.id,
+      source: row.source,
+      direction: row.direction,
+      subject: row.subject,
+      from_email: row.from_email,
+      from_name: row.from_name,
+      sent_at: row.sent_at,
+      to_emails: collectEmailEntries(row.to_emails).map(e => e.email),
+      cc_emails: collectEmailEntries(row.cc_emails).map(e => e.email),
+      participants: participantMap.get(row.id) || [],
+      body_excerpt: row.body_preview,
+    })),
+    recipient_rollup: input.include_recipients
+      ? {
+          unique_recipient_count: recipientEntries.size,
+          returned_recipient_count: recipients.length,
+          truncated: recipientEntries.size > recipients.length,
+          recipients,
+        }
+      : undefined,
+    note: input.include_recipients
+      ? 'Recipient rollup is built from To/Cc fields stored on matching conversations. Bcc recipients are not available unless they were stored in source data.'
+      : undefined,
+  };
 }
 
 // ACL: returns entity-level CRM fields only (no email/conversation bodies).

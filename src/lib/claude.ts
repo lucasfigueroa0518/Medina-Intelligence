@@ -109,6 +109,7 @@ export async function callClaudeStreaming(
     maxIterations?: number;
     tools?: ToolDefinition[];
     onToolCall?: ToolExecutor;
+    preludeEvents?: any[];
     // Wave-1 cancellation: when this signal aborts, the streaming fetch is
     // interrupted and the run loop exits cleanly between iterations.
     signal?: AbortSignal;
@@ -129,6 +130,11 @@ export async function callClaudeStreaming(
     const maxIterations = params.maxIterations ?? NORMAL_MODE_LIMITS.toolIterations;
     let activeMaxTokens = params.max_tokens;
     let usedMaxTokenFallback = false;
+    if (params.preludeEvents?.length) {
+      for (const event of params.preludeEvents) {
+        await emit(event);
+      }
+    }
 
     while (iterations < maxIterations) {
       // Cooperative cancellation between iterations: a Cmd+Backspace / stop

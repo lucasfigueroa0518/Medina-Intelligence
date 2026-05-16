@@ -4,10 +4,10 @@ import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { CLAUDE_MODEL } from './claude';
 import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from './max-mode';
 
-export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-15-runtime-parity-v2';
-export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-15-live-agent-v2';
+export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-16-max-set-builder-v2-forced';
+export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-16-live-agent-max-set-builder-v2-forced';
 export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v2';
-export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-15-agent-tools-v1';
+export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-16-agent-tools-max-set-builder-v2-forced';
 export const MARTY_ARTIFACT_RUNTIME_VERSION = '2026-05-15-office-artifacts-v1';
 
 export interface MartyRuntimeFingerprint {
@@ -109,12 +109,20 @@ export function buildMartyMaxModePrompt(stats?: {
   companies: number;
 }): string {
   const scope = stats
-    ? `MAX: Searched ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts.`
-    : 'MAX: Ran a maximum sweep across the user-permitted Medina data.';
+    ? `MAX: Initial retrieval surfaced ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts before tool sweeps.`
+    : 'MAX: Starting from the broad Medina retrieval context; tool sweeps define exhaustive coverage.';
   return `\n\nYou are in MAX mode, powered by Claude Opus 4.7 for a maximum sweep across the user's permitted Medina data.
 
-Begin your response with one brief scope line formatted as:
+Begin your response with one brief scope line. If you used sweep_conversations or another structured sweep, report the actual sweep coverage and aggregation counts from the tool result. If you did not use a sweep, use:
 ${scope}
+
+MAX mode is built for exhaustive database work, not just richer prose:
+- If the user asks for "all", "every", "list everyone", a mail merge/export, a count, all touchpoints, "ever talked to", or a broad roster of people/firms/startups, do not rely on the initial SOURCES list or recall() alone.
+- Use build_max_set for exhaustive rosters and set queries. It searches communications, events, campaigns, CRM entities, documents, and tasks; deduplicates entities; returns confirmed/probable/needs_review/excluded buckets; reports coverage/gaps; and creates XLSX files for large/export/mail-merge results.
+- Some exhaustive MAX turns include a FORCED MAX SET BUILDER RESULT injected before you answer. When present, that deterministic result supersedes initial SOURCES and recall samples.
+- Use sweep_conversations only as a lower-level fallback when you need a narrower communications-only pass after build_max_set.
+- If build_max_set reports caps_hit or gaps, surface those as real coverage limits. Do not write "I have enough coverage" while a source family is capped or errored.
+- Treat missing Bcc/attachments/export files as explicit data boundaries, but only after build_max_set has swept the available rows. Do not install a tracker/export gap as the primary answer when available source families can answer the user.
 
 Then write a cited evidence memo:
 - Key findings
@@ -122,7 +130,7 @@ Then write a cited evidence memo:
 - Conflicts, gaps, and unknowns
 - Recommended next actions
 
-Use multiple retrieval angles before finalizing when the question calls for it: broad recall, source-specific recall, structured entity search, and search_conversations for deterministic date/channel filters. Be thorough, but synthesize instead of dumping raw sources. Cite specific emails, meetings, Slack messages, and documents by name/date where available.`;
+Use multiple retrieval angles before finalizing when the question calls for it: build_max_set for exhaustive sets, broad recall/source-specific recall for narrative evidence, sweep_conversations/search_conversations for narrow communication debugging, and structured entity search for specific CRM records. For exhaustive roster/export tasks, return the actual aggregated set or created artifact; do not collapse hundreds of possible rows into a handful of examples. Cite specific emails, meetings, Slack messages, and documents by name/date where available.`;
 }
 
 function productionRuntimeComponents(env: Env, deepDive: boolean): Record<string, unknown> {
@@ -132,7 +140,7 @@ function productionRuntimeComponents(env: Env, deepDive: boolean): Record<string
     prompt_scaffolding: {
       timeline_awareness_version: 'shared-v1',
       current_user_privacy_version: 'shared-v1',
-      max_mode_addendum_version: 'max-evidence-memo-v1',
+      max_mode_addendum_version: 'max-set-builder-v2-forced',
     },
     claude: {
       normal_model: CLAUDE_MODEL,
