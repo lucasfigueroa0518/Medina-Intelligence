@@ -733,6 +733,7 @@ async function executeTool(
 
 const STALE_AGENT_TURN_MINUTES = 10;
 const FORCED_MAX_SET_TIMEOUT_MS = 120_000;
+const STREAMING_MAX_SET_TIMEOUT_MS = 50_000;
 
 function normalizeSessionId(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -969,6 +970,252 @@ async function touchAgentSessionActivity(
      SET last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      WHERE id = ?`
   ).bind(sessionId).run().catch(() => {});
+}
+
+function encodeSseEvent(data: any): Uint8Array {
+  return new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function encodeSseDone(): Uint8Array {
+  return new TextEncoder().encode('data: [DONE]\n\n');
+}
+
+function titleFromQuery(query: string): string {
+  const cleaned = query
+    .replace(/\s+/g, ' ')
+    .replace(/^(please|can you|could you|i need you to|i need to)\s+/i, '')
+    .trim();
+  if (!cleaned) return 'MARTy MAX Request';
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1, 80);
+}
+
+function formatSourceStats(result: any): string {
+  const stats = Array.isArray(result?.coverage?.stats) ? result.coverage.stats : [];
+  if (stats.length === 0) return 'No source-family coverage was reported.';
+  return stats
+    .map((s: any) => {
+      const errors = Array.isArray(s.errors) && s.errors.length > 0 ? `, errors: ${s.errors.length}` : '';
+      const cap = s.cap_hit ? ', cap hit' : '';
+      return `${s.source_family}: ${s.rows_scanned ?? 0} scanned / ${s.rows_returned ?? 0} returned / ${s.candidates_added ?? 0} candidates${cap}${errors}`;
+    })
+    .join('\n');
+}
+
+function formatMaxSetAnswer(result: any, elapsedMs: number): string {
+  if (result?.error) {
+    return [
+      `MAX set-builder failed before it could complete: ${result.error}`,
+      '',
+      'I did not create an export because the deterministic set-builder did not return a safe result.',
+    ].join('\n');
+  }
+
+  const confirmed = Array.isArray(result?.confirmed) ? result.confirmed.length : 0;
+  const probable = Array.isArray(result?.probable) ? result.probable.length : 0;
+  const needsReview = Array.isArray(result?.needs_review) ? result.needs_review.length : 0;
+  const excluded = Array.isArray(result?.excluded) ? result.excluded.length : 0;
+  const safety = result?.safety_status || 'unknown';
+  const gate = result?.quality_gate || {};
+  const artifact = result?.artifact_card;
+  const gaps = Array.isArray(result?.gaps) ? result.gaps.filter(Boolean).slice(0, 8) : [];
+
+  const lines = [
+    `MAX set-builder finished in ${Math.round(elapsedMs / 1000)}s.`,
+    '',
+    `Status: **${safety}**`,
+    `Counts: **${confirmed} confirmed**, **${probable} probable**, **${needsReview} needs review**, **${excluded} excluded**.`,
+  ];
+
+  if (artifact) {
+    lines.push('', `Workbook: **${artifact.title || 'MAX export'}** is ready in the card above.`);
+  } else if (gate.artifact_allowed === false || result?.note) {
+    lines.push('', `Artifact: ${gate.artifact_suppressed_reason || result.note || 'No workbook was created.'}`);
+  }
+
+  if (gate.reasons?.length) {
+    lines.push('', 'Quality gate:', ...gate.reasons.slice(0, 8).map((reason: string) => `- ${reason}`));
+  }
+
+  if (gaps.length > 0) {
+    lines.push('', 'Gaps:', ...gaps.map((gap: string) => `- ${gap}`));
+  }
+
+  lines.push('', 'Coverage:', formatSourceStats(result));
+
+  return lines.join('\n');
+}
+
+async function persistImmediateAgentResult(
+  env: Env,
+  ctx: AuthContext,
+  session: AgentSession,
+  assistantMessageId: string,
+  requestId: string,
+  runtimeFingerprint: any,
+  deepDive: boolean,
+  content: string,
+  status: 'done' | 'error',
+  documentCards: MartyDocumentCard[] = [],
+  error?: string
+): Promise<void> {
+  const metadataObj: Record<string, any> = {
+    status,
+    request_id: requestId,
+    runtime_fingerprint: runtimeFingerprint,
+    deep_dive: deepDive,
+  };
+  if (error) metadataObj.error = error;
+  const normalizedCards = normalizeDocumentCards(documentCards);
+  if (normalizedCards.length > 0) metadataObj.document_cards = normalizedCards;
+  await env.D1.prepare(
+    `UPDATE agent_messages SET content = ?, sources_json = ?, metadata = ? WHERE id = ?`
+  ).bind(
+    normalizeMartySentenceSpacing(content),
+    null,
+    JSON.stringify(metadataObj),
+    assistantMessageId
+  ).run();
+  if (normalizedCards.length > 0) {
+    await linkDocumentCardsToMessage(normalizedCards, assistantMessageId, ctx, env);
+  }
+  await touchAgentSessionActivity(env, session.id);
+}
+
+function createStreamingMaxSetResponse(args: {
+  ctx: AuthContext;
+  env: Env;
+  session: AgentSession;
+  query: string;
+  input: any;
+  requestId: string;
+  assistantMessageId: string;
+  runtimeFingerprint: any;
+  turnAttachments: UploadSummary[];
+  sessionAttachments: Awaited<ReturnType<typeof assembleSessionAttachments>>;
+  turnIndex: number;
+}): Response {
+  const {
+    ctx,
+    env,
+    session,
+    query,
+    input,
+    requestId,
+    assistantMessageId,
+    runtimeFingerprint,
+    turnAttachments,
+    sessionAttachments,
+    turnIndex,
+  } = args;
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const emit = (data: any) => controller.enqueue(encodeSseEvent(data));
+      const started = Date.now();
+      let heartbeat: ReturnType<typeof setInterval> | null = null;
+      try {
+        emit({ type: 'session', session_id: session.id });
+        emit({ type: 'request', request_id: requestId });
+        emit({ type: 'runtime', runtime_fingerprint: runtimeFingerprint });
+        emit({ type: 'sources', sources: [] });
+        emit({
+          type: 'attachments',
+          turn_attachments: turnAttachments,
+          session_attachments: sessionAttachments.summaries,
+          bytes_used: sessionAttachments.bytesUsed,
+          bytes_total: sessionAttachments.bytesTotal,
+        });
+        emit({ type: 'tool_call', tool: 'build_max_set', input, status: 'executing', forced: true });
+
+        heartbeat = setInterval(() => {
+          try {
+            emit({
+              type: 'tool_call',
+              tool: 'build_max_set',
+              status: 'executing',
+              forced: true,
+              heartbeat: true,
+              elapsed_ms: Date.now() - started,
+            });
+          } catch {
+            // The client may have disconnected; the main path will handle it.
+          }
+        }, 15_000);
+
+        const result = await withTimeout(
+          buildMaxSetTool(ctx, input, env, { deepDive: true }),
+          STREAMING_MAX_SET_TIMEOUT_MS,
+          `MAX set-builder exceeded ${Math.round(STREAMING_MAX_SET_TIMEOUT_MS / 1000)}s before returning.`
+        );
+        if (heartbeat) clearInterval(heartbeat);
+
+        const compact = compactMaxSetResultForContext(result);
+        const documentCards = normalizeDocumentCards(result?.document_cards || []);
+        if (documentCards.length > 0) {
+          emit({ type: 'document_cards', document_cards: documentCards });
+        }
+        emit({ type: 'tool_result', tool: 'build_max_set', result: compact, status: 'done', forced: true });
+
+        const finalText = formatMaxSetAnswer(result, Date.now() - started);
+        emit({ text: finalText });
+        await persistImmediateAgentResult(
+          env,
+          ctx,
+          session,
+          assistantMessageId,
+          requestId,
+          runtimeFingerprint,
+          true,
+          finalText,
+          result?.error ? 'error' : 'done',
+          documentCards,
+          result?.error
+        );
+
+        if (turnIndex === 0 && !session.title) {
+          await env.D1.prepare('UPDATE agent_sessions SET title = ? WHERE id = ?')
+            .bind(titleFromQuery(query), session.id)
+            .run()
+            .catch(() => {});
+        }
+      } catch (error: any) {
+        if (heartbeat) clearInterval(heartbeat);
+        const message = String(error?.message || error);
+        const finalText = [
+          `MAX mode failed before it could return the set-builder result: ${message}`,
+          '',
+          'I did not create an export because the run did not complete safely.',
+        ].join('\n');
+        emit({ type: 'tool_result', tool: 'build_max_set', result: { error: message }, status: 'error', forced: true });
+        emit({ text: finalText });
+        await persistImmediateAgentResult(
+          env,
+          ctx,
+          session,
+          assistantMessageId,
+          requestId,
+          runtimeFingerprint,
+          true,
+          finalText,
+          'error',
+          [],
+          message
+        ).catch(() => {});
+      } finally {
+        unregisterRequest(requestId);
+        controller.enqueue(encodeSseDone());
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
+  });
 }
 
 export async function listSessions(
@@ -1276,6 +1523,7 @@ export async function queryAgent(
       }, 429);
     }
   }
+  const maxSetIntent = deepDive ? detectMaxSetIntent(query, { currentUserEmail: ctx.email }) : { shouldBuild: false, reason: null, input: null };
 
   const runningTurn = await getRunningAssistantTurn(session.id, env);
   if (runningTurn) {
@@ -1339,6 +1587,26 @@ export async function queryAgent(
       }, 409);
     }
     throw e;
+  }
+
+  if (maxSetIntent.shouldBuild && maxSetIntent.input) {
+    if (ddKey) {
+      const ddCount = parseInt(await env.KV.get(ddKey) || '0');
+      await env.KV.put(ddKey, String(ddCount + 1), { expirationTtl: 7200 }).catch(() => {});
+    }
+    return createStreamingMaxSetResponse({
+      ctx,
+      env,
+      session,
+      query,
+      input: maxSetIntent.input,
+      requestId,
+      assistantMessageId,
+      runtimeFingerprint,
+      turnAttachments,
+      sessionAttachments,
+      turnIndex,
+    });
   }
 
   // --- Pre-process query & retrieve RAG context ---
@@ -1437,7 +1705,6 @@ export async function queryAgent(
     { deepDive }
   );
 
-  const maxSetIntent = deepDive ? detectMaxSetIntent(query, { currentUserEmail: ctx.email }) : { shouldBuild: false, reason: null, input: null };
   let forcedMaxSetResult: any = null;
   let compactForcedMaxSet: Record<string, unknown> | null = null;
   const preludeEvents: any[] = [];

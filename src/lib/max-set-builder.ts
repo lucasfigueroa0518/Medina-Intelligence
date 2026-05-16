@@ -232,6 +232,7 @@ const CONFIDENCE_RANK: Record<MaxSetConfidence, number> = {
 const MAX_TEXT_TERMS = 14;
 const INTERNAL_DOMAINS = new Set(['medinavc.com', 'medinaventures.ai', 'medinaventures.com']);
 const DOCUMENT_TEXT_EXTRACT_LIMIT = 25;
+const INVITE_ROSTER_DOCUMENT_TEXT_EXTRACT_LIMIT = 0;
 const D1_IN_BATCH_SIZE = 50;
 const SOURCE_FAMILIES: MaxSetSourceFamily[] = [
   'communications',
@@ -1279,6 +1280,7 @@ function addCommunicationCandidatesFromMatch(
     for (const contact of linkedContacts) {
       if (isInternalEmail(contact.email)) continue;
       const linkedSatisfiesInvite = Boolean(contact.email && headerEmails.has(contact.email.toLowerCase()));
+      if (profile.taskType === 'invite_roster' && !linkedSatisfiesInvite) continue;
       addCandidate(candidates, excluded, {
         entityKind: 'person',
         id: contact.contact_id,
@@ -1426,6 +1428,7 @@ async function scanCommunications(
   stat.rows_scanned = rows.results.length;
   stat.cap_hit = rows.results.length >= limit;
   const linkedContactMap = await loadConversationContactMap(env, rows.results.map(row => row.id));
+  const bodyFetchLimit = profile.taskType === 'invite_roster' ? 0 : MAX_MODE_LIMITS.setBuilderBodyFetchMax;
   let bodyFetches = 0;
   for (const row of rows.results) {
     const canRead = canReadConversationContent({
@@ -1438,13 +1441,13 @@ async function scanCommunications(
     const text = [row.subject, row.body_preview, row.from_email, row.to_emails, row.cc_emails].join(' ');
     let bodyText = '';
     let matches = textMatchesProfile(text, profile) || profile.taskType === 'funding_interest_gap';
-    if (!matches && row.body_r2_key && bodyFetches < MAX_MODE_LIMITS.setBuilderBodyFetchMax) {
+    if (!matches && row.body_r2_key && bodyFetches < bodyFetchLimit) {
       bodyText = await loadR2TextExcerpt(env, row.body_r2_key);
       bodyFetches += bodyText ? 1 : 0;
       matches = textMatchesProfile(bodyText, profile);
     }
     if (!matches) continue;
-    if (!bodyText && row.body_r2_key && bodyFetches < MAX_MODE_LIMITS.setBuilderBodyFetchMax &&
+    if (!bodyText && row.body_r2_key && bodyFetches < bodyFetchLimit &&
       (profile.taskType === 'invite_roster' || profile.taskType === 'entity_theme_set' || profile.taskType === 'firm_involvement')) {
       bodyText = await loadR2TextExcerpt(env, row.body_r2_key);
       bodyFetches += bodyText ? 1 : 0;
@@ -1931,6 +1934,9 @@ async function scanDocuments(
   stat.rows_scanned = rows.results.length;
   stat.cap_hit = rows.results.length >= limit;
   const sharingSet = new Set(Object.keys(await getSharingFlags(ctx.orgId, env)));
+  const documentExtractLimit = profile.taskType === 'invite_roster'
+    ? INVITE_ROSTER_DOCUMENT_TEXT_EXTRACT_LIMIT
+    : DOCUMENT_TEXT_EXTRACT_LIMIT;
   let documentsExtracted = 0;
   for (const row of rows.results) {
     if (!isDocumentAccessibleToUser(row, ctx.userId, ctx.userRole, sharingSet)) continue;
@@ -1942,7 +1948,7 @@ async function scanDocuments(
       docKind.includes('registrant') || docKind.includes('xlsx');
     let fullText = '';
     let matchesDocument = textMatchesProfile(text, profile);
-    if (!matchesDocument && looksTabular && tabularDoc && documentsExtracted < DOCUMENT_TEXT_EXTRACT_LIMIT) {
+    if (!matchesDocument && looksTabular && tabularDoc && documentsExtracted < documentExtractLimit) {
       fullText = await extractDocumentText(row, env);
       documentsExtracted += fullText ? 1 : 0;
       matchesDocument = textMatchesProfile(fullText, profile) ||
@@ -1962,46 +1968,48 @@ async function scanDocuments(
       satisfies_membership: profile.taskType === 'document_list_reconstruction',
     };
     const before = candidates.size + excluded.size;
-    if ((profile.entityKind === 'person' || profile.entityKind === 'mixed') && row.contact_id) {
-      addCandidate(candidates, excluded, {
-        entityKind: 'person',
-        id: row.contact_id,
-        name: row.contact_name,
-        email: row.contact_email,
-        confidence: 'probable',
-        why: 'Linked contact on a matching document',
-        evidence,
-        exclude: hasExcludedText(text, profile),
-        exclusionReason: 'Matched explicit exclusion terms',
-      }, profile);
-    } else if (row.company_id || row.company_name) {
-      addCandidate(candidates, excluded, {
-        entityKind: profile.entityKind === 'firm' ? 'firm' : profile.entityKind === 'startup' ? 'startup' : 'company',
-        id: row.company_id,
-        name: row.company_name || row.title,
-        domain: row.company_domain,
-        confidence: row.company_id ? 'probable' : 'needs_review',
-        why: 'Linked company or company evidence on a matching document',
-        evidence,
-        exclude: hasExcludedText(text, profile),
-        exclusionReason: 'Matched explicit exclusion terms',
-      }, profile);
-    } else {
-      addCandidate(candidates, excluded, {
-        entityKind: 'mixed',
-        id: row.id,
-        name: row.title || row.file_name,
-        confidence: 'needs_review',
-        why: 'Matching document requires entity review',
-        evidence,
-        exclude: hasExcludedText(text, profile),
-        exclusionReason: 'Matched explicit exclusion terms',
-      }, profile);
+    if (profile.taskType !== 'invite_roster') {
+      if ((profile.entityKind === 'person' || profile.entityKind === 'mixed') && row.contact_id) {
+        addCandidate(candidates, excluded, {
+          entityKind: 'person',
+          id: row.contact_id,
+          name: row.contact_name,
+          email: row.contact_email,
+          confidence: 'probable',
+          why: 'Linked contact on a matching document',
+          evidence,
+          exclude: hasExcludedText(text, profile),
+          exclusionReason: 'Matched explicit exclusion terms',
+        }, profile);
+      } else if (row.company_id || row.company_name) {
+        addCandidate(candidates, excluded, {
+          entityKind: profile.entityKind === 'firm' ? 'firm' : profile.entityKind === 'startup' ? 'startup' : 'company',
+          id: row.company_id,
+          name: row.company_name || row.title,
+          domain: row.company_domain,
+          confidence: row.company_id ? 'probable' : 'needs_review',
+          why: 'Linked company or company evidence on a matching document',
+          evidence,
+          exclude: hasExcludedText(text, profile),
+          exclusionReason: 'Matched explicit exclusion terms',
+        }, profile);
+      } else {
+        addCandidate(candidates, excluded, {
+          entityKind: 'mixed',
+          id: row.id,
+          name: row.title || row.file_name,
+          confidence: 'needs_review',
+          why: 'Matching document requires entity review',
+          evidence,
+          exclude: hasExcludedText(text, profile),
+          exclusionReason: 'Matched explicit exclusion terms',
+        }, profile);
+      }
     }
     stat.candidates_added += Math.max(0, candidates.size + excluded.size - before);
 
     if (looksTabular && tabularDoc) {
-      if (!fullText && documentsExtracted < DOCUMENT_TEXT_EXTRACT_LIMIT) {
+      if (!fullText && documentsExtracted < documentExtractLimit) {
         fullText = await extractDocumentText(row, env);
         documentsExtracted += fullText ? 1 : 0;
       }
