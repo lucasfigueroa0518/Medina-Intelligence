@@ -20,6 +20,14 @@ describe('MAX set builder contracts', () => {
         { email: 'alice@example.com', display_name: 'Alice Example' },
         { email: 'raw@example.org', display_name: undefined },
       ]);
+
+    expect(__maxSetTestHooks.collectEmailEntries('hunter.ager@gs.com; beatriz.ramos@bofa.com'))
+      .toEqual([
+        { email: 'hunter.ager@gs.com', display_name: undefined },
+        { email: 'beatriz.ramos@bofa.com', display_name: undefined },
+      ]);
+    expect(__maxSetTestHooks.humanNameFromEmail('hunter.ager@gs.com')).toBe('Hunter Ager');
+    expect(__maxSetTestHooks.humanNameFromEmail('jl@jlahoud.com')).toBeNull();
   });
 
   it('uses safe invite-roster defaults that do not let generic events or contacts generate candidates', () => {
@@ -49,6 +57,40 @@ describe('MAX set builder contracts', () => {
     expect(plan.target_scope.named_people.filter((person: any) => person.role === 'inviter').length).toBe(3);
     expect(plan.membership_predicate).toMatch(/recipient/i);
     expect(plan.target_scope.date_range?.start).toContain('2026-03');
+    expect(__maxSetTestHooks.inviteSubjectMatches(
+      'Virtual Town Hall: Intelligent Infrastructure: AI, Quantum & the new Compute Stack - May 7th at 10 AM',
+      profile
+    )).toBe(true);
+    expect(__maxSetTestHooks.inviteSubjectMatches(
+      'Re: MEDINA VENTURES FUND, LP - Commitment Summary for approval - 03-05-26',
+      profile
+    )).toBe(false);
+    expect(__maxSetTestHooks.inviteSubjectMatches(
+      'Medina Virtual Town Hall follow-up // Intelligent Infrastructure',
+      profile
+    )).toBe(false);
+    expect(__maxSetTestHooks.inviteSubjectMatches(
+      'Intelligent Infrastructure Town Hall - Attendee Report | May 7, 2026',
+      profile
+    )).toBe(false);
+    expect(__maxSetTestHooks.inviteSubjectMatches(
+      'Undeliverable: Virtual Town Hall: Intelligent Infrastructure: AI, Quantum & the new Compute Stack - May 7th at 10 AM',
+      profile
+    )).toBe(false);
+    expect(__maxSetTestHooks.inviteDocumentMatches({
+      title: 'Intelligent Infrastructure Webinar - Mail Merge (May 7, 2026)',
+      file_name: 'Intelligent Infrastructure Webinar - Mail Merge (May 7, 2026).xlsx',
+      document_type: 'spreadsheet',
+      mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      extracted_text_preview: 'Sheet: Results\\nfirst_name,email\\nAnna,anna@example.com',
+    }, profile)).toBe(true);
+    expect(__maxSetTestHooks.inviteDocumentMatches({
+      title: 'Medina Ventures Intelligent Infrastructure Town Hall Deck',
+      file_name: 'Medina Ventures Intelligent Infrastructure Town Hall Deck.pdf',
+      document_type: 'reference',
+      mime_type: 'application/pdf',
+      extracted_text_preview: '',
+    }, profile)).toBe(false);
   });
 
   it('suppresses artifacts when invite authoritative sources fail or produce no valid candidates', () => {

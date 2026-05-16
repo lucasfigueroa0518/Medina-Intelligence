@@ -230,9 +230,14 @@ const CONFIDENCE_RANK: Record<MaxSetConfidence, number> = {
 };
 
 const MAX_TEXT_TERMS = 14;
-const INTERNAL_DOMAINS = new Set(['medinavc.com', 'medinaventures.ai', 'medinaventures.com']);
+const INTERNAL_DOMAINS = new Set([
+  'medinavc.com',
+  'medinaventures.ai',
+  'medinaventures.com',
+  'medinacapital.com',
+]);
 const DOCUMENT_TEXT_EXTRACT_LIMIT = 25;
-const INVITE_ROSTER_DOCUMENT_TEXT_EXTRACT_LIMIT = 0;
+const INVITE_ROSTER_DOCUMENT_TEXT_EXTRACT_LIMIT = 3;
 const D1_IN_BATCH_SIZE = 50;
 const SOURCE_FAMILIES: MaxSetSourceFamily[] = [
   'communications',
@@ -425,11 +430,33 @@ function domainFromEmail(email: string | null | undefined): string | null {
 
 function firstNameFrom(fullName: string | null | undefined, email?: string | null): string | null {
   const name = cleanText(fullName);
-  if (name) return name.split(/\s+/)[0] || null;
+  if (name && !normalizeEmail(name)) return name.split(/\s+/)[0] || null;
   if (!email) return null;
   const local = email.split('@')[0] || '';
-  const part = local.split(/[._+-]+/).find(x => x.length > 0);
+  const part = local.split(/[._+-]+/).find(x => x.length >= 3);
   return part ? part.replace(/^\w/, c => c.toUpperCase()) : null;
+}
+
+function humanNameFromEmail(email: string | null | undefined): string | null {
+  if (!email) return null;
+  const local = email.split('@')[0] || '';
+  const rawParts = local
+    .split(/[._+-]+/)
+    .map(part => part.trim())
+    .filter(part => part.length > 0 && !/^\d+$/.test(part));
+  if (rawParts.length === 1 && rawParts[0].length <= 2) return null;
+  const parts = rawParts
+    .filter(part => part.length >= 2)
+    .slice(0, 3);
+  if (parts.length === 0) return null;
+  return parts.map(part => part.replace(/^\w/, c => c.toUpperCase())).join(' ');
+}
+
+function hasResolvedPersonName(name: string | null | undefined): boolean {
+  const cleaned = cleanText(name);
+  if (!cleaned || normalizeEmail(cleaned)) return false;
+  if (cleaned.length <= 2) return false;
+  return true;
 }
 
 function parseMaybeJson(value: string): unknown {
@@ -442,13 +469,23 @@ function collectEmailEntries(value: unknown): Array<{ email: string; display_nam
     const parsed = value.trim().startsWith('[') || value.trim().startsWith('{') ? parseMaybeJson(value) : value;
     if (parsed !== value) return collectEmailEntries(parsed);
     const entries: Array<{ email: string; display_name?: string }> = [];
-    const re = /(?:"?([^"<,;]+?)"?\s*)?<?([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})>?/gi;
-    let match: RegExpExecArray | null;
-    while ((match = re.exec(value)) !== null) {
-      const email = normalizeEmail(match[2]);
-      if (!email) continue;
-      const display = cleanText(match[1]).replace(/^"|"$/g, '');
+    const seen = new Set<string>();
+    const push = (emailValue: unknown, displayValue?: unknown) => {
+      const email = normalizeEmail(emailValue);
+      if (!email || seen.has(email)) return;
+      seen.add(email);
+      const display = cleanText(displayValue).replace(/^"|"$/g, '');
       entries.push({ email, display_name: display || undefined });
+    };
+    const angleRe = /(?:"?([^"<,;]+?)"?\s*)<\s*([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})\s*>/gi;
+    let angleMatch: RegExpExecArray | null;
+    while ((angleMatch = angleRe.exec(value)) !== null) {
+      push(angleMatch[2], angleMatch[1]);
+    }
+    const plainRe = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+    let plainMatch: RegExpExecArray | null;
+    while ((plainMatch = plainRe.exec(value)) !== null) {
+      push(plainMatch[0]);
     }
     return entries;
   }
@@ -840,6 +877,110 @@ function textMatchesProfile(text: string, profile: SearchProfile): boolean {
   return profile.includeTerms.length === 0 || profile.includeTerms.some(term => haystack.includes(compactText(term)));
 }
 
+const INVITE_SUBJECT_STOP_TERMS = new Set([
+  'associated', 'emails', 'excel', 'first', 'individuals', 'mail', 'merge',
+  'names', 'people', 'thursday', 'took', 'place', 'webinar', 'invited',
+  'invite', 'attendee', 'attendees', 'registrant', 'registrants',
+]);
+
+const NON_INVITE_SUBJECT_RE = /\b(attendee report|attendance report|registrant report|registration report|follow up|follow-up|followup|recording|zoom recording|deck|slides|recap|thank you|thanks|undeliverable|delivery status notification|delivery has failed|automatic reply|out of office|confirmation of completion)\b/;
+const INVITE_CONTEXT_RE = /\b(virtual town hall|town hall|webinar|invite|invitation)\b/;
+
+function inviteSubjectNeedles(profile: SearchProfile): { phrases: string[]; tokens: string[] } {
+  const terms = unique([
+    ...(profile.plan?.target_scope.title_terms || []),
+    ...profile.includeTerms,
+    ...profile.aliases,
+  ]);
+  const phrases = terms
+    .map(term => compactText(term))
+    .filter(term =>
+      term.includes(' ') &&
+      term.length >= 8 &&
+      !/(thursday|mail merge|first name|associated email)/.test(term)
+    )
+    .slice(0, 8);
+  const tokens = terms
+    .map(term => compactText(term))
+    .filter(term =>
+      term.length >= 5 &&
+      !term.includes(' ') &&
+      !INVITE_SUBJECT_STOP_TERMS.has(term)
+    )
+    .slice(0, 8);
+  return { phrases, tokens };
+}
+
+function inviteSubjectMatches(subject: unknown, profile: SearchProfile): boolean {
+  const normalized = compactText(subject);
+  if (!normalized) return false;
+  if (NON_INVITE_SUBJECT_RE.test(normalized)) return false;
+  if (!INVITE_CONTEXT_RE.test(normalized)) return false;
+  const { phrases, tokens } = inviteSubjectNeedles(profile);
+  if (phrases.some(phrase => normalized.includes(phrase))) return true;
+  return tokens.length === 0 || tokens.some(token => normalized.includes(token));
+}
+
+function addInviteSubjectClauses(where: string[], binds: unknown[], profile: SearchProfile): void {
+  const { phrases, tokens } = inviteSubjectNeedles(profile);
+  const terms = phrases.length > 0 ? phrases : tokens;
+  if (terms.length === 0) return;
+  where.push(`LOWER(COALESCE(c.subject, '')) NOT LIKE '%attendee report%'`);
+  where.push(`LOWER(COALESCE(c.subject, '')) NOT LIKE '%follow-up%'`);
+  where.push(`LOWER(COALESCE(c.subject, '')) NOT LIKE '%follow up%'`);
+  where.push(`LOWER(COALESCE(c.subject, '')) NOT LIKE '%recording%'`);
+  where.push(`LOWER(COALESCE(c.subject, '')) NOT LIKE '%deck%'`);
+  where.push(`LOWER(COALESCE(c.subject, '')) NOT LIKE '%undeliverable%'`);
+  where.push(`(LOWER(COALESCE(c.subject, '')) LIKE '%town hall%' OR LOWER(COALESCE(c.subject, '')) LIKE '%webinar%' OR LOWER(COALESCE(c.subject, '')) LIKE '%invite%' OR LOWER(COALESCE(c.subject, '')) LIKE '%invitation%')`);
+  where.push(`(${terms.map(() => "LOWER(COALESCE(c.subject, '')) LIKE ?").join(' OR ')})`);
+  binds.push(...terms.map(term => `%${term.toLowerCase()}%`));
+}
+
+function addInviteCampaignClauses(where: string[], binds: unknown[], profile: SearchProfile): void {
+  const { phrases, tokens } = inviteSubjectNeedles(profile);
+  const terms = phrases.length > 0 ? phrases : tokens;
+  if (terms.length === 0) return;
+  const subjectExpr = "LOWER(COALESCE(ec.subject, '') || ' ' || COALESCE(ec.title, ''))";
+  where.push(`${subjectExpr} NOT LIKE '%attendee report%'`);
+  where.push(`${subjectExpr} NOT LIKE '%follow-up%'`);
+  where.push(`${subjectExpr} NOT LIKE '%follow up%'`);
+  where.push(`${subjectExpr} NOT LIKE '%recording%'`);
+  where.push(`${subjectExpr} NOT LIKE '%deck%'`);
+  where.push(`${subjectExpr} NOT LIKE '%undeliverable%'`);
+  where.push(`(${subjectExpr} LIKE '%town hall%' OR ${subjectExpr} LIKE '%webinar%' OR ${subjectExpr} LIKE '%invite%' OR ${subjectExpr} LIKE '%invitation%')`);
+  where.push(`(${terms.map(() => `${subjectExpr} LIKE ?`).join(' OR ')})`);
+  binds.push(...terms.map(term => `%${term.toLowerCase()}%`));
+}
+
+function inviteDocumentMatches(row: any, profile: SearchProfile): boolean {
+  const text = compactText([
+    row.title,
+    row.file_name,
+    row.document_type,
+    row.mime_type,
+    row.extracted_text_preview,
+  ].join(' '));
+  if (!text) return false;
+  if (/\b(deck|slides|slide|presentation|pdf|ppm|questionnaire|concert|music|save the date|cyber symposium|tax return|registered agent)\b/.test(text)) return false;
+  const listLike = /\b(mail merge|invite list|invited attendees|invitees|invitee|invited|attendee report|attendee|registrant|registration|roster|spreadsheet|xlsx|csv|contact data)\b/.test(text);
+  if (!listLike) return false;
+  const { phrases, tokens } = inviteSubjectNeedles(profile);
+  const targetTerms = [...phrases, ...tokens].filter(term =>
+    term.length >= 5 &&
+    !INVITE_SUBJECT_STOP_TERMS.has(term) &&
+    !/^(may|place|thursday|names|emails|individuals|myself)$/.test(term)
+  );
+  const targetMatched = targetTerms.length === 0 || targetTerms.some(term => text.includes(term));
+  return targetMatched && /\b(intelligent infrastructure|town hall|webinar|ai|quantum)\b/.test(text);
+}
+
+function inviteDocumentRowSatisfiesMembership(row: any, profile: SearchProfile): boolean {
+  const text = compactText([row.title, row.file_name, row.document_type].join(' '));
+  if (/\b(mail merge|invite list|invitees|invitee|invited|recipient|source list)\b/.test(text)) return true;
+  if (/\b(attendee|registrant|registration)\b/.test(text) && /\b(attendee|attendees|registrant|registrants|registered|showed up)\b/i.test(profile.query)) return true;
+  return false;
+}
+
 function hasExcludedText(text: string, profile: SearchProfile): boolean {
   const haystack = compactText(text);
   return profile.excludeTerms.some(term => haystack.includes(compactText(term)));
@@ -967,7 +1108,7 @@ function addCandidate(
       why_excluded: draft.exclude ? [draft.exclusionReason || draft.why] : undefined,
       unresolved_fields: [
         kind === 'person' && !email ? 'email' : '',
-        !name || name === 'Unknown' ? 'name' : '',
+        kind === 'person' && !hasResolvedPersonName(name) ? 'name' : '',
       ].filter(Boolean),
     });
     return;
@@ -990,7 +1131,7 @@ function addCandidate(
     if (why && !existing.why_excluded.includes(why)) existing.why_excluded.push(why);
   }
   if (kind === 'person' && email) existing.unresolved_fields = existing.unresolved_fields.filter(f => f !== 'email');
-  if (name && name !== 'Unknown') existing.unresolved_fields = existing.unresolved_fields.filter(f => f !== 'name');
+  if (hasResolvedPersonName(name)) existing.unresolved_fields = existing.unresolved_fields.filter(f => f !== 'name');
 }
 
 function companyFromEmail(email: string | null, displayName?: string | null): string | null {
@@ -1265,12 +1406,16 @@ function addCommunicationCandidatesFromMatch(
     }
     for (const entry of entries) {
       if (isInternalEmail(entry.email)) continue;
+      const displayName = entry.display_name || humanNameFromEmail(entry.email);
+      const hasUsableName = hasResolvedPersonName(displayName);
       addCandidate(candidates, excluded, {
         entityKind: 'person',
-        name: entry.display_name || entry.email,
+        name: displayName || entry.email,
         email: entry.email,
-        company: companyFromEmail(entry.email, entry.display_name),
-        confidence: profile.taskType === 'invite_roster' ? 'confirmed' : 'probable',
+        company: companyFromEmail(entry.email, displayName),
+        confidence: profile.taskType === 'invite_roster'
+          ? hasUsableName ? 'confirmed' : 'needs_review'
+          : hasUsableName ? 'probable' : 'needs_review',
         why: profile.taskType === 'invite_roster' ? 'Appeared as an email recipient on a matching invite/thread' : 'Appeared in a matching communication',
         evidence,
         exclude: excludedByText,
@@ -1281,17 +1426,23 @@ function addCommunicationCandidatesFromMatch(
       if (isInternalEmail(contact.email)) continue;
       const linkedSatisfiesInvite = Boolean(contact.email && headerEmails.has(contact.email.toLowerCase()));
       if (profile.taskType === 'invite_roster' && !linkedSatisfiesInvite) continue;
+      const contactName = hasResolvedPersonName(contact.full_name)
+        ? contact.full_name
+        : humanNameFromEmail(contact.email || undefined);
+      const contactConfidence = linkedSatisfiesInvite
+        ? hasResolvedPersonName(contactName) ? 'confirmed' : 'needs_review'
+        : 'probable';
       addCandidate(candidates, excluded, {
         entityKind: 'person',
         id: contact.contact_id,
-        name: contact.full_name || contact.email,
+        name: contactName || contact.email,
         email: contact.email,
         company: contact.company_name || companyFromEmail(contact.email),
         domain: contact.company_domain || domainFromEmail(contact.email || undefined),
-        confidence: linkedSatisfiesInvite ? 'confirmed' : 'probable',
+        confidence: contactConfidence,
         why: 'Linked through conversation_contacts on a matching communication',
         evidence: profile.taskType === 'invite_roster'
-          ? { ...evidence, satisfies_membership: linkedSatisfiesInvite, evidence_type: linkedSatisfiesInvite ? 'direct_recipient' : 'text_mention', strength: linkedSatisfiesInvite ? 'confirmed' : 'probable' }
+          ? { ...evidence, satisfies_membership: linkedSatisfiesInvite, evidence_type: linkedSatisfiesInvite ? 'direct_recipient' : 'text_mention', strength: contactConfidence }
           : evidence,
         exclude: excludedByText,
         exclusionReason: 'Matched explicit exclusion terms',
@@ -1300,11 +1451,12 @@ function addCommunicationCandidatesFromMatch(
     if (profile.taskType === 'invite_roster' && bodyText) {
       for (const entry of collectEmailEntries(bodyText)) {
         if (isInternalEmail(entry.email) || headerEmails.has(entry.email)) continue;
+        const displayName = entry.display_name || humanNameFromEmail(entry.email);
         addCandidate(candidates, excluded, {
           entityKind: 'person',
-          name: entry.display_name || entry.email,
+          name: displayName || entry.email,
           email: entry.email,
-          company: companyFromEmail(entry.email, entry.display_name),
+          company: companyFromEmail(entry.email, displayName),
           confidence: 'needs_review',
           why: 'Email address appeared in the full body of a matching invite/thread',
           evidence: { ...evidence, strength: 'needs_review', evidence_type: 'text_mention', satisfies_membership: false },
@@ -1383,14 +1535,16 @@ async function scanCommunications(
         ...profile.domains,
         ...(profile.taskType === 'funding_interest_gap' ? fundingInterestTerms() : []),
       ];
-  addLikeTermClauses(
-    where,
-    binds,
-    profile.taskType === 'invite_roster'
-      ? ['c.subject', 'c.body_preview']
-      : ['c.subject', 'c.body_preview', 'c.from_email', 'c.to_emails', 'c.cc_emails'],
-    communicationTerms
-  );
+  if (profile.taskType === 'invite_roster') {
+    addInviteSubjectClauses(where, binds, profile);
+  } else {
+    addLikeTermClauses(
+      where,
+      binds,
+      ['c.subject', 'c.body_preview', 'c.from_email', 'c.to_emails', 'c.cc_emails'],
+      communicationTerms
+    );
+  }
   if (profile.taskType === 'invite_roster') {
     where.push("c.source = 'outlook'");
     if (inviterEmails.length > 0) {
@@ -1440,7 +1594,9 @@ async function scanCommunications(
     if (!canRead) continue;
     const text = [row.subject, row.body_preview, row.from_email, row.to_emails, row.cc_emails].join(' ');
     let bodyText = '';
-    let matches = textMatchesProfile(text, profile) || profile.taskType === 'funding_interest_gap';
+    let matches = profile.taskType === 'invite_roster'
+      ? inviteSubjectMatches(row.subject, profile)
+      : textMatchesProfile(text, profile) || profile.taskType === 'funding_interest_gap';
     if (!matches && row.body_r2_key && bodyFetches < bodyFetchLimit) {
       bodyText = await loadR2TextExcerpt(env, row.body_r2_key);
       bodyFetches += bodyText ? 1 : 0;
@@ -1654,7 +1810,11 @@ async function scanCampaigns(
   const stat: SourceStat = { source_family: 'campaigns', rows_scanned: 0, rows_returned: 0, candidates_added: 0, cap_hit: false, errors: [] };
   const where = ['ec.org_id = ?', 'ec.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
-  addLikeTermClauses(where, binds, ['ec.title', 'ec.subject', 'ec.body_template'], profile.includeTerms);
+  if (profile.taskType === 'invite_roster') {
+    addInviteCampaignClauses(where, binds, profile);
+  } else {
+    addLikeTermClauses(where, binds, ['ec.title', 'ec.subject', 'ec.body_template'], profile.includeTerms);
+  }
   addDateRange(where, binds, 'COALESCE(ec.sent_at, ec.scheduled_at, ec.created_at)', profile);
   const limit = MAX_MODE_LIMITS.setBuilderRowCap;
   const rows = await env.D1.prepare(
@@ -1672,6 +1832,7 @@ async function scanCampaigns(
   stat.cap_hit = rows.results.length >= limit;
   for (const row of rows.results) {
     if (isInternalEmail(row.email)) continue;
+    if (profile.taskType === 'invite_roster' && !inviteSubjectMatches([row.title, row.subject].join(' '), profile)) continue;
     stat.rows_returned += 1;
     const evidence: MaxSetEvidence = {
       source_family: 'campaigns',
@@ -1909,8 +2070,24 @@ async function scanDocuments(
   const documentMatchBinds: unknown[] = [];
   addLikeTermClauses(documentMatchWhere, documentMatchBinds, ['d.title', 'd.file_name', 'd.document_type', 'd.extracted_text_preview'], [...profile.includeTerms, ...profile.domains]);
   if (profile.taskType === 'invite_roster') {
-    where.push(`(${documentMatchWhere.join(' AND ') || '0'} OR LOWER(COALESCE(d.document_type, '')) IN ('contact_data','spreadsheet') OR LOWER(COALESCE(d.file_name, '')) LIKE '%attendee%' OR LOWER(COALESCE(d.file_name, '')) LIKE '%invite%' OR LOWER(COALESCE(d.file_name, '')) LIKE '%registrant%' OR LOWER(COALESCE(d.title, '')) LIKE '%attendee%' OR LOWER(COALESCE(d.title, '')) LIKE '%invite%' OR LOWER(COALESCE(d.title, '')) LIKE '%registrant%')`);
-    binds.push(...documentMatchBinds);
+    const docExpr = "LOWER(COALESCE(d.title, '') || ' ' || COALESCE(d.file_name, '') || ' ' || COALESCE(d.document_type, '') || ' ' || COALESCE(d.extracted_text_preview, ''))";
+    const { phrases, tokens } = inviteSubjectNeedles(profile);
+    const targetTerms = [...phrases, ...tokens]
+      .filter(term => term.length >= 5 && !INVITE_SUBJECT_STOP_TERMS.has(term))
+      .slice(0, 8);
+    if (targetTerms.length > 0) {
+      where.push(`(${targetTerms.map(() => `${docExpr} LIKE ?`).join(' OR ')})`);
+      binds.push(...targetTerms.map(term => `%${term.toLowerCase()}%`));
+    } else {
+      where.push(documentMatchWhere.join(' AND ') || '1');
+      binds.push(...documentMatchBinds);
+    }
+    where.push(`(${docExpr} LIKE '%mail merge%' OR ${docExpr} LIKE '%invite%' OR ${docExpr} LIKE '%attendee%' OR ${docExpr} LIKE '%registrant%' OR ${docExpr} LIKE '%registration%' OR ${docExpr} LIKE '%roster%' OR ${docExpr} LIKE '%spreadsheet%' OR ${docExpr} LIKE '%xlsx%' OR ${docExpr} LIKE '%csv%')`);
+    where.push(`${docExpr} NOT LIKE '%deck%'`);
+    where.push(`${docExpr} NOT LIKE '%slides%'`);
+    where.push(`${docExpr} NOT LIKE '%presentation%'`);
+    where.push(`${docExpr} NOT LIKE '%ppm%'`);
+    where.push(`${docExpr} NOT LIKE '%tax return%'`);
   } else {
     where.push(...documentMatchWhere);
     binds.push(...documentMatchBinds);
@@ -1940,6 +2117,7 @@ async function scanDocuments(
   let documentsExtracted = 0;
   for (const row of rows.results) {
     if (!isDocumentAccessibleToUser(row, ctx.userId, ctx.userRole, sharingSet)) continue;
+    if (profile.taskType === 'invite_roster' && !inviteDocumentMatches(row, profile)) continue;
     const text = [row.title, row.file_name, row.document_type, row.extracted_text_preview, row.contact_name, row.company_name, row.deal_title].join(' ');
     const looksTabular = profile.entityKind === 'person' || profile.entityKind === 'mixed' || profile.taskType === 'invite_roster';
     const docKind = `${row.document_type || ''} ${row.mime_type || ''} ${row.file_name || ''} ${row.title || ''}`.toLowerCase();
@@ -2013,15 +2191,23 @@ async function scanDocuments(
         fullText = await extractDocumentText(row, env);
         documentsExtracted += fullText ? 1 : 0;
       }
-      const extractedRows = extractPersonRowsFromTabularText(fullText).slice(0, MAX_MODE_LIMITS.setBuilderCandidateCap);
+      const sourceSatisfiesMembership = profile.taskType === 'invite_roster'
+        ? inviteDocumentRowSatisfiesMembership(row, profile)
+        : true;
+      const rowText = fullText || row.extracted_text_preview || '';
+      const extractedRows = extractPersonRowsFromTabularText(rowText).slice(0, MAX_MODE_LIMITS.setBuilderCandidateCap);
+      const beforeDocumentRows = candidates.size + excluded.size;
       for (const person of extractedRows) {
         if (isInternalEmail(person.email)) continue;
+        const confidence = sourceSatisfiesMembership
+          ? person.confidence
+          : person.confidence === 'confirmed' ? 'probable' : person.confidence;
         addCandidate(candidates, excluded, {
           entityKind: 'person',
           name: person.name,
           email: person.email,
           company: person.company,
-          confidence: person.confidence,
+          confidence,
           why: 'Extracted from a matching tabular document/spreadsheet row',
           evidence: {
             source_family: 'documents',
@@ -2031,13 +2217,14 @@ async function scanDocuments(
             title: row.title || row.file_name,
             date: row.created_at,
             detail: person.detail,
-            strength: person.confidence,
-            satisfies_membership: true,
+            strength: confidence,
+            satisfies_membership: sourceSatisfiesMembership,
           },
           exclude: hasExcludedText([text, person.name, person.email, person.company].join(' '), profile),
           exclusionReason: 'Matched explicit exclusion terms',
         }, profile);
       }
+      stat.candidates_added += Math.max(0, candidates.size + excluded.size - beforeDocumentRows);
     }
   }
   stat.documents_extracted = documentsExtracted;
@@ -2251,6 +2438,21 @@ function sortCandidates(candidates: MaxSetCandidate[]): MaxSetCandidate[] {
   });
 }
 
+function finalizeCandidateForBuckets(profile: SearchProfile, candidate: MaxSetCandidate): MaxSetCandidate {
+  if (
+    profile.taskType === 'invite_roster' &&
+    candidate.entity_kind === 'person' &&
+    (!candidate.first_name || candidate.unresolved_fields.includes('name') || Boolean(normalizeEmail(candidate.canonical_name)))
+  ) {
+    candidate.confidence = 'needs_review';
+    if (!candidate.unresolved_fields.includes('name')) candidate.unresolved_fields.push('name');
+    if (!candidate.why_included.includes('Name/first name is unresolved for mail merge review')) {
+      candidate.why_included.push('Name/first name is unresolved for mail merge review');
+    }
+  }
+  return candidate;
+}
+
 function partitionCandidates(candidates: MaxSetCandidate[]): Record<MaxSetConfidence, MaxSetCandidate[]> {
   return {
     confirmed: sortCandidates(candidates.filter(c => c.confidence === 'confirmed')),
@@ -2301,6 +2503,10 @@ export function evaluateMaxSetQuality(
     ));
     if (contaminating.length > 0) reasons.push(`Invite roster contains ${contaminating.length} candidates from non-authoritative event/contact evidence.`);
     if (all.length > 1000) reasons.push(`Invite roster candidate count (${all.length}) is implausibly broad for a targeted mail-merge request.`);
+    const documentStat = stats.find(s => s.source_family === 'documents');
+    if (documentStat && documentStat.rows_returned > 0 && documentStat.candidates_added === 0 && (documentStat.documents_extracted || 0) === 0) {
+      reasons.push('Matching invite/list documents were found, but no structured rows were extracted from them.');
+    }
   }
 
   if (all.length > 0 && membershipSatisfiedCount / all.length < 0.5) {
@@ -2347,7 +2553,22 @@ function buildArtifactContent(
 
 function titleForArtifact(profile: SearchProfile): string {
   const base = profile.taskType.replace(/_/g, ' ');
-  const topic = profile.includeTerms.slice(0, 3).join(' ');
+  if (profile.taskType === 'invite_roster') {
+    let topic = '';
+    if (/\bintelligent infrastructure\b/i.test(profile.query)) topic = 'Intelligent Infrastructure Webinar';
+    else if (/\bquantum\b/i.test(profile.query)) topic = 'Quantum Invite Roster';
+    else {
+      topic = unique([...(profile.plan?.target_scope.title_terms || []), ...profile.includeTerms])
+        .filter(term => !/^(ai infrastructure|infrastructure|webinar|invite|invited|names|emails|mail merge|may|thursday)$/.test(compactText(term)))
+        .slice(0, 3)
+        .join(' ');
+    }
+    return `MAX Invite Roster${topic ? ` - ${topic}` : ''}`.replace(/\b\w/g, c => c.toUpperCase()).slice(0, 120);
+  }
+  const topic = unique(profile.includeTerms)
+    .filter(term => !/^(infrastructure|webinar|names|emails|mail merge|may|thursday)$/.test(compactText(term)))
+    .slice(0, 3)
+    .join(' ');
   return `MAX ${base}${topic ? ` - ${topic}` : ''}`.replace(/\b\w/g, c => c.toUpperCase()).slice(0, 120);
 }
 
@@ -2671,7 +2892,7 @@ export async function buildMaxSetTool(
     stats.push(await runAdapter(family, ctx, env, profile, candidates, excludedMap));
   }
 
-  const allCandidates = sortCandidates([...candidates.values()]).slice(0, MAX_MODE_LIMITS.setBuilderCandidateCap);
+  const allCandidates = sortCandidates([...candidates.values()].map(candidate => finalizeCandidateForBuckets(profile, candidate))).slice(0, MAX_MODE_LIMITS.setBuilderCandidateCap);
   const buckets = partitionCandidates(allCandidates);
   const excluded = sortCandidates([...excludedMap.values()]).slice(0, MAX_MODE_LIMITS.setBuilderCandidateCap);
   const qualityGate = evaluateMaxSetQuality(plan, stats, buckets, excluded);
@@ -2681,6 +2902,9 @@ export async function buildMaxSetTool(
     ...capFamilies.map(f => `${f} hit the MAX row cap; rerun with narrower filters or pagination for full certainty.`),
     ...stats.flatMap(s => s.errors.map(e => `${s.source_family}: ${e}`)),
   ];
+  if (profile.taskType === 'invite_roster' && buckets.probable.length > 0) {
+    gaps.push(`${buckets.probable.length} candidates are probable because their strongest evidence is a matching attendee/registration/list document rather than direct outbound invite-recipient headers.`);
+  }
   const coverageRows = [
     ['quality_status', qualityGate.status],
     ['quality_gate_passed', qualityGate.passed ? 'yes' : 'no'],
@@ -2776,6 +3000,9 @@ export const __maxSetTestHooks = {
   evaluateMaxSetQuality,
   expandAliases,
   extractPersonRowsFromTabularText,
+  humanNameFromEmail,
+  inviteDocumentMatches,
+  inviteSubjectMatches,
   planMaxSetJob,
   sourcePolicyForTask,
 };
