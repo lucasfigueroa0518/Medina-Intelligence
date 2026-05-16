@@ -4,10 +4,10 @@ import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { CLAUDE_MODEL } from './claude';
 import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from './max-mode';
 
-export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-16-max-exhaustive-job-system-v1';
-export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-16-live-agent-max-exhaustive-job-system-v1';
+export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-16-meetings-events-tooling-v1';
+export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-16-live-agent-meetings-events-v1';
 export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v2';
-export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-16-agent-tools-max-exhaustive-job-system-v1';
+export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-16-agent-tools-search-events-v1';
 export const MARTY_ARTIFACT_RUNTIME_VERSION = '2026-05-15-office-artifacts-v1';
 
 export interface MartyRuntimeFingerprint {
@@ -130,7 +130,7 @@ Then write a cited evidence memo:
 - Conflicts, gaps, and unknowns
 - Recommended next actions
 
-Use multiple retrieval angles before finalizing when the question calls for it: build_max_set for exhaustive sets, broad recall/source-specific recall for narrative evidence, sweep_conversations/search_conversations for narrow communication debugging, and structured entity search for specific CRM records. For exhaustive roster/export tasks, return the actual aggregated set or created artifact; do not collapse hundreds of possible rows into a handful of examples. Cite specific emails, meetings, Slack messages, and documents by name/date where available.`;
+Use multiple retrieval angles before finalizing when the question calls for it: build_max_set for exhaustive sets, search_events for calendar/meeting/transcript windows, broad recall/source-specific recall for narrative evidence, sweep_conversations/search_conversations for narrow email/Slack debugging, and structured entity search for specific CRM records. For exhaustive roster/export tasks, return the actual aggregated set or created artifact; do not collapse hundreds of possible rows into a handful of examples. Cite specific emails, meetings, Slack messages, and documents by name/date where available. Never use a zero-result conversation search as evidence that meeting transcripts do not exist.`;
 }
 
 function productionRuntimeComponents(env: Env, deepDive: boolean): Record<string, unknown> {

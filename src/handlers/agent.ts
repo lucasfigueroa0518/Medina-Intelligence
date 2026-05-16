@@ -20,7 +20,7 @@ import { estimateTokens, truncateToTokens } from '../lib/tokens';
 import { emitAudit } from '../lib/audit';
 import {
   searchContacts, searchCompanies, searchDeals, searchConversations,
-  recall, sweepConversations,
+  searchEvents, recall, sweepConversations,
   getContactDetail, getCompanyDetail, getDealDetail,
   createContactTool, updateContactTool,
   createCompanyTool, updateCompanyTool,
@@ -187,16 +187,36 @@ const AGENT_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'search_conversations',
-    description: 'Search emails, Slack messages, and meeting transcripts stored in the CRM. Use this for normal communication lookup. In Deep mode, prefer sweep_conversations for exhaustive all/every/list/export/count jobs.',
+    description: 'Search emails, Slack messages, and manual conversation rows stored in the conversations table. This does NOT search Firefly meeting transcripts or calendar events; use search_events for meetings, calendar windows, events, and transcript-backed recaps. In Deep mode, prefer sweep_conversations for exhaustive all/every/list/export/count communication jobs.',
     input_schema: {
       type: 'object',
       properties: {
         keyword: { type: 'string', description: 'Search by subject, body preview, sender, To, or Cc' },
-        source: { type: 'string', enum: ['outlook', 'slack', 'firefly', 'all'], description: 'Filter by communication channel. Default: all' },
+        source: { type: 'string', enum: ['outlook', 'slack', 'manual', 'all'], description: 'Filter by conversation channel. Default: all. Meeting transcripts are not conversations; use search_events.' },
         contact_id: { type: 'string', description: 'Filter conversations involving a specific contact' },
         direction: { type: 'string', enum: ['inbound', 'outbound', 'all'], description: 'Filter by direction. Default: all' },
         days_back: { type: 'number', description: 'How many days back to search. Default: 30, or 365 in Deep mode.' },
         limit: { type: 'number', description: 'Max results. Default 20; in Deep mode default 250. Max 50 normally, 1000 in Deep mode.' },
+      },
+    },
+  },
+  {
+    name: 'search_events',
+    description: 'Deterministic SQL search over the events table: calendar events, meetings, calls, hosted events, and Firefly transcript-backed meeting records. Use this for recent/upcoming meetings, event windows, meeting recaps, transcript availability, action items from meetings, or whenever a user asks about meetings/events/calendar. Pair with recall(source_types=["meeting"]) when the user needs transcript content, but never infer "no transcripts" from search_conversations.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        keyword: { type: 'string', description: 'Optional high-signal event/company/person/topic term. Do not pass generic words like recent, upcoming, meetings, or events.' },
+        event_type: { type: 'string', enum: ['meeting', 'conference', 'call', 'email_thread', 'hosted_event', 'in_person', 'other', 'all'], description: 'Optional event type. Default: all.' },
+        source: { type: 'string', enum: ['outlook', 'firefly', 'manual', 'all'], description: 'Optional event source. Use firefly for transcript-backed Firefly meetings. Default: all.' },
+        timeframe: { type: 'string', enum: ['recent', 'upcoming', 'past', 'recent_and_upcoming', 'all'], description: 'Default: recent_and_upcoming.' },
+        start_date: { type: 'string', description: 'Inclusive ISO/date lower bound. Optional.' },
+        end_date: { type: 'string', description: 'Inclusive ISO/date upper bound. Optional.' },
+        days_back: { type: 'number', description: 'Lookback window when start_date is omitted. Default 60.' },
+        days_forward: { type: 'number', description: 'Forward window when end_date is omitted. Default 90.' },
+        has_transcript: { type: 'boolean', description: 'Filter by transcript availability. Omit to include both transcript and calendar-only events.' },
+        include_transcript_excerpt: { type: 'boolean', description: 'Fetch a short transcript excerpt from R2 when available. Use for meeting-content questions; keep false for calendar windows.' },
+        limit: { type: 'number', description: 'Max events. Default 20; in Deep mode default 100. Max 50 normally, 200 in Deep mode.' },
       },
     },
   },
@@ -679,6 +699,7 @@ async function executeTool(
     case 'search_companies': return searchCompanies(ctx, toolInput, env, toolContext);
     case 'search_deals': return searchDeals(ctx, toolInput, env, toolContext);
     case 'search_conversations': return searchConversations(ctx, toolInput, env, toolContext);
+    case 'search_events': return searchEvents(ctx, toolInput, env, toolContext);
     case 'sweep_conversations': return sweepConversations(ctx, toolInput, env, toolContext);
     case 'build_max_set': return buildMaxSetTool(ctx, toolInput, env, toolContext);
     case 'find_documents': return findDocumentsTool(ctx, toolInput, env);

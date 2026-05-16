@@ -4,7 +4,7 @@ import { emitAudit } from './audit';
 import { invalidateRagCache } from './cache';
 import { findDuplicateCompany } from './discovery';
 import { updateEntityInIndex } from './entity-index';
-import { canReadConversationContent, getSharingFlags, hasOrgWidePrivateDataAccess } from './helpers';
+import { canReadConversationContent, chunkArray, getSharingFlags, hasOrgWidePrivateDataAccess } from './helpers';
 import { isCompanyInternal, assertNoOpenDealForCompany, OpenDealConflictError } from './internal-entity';
 import {
   updateContactFields, updateCompanyFields, updateDealFields,
@@ -214,6 +214,15 @@ export async function searchConversations(
   const where: string[] = ['c.org_id = ?'];
   const binds: unknown[] = [ctx.orgId];
 
+  if (input.source === 'firefly' || input.source === 'meeting' || input.source === 'meetings') {
+    return {
+      conversations: [],
+      count: 0,
+      error: 'SOURCE_NOT_IN_CONVERSATIONS',
+      message: 'Firefly meeting transcripts and calendar events are stored in the events table, not conversations. Use search_events for meetings, calendar windows, and transcript-backed recaps.',
+    };
+  }
+
   if (input.source && input.source !== 'all') {
     where.push('c.source = ?');
     binds.push(input.source);
@@ -334,6 +343,302 @@ export async function searchConversations(
   }
 
   return { conversations, count: conversations.length };
+}
+
+type SearchEventsTimeframe = 'recent' | 'upcoming' | 'past' | 'recent_and_upcoming' | 'all';
+
+const EVENT_KEYWORD_STOP_WORDS = new Set([
+  'all', 'and', 'calendar', 'event', 'events', 'future', 'give', 'into',
+  'meeting', 'meetings', 'past', 'recent', 'recap', 'recaps', 'show',
+  'transcript', 'transcripts', 'upcoming', 'window',
+]);
+
+function addDaysIso(base: Date, days: number): string {
+  const d = new Date(base.getTime());
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString();
+}
+
+function normalizeDateBound(value: unknown): string | null {
+  if (!value) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? text : parsed.toISOString();
+}
+
+function deriveEventKeywordTerms(keyword: unknown): string[] {
+  const text = String(keyword || '').trim().toLowerCase();
+  if (!text) return [];
+  const tokens = text.match(/[a-z0-9][a-z0-9._@-]{2,}/gi) || [];
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const token of tokens) {
+    const cleaned = token.replace(/^[-_.]+|[-_.]+$/g, '').toLowerCase();
+    if (cleaned.length < 3 || EVENT_KEYWORD_STOP_WORDS.has(cleaned) || seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    terms.push(cleaned);
+    if (terms.length >= 8) break;
+  }
+  return terms;
+}
+
+function cleanEventText(value: unknown, max = 700): string | null {
+  if (value == null) return null;
+  let text = String(value).trim();
+  if (!text) return null;
+  if ((text.startsWith('[') && text.endsWith(']')) || (text.startsWith('{') && text.endsWith('}'))) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        text = parsed
+          .map(item => typeof item === 'string' ? item : JSON.stringify(item))
+          .join('; ');
+      } else if (parsed && typeof parsed === 'object') {
+        text = Object.entries(parsed as Record<string, unknown>)
+          .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+          .join('; ');
+      }
+    } catch {
+      // Keep the original string when legacy rows contain JSON-ish text.
+    }
+  }
+  text = text.replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function canUseEventSource(source: unknown): source is 'outlook' | 'firefly' | 'manual' | 'all' {
+  return source === 'outlook' || source === 'firefly' || source === 'manual' || source === 'all';
+}
+
+function canUseEventType(type: unknown): type is 'meeting' | 'conference' | 'call' | 'email_thread' | 'hosted_event' | 'in_person' | 'other' | 'all' {
+  return type === 'meeting' || type === 'conference' || type === 'call' || type === 'email_thread' || type === 'hosted_event' || type === 'in_person' || type === 'other' || type === 'all';
+}
+
+// Deterministic calendar/event search. This is intentionally separate from
+// search_conversations: Firefly transcripts are first-class event rows, not
+// conversation rows. Keeping the data families separate prevents a zero-result
+// conversation search from being misread as "no meeting transcripts exist."
+export async function searchEvents(
+  ctx: AuthContext,
+  input: {
+    keyword?: string;
+    event_type?: 'meeting' | 'conference' | 'call' | 'email_thread' | 'hosted_event' | 'in_person' | 'other' | 'all';
+    source?: 'outlook' | 'firefly' | 'manual' | 'all';
+    timeframe?: SearchEventsTimeframe;
+    start_date?: string;
+    end_date?: string;
+    days_back?: number;
+    days_forward?: number;
+    has_transcript?: boolean;
+    include_transcript_excerpt?: boolean;
+    limit?: number;
+  },
+  env: Env,
+  toolContext: AgentToolContext = {}
+): Promise<any> {
+  const now = new Date();
+  const timeframe: SearchEventsTimeframe = input.timeframe || 'recent_and_upcoming';
+  const daysBack = Math.min(Math.max(Number(input.days_back ?? 60), 1), 730);
+  const daysForward = Math.min(Math.max(Number(input.days_forward ?? 90), 1), 730);
+
+  let startBound = normalizeDateBound(input.start_date);
+  let endBound = normalizeDateBound(input.end_date);
+  if (!startBound && !endBound) {
+    if (timeframe === 'upcoming') {
+      startBound = now.toISOString();
+      endBound = addDaysIso(now, daysForward);
+    } else if (timeframe === 'past' || timeframe === 'recent') {
+      startBound = addDaysIso(now, -daysBack);
+      endBound = now.toISOString();
+    } else if (timeframe === 'recent_and_upcoming') {
+      startBound = addDaysIso(now, -daysBack);
+      endBound = addDaysIso(now, daysForward);
+    }
+  }
+
+  const where: string[] = ['e.org_id = ?', 'e.deleted_at IS NULL'];
+  const binds: unknown[] = [ctx.orgId];
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+
+  if (!hasOrgWidePrivateDataAccess(ctx.userRole)) {
+    const readableUserIds = [ctx.userId, ...Object.keys(sharingFlags).filter(id => id !== ctx.userId)];
+    const ph = readableUserIds.map(() => '?').join(',');
+    where.push(`EXISTS (
+      SELECT 1 FROM event_attendees ea_acl
+       WHERE ea_acl.event_id = e.id
+         AND ea_acl.user_id IN (${ph})
+    )`);
+    binds.push(...readableUserIds);
+  }
+
+  if (startBound) {
+    where.push('e.start_time >= ?');
+    binds.push(startBound);
+  }
+  if (endBound) {
+    where.push('e.start_time <= ?');
+    binds.push(endBound);
+  }
+
+  if (input.source && canUseEventSource(input.source) && input.source !== 'all') {
+    where.push('e.source = ?');
+    binds.push(input.source);
+  }
+
+  if (input.event_type && canUseEventType(input.event_type) && input.event_type !== 'all') {
+    where.push('e.event_type = ?');
+    binds.push(input.event_type);
+  }
+
+  if (typeof input.has_transcript === 'boolean') {
+    where.push(input.has_transcript ? 'e.transcript_r2_key IS NOT NULL' : 'e.transcript_r2_key IS NULL');
+  }
+
+  const keywordTerms = deriveEventKeywordTerms(input.keyword);
+  if (keywordTerms.length > 0) {
+    const searchable = [
+      'LOWER(COALESCE(e.title, \'\'))',
+      'LOWER(COALESCE(e.location, \'\'))',
+      'LOWER(COALESCE(e.description, \'\'))',
+      'LOWER(COALESCE(e.summary, \'\'))',
+      'LOWER(COALESCE(e.key_decisions, \'\'))',
+      'LOWER(COALESCE(e.action_items, \'\'))',
+      'LOWER(COALESCE(e.topics_discussed, \'\'))',
+    ];
+    const termClauses = keywordTerms.map(() => `(${searchable.map(expr => `${expr} LIKE ?`).join(' OR ')})`);
+    where.push(`(${termClauses.join(' OR ')})`);
+    for (const term of keywordTerms) {
+      for (let i = 0; i < searchable.length; i++) binds.push(`%${term}%`);
+    }
+  }
+
+  const limit = structuredLimit(input.limit, toolContext);
+  const whereSql = where.join(' AND ');
+  const orderBinds: unknown[] = [];
+  let orderSql = 'e.start_time DESC';
+  if (timeframe === 'upcoming') {
+    orderSql = 'e.start_time ASC';
+  } else if (timeframe === 'recent_and_upcoming') {
+    orderSql = `CASE WHEN e.start_time >= ? THEN 0 ELSE 1 END ASC,
+                CASE WHEN e.start_time >= ? THEN e.start_time END ASC,
+                e.start_time DESC`;
+    orderBinds.push(now.toISOString(), now.toISOString());
+  }
+
+  const rowSql = `
+    SELECT e.id, e.title, e.event_type, e.start_time, e.end_time, e.location,
+           e.description, e.source, e.outlook_event_id, e.firefly_event_id,
+           e.reconciliation_status, e.transcript_r2_key, e.transcript_source,
+           e.summary, e.key_decisions, e.action_items, e.topics_discussed,
+           e.followup_status, e.followup_due_date
+      FROM events e
+     WHERE ${whereSql}
+     ORDER BY ${orderSql}
+     LIMIT ?`;
+
+  const [rows, totalRow, transcriptRow, sourceRows] = await Promise.all([
+    env.D1.prepare(rowSql).bind(...binds, ...orderBinds, limit).all<any>(),
+    env.D1.prepare(`SELECT COUNT(*) AS total FROM events e WHERE ${whereSql}`).bind(...binds).first<{ total: number }>(),
+    env.D1.prepare(`SELECT COUNT(*) AS total FROM events e WHERE ${whereSql} AND e.transcript_r2_key IS NOT NULL`).bind(...binds).first<{ total: number }>(),
+    env.D1.prepare(`SELECT e.source, COUNT(*) AS total FROM events e WHERE ${whereSql} GROUP BY e.source`).bind(...binds).all<{ source: string; total: number }>(),
+  ]);
+
+  const eventRows = rows.results || [];
+  const eventIds = eventRows.map((row: any) => row.id).filter(Boolean);
+  const attendeesByEvent = new Map<string, Array<Record<string, unknown>>>();
+  const attendeeCounts = new Map<string, number>();
+  if (eventIds.length > 0) {
+    for (const batch of chunkArray(eventIds, 80)) {
+      const ph = batch.map(() => '?').join(',');
+      const attendeeRows = await env.D1.prepare(
+        `SELECT event_id, email, display_name, role, is_internal
+           FROM event_attendees
+          WHERE event_id IN (${ph})
+          ORDER BY CASE role
+            WHEN 'organizer' THEN 0
+            WHEN 'presenter' THEN 1
+            WHEN 'attendee' THEN 2
+            ELSE 3
+          END, display_name ASC, email ASC`
+      ).bind(...batch).all<any>();
+      for (const attendee of attendeeRows.results || []) {
+        attendeeCounts.set(attendee.event_id, (attendeeCounts.get(attendee.event_id) || 0) + 1);
+        const list = attendeesByEvent.get(attendee.event_id) || [];
+        if (list.length < 25) {
+          list.push({
+            email: attendee.email,
+            display_name: attendee.display_name,
+            role: attendee.role,
+            is_internal: !!attendee.is_internal,
+          });
+        }
+        attendeesByEvent.set(attendee.event_id, list);
+      }
+    }
+  }
+
+  const events: any[] = [];
+  for (const row of eventRows) {
+    let transcriptExcerpt: string | null = null;
+    if (input.include_transcript_excerpt && row.transcript_r2_key) {
+      try {
+        const obj = await env.R2.get(row.transcript_r2_key);
+        if (obj) transcriptExcerpt = cleanEventText(await obj.text(), 1400);
+      } catch {
+        transcriptExcerpt = null;
+      }
+    }
+
+    events.push({
+      id: row.id,
+      title: row.title,
+      event_type: row.event_type,
+      source: row.source,
+      start_time: row.start_time,
+      end_time: row.end_time,
+      location: row.location,
+      description: cleanEventText(row.description, 500),
+      summary: cleanEventText(row.summary, 900),
+      key_decisions: cleanEventText(row.key_decisions, 700),
+      action_items: cleanEventText(row.action_items, 700),
+      topics_discussed: cleanEventText(row.topics_discussed, 700),
+      followup_status: row.followup_status,
+      followup_due_date: row.followup_due_date,
+      reconciliation_status: row.reconciliation_status,
+      has_transcript: !!row.transcript_r2_key,
+      transcript_source: row.transcript_source,
+      transcript_excerpt: transcriptExcerpt || undefined,
+      attendee_count: attendeeCounts.get(row.id) || 0,
+      attendees: attendeesByEvent.get(row.id) || [],
+    });
+  }
+
+  const source_counts: Record<string, number> = {};
+  for (const row of sourceRows.results || []) source_counts[row.source || 'unknown'] = row.total || 0;
+
+  return {
+    events,
+    count: events.length,
+    coverage: {
+      mode: toolContext.deepDive ? 'deep' : 'agile',
+      total_matching_events: totalRow?.total || 0,
+      returned_count: events.length,
+      effective_limit: limit,
+      has_more: (totalRow?.total || 0) > events.length,
+      matching_events_with_transcripts: transcriptRow?.total || 0,
+      source_counts,
+      timeframe,
+      start_bound: startBound,
+      end_bound: endBound,
+      keyword_terms: keywordTerms,
+      acl_scope: hasOrgWidePrivateDataAccess(ctx.userRole) ? 'org_wide_role' : 'participant_or_shared_user_events',
+    },
+    data_model_note: 'Meeting transcripts and calendar events live in events. search_conversations only covers emails and Slack/manual conversation rows.',
+    note: (totalRow?.total || 0) > events.length
+      ? `Showing ${events.length} of ${totalRow?.total || 0} matching events. Increase limit or narrow the window for more.`
+      : undefined,
+  };
 }
 
 // Deep-mode deterministic conversation sweep. Unlike recall(), this is not a
@@ -2021,3 +2326,8 @@ async function setFieldLockHelper(
       : `Unlocked ${fieldName} on ${entityType} (automated proposals can resume).`,
   };
 }
+
+export const __agentToolsTestHooks = {
+  deriveEventKeywordTerms,
+  cleanEventText,
+};
