@@ -3,6 +3,7 @@ import type { AgentSession, AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { preprocessQuery, retrieveContext, TOKEN_BUDGET, type RetrievalOptions } from '../lib/retrieval';
 import { buildSourcesAndContext, type CitationSource } from '../lib/citations';
+import { normalizeCitationMarkers } from '../lib/citation-format';
 import { verifySampleClaims } from '../lib/citation-verifier';
 import { callClaude, callClaudeStreaming } from '../lib/claude';
 import type { ToolDefinition } from '../lib/claude';
@@ -59,6 +60,21 @@ function normalizeMartySentenceSpacing(text: string): string {
     .split(/(```[\s\S]*?```|`[^`\n]*`)/g)
     .map(part => part.startsWith('`') ? part : fixProse(part))
     .join('');
+}
+
+function normalizeMartyOutputText(text: string, validSourceIds?: Set<number>): {
+  text: string;
+  validCitationsUsed: number;
+  invalidCitationsStripped: number;
+  labeledCitationsCanonicalized: number;
+} {
+  const normalized = normalizeCitationMarkers(text, validSourceIds);
+  return {
+    text: normalizeMartySentenceSpacing(normalized.text),
+    validCitationsUsed: normalized.stats.valid_citations_used,
+    invalidCitationsStripped: normalized.stats.invalid_citations_stripped,
+    labeledCitationsCanonicalized: normalized.stats.labeled_citations_canonicalized,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,10 +1104,17 @@ async function persistImmediateAgentResult(
   if (error) metadataObj.error = error;
   const normalizedCards = normalizeDocumentCards(documentCards);
   if (normalizedCards.length > 0) metadataObj.document_cards = normalizedCards;
+  const output = normalizeMartyOutputText(content, new Set());
+  if (output.invalidCitationsStripped > 0) {
+    metadataObj.invalid_citations_stripped = output.invalidCitationsStripped;
+  }
+  if (output.labeledCitationsCanonicalized > 0) {
+    metadataObj.labeled_citations_canonicalized = output.labeledCitationsCanonicalized;
+  }
   await env.D1.prepare(
     `UPDATE agent_messages SET content = ?, sources_json = ?, metadata = ? WHERE id = ?`
   ).bind(
-    normalizeMartySentenceSpacing(content),
+    output.text,
     null,
     JSON.stringify(metadataObj),
     assistantMessageId
@@ -1938,6 +1961,10 @@ export async function queryAgent(
       // the invalid markers replaced by an empty string. Count is recorded
       // in metadata for UI badging + the existing marty_citation_metrics
       // telemetry table.
+      //
+      // Audit 2026-05-16 extended this to the other recurring model drift:
+      // labeled markers such as [^16 Slack]. Those are valid source intents
+      // but invalid UI grammar, so canonicalize them to [^16] before storage.
       const cancelled = await wasCancelledIncludingKV(requestId, env);
       const documentCards = normalizeDocumentCards(surfacedDocumentCards);
       const rawContent = fullText || (
@@ -1947,29 +1974,15 @@ export async function queryAgent(
             ? 'I pulled the relevant document forward.'
             : ''
       );
-      let strippedContent = rawContent;
-      let invalidCitationsStripped = 0;
-      if (rawContent && sources.length > 0) {
-        const validIds = new Set(sources.map(s => s.id));
-        strippedContent = rawContent.replace(/\[\^(\d+)\]/g, (match, num) => {
-          if (validIds.has(parseInt(num, 10))) return match;
-          invalidCitationsStripped++;
-          return '';
-        });
-      } else if (rawContent && sources.length === 0) {
-        // No sources at all — every [^N] marker is invalid. Strip them.
-        strippedContent = rawContent.replace(/\[\^(\d+)\]/g, () => {
-          invalidCitationsStripped++;
-          return '';
-        });
-      }
+      const normalizedOutput = normalizeMartyOutputText(
+        rawContent,
+        new Set(sources.map(s => s.id))
+      );
 
-      const persistedContent = normalizeMartySentenceSpacing(
-        strippedContent || (
+      const persistedContent = normalizedOutput.text || (
           cancelled
             ? '_(cancelled before MARTy started generating)_'
             : 'Something went wrong — no response was received. Please try again.'
-        )
       );
       const sourcesJson = sources.length > 0 ? JSON.stringify(sources) : null;
       const metadataObj: Record<string, any> = {
@@ -1979,8 +1992,11 @@ export async function queryAgent(
         deep_dive: deepDive,
       };
       if (cancelled) metadataObj.cancelled = true;
-      if (invalidCitationsStripped > 0) {
-        metadataObj.invalid_citations_stripped = invalidCitationsStripped;
+      if (normalizedOutput.invalidCitationsStripped > 0) {
+        metadataObj.invalid_citations_stripped = normalizedOutput.invalidCitationsStripped;
+      }
+      if (normalizedOutput.labeledCitationsCanonicalized > 0) {
+        metadataObj.labeled_citations_canonicalized = normalizedOutput.labeledCitationsCanonicalized;
       }
       if (documentCards.length > 0) {
         metadataObj.document_cards = documentCards;
@@ -1999,16 +2015,6 @@ export async function queryAgent(
       // monitor citation hit rate and Claude hallucinating numbers.
       if (assistantMessageId && fullText) {
         try {
-          const validIds = new Set(sources.map(s => s.id));
-          let used = 0;
-          let invalid = 0;
-          const re = /\[\^(\d+)\]/g;
-          let m: RegExpExecArray | null;
-          while ((m = re.exec(fullText)) !== null) {
-            const n = parseInt(m[1], 10);
-            if (validIds.has(n)) used++;
-            else invalid++;
-          }
           await env.D1.prepare(
             `INSERT INTO marty_citation_metrics
                (id, org_id, user_id, session_id, message_id, sources_provided,
@@ -2016,10 +2022,13 @@ export async function queryAgent(
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
           ).bind(
             crypto.randomUUID(), ctx.orgId, ctx.userId, session.id, assistantMessageId,
-            sources.length, used, invalid, fullText.length
+            sources.length,
+            normalizedOutput.validCitationsUsed,
+            normalizedOutput.invalidCitationsStripped,
+            fullText.length
           ).run();
-          if (invalid > 0) {
-            console.warn(`[citations] ${invalid} invalid [^N] markers (sources=${sources.length}) in message ${assistantMessageId}`);
+          if (normalizedOutput.invalidCitationsStripped > 0) {
+            console.warn(`[citations] ${normalizedOutput.invalidCitationsStripped} invalid markers (sources=${sources.length}) in message ${assistantMessageId}`);
           }
         } catch (e) {
           console.error('[citations] metrics insert failed:', e);

@@ -34,16 +34,45 @@ export interface MessageToken {
   sourceId?: number;
 }
 
+export function parseCitationIdentifier(raw: unknown):
+  | { kind: 'number'; value: number }
+  | { kind: 'hash'; value: string }
+  | null {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+
+  const exactNumeric = text.match(/^(\d{1,3})$/);
+  if (exactNumeric) {
+    const id = parseInt(exactNumeric[1], 10);
+    return id > 0 && id < 1000 ? { kind: 'number', value: id } : null;
+  }
+
+  const labeledNumeric = text.match(/^(\d{1,3})(?:[\s:;,\-/]+[A-Za-z][^\]\r\n]*)$/);
+  if (labeledNumeric) {
+    const id = parseInt(labeledNumeric[1], 10);
+    return id > 0 && id < 1000 ? { kind: 'number', value: id } : null;
+  }
+
+  if (/^[a-f0-9]{6,}$/i.test(text)) {
+    return { kind: 'hash', value: text.toLowerCase() };
+  }
+
+  return null;
+}
+
 export function parseMessageWithCitations(message: string): MessageToken[] {
   const tokens: MessageToken[] = [];
-  const regex = /\[\^(\d+)\]/g;
+  const regex = /\[\^([^\]\r\n]+)\]/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(message)) !== null) {
+    const parsed = parseCitationIdentifier(match[1]);
     if (match.index > lastIndex) {
       tokens.push({ type: 'text', content: message.slice(lastIndex, match.index) });
     }
-    tokens.push({ type: 'citation', sourceId: parseInt(match[1], 10) });
+    if (parsed?.kind === 'number') {
+      tokens.push({ type: 'citation', sourceId: parsed.value });
+    }
     lastIndex = match.index + match[0].length;
   }
   if (lastIndex < message.length) {
@@ -57,7 +86,7 @@ export function parseMessageWithCitations(message: string): MessageToken[] {
 // Once the closing bracket arrives, the marker is parsed normally.
 export function trimPartialCitation(text: string): string {
   // Trailing "[" or "[^" or "[^123" (no closing ]) — peel it off.
-  return text.replace(/\[\^?\d*$/, '');
+  return text.replace(/\[\^?[0-9A-Za-z _.,:;/-]*$/, '');
 }
 
 // Remark plugin: rewrites every `[^N]` marker into a `link` node whose URL is
@@ -100,6 +129,8 @@ function walk(node: any): void {
     // identifier shapes:
     //   • Small positive integer (1–999) — the canonical [^N] format Claude
     //     is instructed to emit. Matches a source by numeric index.
+    //   • Small positive integer plus a source-type label — observed model
+    //     drift like [^16 Slack]. Canonicalize to the numeric citation.
     //   • 6+ hex chars — off-spec but observed in production when Claude
     //     occasionally cites raw UUID fragments. Defer to the link renderer
     //     for partial-prefix lookup against source_id / entity_id; if no
@@ -111,24 +142,22 @@ function walk(node: any): void {
     // misleading citation pill linking to source 50. Strict regex check now.
     if (child?.type === 'footnoteReference') {
       const idStr = String(child.identifier ?? child.label ?? '');
-      if (/^\d+$/.test(idStr)) {
-        const idNum = parseInt(idStr, 10);
-        if (idNum > 0 && idNum < 1000) {
-          node.children[i] = {
-            type: 'link',
-            url: `citation:${idNum}`,
-            title: null,
-            children: [{ type: 'text', value: String(idNum) }],
-          };
-          continue;
-        }
-      }
-      if (/^[a-f0-9]{6,}$/i.test(idStr)) {
+      const parsed = parseCitationIdentifier(idStr);
+      if (parsed?.kind === 'number') {
         node.children[i] = {
           type: 'link',
-          url: `citation:hash:${idStr.toLowerCase()}`,
+          url: `citation:${parsed.value}`,
           title: null,
-          children: [{ type: 'text', value: idStr }],
+          children: [{ type: 'text', value: String(parsed.value) }],
+        };
+        continue;
+      }
+      if (parsed?.kind === 'hash') {
+        node.children[i] = {
+          type: 'link',
+          url: `citation:hash:${parsed.value}`,
+          title: null,
+          children: [{ type: 'text', value: parsed.value }],
         };
         continue;
       }
@@ -158,27 +187,30 @@ function walk(node: any): void {
 }
 
 function splitText(value: string): any[] | null {
-  // Match either the canonical [^N] (small int) or [^HEX] off-spec format.
-  // Same disposition as the footnoteReference branch above: numeric → pill,
-  // hex → defer to link renderer, anything else won't match this regex at all
-  // (so it stays as plain text).
-  const regex = /\[\^(\d+|[a-f0-9]{6,})\]/gi;
+  // Match citation-shaped markers broadly, then validate each identifier.
+  // Unknown identifiers are removed instead of shown as raw footnote text.
+  const regex = /\[\^([^\]\r\n]+)\]/g;
   const out: any[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
+  let changed = false;
   while ((m = regex.exec(value)) !== null) {
     if (m.index > last) out.push({ type: 'text', value: value.slice(last, m.index) });
-    const tok = m[1];
-    const url = /^\d+$/.test(tok) ? `citation:${tok}` : `citation:hash:${tok.toLowerCase()}`;
-    out.push({
-      type: 'link',
-      url,
-      title: null,
-      children: [{ type: 'text', value: tok }],
-    });
+    const parsed = parseCitationIdentifier(m[1]);
+    if (parsed) {
+      const valueText = parsed.kind === 'number' ? String(parsed.value) : parsed.value;
+      const url = parsed.kind === 'number' ? `citation:${parsed.value}` : `citation:hash:${parsed.value}`;
+      out.push({
+        type: 'link',
+        url,
+        title: null,
+        children: [{ type: 'text', value: valueText }],
+      });
+    }
+    changed = true;
     last = m.index + m[0].length;
   }
-  if (out.length === 0) return null;
+  if (!changed) return null;
   if (last < value.length) out.push({ type: 'text', value: value.slice(last) });
   return out;
 }

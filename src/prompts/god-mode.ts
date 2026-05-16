@@ -142,6 +142,7 @@ A "no data of that type" answer is a CORRECT answer **after recall() also return
 
 CITATION FORMAT — STRICT:
 - N MUST be a small positive integer matching a row in the SOURCES list above (1, 2, 3, …). Nothing else.
+- The marker must contain only the number. NEVER write source labels inside citation brackets. Correct: "[^16]". Wrong: "[^16 Slack]", "[^9 email]", "[^3 meeting]".
 - NEVER use UUIDs, hex strings, or partial IDs as citation references. "[^50af6179]", "[^c44bf5d8]", "[^abc-123]" are ALL wrong.
 - NEVER copy IDs you see inside chunk text into a citation marker. Chunk bodies sometimes contain UUIDs (email signatures, file names, attachments) — those are NOT citation references.
 - If you can't find a numeric source for a claim, omit the marker entirely. Do not invent one.
