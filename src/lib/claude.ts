@@ -363,7 +363,7 @@ export async function callClaudeStreaming(
           retryable: true,
         });
         await emit({
-          text: '\n\nI hit a model handoff limit while synthesizing the retrieved evidence. The retrieval completed, but the final narrative did not finish cleanly. Please retry this Deep request; MARTy will reuse the same underlying sources with a smaller synthesis payload.',
+          text: '\n\nI hit a model handoff limit while synthesizing the retrieved evidence. The retrieval completed, but the final narrative did not finish cleanly. Please retry this MAX request; MARTy will reuse the same underlying sources with a smaller synthesis payload.',
         });
         break;
       }

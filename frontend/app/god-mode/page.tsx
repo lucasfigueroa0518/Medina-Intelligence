@@ -1764,7 +1764,7 @@ export default function GodModePage() {
       interruptRequestId = cancelSessionStream(activeSessionId);
     }
 
-    // Trust the server before accepting a new turn. A previous Deep request can
+    // Trust the server before accepting a new turn. A previous MAX request can
     // keep working after the browser stream has dropped; if so, treat this
     // prompt as a server-side interrupt and continue with the replacement turn.
     if (!demoMode && activeSessionId) {
@@ -2617,7 +2617,7 @@ export default function GodModePage() {
               {/* MARTy mode — explicit, persisted choice */}
               <div
                 className="relative shrink-0"
-                title={`MARTy mode. Agile is concise; Deep performs the widest data sweep (${maxModeShortcut}).`}
+                title={`MARTy mode. Agile is concise; MAX performs the widest data sweep (${maxModeShortcut}).`}
               >
                 <Search
                   size={15}
@@ -2644,7 +2644,7 @@ export default function GodModePage() {
                   }}
                 >
                   <option value="fast">Agile</option>
-                  <option value="max">Deep</option>
+                  <option value="max">MAX</option>
                 </select>
                 <ChevronDown
                   size={13}
@@ -2665,7 +2665,7 @@ export default function GodModePage() {
                     setMartyMode(mode => mode === 'max' ? 'fast' : 'max');
                   }
                 }}
-                placeholder={deepDive ? 'Deep mode — sweeping across everything...' : placeholderText}
+                placeholder={deepDive ? 'MAX mode — sweeping across everything...' : placeholderText}
                 onBlur={() => {
                   setTimeout(() => {
                     if (document.activeElement !== inputRef.current) {

@@ -2529,7 +2529,7 @@ export function evaluateMaxSetQuality(
     status,
     reasons,
     artifact_allowed: artifactAllowed,
-    artifact_suppressed_reason: artifactAllowed ? undefined : reasons[0] || 'Deep quality gate suppressed artifact creation.',
+    artifact_suppressed_reason: artifactAllowed ? undefined : reasons[0] || 'MAX quality gate suppressed artifact creation.',
   };
 }
 
@@ -2563,13 +2563,13 @@ function titleForArtifact(profile: SearchProfile): string {
         .slice(0, 3)
         .join(' ');
     }
-    return `Deep Invite Roster${topic ? ` - ${topic}` : ''}`.replace(/\b\w/g, c => c.toUpperCase()).slice(0, 120);
+    return `MAX Invite Roster${topic ? ` - ${topic}` : ''}`.replace(/\b\w/g, c => c.toUpperCase()).slice(0, 120);
   }
   const topic = unique(profile.includeTerms)
     .filter(term => !/^(infrastructure|webinar|names|emails|mail merge|may|thursday)$/.test(compactText(term)))
     .slice(0, 3)
     .join(' ');
-  return `Deep ${base}${topic ? ` - ${topic}` : ''}`.replace(/\b\w/g, c => c.toUpperCase()).slice(0, 120);
+  return `MAX ${base}${topic ? ` - ${topic}` : ''}`.replace(/\b\w/g, c => c.toUpperCase()).slice(0, 120);
 }
 
 async function persistTelemetry(
@@ -2722,7 +2722,7 @@ async function runAdapter(
       rows_returned: 0,
       candidates_added: 0,
       cap_hit: false,
-      errors: [`${family} is ${role} for ${profile.taskType}; it cannot generate candidates for this Deep job.`],
+      errors: [`${family} is ${role} for ${profile.taskType}; it cannot generate candidates for this MAX job.`],
     };
   }
   try {
@@ -2779,7 +2779,7 @@ export function detectMaxSetIntent(
   }
   return {
     shouldBuild,
-    reason: 'Deep exhaustive set query detected',
+    reason: 'MAX exhaustive set query detected',
     input: {
       query: cleanQuery,
       task_type: taskType,
@@ -2845,8 +2845,8 @@ export function compactMaxSetResultForContext(result: any): Record<string, unkno
       excluded: excluded.slice(0, 15).map(compactCandidateForContext),
     },
     instruction: result?.safety_status === 'unsafe_incomplete'
-      ? 'The deterministic Deep set-builder marked this run unsafe/incomplete. Do not claim the set is complete and do not create a duplicate workbook from recall snippets; explain the quality gate reasons and real gaps.'
-      : 'Use this deterministic Deep set-builder result as the source of truth. If an artifact_card exists, do not create a duplicate roster workbook from recall snippets.',
+      ? 'The deterministic MAX set-builder marked this run unsafe/incomplete. Do not claim the set is complete and do not create a duplicate workbook from recall snippets; explain the quality gate reasons and real gaps.'
+      : 'Use this deterministic MAX set-builder result as the source of truth. If an artifact_card exists, do not create a duplicate roster workbook from recall snippets.',
   };
 }
 
@@ -2858,8 +2858,8 @@ export async function buildMaxSetTool(
 ): Promise<any> {
   if (!opts.deepDive) {
     return {
-      error: 'build_max_set is only available in Deep mode',
-      message: 'Use Deep mode for exhaustive all/every/list/export/count set-building tasks.',
+      error: 'build_max_set is only available in MAX mode',
+      message: 'Use MAX mode for exhaustive all/every/list/export/count set-building tasks.',
     };
   }
   const profile = buildProfile(input);
@@ -2899,7 +2899,7 @@ export async function buildMaxSetTool(
   const capFamilies = stats.filter(s => s.cap_hit).map(s => s.source_family);
   const gaps = [
     ...qualityGate.reasons,
-    ...capFamilies.map(f => `${f} hit the Deep row cap; rerun with narrower filters or pagination for full certainty.`),
+    ...capFamilies.map(f => `${f} hit the MAX row cap; rerun with narrower filters or pagination for full certainty.`),
     ...stats.flatMap(s => s.errors.map(e => `${s.source_family}: ${e}`)),
   ];
   if (profile.taskType === 'invite_roster' && buckets.probable.length > 0) {
@@ -2987,7 +2987,7 @@ export async function buildMaxSetTool(
         ? 'Created an XLSX workbook with Confirmed, Probable, Needs Review, Excluded, and Coverage & Gaps tabs.'
         : qualityGate.artifact_allowed
           ? 'Attempted to create an XLSX workbook, but artifact creation failed; see gaps.'
-          : `No XLSX workbook was created because Deep marked this run ${qualityGate.status}: ${qualityGate.artifact_suppressed_reason || 'quality gate failed.'}`
+          : `No XLSX workbook was created because MAX marked this run ${qualityGate.status}: ${qualityGate.artifact_suppressed_reason || 'quality gate failed.'}`
       : 'No artifact was created because the result set was small and no export/mail-merge intent was detected.',
   };
 }

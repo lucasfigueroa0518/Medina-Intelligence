@@ -226,7 +226,7 @@ export async function acquireEmbedSlot(orgId: string, env: Env): Promise<number>
       // Window enforcement is timestamp-based in `state` (window_start/count) — TTL
       // is just disaster-recovery cleanup. Cloudflare KV minimum TTL is 60s; passing
       // less than that throws KV PUT 400 Invalid expiration_ttl on every write,
-      // which previously crashed every embed-touching path (news, Deep mode, ingestion).
+      // which previously crashed every embed-touching path (news, MAX mode, ingestion).
       try {
         await env.KV.put(key, JSON.stringify(state), { expirationTtl: 60 });
       } catch (e) {
