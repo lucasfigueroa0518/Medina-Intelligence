@@ -40,6 +40,12 @@ export interface Env {
   MARTY_LAB_CODE_PATCH_MODEL?: string;
   MARTY_MAX_MODEL?: string;
   MARTY_RUNTIME_GIT_SHA?: string;
+  // Premium deck rendering is orchestrated by the Worker but executed by a
+  // separate Node/Playwright service. Keep optional so the HTML-first fallback
+  // can deploy before the renderer service is provisioned.
+  DECK_RENDERER_ENABLED?: string;
+  DECK_RENDERER_URL?: string;
+  DECK_RENDERER_TOKEN?: string;
   // Optional: gateway-level token. Only required when the AI Gateway has
   // "Authenticated Gateway" enabled. Set via `wrangler secret put CLOUDFLARE_AI_GATEWAY_TOKEN`.
   CLOUDFLARE_AI_GATEWAY_TOKEN?: string;

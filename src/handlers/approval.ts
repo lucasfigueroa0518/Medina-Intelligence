@@ -402,7 +402,7 @@ async function commitCreateDealApproval(item: any, env: Env): Promise<{ reEnrich
     `SELECT id, title FROM deals
        WHERE org_id = ? AND company_id = ?
          AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')
+         AND stage NOT IN ('closed','closed_won','closed_lost')
        LIMIT 1`
   ).bind(item.org_id, payload.company_id).first<{ id: string; title: string }>();
   if (existingOpen) {

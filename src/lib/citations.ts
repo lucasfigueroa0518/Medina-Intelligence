@@ -490,7 +490,7 @@ async function hydrateSources(
   return Array.from(out.values()).sort((a, b) => a.id - b.id);
 }
 
-function formatSourceLine(s: CitationSource, nowMs: number = Date.now()): string {
+export function formatSourceLine(s: CitationSource, nowMs: number = Date.now()): string {
   const date = sourceDateSuffix(s.date, nowMs);
   switch (s.type) {
     case 'email':

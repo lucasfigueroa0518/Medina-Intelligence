@@ -13,6 +13,7 @@ import {
   type WriteContext,
 } from './entity-writes';
 import { linkConversationToDeal, linkEventToDeal } from './deal-association';
+import { loadFirmRelationshipSnapshot, upsertFirmCompanyRelationship } from './firm-relationship-state';
 import { preprocessQuery, retrieveContext } from './retrieval';
 import { buildSourcesAndContext } from './citations';
 import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
@@ -1002,6 +1003,40 @@ export async function searchCompanies(
   env: Env,
   toolContext: AgentToolContext = {}
 ): Promise<any> {
+  if (String(input.company_type || '').toLowerCase() === 'portfolio') {
+    const snapshot = await loadFirmRelationshipSnapshot(ctx, env, {
+      includePipeline: false,
+      limit: input.limit,
+    });
+    const keyword = cleanTerm(input.keyword);
+    const companies = snapshot.current_portfolio
+      .filter(company => {
+        if (!keyword) return true;
+        return [company.name, company.domain, company.sector]
+          .filter(Boolean)
+          .some(value => String(value).toLowerCase().includes(keyword));
+      })
+      .map(company => ({
+        id: company.id,
+        name: company.name,
+        domain: company.domain,
+        website: company.website,
+        sector: company.sector,
+        company_type: company.company_type,
+        investment_status: company.investment_status,
+        current_valuation: company.current_valuation,
+        firm_relationship_state: company.classification.state,
+        firm_relationship_confidence: company.classification.confidence,
+        firm_relationship_reasons: company.classification.reasons,
+      }));
+    return {
+      companies,
+      count: companies.length,
+      note: 'company_type=portfolio is resolved through the authoritative firm relationship snapshot, not fuzzy CRM tags alone.',
+      sources: snapshot.sources,
+    };
+  }
+
   const where: string[] = ['org_id = ?', 'deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
 
@@ -1029,6 +1064,76 @@ export async function searchCompanies(
   ).bind(...binds, limit).all();
 
   return { companies: result.results, count: result.results.length };
+}
+
+export async function getFirmRelationshipSnapshotTool(
+  ctx: AuthContext,
+  input: { include_pipeline?: boolean; limit?: number },
+  env: Env
+): Promise<any> {
+  const snapshot = await loadFirmRelationshipSnapshot(ctx, env, {
+    includePipeline: input.include_pipeline !== false,
+    limit: input.limit,
+  });
+  return {
+    ...snapshot,
+    note: 'Use current_portfolio as the authoritative current portfolio set. Do not infer portfolio membership from semantically related documents or pipeline companies.',
+  };
+}
+
+export async function setFirmCompanyRelationshipTool(
+  ctx: AuthContext,
+  input: {
+    company_id?: string;
+    company_name?: string;
+    relationship_state?: 'current_portfolio' | 'active_pipeline' | 'watchlist' | 'passed' | 'exited' | 'other';
+    effective_date?: string;
+    notes?: string;
+    create_if_missing?: boolean;
+  },
+  env: Env
+): Promise<any> {
+  if (!input.company_id && !input.company_name) {
+    return { error: 'COMPANY_REQUIRED', message: 'Provide company_id or company_name.' };
+  }
+  const result = await upsertFirmCompanyRelationship(ctx, env, {
+    company_id: input.company_id || null,
+    company_name: input.company_name || null,
+    relationship_state: input.relationship_state || 'current_portfolio',
+    effective_date: input.effective_date || null,
+    notes: input.notes || null,
+    create_if_missing: input.create_if_missing !== false,
+  });
+  try {
+    await emitAudit(env, {
+      org_id: ctx.orgId,
+      user_id: ctx.userId,
+      action: 'update',
+      entity_type: 'company',
+      entity_id: result.company_id,
+      after_data: {
+        firm_relationship_state: result.relationship_state,
+        company_name: result.company_name,
+        created_company: result.created_company,
+      },
+      metadata: {
+        origin: 'marty',
+        subaction: 'set_firm_company_relationship',
+        source: 'marty_user_assertion',
+      },
+      created_at: new Date().toISOString(),
+    });
+  } catch { /* best-effort */ }
+  try { await updateEntityInIndex(ctx.orgId, 'company', result.company_id, env); } catch {}
+
+  const snapshot = await loadFirmRelationshipSnapshot(ctx, env, { includePipeline: true });
+  return {
+    success: true,
+    ...result,
+    message: `${result.company_name} is now recorded as ${result.relationship_state}.`,
+    snapshot_counts: snapshot.counts,
+    sources: snapshot.sources,
+  };
 }
 
 // ACL redaction: For non-owner users, fields derived from private conversation
@@ -1253,10 +1358,16 @@ export async function recall(
     current_date: new Date().toISOString(),
     timeline_note: 'Dates are source dates. Relative phrases in excerpts such as "next week", "currently", "today", or "now" are relative to each source date, not the current date.',
     sources: trimmed.map(s => ({
+      id: s.id,
       type: s.type,
+      source_table: s.source_table,
+      source_id: s.source_id,
+      entity_id: s.entity_id,
       title: s.title,
       subtitle: s.subtitle,
       date: s.date,
+      url_path: s.url_path,
+      external_url: s.external_url,
       excerpt: s.excerpt,
       citation_marker: `[^${s.id}]`,
     })),
@@ -1374,7 +1485,7 @@ export async function getCompanyDetail(
   ).bind(companyId, ctx.orgId).first();
   if (!company) return { error: 'Company not found' };
 
-  const [contacts, deals, tags, news] = await Promise.all([
+  const [contacts, deals, tags, news, firmSnapshot] = await Promise.all([
     env.D1.prepare(
       `SELECT id, full_name, email, job_title, contact_type, last_contact_date, total_interactions
        FROM contacts WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
@@ -1398,10 +1509,22 @@ export async function getCompanyDetail(
       `SELECT id, title, source, published_at, summary, relevance_score
        FROM news_articles WHERE company_id = ? ORDER BY published_at DESC LIMIT ?`
     ).bind(companyId, toolContext.deepDive ? MAX_MODE_LIMITS.ragV1NewsReturn : 10).all().catch(() => ({ results: [] })),
+    loadFirmRelationshipSnapshot(ctx, env, { includePipeline: true, limit: 1000 }).catch(() => null),
   ]);
+  const firmRelationship = firmSnapshot
+    ? [
+        ...firmSnapshot.current_portfolio,
+        ...firmSnapshot.active_pipeline,
+        ...firmSnapshot.watchlist,
+        ...firmSnapshot.passed,
+        ...firmSnapshot.exited,
+        ...firmSnapshot.unknown,
+      ].find(c => c.id === companyId)?.classification || null
+    : null;
 
   return {
     company,
+    firm_relationship: firmRelationship,
     contacts: contacts.results,
     deals: deals.results,
     tags: tags.results,

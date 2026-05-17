@@ -41,6 +41,24 @@ interface DocLite {
   processing_status: string | null;
   error_message: string | null;
   extracted_text_preview: string | null;
+  custom_fields?: string | Record<string, unknown> | null;
+}
+
+function parseCustomFields(value: DocLite['custom_fields']): Record<string, any> {
+  if (!value) return {};
+  if (typeof value === 'object') return value as Record<string, any>;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function deckHtmlDocumentId(doc: DocLite | null): string | null {
+  const fields = parseCustomFields(doc?.custom_fields);
+  const id = fields?.deck_bundle?.html_document_id;
+  return typeof id === 'string' && id ? id : null;
 }
 
 export function DocumentPreviewModal({
@@ -98,9 +116,10 @@ export function DocumentPreviewModal({
   // PDFs/images render natively; Office files use browser-side format-aware previews.
   React.useEffect(() => {
     if (!doc) return;
-    const kind = kindFromMime(doc.mime_type);
-    if (kind !== 'pdf' && kind !== 'image' && kind !== 'docx' && kind !== 'xlsx' && kind !== 'pptx') return;
-    if (!doc.r2_key) {
+    const htmlDocId = deckHtmlDocumentId(doc);
+    const kind = htmlDocId ? 'html' : kindFromMime(doc.mime_type);
+    if (kind !== 'pdf' && kind !== 'image' && kind !== 'docx' && kind !== 'xlsx' && kind !== 'pptx' && kind !== 'html') return;
+    if (!doc.r2_key && !htmlDocId) {
       setPreviewError('Original file is unavailable.');
       return;
     }
@@ -108,7 +127,7 @@ export function DocumentPreviewModal({
     let createdUrl: string | null = null;
     setPreviewLoading(true);
     setPreviewError(null);
-    fetch(`${API_BASE}/documents/${doc.id}/download`, { headers: authHeader() })
+    fetch(`${API_BASE}/documents/${htmlDocId || doc.id}/download`, { headers: authHeader() })
       .then(async r => {
         if (!alive) return;
         if (!r.ok) {
@@ -196,7 +215,8 @@ export function DocumentPreviewModal({
 
   if (!docId || !mounted) return null;
 
-  const rawKind = doc ? kindFromMime(doc.mime_type) : 'unsupported';
+  const companionHtmlId = deckHtmlDocumentId(doc);
+  const rawKind = companionHtmlId ? 'html' : doc ? kindFromMime(doc.mime_type) : 'unsupported';
   const kind = rawKind === 'unsupported' && doc?.extracted_text_preview ? 'text' : rawKind;
   const showFailedBanner = doc?.processing_status === 'failed';
   const hasOriginalFile = !!doc?.r2_key;
@@ -269,9 +289,9 @@ export function DocumentPreviewModal({
                 text={doc?.extracted_text_preview || undefined}
                 emptyMessage="No text preview available — open detail page for full content."
               />
-            ) : kind === 'pdf' || kind === 'image' || kind === 'docx' || kind === 'xlsx' || kind === 'pptx' ? (
+            ) : kind === 'pdf' || kind === 'image' || kind === 'docx' || kind === 'xlsx' || kind === 'pptx' || kind === 'html' ? (
               <FilePreview
-                kind={kind}
+                kind={deckHtmlDocumentId(doc) ? 'html' : kind}
                 src={previewBlobUrl || undefined}
                 fileName={doc?.file_name || undefined}
                 error={previewError || (!previewBlobUrl && !previewLoading ? 'Preview unavailable' : null)}

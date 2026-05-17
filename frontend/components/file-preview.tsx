@@ -8,7 +8,7 @@ import { Loader2, AlertCircle, FileText } from 'lucide-react';
 // the blob/text and passing in `src` (for pdf/image) or `text`. This split
 // keeps auth concerns at the call site: the modal can pass a same-origin URL
 // (cookie-auth), the detail page passes a blob: URL after a bearer-fetch.
-export type FilePreviewKind = 'pdf' | 'image' | 'docx' | 'xlsx' | 'pptx' | 'text' | 'unsupported';
+export type FilePreviewKind = 'pdf' | 'image' | 'docx' | 'xlsx' | 'pptx' | 'html' | 'text' | 'unsupported';
 
 export function FilePreview({
   kind,
@@ -62,6 +62,16 @@ export function FilePreview({
   if (kind === 'pptx' && src) {
     return <PptxPreview src={src} fileName={fileName} />;
   }
+  if (kind === 'html' && src) {
+    return (
+      <iframe
+        src={src}
+        title={fileName || 'deck preview'}
+        sandbox="allow-same-origin"
+        className="w-full h-full rounded-md bg-white"
+      />
+    );
+  }
   if (kind === 'text' && text) {
     return (
       <pre className="w-full h-full overflow-auto bg-bg-root rounded-md p-4 text-xs text-text-secondary whitespace-pre-wrap font-mono">
@@ -86,6 +96,7 @@ export function kindFromMime(mime: string | null | undefined): FilePreviewKind {
   if (m.includes('wordprocessingml.document') || m === 'application/msword') return 'docx';
   if (m.includes('spreadsheetml.sheet') || m.includes('ms-excel') || m.includes('excel')) return 'xlsx';
   if (m.includes('presentationml.presentation') || m.includes('powerpoint') || m.includes('presentation')) return 'pptx';
+  if (m.startsWith('text/html') || m.includes('html')) return 'html';
   if (m.startsWith('text/')) return 'text';
   return 'unsupported';
 }

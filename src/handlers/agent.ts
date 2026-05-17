@@ -10,6 +10,7 @@ import type { ToolDefinition } from '../lib/claude';
 import { extractTextFromFile } from '../lib/file-extraction';
 import { assembleSessionAttachments, type UploadSummary } from '../lib/chat-uploads';
 import {
+  createDeckArtifactTool,
   createDocumentArtifactTool,
   editDocumentArtifactTool,
   findDocumentsTool,
@@ -22,6 +23,7 @@ import { emitAudit } from '../lib/audit';
 import {
   searchContacts, searchCompanies, searchDeals, searchConversations,
   searchEvents, recall, sweepConversations,
+  getFirmRelationshipSnapshotTool, setFirmCompanyRelationshipTool,
   getContactDetail, getCompanyDetail, getDealDetail,
   createContactTool, updateContactTool,
   createCompanyTool, updateCompanyTool,
@@ -44,6 +46,13 @@ import {
   unregisterRequest,
   wasCancelledIncludingKV,
 } from '../lib/agent-cancellation';
+import {
+  appendAgentRunEvent,
+  createAgentRun,
+  fetchAgentRunEvents,
+  markAgentRunCancelRequested,
+  updateAgentRunStatus,
+} from '../lib/agent-runs';
 import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from '../lib/max-mode';
 import {
   buildLiveMartyRuntimeFingerprint,
@@ -51,6 +60,8 @@ import {
   buildMartyMaxModePrompt,
 } from '../lib/marty-runtime';
 import { buildMaxSetTool, compactMaxSetResultForContext, detectMaxSetIntent } from '../lib/max-set-builder';
+import { TurnSourceRegistry } from '../lib/turn-source-registry';
+import { planDeterministicSourceRouting } from '../lib/source-router';
 
 function normalizeMartySentenceSpacing(text: string): string {
   if (!text) return text;
@@ -147,6 +158,25 @@ const AGENT_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: 'create_deck_artifact',
+    description: 'Create a premium, HTML-first presentation deck bundle and save it to Documents. Use for decks, slide decks, PowerPoint presentations, board/IC decks, recaps, pitches, and any request where visual composition matters. Produces a PPTX plus HTML/PDF companion exports after deck QA.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'The full deck request, including audience, objective, sources, and desired storyline.' },
+        title: { type: 'string', description: 'Human-readable deck title.' },
+        audience: { type: 'string', description: 'Audience such as internal IC, LP, board, founder, sales, diligence, or weekly recap.' },
+        objective: { type: 'string', enum: ['inform', 'persuade', 'decide', 'update', 'sell'], description: 'Primary deck objective.' },
+        style_pack: { type: 'string', enum: ['medina_default', 'banker_clean', 'consulting_editorial', 'founder_story', 'lp_report'], description: 'Medina default unless a different audience-specific style is needed.' },
+        output_formats: { type: 'array', items: { type: 'string', enum: ['html', 'pdf', 'pptx'] }, description: 'Requested outputs. Defaults to html, pdf, and pptx.' },
+        quality_mode: { type: 'string', enum: ['fast', 'premium'], description: 'Use premium unless the user explicitly asks for rough/fast.' },
+        structured_content: { type: 'object', description: 'Optional complete deck content. Include slides, metrics, tables, evidence_blocks, and speaker_notes when known.' },
+        source_document_ids: { type: 'array', items: { type: 'string' }, description: 'Optional source document IDs used to create the deck.' },
+      },
+      required: ['prompt'],
+    },
+  },
+  {
     name: 'edit_document_artifact',
     description: 'Create a new edited copy/version of an existing document. Never mutates the original. Use when the user asks to revise, duplicate, update, convert, summarize into, or alter an existing document.',
     input_schema: {
@@ -189,13 +219,43 @@ const AGENT_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: 'get_firm_relationship_snapshot',
+    description: 'Return the authoritative Medina firm relationship state for companies: current portfolio, active pipeline, watchlist, passed, exited, and unknown. Use before answering current portfolio, investments, portfolio companies, or pipeline-vs-portfolio questions.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        include_pipeline: { type: 'boolean', description: 'Include pipeline and watchlist buckets. Defaults true.' },
+        limit: { type: 'number', description: 'Maximum companies to inspect. Default 300.' },
+      },
+    },
+  },
+  {
+    name: 'set_firm_company_relationship',
+    description: 'Persistently mark a company as current portfolio, active pipeline, watchlist, passed, exited, or other in the authoritative firm relationship log. Use immediately when the user says a company is/also is/no longer is a portfolio company or asks to update portfolio/pipeline status.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company_id: { type: 'string', description: 'Existing company ID if known.' },
+        company_name: { type: 'string', description: 'Company name. The tool resolves or creates the company if needed.' },
+        relationship_state: {
+          type: 'string',
+          enum: ['current_portfolio', 'active_pipeline', 'watchlist', 'passed', 'exited', 'other'],
+          description: 'Defaults to current_portfolio.',
+        },
+        effective_date: { type: 'string', description: 'Optional YYYY-MM-DD effective date.' },
+        notes: { type: 'string', description: 'Optional reason/source note.' },
+        create_if_missing: { type: 'boolean', description: 'Create the company if no matching company exists. Defaults true.' },
+      },
+    },
+  },
+  {
     name: 'search_deals',
     description: 'Search deals by keyword, stage, or company. Use when asked about the pipeline or deals broadly.',
     input_schema: {
       type: 'object',
       properties: {
         keyword: { type: 'string', description: 'Search by title or company name' },
-        stage: { type: 'string', description: 'Filter by stage: prospect, initial_contact, due_diligence, term_sheet, negotiation, closed_won, closed_lost, on_hold' },
+        stage: { type: 'string', description: 'Filter by stage: new, talking, due_diligence, term_sheet, closed (legacy values may also exist)' },
         company_id: { type: 'string' },
         limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
       },
@@ -269,7 +329,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
       properties: {
         task_type: {
           type: 'string',
-          enum: ['invite_roster', 'touchpoint_roster', 'entity_theme_set', 'funding_interest_gap', 'firm_involvement', 'open_loops', 'account_map', 'campaign_response_set', 'document_list_reconstruction', 'deal_process_history', 'generic_set'],
+          enum: ['invite_roster', 'touchpoint_roster', 'entity_theme_set', 'funding_interest_gap', 'firm_involvement', 'open_loops', 'account_map', 'campaign_response_set', 'document_list_reconstruction', 'deal_process_history', 'candidate_slate', 'generic_set'],
           description: 'The exhaustive set-building workflow. Infer from the user request when obvious.',
         },
         entity_kind: {
@@ -433,7 +493,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         title: { type: 'string' },
         company_name: { type: 'string', description: 'Name of an existing company' },
         company_id: { type: 'string', description: 'Or provide company ID directly' },
-        stage: { type: 'string', description: 'prospect, initial_contact, due_diligence, term_sheet, negotiation, closed_won, closed_lost, on_hold' },
+        stage: { type: 'string', description: 'new, talking, due_diligence, term_sheet, closed (legacy values may also exist)' },
         amount: { type: 'number' },
         valuation: { type: 'number' },
         description: { type: 'string' },
@@ -708,17 +768,27 @@ async function executeTool(
   toolInput: any,
   ctx: AuthContext,
   env: Env,
-  toolContext: { deepDive?: boolean } = {}
+  toolContext: {
+    deepDive?: boolean;
+    signal?: AbortSignal;
+    jobId?: string;
+    sessionId?: string | null;
+    requestId?: string | null;
+    assistantMessageId?: string | null;
+  } = {}
 ): Promise<any> {
   switch (toolName) {
     case 'search_contacts': return searchContacts(ctx, toolInput, env, toolContext);
     case 'search_companies': return searchCompanies(ctx, toolInput, env, toolContext);
+    case 'get_firm_relationship_snapshot': return getFirmRelationshipSnapshotTool(ctx, toolInput || {}, env);
+    case 'set_firm_company_relationship': return setFirmCompanyRelationshipTool(ctx, toolInput || {}, env);
     case 'search_deals': return searchDeals(ctx, toolInput, env, toolContext);
     case 'search_conversations': return searchConversations(ctx, toolInput, env, toolContext);
     case 'search_events': return searchEvents(ctx, toolInput, env, toolContext);
     case 'sweep_conversations': return sweepConversations(ctx, toolInput, env, toolContext);
     case 'build_max_set': return buildMaxSetTool(ctx, toolInput, env, toolContext);
     case 'find_documents': return findDocumentsTool(ctx, toolInput, env);
+    case 'create_deck_artifact': return createDeckArtifactTool(ctx, toolInput, env, toolContext);
     case 'create_document_artifact': return createDocumentArtifactTool(ctx, toolInput, env);
     case 'edit_document_artifact': return editDocumentArtifactTool(ctx, toolInput, env);
     case 'recall':
@@ -1089,6 +1159,84 @@ function encodeSseDone(): Uint8Array {
   return new TextEncoder().encode('data: [DONE]\n\n');
 }
 
+async function persistRunEventSafe(
+  env: Env,
+  runId: string | null | undefined,
+  ctx: AuthContext,
+  sessionId: string,
+  eventType: string,
+  payload: unknown
+): Promise<void> {
+  if (!runId) return;
+  await appendAgentRunEvent(env, {
+    runId,
+    orgId: ctx.orgId,
+    sessionId,
+    eventType,
+    payload,
+  }).catch(error => {
+    console.warn('[agent:runs] event append failed:', error?.message || error);
+  });
+}
+
+function safeModelErrorText(): string {
+  return 'MARTy hit a model handoff issue. Retry is safe.';
+}
+
+function compactRoutedToolResult(tool: string, result: any): any {
+  if (!result || typeof result !== 'object') return result;
+  if (tool === 'get_firm_relationship_snapshot') {
+    return {
+      current_portfolio: Array.isArray(result.current_portfolio) ? result.current_portfolio : [],
+      active_pipeline: Array.isArray(result.active_pipeline) ? result.active_pipeline.slice(0, 80) : [],
+      watchlist: Array.isArray(result.watchlist) ? result.watchlist.slice(0, 80) : [],
+      passed_count: Array.isArray(result.passed) ? result.passed.length : undefined,
+      exited_count: Array.isArray(result.exited) ? result.exited.length : undefined,
+      counts: result.counts,
+      classification_rules: result.classification_rules,
+      data_quality_warnings: Array.isArray(result.data_quality_warnings)
+        ? result.data_quality_warnings.slice(0, 25)
+        : [],
+      sources: Array.isArray(result.sources) ? result.sources.slice(0, 80) : [],
+      note: result.note,
+    };
+  }
+  if (tool === 'search_events') {
+    const events = Array.isArray(result.events) ? result.events : [];
+    return {
+      events: events.slice(0, 20).map((event: any) => ({
+        id: event.id,
+        title: event.title,
+        event_type: event.event_type,
+        source: event.source,
+        start_time: event.start_time,
+        end_time: event.end_time,
+        has_transcript: event.has_transcript,
+        transcript_excerpt: event.transcript_excerpt,
+        summary: event.summary,
+        topics_discussed: event.topics_discussed,
+        key_decisions: event.key_decisions,
+        action_items: event.action_items,
+        attendee_count: event.attendee_count,
+      })),
+      count: result.count,
+      coverage: result.coverage,
+      data_model_note: result.data_model_note,
+      note: result.note,
+    };
+  }
+  if (tool === 'recall') {
+    return {
+      results: Array.isArray(result.results) ? result.results.slice(0, 20) : undefined,
+      sources: Array.isArray(result.sources) ? result.sources.slice(0, 20) : undefined,
+      coverage: result.coverage,
+      count: result.count,
+      note: result.note,
+    };
+  }
+  return result;
+}
+
 function titleFromQuery(query: string): string {
   const cleaned = query
     .replace(/\s+/g, ' ')
@@ -1154,6 +1302,86 @@ function formatMaxSetAnswer(result: any, elapsedMs: number): string {
   return lines.join('\n');
 }
 
+async function createMaxModeJobRecordSafe(
+  env: Env,
+  ctx: AuthContext,
+  input: {
+    sessionId: string;
+    assistantMessageId: string;
+    requestId: string;
+    agentRunId?: string | null;
+    query: string;
+    maxInput: any;
+  }
+): Promise<string | null> {
+  const jobId = crypto.randomUUID();
+  try {
+    await env.D1.prepare(
+      `INSERT INTO max_mode_jobs
+         (id, org_id, user_id, query, task_type, entity_kind, status,
+          session_id, assistant_message_id, request_id, agent_run_id,
+          heartbeat_at, progress_json)
+       VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)`
+    ).bind(
+      jobId,
+      ctx.orgId,
+      ctx.userId,
+      input.query,
+      input.maxInput?.task_type || 'generic_set',
+      input.maxInput?.entity_kind || 'mixed',
+      input.sessionId,
+      input.assistantMessageId,
+      input.requestId,
+      input.agentRunId || null,
+      JSON.stringify({ phase: 'started', started_at: new Date().toISOString() })
+    ).run();
+    return jobId;
+  } catch (error: any) {
+    console.warn('[max-mode:job] create failed:', error?.message || error);
+    return null;
+  }
+}
+
+async function updateMaxModeJobRecordSafe(
+  env: Env,
+  jobId: string | null | undefined,
+  input: {
+    status: 'completed' | 'failed' | 'cancelled';
+    result?: any;
+    artifactDocumentId?: string | null;
+    errorMessage?: string | null;
+  }
+): Promise<void> {
+  if (!jobId) return;
+  try {
+    await env.D1.prepare(
+      `UPDATE max_mode_jobs
+          SET status = ?,
+              result_json = COALESCE(?, result_json),
+              artifact_document_id = COALESCE(?, artifact_document_id),
+              error_message = COALESCE(?, error_message),
+              progress_json = json_set(
+                CASE WHEN json_valid(COALESCE(progress_json, '{}')) THEN COALESCE(progress_json, '{}') ELSE '{}' END,
+                '$.phase', ?,
+                '$.updated_at', strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              ),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              completed_at = CASE WHEN ? IN ('completed','failed','cancelled') THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE completed_at END
+        WHERE id = ?`
+    ).bind(
+      input.status,
+      input.result ? JSON.stringify(input.result) : null,
+      input.artifactDocumentId || null,
+      input.errorMessage || null,
+      input.status,
+      input.status,
+      jobId
+    ).run();
+  } catch (error: any) {
+    console.warn('[max-mode:job] update failed:', error?.message || error);
+  }
+}
+
 async function persistImmediateAgentResult(
   env: Env,
   ctx: AuthContext,
@@ -1204,6 +1432,7 @@ function createStreamingMaxSetResponse(args: {
   query: string;
   input: any;
   requestId: string;
+  runId?: string;
   assistantMessageId: string;
   runtimeFingerprint: any;
   turnAttachments: UploadSummary[];
@@ -1218,6 +1447,7 @@ function createStreamingMaxSetResponse(args: {
     query,
     input,
     requestId,
+    runId,
     assistantMessageId,
     runtimeFingerprint,
     turnAttachments,
@@ -1231,9 +1461,11 @@ function createStreamingMaxSetResponse(args: {
       const emit = (data: any) => controller.enqueue(encodeSseEvent(data));
       const started = Date.now();
       let heartbeat: ReturnType<typeof setInterval> | null = null;
+      let maxJobId: string | null = null;
       try {
         emit({ type: 'session', session_id: session.id });
         emit({ type: 'request', request_id: requestId });
+        if (runId) emit({ type: 'run', run_id: runId, request_id: requestId, session_id: session.id });
         emit({ type: 'runtime', runtime_fingerprint: runtimeFingerprint });
         emit({ type: 'sources', sources: [] });
         emit({
@@ -1244,6 +1476,23 @@ function createStreamingMaxSetResponse(args: {
           bytes_total: sessionAttachments.bytesTotal,
         });
         if (signal?.aborted) throw new Error('MARTy request cancelled');
+        maxJobId = await createMaxModeJobRecordSafe(env, ctx, {
+          sessionId: session.id,
+          assistantMessageId,
+          requestId,
+          agentRunId: runId,
+          query,
+          maxInput: input,
+        });
+        if (maxJobId) {
+          emit({ type: 'max_step', job_id: maxJobId, step: 'started', status: 'running' });
+          await persistRunEventSafe(env, runId, ctx, session.id, 'max_step', {
+            type: 'max_step',
+            job_id: maxJobId,
+            step: 'started',
+            status: 'running',
+          });
+        }
         emit({ type: 'tool_call', tool: 'build_max_set', input, status: 'executing', forced: true });
 
         heartbeat = setInterval(() => {
@@ -1268,7 +1517,7 @@ function createStreamingMaxSetResponse(args: {
         });
         const result: any = await withTimeout(
           Promise.race([
-            buildMaxSetTool(ctx, input, env, { deepDive: true }),
+            buildMaxSetTool(ctx, input, env, { deepDive: true, signal, jobId: maxJobId || runId }),
             abortPromise,
           ]),
           STREAMING_MAX_SET_TIMEOUT_MS,
@@ -1288,6 +1537,22 @@ function createStreamingMaxSetResponse(args: {
 
         const finalText = formatMaxSetAnswer(result, Date.now() - started);
         emit({ text: finalText });
+        await persistRunEventSafe(env, runId, ctx, session.id, 'max_complete', {
+          type: 'max_complete',
+          job_id: maxJobId,
+          safety_status: result?.safety_status,
+          counts: {
+            confirmed: Array.isArray(result?.confirmed) ? result.confirmed.length : 0,
+            probable: Array.isArray(result?.probable) ? result.probable.length : 0,
+            needs_review: Array.isArray(result?.needs_review) ? result.needs_review.length : 0,
+          },
+        });
+        await updateMaxModeJobRecordSafe(env, maxJobId, {
+          status: result?.error ? 'failed' : 'completed',
+          result: compact,
+          artifactDocumentId: documentCards[0]?.document_id || result?.artifact_card?.document_id || null,
+          errorMessage: result?.error || null,
+        });
         await persistImmediateAgentResult(
           env,
           ctx,
@@ -1301,6 +1566,10 @@ function createStreamingMaxSetResponse(args: {
           documentCards,
           result?.error
         );
+        await updateAgentRunStatus(env, runId, result?.error ? 'error' : 'completed', {
+          errorCode: result?.error ? 'MAX_SET_ERROR' : null,
+          errorJson: result?.error ? result : undefined,
+        }).catch(() => {});
 
         if (turnIndex === 0 && !session.title) {
           await env.D1.prepare('UPDATE agent_sessions SET title = ? WHERE id = ?')
@@ -1320,6 +1589,11 @@ function createStreamingMaxSetResponse(args: {
             sessionId: session.id,
             reason: 'Stopped by user.',
           }).catch(() => 0);
+          await updateMaxModeJobRecordSafe(env, maxJobId, {
+            status: 'cancelled',
+            errorMessage: 'Stopped by user.',
+          });
+          await updateAgentRunStatus(env, runId, 'cancelled').catch(() => {});
           return;
         }
         const finalText = [
@@ -1342,6 +1616,14 @@ function createStreamingMaxSetResponse(args: {
           [],
           message
         ).catch(() => {});
+        await updateMaxModeJobRecordSafe(env, maxJobId, {
+          status: 'failed',
+          errorMessage: message,
+        });
+        await updateAgentRunStatus(env, runId, 'error', {
+          errorCode: 'MAX_MODE_STREAMING_ERROR',
+          errorJson: { message },
+        }).catch(() => {});
       } finally {
         unregisterRequest(requestId);
         controller.enqueue(encodeSseDone());
@@ -1543,21 +1825,52 @@ export async function cancelAgentRequest(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const body = await parseJsonBody<{ request_id?: string }>(request);
-  if (!body?.request_id || typeof body.request_id !== 'string') {
-    return errorResponse('VALIDATION_ERROR', 400, 'request_id required');
+  const body = await parseJsonBody<{ request_id?: string; run_id?: string; session_id?: string }>(request);
+  const requestId = body?.request_id ? normalizeRequestId(body.request_id) : null;
+  const runId = body?.run_id ? normalizeRequestId(body.run_id) : null;
+  const sessionId = body?.session_id ? normalizeSessionId(body.session_id) : null;
+  if (!requestId && !runId && !sessionId) {
+    return errorResponse('VALIDATION_ERROR', 400, 'request_id, run_id, or session_id required');
   }
-  const requestId = normalizeRequestId(body.request_id);
-  if (!requestId) return errorResponse('VALIDATION_ERROR', 400, 'valid request_id required');
-  const result = await cancelRequest(requestId, env);
+  const result = requestId
+    ? await cancelRequest(requestId, env)
+    : { local: false };
+  await markAgentRunCancelRequested(env, ctx, { runId, requestId, sessionId }).catch(() => 0);
   const cancelledRows = await markAgentTurnCancelled(env, ctx, {
     requestId,
+    sessionId,
     reason: 'Stopped by user.',
   }).catch(() => 0);
   // Audit the cancel for debugging — keeps a trace in case Lucas reports
   // "I clicked stop and nothing happened."
-  console.log(`[agent:cancel] request=${requestId} user=${ctx.userId} local=${result.local} rows=${cancelledRows}`);
+  console.log(`[agent:cancel] request=${requestId || 'n/a'} run=${runId || 'n/a'} session=${sessionId || 'n/a'} user=${ctx.userId} local=${result.local} rows=${cancelledRows}`);
   return jsonResponse({ ok: true, local: result.local, cancelled_rows: cancelledRows });
+}
+
+export async function getAgentRunEvents(
+  request: Request,
+  runId: string,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const url = new URL(request.url);
+  const afterSeq = Math.max(0, Number(url.searchParams.get('after_seq') || 0));
+  const waitMs = Math.min(Math.max(Number(url.searchParams.get('wait_ms') || 0), 0), 25_000);
+
+  const started = Date.now();
+  let snapshot = await fetchAgentRunEvents(env, ctx, runId, afterSeq);
+  while (snapshot.run && snapshot.events.length === 0 && waitMs > 0 && Date.now() - started < waitMs) {
+    await new Promise(resolve => setTimeout(resolve, 750));
+    snapshot = await fetchAgentRunEvents(env, ctx, runId, afterSeq);
+  }
+  if (!snapshot.run) return errorResponse('RUN_NOT_FOUND', 404, 'That MARTy run no longer exists.');
+  return jsonResponse({
+    run: snapshot.run,
+    events: snapshot.events,
+    latest_seq: snapshot.events.length > 0
+      ? snapshot.events[snapshot.events.length - 1].seq
+      : afterSeq,
+  });
 }
 
 export async function getSessionTrace(
@@ -1720,6 +2033,7 @@ export async function queryAgent(
   // Create this before retrieval so the durable placeholder can expose a
   // cancellation handle even if the user navigates away before streaming starts.
   const requestId = clientRequestId || crypto.randomUUID();
+  const agentRunId = crypto.randomUUID();
   const cancelController = registerActiveRequest(requestId);
 
   // --- Per-session attachment replay (Approach A + 50 MB cap) ---
@@ -1748,7 +2062,7 @@ export async function queryAgent(
       turnIndex,
       query,
       attachmentsJson,
-      JSON.stringify({ status: 'running', request_id: requestId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
+      JSON.stringify({ status: 'running', request_id: requestId, run_id: agentRunId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
     );
   } catch (e) {
     if (isAgentRunningReservationConflict(e)) {
@@ -1776,7 +2090,7 @@ export async function queryAgent(
             turnIndex,
             query,
             attachmentsJson,
-            JSON.stringify({ status: 'running', request_id: requestId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
+            JSON.stringify({ status: 'running', request_id: requestId, run_id: agentRunId, runtime_fingerprint: runtimeFingerprint, deep_dive: deepDive })
           );
         } catch (retryError) {
           unregisterRequest(requestId);
@@ -1810,6 +2124,24 @@ export async function queryAgent(
     }
   }
 
+  await createAgentRun(env, ctx, {
+    id: agentRunId,
+    sessionId: session.id,
+    assistantMessageId,
+    requestId,
+    mode: deepDive ? 'max' : 'agile',
+    status: 'running',
+  }).catch(error => {
+    console.warn('[agent:runs] create failed:', error?.message || error);
+  });
+  await persistRunEventSafe(env, agentRunId, ctx, session.id, 'run', {
+    type: 'run',
+    run_id: agentRunId,
+    request_id: requestId,
+    session_id: session.id,
+    mode: deepDive ? 'max' : 'agile',
+  });
+
   if (maxSetIntent.shouldBuild && maxSetIntent.input) {
     if (ddKey) {
       const ddCount = parseInt(await env.KV.get(ddKey) || '0');
@@ -1822,6 +2154,7 @@ export async function queryAgent(
       query,
       input: maxSetIntent.input,
       requestId,
+      runId: agentRunId,
       assistantMessageId,
       runtimeFingerprint,
       turnAttachments,
@@ -1849,6 +2182,10 @@ export async function queryAgent(
   } catch (e: any) {
     const errMsg = String(e?.message || e);
     console.error('[agent] retrieval failed:', errMsg);
+    await updateAgentRunStatus(env, agentRunId, 'error', {
+      errorCode: 'RETRIEVAL_FAILED',
+      errorJson: { phase: 'retrieval', message: errMsg },
+    }).catch(() => {});
 
     await env.D1.prepare(
       `UPDATE agent_messages SET content = ?, metadata = ? WHERE id = ?`
@@ -1883,11 +2220,13 @@ export async function queryAgent(
       sessionId: session.id,
       reason: 'Stopped by user.',
     }).catch(() => 0);
+    await updateAgentRunStatus(env, agentRunId, 'cancelled').catch(() => {});
     unregisterRequest(requestId);
     const cancelledStream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encodeSseEvent({ type: 'session', session_id: session.id }));
         controller.enqueue(encodeSseEvent({ type: 'request', request_id: requestId }));
+        controller.enqueue(encodeSseEvent({ type: 'run', run_id: agentRunId, request_id: requestId, session_id: session.id }));
         controller.enqueue(encodeSseEvent({ text: '_(stopped)_' }));
         controller.enqueue(encodeSseDone());
         controller.close();
@@ -1951,10 +2290,80 @@ export async function queryAgent(
     query,
     { deepDive }
   );
+  const sourceRegistry = new TurnSourceRegistry(sources);
+  const routedSourceResults: Array<{ tool: string; reason: string; result: any }> = [];
+  const preludeEvents: any[] = [];
+  const sourceRoutingPlan = planDeterministicSourceRouting(query, { deepDive });
+  if (sourceRoutingPlan.calls.length > 0) {
+    for (const routedCall of sourceRoutingPlan.calls) {
+      if (cancelController.signal.aborted || await wasCancelledIncludingKV(requestId, env)) break;
+      preludeEvents.push({
+        type: 'tool_call',
+        tool: routedCall.tool,
+        input: routedCall.input,
+        status: 'executing',
+        routed: true,
+        reason: routedCall.reason,
+      });
+      await persistRunEventSafe(env, agentRunId, ctx, session.id, 'routed_tool_call', {
+        type: 'routed_tool_call',
+        tool: routedCall.tool,
+        input: routedCall.input,
+        reason: routedCall.reason,
+      });
+      try {
+        const rawResult = await executeTool(routedCall.tool, routedCall.input, ctx, env, {
+          deepDive,
+          signal: cancelController.signal,
+          jobId: agentRunId,
+          sessionId: session.id,
+          requestId,
+          assistantMessageId,
+        });
+        const transformed = sourceRegistry.appendToolResult(routedCall.tool, rawResult);
+        if (transformed.delta.length > 0) {
+          preludeEvents.push({ type: 'sources_delta', sources: transformed.delta, routed: true });
+          await persistRunEventSafe(env, agentRunId, ctx, session.id, 'sources_delta', {
+            type: 'sources_delta',
+            sources: transformed.delta,
+            routed: true,
+          });
+        }
+        const compact = compactRoutedToolResult(routedCall.tool, transformed.result);
+        routedSourceResults.push({ tool: routedCall.tool, reason: routedCall.reason, result: compact });
+        preludeEvents.push({
+          type: 'tool_result',
+          tool: routedCall.tool,
+          result: compact,
+          status: 'done',
+          routed: true,
+        });
+      } catch (error: any) {
+        const compactError = {
+          error: 'ROUTED_RETRIEVAL_FAILED',
+          message: 'A deterministic source-specific lookup failed before returning a safe result.',
+          retryable: true,
+        };
+        routedSourceResults.push({ tool: routedCall.tool, reason: routedCall.reason, result: compactError });
+        preludeEvents.push({
+          type: 'tool_result',
+          tool: routedCall.tool,
+          result: compactError,
+          status: 'error',
+          routed: true,
+        });
+        await persistRunEventSafe(env, agentRunId, ctx, session.id, 'routed_tool_error', {
+          type: 'routed_tool_error',
+          tool: routedCall.tool,
+          reason: routedCall.reason,
+          message: String(error?.message || error),
+        });
+      }
+    }
+  }
 
   let forcedMaxSetResult: any = null;
   let compactForcedMaxSet: Record<string, unknown> | null = null;
-  const preludeEvents: any[] = [];
   if (maxSetIntent.shouldBuild && maxSetIntent.input) {
     preludeEvents.push({
       type: 'tool_call',
@@ -1965,7 +2374,7 @@ export async function queryAgent(
     });
     try {
       forcedMaxSetResult = await withTimeout(
-        buildMaxSetTool(ctx, maxSetIntent.input, env, { deepDive: true }),
+        buildMaxSetTool(ctx, maxSetIntent.input, env, { deepDive: true, signal: cancelController.signal, jobId: agentRunId }),
         FORCED_MAX_SET_TIMEOUT_MS,
         `Forced MAX set-builder exceeded ${Math.round(FORCED_MAX_SET_TIMEOUT_MS / 1000)}s before returning.`
       );
@@ -1998,8 +2407,11 @@ export async function queryAgent(
   const maxSetContext = compactForcedMaxSet
     ? `\n\n--- FORCED MAX SET BUILDER RESULT ---\n${JSON.stringify(compactForcedMaxSet, null, 2)}\n--- END FORCED MAX SET BUILDER RESULT ---`
     : '';
+  const routedSourceContext = routedSourceResults.length > 0
+    ? `\n\n--- DETERMINISTIC SOURCE ROUTING (${sourceRoutingPlan.intent}) ---\n${JSON.stringify(routedSourceResults, null, 2)}\n--- END DETERMINISTIC SOURCE ROUTING ---`
+    : '';
 
-  const userText = `${contextBlock}${maxSetContext}\n\n--- QUERY ---\n${query}`;
+  const userText = `${contextBlock}${routedSourceContext}${maxSetContext}\n\n--- QUERY ---\n${query}`;
   if (sessionAttachments.contentBlocks.length > 0) {
     // Multi-block content: PDFs/images/text-extracted attachments first, then
     // the RAG context + the user's actual query as the final text block.
@@ -2044,7 +2456,29 @@ export async function queryAgent(
               max_set_run_id: forcedMaxSetResult.run_id,
             });
           }
-          return executeTool(name, input, ctx, env, { deepDive });
+          return executeTool(name, input, ctx, env, {
+            deepDive,
+            signal: cancelController.signal,
+            jobId: agentRunId,
+            sessionId: session.id,
+            requestId,
+            assistantMessageId,
+          });
+        },
+        onToolResult: async (name, rawResult) => {
+          const transformed = sourceRegistry.appendToolResult(name, rawResult);
+          if (transformed.delta.length > 0) {
+            await persistRunEventSafe(env, agentRunId, ctx, session.id, 'sources_delta', {
+              type: 'sources_delta',
+              sources: transformed.delta,
+              tool: name,
+            });
+            return {
+              result: transformed.result,
+              events: [{ type: 'sources_delta', sources: transformed.delta }],
+            };
+          }
+          return { result: transformed.result };
         },
         signal: cancelController.signal,
       },
@@ -2052,23 +2486,28 @@ export async function queryAgent(
     );
   } catch (e: any) {
     unregisterRequest(requestId);
+    await updateAgentRunStatus(env, agentRunId, 'error', {
+      errorCode: 'GENERATION_START_FAILED',
+      errorJson: { phase: 'generation_start', message: String(e?.message || e) },
+    }).catch(() => {});
     await env.D1.prepare(
       `UPDATE agent_messages SET content = ?, metadata = ? WHERE id = ?`
     ).bind(
-      'I ran into a problem starting that MARTy response. Try again, or rephrase.',
+      safeModelErrorText(),
       JSON.stringify({
         status: 'error',
         request_id: requestId,
+        run_id: agentRunId,
         runtime_fingerprint: runtimeFingerprint,
         deep_dive: deepDive,
-        error: String(e?.message || e),
+        error_code: 'GENERATION_START_FAILED',
       }),
       assistantMessageId
     ).run().catch(() => {});
     await touchAgentSessionActivity(env, session.id);
     return jsonResponse({
       error: 'Generation failed',
-      message: 'I ran into a problem starting that MARTy response. Try again, or rephrase.',
+      message: safeModelErrorText(),
       retryable: true,
     }, 500);
   }
@@ -2090,7 +2529,7 @@ export async function queryAgent(
     `data: ${JSON.stringify({ type: 'runtime', runtime_fingerprint: runtimeFingerprint })}\n\n`
   );
   const sourcesEvent = encoder.encode(
-    `data: ${JSON.stringify({ type: 'sources', sources })}\n\n`
+    `data: ${JSON.stringify({ type: 'sources', sources: sourceRegistry.all() })}\n\n`
   );
   const attachmentsEvent = encoder.encode(
     `data: ${JSON.stringify({
@@ -2177,24 +2616,29 @@ export async function queryAgent(
             ? 'I pulled the relevant document forward.'
             : ''
       );
+      const finalSources = sourceRegistry.all();
       const normalizedOutput = normalizeMartyOutputText(
         rawContent,
-        new Set(sources.map(s => s.id))
+        sourceRegistry.idSet()
       );
 
       const persistedContent = normalizedOutput.text || (
           cancelled
             ? '_(cancelled before MARTy started generating)_'
-            : 'Something went wrong — no response was received. Please try again.'
+            : safeModelErrorText()
       );
-      const sourcesJson = sources.length > 0 ? JSON.stringify(sources) : null;
+      const sourcesJson = finalSources.length > 0 ? JSON.stringify(finalSources) : null;
       const metadataObj: Record<string, any> = {
         status: cancelled ? 'cancelled' : (fullText || documentCards.length > 0 ? 'done' : 'error'),
         request_id: requestId,
+        run_id: agentRunId,
         runtime_fingerprint: runtimeFingerprint,
         deep_dive: deepDive,
       };
       if (cancelled) metadataObj.cancelled = true;
+      if (!cancelled && !fullText && documentCards.length === 0) {
+        metadataObj.error_code = 'NO_RESPONSE_RECEIVED';
+      }
       if (normalizedOutput.invalidCitationsStripped > 0) {
         metadataObj.invalid_citations_stripped = normalizedOutput.invalidCitationsStripped;
       }
@@ -2213,6 +2657,14 @@ export async function queryAgent(
       }
       // Free the in-isolate controller entry (KV marker ages out on its own).
       unregisterRequest(requestId);
+      await updateAgentRunStatus(
+        env,
+        agentRunId,
+        cancelled ? 'cancelled' : (fullText || documentCards.length > 0 ? 'completed' : 'error'),
+        !cancelled && !fullText && documentCards.length === 0
+          ? { errorCode: 'NO_RESPONSE_RECEIVED', errorJson: { phase: 'stream_capture' } }
+          : {}
+      ).catch(() => {});
 
       // Citation telemetry — counts valid vs. invalid [^N] markers so we can
       // monitor citation hit rate and Claude hallucinating numbers.
@@ -2225,13 +2677,13 @@ export async function queryAgent(
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
           ).bind(
             crypto.randomUUID(), ctx.orgId, ctx.userId, session.id, assistantMessageId,
-            sources.length,
+            finalSources.length,
             normalizedOutput.validCitationsUsed,
             normalizedOutput.invalidCitationsStripped,
             fullText.length
           ).run();
           if (normalizedOutput.invalidCitationsStripped > 0) {
-            console.warn(`[citations] ${normalizedOutput.invalidCitationsStripped} invalid markers (sources=${sources.length}) in message ${assistantMessageId}`);
+            console.warn(`[citations] ${normalizedOutput.invalidCitationsStripped} invalid markers (sources=${finalSources.length}) in message ${assistantMessageId}`);
           }
         } catch (e) {
           console.error('[citations] metrics insert failed:', e);
@@ -2244,9 +2696,9 @@ export async function queryAgent(
       // rate inside verifySampleClaims; if not sampled, function returns
       // immediately. Operates on persistedContent (post-strip from Chunk 2)
       // so we never verify claims attached to invalid markers.
-      if (assistantMessageId && persistedContent && sources.length > 0) {
+      if (assistantMessageId && persistedContent && finalSources.length > 0) {
         ctxExec.waitUntil(
-          verifySampleClaims(assistantMessageId, ctx.orgId, persistedContent, sources, env)
+          verifySampleClaims(assistantMessageId, ctx.orgId, persistedContent, finalSources, env)
         );
       }
 
@@ -2269,7 +2721,7 @@ export async function queryAgent(
 
       // Persist RAG trace
       const traceKey = `${ctx.orgId}/rag_traces/${new Date().toISOString().slice(0, 7)}/${session.id}_${turnIndex}.txt`;
-      try { await env.R2.put(traceKey, contextBlock); } catch { /* ignore */ }
+      try { await env.R2.put(traceKey, `${contextBlock}${routedSourceContext}${maxSetContext}`); } catch { /* ignore */ }
 
       // Log to rag_query_logs
       try {

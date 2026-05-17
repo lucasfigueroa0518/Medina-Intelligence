@@ -122,13 +122,13 @@ export async function listCompanies(
   }
 
   // Has-deals — only include companies with at least one non-deleted active
-  // deal (excludes closed_won/closed_lost so "in active deals" matches).
+  // deal. Support both the current "closed" stage and legacy closed_* rows.
   if (sp.get('has_deals') === 'true') {
     where.push(
       `EXISTS (SELECT 1 FROM deals d
                WHERE d.company_id = co.id
                  AND d.deleted_at IS NULL
-                 AND d.stage NOT IN ('closed_won','closed_lost'))`
+                 AND d.stage NOT IN ('closed','closed_won','closed_lost'))`
     );
   }
 

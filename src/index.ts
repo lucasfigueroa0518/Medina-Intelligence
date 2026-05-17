@@ -30,6 +30,7 @@ import * as Imports from './handlers/imports';
 import * as IntelligentImport from './handlers/intelligent-import';
 import * as Campaigns from './handlers/campaigns';
 import * as Agent from './handlers/agent';
+import * as DeckArtifacts from './handlers/deck-artifacts';
 import * as ChatUploads from './handlers/chat-uploads';
 import * as Webhooks from './handlers/webhooks';
 import * as AuthOAuth from './handlers/auth-oauth';
@@ -181,6 +182,9 @@ if (path === '/webhooks/firefly' && method === 'POST') {
   }
   if (path === '/api/auth/reset-password' && method === 'POST') {
     return withCors(await AuthLogin.resetPassword(request, env), reqOrigin, env);
+  }
+  if (path === '/api/internal/deck-render-complete' && method === 'POST') {
+    return withCors(await DeckArtifacts.internalDeckRenderComplete(request, env), reqOrigin, env);
   }
 
   // --- Authenticated routes ---
@@ -573,6 +577,8 @@ async function routeAuthenticated(
   if (path === '/api/agent/cancel' && method === 'POST') {
     return Agent.cancelAgentRequest(request, ctx, env);
   }
+  m = path.match(/^\/api\/agent\/runs\/([^/]+)\/events$/);
+  if (m && method === 'GET') return Agent.getAgentRunEvents(request, m[1], ctx, env);
   if (path === '/api/agent/sessions' && method === 'GET') {
     return Agent.listSessions(ctx, env);
   }
@@ -599,6 +605,12 @@ async function routeAuthenticated(
   if (m && method === 'GET') return ChatUploads.getChatUploadContent(m[1], ctx, env);
   m = path.match(/^\/api\/agent\/sessions\/([^/]+)\/uploads$/);
   if (m && method === 'GET') return ChatUploads.listSessionUploads(m[1], ctx, env);
+
+  // --- Deck production jobs ---
+  m = path.match(/^\/api\/deck-jobs\/([^/]+)$/);
+  if (m && method === 'GET') return DeckArtifacts.getDeckJob(m[1], ctx, env);
+  m = path.match(/^\/api\/deck-jobs\/([^/]+)\/events$/);
+  if (m && method === 'GET') return DeckArtifacts.getDeckJobEvents(request, m[1], ctx, env);
 
   // --- Audit log ---
   if (path === '/api/audit-log' && method === 'GET') {

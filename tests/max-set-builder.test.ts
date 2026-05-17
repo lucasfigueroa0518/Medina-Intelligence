@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { __maxSetTestHooks } from '../src/lib/max-set-builder';
+import { __maxSetTestHooks, detectMaxSetIntent } from '../src/lib/max-set-builder';
 
 describe('MAX set builder contracts', () => {
   it('parses email recipients from strings and JSON-shaped Outlook fields', () => {
@@ -123,5 +123,19 @@ describe('MAX set builder contracts', () => {
     const chunks = __maxSetTestHooks.chunkArray(Array.from({ length: 123 }, (_, i) => `id-${i}`));
     expect(chunks).toHaveLength(3);
     expect(chunks.every((chunk: string[]) => chunk.length <= 50)).toBe(true);
+  });
+
+  it('keeps ranked candidate slates out of exhaustive MAX set detection', () => {
+    const slate = detectMaxSetIntent(
+      'I want to put together a roundtable of people in quantum. Who are our heaviest hitters? I want 8-10 people but find more than that.'
+    );
+    expect(slate.shouldBuild).toBe(false);
+    expect(slate.reason).toMatch(/candidate_slate/i);
+
+    const exhaustive = detectMaxSetIntent(
+      'List every startup we have ever talked to that is involved in Quantum'
+    );
+    expect(exhaustive.shouldBuild).toBe(true);
+    expect(exhaustive.input?.task_type).toBe('entity_theme_set');
   });
 });

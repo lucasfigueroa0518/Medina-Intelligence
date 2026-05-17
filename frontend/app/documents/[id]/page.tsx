@@ -33,8 +33,26 @@ type Doc = {
   conversation_id: string | null;
   visibility: string | null;
   version_number: number | null;
+  custom_fields?: string | Record<string, unknown> | null;
   created_at: string;
 };
+
+function parseCustomFields(value: Doc['custom_fields']): Record<string, any> {
+  if (!value) return {};
+  if (typeof value === 'object') return value as Record<string, any>;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function deckHtmlDocumentId(doc: Doc | null): string | null {
+  const fields = parseCustomFields(doc?.custom_fields);
+  const id = fields?.deck_bundle?.html_document_id;
+  return typeof id === 'string' && id ? id : null;
+}
 
 export default function DocumentDetailPage() {
   const params = useParams<{ id: string }>();
@@ -84,12 +102,13 @@ export default function DocumentDetailPage() {
   // preview. PDFs/images render natively; DOCX uses browser-side rendering.
   React.useEffect(() => {
     if (!doc) return;
-    const kind = kindFromMime(doc.mime_type);
-    if (kind !== 'pdf' && kind !== 'image' && kind !== 'docx') {
+    const htmlDocId = deckHtmlDocumentId(doc);
+    const kind = htmlDocId ? 'html' : kindFromMime(doc.mime_type);
+    if (kind !== 'pdf' && kind !== 'image' && kind !== 'docx' && kind !== 'xlsx' && kind !== 'pptx' && kind !== 'html') {
       setPreviewBlobUrl(null);
       return;
     }
-    if (!doc.r2_key) {
+    if (!doc.r2_key && !htmlDocId) {
       setPreviewBlobUrl(null);
       setPreviewError('Original file is unavailable.');
       return;
@@ -98,7 +117,7 @@ export default function DocumentDetailPage() {
     let createdUrl: string | null = null;
     setPreviewLoading(true);
     setPreviewError(null);
-    fetch(`${API_BASE}/documents/${doc.id}/download`, { headers: authHeader() })
+    fetch(`${API_BASE}/documents/${htmlDocId || doc.id}/download`, { headers: authHeader() })
       .then(async r => {
         if (!alive) return;
         if (!r.ok) {
@@ -203,9 +222,9 @@ export default function DocumentDetailPage() {
       )}
 
       {(() => {
-        const rawKind = kindFromMime(doc.mime_type);
+        const rawKind = deckHtmlDocumentId(doc) ? 'html' : kindFromMime(doc.mime_type);
         const kind = rawKind === 'unsupported' && doc.extracted_text_preview ? 'text' : rawKind;
-        if (kind === 'pdf' || kind === 'image' || kind === 'docx') {
+        if (kind === 'pdf' || kind === 'image' || kind === 'docx' || kind === 'xlsx' || kind === 'pptx' || kind === 'html') {
           return (
             <section className="mb-6 bg-white/[0.03] border border-border rounded-xl overflow-hidden h-[78dvh] max-h-[920px] min-h-[420px]">
               <FilePreview

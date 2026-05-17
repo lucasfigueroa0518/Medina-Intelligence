@@ -18,6 +18,7 @@ export type MaxSetTaskType =
   | 'campaign_response_set'
   | 'document_list_reconstruction'
   | 'deal_process_history'
+  | 'candidate_slate'
   | 'generic_set';
 
 export type MaxSetEntityKind =
@@ -263,6 +264,13 @@ function chunkArray<T>(values: T[], size = D1_IN_BATCH_SIZE): T[][] {
   const chunks: T[][] = [];
   for (let i = 0; i < values.length; i += size) chunks.push(values.slice(i, i + size));
   return chunks;
+}
+
+function isCandidateSlateQuery(query: string): boolean {
+  const lower = cleanText(query).toLowerCase();
+  const rankingIntent = /\b(best|top|heaviest hitters?|strongest|who should i invite|who should we invite|recommend|shortlist|slate|ranked|8\s*[-–]\s*10|eight\s+to\s+ten|find more than that)\b/.test(lower);
+  const explicitExhaustive = /\b(all|every|everyone|everybody|full universe|complete roster|export|mail merge|spreadsheet|xlsx|count|how many)\b/.test(lower);
+  return rankingIntent && !explicitExhaustive;
 }
 
 async function queryRowsInBatches<T>(
@@ -536,6 +544,7 @@ function expandAliases(query: string, aliases: string[], domains: string[]): { a
 }
 
 function defaultSourceFamilies(taskType: MaxSetTaskType): MaxSetSourceFamily[] {
+  if (taskType === 'candidate_slate') return ['contacts', 'companies', 'communications', 'events', 'documents'];
   if (taskType === 'invite_roster') return ['communications', 'campaigns', 'documents'];
   if (taskType === 'touchpoint_roster') return ['communications', 'events', 'tasks', 'documents', 'contacts', 'companies'];
   if (taskType === 'entity_theme_set') return ['companies', 'deals', 'documents', 'communications', 'events'];
@@ -551,7 +560,9 @@ function defaultSourceFamilies(taskType: MaxSetTaskType): MaxSetSourceFamily[] {
 
 function inferTaskType(query: string): MaxSetTaskType {
   const lower = query.toLowerCase();
+  if (isCandidateSlateQuery(query)) return 'candidate_slate';
   if (/\b(invite|invited|attendee|attendees|registrant|webinar|town hall|dinner|mail merge)\b/.test(lower)) return 'invite_roster';
+  if (/\b(startup|startups|company|companies|sector|theme|quantum|robotics|defense|infrastructure)\b/.test(lower)) return 'entity_theme_set';
   if (/\b(touchpoint|touch point|ever talked|interactions|relationship history)\b/.test(lower)) return 'touchpoint_roster';
   if (/\b(showed interest|interested|funding|fund the funds|committed|invested money|never.*invest)\b/.test(lower)) return 'funding_interest_gap';
   if (/\b(vc firm|venture firm|coinvestor|co-investor|firm involved|firms involved)\b/.test(lower)) return 'firm_involvement';
@@ -560,7 +571,6 @@ function inferTaskType(query: string): MaxSetTaskType {
   if (/\b(campaign|blast|mailing list|replied positively|positive replies)\b/.test(lower)) return 'campaign_response_set';
   if (/\b(source workbook|source spreadsheet|find the list|reconstruct.*list|document list)\b/.test(lower)) return 'document_list_reconstruction';
   if (/\b(deal process|deal history|who touched|touched this deal)\b/.test(lower)) return 'deal_process_history';
-  if (/\b(startup|company|companies|sector|theme|quantum|robotics|defense|infrastructure)\b/.test(lower)) return 'entity_theme_set';
   return 'generic_set';
 }
 
@@ -684,6 +694,7 @@ export function planMaxSetJob(input: BuildMaxSetInput, profile: SearchProfile): 
 }
 
 function membershipPredicateForTask(taskType: MaxSetTaskType): string {
+  if (taskType === 'candidate_slate') return 'Candidate is a ranked recommendation candidate, not an exhaustive set member.';
   if (taskType === 'invite_roster') return 'Candidate was a recipient of an anchored outbound invite, campaign recipient, or row in an authoritative invite/registrant spreadsheet for the target event.';
   if (taskType === 'touchpoint_roster') return 'Candidate is a communication, event, task, or note touchpoint tied to the requested account/entity scope.';
   if (taskType === 'funding_interest_gap') return 'Candidate has positive funding-interest evidence and no investment/commitment exclusion evidence.';
@@ -2039,8 +2050,8 @@ async function scanDeals(
         confidence: 'confirmed',
         why: 'Linked company appeared in a matching deal',
         evidence,
-        exclude: hasExcludedText(text, profile) || (profile.taskType === 'funding_interest_gap' && row.stage === 'closed_won'),
-        exclusionReason: row.stage === 'closed_won' ? 'Deal is already closed won' : 'Matched explicit exclusion terms',
+        exclude: hasExcludedText(text, profile) || (profile.taskType === 'funding_interest_gap' && ['closed', 'closed_won'].includes(String(row.stage || ''))),
+        exclusionReason: ['closed', 'closed_won'].includes(String(row.stage || '')) ? 'Deal is already closed/invested' : 'Matched explicit exclusion terms',
       }, profile);
     }
     stat.candidates_added += Math.max(0, candidates.size + excluded.size - before);
@@ -2757,6 +2768,13 @@ export function detectMaxSetIntent(
 ): { shouldBuild: boolean; reason: string | null; input: BuildMaxSetInput | null } {
   const cleanQuery = cleanText(query);
   const lower = cleanQuery.toLowerCase();
+  if (isCandidateSlateQuery(cleanQuery)) {
+    return {
+      shouldBuild: false,
+      reason: 'candidate_slate recommendation query: use ranked retrieval workflow, not exhaustive set builder',
+      input: null,
+    };
+  }
   const exhaustive =
     /\b(all|every|everyone|everybody|list|roster|export|xlsx|excel|spreadsheet|file|mail merge|count|how many|touchpoints?|ever talked|ever showed|ever involved|all firms|all startups|all people)\b/.test(lower);
   const setNoun =
@@ -2854,7 +2872,7 @@ export async function buildMaxSetTool(
   ctx: AuthContext,
   input: BuildMaxSetInput,
   env: Env,
-  opts: { deepDive?: boolean } = {}
+  opts: { deepDive?: boolean; signal?: AbortSignal; jobId?: string; phaseBudget?: Record<string, number> } = {}
 ): Promise<any> {
   if (!opts.deepDive) {
     return {
@@ -2862,7 +2880,23 @@ export async function buildMaxSetTool(
       message: 'Use MAX mode for exhaustive all/every/list/export/count set-building tasks.',
     };
   }
+  if (opts.signal?.aborted) throw new Error('MARTy request cancelled');
   const profile = buildProfile(input);
+  if (profile.taskType === 'candidate_slate' || isCandidateSlateQuery(profile.query)) {
+    return {
+      error: 'CANDIDATE_SLATE_NOT_EXHAUSTIVE_SET',
+      message: 'This is a shortlist/ranking request, not an exhaustive all/every/list/export set. Use recall/search tools to build a ranked candidate slate with alternates; do not create a MAX roster workbook.',
+      suggested_workflow: 'candidate_slate',
+      safety_status: 'unsafe_incomplete',
+      artifact_card: null,
+      document_cards: [],
+      confirmed: [],
+      probable: [],
+      needs_review: [],
+      excluded: [],
+      gaps: ['MAX set builder refused a non-exhaustive recommendation prompt.'],
+    };
+  }
   const plan = planMaxSetJob(input, profile);
   profile.plan = plan;
   if (!profile.query && profile.includeTerms.length === 0 && profile.domains.length === 0) {
@@ -2874,13 +2908,22 @@ export async function buildMaxSetTool(
   const candidates = new Map<string, MaxSetCandidate>();
   const excludedMap = new Map<string, MaxSetCandidate>();
   const stats: SourceStat[] = [];
+  if (opts.signal?.aborted) throw new Error('MARTy request cancelled');
   await discoverAnchors(ctx, env, profile, plan);
 
-  for (const family of profile.sourceFamilies) {
-    if (candidates.size >= MAX_MODE_LIMITS.setBuilderCandidateCap) {
+  const rolePriority: Record<string, number> = { authoritative: 0, supporting: 1, enrichment: 2, disallowed: 3 };
+  const orderedFamilies = [...profile.sourceFamilies].sort((a, b) => {
+    const aRole = sourceRole(plan, a) || 'authoritative';
+    const bRole = sourceRole(plan, b) || 'authoritative';
+    return (rolePriority[aRole] ?? 1) - (rolePriority[bRole] ?? 1);
+  });
+  for (const family of orderedFamilies) {
+    if (opts.signal?.aborted) throw new Error('MARTy request cancelled');
+    const role = sourceRole(plan, family);
+    if (candidates.size >= MAX_MODE_LIMITS.setBuilderCandidateCap && role !== 'authoritative') {
       stats.push({
         source_family: family,
-        role: sourceRole(plan, family),
+        role,
         rows_scanned: 0,
         rows_returned: 0,
         candidates_added: 0,
@@ -2931,6 +2974,7 @@ export async function buildMaxSetTool(
   const shouldCreateArtifact = profile.wantsArtifact || totalReturned > 50;
   if (shouldCreateArtifact && qualityGate.artifact_allowed) {
     try {
+      if (opts.signal?.aborted) throw new Error('MARTy request cancelled');
       const artifact = await createDocumentArtifactTool(ctx, {
         kind: 'xlsx',
         title: titleForArtifact(profile),

@@ -195,7 +195,7 @@ async function routeDealSignal(
 
   const deal = await env.D1.prepare(
     `SELECT id FROM deals WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL
-     AND stage NOT IN ('closed_won', 'closed_lost')
+     AND stage NOT IN ('closed', 'closed_won', 'closed_lost')
      ORDER BY updated_at DESC LIMIT 1`
   ).bind(companyId, orgId).first<{ id: string }>();
 

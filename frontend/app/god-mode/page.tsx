@@ -179,6 +179,8 @@ interface Message {
 interface RunningMartyStream {
   sessionId: string;
   requestId: string;
+  runId?: string | null;
+  lastSeq?: number;
   assistantMessageId: string;
   abortController?: AbortController | null;
   clientRequestId?: string;
@@ -367,7 +369,7 @@ const TOOL_ICONS: Record<string, typeof Search> = {
   create_contact: FileText, update_contact: FileText,
   create_company: FileText, update_company: FileText,
   create_deal: FileText, update_deal: FileText,
-  create_document_artifact: FileText, edit_document_artifact: FileText,
+  create_document_artifact: FileText, create_deck_artifact: FileText, edit_document_artifact: FileText,
   add_note: FileText, add_deal_action_item: FileText, apply_tag: FileText,
   delete_entity: AlertCircle,
 };
@@ -378,6 +380,7 @@ function toolLabel(name: string): string {
 
 function toolActionLabel(name: string): string {
   if (name === 'find_documents') return 'Finding documents';
+  if (name === 'create_deck_artifact') return 'Creating deck';
   if (name === 'create_document_artifact') return 'Creating document';
   if (name === 'edit_document_artifact') return 'Editing document';
   if (name.startsWith('search')) return 'Searching';
@@ -416,6 +419,7 @@ function aggregateToolStatus(runs: ToolRun[]): ToolCall['status'] {
 function resultCountForRun(run: ToolRun): number | null {
   const result = run.result;
   if (!result) return null;
+  if (result.deck_job) return null;
   if (typeof result.count === 'number') return result.count;
   if (Array.isArray(result.sources)) return result.sources.length;
   if (Array.isArray(result.results)) return result.results.length;
@@ -549,6 +553,8 @@ function toolStatusText(tool: ToolCall): string {
   const runCount = runs.length;
   const totalCount = aggregateResultCount(tool);
   const suffix = runCount > 1 ? ` across ${runCount} runs` : '';
+  const latestResult = runs[runs.length - 1]?.result || tool.result;
+  const deckJob = tool.tool === 'create_deck_artifact' ? latestResult?.deck_job : null;
 
   if (tool.status === 'started' || tool.status === 'executing') {
     const priorCount = totalCount !== null ? ` · ${totalCount} ${resultNoun(tool.tool)} so far` : '';
@@ -556,6 +562,10 @@ function toolStatusText(tool: ToolCall): string {
   }
   if (tool.status === 'error') return runCount > 1 ? `${runCount} runs failed` : 'Failed';
   if (tool.status === 'cancelled') return 'Stopped';
+  if (deckJob) {
+    const phase = String(deckJob.phase || deckJob.status || 'queued').replace(/_/g, ' ');
+    return deckJob.status === 'completed' ? 'Deck complete' : `Deck job ${phase}`;
+  }
   if (totalCount !== null) return `Found ${totalCount} ${resultNoun(tool.tool)}${suffix}`;
   if ((tool.tool === 'create_document_artifact' || tool.tool === 'edit_document_artifact') && tool.result?.document?.file_name) {
     return tool.result.document.file_name;
@@ -610,6 +620,19 @@ function mergeDocumentCards(
     if (!prior || nextConfidence >= priorConfidence) byKey.set(key, merged);
   }
   return [...byKey.values()];
+}
+
+function mergeCitationSources(
+  existing: CitationSource[] | undefined,
+  incoming: CitationSource[] | undefined
+): CitationSource[] | undefined {
+  const all = [...(existing || []), ...(incoming || [])].filter(s => typeof s?.id === 'number');
+  if (all.length === 0) return existing;
+  const byId = new Map<number, CitationSource>();
+  for (const source of all) {
+    byId.set(source.id, { ...byId.get(source.id), ...source });
+  }
+  return [...byId.values()].sort((a, b) => a.id - b.id);
 }
 
 function readStoredMartyMode(): MartyMode {
@@ -1098,6 +1121,8 @@ export default function GodModePage() {
         const pendingRuns = runs.map(run => ({
           sessionId: run.sessionId,
           requestId: run.requestId,
+          runId: run.runId || null,
+          lastSeq: run.lastSeq || 0,
         }));
         localStorage.setItem(MARTY_PENDING_RUNS_STORAGE_KEY, JSON.stringify(pendingRuns));
         localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify(pendingRuns[0]));
@@ -1136,7 +1161,7 @@ export default function GodModePage() {
     cancelledLocallyRef.current = true;
     locallyCancelledRequestIdsRef.current.add(reqId);
     if (run?.clientRequestId) locallyCancelledRequestIdsRef.current.add(run.clientRequestId);
-    api.cancelAgentQuery(reqId).catch(() => {});
+    api.cancelAgentQuery({ request_id: reqId, run_id: run?.runId || null, session_id: sessionId }).catch(() => {});
     run?.abortController?.abort();
 
     if (sessionId) {
@@ -1521,9 +1546,18 @@ export default function GodModePage() {
           }).catch(e => {
             clearRunningStream(sessionId);
             if (isSessionNotFoundError(e)) {
-              setActiveSessionId(current => current === sessionId ? null : current);
-              setMessages([]);
-              removeSessionFromSidebar(sessionId);
+              upsertSessionInSidebar({
+                id: sessionId,
+                title: 'Repairing session...',
+                last_activity_at: new Date().toISOString(),
+              });
+              updateSessionDraft(sessionId, current => current.length > 0 ? current : [{
+                id: crypto.randomUUID(),
+                role: 'assistant',
+                content: 'This chat is repairing its server record. Your visible draft is preserved; retry once the session list refreshes.',
+                error: true,
+                retryable: true,
+              }]);
               api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
             }
           });
@@ -1600,14 +1634,19 @@ export default function GodModePage() {
         }).catch(e => {
         if (isSessionNotFoundError(e)) {
           const missingSessionId = activeSessionId;
-          setActiveSessionId(current => current === missingSessionId ? null : current);
-          if (activeSessionIdRef.current === missingSessionId) activeSessionIdRef.current = null;
-          setMessages([]);
-          setSessionUploads([]);
-          setBytesUsed(0);
-          setBytesTotal(0);
-          removeSessionFromSidebar(missingSessionId);
           clearRunningStream(missingSessionId);
+          upsertSessionInSidebar({
+            id: missingSessionId,
+            title: sessions.find(s => s.id === missingSessionId)?.title || 'Repairing session...',
+            last_activity_at: new Date().toISOString(),
+          });
+          updateSessionDraft(missingSessionId, current => current.length > 0 ? current : [{
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: 'This chat is temporarily unavailable on the server. I kept it visible here while MARTy repairs or refreshes the session list.',
+            error: true,
+            retryable: true,
+          }]);
           api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
         }
         });
@@ -1658,9 +1697,18 @@ export default function GodModePage() {
           const missingSessionId = activeSessionId;
           clearRunningStream(missingSessionId);
           if (activeSessionIdRef.current === missingSessionId) setIsThinking(false);
-          setActiveSessionId(current => current === missingSessionId ? null : current);
-          setMessages([]);
-          removeSessionFromSidebar(missingSessionId);
+          upsertSessionInSidebar({
+            id: missingSessionId,
+            title: sessions.find(s => s.id === missingSessionId)?.title || 'Repairing session...',
+            last_activity_at: new Date().toISOString(),
+          });
+          updateSessionDraft(missingSessionId, current => current.length > 0 ? current : [{
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: 'This chat is repairing its server state. I kept the local transcript visible instead of dropping it from the sidebar.',
+            error: true,
+            retryable: true,
+          }]);
           api.listSessions().then(d2 => mergeSessionsFromServer(d2.sessions)).catch(() => {});
           return;
         }
@@ -2055,14 +2103,25 @@ export default function GodModePage() {
             });
           }
           if (staleSession) {
-            if (activeSessionIdRef.current === requestSessionId) {
-              activeSessionIdRef.current = null;
-              setActiveSessionId(null);
+            if (requestSessionId) {
+              upsertSessionInSidebar({
+                id: requestSessionId,
+                title: sessions.find(s => s.id === requestSessionId)?.title || optimisticSessionTitle(trimmedQuery),
+                last_activity_at: new Date().toISOString(),
+              });
+              updateSessionDraft(requestSessionId, m => m.map(msg =>
+                msg.id === assistantMsgId
+                  ? {
+                      ...msg,
+                      content: msg.content || 'This chat hit a session repair path. I kept it visible so you can retry without losing the thread.',
+                      streaming: false,
+                      pendingRequestId: undefined,
+                      error: true,
+                      retryable: true,
+                    }
+                  : msg
+              ));
             }
-            if (requestSessionId) removeSessionFromSidebar(requestSessionId);
-            setSessionUploads([]);
-            setBytesUsed(0);
-            setBytesTotal(0);
             api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
           }
           if (pendingSessionIdRef.current === finalSessionId) pendingSessionIdRef.current = null;
@@ -2099,6 +2158,8 @@ export default function GodModePage() {
             registerRunningStream({
               sessionId: event.session_id,
               requestId: runningStreamsRef.current[event.session_id]?.requestId || clientRequestId,
+              runId: runningStreamsRef.current[event.session_id]?.runId || null,
+              lastSeq: runningStreamsRef.current[event.session_id]?.lastSeq || 0,
               assistantMessageId: assistantMsgId,
               abortController,
               clientRequestId,
@@ -2113,6 +2174,19 @@ export default function GodModePage() {
             registerRunningStream({
               sessionId: requestSessionId!,
               requestId: event.request_id,
+              runId: runningStreamsRef.current[requestSessionId!]?.runId || null,
+              lastSeq: runningStreamsRef.current[requestSessionId!]?.lastSeq || 0,
+              assistantMessageId: assistantMsgId,
+              abortController,
+              clientRequestId,
+            });
+            return;
+          }
+          if (event.type === 'run' && event.run_id) {
+            registerRunningStream({
+              sessionId: event.session_id || requestSessionId!,
+              requestId: event.request_id || runningStreamsRef.current[requestSessionId!]?.requestId || clientRequestId,
+              runId: event.run_id,
               assistantMessageId: assistantMsgId,
               abortController,
               clientRequestId,
@@ -2123,6 +2197,13 @@ export default function GodModePage() {
             const sources = (event.sources || []) as CitationSource[];
             updateSessionDraft(requestSessionId!, m => m.map(msg =>
               msg.id === assistantMsgId ? { ...msg, sources } : msg
+            ));
+            return;
+          }
+          if (event.type === 'sources_delta') {
+            const incoming = (event.sources || []) as CitationSource[];
+            updateSessionDraft(requestSessionId!, m => m.map(msg =>
+              msg.id === assistantMsgId ? { ...msg, sources: mergeCitationSources(msg.sources, incoming) } : msg
             ));
             return;
           }

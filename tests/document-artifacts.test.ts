@@ -75,4 +75,51 @@ describe('document artifact quality gates', () => {
     expect(indent).toBeGreaterThanOrEqual(540);
     expect(calloutBlock).toContain('w:space="14"');
   });
+
+  it('builds an HTML-first deck plan with Medina branding and safe accent spacing', () => {
+    const content = {
+      audience: 'internal IC',
+      objective: 'decide',
+      style_pack: 'medina_default',
+      summary: 'NeuralSeek is ready for a decision if revenue quality and channel concentration are underwritten explicitly.',
+      slides: [
+        { layout: 'cover', title: 'NeuralSeek IC Decision', headline: 'A focused diligence deck for the investment committee.' },
+        { layout: 'executive_summary', title: 'The decision is attractive but not automatic', headline: 'Medina can underwrite the round if SaaS ARR and IBM channel dependence are separated.', metrics: [{ label: 'Probability', value: '84%' }, { label: 'Lead', value: '$1M' }] },
+        { layout: 'matrix', title: 'Revenue quality is the central diligence issue', headline: 'The underwriting case depends on isolating repeatable SaaS from services and channel resale.', table: { headers: ['Question', 'Why it matters', 'Status'], rows: [['SaaS ARR', 'Baseline for valuation', 'Needs bridge'], ['IBM channel', 'Concentration risk', 'Needs mitigation']] } },
+        { layout: 'evidence', title: 'Customer proof is real but uneven', headline: 'Enterprise logos support the thesis while usage depth still needs confirmation.', evidence_blocks: ['136 enterprise clients', '24 countries', 'Customer-driven roadmap'] },
+        { layout: 'risk', title: 'Open diligence items remain underwriteable', headline: 'The risks are explicit enough to assign owners before close.', bullets: ['Revenue bridge', 'Channel concentration', 'Corporate structure'] },
+        { layout: 'next_steps', title: 'The next step is a scoped confirmatory diligence push', headline: 'Resolve the open questions before Medina commits.', table: { headers: ['Step', 'Owner', 'Output'], rows: [['Revenue bridge', 'Finance', 'Clean ARR split'], ['Customer calls', 'Deal team', 'Reference notes']] } },
+      ],
+    };
+
+    const plan = __documentArtifactsTestHooks.deckPlanFromContent('NeuralSeek IC Decision', content);
+    const html = __documentArtifactsTestHooks.renderPremiumDeckHtml('NeuralSeek IC Decision', content);
+    const qa = __documentArtifactsTestHooks.evaluatePremiumDeckQa('NeuralSeek IC Decision', content, html);
+
+    expect(plan.style_pack).toBe('medina_default');
+    expect(plan.objective).toBe('decide');
+    expect(plan.slides).toHaveLength(6);
+    expect(html).toContain('--accent-gutter: 72px');
+    expect(html).toContain('HTML source of truth');
+    expect(qa.status).toBe('pass');
+    expect(qa.checks.visual_surface_count).toBeGreaterThanOrEqual(4);
+  });
+
+  it('blocks critically unsafe deck QA before polished export', () => {
+    const qa = __documentArtifactsTestHooks.evaluatePremiumDeckQa('Thin Deck', {
+      slides: [
+        { layout: 'cover', title: 'Thin Deck' },
+        { title: '' },
+      ],
+    });
+
+    expect(qa.status).toBe('failed');
+    expect(qa.slideFindings.some(f => f.severity === 'critical')).toBe(true);
+  });
+
+  it('normalizes deck output formats and exposes the render queue domain', () => {
+    expect(__documentArtifactsTestHooks.normalizeDeckOutputFormats(['pdf', 'pptx', 'bogus', 'pdf'])).toEqual(['pdf', 'pptx']);
+    expect(__documentArtifactsTestHooks.normalizeDeckOutputFormats([])).toEqual(['html', 'pdf', 'pptx']);
+    expect(__documentArtifactsTestHooks.DECK_RENDER_WORK_DOMAIN).toBe('deck_render');
+  });
 });

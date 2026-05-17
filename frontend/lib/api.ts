@@ -570,11 +570,19 @@ export const api = {
     request<{ ok: boolean }>(`/agent/sessions/${id}`, { method: 'DELETE' }),
   renameSession: (id: string, title: string) =>
     request<{ ok: boolean }>(`/agent/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
-  cancelAgentQuery: (request_id: string) =>
-    request<{ ok: boolean; local: boolean; cancelled_rows?: number }>('/agent/cancel', {
+  cancelAgentQuery: (input: string | { request_id?: string | null; run_id?: string | null; session_id?: string | null }) => {
+    const body = typeof input === 'string' ? { request_id: input } : input;
+    return request<{ ok: boolean; local: boolean; cancelled_rows?: number }>('/agent/cancel', {
       method: 'POST',
-      body: JSON.stringify({ request_id }),
-    }).catch(() => ({ ok: false, local: false, cancelled_rows: 0 })),
+      body: JSON.stringify(body),
+    }).catch(() => ({ ok: false, local: false, cancelled_rows: 0 }));
+  },
+  getAgentRunEvents: (runId: string, afterSeq = 0, waitMs = 0) =>
+    request<{
+      run: any;
+      events: Array<{ seq: number; event_type: string; payload: any; created_at: string }>;
+      latest_seq: number;
+    }>(`/agent/runs/${encodeURIComponent(runId)}/events?after_seq=${afterSeq}&wait_ms=${waitMs}`),
   logCitationClick: (payload: {
     message_id?: string;
     source_id: number;
@@ -632,6 +640,16 @@ export const api = {
   listSessionUploads: (sessionId: string) =>
     request<{ uploads: ChatUploadSummary[] }>(`/agent/sessions/${sessionId}/uploads`),
   uploadContentUrl: (uploadId: string) => `${API_BASE}/agent/uploads/${uploadId}/content`,
+
+  // Deck production jobs
+  getDeckJob: (jobId: string) =>
+    request<{ job: any }>(`/deck-jobs/${encodeURIComponent(jobId)}`),
+  getDeckJobEvents: (jobId: string, afterSeq = 0, waitMs = 0) =>
+    request<{
+      job: any;
+      events: Array<{ seq: number; event_type: string; payload: any; created_at: string }>;
+      latest_seq: number;
+    }>(`/deck-jobs/${encodeURIComponent(jobId)}/events?after_seq=${afterSeq}&wait_ms=${waitMs}`),
 
   // Campaigns
   listCampaigns: () => request<{ campaigns: any[] }>('/campaigns'),
@@ -1658,11 +1676,19 @@ export async function streamAgentQuery(
           } else if (evt.type === 'request') {
             // Cancellation handle — first event the server emits per turn.
             onToolEvent?.({ type: 'request', request_id: evt.request_id });
+          } else if (evt.type === 'run') {
+            onToolEvent?.(evt);
           } else if (evt.type === 'sources') {
             onToolEvent?.({ type: 'sources', sources: evt.sources });
+          } else if (evt.type === 'sources_delta') {
+            onToolEvent?.(evt);
           } else if (evt.type === 'attachments') {
             onToolEvent?.(evt);
           } else if (evt.type === 'document_cards') {
+            onToolEvent?.(evt);
+          } else if (evt.type === 'model_error') {
+            onToolEvent?.(evt);
+          } else if (evt.type === 'max_step') {
             onToolEvent?.(evt);
           } else if (evt.text) {
             receivedContent = true;

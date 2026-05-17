@@ -173,6 +173,7 @@ import { martyLabArtifactReviewHandler } from './work-queue-handlers/marty-lab-a
 import { martyLabCodePatchHandler } from './work-queue-handlers/marty-lab-code-patch';
 import { contactEnrichmentHandler } from './work-queue-handlers/contact-enrichment';
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
+import { deckRenderHandler } from './work-queue-handlers/deck-render';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -209,6 +210,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   martyLabArtifactReviewHandler,
   martyLabCodePatchHandler,
   ragReindexV2Handler,
+  deckRenderHandler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────

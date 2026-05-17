@@ -2028,8 +2028,9 @@ export async function getDealMetrics(
          WHEN 'due_diligence' THEN 3
          WHEN 'term_sheet' THEN 4
          WHEN 'closing' THEN 5
-         WHEN 'closed_won' THEN 6
-         WHEN 'closed_lost' THEN 7
+         WHEN 'closed' THEN 6
+         WHEN 'closed_won' THEN 7
+         WHEN 'closed_lost' THEN 8
        END`
     ).bind(ctx.orgId).all(),
 
@@ -2044,7 +2045,7 @@ export async function getDealMetrics(
               ), 1) AS avg_days
        FROM deals
        WHERE org_id = ? AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')
+         AND stage NOT IN ('closed','closed_won','closed_lost')
        GROUP BY stage`
     ).bind(ctx.orgId).all(),
 
@@ -2053,7 +2054,7 @@ export async function getDealMetrics(
       `SELECT COALESCE(SUM(amount), 0) AS total_pipeline_value
        FROM deals
        WHERE org_id = ? AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')`
+         AND stage NOT IN ('closed','closed_won','closed_lost')`
     ).bind(ctx.orgId).first<{ total_pipeline_value: number }>(),
 
     // Stale deals: no activity in the last 7 days
@@ -2061,7 +2062,7 @@ export async function getDealMetrics(
       `SELECT id, title, stage, last_activity_date, company_id
        FROM deals
        WHERE org_id = ? AND deleted_at IS NULL
-         AND stage NOT IN ('closed_won','closed_lost')
+         AND stage NOT IN ('closed','closed_won','closed_lost')
          AND (last_activity_date IS NULL
               OR last_activity_date < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days'))
        ORDER BY last_activity_date ASC NULLS FIRST

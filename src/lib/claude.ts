@@ -194,6 +194,10 @@ export interface ToolDefinition {
 }
 
 export type ToolExecutor = (name: string, input: any) => Promise<any>;
+export type ToolResultTransformer = (
+  name: string,
+  result: any
+) => Promise<{ result: any; events?: any[] }> | { result: any; events?: any[] };
 
 function abortError(): Error {
   const err = new Error('MARTy request cancelled');
@@ -234,6 +238,7 @@ export async function callClaudeStreaming(
     maxIterations?: number;
     tools?: ToolDefinition[];
     onToolCall?: ToolExecutor;
+    onToolResult?: ToolResultTransformer;
     preludeEvents?: any[];
     // Wave-1 cancellation: when this signal aborts, the streaming fetch is
     // interrupted and the run loop exits cleanly between iterations.
@@ -363,7 +368,7 @@ export async function callClaudeStreaming(
           retryable: true,
         });
         await emit({
-          text: '\n\nI hit a model handoff limit while synthesizing the retrieved evidence. The retrieval completed, but the final narrative did not finish cleanly. Please retry this MAX request; MARTy will reuse the same underlying sources with a smaller synthesis payload.',
+          text: '\n\nMARTy hit a model handoff issue. Retry is safe.',
         });
         break;
       }
@@ -481,12 +486,19 @@ export async function callClaudeStreaming(
 
           try {
             throwIfAborted(params.signal);
-            const result = await abortable(params.onToolCall(block.name, block.input), params.signal);
+            const rawResult = await abortable(params.onToolCall(block.name, block.input), params.signal);
             throwIfAborted(params.signal);
+            const transformed = params.onToolResult
+              ? await params.onToolResult(block.name, rawResult)
+              : { result: rawResult };
+            const result = transformed.result;
             const resultStr = stringifyToolResultForModel(block.name, result);
 
             if (result && typeof result === 'object' && Array.isArray((result as any).document_cards)) {
               await emit({ type: 'document_cards', document_cards: (result as any).document_cards });
+            }
+            for (const event of transformed.events || []) {
+              await emit(event);
             }
             await emit({ type: 'tool_result', tool: block.name, result, status: 'done' });
 
@@ -500,8 +512,16 @@ export async function callClaudeStreaming(
               console.log('[claude-stream] tool execution aborted');
               break;
             }
-            const errorResult = JSON.stringify({ error: e.message });
-            await emit({ type: 'tool_result', tool: block.name, result: { error: e.message }, status: 'error' });
+            const errorResult = JSON.stringify({
+              error: 'TOOL_EXECUTION_FAILED',
+              message: 'The tool failed before returning a safe result. Report this as an incomplete tool run; do not fabricate the missing data.',
+            });
+            await emit({
+              type: 'tool_result',
+              tool: block.name,
+              result: { error: 'TOOL_EXECUTION_FAILED', retryable: true },
+              status: 'error',
+            });
             toolResults.push({
               type: 'tool_result',
               tool_use_id: block.id,
@@ -527,7 +547,8 @@ export async function callClaudeStreaming(
   runLoop().catch(async (e) => {
     console.error(`[claude-stream] runLoop fatal error:`, e.message);
     try {
-      await emit({ text: `\n\n[Error: ${e.message}]` });
+      await emit({ type: 'model_error', retryable: true });
+      await emit({ text: '\n\nMARTy hit a model handoff issue. Retry is safe.' });
       await emitDone();
       await writer.close();
     } catch { /* writer may be closed */ }

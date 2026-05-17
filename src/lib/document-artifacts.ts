@@ -8,9 +8,141 @@ import { persistDocument, type DocumentLink, type DocumentVisibility } from './p
 import { preprocessQuery, retrieveContext } from './retrieval';
 import { callClaude } from './claude';
 import { truncateToTokens } from './tokens';
+import { enqueueWork } from './work-queue';
 
 export type MartyDocumentCardMode = 'compact' | 'dominant';
 export type ArtifactKind = 'docx' | 'xlsx' | 'pptx' | 'pdf';
+export type DeckStylePackId = 'medina_default' | 'banker_clean' | 'consulting_editorial' | 'founder_story' | 'lp_report';
+export type DeckObjective = 'inform' | 'persuade' | 'decide' | 'update' | 'sell';
+export type DeckQaStatus = 'pass' | 'needs_revision' | 'failed';
+export type DeckQaSeverity = 'critical' | 'high' | 'medium' | 'low';
+
+export interface DeckFact {
+  id: string;
+  claim: string;
+  value?: string | number;
+  sourceIds: string[];
+  confidence: 'confirmed' | 'probable' | 'needs_review';
+  use: 'headline' | 'chart' | 'table' | 'speaker_note' | 'appendix';
+}
+
+export interface DeckStylePack {
+  id: DeckStylePackId;
+  name: string;
+  audienceFit: string[];
+  palette: string[];
+  typography: {
+    display: string;
+    body: string;
+    mono?: string;
+  };
+  layoutGrid: 'editorial' | 'banker' | 'consulting' | 'product' | 'board';
+  density: 'sparse' | 'balanced' | 'dense';
+  motifs: string[];
+}
+
+export interface SlideSpec {
+  id: string;
+  role: string;
+  headline: string;
+  layout: string;
+  facts: string[];
+  visualIntent: string;
+  speakerNotes?: string;
+}
+
+export interface DeckPlan {
+  title: string;
+  audience: string;
+  objective: DeckObjective;
+  storyline: string[];
+  style_pack: DeckStylePackId;
+  slides: SlideSpec[];
+  facts: DeckFact[];
+}
+
+export interface DeckQaReport {
+  status: DeckQaStatus;
+  slideFindings: {
+    slideId: string;
+    severity: DeckQaSeverity;
+    issue: string;
+    requiredFix: string;
+  }[];
+  checks: {
+    slide_count: number;
+    visual_surface_count: number;
+    average_words_per_slide: number;
+    max_words_on_slide: number;
+    accent_gutter_px: number;
+    html_bytes: number;
+  };
+}
+
+export type DeckJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type DeckJobPhase =
+  | 'planning'
+  | 'research'
+  | 'narrative'
+  | 'visual_direction'
+  | 'html_render'
+  | 'render_qa'
+  | 'repair'
+  | 'export'
+  | 'complete'
+  | 'failed';
+
+export interface DeckScreenshot {
+  slideId: string;
+  index: number;
+  fileName: string;
+  mimeType: 'image/png';
+  width: number;
+  height: number;
+  base64?: string;
+  document_id?: string;
+}
+
+export interface DeckVisualQaFinding {
+  slideId: string;
+  severity: DeckQaSeverity;
+  issue: string;
+  requiredFix: string;
+}
+
+export interface DeckRenderRequest {
+  job_id: string;
+  title: string;
+  html: string;
+  style_pack: DeckStylePackId;
+  quality_mode: 'fast' | 'premium';
+  output_formats: Array<'html' | 'pdf' | 'pptx'>;
+  plan: DeckPlan;
+  qa_report: DeckQaReport;
+}
+
+export interface DeckRenderResult {
+  job_id: string;
+  status: DeckQaStatus;
+  qa_report: DeckQaReport;
+  screenshots?: DeckScreenshot[];
+  pdf_base64?: string;
+  metrics?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface DeckRepairPatch {
+  slide_patches?: Array<{
+    slideId: string;
+    headline?: string;
+    layout?: string;
+    visualIntent?: string;
+    body?: string;
+    bullets?: string[];
+  }>;
+  style_patch?: Record<string, unknown>;
+  rationale?: string;
+}
 
 export interface MartyDocumentCard {
   document_id: string;
@@ -88,6 +220,66 @@ const MIME_BY_KIND: Record<ArtifactKind, string> = {
   pdf: 'application/pdf',
 };
 
+const DECK_HTML_MIME = 'text/html; charset=utf-8';
+export const DECK_RENDER_WORK_DOMAIN = 'deck_render';
+
+const DECK_STYLE_PACKS: Record<DeckStylePackId, DeckStylePack> = {
+  medina_default: {
+    id: 'medina_default',
+    name: 'Medina Ventures Default',
+    audienceFit: ['internal IC', 'board', 'portfolio', 'diligence', 'weekly recap'],
+    palette: ['#08080D', '#12121A', '#F8FAFC', '#D946A8', '#8B5CF6', '#38BDF8'],
+    typography: { display: 'DM Sans', body: 'Inter', mono: 'JetBrains Mono' },
+    layoutGrid: 'editorial',
+    density: 'balanced',
+    motifs: ['offset-magenta-rule', 'quiet-dark-panels', 'evidence-led-layouts'],
+  },
+  banker_clean: {
+    id: 'banker_clean',
+    name: 'Banker Clean',
+    audienceFit: ['IC', 'board', 'LP', 'transaction committee'],
+    palette: ['#FFFFFF', '#F4F5F7', '#111827', '#1D4ED8', '#64748B', '#A855F7'],
+    typography: { display: 'Aptos Display', body: 'Aptos', mono: 'Aptos Mono' },
+    layoutGrid: 'banker',
+    density: 'dense',
+    motifs: ['tight-exhibit-headlines', 'thin-rules', 'source-footers'],
+  },
+  consulting_editorial: {
+    id: 'consulting_editorial',
+    name: 'Consulting Editorial',
+    audienceFit: ['strategy', 'operating review', 'market analysis', 'board'],
+    palette: ['#FBFBFC', '#ECEFF3', '#101828', '#334155', '#2563EB', '#E11D48'],
+    typography: { display: 'Aptos Display', body: 'Aptos' },
+    layoutGrid: 'consulting',
+    density: 'balanced',
+    motifs: ['so-what-headlines', 'exhibit-labels', 'structured-white-space'],
+  },
+  founder_story: {
+    id: 'founder_story',
+    name: 'Founder Story',
+    audienceFit: ['founder', 'sales', 'external narrative', 'pitch'],
+    palette: ['#111827', '#192132', '#F8FAFC', '#22D3EE', '#F97316', '#FACC15'],
+    typography: { display: 'DM Sans', body: 'Inter' },
+    layoutGrid: 'product',
+    density: 'sparse',
+    motifs: ['hero-claims', 'product-panels', 'momentum-metrics'],
+  },
+  lp_report: {
+    id: 'lp_report',
+    name: 'LP Report',
+    audienceFit: ['LP', 'quarterly update', 'investor update'],
+    palette: ['#F8F7F4', '#E8E1D7', '#151515', '#6D28D9', '#0F766E', '#9A3412'],
+    typography: { display: 'Aptos Display', body: 'Aptos' },
+    layoutGrid: 'board',
+    density: 'balanced',
+    motifs: ['folio-markers', 'calm-evidence', 'portfolio-summary-bands'],
+  },
+};
+
+const DECK_ACCENT_GUTTER_PX = 72;
+const DECK_RENDERER_TIMEOUT_MS = 90_000;
+const DECK_ALLOWED_OUTPUT_FORMATS = new Set(['html', 'pdf', 'pptx']);
+
 const DOCX_PAGE_MARGIN_DXA = 1080;
 const DOCX_TABLE_WIDTH_DXA = 9360;
 const DOCX_CALLOUT_INDENT_DXA = 540;
@@ -96,6 +288,87 @@ const DOCX_CALLOUT_BORDER_SPACE = 14;
 function clampLimit(limit: unknown, fallback = 8): number {
   const n = typeof limit === 'number' && Number.isFinite(limit) ? Math.floor(limit) : fallback;
   return Math.min(Math.max(n, 1), 20);
+}
+
+function isDeckRendererEnabled(env: Env): boolean {
+  return env.DECK_RENDERER_ENABLED === 'true' && Boolean(env.DECK_RENDERER_URL && env.DECK_RENDERER_TOKEN);
+}
+
+function normalizeDeckOutputFormats(value: unknown): Array<'html' | 'pdf' | 'pptx'> {
+  const raw = Array.isArray(value) ? value : ['html', 'pdf', 'pptx'];
+  const formats = raw
+    .map(v => String(v || '').toLowerCase())
+    .filter((v): v is 'html' | 'pdf' | 'pptx' => DECK_ALLOWED_OUTPUT_FORMATS.has(v));
+  return formats.length > 0 ? [...new Set(formats)] : ['html', 'pdf', 'pptx'];
+}
+
+function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
+  if (!value) return fallback;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed == null ? fallback : parsed as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function bytesFromBase64(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function appendDeckJobEvent(
+  env: Env,
+  jobId: string,
+  orgId: string,
+  eventType: string,
+  payload: unknown
+): Promise<number> {
+  const seqRow = await env.D1.prepare(
+    `SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
+       FROM deck_artifact_job_events
+      WHERE job_id = ?`
+  ).bind(jobId).first<{ next_seq: number }>();
+  const seq = Number(seqRow?.next_seq || 1);
+  await env.D1.prepare(
+    `INSERT INTO deck_artifact_job_events
+       (id, job_id, org_id, seq, event_type, payload_json)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(
+    crypto.randomUUID(),
+    jobId,
+    orgId,
+    seq,
+    eventType,
+    JSON.stringify(payload ?? {})
+  ).run();
+  await env.D1.prepare(
+    `UPDATE deck_artifact_jobs
+        SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(jobId).run().catch(() => {});
+  return seq;
+}
+
+async function updateDeckJobPhase(
+  env: Env,
+  jobId: string,
+  orgId: string,
+  phase: DeckJobPhase,
+  payload: Record<string, unknown> = {}
+): Promise<void> {
+  await env.D1.prepare(
+    `UPDATE deck_artifact_jobs
+        SET status = CASE WHEN ? IN ('complete', 'failed') THEN status ELSE 'running' END,
+            phase = ?,
+            heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(phase, phase, jobId, orgId).run().catch(() => {});
+  await appendDeckJobEvent(env, jobId, orgId, 'phase', { phase, ...payload }).catch(() => {});
 }
 
 const DOCUMENT_QUERY_STOPWORDS = new Set([
@@ -1364,6 +1637,378 @@ function slidesFromContent(title: string, content: any): any[] {
   return slides.slice(0, 12).map((slide, index) => normalizePptxSlide(title, slide, index));
 }
 
+function deckStylePackFrom(input: any, title: string): DeckStylePackId {
+  const explicit = cleanArtifactText(input?.style_pack || input?.stylePack || input?.deck_style_pack).toLowerCase();
+  if (explicit && explicit in DECK_STYLE_PACKS) return explicit as DeckStylePackId;
+  const text = `${title} ${plainTextFromStructured(input)}`.toLowerCase();
+  if (/\b(lp|limited partner|quarterly update|investor update)\b/.test(text)) return 'lp_report';
+  if (/\b(founder|pitch|sales|customer|demo|product story)\b/.test(text)) return 'founder_story';
+  if (/\b(board|ic|investment committee|committee|banker|financing|transaction)\b/.test(text)) return 'banker_clean';
+  if (/\b(strategy|market map|operating review|recommendation|workstream)\b/.test(text)) return 'consulting_editorial';
+  return 'medina_default';
+}
+
+function inferDeckObjective(input: any, title: string): DeckObjective {
+  const explicit = cleanArtifactText(input?.objective).toLowerCase();
+  if (explicit === 'inform' || explicit === 'persuade' || explicit === 'decide' || explicit === 'update' || explicit === 'sell') return explicit;
+  const text = `${title} ${plainTextFromStructured(input)}`.toLowerCase();
+  if (/\b(decide|decision|approve|approval|commit|go\/no-go|go no go)\b/.test(text)) return 'decide';
+  if (/\b(sell|sales|pitch|convince|persuade|fundraise|raise)\b/.test(text)) return 'sell';
+  if (/\b(update|weekly|monthly|quarterly|recap|status)\b/.test(text)) return 'update';
+  if (/\b(recommend|should|case for|argument)\b/.test(text)) return 'persuade';
+  return 'inform';
+}
+
+function escapeHtml(value: any): string {
+  return cleanArtifactText(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function wordsIn(value: string): number {
+  return cleanArtifactText(value).split(/\s+/).filter(Boolean).length;
+}
+
+function slideWordCount(slide: any): number {
+  const text = [
+    slide?.title,
+    slide?.headline,
+    slide?.subtitle,
+    slide?.body,
+    ...asArray(slide?.bullets),
+    ...slideEvidenceBlocks(slide),
+    ...slideTables(slide).flatMap(t => [...t.headers, ...t.rows.flat()]),
+  ].map(cleanArtifactText).join(' ');
+  return wordsIn(text);
+}
+
+function inferSlideRole(slide: any, index: number): string {
+  const layout = cleanArtifactText(slide?.layout).toLowerCase();
+  if (layout === 'cover' || index === 0) return 'cover';
+  if (layout === 'executive_summary') return 'executive_summary';
+  if (layout === 'risk') return 'risk_register';
+  if (layout === 'timeline' || layout === 'next_steps') return 'action_plan';
+  if (layout === 'matrix') return 'analysis_exhibit';
+  return 'evidence_slide';
+}
+
+function deckFactsFromContent(title: string, content: any, slides: any[]): DeckFact[] {
+  const facts: DeckFact[] = [];
+  const addFact = (claim: string, use: DeckFact['use'], confidence: DeckFact['confidence'] = 'probable') => {
+    const cleaned = cleanArtifactText(claim);
+    if (!cleaned) return;
+    const existing = facts.find(f => f.claim.toLowerCase() === cleaned.toLowerCase());
+    if (existing) return;
+    facts.push({
+      id: `fact_${facts.length + 1}`,
+      claim: cleaned.slice(0, 260),
+      sourceIds: asArray(content?.source_document_ids).map(String),
+      confidence,
+      use,
+    });
+  };
+  addFact(firstNonEmpty(content?.summary, title), 'headline', 'probable');
+  for (const slide of slides) {
+    addFact(slide?.headline || slide?.title, 'headline', 'probable');
+    for (const metric of asArray(slide?.metrics).slice(0, 4)) {
+      const value = firstNonEmpty(metric?.value, metric?.metric);
+      const label = firstNonEmpty(metric?.label, metric?.name, metric?.context);
+      if (value || label) {
+        facts.push({
+          id: `fact_${facts.length + 1}`,
+          claim: `${label || 'Metric'}: ${value || ''}`.trim().slice(0, 260),
+          value: value || undefined,
+          sourceIds: asArray(content?.source_document_ids).map(String),
+          confidence: 'probable',
+          use: 'chart',
+        });
+      }
+    }
+    for (const evidence of slideEvidenceBlocks(slide).slice(0, 2)) addFact(evidence, 'speaker_note', 'needs_review');
+  }
+  return facts.slice(0, 80);
+}
+
+function deckPlanFromContent(title: string, content: any): DeckPlan {
+  const slides = slidesFromContent(title, content);
+  const stylePack = deckStylePackFrom(content, title);
+  const objective = inferDeckObjective(content, title);
+  const slideSpecs: SlideSpec[] = slides.map((slide, index) => ({
+    id: `slide_${index + 1}`,
+    role: inferSlideRole(slide, index),
+    headline: firstNonEmpty(slide?.headline, slide?.title, `Slide ${index + 1}`),
+    layout: cleanArtifactText(slide?.layout) || inferPptxLayout(slide, index),
+    facts: [
+      firstNonEmpty(slide?.headline, slide?.title),
+      ...asArray(slide?.metrics).map((m: any) => `${firstNonEmpty(m?.label, m?.name)} ${firstNonEmpty(m?.value, m?.metric)}`.trim()),
+      ...slideEvidenceBlocks(slide).slice(0, 3),
+    ].map(cleanArtifactText).filter(Boolean).slice(0, 6),
+    visualIntent: firstNonEmpty(slide?.visualIntent, slide?.visual_intent, slide?.layout, 'evidence-led executive slide'),
+    speakerNotes: cleanArtifactText(slide?.speaker_notes || slide?.notes) || undefined,
+  }));
+  const explicitStoryline = asArray(content?.storyline).map(cleanArtifactText).filter(Boolean);
+  const storyline = explicitStoryline.length > 0
+    ? explicitStoryline.slice(0, 8)
+    : slideSpecs
+        .filter(s => s.role !== 'cover')
+        .map(s => s.headline)
+        .slice(0, 6);
+  return {
+    title,
+    audience: firstNonEmpty(content?.audience, content?.target_audience, 'Medina Ventures internal stakeholders'),
+    objective,
+    storyline,
+    style_pack: stylePack,
+    slides: slideSpecs,
+    facts: deckFactsFromContent(title, content, slides),
+  };
+}
+
+function styleTokens(styleId: DeckStylePackId): Record<string, string> {
+  const style = DECK_STYLE_PACKS[styleId] || DECK_STYLE_PACKS.medina_default;
+  if (style.id === 'banker_clean') {
+    return {
+      bg: '#FFFFFF',
+      panel: '#F4F5F7',
+      panel2: '#FFFFFF',
+      text: '#111827',
+      muted: '#64748B',
+      accent: '#1D4ED8',
+      accent2: '#A855F7',
+      border: '#D9DEE7',
+    };
+  }
+  if (style.id === 'consulting_editorial') {
+    return {
+      bg: '#FBFBFC',
+      panel: '#ECEFF3',
+      panel2: '#FFFFFF',
+      text: '#101828',
+      muted: '#667085',
+      accent: '#2563EB',
+      accent2: '#E11D48',
+      border: '#D0D5DD',
+    };
+  }
+  if (style.id === 'founder_story') {
+    return {
+      bg: '#111827',
+      panel: '#192132',
+      panel2: '#243044',
+      text: '#F8FAFC',
+      muted: '#CBD5E1',
+      accent: '#22D3EE',
+      accent2: '#F97316',
+      border: '#334155',
+    };
+  }
+  if (style.id === 'lp_report') {
+    return {
+      bg: '#F8F7F4',
+      panel: '#E8E1D7',
+      panel2: '#FFFFFF',
+      text: '#151515',
+      muted: '#6B625A',
+      accent: '#6D28D9',
+      accent2: '#0F766E',
+      border: '#D6CFC4',
+    };
+  }
+  return {
+    bg: '#08080D',
+    panel: '#12121A',
+    panel2: '#191923',
+    text: '#F8FAFC',
+    muted: '#A1A1AA',
+    accent: '#D946A8',
+    accent2: '#8B5CF6',
+    border: '#2D2D36',
+  };
+}
+
+function renderSlideTableHtml(table: any): string {
+  const t = tableFromAny(table);
+  if (!t || t.headers.length === 0) return '';
+  const rows = t.rows.slice(0, 8);
+  return `<div class="table-wrap">${t.title ? `<div class="table-title">${escapeHtml(t.title)}</div>` : ''}<table><thead><tr>${t.headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${t.headers.map((_, i) => `<td>${escapeHtml(row[i])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+
+function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaReport): string {
+  const slides = slidesFromContent(title, content);
+  const plan = deckPlanFromContent(title, content);
+  const style = DECK_STYLE_PACKS[plan.style_pack];
+  const T = styleTokens(plan.style_pack);
+  const qa = qaReport || evaluatePremiumDeckQa(title, content);
+  const slideHtml = slides.map((slide, index) => {
+    const metrics = asArray(slide.metrics).slice(0, 4);
+    const evidence = slideEvidenceBlocks(slide).slice(0, 5);
+    const tableHtml = renderSlideTableHtml(slide.table);
+    const bullets = asArray(slide.bullets).map(cleanArtifactText).filter(Boolean).slice(0, 5);
+    const layout = cleanArtifactText(slide.layout || 'evidence');
+    const body = cleanArtifactText(slide.body);
+    const metricHtml = metrics.length
+      ? `<div class="metrics">${metrics.map((m: any) => `<div class="metric"><div class="metric-value">${escapeHtml(firstNonEmpty(m?.value, m?.metric, m))}</div><div class="metric-label">${escapeHtml(firstNonEmpty(m?.label, m?.name, m?.context))}</div></div>`).join('')}</div>`
+      : '';
+    const evidenceHtml = evidence.length
+      ? `<div class="evidence-grid">${evidence.map((e, i) => `<div class="evidence-card"><span>${String(i + 1).padStart(2, '0')}</span><strong>${escapeHtml(e)}</strong></div>`).join('')}</div>`
+      : '';
+    const bulletHtml = bullets.length
+      ? `<ul>${bullets.map(b => `<li>${escapeHtml(b)}</li>`).join('')}</ul>`
+      : '';
+    const mainVisual = tableHtml || evidenceHtml || metricHtml || bulletHtml;
+    if (layout === 'cover' || index === 0) {
+      return `<section class="slide cover" data-slide="${index + 1}">
+        <div class="slide-accent"></div>
+        <div class="kicker">MEDINA VENTURES · ${escapeHtml(style.name)}</div>
+        <h1>${escapeHtml(slide.title || title)}</h1>
+        <p class="cover-subtitle">${escapeHtml(firstNonEmpty(slide.headline, slide.subtitle, content?.summary, 'Prepared by MARTy'))}</p>
+        <div class="cover-proof">${evidenceHtml || metricHtml || '<div class="evidence-grid"><div class="evidence-card"><span>01</span><strong>Claim spine</strong></div><div class="evidence-card"><span>02</span><strong>Visual system</strong></div><div class="evidence-card"><span>03</span><strong>QA-gated export</strong></div></div>'}</div>
+        <footer>${escapeHtml(firstNonEmpty(slide.subtitle, 'Prepared by MARTy'))}</footer>
+      </section>`;
+    }
+    return `<section class="slide ${escapeHtml(layout)}" data-slide="${index + 1}">
+      <div class="slide-accent"></div>
+      <div class="kicker">${escapeHtml(inferSlideRole(slide, index).replace(/_/g, ' '))}</div>
+      <header>
+        <h2>${escapeHtml(slide.title)}</h2>
+        <p>${escapeHtml(firstNonEmpty(slide.headline, slide.takeaway))}</p>
+      </header>
+      <main class="${tableHtml ? 'with-table' : evidence.length ? 'with-evidence' : 'with-bullets'}">
+        <div class="narrative">
+          ${metricHtml}
+          ${body ? `<p class="body">${escapeHtml(body)}</p>` : ''}
+          ${bulletHtml}
+        </div>
+        <div class="visual">${mainVisual}</div>
+      </main>
+      ${slide.source_note ? `<div class="source-note">Source note: ${escapeHtml(slide.source_note)}</div>` : ''}
+      <footer>${index + 1}/${slides.length}</footer>
+    </section>`;
+  }).join('\n');
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>${escapeHtml(title)}</title>
+<style>
+:root {
+  --bg: ${T.bg};
+  --panel: ${T.panel};
+  --panel-2: ${T.panel2};
+  --text: ${T.text};
+  --muted: ${T.muted};
+  --accent: ${T.accent};
+  --accent-2: ${T.accent2};
+  --border: ${T.border};
+  --accent-gutter: ${DECK_ACCENT_GUTTER_PX}px;
+  --slide-w: 1280px;
+  --slide-h: 720px;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: #050507; color: var(--text); font-family: Inter, Arial, sans-serif; }
+.deck-frame { min-height: 100vh; padding: 32px; display: grid; gap: 32px; place-items: center; }
+.deck-meta { width: min(1280px, 100%); color: #a1a1aa; display: flex; justify-content: space-between; gap: 16px; font-size: 12px; }
+.slide { position: relative; width: min(var(--slide-w), calc(100vw - 64px)); aspect-ratio: 16 / 9; overflow: hidden; background: var(--bg); border: 1px solid color-mix(in srgb, var(--border) 72%, transparent); box-shadow: 0 24px 90px rgba(0,0,0,.36); padding: 54px 70px 46px calc(var(--accent-gutter) + 42px); }
+.slide-accent { position: absolute; left: 32px; top: 54px; bottom: 54px; width: 5px; border-radius: 999px; background: linear-gradient(180deg, var(--accent), var(--accent-2)); }
+.kicker { color: var(--accent-2); text-transform: uppercase; letter-spacing: .16em; font-size: 12px; font-weight: 700; margin-bottom: 22px; }
+h1, h2 { font-family: "DM Sans", Inter, Arial, sans-serif; letter-spacing: 0; margin: 0; color: var(--text); }
+h1 { font-size: 58px; line-height: .98; max-width: 860px; }
+h2 { font-size: 34px; line-height: 1.04; max-width: 780px; }
+header p, .cover-subtitle { margin: 18px 0 0; color: color-mix(in srgb, var(--text) 84%, var(--accent-2)); font-size: 23px; line-height: 1.25; font-weight: 650; max-width: 910px; }
+main { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.08fr); gap: 34px; align-items: start; margin-top: 32px; }
+.cover { display: grid; grid-template-rows: auto auto auto 1fr auto; }
+.cover-proof { position: absolute; right: 72px; top: 148px; width: 380px; }
+.cover footer, .slide footer { position: absolute; left: calc(var(--accent-gutter) + 42px); bottom: 28px; color: var(--muted); font-size: 12px; }
+.slide footer { left: auto; right: 52px; }
+.body { color: color-mix(in srgb, var(--text) 78%, var(--muted)); line-height: 1.45; font-size: 18px; margin: 0 0 18px; }
+ul { margin: 0; padding: 0; display: grid; gap: 11px; list-style: none; }
+li { position: relative; padding-left: 22px; color: color-mix(in srgb, var(--text) 82%, var(--muted)); font-size: 17px; line-height: 1.34; }
+li::before { content: ""; position: absolute; left: 0; top: .58em; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+.metric, .evidence-card { background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--border); border-radius: 12px; }
+.metric { padding: 16px; }
+.metric-value { font-size: 30px; line-height: 1; font-weight: 800; color: var(--text); }
+.metric-label { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.25; text-transform: uppercase; letter-spacing: .08em; }
+.evidence-grid { display: grid; gap: 12px; }
+.evidence-card { min-height: 86px; padding: 16px 18px; display: grid; grid-template-columns: 38px 1fr; gap: 12px; align-items: start; }
+.evidence-card span { color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: .1em; }
+.evidence-card strong { color: var(--text); font-size: 17px; line-height: 1.25; }
+.table-wrap { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.table-title { padding: 12px 14px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--border); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 12px 13px; border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent); text-align: left; vertical-align: top; line-height: 1.25; }
+th { color: var(--accent-2); background: color-mix(in srgb, var(--panel) 90%, transparent); text-transform: uppercase; letter-spacing: .08em; font-size: 11px; }
+td { color: color-mix(in srgb, var(--text) 82%, var(--muted)); }
+.source-note { position: absolute; left: calc(var(--accent-gutter) + 42px); right: 92px; bottom: 28px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.qa-panel { width: min(1280px, 100%); padding: 18px 20px; border: 1px solid #2d2d36; border-radius: 14px; background: #101014; color: #d4d4d8; font-size: 13px; }
+.qa-panel strong { color: #fff; }
+@media print { body { background: white; } .deck-frame { padding: 0; gap: 0; } .deck-meta, .qa-panel { display: none; } .slide { width: 100vw; height: 100vh; box-shadow: none; border: 0; page-break-after: always; } }
+</style>
+</head>
+<body>
+<div class="deck-frame">
+  <div class="deck-meta"><span>${escapeHtml(style.name)} · HTML source of truth</span><span>QA: ${escapeHtml(qa.status)}</span></div>
+  ${slideHtml}
+  <aside class="qa-panel"><strong>Deck QA:</strong> ${escapeHtml(qa.status)} · ${qa.checks.slide_count} slides · ${qa.checks.visual_surface_count} visual surfaces · accent gutter ${qa.checks.accent_gutter_px}px.</aside>
+</div>
+</body>
+</html>`;
+}
+
+function evaluatePremiumDeckQa(title: string, content: any, html?: string): DeckQaReport {
+  const slides = slidesFromContent(title, content);
+  const explicitSlideCount = asArray(content?.slides).length;
+  const findings: DeckQaReport['slideFindings'] = [];
+  let visualSurfaceCount = 0;
+  let totalWords = 0;
+  let maxWords = 0;
+  slides.forEach((slide, index) => {
+    const slideId = `slide_${index + 1}`;
+    const wordCount = slideWordCount(slide);
+    totalWords += wordCount;
+    maxWords = Math.max(maxWords, wordCount);
+    visualSurfaceCount += slideTables(slide).length + slideEvidenceBlocks(slide).length + asArray(slide?.metrics).length;
+    if (!firstNonEmpty(slide?.title, slide?.headline)) {
+      findings.push({ slideId, severity: 'critical', issue: 'Slide has no title or decision headline.', requiredFix: 'Add a clear decision headline before export.' });
+    }
+    if (index > 0 && !firstNonEmpty(slide?.headline, slide?.takeaway)) {
+      findings.push({ slideId, severity: 'high', issue: 'Slide title is topical instead of making a point.', requiredFix: 'Add a so-what headline that states the conclusion.' });
+    }
+    if (wordCount > 155) {
+      findings.push({ slideId, severity: 'high', issue: `Slide is too dense at ${wordCount} words.`, requiredFix: 'Split content into a proof object plus concise supporting copy.' });
+    }
+    if (asArray(slide?.bullets).length > 6) {
+      findings.push({ slideId, severity: 'medium', issue: 'Slide has too many bullets.', requiredFix: 'Convert bullets into a table, matrix, timeline, or metric surface.' });
+    }
+  });
+  if (explicitSlideCount > 0 && explicitSlideCount < 4) {
+    findings.push({ slideId: 'deck', severity: 'critical', issue: 'Original deck content is a skeletal slide draft.', requiredFix: 'Build a complete claim spine before exporting a polished deck.' });
+  }
+  if (slides.length < 6) findings.push({ slideId: 'deck', severity: 'critical', issue: 'Deck has too few slides for a complete executive presentation.', requiredFix: 'Add enough slides to cover setup, evidence, recommendation, and next steps.' });
+  if (visualSurfaceCount < 4) findings.push({ slideId: 'deck', severity: 'high', issue: 'Deck lacks enough visual evidence surfaces.', requiredFix: 'Add tables, metrics, matrices, timelines, or proof blocks.' });
+  if (DECK_ACCENT_GUTTER_PX < 56) findings.push({ slideId: 'deck', severity: 'critical', issue: 'Accent line is too close to body text.', requiredFix: 'Increase the accent gutter before rendering.' });
+  const htmlBytes = html ? new TextEncoder().encode(html).byteLength : 0;
+  const hasCritical = findings.some(f => f.severity === 'critical');
+  const hasHigh = findings.some(f => f.severity === 'high');
+  return {
+    status: hasCritical ? 'failed' : hasHigh ? 'needs_revision' : 'pass',
+    slideFindings: findings,
+    checks: {
+      slide_count: slides.length,
+      visual_surface_count: visualSurfaceCount,
+      average_words_per_slide: Math.round(totalWords / Math.max(slides.length, 1)),
+      max_words_on_slide: maxWords,
+      accent_gutter_px: DECK_ACCENT_GUTTER_PX,
+      html_bytes: htmlBytes,
+    },
+  };
+}
+
 function pptxBulletText(items: string[]): string {
   return items.map(item => cleanArtifactText(item)).filter(Boolean).join('\n');
 }
@@ -1397,18 +2042,18 @@ async function makePptx(title: string, content: any): Promise<Uint8Array> {
   const addShell = (slide: any, idx: number, kicker?: string) => {
     slide.background = { color: C.bg };
     slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 13.333, h: 7.5, fill: { color: C.bg }, line: { color: C.bg } });
-    slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 0.1, h: 7.5, fill: { color: C.magenta }, line: { color: C.magenta } });
-    slide.addShape(pptx.ShapeType.rect, { x: 0.1, y: 0, w: 0.04, h: 7.5, fill: { color: C.purple }, line: { color: C.purple } });
+    slide.addShape(pptx.ShapeType.rect, { x: 0.22, y: 0.48, w: 0.05, h: 6.54, fill: { color: C.magenta }, line: { color: C.magenta } });
+    slide.addShape(pptx.ShapeType.rect, { x: 0.29, y: 0.48, w: 0.025, h: 6.54, fill: { color: C.purple }, line: { color: C.purple } });
     if (idx > 0) {
-      slide.addText(kicker || `SLIDE ${idx + 1}`, { x: 0.52, y: 0.34, w: 2.0, h: 0.22, fontSize: 8.5, color: C.purple, charSpace: 1.6, margin: 0 });
+      slide.addText(kicker || `SLIDE ${idx + 1}`, { x: 0.68, y: 0.34, w: 2.0, h: 0.22, fontSize: 8.5, color: C.purple, charSpace: 1.6, margin: 0 });
       slide.addText(`${idx + 1}/${normalizedSlides.length}`, { x: 12.0, y: 6.88, w: 0.72, h: 0.18, fontSize: 8, color: C.dim, align: 'right', margin: 0 });
     }
   };
 
   const addHeadline = (slide: any, s: any, y = 0.72, w = 7.2) => {
-    slide.addText(s.title, { x: 0.52, y, w, h: 0.42, fontSize: 21, bold: true, color: C.text, margin: 0.01, fit: 'shrink' });
+    slide.addText(s.title, { x: 0.68, y, w, h: 0.42, fontSize: 21, bold: true, color: C.text, margin: 0.01, fit: 'shrink' });
     if (s.headline) {
-      slide.addText(s.headline, { x: 0.54, y: y + 0.62, w: Math.min(w + 1.6, 8.6), h: 0.72, fontSize: 14.5, bold: true, color: 'EDE9FE', margin: 0.02, fit: 'shrink' });
+      slide.addText(s.headline, { x: 0.70, y: y + 0.62, w: Math.min(w + 1.6, 8.6), h: 0.72, fontSize: 14.5, bold: true, color: 'EDE9FE', margin: 0.02, fit: 'shrink' });
     }
   };
 
@@ -1479,11 +2124,11 @@ async function makePptx(title: string, content: any): Promise<Uint8Array> {
     addNotes(slide, s);
 
     if (s.layout === 'cover') {
-      slide.addText('MEDINA INTELLIGENCE', { x: 0.56, y: 0.62, w: 3.0, h: 0.22, fontSize: 8.5, color: C.purple, charSpace: 1.8, margin: 0 });
-      slide.addText(s.title || title, { x: 0.58, y: 1.95, w: 8.6, h: 0.82, fontSize: 34, bold: true, color: C.text, margin: 0.01, fit: 'shrink' });
-      slide.addText(s.headline || s.subtitle || 'Prepared by MARTy', { x: 0.62, y: 2.93, w: 7.8, h: 0.72, fontSize: 15, color: 'E9D5FF', margin: 0.02, fit: 'shrink' });
+      slide.addText('MEDINA INTELLIGENCE', { x: 0.72, y: 0.62, w: 3.0, h: 0.22, fontSize: 8.5, color: C.purple, charSpace: 1.8, margin: 0 });
+      slide.addText(s.title || title, { x: 0.74, y: 1.95, w: 8.6, h: 0.82, fontSize: 34, bold: true, color: C.text, margin: 0.01, fit: 'shrink' });
+      slide.addText(s.headline || s.subtitle || 'Prepared by MARTy', { x: 0.78, y: 2.93, w: 7.8, h: 0.72, fontSize: 15, color: 'E9D5FF', margin: 0.02, fit: 'shrink' });
       addEvidenceBlocks(slide, s.evidence_blocks.length ? s.evidence_blocks : ['Executive storyline', 'Evidence-first structure', 'Editable PowerPoint'], 8.55, 1.48, 3.85, 3.1);
-      slide.addText(s.subtitle || 'Prepared by MARTy', { x: 0.62, y: 6.65, w: 4.0, h: 0.24, fontSize: 9.5, color: C.muted, margin: 0 });
+      slide.addText(s.subtitle || 'Prepared by MARTy', { x: 0.78, y: 6.65, w: 4.0, h: 0.24, fontSize: 9.5, color: C.muted, margin: 0 });
       return;
     }
 
@@ -1647,6 +2292,98 @@ async function makePdf(title: string, content: any): Promise<Uint8Array> {
   return await pdf.save();
 }
 
+async function makeDeckPdf(title: string, content: any): Promise<Uint8Array> {
+  const { PDFDocument, StandardFonts, rgb } = await import('pdf-lib');
+  const pdf = await PDFDocument.create();
+  const regular = await pdf.embedFont(StandardFonts.Helvetica);
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+  const slides = slidesFromContent(title, content);
+  const styleId = deckStylePackFrom(content, title);
+  const tokens = styleTokens(styleId);
+  const hexToRgb = (hex: string) => {
+    const clean = hex.replace('#', '');
+    const n = parseInt(clean.length === 3 ? clean.split('').map(c => c + c).join('') : clean, 16);
+    return rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
+  };
+  const bg = hexToRgb(tokens.bg);
+  const panel = hexToRgb(tokens.panel);
+  const ink = hexToRgb(tokens.text);
+  const muted = hexToRgb(tokens.muted);
+  const accent = hexToRgb(tokens.accent);
+  const accent2 = hexToRgb(tokens.accent2);
+  const pageW = 960;
+  const pageH = 540;
+  const margin = 72;
+  const lineHeight = (size: number) => size * 1.24;
+  const wrap = (text: string, size: number, font = regular, width = 420) => {
+    const words = pdfSafeText(text).split(/\s+/).filter(Boolean);
+    const lines: string[] = [];
+    let line = '';
+    for (const word of words) {
+      const candidate = line ? `${line} ${word}` : word;
+      if (font.widthOfTextAtSize(candidate, size) > width && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = candidate;
+      }
+    }
+    if (line) lines.push(line);
+    return lines;
+  };
+  slides.forEach((slide, index) => {
+    const page = pdf.addPage([pageW, pageH]);
+    page.drawRectangle({ x: 0, y: 0, width: pageW, height: pageH, color: bg });
+    page.drawRectangle({ x: 30, y: 52, width: 5, height: pageH - 104, color: accent });
+    page.drawRectangle({ x: 37, y: 52, width: 2, height: pageH - 104, color: accent2 });
+    page.drawText(index === 0 ? 'MEDINA VENTURES' : inferSlideRole(slide, index).replace(/_/g, ' ').toUpperCase(), {
+      x: margin,
+      y: pageH - 64,
+      size: 8.5,
+      font: bold,
+      color: accent2,
+    });
+    const titleLines = wrap(slide.title || title, index === 0 ? 31 : 22, bold, index === 0 ? 620 : 560).slice(0, index === 0 ? 3 : 2);
+    let y = index === 0 ? pageH - 142 : pageH - 104;
+    for (const line of titleLines) {
+      page.drawText(line, { x: margin, y, size: index === 0 ? 31 : 22, font: bold, color: ink });
+      y -= lineHeight(index === 0 ? 31 : 22);
+    }
+    const headline = firstNonEmpty(slide.headline, slide.takeaway, slide.subtitle);
+    if (headline) {
+      y -= 12;
+      for (const line of wrap(headline, 14, bold, 700).slice(0, 3)) {
+        page.drawText(line, { x: margin, y, size: 14, font: bold, color: accent2 });
+        y -= lineHeight(14);
+      }
+    }
+    const metrics = asArray(slide.metrics).slice(0, 4);
+    if (metrics.length > 0) {
+      const cardW = 162;
+      metrics.forEach((m: any, i: number) => {
+        const x = margin + i * (cardW + 14);
+        page.drawRectangle({ x, y: 236, width: cardW, height: 72, color: panel, borderColor: accent2, borderWidth: 0.4 });
+        page.drawText(pdfSafeText(firstNonEmpty(m?.value, m?.metric, m)).slice(0, 18), { x: x + 12, y: 278, size: 18, font: bold, color: ink });
+        page.drawText(pdfSafeText(firstNonEmpty(m?.label, m?.name, m?.context)).slice(0, 30), { x: x + 12, y: 256, size: 8, font: regular, color: muted });
+      });
+    }
+    const bullets = asArray(slide.bullets).map(cleanArtifactText).filter(Boolean).slice(0, 5);
+    const evidence = slideEvidenceBlocks(slide).slice(0, 4);
+    const list = evidence.length ? evidence : bullets;
+    let listY = metrics.length > 0 ? 208 : Math.min(y - 18, 300);
+    for (const item of list) {
+      page.drawCircle({ x: margin + 3, y: listY + 4, size: 2.5, color: accent });
+      for (const line of wrap(item, 11.5, regular, 650).slice(0, 2)) {
+        page.drawText(line, { x: margin + 16, y: listY, size: 11.5, font: regular, color: ink });
+        listY -= lineHeight(11.5);
+      }
+      listY -= 8;
+    }
+    page.drawText(`${index + 1}/${slides.length}`, { x: pageW - 82, y: 26, size: 8.5, font: regular, color: muted });
+  });
+  return pdf.save();
+}
+
 async function artifactBytes(kind: ArtifactKind, title: string, content: any): Promise<Uint8Array> {
   if (kind === 'docx') return makeDocx(title, content);
   if (kind === 'xlsx') return makeXlsx(title, content);
@@ -1766,6 +2503,248 @@ function participantUnion(docs: DocumentRow[], ctx: AuthContext, visibility: Doc
   return [...participants];
 }
 
+function companionFileTitle(title: string, extension: 'html' | 'pdf' | 'json' | 'png'): string {
+  const clean = title.trim().replace(/[<>:"|?*\x00-\x1f\x7f]/g, '_').slice(0, 100) || 'MARTy deck';
+  return clean.toLowerCase().endsWith(`.${extension}`) ? clean : `${clean}.${extension}`;
+}
+
+async function persistGeneratedCompanion(
+  ctx: AuthContext,
+  env: Env,
+  opts: {
+    title: string;
+    fileName: string;
+    mimeType: string;
+    bytes: Uint8Array | string;
+    extractedText: string;
+    visibility: DocumentVisibility;
+    participantUserIds: string[] | null;
+    parentDocumentId: string;
+    customFields: Record<string, unknown>;
+  }
+): Promise<{ documentId: string; r2Key: string; fileName: string }> {
+  const file = new File([opts.bytes], opts.fileName, { type: opts.mimeType });
+  const persisted = await persistDocument({
+    file,
+    orgId: ctx.orgId,
+    source: 'marty_generated',
+    visibility: opts.visibility,
+    participantUserIds: opts.participantUserIds,
+    uploadedBy: ctx.userId,
+    links: [],
+    title: opts.title,
+    documentType: 'presentation',
+    parentDocumentId: opts.parentDocumentId,
+    preExtractedText: opts.extractedText,
+    dedupOnContentHash: false,
+    embed: false,
+  }, env);
+  await persisted.finalize();
+  await env.D1.prepare(
+    `UPDATE documents
+        SET custom_fields = ?
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    JSON.stringify({
+      marty_generated: true,
+      artifact_kind: opts.fileName.split('.').pop() || 'companion',
+      artifact_schema_version: 4,
+      parent_deck_document_id: opts.parentDocumentId,
+      ...opts.customFields,
+    }),
+    persisted.documentId,
+    ctx.orgId
+  ).run().catch(() => {});
+  return { documentId: persisted.documentId, r2Key: persisted.r2Key, fileName: opts.fileName };
+}
+
+export async function getDeckJobSnapshot(
+  ctx: AuthContext,
+  env: Env,
+  jobId: string
+): Promise<any | null> {
+  const job = await env.D1.prepare(
+    `SELECT *
+       FROM deck_artifact_jobs
+      WHERE id = ? AND org_id = ?
+        AND (user_id = ? OR ? IN (SELECT id FROM users WHERE role IN ('owner','admin','super_admin')))
+      LIMIT 1`
+  ).bind(jobId, ctx.orgId, ctx.userId, ctx.userId).first<any>();
+  if (!job) return null;
+  return {
+    ...job,
+    plan: safeJsonParse(job.plan_json, null),
+    fact_ledger: safeJsonParse(job.fact_ledger_json, null),
+    qa_report: safeJsonParse(job.qa_report_json, null),
+    render_result: safeJsonParse(job.render_result_json, null),
+    output_formats: safeJsonParse(job.output_formats_json, []),
+    screenshot_document_ids: safeJsonParse(job.screenshot_document_ids_json, []),
+  };
+}
+
+export async function getDeckJobEventsSnapshot(
+  ctx: AuthContext,
+  env: Env,
+  jobId: string,
+  afterSeq = 0
+): Promise<{ job: any | null; events: any[] }> {
+  const job = await getDeckJobSnapshot(ctx, env, jobId);
+  if (!job) return { job: null, events: [] };
+  const rows = await env.D1.prepare(
+    `SELECT seq, event_type, payload_json, created_at
+       FROM deck_artifact_job_events
+      WHERE job_id = ? AND org_id = ? AND seq > ?
+      ORDER BY seq ASC
+      LIMIT 200`
+  ).bind(jobId, ctx.orgId, afterSeq).all<any>();
+  return {
+    job,
+    events: rows.results.map(row => ({
+      seq: row.seq,
+      event_type: row.event_type,
+      payload: safeJsonParse(row.payload_json, {}),
+      created_at: row.created_at,
+    })),
+  };
+}
+
+export async function applyDeckRenderResult(
+  ctx: AuthContext,
+  env: Env,
+  result: DeckRenderResult
+): Promise<void> {
+  const job = await env.D1.prepare(
+    `SELECT *
+       FROM deck_artifact_jobs
+      WHERE id = ? AND org_id = ?
+      LIMIT 1`
+  ).bind(result.job_id, ctx.orgId).first<any>();
+  if (!job) throw new Error('DECK_JOB_NOT_FOUND');
+
+  const qa = result.qa_report || safeJsonParse<DeckQaReport | null>(job.qa_report_json, null);
+  const screenshotDocumentIds: string[] = [];
+  const participantUserIds = null;
+  const visibility: DocumentVisibility = 'org_wide';
+  const parentDocumentId = job.pptx_document_id || job.html_document_id || job.pdf_document_id;
+  if (!parentDocumentId) {
+    throw new Error('DECK_RENDER_PARENT_DOCUMENT_NOT_READY');
+  }
+
+  await updateDeckJobPhase(env, job.id, job.org_id, 'render_qa', {
+    status: result.status,
+    findings: qa?.slideFindings?.length || 0,
+  });
+
+  if (Array.isArray(result.screenshots)) {
+    for (const screenshot of result.screenshots.slice(0, 40)) {
+      if (!screenshot.base64) continue;
+      const doc = await persistGeneratedCompanion(ctx, env, {
+        title: `${job.title} - Slide ${screenshot.index}`,
+        fileName: companionFileTitle(`${job.title} - slide-${String(screenshot.index).padStart(2, '0')}`, 'png'),
+        mimeType: screenshot.mimeType || 'image/png',
+        bytes: bytesFromBase64(screenshot.base64),
+        extractedText: `Rendered screenshot for ${job.title}, slide ${screenshot.index}.`,
+        visibility,
+        participantUserIds,
+        parentDocumentId,
+        customFields: {
+          deck_companion_kind: 'rendered_slide_screenshot',
+          deck_job_id: job.id,
+          slide_id: screenshot.slideId,
+          slide_index: screenshot.index,
+          width: screenshot.width,
+          height: screenshot.height,
+        },
+      });
+      screenshotDocumentIds.push(doc.documentId);
+    }
+  }
+
+  let rendererPdfDocumentId: string | null = null;
+  if (result.pdf_base64) {
+    const pdfDoc = await persistGeneratedCompanion(ctx, env, {
+      title: `${job.title} - Rendered PDF Export`,
+      fileName: companionFileTitle(`${job.title} - Rendered PDF Export`, 'pdf'),
+      mimeType: MIME_BY_KIND.pdf,
+      bytes: bytesFromBase64(result.pdf_base64),
+      extractedText: `Rendered PDF export for ${job.title}.`,
+      visibility,
+      participantUserIds,
+      parentDocumentId,
+      customFields: {
+        deck_companion_kind: 'playwright_pdf_export',
+        deck_job_id: job.id,
+        deck_qa_status: result.status,
+      },
+    });
+    rendererPdfDocumentId = pdfDoc.documentId;
+  }
+
+  let qaDocumentId: string | null = null;
+  if (qa) {
+    const qaDoc = await persistGeneratedCompanion(ctx, env, {
+      title: `${job.title} - QA Report`,
+      fileName: companionFileTitle(`${job.title} - QA Report`, 'json'),
+      mimeType: 'application/json; charset=utf-8',
+      bytes: JSON.stringify({ job_id: job.id, qa_report: qa, metrics: result.metrics || {} }, null, 2),
+      extractedText: [
+        `Deck QA status: ${qa.status}`,
+        ...qa.slideFindings.map(f => `${f.severity}: ${f.slideId}: ${f.issue} -> ${f.requiredFix}`),
+      ].join('\n').slice(0, 8000),
+      visibility,
+      participantUserIds,
+      parentDocumentId,
+      customFields: {
+        deck_companion_kind: 'qa_report',
+        deck_job_id: job.id,
+        deck_qa_status: qa.status,
+      },
+    });
+    qaDocumentId = qaDoc.documentId;
+  }
+
+  const status: DeckJobStatus = result.status === 'failed' ? 'failed' : 'completed';
+  const phase: DeckJobPhase = result.status === 'failed' ? 'failed' : 'complete';
+  await env.D1.prepare(
+    `UPDATE deck_artifact_jobs
+        SET status = ?,
+            phase = ?,
+            qa_report_json = ?,
+            render_result_json = ?,
+            pdf_document_id = COALESCE(?, pdf_document_id),
+            screenshot_document_ids_json = ?,
+            qa_document_id = COALESCE(?, qa_document_id),
+            error_code = ?,
+            error_message = ?,
+            completed_at = CASE WHEN ? IN ('completed','failed') THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE completed_at END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    status,
+    phase,
+    qa ? JSON.stringify(qa) : null,
+    JSON.stringify({ ...result, screenshots: result.screenshots?.map(s => ({ ...s, base64: undefined })) || [] }),
+    rendererPdfDocumentId,
+    JSON.stringify(screenshotDocumentIds),
+    qaDocumentId,
+    result.error ? 'DECK_RENDER_FAILED' : null,
+    result.error ? String(result.error).slice(0, 500) : null,
+    status,
+    job.id,
+    job.org_id
+  ).run();
+
+  await appendDeckJobEvent(env, job.id, job.org_id, status === 'completed' ? 'complete' : 'failed', {
+    status,
+    phase,
+    qa_status: qa?.status || result.status,
+    screenshot_document_ids: screenshotDocumentIds,
+    pdf_document_id: rendererPdfDocumentId,
+    qa_document_id: qaDocumentId,
+    error: result.error || null,
+  }).catch(() => {});
+}
+
 async function persistArtifact(
   ctx: AuthContext,
   env: Env,
@@ -1782,6 +2761,29 @@ async function persistArtifact(
 ): Promise<{ card: MartyDocumentCard; document: { id: string; title: string; file_name: string; mime_type: string } }> {
   const inputContent = normalizeStructuredArtifactContent(opts.structuredContent);
   let structuredContent = await prepareArtifactContent(opts.kind, opts.title, inputContent, ctx, env, opts.sourceDocs);
+  let deckBundle: { plan: DeckPlan; html: string; qa: DeckQaReport } | null = null;
+  if (opts.kind === 'pptx') {
+    let html = renderPremiumDeckHtml(opts.title, structuredContent);
+    let qa = evaluatePremiumDeckQa(opts.title, structuredContent, html);
+    if (qa.status === 'failed') {
+      structuredContent = await repairArtifactContent(
+        opts.kind,
+        opts.title,
+        structuredContent,
+        ctx,
+        env,
+        opts.sourceDocs,
+        qa.slideFindings.map(f => `${f.severity}: ${f.issue} ${f.requiredFix}`)
+      );
+      html = renderPremiumDeckHtml(opts.title, structuredContent);
+      qa = evaluatePremiumDeckQa(opts.title, structuredContent, html);
+    }
+    deckBundle = {
+      plan: deckPlanFromContent(opts.title, structuredContent),
+      html,
+      qa,
+    };
+  }
   let bytes: Uint8Array | null = null;
   let validation: { ok: boolean; issues: string[] };
   try {
@@ -1808,6 +2810,17 @@ async function persistArtifact(
         issues: [`artifact generation failed after repair: ${String(error?.message || error).slice(0, 220)}`],
       };
     }
+  }
+  if (deckBundle?.qa.status === 'failed') {
+    validation = {
+      ok: false,
+      issues: [
+        ...validation.issues,
+        ...deckBundle.qa.slideFindings
+          .filter(f => f.severity === 'critical')
+          .map(f => `deck QA critical: ${f.issue}`),
+      ],
+    };
   }
   if (!validation.ok || !bytes) {
     throw new Error(`MARTy could not create a valid ${opts.kind.toUpperCase()} file yet. ${validation.issues.join('; ')}`);
@@ -1840,6 +2853,70 @@ async function persistArtifact(
   }, env);
   await persisted.finalize();
 
+  const companionFields: Record<string, unknown> = {};
+  if (deckBundle) {
+    try {
+      const htmlDoc = await persistGeneratedCompanion(ctx, env, {
+        title: `${opts.title} - HTML Preview`,
+        fileName: companionFileTitle(`${opts.title} - HTML Preview`, 'html'),
+        mimeType: DECK_HTML_MIME,
+        bytes: deckBundle.html,
+        extractedText: [
+          deckBundle.plan.title,
+          deckBundle.plan.storyline.join('\n'),
+          ...deckBundle.plan.slides.map(s => `${s.role}: ${s.headline}`),
+        ].join('\n').slice(0, 8000),
+        visibility,
+        participantUserIds,
+        parentDocumentId: persisted.documentId,
+        customFields: {
+          deck_companion_kind: 'html_source',
+          html_source_of_truth: true,
+          deck_style_pack: deckBundle.plan.style_pack,
+          deck_qa_status: deckBundle.qa.status,
+        },
+      });
+      const pdfBytes = await makeDeckPdf(opts.title, structuredContent);
+      const pdfDoc = await persistGeneratedCompanion(ctx, env, {
+        title: `${opts.title} - PDF Export`,
+        fileName: companionFileTitle(`${opts.title} - PDF Export`, 'pdf'),
+        mimeType: MIME_BY_KIND.pdf,
+        bytes: pdfBytes,
+        extractedText: [
+          deckBundle.plan.title,
+          deckBundle.plan.storyline.join('\n'),
+          ...deckBundle.plan.slides.map(s => `${s.role}: ${s.headline}`),
+        ].join('\n').slice(0, 8000),
+        visibility,
+        participantUserIds,
+        parentDocumentId: persisted.documentId,
+        customFields: {
+          deck_companion_kind: 'pdf_export',
+          deck_style_pack: deckBundle.plan.style_pack,
+          deck_qa_status: deckBundle.qa.status,
+        },
+      });
+      companionFields.deck_bundle = {
+        html_source_of_truth: true,
+        html_document_id: htmlDoc.documentId,
+        html_r2_key: htmlDoc.r2Key,
+        pdf_document_id: pdfDoc.documentId,
+        pdf_r2_key: pdfDoc.r2Key,
+        style_pack: deckBundle.plan.style_pack,
+        qa_report: deckBundle.qa,
+        plan: deckBundle.plan,
+      };
+    } catch (error: any) {
+      companionFields.deck_bundle_error = String(error?.message || error).slice(0, 300);
+      companionFields.deck_bundle = {
+        html_source_of_truth: true,
+        style_pack: deckBundle.plan.style_pack,
+        qa_report: deckBundle.qa,
+        plan: deckBundle.plan,
+      };
+    }
+  }
+
   await env.D1.prepare(
     `UPDATE documents
         SET custom_fields = ?
@@ -1848,9 +2925,10 @@ async function persistArtifact(
     JSON.stringify({
       marty_generated: true,
       ...(opts.customFields || {}),
+      ...companionFields,
       source_document_ids: opts.sourceDocs.map(d => d.id),
       artifact_kind: opts.kind,
-      artifact_schema_version: 3,
+      artifact_schema_version: opts.kind === 'pptx' ? 4 : 3,
       artifact_text_length: extractedText.length,
       artifact_validation: validation,
     }),
@@ -1927,6 +3005,399 @@ export async function createDocumentArtifactTool(
     document_cards: [result.card],
     message: `Created ${result.document.file_name}`,
   };
+}
+
+export async function createDeckArtifactTool(
+  ctx: AuthContext,
+  input: {
+    prompt: string;
+    title?: string;
+    audience?: string;
+    objective?: DeckObjective;
+    style_pack?: DeckStylePackId;
+    output_formats?: Array<'html' | 'pdf' | 'pptx'>;
+    quality_mode?: 'fast' | 'premium';
+    structured_content?: any;
+    source_document_ids?: string[];
+  },
+  env: Env,
+  opts: {
+    sessionId?: string | null;
+    requestId?: string | null;
+    assistantMessageId?: string | null;
+    signal?: AbortSignal;
+  } = {}
+): Promise<any> {
+  const prompt = String(input.prompt || '').trim();
+  const title = String(input.title || prompt.split(/[.!?\n]/)[0] || 'MARTy deck').trim().slice(0, 140);
+  const deckJobId = crypto.randomUUID();
+  const startedAt = new Date().toISOString();
+  const qualityMode = input.quality_mode || 'premium';
+  const outputFormats = normalizeDeckOutputFormats(input.output_formats);
+  const structured = normalizeStructuredArtifactContent(input.structured_content || {
+    title,
+    subtitle: 'Prepared by MARTy',
+    summary: prompt,
+    audience: input.audience,
+    objective: input.objective,
+    style_pack: input.style_pack || 'medina_default',
+    storyline: [
+      'Clarify the decision or narrative the audience needs.',
+      'Translate the strongest evidence into visual proof objects.',
+      'Close with the recommendation, owner, or next action.',
+    ],
+    slides: [
+      { layout: 'cover', title, subtitle: 'Prepared by MARTy', headline: prompt },
+      { layout: 'executive_summary', title: 'Executive Takeaway', headline: prompt, evidence_blocks: ['Audience-ready claim spine', 'Evidence-first slide plan', 'QA-gated export'] },
+      { layout: 'matrix', title: 'Narrative Spine', headline: 'The deck should move from context to evidence to action.', table: { headers: ['Section', 'Purpose', 'Proof object'], rows: [['Context', 'Set the stakes', 'Executive frame'], ['Evidence', 'Make the case', 'Metrics / table / map'], ['Action', 'Drive follow-through', 'Next-step owner list']] } },
+      { layout: 'evidence', title: 'Evidence To Build Around', headline: 'Each substantive slide needs one proof object, not a paragraph dump.', evidence_blocks: ['Confirmed facts from source material', 'Decision-useful metrics', 'Clear caveats and gaps'] },
+      { layout: 'risk', title: 'Open Questions And Risks', headline: 'Unverified claims should be visible before the deck is circulated.', bullets: ['Separate confirmed facts from assumptions', 'Move weak claims to notes or appendix', 'Flag missing source material'] },
+      { layout: 'next_steps', title: 'Next Steps', headline: 'Finish by making the next decision easy.', table: { headers: ['Step', 'Owner', 'Output'], rows: [['Review', 'MARTy / team', 'Tightened storyline'], ['Verify', 'Source owner', 'Confirmed metrics'], ['Circulate', 'Deck owner', 'PDF + PPTX bundle']] } },
+    ],
+  });
+  structured.audience = firstNonEmpty(input.audience, structured.audience);
+  structured.objective = input.objective || structured.objective;
+  structured.style_pack = input.style_pack || structured.style_pack || 'medina_default';
+  structured.deck_request = prompt;
+  const plan = deckPlanFromContent(title, structured);
+  const facts = deckFactsFromContent(title, structured, slidesFromContent(title, structured));
+  const asyncRenderer = qualityMode === 'premium' && isDeckRendererEnabled(env);
+
+  await env.D1.prepare(
+    `INSERT INTO deck_artifact_jobs
+       (id, org_id, user_id, session_id, request_id, assistant_message_id,
+        status, phase, title, prompt, audience, objective, style_pack,
+        quality_mode, output_formats_json, structured_content_json,
+        source_document_ids_json, plan_json, fact_ledger_json, started_at, heartbeat_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    deckJobId,
+    ctx.orgId,
+    ctx.userId,
+    opts.sessionId || null,
+    opts.requestId || null,
+    opts.assistantMessageId || null,
+    asyncRenderer ? 'queued' : 'running',
+    title,
+    prompt,
+    input.audience || null,
+    input.objective || null,
+    input.style_pack || structured.style_pack || 'medina_default',
+    qualityMode,
+    JSON.stringify(outputFormats),
+    JSON.stringify(structured),
+    JSON.stringify(Array.isArray(input.source_document_ids) ? input.source_document_ids : []),
+    JSON.stringify(plan),
+    JSON.stringify(facts),
+    startedAt,
+    startedAt
+  ).run().catch(() => {});
+  await appendDeckJobEvent(env, deckJobId, ctx.orgId, 'created', {
+    job_id: deckJobId,
+    status: asyncRenderer ? 'queued' : 'running',
+    phase: 'planning',
+    title,
+    quality_mode: qualityMode,
+    renderer_enabled: asyncRenderer,
+  }).catch(() => {});
+
+  if (asyncRenderer) {
+    await enqueueWork(env, ctx.orgId, DECK_RENDER_WORK_DOMAIN, {
+      deck_job_id: deckJobId,
+    }, {
+      upstream: 'deck-renderer',
+      idempotency_key: `${ctx.orgId}:${deckJobId}:deck_render`,
+      max_attempts: 2,
+      priority: 8,
+    });
+    await appendDeckJobEvent(env, deckJobId, ctx.orgId, 'queued', {
+      phase: 'planning',
+      message: 'Premium deck job queued for HTML render, screenshot QA, and export.',
+    }).catch(() => {});
+    return {
+      ok: true,
+      deck_job_id: deckJobId,
+      deck_job: {
+        id: deckJobId,
+        status: 'queued',
+        phase: 'planning',
+        title,
+        quality_mode: qualityMode,
+        output_formats: outputFormats,
+      },
+      document_cards: [],
+      message: 'Premium deck job queued. MARTy will render, QA, and export the deck before marking it complete.',
+    };
+  }
+
+  try {
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET phase = 'visual_direction',
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(deckJobId, ctx.orgId).run().catch(() => {});
+    await appendDeckJobEvent(env, deckJobId, ctx.orgId, 'phase', {
+      phase: 'visual_direction',
+      message: 'Deck plan and style direction prepared.',
+    }).catch(() => {});
+
+    const result = await createDocumentArtifactTool(ctx, {
+      kind: 'pptx',
+      title,
+      structured_content: structured,
+      source_document_ids: input.source_document_ids,
+      custom_fields: {
+        deck_tool: 'create_deck_artifact',
+        deck_job_id: deckJobId,
+        deck_quality_mode: qualityMode,
+        requested_output_formats: outputFormats,
+        requested_audience: input.audience || null,
+        requested_objective: input.objective || null,
+        requested_style_pack: input.style_pack || 'medina_default',
+      },
+    }, env);
+
+    const persisted = result?.document?.id
+      ? await env.D1.prepare(
+        `SELECT custom_fields FROM documents WHERE id = ? AND org_id = ?`
+      ).bind(result.document.id, ctx.orgId).first<{ custom_fields: string | null }>().catch(() => null)
+      : null;
+    let deckBundle: any = null;
+    try {
+      deckBundle = persisted?.custom_fields ? JSON.parse(persisted.custom_fields)?.deck_bundle : null;
+    } catch { deckBundle = null; }
+
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET status = 'completed',
+              phase = 'complete',
+              pptx_document_id = ?,
+              html_document_id = ?,
+              pdf_document_id = ?,
+              qa_report_json = ?,
+              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(
+      result?.document?.id || null,
+      deckBundle?.html_document_id || null,
+      deckBundle?.pdf_document_id || null,
+      deckBundle?.qa_report ? JSON.stringify(deckBundle.qa_report) : null,
+      deckJobId,
+      ctx.orgId
+    ).run().catch(() => {});
+    await appendDeckJobEvent(env, deckJobId, ctx.orgId, 'complete', {
+      phase: 'complete',
+      pptx_document_id: result?.document?.id || null,
+      html_document_id: deckBundle?.html_document_id || null,
+      pdf_document_id: deckBundle?.pdf_document_id || null,
+      qa_status: deckBundle?.qa_report?.status || null,
+    }).catch(() => {});
+
+    return { ...result, deck_job_id: deckJobId };
+  } catch (error: any) {
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET status = 'failed',
+              phase = 'failed',
+              error_code = 'DECK_ARTIFACT_FAILED',
+              error_message = ?,
+              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(String(error?.message || error).slice(0, 500), deckJobId, ctx.orgId).run().catch(() => {});
+    await appendDeckJobEvent(env, deckJobId, ctx.orgId, 'failed', {
+      phase: 'failed',
+      error_code: 'DECK_ARTIFACT_FAILED',
+      error_message: String(error?.message || error).slice(0, 500),
+    }).catch(() => {});
+    throw error;
+  }
+}
+
+interface DeckArtifactJobRow {
+  id: string;
+  org_id: string;
+  user_id: string | null;
+  session_id: string | null;
+  request_id: string | null;
+  assistant_message_id: string | null;
+  status: string;
+  phase: string;
+  title: string;
+  prompt: string;
+  audience: string | null;
+  objective: string | null;
+  style_pack: DeckStylePackId | null;
+  quality_mode: 'fast' | 'premium' | null;
+  output_formats_json: string | null;
+  structured_content_json: string | null;
+  source_document_ids_json: string | null;
+  plan_json: string | null;
+  fact_ledger_json: string | null;
+}
+
+async function callDeckRendererService(
+  env: Env,
+  request: DeckRenderRequest
+): Promise<DeckRenderResult> {
+  if (!env.DECK_RENDERER_URL || !env.DECK_RENDERER_TOKEN) {
+    throw new Error('DECK_RENDERER_NOT_CONFIGURED');
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DECK_RENDERER_TIMEOUT_MS);
+  try {
+    const base = env.DECK_RENDERER_URL.replace(/\/+$/, '');
+    const res = await fetch(`${base}/render`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.DECK_RENDERER_TOKEN}`,
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let parsed: any = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { /* handled below */ }
+    if (!res.ok) {
+      if (parsed?.job_id && parsed?.qa_report) return parsed as DeckRenderResult;
+      throw new Error(parsed?.error || parsed?.message || `deck renderer returned ${res.status}`);
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('deck renderer returned malformed JSON');
+    }
+    return parsed as DeckRenderResult;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function processDeckRenderJob(
+  env: Env,
+  jobId: string
+): Promise<void> {
+  const job = await env.D1.prepare(
+    `SELECT *
+       FROM deck_artifact_jobs
+      WHERE id = ?
+      LIMIT 1`
+  ).bind(jobId).first<DeckArtifactJobRow>();
+  if (!job) throw new Error(`deck job ${jobId} not found`);
+  if (job.status === 'completed' || job.status === 'cancelled') return;
+
+  const user = job.user_id
+    ? await env.D1.prepare(
+      `SELECT id, email, role
+         FROM users
+        WHERE id = ? AND org_id = ? AND deleted_at IS NULL
+        LIMIT 1`
+    ).bind(job.user_id, job.org_id).first<{ id: string; email: string; role: AuthContext['userRole'] }>()
+    : null;
+  if (!user) throw new Error(`deck job ${job.id} has no accessible user`);
+
+  const ctx: AuthContext = {
+    orgId: job.org_id,
+    userId: user.id,
+    userRole: user.role || 'member',
+    email: user.email,
+  };
+  const structured = safeJsonParse<Record<string, any>>(job.structured_content_json, {});
+  const outputFormats = normalizeDeckOutputFormats(safeJsonParse(job.output_formats_json, ['html', 'pdf', 'pptx']));
+  const sourceDocumentIds = safeJsonParse<string[]>(job.source_document_ids_json, []);
+  const title = job.title || structured.title || 'MARTy deck';
+
+  await updateDeckJobPhase(env, job.id, job.org_id, 'narrative', {
+    message: 'Narrative plan loaded for render job.',
+  });
+  await updateDeckJobPhase(env, job.id, job.org_id, 'html_render', {
+    message: 'Creating canonical HTML/PPTX deck bundle.',
+  });
+
+  const artifact = await createDocumentArtifactTool(ctx, {
+    kind: 'pptx',
+    title,
+    structured_content: structured,
+    source_document_ids: sourceDocumentIds,
+    custom_fields: {
+      deck_tool: 'create_deck_artifact',
+      deck_job_id: job.id,
+      deck_quality_mode: job.quality_mode || 'premium',
+      requested_output_formats: outputFormats,
+      requested_audience: job.audience,
+      requested_objective: job.objective,
+      requested_style_pack: job.style_pack || 'medina_default',
+      async_deck_render_job: true,
+    },
+  }, env);
+
+  const persisted = artifact?.document?.id
+    ? await env.D1.prepare(
+      `SELECT custom_fields FROM documents WHERE id = ? AND org_id = ?`
+    ).bind(artifact.document.id, job.org_id).first<{ custom_fields: string | null }>().catch(() => null)
+    : null;
+  const deckBundle = safeJsonParse<any>(persisted?.custom_fields, {})?.deck_bundle || null;
+  await env.D1.prepare(
+    `UPDATE deck_artifact_jobs
+        SET pptx_document_id = ?,
+            html_document_id = ?,
+            pdf_document_id = ?,
+            qa_report_json = COALESCE(?, qa_report_json),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    artifact?.document?.id || null,
+    deckBundle?.html_document_id || null,
+    deckBundle?.pdf_document_id || null,
+    deckBundle?.qa_report ? JSON.stringify(deckBundle.qa_report) : null,
+    job.id,
+    job.org_id
+  ).run().catch(() => {});
+  await appendDeckJobEvent(env, job.id, job.org_id, 'artifact_bundle_created', {
+    pptx_document_id: artifact?.document?.id || null,
+    html_document_id: deckBundle?.html_document_id || null,
+    pdf_document_id: deckBundle?.pdf_document_id || null,
+  }).catch(() => {});
+
+  const html = renderPremiumDeckHtml(title, structured, deckBundle?.qa_report);
+  const plan = deckPlanFromContent(title, structured);
+  const qa = deckBundle?.qa_report || evaluatePremiumDeckQa(title, structured, html);
+
+  if (!isDeckRendererEnabled(env)) {
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET status = 'completed',
+              phase = 'complete',
+              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(job.id, job.org_id).run();
+    await appendDeckJobEvent(env, job.id, job.org_id, 'complete', {
+      qa_status: qa.status,
+      renderer_enabled: false,
+    }).catch(() => {});
+    return;
+  }
+
+  await updateDeckJobPhase(env, job.id, job.org_id, 'render_qa', {
+    message: 'Sending canonical HTML to the Playwright renderer for screenshot QA.',
+  });
+  const renderResult = await callDeckRendererService(env, {
+    job_id: job.id,
+    title,
+    html,
+    style_pack: plan.style_pack,
+    quality_mode: job.quality_mode || 'premium',
+    output_formats: outputFormats,
+    plan,
+    qa_report: qa,
+  });
+  await updateDeckJobPhase(env, job.id, job.org_id, 'export', {
+    message: 'Persisting renderer screenshots, QA report, and exports.',
+    qa_status: renderResult.qa_report?.status || renderResult.status,
+  });
+  await applyDeckRenderResult(ctx, env, renderResult);
 }
 
 async function extractFullDocumentText(doc: DocumentRow, env: Env): Promise<string> {
@@ -2033,4 +3504,11 @@ export const __documentArtifactsTestHooks = {
   contentQualityIssues,
   docxTableColumnWidths,
   makeDocx,
+  makePptx,
+  deckPlanFromContent,
+  renderPremiumDeckHtml,
+  evaluatePremiumDeckQa,
+  normalizeDeckOutputFormats,
+  DECK_RENDER_WORK_DOMAIN,
+  DECK_STYLE_PACKS,
 };
