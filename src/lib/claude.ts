@@ -11,10 +11,106 @@ interface ClaudeResponse {
 
 const ANTHROPIC_VERSION = '2023-06-01';
 export const CLAUDE_MODEL = 'claude-sonnet-4-6';
+const MODEL_TOOL_RESULT_JSON_LIMIT = 80_000;
+const MODEL_TOOL_RESULT_ARRAY_LIMIT = 40;
+const MODEL_TOOL_RESULT_STRING_LIMIT = 2_400;
+const MODEL_RETRY_USER_TEXT_LIMIT = 65_000;
 
 function isMaxTokenRejection(status: number, body: string): boolean {
   return status === 400 && /max_tokens|maximum.*tokens|tokens.*maximum|output.*tokens/i.test(body);
 }
+
+function isRecoverableProviderRejection(status: number, body: string): boolean {
+  return (status === 400 || status === 413)
+    && /prompt|token|tokens|too\s+long|exceed|maximum|messages?|content|tool_result|input/i.test(body);
+}
+
+function compactForModel(value: any, depth = 0): any {
+  if (value == null) return value;
+  if (typeof value === 'string') {
+    return value.length > MODEL_TOOL_RESULT_STRING_LIMIT
+      ? `${value.slice(0, MODEL_TOOL_RESULT_STRING_LIMIT)}\n...[truncated ${value.length - MODEL_TOOL_RESULT_STRING_LIMIT} chars]`
+      : value;
+  }
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    const sliced = value.slice(0, MODEL_TOOL_RESULT_ARRAY_LIMIT).map(item => compactForModel(item, depth + 1));
+    if (value.length > MODEL_TOOL_RESULT_ARRAY_LIMIT) {
+      sliced.push({ omitted_count: value.length - MODEL_TOOL_RESULT_ARRAY_LIMIT });
+    }
+    return sliced;
+  }
+  if (depth > 6) return '[nested object truncated]';
+
+  const out: Record<string, any> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (/^(raw|html|base64|binary|embedding|vector|blob|buffer)$/i.test(key)) {
+      out[key] = '[omitted from model context]';
+      continue;
+    }
+    out[key] = compactForModel(entry, depth + 1);
+  }
+  return out;
+}
+
+function stringifyToolResultForModel(toolName: string, result: any): string {
+  const compact = compactForModel(result);
+  const json = typeof compact === 'string' ? compact : JSON.stringify(compact);
+  if (json.length <= MODEL_TOOL_RESULT_JSON_LIMIT) return json;
+  return JSON.stringify({
+    tool: toolName,
+    truncated_for_model_context: true,
+    original_chars: json.length,
+    retained_chars: MODEL_TOOL_RESULT_JSON_LIMIT,
+    note: 'The full tool result was streamed to the UI; this compact copy is for Claude synthesis only.',
+    preview: json.slice(0, MODEL_TOOL_RESULT_JSON_LIMIT),
+  });
+}
+
+function compactMessageContentForRetry(content: any): any {
+  if (typeof content === 'string') {
+    return content.length > MODEL_RETRY_USER_TEXT_LIMIT
+      ? `${content.slice(0, MODEL_RETRY_USER_TEXT_LIMIT)}\n...[context truncated for provider retry]`
+      : content;
+  }
+  if (!Array.isArray(content)) return compactForModel(content);
+  return content.map(block => {
+    if (!block || typeof block !== 'object') return block;
+    if (block.type === 'text' && typeof block.text === 'string') {
+      return {
+        ...block,
+        text: block.text.length > MODEL_RETRY_USER_TEXT_LIMIT
+          ? `${block.text.slice(0, MODEL_RETRY_USER_TEXT_LIMIT)}\n...[context truncated for provider retry]`
+          : block.text,
+      };
+    }
+    if (block.type === 'tool_result' && typeof block.content === 'string') {
+      return {
+        ...block,
+        content: block.content.length > MODEL_TOOL_RESULT_JSON_LIMIT
+          ? `${block.content.slice(0, MODEL_TOOL_RESULT_JSON_LIMIT)}\n...[tool result truncated for provider retry]`
+          : block.content,
+      };
+    }
+    return compactForModel(block);
+  });
+}
+
+function compactMessagesForProviderRetry(
+  messages: Array<{ role: 'user' | 'assistant'; content: any }>
+): Array<{ role: 'user' | 'assistant'; content: any }> {
+  return messages.map(message => ({
+    role: message.role,
+    content: compactMessageContentForRetry(message.content),
+  }));
+}
+
+export const __claudeTestHooks = {
+  compactForModel,
+  stringifyToolResultForModel,
+  compactMessagesForProviderRetry,
+  isRecoverableProviderRejection,
+};
 
 function buildGatewayUrl(env: Env): string {
   if (!env.CLOUDFLARE_ACCOUNT_ID) {
@@ -154,11 +250,12 @@ export async function callClaudeStreaming(
   const emitDone = () => writer.write(encoder.encode('data: [DONE]\n\n'));
 
   const runLoop = async () => {
-    const messages = [...params.messages];
+    let messages = [...params.messages];
     let iterations = 0;
     const maxIterations = params.maxIterations ?? NORMAL_MODE_LIMITS.toolIterations;
     let activeMaxTokens = params.max_tokens;
     let usedMaxTokenFallback = false;
+    let usedProviderContextFallback = false;
     if (params.preludeEvents?.length) {
       for (const event of params.preludeEvents) {
         await emit(event);
@@ -246,8 +343,28 @@ export async function callClaudeStreaming(
 
       if (!response.ok) {
         const errorBody = finalErrorBody ?? await response.text();
-        console.error(`[claude-stream] API error ${response.status}: ${errorBody.slice(0, 200)}`);
-        await emit({ text: `\n\n[Error: Claude API ${response.status}]` });
+        console.error(`[claude-stream] API error ${response.status}: ${errorBody.slice(0, 1000)}`);
+        if (!usedProviderContextFallback && isRecoverableProviderRejection(response.status, errorBody)) {
+          usedProviderContextFallback = true;
+          activeMaxTokens = Math.min(activeMaxTokens, params.fallbackMaxTokens || 4096);
+          messages = compactMessagesForProviderRetry(messages);
+          await emit({
+            type: 'model_fallback',
+            reason: 'provider_rejected_context_compacted',
+            status: response.status,
+            fallback_max_tokens: activeMaxTokens,
+          });
+          continue;
+        }
+        await emit({
+          type: 'model_error',
+          provider: 'claude',
+          status: response.status,
+          retryable: true,
+        });
+        await emit({
+          text: '\n\nI hit a model handoff limit while synthesizing the retrieved evidence. The retrieval completed, but the final narrative did not finish cleanly. Please retry this Deep request; MARTy will reuse the same underlying sources with a smaller synthesis payload.',
+        });
         break;
       }
       if (!response.body) break;
@@ -366,7 +483,7 @@ export async function callClaudeStreaming(
             throwIfAborted(params.signal);
             const result = await abortable(params.onToolCall(block.name, block.input), params.signal);
             throwIfAborted(params.signal);
-            const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+            const resultStr = stringifyToolResultForModel(block.name, result);
 
             if (result && typeof result === 'object' && Array.isArray((result as any).document_cards)) {
               await emit({ type: 'document_cards', document_cards: (result as any).document_cards });

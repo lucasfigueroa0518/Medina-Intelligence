@@ -263,7 +263,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'build_max_set',
-    description: 'Deep-only exhaustive set builder for all/every/list/export/count/touchpoint/ever-involved questions. Prefer this over recall and lower-level sweeps whenever the user needs a complete roster or broad aggregation across communications, events, campaigns, CRM entities, documents, and tasks. It deduplicates candidates, assigns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and auto-creates an XLSX for large or export/mail-merge outputs.',
+    description: 'Deep-only exhaustive set builder for explicit all/every/list/export/count/touchpoint/ever-involved questions. Prefer this over recall and lower-level sweeps when the user needs a complete roster or broad aggregation across communications, events, campaigns, CRM entities, documents, and tasks. Do not use it for shortlist/recommendation questions like "best people", "heaviest hitters", or "who should I invite" unless the user explicitly asks for the full universe first; use recall/search tools for those ranked recommendations. It deduplicates candidates, assigns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and auto-creates an XLSX for large or export/mail-merge outputs.',
     input_schema: {
       type: 'object',
       properties: {

@@ -4,10 +4,10 @@ import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { CLAUDE_MODEL } from './claude';
 import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from './max-mode';
 
-export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-16-meetings-events-tooling-v1';
-export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-16-live-agent-meetings-events-v1';
+export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-17-provider-safe-deep-v1';
+export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-17-live-agent-provider-safe-deep-v1';
 export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v2';
-export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-16-agent-tools-search-events-v1';
+export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-17-agent-tools-ranked-shortlist-v1';
 export const MARTY_ARTIFACT_RUNTIME_VERSION = '2026-05-15-office-artifacts-v1';
 
 export interface MartyRuntimeFingerprint {
@@ -119,6 +119,7 @@ ${scope}
 Deep mode is built for exhaustive database work, not just richer prose:
 - If the user asks for "all", "every", "list everyone", a mail merge/export, a count, all touchpoints, "ever talked to", or a broad roster of people/firms/startups, do not rely on the initial SOURCES list or recall() alone.
 - Use build_max_set for exhaustive rosters and set queries. It plans the typed Deep job, applies source authority rules, deduplicates entities, returns confirmed/probable/needs_review/excluded buckets, reports coverage/gaps, and creates XLSX files only when the quality gate says the set is safe to export.
+- For ranked shortlist/recommendation work ("best people", "heaviest hitters", "who should I invite", "8-10 people", "find more candidates than that"), use recall/search tools plus source-backed judgment. Do not open with build_max_set unless the user explicitly asks for the complete universe or export.
 - Some exhaustive Deep turns include a FORCED DEEP SET BUILDER RESULT injected before you answer. When present, that deterministic result supersedes initial SOURCES and recall samples.
 - Use sweep_conversations only as a lower-level fallback when you need a narrower communications-only pass after build_max_set.
 - If build_max_set reports safety_status=unsafe_incomplete, artifact_allowed=false, caps_hit, or gaps, surface those as real coverage limits. Do not write "I have enough coverage" while a source family is capped, errored, or blocked by the quality gate.
