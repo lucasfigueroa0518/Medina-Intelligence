@@ -278,6 +278,8 @@ const DECK_STYLE_PACKS: Record<DeckStylePackId, DeckStylePack> = {
 
 const DECK_ACCENT_GUTTER_PX = 72;
 const DECK_RENDERER_TIMEOUT_MS = 90_000;
+const DECK_RENDER_VIEWPORT = { width: 1920, height: 1080 };
+const DECK_RENDER_MAX_REPAIR_PASSES = 3;
 const DECK_ALLOWED_OUTPUT_FORMATS = new Set(['html', 'pdf', 'pptx']);
 
 const DOCX_PAGE_MARGIN_DXA = 1080;
@@ -291,7 +293,15 @@ function clampLimit(limit: unknown, fallback = 8): number {
 }
 
 function isDeckRendererEnabled(env: Env): boolean {
-  return env.DECK_RENDERER_ENABLED === 'true' && Boolean(env.DECK_RENDERER_URL && env.DECK_RENDERER_TOKEN);
+  if (env.DECK_RENDERER_ENABLED !== 'true') return false;
+  if ((env.DECK_RENDERER_PROVIDER || '').toLowerCase() === 'cloudflare') return Boolean(env.BROWSER);
+  return Boolean(env.DECK_RENDERER_URL && env.DECK_RENDERER_TOKEN);
+}
+
+function useCloudflareDeckRenderer(env: Env): boolean {
+  return env.DECK_RENDERER_ENABLED === 'true'
+    && (env.DECK_RENDERER_PROVIDER || '').toLowerCase() === 'cloudflare'
+    && Boolean(env.BROWSER);
 }
 
 function normalizeDeckOutputFormats(value: unknown): Array<'html' | 'pdf' | 'pptx'> {
@@ -317,6 +327,45 @@ function bytesFromBase64(base64: string): Uint8Array {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
+}
+
+function bytesToBase64(input: ArrayBuffer | Uint8Array): string {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function deckQaSeverityRank(severity: DeckQaSeverity): number {
+  return { critical: 4, high: 3, medium: 2, low: 1 }[severity] || 0;
+}
+
+function mergeDeckQaReport(
+  baseQa: DeckQaReport,
+  findings: DeckQaReport['slideFindings'],
+  metrics: Record<string, unknown>
+): DeckQaReport {
+  const seen = new Set<string>();
+  const merged: DeckQaReport['slideFindings'] = [];
+  for (const finding of [...(baseQa.slideFindings || []), ...findings]) {
+    const key = `${finding.slideId}|${finding.severity}|${finding.issue}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(finding);
+  }
+  const maxSeverity = merged.reduce((max, item) => Math.max(max, deckQaSeverityRank(item.severity)), 0);
+  return {
+    status: maxSeverity >= 4 ? 'failed' : maxSeverity >= 3 ? 'needs_revision' : 'pass',
+    slideFindings: merged,
+    checks: {
+      ...(baseQa.checks || {}),
+      ...(metrics as any),
+    },
+  };
 }
 
 async function appendDeckJobEvent(
@@ -3274,6 +3323,231 @@ async function callDeckRendererService(
   }
 }
 
+async function inspectRenderedDeckPage(page: any): Promise<{
+  findings: DeckQaReport['slideFindings'];
+  metrics: Record<string, unknown>;
+}> {
+  return page.evaluate(() => {
+    const win = globalThis as any;
+    const doc = win.document;
+    const slides = Array.from(doc.querySelectorAll('.slide')) as any[];
+    const findings: Array<{ slideId: string; severity: 'critical' | 'high' | 'medium' | 'low'; issue: string; requiredFix: string }> = [];
+    const metrics: Record<string, number> = {
+      slide_count: slides.length,
+      blank_slide_count: 0,
+      overflow_count: 0,
+      overlap_count: 0,
+      low_contrast_count: 0,
+      tiny_type_count: 0,
+      bad_margin_count: 0,
+      excessive_bullet_slide_count: 0,
+      accent_gutter_px: 0,
+    };
+
+    function luminance(rgb: string): number {
+      const parts = String(rgb || '').match(/\d+(\.\d+)?/g)?.slice(0, 3).map(Number) || [0, 0, 0];
+      const [r, g, b] = parts.map(v => {
+        const s = Math.max(0, Math.min(255, v)) / 255;
+        return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+
+    function contrast(a: string, b: string): number {
+      const l1 = luminance(a);
+      const l2 = luminance(b);
+      return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+    }
+
+    function rectFor(el: any): { left: number; right: number; top: number; bottom: number; width: number; height: number } {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+    }
+
+    function intersects(a: ReturnType<typeof rectFor>, b: ReturnType<typeof rectFor>): boolean {
+      const x = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+      const y = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+      const area = x * y;
+      if (area < 64) return false;
+      const smaller = Math.max(1, Math.min(a.width * a.height, b.width * b.height));
+      return area / smaller > 0.08;
+    }
+
+    slides.forEach((slide, index) => {
+      const slideId = slide.id || `slide_${index + 1}`;
+      const rect = rectFor(slide);
+      const style = win.getComputedStyle(slide);
+      const text = (slide.textContent || '').replace(/\s+/g, ' ').trim();
+      const contentEls = Array.from(slide.querySelectorAll('h1,h2,h3,p,li,td,th,.headline,.takeaway,.evidence-card,.metric-card,.table-wrap'))
+        .filter(el => {
+          const r = (el as any).getBoundingClientRect();
+          return r.width > 8 && r.height > 8;
+        });
+
+      if (!text && slide.querySelectorAll('img,svg,canvas,table').length === 0) {
+        metrics.blank_slide_count += 1;
+        findings.push({ slideId, severity: 'critical', issue: 'Rendered slide appears blank.', requiredFix: 'Populate the slide or remove it from the deck.' });
+      }
+
+      if (slide.scrollWidth > slide.clientWidth + 3 || slide.scrollHeight > slide.clientHeight + 3) {
+        metrics.overflow_count += 1;
+        findings.push({ slideId, severity: 'critical', issue: 'Slide content overflows the canvas.', requiredFix: 'Compress copy, reduce density, or split the slide.' });
+      }
+
+      if (contentEls.length > 0) {
+        const minMargin = Math.min(
+          ...contentEls.map(el => {
+            const r = rectFor(el);
+            return Math.min(r.left - rect.left, rect.right - r.right, r.top - rect.top, rect.bottom - r.bottom);
+          })
+        );
+        if (minMargin < 24) {
+          metrics.bad_margin_count += 1;
+          findings.push({ slideId, severity: 'high', issue: 'Slide has content too close to the edge.', requiredFix: 'Restore safe margins and rebalance the layout grid.' });
+        }
+      }
+
+      const tiny = contentEls.filter(el => Number.parseFloat(win.getComputedStyle(el).fontSize || '16') < 11);
+      if (tiny.length > 0) {
+        metrics.tiny_type_count += 1;
+        findings.push({ slideId, severity: 'high', issue: 'Slide contains tiny type below presentation-safe size.', requiredFix: 'Increase type size or move detail to appendix/notes.' });
+      }
+
+      const bullets = slide.querySelectorAll('li').length;
+      if (bullets > 7) {
+        metrics.excessive_bullet_slide_count += 1;
+        findings.push({ slideId, severity: 'medium', issue: `Slide has ${bullets} bullets.`, requiredFix: 'Convert the list into a table, matrix, timeline, or proof surface.' });
+      }
+
+      const background = style.backgroundColor || 'rgb(15,15,20)';
+      const lowContrast = contentEls.filter(el => contrast(win.getComputedStyle(el).color, background) < 3.4);
+      if (lowContrast.length > Math.max(2, contentEls.length * 0.15)) {
+        metrics.low_contrast_count += 1;
+        findings.push({ slideId, severity: 'high', issue: 'Slide has low-contrast text.', requiredFix: 'Increase foreground/background contrast before export.' });
+      }
+
+      const blocks = contentEls.slice(0, 60).map(el => rectFor(el));
+      let overlap = false;
+      for (let i = 0; i < blocks.length && !overlap; i += 1) {
+        for (let j = i + 1; j < blocks.length; j += 1) {
+          if (intersects(blocks[i], blocks[j])) {
+            overlap = true;
+            break;
+          }
+        }
+      }
+      if (overlap) {
+        metrics.overlap_count += 1;
+        findings.push({ slideId, severity: 'critical', issue: 'Slide elements appear to overlap.', requiredFix: 'Reflow the slide and increase spacing between elements.' });
+      }
+
+      const accent = slide.querySelector('.accent-line,.purple-line,.callout-accent,[data-accent-line]');
+      if (accent) {
+        const accentRect = rectFor(accent);
+        const textLefts = contentEls.map(el => rectFor(el).left).filter(v => Number.isFinite(v));
+        const nearestTextLeft = textLefts.length ? Math.min(...textLefts) : rect.right;
+        const gutter = nearestTextLeft - accentRect.right;
+        metrics.accent_gutter_px = Math.max(metrics.accent_gutter_px || 0, Math.round(gutter));
+        if (gutter < 48) {
+          findings.push({ slideId, severity: 'critical', issue: 'Purple accent line is too close to body text.', requiredFix: 'Move the accent line left or increase the text gutter.' });
+        }
+      }
+    });
+
+    return { findings, metrics };
+  });
+}
+
+async function applyDeckRenderRepairPass(page: any, pass: number): Promise<void> {
+  await page.addStyleTag({
+    content: `
+      :root { --accent-gutter: ${88 + pass * 10}px !important; }
+      .slide { overflow: hidden !important; }
+      .slide * { box-sizing: border-box !important; }
+      .accent-line, .purple-line, [data-accent-line] { margin-right: ${42 + pass * 8}px !important; }
+      .slide p, .slide li, .slide td, .slide th { line-height: ${pass >= 2 ? 1.18 : 1.22} !important; }
+      .slide .body, .slide .content, .slide .evidence-grid, .slide .table-wrap { max-width: 100% !important; }
+    `,
+  });
+}
+
+async function renderDeckWithCloudflareBrowser(
+  env: Env,
+  request: DeckRenderRequest
+): Promise<DeckRenderResult> {
+  if (!env.BROWSER) throw new Error('CLOUDFLARE_BROWSER_BINDING_MISSING');
+  const mod = await import('@cloudflare/puppeteer');
+  const puppeteer = (mod as any).default || mod;
+  const browser = await puppeteer.launch(env.BROWSER);
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ ...DECK_RENDER_VIEWPORT, deviceScaleFactor: 1 });
+    await page.setContent(request.html, { waitUntil: 'networkidle0' });
+
+    let inspection = await inspectRenderedDeckPage(page);
+    let repairPasses = 0;
+    while (
+      repairPasses < DECK_RENDER_MAX_REPAIR_PASSES
+      && inspection.findings.some(f => f.severity === 'critical' || f.severity === 'high')
+    ) {
+      repairPasses += 1;
+      await applyDeckRenderRepairPass(page, repairPasses);
+      inspection = await inspectRenderedDeckPage(page);
+    }
+
+    const slideHandles = await page.$$('.slide');
+    const screenshots: DeckScreenshot[] = [];
+    for (let i = 0; i < Math.min(slideHandles.length, 40); i += 1) {
+      const handle = slideHandles[i];
+      const bytes = await handle.screenshot({ type: 'png' });
+      const slideId = await handle.evaluate((el: any, fallback: string) => el.id || fallback, `slide_${i + 1}`);
+      screenshots.push({
+        slideId,
+        index: i + 1,
+        fileName: `${request.job_id}-slide-${String(i + 1).padStart(2, '0')}.png`,
+        mimeType: 'image/png',
+        width: DECK_RENDER_VIEWPORT.width,
+        height: DECK_RENDER_VIEWPORT.height,
+        base64: bytesToBase64(bytes),
+      });
+    }
+
+    let pdfBase64: string | undefined;
+    if (request.output_formats.includes('pdf')) {
+      const pdf = await page.pdf({
+        printBackground: true,
+        width: `${DECK_RENDER_VIEWPORT.width}px`,
+        height: `${DECK_RENDER_VIEWPORT.height}px`,
+        preferCSSPageSize: true,
+        margin: { top: '0', right: '0', bottom: '0', left: '0' },
+      });
+      pdfBase64 = bytesToBase64(pdf);
+    }
+
+    const qa = mergeDeckQaReport(request.qa_report, inspection.findings, {
+      ...inspection.metrics,
+      html_bytes: new TextEncoder().encode(request.html).byteLength,
+      repair_passes: repairPasses,
+    });
+
+    return {
+      job_id: request.job_id,
+      status: qa.status,
+      qa_report: qa,
+      screenshots,
+      pdf_base64: pdfBase64,
+      metrics: {
+        viewport: DECK_RENDER_VIEWPORT,
+        repair_passes: repairPasses,
+        renderer: 'cloudflare_browser_rendering',
+        rendered_slide_count: screenshots.length,
+      },
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
 export async function processDeckRenderJob(
   env: Env,
   jobId: string
@@ -3381,9 +3655,11 @@ export async function processDeckRenderJob(
   }
 
   await updateDeckJobPhase(env, job.id, job.org_id, 'render_qa', {
-    message: 'Sending canonical HTML to the Playwright renderer for screenshot QA.',
+    message: useCloudflareDeckRenderer(env)
+      ? 'Rendering canonical HTML with Cloudflare Browser Rendering for screenshot QA.'
+      : 'Sending canonical HTML to the Playwright renderer for screenshot QA.',
   });
-  const renderResult = await callDeckRendererService(env, {
+  const renderRequest: DeckRenderRequest = {
     job_id: job.id,
     title,
     html,
@@ -3392,7 +3668,10 @@ export async function processDeckRenderJob(
     output_formats: outputFormats,
     plan,
     qa_report: qa,
-  });
+  };
+  const renderResult = useCloudflareDeckRenderer(env)
+    ? await renderDeckWithCloudflareBrowser(env, renderRequest)
+    : await callDeckRendererService(env, renderRequest);
   await updateDeckJobPhase(env, job.id, job.org_id, 'export', {
     message: 'Persisting renderer screenshots, QA report, and exports.',
     qa_status: renderResult.qa_report?.status || renderResult.status,

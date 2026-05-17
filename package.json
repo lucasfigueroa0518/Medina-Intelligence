@@ -33,6 +33,7 @@
     "unpdf": "^1.6.2"
   },
   "devDependencies": {
+    "@cloudflare/puppeteer": "^1.1.0",
     "@cloudflare/workers-types": "^4.20240924.0",
     "@types/node": "^20.14.0",
     "concurrently": "^9.0.1",

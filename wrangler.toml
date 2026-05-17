@@ -28,6 +28,11 @@ CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
 GEMINI_MAX_RPM = "500"
 ALLOWED_ORIGINS = "https://medinaventures.ai,https://www.medinaventures.ai,http://localhost:3000"
 FRONTEND_URL = "https://medinaventures.ai"
+DECK_RENDERER_ENABLED = "true"
+DECK_RENDERER_PROVIDER = "cloudflare"
+
+[browser]
+binding = "BROWSER"
 
 [ai]
 binding = "AI"

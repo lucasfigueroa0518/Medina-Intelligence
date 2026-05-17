@@ -14,6 +14,7 @@ export interface Env {
   VECTORIZE_RAG_V2_BGE?: VectorizeIndex;
   VECTORIZE_RAG_V2_QWEN3?: VectorizeIndex;
   VECTORIZE_RAG_V2_MINILM?: VectorizeIndex;
+  BROWSER?: Fetcher;
 
   // --- Queues ---
   AUDIT_QUEUE: Queue<AuditEvent>;
@@ -44,6 +45,7 @@ export interface Env {
   // separate Node/Playwright service. Keep optional so the HTML-first fallback
   // can deploy before the renderer service is provisioned.
   DECK_RENDERER_ENABLED?: string;
+  DECK_RENDERER_PROVIDER?: 'cloudflare' | 'external' | string;
   DECK_RENDERER_URL?: string;
   DECK_RENDERER_TOKEN?: string;
   // Optional: gateway-level token. Only required when the AI Gateway has
