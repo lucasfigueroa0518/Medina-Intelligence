@@ -157,6 +157,15 @@ interface DeckJobView {
   } | null;
   blocked_reason?: string | null;
   visible_document_cards?: MartyDocumentCard[];
+  diagnostic_document_cards?: MartyDocumentCard[];
+  qa_findings?: Array<{
+    slideId?: string;
+    severity?: 'critical' | 'high' | 'medium' | 'low' | string;
+    issue?: string;
+    requiredFix?: string;
+  }>;
+  latest_event_message?: string;
+  last_event_message?: string;
 }
 
 interface MartyDocumentCard {
@@ -844,6 +853,9 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
   const round = Number(job.revision_round || 0);
   const maxRounds = Number(job.max_revision_rounds || 3);
   const qa = job.qa_summary;
+  const latestMessage = job.latest_event_message || job.last_event_message || '';
+  const findings = (job.qa_findings || []).slice(0, 3);
+  const diagnostics = (job.diagnostic_document_cards || []).slice(0, 5);
   const statusTone = failed || blocked
     ? 'border-semantic-error/25 bg-semantic-error/5 text-semantic-error'
     : completed
@@ -864,6 +876,9 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
           </span>
         )}
       </div>
+      {latestMessage && active && (
+        <div className="mt-2 text-[11px] leading-relaxed text-text-secondary">{latestMessage}</div>
+      )}
       {qa && (
         <div className="mt-2 grid grid-cols-4 gap-1.5 text-center text-[10px] text-text-secondary">
           <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">Critical {qa.critical || 0}</div>
@@ -875,6 +890,30 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
       {blocked && (
         <div className="mt-2 text-[11px] leading-relaxed text-text-secondary">
           {job.blocked_reason || 'Screenshot QA blocked polished export. MARTy did not expose the draft deck as a finished file.'}
+        </div>
+      )}
+      {blocked && findings.length > 0 && (
+        <div className="mt-2 space-y-1.5">
+          {findings.map((finding, index) => (
+            <div key={`${finding.slideId || 'slide'}-${index}`} className="rounded border border-semantic-error/15 bg-bg-root/50 px-2 py-1.5 text-[11px] leading-relaxed text-text-secondary">
+              <span className="font-semibold text-text-primary">{finding.slideId || 'Slide'}</span>
+              {finding.issue ? `: ${finding.issue}` : ''}
+              {finding.requiredFix ? <span className="text-text-muted"> · {finding.requiredFix}</span> : null}
+            </div>
+          ))}
+        </div>
+      )}
+      {blocked && diagnostics.length > 0 && (
+        <div className="mt-2 rounded border border-white/[0.05] bg-bg-root/45 px-2 py-1.5">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-text-muted">Diagnostics</div>
+          <div className="space-y-1">
+            {diagnostics.map(card => (
+              <div key={card.document_id} className="flex min-w-0 items-center gap-1.5 text-[11px] text-text-secondary">
+                <FileText size={12} className="shrink-0 text-text-muted" />
+                <span className="truncate">{card.title || card.file_name || 'Diagnostic file'}</span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -1556,6 +1595,13 @@ export default function GodModePage() {
     events: Array<{ seq: number; event_type: string; payload: any; created_at: string }>
   ) => {
     const visibleCards = mergeDocumentCards(undefined, job.visible_document_cards);
+    const latestEventMessage = [...(events || [])]
+      .reverse()
+      .map(event => event?.payload?.message)
+      .find(message => typeof message === 'string' && message.trim());
+    const jobWithEvent: DeckJobView = latestEventMessage
+      ? { ...job, latest_event_message: latestEventMessage }
+      : job;
     updateSessionDraft(sessionId, current => current.map(msg => {
       let changed = false;
       const toolCalls = (msg.toolCalls || []).map(tool => {
@@ -1570,15 +1616,15 @@ export default function GodModePage() {
             ...run,
             result: {
               ...(run.result || {}),
-              deck_job_id: job.id,
-              deck_job: job,
+              deck_job_id: jobWithEvent.id,
+              deck_job: jobWithEvent,
               deck_job_events: events.slice(-20),
             },
           };
         });
         const existing = deckJobFromResult(tool.result);
         const result = existing?.id === job.id
-          ? { ...(tool.result || {}), deck_job_id: job.id, deck_job: job, deck_job_events: events.slice(-20) }
+          ? { ...(tool.result || {}), deck_job_id: jobWithEvent.id, deck_job: jobWithEvent, deck_job_events: events.slice(-20) }
           : tool.result;
         if (existing?.id === job.id) {
           changed = true;
@@ -1638,6 +1684,15 @@ export default function GodModePage() {
       }
     }
   }, [activeSessionId, messages, startDeckJobPolling]);
+
+  React.useEffect(() => {
+    return () => {
+      Object.values(deckJobPollersRef.current).forEach(poller => {
+        poller.stopped = true;
+      });
+      deckJobPollersRef.current = {};
+    };
+  }, []);
 
   const selectSession = React.useCallback((sessionId: string) => {
     activeSessionIdRef.current = sessionId;

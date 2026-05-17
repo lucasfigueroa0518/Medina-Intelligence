@@ -2836,6 +2836,32 @@ function deckQaSummary(qa: DeckQaReport | null | undefined): Record<string, unkn
   };
 }
 
+function deckBlockingFindings(qa: DeckQaReport | null | undefined, limit = 6): DeckQaReport['slideFindings'] {
+  if (!qa) return [];
+  return qa.slideFindings
+    .filter(f => f.severity === 'critical' || f.severity === 'high')
+    .slice(0, limit);
+}
+
+function deckVisibleDocumentIdsForQa(
+  qaPassed: boolean,
+  job: { pptx_document_id?: string | null; html_document_id?: string | null; pdf_document_id?: string | null },
+  rendererPdfDocumentId?: string | null
+): string[] {
+  if (!qaPassed) return [];
+  return [job.pptx_document_id, job.html_document_id, rendererPdfDocumentId || job.pdf_document_id]
+    .filter(Boolean) as string[];
+}
+
+function deckDiagnosticDocumentIdsForStatus(
+  status: string | null | undefined,
+  screenshotDocumentIds: string[] = [],
+  qaDocumentId?: string | null
+): string[] {
+  if (status !== 'qa_blocked') return [];
+  return [...screenshotDocumentIds.slice(0, 8), qaDocumentId].filter(Boolean) as string[];
+}
+
 function deckStatusLabel(job: any, qa: DeckQaReport | null | undefined): string {
   const status = String(job?.status || '');
   const phase = String(job?.phase || '');
@@ -2918,22 +2944,40 @@ export async function getDeckJobSnapshot(
   if (!job) return null;
   const qa = safeJsonParse<DeckQaReport | null>(job.qa_report_json, null);
   const visibleIds = safeJsonParse<string[]>(job.user_visible_document_ids_json, []);
+  const screenshotIds = safeJsonParse<string[]>(job.screenshot_document_ids_json, []);
+  const diagnosticIds = deckDiagnosticDocumentIdsForStatus(job.status, screenshotIds, job.qa_document_id);
   const visibleCards = await documentCardsForIds(ctx, env, visibleIds, 'dominant').catch(() => []);
+  const diagnosticCards = await documentCardsForIds(ctx, env, diagnosticIds, 'compact').catch(() => []);
+  const latestEvent = await env.D1.prepare(
+    `SELECT seq, event_type, payload_json, created_at
+       FROM deck_artifact_job_events
+      WHERE job_id = ? AND org_id = ?
+      ORDER BY seq DESC
+      LIMIT 1`
+  ).bind(jobId, ctx.orgId).first<any>().catch(() => null);
+  const latestPayload = safeJsonParse<Record<string, any>>(latestEvent?.payload_json, {});
   return {
     ...job,
     plan: safeJsonParse(job.plan_json, null),
     fact_ledger: safeJsonParse(job.fact_ledger_json, null),
     qa_report: qa,
     qa_summary: deckQaSummary(qa),
+    qa_findings: deckBlockingFindings(qa),
     render_result: safeJsonParse(job.render_result_json, null),
     output_formats: safeJsonParse(job.output_formats_json, []),
-    screenshot_document_ids: safeJsonParse(job.screenshot_document_ids_json, []),
+    screenshot_document_ids: screenshotIds,
     user_visible_document_ids: visibleIds,
     visible_document_cards: visibleCards,
+    diagnostic_document_ids: diagnosticIds,
+    diagnostic_document_cards: diagnosticCards,
     status_label: deckStatusLabel(job, qa),
     revision_round: Number(job.revision_round || 0),
     max_revision_rounds: Number(job.max_revision_rounds || MAX_DECK_REVISION_ROUNDS),
     blocked_reason: job.blocked_reason || null,
+    last_event_seq: Number(latestEvent?.seq || 0),
+    last_event_type: latestEvent?.event_type || null,
+    last_event_message: cleanArtifactText(latestPayload.message || ''),
+    last_event_created_at: latestEvent?.created_at || null,
   };
 }
 
@@ -3061,12 +3105,10 @@ export async function applyDeckRenderResult(
 
   const status: DeckJobStatus = result.error ? 'failed' : (qaPassed ? 'completed' : 'qa_blocked');
   const phase: DeckJobPhase = result.error ? 'failed' : (qaPassed ? 'complete' : 'qa_blocked');
-  const userVisibleIds = qaPassed
-    ? [job.pptx_document_id, job.html_document_id, rendererPdfDocumentId || job.pdf_document_id].filter(Boolean) as string[]
-    : [];
+  const userVisibleIds = deckVisibleDocumentIdsForQa(qaPassed, job, rendererPdfDocumentId);
+  const diagnosticIds = deckDiagnosticDocumentIdsForStatus(status, screenshotDocumentIds, qaDocumentId);
   const blockedReason = !qaPassed && !result.error
-    ? (qa?.slideFindings || [])
-      .filter(f => f.severity === 'critical' || f.severity === 'high')
+    ? deckBlockingFindings(qa, 3)
       .slice(0, 3)
       .map(f => `${f.slideId}: ${f.issue}`)
       .join('; ') || 'Screenshot QA found layout issues that must be revised before export.'
@@ -3117,8 +3159,11 @@ export async function applyDeckRenderResult(
     screenshot_document_ids: screenshotDocumentIds,
     pdf_document_id: rendererPdfDocumentId,
     qa_document_id: qaDocumentId,
+    qa_findings: deckBlockingFindings(qa),
     user_visible_document_ids: userVisibleIds,
     visible_document_cards: qaPassed ? await documentCardsForIds(ctx, env, userVisibleIds, 'dominant').catch(() => []) : [],
+    diagnostic_document_ids: diagnosticIds,
+    diagnostic_document_cards: status === 'qa_blocked' ? await documentCardsForIds(ctx, env, diagnosticIds, 'compact').catch(() => []) : [],
     blocked_reason: blockedReason,
     error: result.error || null,
   }).catch(() => {});
@@ -4292,6 +4337,8 @@ export const __documentArtifactsTestHooks = {
   evaluatePremiumDeckQa,
   deckQaHasBlockingFindings,
   deterministicDeckRepair,
+  deckVisibleDocumentIdsForQa,
+  deckDiagnosticDocumentIdsForStatus,
   normalizeDeckOutputFormats,
   DECK_RENDER_WORK_DOMAIN,
   DECK_STYLE_PACKS,

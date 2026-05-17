@@ -156,4 +156,17 @@ describe('document artifact quality gates', () => {
     expect(__documentArtifactsTestHooks.DECK_RENDER_WORK_DOMAIN).toBe('deck_render');
     expect(__documentArtifactsTestHooks.MAX_DECK_REVISION_ROUNDS).toBe(3);
   });
+
+  it('keeps polished deck cards hidden when screenshot QA blocks export', () => {
+    const job = {
+      pptx_document_id: 'pptx_1',
+      html_document_id: 'html_1',
+      pdf_document_id: 'pdf_1',
+    };
+
+    expect(__documentArtifactsTestHooks.deckVisibleDocumentIdsForQa(false, job, 'rendered_pdf_1')).toEqual([]);
+    expect(__documentArtifactsTestHooks.deckDiagnosticDocumentIdsForStatus('qa_blocked', ['shot_1', 'shot_2'], 'qa_1')).toEqual(['shot_1', 'shot_2', 'qa_1']);
+    expect(__documentArtifactsTestHooks.deckDiagnosticDocumentIdsForStatus('completed', ['shot_1'], 'qa_1')).toEqual([]);
+    expect(__documentArtifactsTestHooks.deckVisibleDocumentIdsForQa(true, job, 'rendered_pdf_1')).toEqual(['pptx_1', 'html_1', 'rendered_pdf_1']);
+  });
 });

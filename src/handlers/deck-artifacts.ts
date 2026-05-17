@@ -50,7 +50,9 @@ export async function getDeckJobEvents(
   }
 
   if (!snapshot.job) return errorResponse('DECK_JOB_NOT_FOUND', 404);
-  const latestSeq = snapshot.events.reduce((max, event) => Math.max(max, Number(event.seq || 0)), afterSeq);
+  const latestSeq = snapshot.events.length > 0
+    ? snapshot.events.reduce((max, event) => Math.max(max, Number(event.seq || 0)), afterSeq)
+    : Math.max(afterSeq, Number(snapshot.job.last_event_seq || 0));
   return jsonResponse({
     job: snapshot.job,
     events: snapshot.events,
