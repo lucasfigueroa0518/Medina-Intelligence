@@ -13,6 +13,7 @@ type GuardState = 'loading' | 'authenticated' | 'unauthenticated' | 'unverified'
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
+  const isPublicPath = PUBLIC_PATHS.some(p => pathname.startsWith(p));
   const [state, setState] = useState<GuardState>('loading');
   const [userEmail, setUserEmail] = useState('');
   const [resending, setResending] = useState(false);
@@ -20,7 +21,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
   const [resendError, setResendError] = useState('');
 
   const checkAuth = useCallback(async () => {
-    if (PUBLIC_PATHS.some(p => pathname.startsWith(p))) {
+    if (isPublicPath) {
       setState('authenticated');
       return;
     }
@@ -66,7 +67,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     } catch {
       setState('authenticated');
     }
-  }, [pathname]);
+  }, [isPublicPath]);
 
   useEffect(() => {
     checkAuth();
@@ -83,13 +84,16 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     };
   }, [router]);
 
+  useEffect(() => {
+    if (state === 'unauthenticated' && !isPublicPath) {
+      router.replace('/login');
+    }
+  }, [isPublicPath, router, state]);
+
   if (state === 'loading') return null;
 
   if (state === 'unauthenticated') {
-    if (!PUBLIC_PATHS.some(p => pathname.startsWith(p))) {
-      router.replace('/login');
-      return null;
-    }
+    if (!isPublicPath) return null;
     return <>{children}</>;
   }
 

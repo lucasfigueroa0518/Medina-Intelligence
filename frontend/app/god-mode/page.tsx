@@ -176,10 +176,19 @@ interface Message {
   documentCards?: MartyDocumentCard[];
 }
 
+interface RunningMartyStream {
+  sessionId: string;
+  requestId: string;
+  assistantMessageId: string;
+  abortController?: AbortController | null;
+  clientRequestId?: string;
+}
+
 type MartyMode = 'fast' | 'max';
 
 const MARTY_MODE_STORAGE_KEY = 'marty_chat_mode';
 const MARTY_PENDING_STORAGE_KEY = 'marty_pending';
+const MARTY_PENDING_RUNS_STORAGE_KEY = 'marty_pending_runs';
 
 // Selected/in-flight uploads (state local to the input bar before send).
 interface PendingUpload {
@@ -1030,10 +1039,12 @@ export default function GodModePage() {
   const sessionDraftsRef = React.useRef<Record<string, Message[]>>({});
   const provisionalSessionIdsRef = React.useRef<Set<string>>(new Set());
   const deletedSessionIdsRef = React.useRef<Set<string>>(new Set());
+  const runningStreamsRef = React.useRef<Record<string, RunningMartyStream>>({});
+  const locallyCancelledRequestIdsRef = React.useRef<Set<string>>(new Set());
   const messagesSnapshotRef = React.useRef<Message[]>([]);
   const streamingRef = React.useRef(false);
   const skipNextFetchRef = React.useRef(false);
-  const [streamSessionId, setStreamSessionId] = React.useState<string | null>(null);
+  const [runningSessionIds, setRunningSessionIds] = React.useState<string[]>([]);
 
   const [sidebarSearch, setSidebarSearch] = React.useState('');
   const [mobileSessionsOpen, setMobileSessionsOpen] = React.useState(false);
@@ -1058,14 +1069,75 @@ export default function GodModePage() {
   const activeRequestIdRef = React.useRef<string | null>(null);
   const cancelledLocallyRef = React.useRef(false);
 
-  const cancelActiveStream = React.useCallback((): string | null => {
-    const reqId = streamRequestIdRef.current;
-    const sessionId = streamSessionIdRef.current;
-    const assistantMessageId = streamAssistantMessageIdRef.current;
+  const syncRunningIndicators = React.useCallback(() => {
+    const ids = Object.keys(runningStreamsRef.current);
+    const runs = Object.values(runningStreamsRef.current);
+    const activeId = activeSessionIdRef.current;
+    const activeRun = activeId ? runningStreamsRef.current[activeId] : null;
+    const fallbackRun = ids.length === 1 ? runningStreamsRef.current[ids[0]] : null;
+    const visibleRun = activeRun || fallbackRun || null;
+
+    setRunningSessionIds(ids);
+    setStreaming(ids.length > 0);
+    streamingRef.current = ids.length > 0;
+    if (visibleRun) {
+      streamSessionIdRef.current = visibleRun.sessionId;
+      streamRequestIdRef.current = visibleRun.requestId;
+      streamAssistantMessageIdRef.current = visibleRun.assistantMessageId;
+      streamAbortControllerRef.current = visibleRun.abortController || null;
+      activeRequestIdRef.current = activeRun ? activeRun.requestId : null;
+    } else {
+      streamSessionIdRef.current = null;
+      streamRequestIdRef.current = null;
+      streamAssistantMessageIdRef.current = null;
+      streamAbortControllerRef.current = null;
+      activeRequestIdRef.current = null;
+    }
+    try {
+      if (runs.length > 0) {
+        const pendingRuns = runs.map(run => ({
+          sessionId: run.sessionId,
+          requestId: run.requestId,
+        }));
+        localStorage.setItem(MARTY_PENDING_RUNS_STORAGE_KEY, JSON.stringify(pendingRuns));
+        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify(pendingRuns[0]));
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+      } else {
+        localStorage.removeItem(MARTY_PENDING_RUNS_STORAGE_KEY);
+        localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const registerRunningStream = React.useCallback((run: RunningMartyStream) => {
+    runningStreamsRef.current = { ...runningStreamsRef.current, [run.sessionId]: run };
+    syncRunningIndicators();
+  }, [syncRunningIndicators]);
+
+  const clearRunningStream = React.useCallback((sessionId: string | null | undefined, requestId?: string | null) => {
+    if (!sessionId) return;
+    const current = runningStreamsRef.current[sessionId];
+    if (!current) return;
+    if (requestId && current.requestId !== requestId && current.clientRequestId !== requestId) return;
+    const next = { ...runningStreamsRef.current };
+    delete next[sessionId];
+    runningStreamsRef.current = next;
+    syncRunningIndicators();
+  }, [syncRunningIndicators]);
+
+  const cancelSessionStream = React.useCallback((targetSessionId?: string | null): string | null => {
+    const sessionId = targetSessionId || activeSessionIdRef.current || streamSessionIdRef.current;
+    if (!sessionId) return null;
+    const run = runningStreamsRef.current[sessionId];
+    const reqId = run?.requestId || (streamSessionIdRef.current === sessionId ? streamRequestIdRef.current : null);
+    const assistantMessageId = run?.assistantMessageId || (streamSessionIdRef.current === sessionId ? streamAssistantMessageIdRef.current : null);
     if (!reqId) return null;
     cancelledLocallyRef.current = true;
-    api.cancelAgentQuery(reqId);
-    streamAbortControllerRef.current?.abort();
+    locallyCancelledRequestIdsRef.current.add(reqId);
+    if (run?.clientRequestId) locallyCancelledRequestIdsRef.current.add(run.clientRequestId);
+    api.cancelAgentQuery(reqId).catch(() => {});
+    run?.abortController?.abort();
 
     if (sessionId) {
       const markCancelled = (current: Message[]) => current.map(msg => {
@@ -1086,45 +1158,45 @@ export default function GodModePage() {
       if (activeSessionIdRef.current === sessionId) setMessages(next);
     }
 
-    activeRequestIdRef.current = null;
-    streamRequestIdRef.current = null;
-    streamSessionIdRef.current = null;
-    streamAssistantMessageIdRef.current = null;
-    streamAbortControllerRef.current = null;
-    setStreamSessionId(null);
-    setIsThinking(false);
-    setStreaming(false);
-    pendingSessionIdRef.current = null;
-    liveSessionIdRef.current = null;
+    clearRunningStream(sessionId, reqId);
+    if (activeSessionIdRef.current === sessionId) setIsThinking(false);
+    if (pendingSessionIdRef.current === sessionId) pendingSessionIdRef.current = null;
+    if (liveSessionIdRef.current === sessionId) liveSessionIdRef.current = null;
     try {
-      localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-      window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+      const nextRunningIds = Object.keys(runningStreamsRef.current);
+      if (nextRunningIds.length === 0) {
+        localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
+        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+      }
     } catch { /* ignore */ }
     return reqId;
-  }, []);
+  }, [clearRunningStream]);
+
+  const cancelActiveStream = React.useCallback((): string | null => (
+    cancelSessionStream(activeSessionIdRef.current || streamSessionIdRef.current)
+  ), [cancelSessionStream]);
 
   // Global Esc / Cmd+Backspace cancel while streaming. Esc only fires when
   // no input/textarea is focused so it doesn't fight with the input's own
   // Escape behavior. Cmd+Backspace works regardless (power-user shortcut).
   React.useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (
-        !streamingRef.current
-        || !streamRequestIdRef.current
-      ) return;
+      const activeId = activeSessionIdRef.current || streamSessionIdRef.current;
+      const activeRun = activeId ? runningStreamsRef.current[activeId] : null;
+      if (!activeRun?.requestId) return;
       const target = e.target as HTMLElement | null;
       const inField = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
       if (e.key === 'Escape' && !inField) {
         e.preventDefault();
-        cancelActiveStream();
+        cancelSessionStream(activeRun.sessionId);
       } else if ((e.metaKey || e.ctrlKey) && e.key === 'Backspace') {
         e.preventDefault();
-        cancelActiveStream();
+        cancelSessionStream(activeRun.sessionId);
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [cancelActiveStream]);
+  }, [cancelSessionStream]);
 
   // Citation source side panel
   const [activeSource, setActiveSource] = React.useState<CitationSource | null>(null);
@@ -1236,12 +1308,11 @@ export default function GodModePage() {
 
   React.useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
-    if (activeSessionId === streamSessionIdRef.current) {
-      activeRequestIdRef.current = streamRequestIdRef.current;
-    } else {
-      activeRequestIdRef.current = null;
-    }
-  }, [activeSessionId]);
+    syncRunningIndicators();
+    const activeDraft = activeSessionId ? sessionDraftsRef.current[activeSessionId] : null;
+    const runningMessage = activeDraft ? getRunningAssistantMessage(activeDraft) : null;
+    setIsThinking(Boolean(activeSessionId && runningStreamsRef.current[activeSessionId] && !runningMessage?.content));
+  }, [activeSessionId, syncRunningIndicators]);
 
   React.useEffect(() => {
     messagesSnapshotRef.current = messages;
@@ -1298,7 +1369,7 @@ export default function GodModePage() {
         }
 
         const hasLocalDraft = Array.isArray(sessionDraftsRef.current[existing.id]);
-        const isLive = existing.id === streamSessionIdRef.current
+        const isLive = Boolean(runningStreamsRef.current[existing.id])
           || existing.id === activeSessionIdRef.current
           || provisionalSessionIdsRef.current.has(existing.id)
           || existing._optimistic;
@@ -1353,7 +1424,7 @@ export default function GodModePage() {
     const draft = sessionDraftsRef.current[sessionId];
     if (draft) {
       setMessages(draft);
-      skipNextFetchRef.current = provisionalSessionIdsRef.current.has(sessionId) || streamSessionIdRef.current === sessionId;
+      skipNextFetchRef.current = provisionalSessionIdsRef.current.has(sessionId) || Boolean(runningStreamsRef.current[sessionId]);
     } else {
       setMessages([]);
     }
@@ -1376,62 +1447,42 @@ export default function GodModePage() {
   const userScrolledUpRef = React.useRef(false);
 
   const applyServerMessages = React.useCallback((rows: any[], sessionIdForPending?: string | null) => {
+    const targetSessionId = sessionIdForPending || activeSessionIdRef.current;
     const nextMessages = hydrateAgentMessages(rows);
+    const runningMessage = getRunningAssistantMessage(nextMessages);
+    const existingRun = targetSessionId ? runningStreamsRef.current[targetSessionId] : null;
+    if (targetSessionId && !runningMessage?.pendingRequestId && existingRun?.abortController) {
+      return getRunningAssistantMessage(sessionDraftsRef.current[targetSessionId] || messagesSnapshotRef.current) || runningMessage;
+    }
     if (sessionIdForPending) {
       sessionDraftsRef.current = { ...sessionDraftsRef.current, [sessionIdForPending]: nextMessages };
     }
     if (!sessionIdForPending || activeSessionIdRef.current === sessionIdForPending) {
       setMessages(nextMessages);
     }
-    const runningMessage = getRunningAssistantMessage(nextMessages);
     if (runningMessage?.pendingRequestId) {
-      if (sessionIdForPending) {
-        streamSessionIdRef.current = sessionIdForPending;
-        streamRequestIdRef.current = runningMessage.pendingRequestId;
-        streamAssistantMessageIdRef.current = runningMessage.id;
-        setStreamSessionId(sessionIdForPending);
+      if (targetSessionId) {
+        registerRunningStream({
+          sessionId: targetSessionId,
+          requestId: runningMessage.pendingRequestId,
+          assistantMessageId: runningMessage.id,
+        });
       }
-      if (!sessionIdForPending || activeSessionIdRef.current === sessionIdForPending) {
-        activeRequestIdRef.current = runningMessage.pendingRequestId;
+      if (targetSessionId && activeSessionIdRef.current === targetSessionId) {
+        setIsThinking(!runningMessage.content);
       }
-      setIsThinking(true);
-      setStreaming(true);
-      try {
-        if (sessionIdForPending) {
-          localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: sessionIdForPending, requestId: runningMessage.pendingRequestId }));
-        }
-        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
-      } catch { /* ignore */ }
+    } else if (targetSessionId) {
+      clearRunningStream(targetSessionId);
+      if (activeSessionIdRef.current === targetSessionId) setIsThinking(false);
     }
     return runningMessage;
-  }, []);
+  }, [clearRunningStream, registerRunningStream]);
 
   const refreshSessionFromServer = React.useCallback(async (sessionId: string) => {
     const d = await api.getSessionMessages(sessionId);
     const runningMessage = applyServerMessages(d.messages, sessionId);
-    if (runningMessage?.pendingRequestId) {
-      streamSessionIdRef.current = sessionId;
-      streamRequestIdRef.current = runningMessage.pendingRequestId;
-      streamAssistantMessageIdRef.current = runningMessage.id;
-      setStreamSessionId(sessionId);
-      if (activeSessionIdRef.current === sessionId) {
-        activeRequestIdRef.current = runningMessage.pendingRequestId;
-      }
-      setIsThinking(true);
-      setStreaming(true);
-    } else {
-      if (streamSessionIdRef.current === sessionId) {
-        activeRequestIdRef.current = null;
-        streamRequestIdRef.current = null;
-        streamSessionIdRef.current = null;
-        streamAssistantMessageIdRef.current = null;
-        streamAbortControllerRef.current = null;
-        setStreamSessionId(null);
-        setIsThinking(false);
-        setStreaming(false);
-        localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
-      }
+    if (!runningMessage?.pendingRequestId && activeSessionIdRef.current === sessionId) {
+      setIsThinking(false);
     }
     api.listSessions().then(d2 => mergeSessionsFromServer(d2.sessions)).catch(() => {});
     return runningMessage;
@@ -1449,20 +1500,26 @@ export default function GodModePage() {
     const t = setTimeout(() => setShowSparkles(false), 1200);
 
     try {
-      const pending = localStorage.getItem(MARTY_PENDING_STORAGE_KEY);
-      if (!demoMode && pending) {
-        const { sessionId } = JSON.parse(pending);
-        if (sessionId) {
-          setActiveSessionId(sessionId);
+      const pendingRunsRaw = localStorage.getItem(MARTY_PENDING_RUNS_STORAGE_KEY);
+      const legacyPendingRaw = localStorage.getItem(MARTY_PENDING_STORAGE_KEY);
+      const pendingRuns = pendingRunsRaw
+        ? JSON.parse(pendingRunsRaw)
+        : legacyPendingRaw
+          ? [JSON.parse(legacyPendingRaw)]
+          : [];
+      if (!demoMode && Array.isArray(pendingRuns) && pendingRuns.length > 0) {
+        let adoptedFirstSession = false;
+        for (const pendingRun of pendingRuns) {
+          const sessionId = pendingRun?.sessionId;
+          if (!sessionId || deletedSessionIdsRef.current.has(sessionId)) continue;
+          if (!adoptedFirstSession) {
+            setActiveSessionId(sessionId);
+            adoptedFirstSession = true;
+          }
           api.getSessionMessages(sessionId).then(d => {
-            const runningMessage = applyServerMessages(d.messages, sessionId);
-            if (!runningMessage) {
-              localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-              window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
-            }
+            applyServerMessages(d.messages, sessionId);
           }).catch(e => {
-            localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+            clearRunningStream(sessionId);
             if (isSessionNotFoundError(e)) {
               setActiveSessionId(current => current === sessionId ? null : current);
               setMessages([]);
@@ -1500,7 +1557,7 @@ export default function GodModePage() {
     } catch { /* ignore */ }
 
     return () => clearTimeout(t);
-  }, [applyServerMessages, demoMode, mergeSessionsFromServer, removeSessionFromSidebar]);
+  }, [applyServerMessages, clearRunningStream, demoMode, mergeSessionsFromServer, removeSessionFromSidebar]);
 
   React.useEffect(() => {
     if (!activeSessionId && messages.length === 0) {
@@ -1532,10 +1589,11 @@ export default function GodModePage() {
     if (activeSessionId) {
       const draft = sessionDraftsRef.current[activeSessionId];
       const isProvisional = provisionalSessionIdsRef.current.has(activeSessionId);
+      const isRunningLocally = Boolean(runningStreamsRef.current[activeSessionId]?.abortController);
       if (draft) {
         setMessages(draft);
       }
-      if (!isProvisional) {
+      if (!isProvisional && !isRunningLocally) {
         api.getSessionMessages(activeSessionId).then(d => {
           applyServerMessages(d.messages, activeSessionId);
           if (d.session) upsertSessionInSidebar(d.session);
@@ -1549,8 +1607,7 @@ export default function GodModePage() {
           setBytesUsed(0);
           setBytesTotal(0);
           removeSessionFromSidebar(missingSessionId);
-          localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-          window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+          clearRunningStream(missingSessionId);
           api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
         }
         });
@@ -1567,12 +1624,13 @@ export default function GodModePage() {
       setBytesTotal(0);
       setPendingUploads([]);
     }
-  }, [activeSessionId, applyServerMessages, demoMode, mergeSessionsFromServer, removeSessionFromSidebar, upsertSessionInSidebar]);
+  }, [activeSessionId, applyServerMessages, clearRunningStream, demoMode, mergeSessionsFromServer, removeSessionFromSidebar, upsertSessionInSidebar]);
 
   React.useEffect(() => {
     if (demoMode || !activeSessionId) return;
     const runningMessage = getRunningAssistantMessage(messages);
     if (!runningMessage?.pendingRequestId) return;
+    if (runningStreamsRef.current[activeSessionId]?.abortController) return;
 
     let stopped = false;
     const refreshPendingTurn = async () => {
@@ -1581,48 +1639,28 @@ export default function GodModePage() {
         if (stopped) return;
         const nextMessages = hydrateAgentMessages(d.messages);
         const stillRunning = getRunningAssistantMessage(nextMessages);
-        setMessages(nextMessages);
+        sessionDraftsRef.current = { ...sessionDraftsRef.current, [activeSessionId]: nextMessages };
+        if (activeSessionIdRef.current === activeSessionId) setMessages(nextMessages);
         if (stillRunning?.pendingRequestId) {
-          activeRequestIdRef.current = stillRunning.pendingRequestId;
-          streamSessionIdRef.current = activeSessionId;
-          streamRequestIdRef.current = stillRunning.pendingRequestId;
-          streamAssistantMessageIdRef.current = stillRunning.id;
-          setStreamSessionId(activeSessionId);
-          setIsThinking(true);
-          setStreaming(true);
+          registerRunningStream({
+            sessionId: activeSessionId,
+            requestId: stillRunning.pendingRequestId,
+            assistantMessageId: stillRunning.id,
+          });
+          if (activeSessionIdRef.current === activeSessionId) setIsThinking(true);
           return;
         }
-        activeRequestIdRef.current = null;
-        if (streamSessionIdRef.current === activeSessionId) {
-          streamRequestIdRef.current = null;
-          streamSessionIdRef.current = null;
-          streamAssistantMessageIdRef.current = null;
-          streamAbortControllerRef.current = null;
-          setStreamSessionId(null);
-        }
-        setIsThinking(false);
-        setStreaming(false);
-        localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+        clearRunningStream(activeSessionId);
+        if (activeSessionIdRef.current === activeSessionId) setIsThinking(false);
         api.listSessions().then(d2 => mergeSessionsFromServer(d2.sessions)).catch(() => {});
       } catch (e) {
         if (isSessionNotFoundError(e)) {
           const missingSessionId = activeSessionId;
-          activeRequestIdRef.current = null;
-          if (streamSessionIdRef.current === missingSessionId) {
-            streamRequestIdRef.current = null;
-            streamSessionIdRef.current = null;
-            streamAssistantMessageIdRef.current = null;
-            streamAbortControllerRef.current = null;
-            setStreamSessionId(null);
-          }
-          setIsThinking(false);
-          setStreaming(false);
+          clearRunningStream(missingSessionId);
+          if (activeSessionIdRef.current === missingSessionId) setIsThinking(false);
           setActiveSessionId(current => current === missingSessionId ? null : current);
           setMessages([]);
           removeSessionFromSidebar(missingSessionId);
-          localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-          window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
           api.listSessions().then(d2 => mergeSessionsFromServer(d2.sessions)).catch(() => {});
           return;
         }
@@ -1637,7 +1675,7 @@ export default function GodModePage() {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [activeSessionId, demoMode, mergeSessionsFromServer, messages, removeSessionFromSidebar]);
+  }, [activeSessionId, clearRunningStream, demoMode, mergeSessionsFromServer, messages, registerRunningStream, removeSessionFromSidebar]);
 
   // Fix 1: Auto-scroll only when user hasn't scrolled up
   React.useEffect(() => {
@@ -1698,7 +1736,7 @@ export default function GodModePage() {
   }
 
   function retryFrom(assistantMsgId: string) {
-    if (streaming) return;
+    if (activeSessionId && runningSessionIds.includes(activeSessionId)) return;
     const idx = messages.findIndex(m => m.id === assistantMsgId);
     if (idx < 1) return;
     const userMsg = messages[idx - 1];
@@ -1718,12 +1756,12 @@ export default function GodModePage() {
     const trimmedQuery = queryText.trim();
     if (!trimmedQuery) return;
 
-    // Blue-chip interrupt behavior: a new prompt is an explicit steer. If any
-    // MARTy turn is currently running in this browser, stop it locally and ask
-    // the server to replace it with the new turn instead of making the user wait.
+    // Blue-chip interrupt behavior: a new prompt steers only the current chat.
+    // Background chats keep running so users can work across sessions.
     let interruptRequestId: string | null = null;
-    if (streamingRef.current && streamRequestIdRef.current) {
-      interruptRequestId = cancelActiveStream();
+    const activeRun = activeSessionId ? runningStreamsRef.current[activeSessionId] : null;
+    if (activeRun?.requestId) {
+      interruptRequestId = cancelSessionStream(activeSessionId);
     }
 
     // Trust the server before accepting a new turn. A previous Deep request can
@@ -1736,17 +1774,13 @@ export default function GodModePage() {
         const runningMessage = getRunningAssistantMessage(serverMessages);
         if (runningMessage?.pendingRequestId) {
           applyServerMessages(d.messages, activeSessionId);
-          streamSessionIdRef.current = activeSessionId;
-          streamRequestIdRef.current = runningMessage.pendingRequestId;
-          streamAssistantMessageIdRef.current = runningMessage.id;
-          interruptRequestId = cancelActiveStream() || runningMessage.pendingRequestId;
+          interruptRequestId = cancelSessionStream(activeSessionId) || runningMessage.pendingRequestId;
         }
       } catch {
         // Existing recovery paths handle stale sessions below.
       }
     }
 
-    setStreaming(true);
     cancelledLocallyRef.current = false;
     lastSentQueryRef.current = trimmedQuery;
 
@@ -1808,6 +1842,16 @@ export default function GodModePage() {
       } catch { /* ignore */ }
     }
 
+    if (!demoMode && requestSessionId) {
+      registerRunningStream({
+        sessionId: requestSessionId,
+        requestId: clientRequestId,
+        assistantMessageId: assistantMsgId,
+        abortController,
+        clientRequestId,
+      });
+    }
+
     // Reset textarea height
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
@@ -1853,10 +1897,17 @@ export default function GodModePage() {
         const establishedAt = new Date().toISOString();
         if (confirmedSessionId !== provisionalId) {
           const draft = sessionDraftsRef.current[provisionalId];
+          const provisionalRun = runningStreamsRef.current[provisionalId];
           if (draft) {
             const nextDrafts = { ...sessionDraftsRef.current, [confirmedSessionId]: draft };
             delete nextDrafts[provisionalId];
             sessionDraftsRef.current = nextDrafts;
+          }
+          if (provisionalRun) {
+            const nextRuns = { ...runningStreamsRef.current };
+            delete nextRuns[provisionalId];
+            runningStreamsRef.current = nextRuns;
+            registerRunningStream({ ...provisionalRun, sessionId: confirmedSessionId });
           }
           setSessions(prev => prev.filter(s => s.id !== provisionalId));
           if (activeSessionIdRef.current === provisionalId) {
@@ -1887,44 +1938,35 @@ export default function GodModePage() {
         });
         sessionDraftsRef.current = { ...sessionDraftsRef.current, [requestSessionId as string]: optimisticMessages };
       }
-      streamSessionIdRef.current = requestSessionId;
-      streamRequestIdRef.current = clientRequestId;
-      streamAssistantMessageIdRef.current = assistantMsgId;
-      streamAbortControllerRef.current = abortController;
-      if (activeSessionIdRef.current === requestSessionId) {
-        activeRequestIdRef.current = clientRequestId;
-      }
-      setStreamSessionId(requestSessionId);
-      setStreaming(true);
-      try {
-        localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId, requestId: clientRequestId }));
-        window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
-      } catch { /* ignore */ }
+      registerRunningStream({
+        sessionId: requestSessionId!,
+        requestId: clientRequestId,
+        assistantMessageId: assistantMsgId,
+        abortController,
+        clientRequestId,
+      });
 
       await streamAgentQuery(
         trimmedQuery, requestSessionId, null, null, file, isDeepDive,
         token => {
           if (typeof token === 'string') {
-            setIsThinking(false);
+            if (activeSessionIdRef.current === requestSessionId) setIsThinking(false);
             updateSessionDraft(requestSessionId!, m => m.map(msg =>
               msg.id === assistantMsgId ? { ...msg, content: msg.content + token } : msg
             ));
           }
         },
         () => {
-          const finishedCurrentStream = streamRequestIdRef.current === clientRequestId
-            || streamAssistantMessageIdRef.current === assistantMsgId;
-          const wasCancelled = !finishedCurrentStream || cancelledLocallyRef.current;
-          if (finishedCurrentStream) cancelledLocallyRef.current = false;
-          if (finishedCurrentStream && streamSessionIdRef.current === requestSessionId) {
-            activeRequestIdRef.current = null;
-            streamRequestIdRef.current = null;
-            streamSessionIdRef.current = null;
-            streamAssistantMessageIdRef.current = null;
-            streamAbortControllerRef.current = null;
-            setStreamSessionId(null);
-          }
-          if (finishedCurrentStream) setIsThinking(false);
+          const finalSessionId = requestSessionId!;
+          const activeRun = runningStreamsRef.current[finalSessionId];
+          const actualRequestId = activeRun?.requestId || clientRequestId;
+          const wasCancelled = locallyCancelledRequestIdsRef.current.has(clientRequestId)
+            || locallyCancelledRequestIdsRef.current.has(actualRequestId);
+          locallyCancelledRequestIdsRef.current.delete(clientRequestId);
+          locallyCancelledRequestIdsRef.current.delete(actualRequestId);
+          cancelledLocallyRef.current = false;
+          clearRunningStream(finalSessionId, clientRequestId);
+          if (activeSessionIdRef.current === finalSessionId) setIsThinking(false);
           updateSessionDraft(requestSessionId!, m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
             if (wasCancelled) {
@@ -1936,12 +1978,11 @@ export default function GodModePage() {
             }
             return { ...msg, content: normalizeMartySentenceSpacing(msg.content), streaming: false, pendingRequestId: undefined, justFinished: true };
           }));
-          if (finishedCurrentStream) {
-            setStreaming(false);
+          if (pendingSessionIdRef.current === finalSessionId) {
             pendingSessionIdRef.current = null;
+          }
+          if (liveSessionIdRef.current === finalSessionId) {
             liveSessionIdRef.current = null;
-            localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
           }
           api.listSessions().then(d => mergeSessionsFromServer(d.sessions));
           setTimeout(() => {
@@ -1951,14 +1992,18 @@ export default function GodModePage() {
           }, 1000);
         },
         (err, opts: AgentSendErrorOptions = {}) => {
-          const isCurrentStream = streamRequestIdRef.current === clientRequestId
-            || streamAssistantMessageIdRef.current === assistantMsgId
-            || (opts.requestId ? streamRequestIdRef.current === opts.requestId : false);
-          if (opts.code === 'CLIENT_ABORT' || cancelledLocallyRef.current) {
-            if (isCurrentStream) {
-              cancelledLocallyRef.current = false;
-              setIsThinking(false);
-            }
+          const finalSessionId = requestSessionId!;
+          const activeRun = runningStreamsRef.current[finalSessionId];
+          const actualRequestId = opts.requestId || activeRun?.requestId || clientRequestId;
+          const wasLocallyCancelled = opts.code === 'CLIENT_ABORT'
+            || locallyCancelledRequestIdsRef.current.has(clientRequestId)
+            || locallyCancelledRequestIdsRef.current.has(actualRequestId);
+          if (wasLocallyCancelled) {
+            locallyCancelledRequestIdsRef.current.delete(clientRequestId);
+            locallyCancelledRequestIdsRef.current.delete(actualRequestId);
+            cancelledLocallyRef.current = false;
+            clearRunningStream(finalSessionId, actualRequestId);
+            if (activeSessionIdRef.current === finalSessionId) setIsThinking(false);
             updateSessionDraft(requestSessionId!, m => m.map(msg =>
               msg.id === assistantMsgId
                 ? {
@@ -1971,21 +2016,8 @@ export default function GodModePage() {
                   }
                 : msg
             ));
-            if (isCurrentStream) setStreaming(false);
-            if (isCurrentStream && streamSessionIdRef.current === requestSessionId) {
-              activeRequestIdRef.current = null;
-              streamRequestIdRef.current = null;
-              streamSessionIdRef.current = null;
-              streamAssistantMessageIdRef.current = null;
-              streamAbortControllerRef.current = null;
-              setStreamSessionId(null);
-            }
-            if (isCurrentStream) {
-              pendingSessionIdRef.current = null;
-              liveSessionIdRef.current = null;
-              localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-              window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
-            }
+            if (pendingSessionIdRef.current === finalSessionId) pendingSessionIdRef.current = null;
+            if (liveSessionIdRef.current === finalSessionId) liveSessionIdRef.current = null;
             return;
           }
           const staleSession = opts.code === 'SESSION_NOT_FOUND' || err.includes('SESSION_NOT_FOUND') || err.includes('no longer exists');
@@ -1993,7 +2025,8 @@ export default function GodModePage() {
             opts.sessionId
             && (opts.code === 'NETWORK_ERROR' || opts.code === 'STREAM_INTERRUPTED' || opts.code === 'AGENT_TURN_RUNNING')
           );
-          if (isCurrentStream) setIsThinking(false);
+          clearRunningStream(finalSessionId, actualRequestId);
+          if (activeSessionIdRef.current === finalSessionId) setIsThinking(false);
           updateSessionDraft(requestSessionId!, m => m.map(msg =>
             msg.id === assistantMsgId
               ? {
@@ -2010,24 +2043,15 @@ export default function GodModePage() {
                 }
               : msg
           ));
-          if (isCurrentStream) setStreaming(false);
-          if (isCurrentStream && streamSessionIdRef.current === requestSessionId) {
-            activeRequestIdRef.current = null;
-            streamRequestIdRef.current = null;
-            streamSessionIdRef.current = null;
-            streamAssistantMessageIdRef.current = null;
-            streamAbortControllerRef.current = null;
-            setStreamSessionId(null);
-          }
-          if (isCurrentStream && serverMayHaveAcceptedTurn && opts.sessionId) {
+          if (serverMayHaveAcceptedTurn && opts.sessionId) {
             refreshSessionFromServer(opts.sessionId).catch(() => {
               updateSessionDraft(requestSessionId!, m => m.map(msg =>
                 msg.id === assistantMsgId
                   ? { ...msg, content: err, streaming: false, error: true, retryable: opts.retryable !== false }
                   : msg
               ));
-              setIsThinking(false);
-              setStreaming(false);
+              if (activeSessionIdRef.current === finalSessionId) setIsThinking(false);
+              clearRunningStream(finalSessionId);
             });
           }
           if (staleSession) {
@@ -2041,22 +2065,25 @@ export default function GodModePage() {
             setBytesTotal(0);
             api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
           }
-          if (isCurrentStream) {
-            pendingSessionIdRef.current = null;
-            liveSessionIdRef.current = null;
-            localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
-          }
+          if (pendingSessionIdRef.current === finalSessionId) pendingSessionIdRef.current = null;
+          if (liveSessionIdRef.current === finalSessionId) liveSessionIdRef.current = null;
         },
         (event: any) => {
           if (event.type === 'session' && event.session_id) {
             if (event.session_id !== requestSessionId) {
               const previousSessionId = requestSessionId;
               const draft = previousSessionId ? sessionDraftsRef.current[previousSessionId] : undefined;
+              const previousRun = previousSessionId ? runningStreamsRef.current[previousSessionId] : undefined;
               if (draft) {
                 const nextDrafts: Record<string, Message[]> = { ...sessionDraftsRef.current, [event.session_id]: draft };
                 delete nextDrafts[previousSessionId!];
                 sessionDraftsRef.current = nextDrafts;
+              }
+              if (previousRun && previousSessionId) {
+                const nextRuns = { ...runningStreamsRef.current };
+                delete nextRuns[previousSessionId];
+                runningStreamsRef.current = nextRuns;
+                registerRunningStream({ ...previousRun, sessionId: event.session_id });
               }
               requestSessionId = event.session_id;
               upsertSessionInSidebar({ id: event.session_id, title: optimisticSessionTitle(trimmedQuery), last_activity_at: new Date().toISOString() });
@@ -2066,23 +2093,30 @@ export default function GodModePage() {
               }
             }
             liveSessionIdRef.current = event.session_id;
-            streamSessionIdRef.current = event.session_id;
-            setStreamSessionId(event.session_id);
             if (!activeSessionIdRef.current || event.session_id !== requestSessionId) {
               pendingSessionIdRef.current = event.session_id;
             }
-            localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: event.session_id, requestId: streamRequestIdRef.current || clientRequestId }));
-            window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: true } }));
+            registerRunningStream({
+              sessionId: event.session_id,
+              requestId: runningStreamsRef.current[event.session_id]?.requestId || clientRequestId,
+              assistantMessageId: assistantMsgId,
+              abortController,
+              clientRequestId,
+            });
             return;
           }
           if (event.type === 'request' && event.request_id) {
-            streamRequestIdRef.current = event.request_id;
-            streamAssistantMessageIdRef.current = assistantMsgId;
-            if (activeSessionIdRef.current === requestSessionId) {
-              activeRequestIdRef.current = event.request_id;
+            if (locallyCancelledRequestIdsRef.current.has(clientRequestId)) {
+              locallyCancelledRequestIdsRef.current.add(event.request_id);
             }
             cancelledLocallyRef.current = false;
-            localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify({ sessionId: requestSessionId, requestId: event.request_id }));
+            registerRunningStream({
+              sessionId: requestSessionId!,
+              requestId: event.request_id,
+              assistantMessageId: assistantMsgId,
+              abortController,
+              clientRequestId,
+            });
             return;
           }
           if (event.type === 'sources') {
@@ -2134,7 +2168,8 @@ export default function GodModePage() {
         { clientRequestId, interruptRequestId, abortSignal: abortController.signal },
       );
     } catch (e) {
-      setIsThinking(false);
+      const finalSessionId = requestSessionId;
+      if (finalSessionId && activeSessionIdRef.current === finalSessionId) setIsThinking(false);
       const markFailed = (m: Message[]) => m.map(msg =>
         msg.id === assistantMsgId
           ? {
@@ -2149,19 +2184,9 @@ export default function GodModePage() {
       );
       if (requestSessionId) updateSessionDraft(requestSessionId, markFailed);
       else setMessages(markFailed);
-      setStreaming(false);
-      if (streamSessionIdRef.current === requestSessionId) {
-        activeRequestIdRef.current = null;
-        streamRequestIdRef.current = null;
-        streamSessionIdRef.current = null;
-        streamAssistantMessageIdRef.current = null;
-        streamAbortControllerRef.current = null;
-        setStreamSessionId(null);
-      }
-      pendingSessionIdRef.current = null;
-      liveSessionIdRef.current = null;
-      localStorage.removeItem(MARTY_PENDING_STORAGE_KEY);
-      window.dispatchEvent(new CustomEvent('marty-pending-change', { detail: { pending: false } }));
+      if (finalSessionId) clearRunningStream(finalSessionId, clientRequestId);
+      if (pendingSessionIdRef.current === finalSessionId) pendingSessionIdRef.current = null;
+      if (liveSessionIdRef.current === finalSessionId) liveSessionIdRef.current = null;
     }
   };
 
@@ -2177,7 +2202,7 @@ export default function GodModePage() {
 
   const isEmptyState = messages.length === 0;
   const hasInput = input.trim().length > 0;
-  const activeSessionIsStreaming = Boolean(streaming && activeSessionId && activeSessionId === streamSessionId);
+  const activeSessionIsStreaming = Boolean(activeSessionId && runningSessionIds.includes(activeSessionId));
   const showStopButton = activeSessionIsStreaming && !hasInput;
   const canSend = hasInput;
 
@@ -2268,7 +2293,7 @@ export default function GodModePage() {
                     return (
                       <SessionItem
                         key={s.id}
-                        session={{ ...s, _running: s.id === streamSessionId }}
+                        session={{ ...s, _running: runningSessionIds.includes(s.id) }}
                         isActive={activeSessionId === s.id}
                         index={idx}
                         onSelect={() => selectSession(s.id)}
@@ -2427,7 +2452,7 @@ export default function GodModePage() {
                       </div>
                     )}
 
-                    {m.streaming && isThinking && (
+                    {m.streaming && activeSessionIsStreaming && isThinking && (
                       <ThinkingIndicator />
                     )}
 
@@ -2685,7 +2710,7 @@ export default function GodModePage() {
                 <button
                   onClick={() => sendMessage(input)}
                   disabled={!canSend}
-                  title={streaming ? 'Stop current response and send' : 'Send'}
+                  title={activeSessionIsStreaming ? 'Stop current response and send' : 'Send'}
                   className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
                   style={{
                     borderRadius: 10,
