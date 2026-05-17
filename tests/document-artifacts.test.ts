@@ -99,7 +99,8 @@ describe('document artifact quality gates', () => {
     expect(plan.style_pack).toBe('medina_default');
     expect(plan.objective).toBe('decide');
     expect(plan.slides).toHaveLength(6);
-    expect(html).toContain('--accent-gutter: 72px');
+    expect(html).toContain('--accent-gutter: 104px');
+    expect(html).toContain('data-accent-line="true"');
     expect(html).toContain('HTML source of truth');
     expect(qa.status).toBe('pass');
     expect(qa.checks.visual_surface_count).toBeGreaterThanOrEqual(4);
@@ -117,9 +118,42 @@ describe('document artifact quality gates', () => {
     expect(qa.slideFindings.some(f => f.severity === 'critical')).toBe(true);
   });
 
+  it('repairs blocking deck QA by compressing dense bullets into safer exhibits', () => {
+    const denseContent = {
+      slides: [
+        { layout: 'cover', title: 'Portfolio Review', headline: 'Weekly operating update' },
+        {
+          layout: 'evidence',
+          title: 'Everything that happened across the portfolio this week and why each item needs a decision',
+          headline: 'This slide intentionally carries too much detail so the deterministic repair must reduce density.',
+          bullets: [
+            'NeuralSeek diligence needs a revenue bridge, channel concentration analysis, customer proof, and corporate structure resolution.',
+            'Tier4 AI needs sales pipeline cleanup, champion mapping, follow-up ownership, and renewed urgency around next customer meetings.',
+            'QNECT requires clearer founder updates, financial hygiene, and a concise memo on traction since the last board discussion.',
+            'Hedgehog needs current metrics, burn trajectory, runway, team plan, and evidence of durable customer pull.',
+            'Medina should consolidate owners, due dates, blockers, next decisions, and evidence quality before the next IC meeting.',
+            'The appendix should hold raw detail while the main slide focuses on the operating point and the decision required.',
+          ],
+        },
+      ],
+    };
+    const qa = __documentArtifactsTestHooks.evaluatePremiumDeckQa('Portfolio Review', denseContent);
+
+    expect(__documentArtifactsTestHooks.deckQaHasBlockingFindings(qa)).toBe(true);
+
+    const repaired = __documentArtifactsTestHooks.deterministicDeckRepair('Portfolio Review', denseContent, qa, 1);
+    const repairedSlide = repaired.slides[1];
+
+    expect(repairedSlide.layout).toBe('matrix');
+    expect(repairedSlide.bullets).toEqual([]);
+    expect(repairedSlide.table.rows.length).toBeLessThanOrEqual(6);
+    expect(repairedSlide.table.rows[0][1].split(/\s+/).length).toBeLessThanOrEqual(17);
+  });
+
   it('normalizes deck output formats and exposes the render queue domain', () => {
     expect(__documentArtifactsTestHooks.normalizeDeckOutputFormats(['pdf', 'pptx', 'bogus', 'pdf'])).toEqual(['pdf', 'pptx']);
     expect(__documentArtifactsTestHooks.normalizeDeckOutputFormats([])).toEqual(['html', 'pdf', 'pptx']);
     expect(__documentArtifactsTestHooks.DECK_RENDER_WORK_DOMAIN).toBe('deck_render');
+    expect(__documentArtifactsTestHooks.MAX_DECK_REVISION_ROUNDS).toBe(3);
   });
 });

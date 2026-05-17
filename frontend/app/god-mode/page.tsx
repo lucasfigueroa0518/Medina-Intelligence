@@ -139,6 +139,26 @@ interface ToolRun {
   status: 'started' | 'executing' | 'done' | 'error' | 'cancelled';
 }
 
+interface DeckJobView {
+  id: string;
+  status?: 'queued' | 'running' | 'revising' | 'qa_blocked' | 'completed' | 'failed' | 'cancelled' | string;
+  phase?: string;
+  title?: string;
+  status_label?: string;
+  revision_round?: number;
+  max_revision_rounds?: number;
+  qa_summary?: {
+    status?: string;
+    findings?: number;
+    critical?: number;
+    high?: number;
+    medium?: number;
+    low?: number;
+  } | null;
+  blocked_reason?: string | null;
+  visible_document_cards?: MartyDocumentCard[];
+}
+
 interface MartyDocumentCard {
   document_id: string;
   title: string;
@@ -442,6 +462,47 @@ function aggregateResultCount(tool: ToolCall): number | null {
   return sawCount ? total : null;
 }
 
+function deckJobFromResult(result: any): DeckJobView | null {
+  const job = result?.deck_job || result?.job || null;
+  if (!job || typeof job !== 'object') return null;
+  const id = String(job.id || result?.deck_job_id || '').trim();
+  if (!id) return null;
+  return { ...job, id };
+}
+
+function deckJobFromTool(tool: ToolCall): DeckJobView | null {
+  if (tool.tool !== 'create_deck_artifact') return null;
+  const runs = getToolRuns(tool);
+  for (let i = runs.length - 1; i >= 0; i -= 1) {
+    const job = deckJobFromResult(runs[i]?.result);
+    if (job) return job;
+  }
+  return deckJobFromResult(tool.result);
+}
+
+function isTerminalDeckJob(job: DeckJobView | null | undefined): boolean {
+  return ['completed', 'failed', 'qa_blocked', 'cancelled'].includes(String(job?.status || ''));
+}
+
+function deckJobStatusLabel(job: DeckJobView | null | undefined): string {
+  if (!job) return '';
+  if (job.status_label) return job.status_label;
+  const phase = String(job.phase || job.status || 'queued').replace(/_/g, ' ');
+  if (job.status === 'completed') return 'Deck ready';
+  if (job.status === 'qa_blocked') return 'QA blocked: needs revision';
+  if (job.status === 'failed') return 'Deck render failed';
+  if (job.status === 'revising') {
+    const round = Math.max(1, Number(job.revision_round || 1));
+    const max = Math.max(round, Number(job.max_revision_rounds || 3));
+    return `Revision ${round}/${max}: fixing layout`;
+  }
+  if (job.phase === 'html_render') return 'Building HTML';
+  if (job.phase === 'render_qa') return 'Rendering screenshots';
+  if (job.phase === 'export') return 'Exporting PDF/PPTX';
+  if (job.phase === 'narrative' || job.phase === 'planning') return 'Planning story';
+  return `Deck job ${phase}`;
+}
+
 function resultNoun(toolName: string): string {
   return toolName === 'find_documents' ? 'documents' : 'results';
 }
@@ -553,19 +614,15 @@ function toolStatusText(tool: ToolCall): string {
   const runCount = runs.length;
   const totalCount = aggregateResultCount(tool);
   const suffix = runCount > 1 ? ` across ${runCount} runs` : '';
-  const latestResult = runs[runs.length - 1]?.result || tool.result;
-  const deckJob = tool.tool === 'create_deck_artifact' ? latestResult?.deck_job : null;
+  const deckJob = deckJobFromTool(tool);
 
-  if (tool.status === 'started' || tool.status === 'executing') {
+  if ((tool.status === 'started' || tool.status === 'executing') && !deckJob) {
     const priorCount = totalCount !== null ? ` · ${totalCount} ${resultNoun(tool.tool)} so far` : '';
     return `${toolActionLabel(tool.tool)}${runCount > 1 ? ` · ${runCount} runs` : ''}${priorCount}...`;
   }
+  if (deckJob) return deckJobStatusLabel(deckJob);
   if (tool.status === 'error') return runCount > 1 ? `${runCount} runs failed` : 'Failed';
   if (tool.status === 'cancelled') return 'Stopped';
-  if (deckJob) {
-    const phase = String(deckJob.phase || deckJob.status || 'queued').replace(/_/g, ' ');
-    return deckJob.status === 'completed' ? 'Deck complete' : `Deck job ${phase}`;
-  }
   if (totalCount !== null) return `Found ${totalCount} ${resultNoun(tool.tool)}${suffix}`;
   if ((tool.tool === 'create_document_artifact' || tool.tool === 'edit_document_artifact') && tool.result?.document?.file_name) {
     return tool.result.document.file_name;
@@ -778,14 +835,63 @@ function DocumentCardList({
   );
 }
 
+function DeckJobProgress({ job }: { job: DeckJobView }) {
+  const status = String(job.status || '');
+  const blocked = status === 'qa_blocked';
+  const failed = status === 'failed';
+  const completed = status === 'completed';
+  const active = !isTerminalDeckJob(job);
+  const round = Number(job.revision_round || 0);
+  const maxRounds = Number(job.max_revision_rounds || 3);
+  const qa = job.qa_summary;
+  const statusTone = failed || blocked
+    ? 'border-semantic-error/25 bg-semantic-error/5 text-semantic-error'
+    : completed
+      ? 'border-semantic-success/25 bg-semantic-success/5 text-semantic-success'
+      : 'border-accent-magenta/25 bg-accent-magenta/5 text-accent-magenta';
+
+  return (
+    <div className={`rounded-lg border p-3 ${statusTone}`}>
+      <div className="flex items-center gap-2">
+        {active ? <MartyEmblem size={16} animate /> : completed ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-semibold">{deckJobStatusLabel(job)}</div>
+          {job.title && <div className="mt-0.5 truncate text-[11px] text-text-muted">{job.title}</div>}
+        </div>
+        {round > 0 && (
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10px] text-text-secondary">
+            {Math.min(round, maxRounds)}/{maxRounds}
+          </span>
+        )}
+      </div>
+      {qa && (
+        <div className="mt-2 grid grid-cols-4 gap-1.5 text-center text-[10px] text-text-secondary">
+          <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">Critical {qa.critical || 0}</div>
+          <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">High {qa.high || 0}</div>
+          <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">Med {qa.medium || 0}</div>
+          <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">Low {qa.low || 0}</div>
+        </div>
+      )}
+      {blocked && (
+        <div className="mt-2 text-[11px] leading-relaxed text-text-secondary">
+          {job.blocked_reason || 'Screenshot QA blocked polished export. MARTy did not expose the draft deck as a finished file.'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // ToolCallCard
 // ---------------------------------------------------------------------------
 
 function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void }) {
   const Icon = TOOL_ICONS[tool.tool] || FileText;
-  const isRunning = tool.status === 'started' || tool.status === 'executing';
-  const isError = tool.status === 'error';
+  const deckJob = deckJobFromTool(tool);
+  const isDeckActive = Boolean(deckJob && !isTerminalDeckJob(deckJob));
+  const isDeckBlocked = deckJob?.status === 'qa_blocked';
+  const isRunning = tool.status === 'started' || tool.status === 'executing' || isDeckActive;
+  const isError = tool.status === 'error' || deckJob?.status === 'failed' || isDeckBlocked;
   const isCancelled = tool.status === 'cancelled';
   const isDone = tool.status === 'done';
   const runs = getToolRuns(tool);
@@ -823,14 +929,15 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
           </span>
         )}
         <span className={`text-[10px] ${
-          isError ? 'text-semantic-error' : isDone ? 'text-semantic-success' : isCancelled ? 'text-text-muted' : 'text-text-muted'
+          isError ? 'text-semantic-error' : isRunning ? 'text-text-muted' : isDone ? 'text-semantic-success' : isCancelled ? 'text-text-muted' : 'text-text-muted'
         }`} style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
-          {isDone && '\u2713 '}{toolStatusText(tool)}
+          {isDone && !isRunning && !isError && '\u2713 '}{toolStatusText(tool)}
         </span>
         {tool.collapsed ? <ChevronRight size={12} className="text-text-muted" /> : <ChevronDown size={12} className="text-text-muted" />}
       </button>
       {!tool.collapsed && (
         <div className="border-t border-border/50 px-3 py-2 space-y-1.5">
+          {deckJob && <DeckJobProgress job={deckJob} />}
           {runs.map((run, index) => (
             <div key={run.id} className="rounded-md border border-white/[0.04] bg-white/[0.02] p-2">
               <div className="mb-1 flex items-center justify-between gap-2">
@@ -1063,6 +1170,7 @@ export default function GodModePage() {
   const provisionalSessionIdsRef = React.useRef<Set<string>>(new Set());
   const deletedSessionIdsRef = React.useRef<Set<string>>(new Set());
   const runningStreamsRef = React.useRef<Record<string, RunningMartyStream>>({});
+  const deckJobPollersRef = React.useRef<Record<string, { stopped: boolean; lastSeq: number }>>({});
   const locallyCancelledRequestIdsRef = React.useRef<Set<string>>(new Set());
   const messagesSnapshotRef = React.useRef<Message[]>([]);
   const streamingRef = React.useRef(false);
@@ -1441,6 +1549,95 @@ export default function GodModePage() {
     }
     return next;
   }, []);
+
+  const mergeDeckJobIntoSession = React.useCallback((
+    sessionId: string,
+    job: DeckJobView,
+    events: Array<{ seq: number; event_type: string; payload: any; created_at: string }>
+  ) => {
+    const visibleCards = mergeDocumentCards(undefined, job.visible_document_cards);
+    updateSessionDraft(sessionId, current => current.map(msg => {
+      let changed = false;
+      const toolCalls = (msg.toolCalls || []).map(tool => {
+        if (tool.tool !== 'create_deck_artifact') return tool;
+        let toolChanged = false;
+        const runs = getToolRuns(tool).map(run => {
+          const existing = deckJobFromResult(run.result);
+          if (!existing || existing.id !== job.id) return run;
+          changed = true;
+          toolChanged = true;
+          return {
+            ...run,
+            result: {
+              ...(run.result || {}),
+              deck_job_id: job.id,
+              deck_job: job,
+              deck_job_events: events.slice(-20),
+            },
+          };
+        });
+        const existing = deckJobFromResult(tool.result);
+        const result = existing?.id === job.id
+          ? { ...(tool.result || {}), deck_job_id: job.id, deck_job: job, deck_job_events: events.slice(-20) }
+          : tool.result;
+        if (existing?.id === job.id) {
+          changed = true;
+          toolChanged = true;
+        }
+        return {
+          ...tool,
+          result,
+          runs,
+          pulseKey: (tool.pulseKey || 0) + (toolChanged ? 1 : 0),
+        };
+      });
+      if (!changed) return msg;
+      return {
+        ...msg,
+        toolCalls,
+        documentCards: visibleCards?.length ? mergeDocumentCards(msg.documentCards, visibleCards) : msg.documentCards,
+      };
+    }));
+  }, [updateSessionDraft]);
+
+  const startDeckJobPolling = React.useCallback((sessionId: string, jobId: string) => {
+    if (!jobId || deckJobPollersRef.current[jobId]) return;
+    const poller = { stopped: false, lastSeq: 0 };
+    deckJobPollersRef.current[jobId] = poller;
+
+    const loop = async () => {
+      while (!poller.stopped) {
+        try {
+          const result = await api.getDeckJobEvents(jobId, poller.lastSeq, 25_000);
+          if (poller.stopped) break;
+          if (typeof result.latest_seq === 'number') poller.lastSeq = Math.max(poller.lastSeq, result.latest_seq);
+          if (result.job) {
+            mergeDeckJobIntoSession(sessionId, result.job as DeckJobView, result.events || []);
+            if (isTerminalDeckJob(result.job as DeckJobView)) break;
+          }
+        } catch {
+          await new Promise(resolve => setTimeout(resolve, 2500));
+          continue;
+        }
+        await new Promise(resolve => setTimeout(resolve, 600));
+      }
+      delete deckJobPollersRef.current[jobId];
+    };
+    void loop();
+  }, [mergeDeckJobIntoSession]);
+
+  React.useEffect(() => {
+    const sessionMessages: Record<string, Message[]> = { ...sessionDraftsRef.current };
+    if (activeSessionId) sessionMessages[activeSessionId] = messagesSnapshotRef.current;
+    for (const [sessionId, draftMessages] of Object.entries(sessionMessages)) {
+      for (const msg of draftMessages || []) {
+        for (const tool of msg.toolCalls || []) {
+          const job = deckJobFromTool(tool);
+          if (job && !isTerminalDeckJob(job)) startDeckJobPolling(sessionId, job.id);
+        }
+      }
+    }
+  }, [activeSessionId, messages, startDeckJobPolling]);
 
   const selectSession = React.useCallback((sessionId: string) => {
     activeSessionIdRef.current = sessionId;

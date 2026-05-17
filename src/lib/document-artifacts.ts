@@ -79,7 +79,7 @@ export interface DeckQaReport {
   };
 }
 
-export type DeckJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type DeckJobStatus = 'queued' | 'running' | 'revising' | 'qa_blocked' | 'completed' | 'failed' | 'cancelled';
 export type DeckJobPhase =
   | 'planning'
   | 'research'
@@ -90,6 +90,7 @@ export type DeckJobPhase =
   | 'repair'
   | 'export'
   | 'complete'
+  | 'qa_blocked'
   | 'failed';
 
 export interface DeckScreenshot {
@@ -276,10 +277,16 @@ const DECK_STYLE_PACKS: Record<DeckStylePackId, DeckStylePack> = {
   },
 };
 
-const DECK_ACCENT_GUTTER_PX = 72;
+const DECK_ACCENT_GUTTER_PX = 104;
+const DECK_SAFE_MARGIN_PX = 64;
+const DECK_GRID_GAP_PX = 40;
+const DECK_TEXT_MAX_WIDTH_PX = 900;
+const DECK_FOOTER_RESERVED_PX = 54;
+const DECK_MIN_CONTRAST_RATIO = 3.8;
 const DECK_RENDERER_TIMEOUT_MS = 90_000;
 const DECK_RENDER_VIEWPORT = { width: 1920, height: 1080 };
 const DECK_RENDER_MAX_REPAIR_PASSES = 3;
+const MAX_DECK_REVISION_ROUNDS = 3;
 const DECK_ALLOWED_OUTPUT_FORMATS = new Set(['html', 'pdf', 'pptx']);
 
 const DOCX_PAGE_MARGIN_DXA = 1080;
@@ -409,15 +416,26 @@ async function updateDeckJobPhase(
   phase: DeckJobPhase,
   payload: Record<string, unknown> = {}
 ): Promise<void> {
+  const status: DeckJobStatus =
+    phase === 'repair' ? 'revising'
+      : phase === 'qa_blocked' ? 'qa_blocked'
+        : phase === 'failed' ? 'failed'
+          : phase === 'complete' ? 'completed'
+            : 'running';
   await env.D1.prepare(
     `UPDATE deck_artifact_jobs
-        SET status = CASE WHEN ? IN ('complete', 'failed') THEN status ELSE 'running' END,
+        SET status = ?,
             phase = ?,
             heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = ? AND org_id = ?`
-  ).bind(phase, phase, jobId, orgId).run().catch(() => {});
-  await appendDeckJobEvent(env, jobId, orgId, 'phase', { phase, ...payload }).catch(() => {});
+  ).bind(status, phase, jobId, orgId).run().catch(() => {});
+  await appendDeckJobEvent(env, jobId, orgId, 'phase', {
+    status,
+    phase,
+    max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
+    ...payload,
+  }).catch(() => {});
 }
 
 const DOCUMENT_QUERY_STOPWORDS = new Set([
@@ -1881,7 +1899,7 @@ function styleTokens(styleId: DeckStylePackId): Record<string, string> {
 function renderSlideTableHtml(table: any): string {
   const t = tableFromAny(table);
   if (!t || t.headers.length === 0) return '';
-  const rows = t.rows.slice(0, 8);
+  const rows = t.rows.slice(0, 6);
   return `<div class="table-wrap">${t.title ? `<div class="table-title">${escapeHtml(t.title)}</div>` : ''}<table><thead><tr>${t.headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${t.headers.map((_, i) => `<td>${escapeHtml(row[i])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
@@ -1893,9 +1911,9 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
   const qa = qaReport || evaluatePremiumDeckQa(title, content);
   const slideHtml = slides.map((slide, index) => {
     const metrics = asArray(slide.metrics).slice(0, 4);
-    const evidence = slideEvidenceBlocks(slide).slice(0, 5);
+    const evidence = slideEvidenceBlocks(slide).slice(0, 4);
     const tableHtml = renderSlideTableHtml(slide.table);
-    const bullets = asArray(slide.bullets).map(cleanArtifactText).filter(Boolean).slice(0, 5);
+    const bullets = asArray(slide.bullets).map(cleanArtifactText).filter(Boolean).slice(0, 4);
     const layout = cleanArtifactText(slide.layout || 'evidence');
     const body = cleanArtifactText(slide.body);
     const metricHtml = metrics.length
@@ -1910,7 +1928,7 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
     const mainVisual = tableHtml || evidenceHtml || metricHtml || bulletHtml;
     if (layout === 'cover' || index === 0) {
       return `<section class="slide cover" data-slide="${index + 1}">
-        <div class="slide-accent"></div>
+        <div class="slide-accent" data-accent-line="true"></div>
         <div class="kicker">MEDINA VENTURES · ${escapeHtml(style.name)}</div>
         <h1>${escapeHtml(slide.title || title)}</h1>
         <p class="cover-subtitle">${escapeHtml(firstNonEmpty(slide.headline, slide.subtitle, content?.summary, 'Prepared by MARTy'))}</p>
@@ -1919,7 +1937,7 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
       </section>`;
     }
     return `<section class="slide ${escapeHtml(layout)}" data-slide="${index + 1}">
-      <div class="slide-accent"></div>
+      <div class="slide-accent" data-accent-line="true"></div>
       <div class="kicker">${escapeHtml(inferSlideRole(slide, index).replace(/_/g, ' '))}</div>
       <header>
         <h2>${escapeHtml(slide.title)}</h2>
@@ -1955,6 +1973,10 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
   --accent-2: ${T.accent2};
   --border: ${T.border};
   --accent-gutter: ${DECK_ACCENT_GUTTER_PX}px;
+  --safe-margin: ${DECK_SAFE_MARGIN_PX}px;
+  --grid-gap: ${DECK_GRID_GAP_PX}px;
+  --text-max-width: ${DECK_TEXT_MAX_WIDTH_PX}px;
+  --footer-reserved: ${DECK_FOOTER_RESERVED_PX}px;
   --slide-w: 1280px;
   --slide-h: 720px;
 }
@@ -1962,21 +1984,21 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
 body { margin: 0; background: #050507; color: var(--text); font-family: Inter, Arial, sans-serif; }
 .deck-frame { min-height: 100vh; padding: 32px; display: grid; gap: 32px; place-items: center; }
 .deck-meta { width: min(1280px, 100%); color: #a1a1aa; display: flex; justify-content: space-between; gap: 16px; font-size: 12px; }
-.slide { position: relative; width: min(var(--slide-w), calc(100vw - 64px)); aspect-ratio: 16 / 9; overflow: hidden; background: var(--bg); border: 1px solid color-mix(in srgb, var(--border) 72%, transparent); box-shadow: 0 24px 90px rgba(0,0,0,.36); padding: 54px 70px 46px calc(var(--accent-gutter) + 42px); }
-.slide-accent { position: absolute; left: 32px; top: 54px; bottom: 54px; width: 5px; border-radius: 999px; background: linear-gradient(180deg, var(--accent), var(--accent-2)); }
+.slide { position: relative; width: min(var(--slide-w), calc(100vw - 64px)); aspect-ratio: 16 / 9; overflow: hidden; background: var(--bg); border: 1px solid color-mix(in srgb, var(--border) 72%, transparent); box-shadow: 0 24px 90px rgba(0,0,0,.36); padding: var(--safe-margin) 76px var(--footer-reserved) calc(var(--accent-gutter) + 48px); }
+.slide-accent { position: absolute; left: 30px; top: var(--safe-margin); bottom: var(--safe-margin); width: 4px; border-radius: 999px; background: linear-gradient(180deg, var(--accent), var(--accent-2)); }
 .kicker { color: var(--accent-2); text-transform: uppercase; letter-spacing: .16em; font-size: 12px; font-weight: 700; margin-bottom: 22px; }
 h1, h2 { font-family: "DM Sans", Inter, Arial, sans-serif; letter-spacing: 0; margin: 0; color: var(--text); }
-h1 { font-size: 58px; line-height: .98; max-width: 860px; }
-h2 { font-size: 34px; line-height: 1.04; max-width: 780px; }
-header p, .cover-subtitle { margin: 18px 0 0; color: color-mix(in srgb, var(--text) 84%, var(--accent-2)); font-size: 23px; line-height: 1.25; font-weight: 650; max-width: 910px; }
-main { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.08fr); gap: 34px; align-items: start; margin-top: 32px; }
+h1 { font-size: 56px; line-height: 1; max-width: 840px; }
+h2 { font-size: 32px; line-height: 1.06; max-width: 760px; }
+header p, .cover-subtitle { margin: 18px 0 0; color: color-mix(in srgb, var(--text) 90%, var(--accent-2)); font-size: 21px; line-height: 1.24; font-weight: 650; max-width: var(--text-max-width); }
+main { display: grid; grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr); gap: var(--grid-gap); align-items: start; margin-top: 30px; }
 .cover { display: grid; grid-template-rows: auto auto auto 1fr auto; }
-.cover-proof { position: absolute; right: 72px; top: 148px; width: 380px; }
-.cover footer, .slide footer { position: absolute; left: calc(var(--accent-gutter) + 42px); bottom: 28px; color: var(--muted); font-size: 12px; }
+.cover-proof { position: absolute; right: 76px; top: 152px; width: 360px; }
+.cover footer, .slide footer { position: absolute; left: calc(var(--accent-gutter) + 48px); bottom: 30px; color: var(--muted); font-size: 12px; }
 .slide footer { left: auto; right: 52px; }
-.body { color: color-mix(in srgb, var(--text) 78%, var(--muted)); line-height: 1.45; font-size: 18px; margin: 0 0 18px; }
+.body { color: color-mix(in srgb, var(--text) 88%, var(--muted)); line-height: 1.4; font-size: 17px; margin: 0 0 18px; max-width: var(--text-max-width); }
 ul { margin: 0; padding: 0; display: grid; gap: 11px; list-style: none; }
-li { position: relative; padding-left: 22px; color: color-mix(in srgb, var(--text) 82%, var(--muted)); font-size: 17px; line-height: 1.34; }
+li { position: relative; padding-left: 22px; color: color-mix(in srgb, var(--text) 88%, var(--muted)); font-size: 16px; line-height: 1.32; }
 li::before { content: ""; position: absolute; left: 0; top: .58em; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
 .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
 .metric, .evidence-card { background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--border); border-radius: 12px; }
@@ -1984,7 +2006,7 @@ li::before { content: ""; position: absolute; left: 0; top: .58em; width: 7px; h
 .metric-value { font-size: 30px; line-height: 1; font-weight: 800; color: var(--text); }
 .metric-label { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.25; text-transform: uppercase; letter-spacing: .08em; }
 .evidence-grid { display: grid; gap: 12px; }
-.evidence-card { min-height: 86px; padding: 16px 18px; display: grid; grid-template-columns: 38px 1fr; gap: 12px; align-items: start; }
+.evidence-card { min-height: 82px; padding: 15px 17px; display: grid; grid-template-columns: 38px 1fr; gap: 12px; align-items: start; }
 .evidence-card span { color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: .1em; }
 .evidence-card strong { color: var(--text); font-size: 17px; line-height: 1.25; }
 .table-wrap { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
@@ -1993,7 +2015,7 @@ table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { padding: 12px 13px; border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent); text-align: left; vertical-align: top; line-height: 1.25; }
 th { color: var(--accent-2); background: color-mix(in srgb, var(--panel) 90%, transparent); text-transform: uppercase; letter-spacing: .08em; font-size: 11px; }
 td { color: color-mix(in srgb, var(--text) 82%, var(--muted)); }
-.source-note { position: absolute; left: calc(var(--accent-gutter) + 42px); right: 92px; bottom: 28px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.source-note { position: absolute; left: calc(var(--accent-gutter) + 48px); right: 92px; bottom: 30px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .qa-panel { width: min(1280px, 100%); padding: 18px 20px; border: 1px solid #2d2d36; border-radius: 14px; background: #101014; color: #d4d4d8; font-size: 13px; }
 .qa-panel strong { color: #fff; }
 @media print { body { background: white; } .deck-frame { padding: 0; gap: 0; } .deck-meta, .qa-panel { display: none; } .slide { width: 100vw; height: 100vh; box-shadow: none; border: 0; page-break-after: always; } }
@@ -2056,6 +2078,150 @@ function evaluatePremiumDeckQa(title: string, content: any, html?: string): Deck
       html_bytes: htmlBytes,
     },
   };
+}
+
+function deckQaHasBlockingFindings(qa: DeckQaReport | null | undefined): boolean {
+  return Boolean(qa?.slideFindings?.some(f => f.severity === 'critical' || f.severity === 'high'));
+}
+
+function wordsFromText(text: string, maxWords: number): string {
+  const words = cleanArtifactText(text).split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return words.join(' ');
+  return `${words.slice(0, maxWords).join(' ')}...`;
+}
+
+function findingSlideIndexes(qa: DeckQaReport): Set<number> {
+  const indexes = new Set<number>();
+  for (const finding of qa.slideFindings) {
+    const match = String(finding.slideId || '').match(/slide_(\d+)/i);
+    if (match) indexes.add(Math.max(0, Number(match[1]) - 1));
+  }
+  return indexes;
+}
+
+function deterministicDeckRepair(title: string, content: any, qa: DeckQaReport, round: number): any {
+  const repaired = JSON.parse(JSON.stringify(content || {}));
+  const slides = slidesFromContent(title, repaired);
+  const targeted = findingSlideIndexes(qa);
+  const repairAll = targeted.size === 0 || qa.slideFindings.some(f => f.slideId === 'deck');
+  const aggressive = round >= MAX_DECK_REVISION_ROUNDS;
+
+  repaired.slides = slides.map((slide, index) => {
+    const shouldRepair = repairAll || targeted.has(index);
+    if (!shouldRepair) return slide;
+
+    const next = { ...slide };
+    next.title = wordsFromText(firstNonEmpty(next.title, next.headline, `Slide ${index + 1}`), 12);
+    next.headline = wordsFromText(firstNonEmpty(next.headline, next.takeaway, next.body, next.title), aggressive ? 14 : 18);
+    next.body = wordsFromText(next.body, aggressive ? 28 : 45);
+    next.speaker_notes = firstNonEmpty(next.speaker_notes, next.headline, next.body);
+
+    const bullets = asArray(next.bullets).map(cleanArtifactText).filter(Boolean);
+    const evidence = slideEvidenceBlocks(next);
+    const allProof = [...evidence, ...bullets, cleanArtifactText(next.body)].filter(Boolean);
+    const hasTable = Boolean(tableFromAny(next.table));
+
+    if (bullets.length > 4 && !hasTable) {
+      next.layout = 'matrix';
+      next.table = {
+        headers: ['Theme', 'Point'],
+        rows: bullets.slice(0, aggressive ? 4 : 6).map((bullet, i) => [`${i + 1}`, wordsFromText(bullet, 16)]),
+      };
+      next.bullets = [];
+    } else {
+      next.bullets = bullets.slice(0, aggressive ? 3 : 4).map(b => wordsFromText(b, aggressive ? 12 : 16));
+    }
+
+    if (!hasTable && allProof.length > 0) {
+      next.evidence_blocks = allProof.slice(0, aggressive ? 3 : 4).map(p => wordsFromText(p, aggressive ? 16 : 22));
+    } else {
+      next.evidence_blocks = evidence.slice(0, aggressive ? 3 : 4);
+    }
+
+    if (next.table) {
+      const table = tableFromAny(next.table);
+      if (table) {
+        next.table = {
+          title: table.title,
+          headers: table.headers.slice(0, 5).map(h => wordsFromText(h, 6)),
+          rows: table.rows.slice(0, aggressive ? 4 : 6).map(row => row.slice(0, 5).map(cell => wordsFromText(cell, aggressive ? 10 : 14))),
+        };
+      }
+    }
+
+    if (aggressive) {
+      next.layout = index === 0 ? 'cover' : (next.table ? 'matrix' : 'evidence');
+      next.body = '';
+      next.metrics = asArray(next.metrics).slice(0, 2);
+    }
+
+    return next;
+  });
+
+  repaired.style_pack = repaired.style_pack || 'medina_default';
+  repaired.deck_design_mode = round >= 2 ? 'safe_qa_repair' : 'qa_repair';
+  return repaired;
+}
+
+async function applyDeckCriticPatch(
+  title: string,
+  content: any,
+  qa: DeckQaReport,
+  ctx: AuthContext,
+  env: Env
+): Promise<any | null> {
+  const system = `You are MARTy's deck repair critic. Return strict JSON only.
+You may compress copy, change layout, convert bullets to tables/proof cards, and improve hierarchy.
+You must not invent facts, metrics, companies, dates, or claims.
+Schema: {"slides":[{"index":1,"layout":"","title":"","headline":"","body":"","bullets":[],"evidence_blocks":[],"table":{"headers":[],"rows":[[]]},"speaker_notes":""}]}`;
+  const user = `Deck title: ${title}
+
+QA findings:
+${qa.slideFindings.map(f => `- ${f.severity}: ${f.slideId}: ${f.issue} -> ${f.requiredFix}`).join('\n')}
+
+Current deck JSON:
+${JSON.stringify(content || {}, null, 2).slice(0, 16000)}`;
+  const raw = await callClaude({ system, user, max_tokens: 4500, orgId: ctx.orgId }, 'low', env).catch(() => '');
+  const patch = parseJsonObject(raw);
+  if (!patch || !Array.isArray(patch.slides)) return null;
+
+  const repaired = JSON.parse(JSON.stringify(content || {}));
+  const slides = slidesFromContent(title, repaired);
+  for (const item of patch.slides) {
+    const index = Number(item?.index) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= slides.length) continue;
+    const current = slides[index];
+    slides[index] = {
+      ...current,
+      layout: cleanArtifactText(item.layout) || current.layout,
+      title: wordsFromText(firstNonEmpty(item.title, current.title), 12),
+      headline: wordsFromText(firstNonEmpty(item.headline, current.headline), 18),
+      body: wordsFromText(firstNonEmpty(item.body, current.body), 45),
+      bullets: asArray(item.bullets).map((b: any) => wordsFromText(b, 16)).filter(Boolean).slice(0, 4),
+      evidence_blocks: asArray(item.evidence_blocks).map((e: any) => wordsFromText(e, 22)).filter(Boolean).slice(0, 4),
+      table: item.table ? tableFromAny(item.table) : current.table,
+      speaker_notes: firstNonEmpty(item.speaker_notes, current.speaker_notes),
+    };
+  }
+  repaired.slides = slides;
+  repaired.deck_design_mode = 'critic_qa_repair';
+  return repaired;
+}
+
+async function repairDeckSpecForQa(
+  title: string,
+  content: any,
+  qa: DeckQaReport,
+  round: number,
+  ctx: AuthContext,
+  env: Env
+): Promise<any> {
+  const deterministic = deterministicDeckRepair(title, content, qa, round);
+  if (round === 2) {
+    const critic = await applyDeckCriticPatch(title, deterministic, qa, ctx, env);
+    return critic || deterministic;
+  }
+  return deterministic;
 }
 
 function pptxBulletText(items: string[]): string {
@@ -2607,6 +2773,136 @@ async function persistGeneratedCompanion(
   return { documentId: persisted.documentId, r2Key: persisted.r2Key, fileName: opts.fileName };
 }
 
+async function persistDeckInternalHtmlDocument(
+  ctx: AuthContext,
+  env: Env,
+  opts: {
+    title: string;
+    html: string;
+    extractedText: string;
+    customFields: Record<string, unknown>;
+  }
+): Promise<{ documentId: string; r2Key: string }> {
+  const fileName = companionFileTitle(`${opts.title} - QA Draft HTML`, 'html');
+  const file = new File([opts.html], fileName, { type: DECK_HTML_MIME });
+  const persisted = await persistDocument({
+    file,
+    orgId: ctx.orgId,
+    source: 'marty_generated',
+    visibility: 'org_wide',
+    participantUserIds: null,
+    uploadedBy: ctx.userId,
+    links: [],
+    title: `${opts.title} - QA Draft HTML`,
+    documentType: 'presentation',
+    preExtractedText: opts.extractedText,
+    dedupOnContentHash: false,
+    embed: false,
+  }, env);
+  await persisted.finalize();
+  await env.D1.prepare(
+    `UPDATE documents
+        SET custom_fields = ?
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    JSON.stringify({
+      marty_generated: true,
+      artifact_kind: 'html',
+      artifact_schema_version: 4,
+      deck_companion_kind: 'qa_blocked_html_draft',
+      html_source_of_truth: true,
+      ...opts.customFields,
+    }),
+    persisted.documentId,
+    ctx.orgId
+  ).run().catch(() => {});
+  return { documentId: persisted.documentId, r2Key: persisted.r2Key };
+}
+
+function deckQaSummary(qa: DeckQaReport | null | undefined): Record<string, unknown> | null {
+  if (!qa) return null;
+  const bySeverity = qa.slideFindings.reduce<Record<string, number>>((acc, finding) => {
+    acc[finding.severity] = (acc[finding.severity] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    status: qa.status,
+    findings: qa.slideFindings.length,
+    critical: bySeverity.critical || 0,
+    high: bySeverity.high || 0,
+    medium: bySeverity.medium || 0,
+    low: bySeverity.low || 0,
+    checks: qa.checks,
+  };
+}
+
+function deckStatusLabel(job: any, qa: DeckQaReport | null | undefined): string {
+  const status = String(job?.status || '');
+  const phase = String(job?.phase || '');
+  const round = Number(job?.revision_round || 0);
+  const maxRounds = Number(job?.max_revision_rounds || MAX_DECK_REVISION_ROUNDS);
+  if (status === 'completed') return 'Deck ready';
+  if (status === 'qa_blocked') return 'QA blocked: needs revision';
+  if (status === 'failed') return 'Deck render failed';
+  if (status === 'cancelled') return 'Deck cancelled';
+  if (status === 'revising' || phase === 'repair') return `Revision ${Math.min(Math.max(round, 1), maxRounds)}/${maxRounds}: fixing layout`;
+  if (phase === 'planning' || phase === 'narrative') return 'Planning story';
+  if (phase === 'html_render') return 'Building HTML';
+  if (phase === 'render_qa') return qa?.status && qa.status !== 'pass' ? 'QA found layout issues' : 'Rendering screenshots';
+  if (phase === 'export') return 'Exporting PDF/PPTX';
+  return 'Working on deck';
+}
+
+async function documentCardsForIds(
+  ctx: AuthContext,
+  env: Env,
+  ids: string[],
+  mode: MartyDocumentCardMode = 'dominant'
+): Promise<MartyDocumentCard[]> {
+  const uniqueIds = Array.from(new Set(ids.filter(Boolean))).slice(0, 12);
+  if (uniqueIds.length === 0) return [];
+  const placeholders = uniqueIds.map(() => '?').join(',');
+  const rows = await env.D1.prepare(
+    `SELECT id, title, document_type, source, r2_key, file_name, file_size, mime_type,
+            extracted_text_preview, contact_id, company_id, deal_id, uploaded_by,
+            visibility, participant_user_ids, parent_document_id, version_number, created_at
+       FROM documents
+      WHERE org_id = ? AND id IN (${placeholders})`
+  ).bind(ctx.orgId, ...uniqueIds).all<DocumentRow>();
+  const byId = new Map((rows.results || []).map(row => [row.id, row]));
+  return uniqueIds
+    .map(id => byId.get(id))
+    .filter((doc): doc is DocumentRow => Boolean(doc))
+    .map(doc => cardFromDoc(doc, mode, { reason: 'QA-approved deck export', confidence: 1, generated: true }));
+}
+
+async function persistDeckVisibleCardsOnMessage(
+  ctx: AuthContext,
+  env: Env,
+  assistantMessageId: string | null | undefined,
+  cards: MartyDocumentCard[]
+): Promise<void> {
+  if (!assistantMessageId || cards.length === 0) return;
+  const row = await env.D1.prepare(
+    `SELECT metadata
+       FROM agent_messages
+      WHERE id = ? AND org_id = ?
+      LIMIT 1`
+  ).bind(assistantMessageId, ctx.orgId).first<{ metadata: string | null }>().catch(() => null);
+  let metadata: Record<string, any> = {};
+  try {
+    metadata = row?.metadata ? JSON.parse(row.metadata) : {};
+  } catch {
+    metadata = {};
+  }
+  metadata.document_cards = normalizeDocumentCards([...(metadata.document_cards || []), ...cards]);
+  await env.D1.prepare(
+    `UPDATE agent_messages
+        SET metadata = ?
+      WHERE id = ? AND org_id = ?`
+  ).bind(JSON.stringify(metadata), assistantMessageId, ctx.orgId).run().catch(() => {});
+}
+
 export async function getDeckJobSnapshot(
   ctx: AuthContext,
   env: Env,
@@ -2620,14 +2916,24 @@ export async function getDeckJobSnapshot(
       LIMIT 1`
   ).bind(jobId, ctx.orgId, ctx.userId, ctx.userId).first<any>();
   if (!job) return null;
+  const qa = safeJsonParse<DeckQaReport | null>(job.qa_report_json, null);
+  const visibleIds = safeJsonParse<string[]>(job.user_visible_document_ids_json, []);
+  const visibleCards = await documentCardsForIds(ctx, env, visibleIds, 'dominant').catch(() => []);
   return {
     ...job,
     plan: safeJsonParse(job.plan_json, null),
     fact_ledger: safeJsonParse(job.fact_ledger_json, null),
-    qa_report: safeJsonParse(job.qa_report_json, null),
+    qa_report: qa,
+    qa_summary: deckQaSummary(qa),
     render_result: safeJsonParse(job.render_result_json, null),
     output_formats: safeJsonParse(job.output_formats_json, []),
     screenshot_document_ids: safeJsonParse(job.screenshot_document_ids_json, []),
+    user_visible_document_ids: visibleIds,
+    visible_document_cards: visibleCards,
+    status_label: deckStatusLabel(job, qa),
+    revision_round: Number(job.revision_round || 0),
+    max_revision_rounds: Number(job.max_revision_rounds || MAX_DECK_REVISION_ROUNDS),
+    blocked_reason: job.blocked_reason || null,
   };
 }
 
@@ -2710,7 +3016,8 @@ export async function applyDeckRenderResult(
   }
 
   let rendererPdfDocumentId: string | null = null;
-  if (result.pdf_base64) {
+  const qaPassed = (qa?.status || result.status) === 'pass' && !result.error;
+  if (qaPassed && result.pdf_base64) {
     const pdfDoc = await persistGeneratedCompanion(ctx, env, {
       title: `${job.title} - Rendered PDF Export`,
       fileName: companionFileTitle(`${job.title} - Rendered PDF Export`, 'pdf'),
@@ -2752,8 +3059,18 @@ export async function applyDeckRenderResult(
     qaDocumentId = qaDoc.documentId;
   }
 
-  const status: DeckJobStatus = result.status === 'failed' ? 'failed' : 'completed';
-  const phase: DeckJobPhase = result.status === 'failed' ? 'failed' : 'complete';
+  const status: DeckJobStatus = result.error ? 'failed' : (qaPassed ? 'completed' : 'qa_blocked');
+  const phase: DeckJobPhase = result.error ? 'failed' : (qaPassed ? 'complete' : 'qa_blocked');
+  const userVisibleIds = qaPassed
+    ? [job.pptx_document_id, job.html_document_id, rendererPdfDocumentId || job.pdf_document_id].filter(Boolean) as string[]
+    : [];
+  const blockedReason = !qaPassed && !result.error
+    ? (qa?.slideFindings || [])
+      .filter(f => f.severity === 'critical' || f.severity === 'high')
+      .slice(0, 3)
+      .map(f => `${f.slideId}: ${f.issue}`)
+      .join('; ') || 'Screenshot QA found layout issues that must be revised before export.'
+    : null;
   await env.D1.prepare(
     `UPDATE deck_artifact_jobs
         SET status = ?,
@@ -2763,9 +3080,11 @@ export async function applyDeckRenderResult(
             pdf_document_id = COALESCE(?, pdf_document_id),
             screenshot_document_ids_json = ?,
             qa_document_id = COALESCE(?, qa_document_id),
+            blocked_reason = ?,
+            user_visible_document_ids_json = ?,
             error_code = ?,
             error_message = ?,
-            completed_at = CASE WHEN ? IN ('completed','failed') THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE completed_at END,
+            completed_at = CASE WHEN ? IN ('completed','failed','qa_blocked') THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE completed_at END,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = ? AND org_id = ?`
   ).bind(
@@ -2776,6 +3095,8 @@ export async function applyDeckRenderResult(
     rendererPdfDocumentId,
     JSON.stringify(screenshotDocumentIds),
     qaDocumentId,
+    blockedReason,
+    qaPassed ? JSON.stringify(userVisibleIds) : null,
     result.error ? 'DECK_RENDER_FAILED' : null,
     result.error ? String(result.error).slice(0, 500) : null,
     status,
@@ -2783,13 +3104,22 @@ export async function applyDeckRenderResult(
     job.org_id
   ).run();
 
-  await appendDeckJobEvent(env, job.id, job.org_id, status === 'completed' ? 'complete' : 'failed', {
+  if (qaPassed && userVisibleIds.length > 0) {
+    const visibleCards = await documentCardsForIds(ctx, env, userVisibleIds, 'dominant').catch(() => []);
+    await persistDeckVisibleCardsOnMessage(ctx, env, job.assistant_message_id, visibleCards).catch(() => {});
+  }
+
+  await appendDeckJobEvent(env, job.id, job.org_id, status === 'completed' ? 'complete' : status, {
     status,
     phase,
     qa_status: qa?.status || result.status,
+    status_label: deckStatusLabel({ ...job, status, phase, revision_round: job.revision_round, max_revision_rounds: job.max_revision_rounds }, qa),
     screenshot_document_ids: screenshotDocumentIds,
     pdf_document_id: rendererPdfDocumentId,
     qa_document_id: qaDocumentId,
+    user_visible_document_ids: userVisibleIds,
+    visible_document_cards: qaPassed ? await documentCardsForIds(ctx, env, userVisibleIds, 'dominant').catch(() => []) : [],
+    blocked_reason: blockedReason,
     error: result.error || null,
   }).catch(() => {});
 }
@@ -2806,10 +3136,13 @@ async function persistArtifact(
     embed?: boolean;
     visibility?: DocumentVisibility;
     customFields?: Record<string, unknown>;
+    prepared?: boolean;
   }
 ): Promise<{ card: MartyDocumentCard; document: { id: string; title: string; file_name: string; mime_type: string } }> {
   const inputContent = normalizeStructuredArtifactContent(opts.structuredContent);
-  let structuredContent = await prepareArtifactContent(opts.kind, opts.title, inputContent, ctx, env, opts.sourceDocs);
+  let structuredContent = opts.prepared
+    ? inputContent
+    : await prepareArtifactContent(opts.kind, opts.title, inputContent, ctx, env, opts.sourceDocs);
   let deckBundle: { plan: DeckPlan; html: string; qa: DeckQaReport } | null = null;
   if (opts.kind === 'pptx') {
     let html = renderPremiumDeckHtml(opts.title, structuredContent);
@@ -3148,6 +3481,9 @@ export async function createDeckArtifactTool(
     title,
     quality_mode: qualityMode,
     renderer_enabled: asyncRenderer,
+    revision_round: 0,
+    max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
+    message: 'Planning story',
   }).catch(() => {});
 
   if (asyncRenderer) {
@@ -3161,6 +3497,9 @@ export async function createDeckArtifactTool(
     });
     await appendDeckJobEvent(env, deckJobId, ctx.orgId, 'queued', {
       phase: 'planning',
+      status: 'queued',
+      revision_round: 0,
+      max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
       message: 'Premium deck job queued for HTML render, screenshot QA, and export.',
     }).catch(() => {});
     return {
@@ -3274,6 +3613,10 @@ interface DeckArtifactJobRow {
   assistant_message_id: string | null;
   status: string;
   phase: string;
+  revision_round?: number | null;
+  max_revision_rounds?: number | null;
+  blocked_reason?: string | null;
+  user_visible_document_ids_json?: string | null;
   title: string;
   prompt: string;
   audience: string | null;
@@ -3401,7 +3744,7 @@ async function inspectRenderedDeckPage(page: any): Promise<{
             return Math.min(r.left - rect.left, rect.right - r.right, r.top - rect.top, rect.bottom - r.bottom);
           })
         );
-        if (minMargin < 24) {
+        if (minMargin < 32) {
           metrics.bad_margin_count += 1;
           findings.push({ slideId, severity: 'high', issue: 'Slide has content too close to the edge.', requiredFix: 'Restore safe margins and rebalance the layout grid.' });
         }
@@ -3420,7 +3763,7 @@ async function inspectRenderedDeckPage(page: any): Promise<{
       }
 
       const background = style.backgroundColor || 'rgb(15,15,20)';
-      const lowContrast = contentEls.filter(el => contrast(win.getComputedStyle(el).color, background) < 3.4);
+      const lowContrast = contentEls.filter(el => contrast(win.getComputedStyle(el).color, background) < DECK_MIN_CONTRAST_RATIO);
       if (lowContrast.length > Math.max(2, contentEls.length * 0.15)) {
         metrics.low_contrast_count += 1;
         findings.push({ slideId, severity: 'high', issue: 'Slide has low-contrast text.', requiredFix: 'Increase foreground/background contrast before export.' });
@@ -3441,7 +3784,7 @@ async function inspectRenderedDeckPage(page: any): Promise<{
         findings.push({ slideId, severity: 'critical', issue: 'Slide elements appear to overlap.', requiredFix: 'Reflow the slide and increase spacing between elements.' });
       }
 
-      const accent = slide.querySelector('.accent-line,.purple-line,.callout-accent,[data-accent-line]');
+      const accent = slide.querySelector('.slide-accent,.accent-line,.purple-line,.callout-accent,[data-accent-line]');
       if (accent) {
         const accentRect = rectFor(accent);
         const textLefts = contentEls.map(el => rectFor(el).left).filter(v => Number.isFinite(v));
@@ -3464,7 +3807,7 @@ async function applyDeckRenderRepairPass(page: any, pass: number): Promise<void>
       :root { --accent-gutter: ${88 + pass * 10}px !important; }
       .slide { overflow: hidden !important; }
       .slide * { box-sizing: border-box !important; }
-      .accent-line, .purple-line, [data-accent-line] { margin-right: ${42 + pass * 8}px !important; }
+      .slide-accent, .accent-line, .purple-line, [data-accent-line] { margin-right: ${42 + pass * 8}px !important; }
       .slide p, .slide li, .slide td, .slide th { line-height: ${pass >= 2 ? 1.18 : 1.22} !important; }
       .slide .body, .slide .content, .slide .evidence-grid, .slide .table-wrap { max-width: 100% !important; }
     `,
@@ -3581,102 +3924,262 @@ export async function processDeckRenderJob(
   const outputFormats = normalizeDeckOutputFormats(safeJsonParse(job.output_formats_json, ['html', 'pdf', 'pptx']));
   const sourceDocumentIds = safeJsonParse<string[]>(job.source_document_ids_json, []);
   const title = job.title || structured.title || 'MARTy deck';
+  const sourceDocs = await loadAccessibleDocuments(sourceDocumentIds, ctx, env);
 
   await updateDeckJobPhase(env, job.id, job.org_id, 'narrative', {
-    message: 'Narrative plan loaded for render job.',
+    message: 'Planning story',
+    revision_round: Number(job.revision_round || 0),
   });
-  await updateDeckJobPhase(env, job.id, job.org_id, 'html_render', {
-    message: 'Creating canonical HTML/PPTX deck bundle.',
-  });
-
-  const artifact = await createDocumentArtifactTool(ctx, {
-    kind: 'pptx',
-    title,
-    structured_content: structured,
-    source_document_ids: sourceDocumentIds,
-    custom_fields: {
-      deck_tool: 'create_deck_artifact',
-      deck_job_id: job.id,
-      deck_quality_mode: job.quality_mode || 'premium',
-      requested_output_formats: outputFormats,
-      requested_audience: job.audience,
-      requested_objective: job.objective,
-      requested_style_pack: job.style_pack || 'medina_default',
-      async_deck_render_job: true,
-    },
-  }, env);
-
-  const persisted = artifact?.document?.id
-    ? await env.D1.prepare(
-      `SELECT custom_fields FROM documents WHERE id = ? AND org_id = ?`
-    ).bind(artifact.document.id, job.org_id).first<{ custom_fields: string | null }>().catch(() => null)
-    : null;
-  const deckBundle = safeJsonParse<any>(persisted?.custom_fields, {})?.deck_bundle || null;
-  await env.D1.prepare(
-    `UPDATE deck_artifact_jobs
-        SET pptx_document_id = ?,
-            html_document_id = ?,
-            pdf_document_id = ?,
-            qa_report_json = COALESCE(?, qa_report_json),
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE id = ? AND org_id = ?`
-  ).bind(
-    artifact?.document?.id || null,
-    deckBundle?.html_document_id || null,
-    deckBundle?.pdf_document_id || null,
-    deckBundle?.qa_report ? JSON.stringify(deckBundle.qa_report) : null,
-    job.id,
-    job.org_id
-  ).run().catch(() => {});
-  await appendDeckJobEvent(env, job.id, job.org_id, 'artifact_bundle_created', {
-    pptx_document_id: artifact?.document?.id || null,
-    html_document_id: deckBundle?.html_document_id || null,
-    pdf_document_id: deckBundle?.pdf_document_id || null,
-  }).catch(() => {});
-
-  const html = renderPremiumDeckHtml(title, structured, deckBundle?.qa_report);
-  const plan = deckPlanFromContent(title, structured);
-  const qa = deckBundle?.qa_report || evaluatePremiumDeckQa(title, structured, html);
 
   if (!isDeckRendererEnabled(env)) {
     await env.D1.prepare(
       `UPDATE deck_artifact_jobs
-          SET status = 'completed',
-              phase = 'complete',
+          SET status = 'failed',
+              phase = 'failed',
+              error_code = 'DECK_RENDERER_UNAVAILABLE',
+              error_message = 'Premium deck rendering is enabled for this job but no renderer binding/service is available.',
               completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         WHERE id = ? AND org_id = ?`
     ).bind(job.id, job.org_id).run();
-    await appendDeckJobEvent(env, job.id, job.org_id, 'complete', {
-      qa_status: qa.status,
+    await appendDeckJobEvent(env, job.id, job.org_id, 'failed', {
+      status: 'failed',
+      phase: 'failed',
+      message: 'Deck renderer is unavailable.',
       renderer_enabled: false,
     }).catch(() => {});
     return;
   }
 
-  await updateDeckJobPhase(env, job.id, job.org_id, 'render_qa', {
-    message: useCloudflareDeckRenderer(env)
-      ? 'Rendering canonical HTML with Cloudflare Browser Rendering for screenshot QA.'
-      : 'Sending canonical HTML to the Playwright renderer for screenshot QA.',
-  });
-  const renderRequest: DeckRenderRequest = {
-    job_id: job.id,
+  let currentStructured: any = normalizeStructuredArtifactContent(structured);
+  let latestHtml = '';
+  let latestPlan: DeckPlan = deckPlanFromContent(title, currentStructured);
+  let latestQa: DeckQaReport = evaluatePremiumDeckQa(title, currentStructured);
+  let latestRenderResult: DeckRenderResult | null = null;
+  let latestRevisionRound = Number(job.revision_round || 0);
+
+  for (let round = Number(job.revision_round || 0); round <= MAX_DECK_REVISION_ROUNDS; round += 1) {
+    latestRevisionRound = round;
+    await updateDeckJobPhase(env, job.id, job.org_id, 'html_render', {
+      message: round === 0 ? 'Building HTML' : `Revision ${round}/${MAX_DECK_REVISION_ROUNDS}: rebuilding HTML`,
+      revision_round: round,
+      max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
+    });
+    latestHtml = renderPremiumDeckHtml(title, currentStructured);
+    latestPlan = deckPlanFromContent(title, currentStructured);
+    latestQa = evaluatePremiumDeckQa(title, currentStructured, latestHtml);
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET structured_content_json = ?,
+              plan_json = ?,
+              fact_ledger_json = ?,
+              qa_report_json = ?,
+              revision_round = ?,
+              max_revision_rounds = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(
+      JSON.stringify(currentStructured),
+      JSON.stringify(latestPlan),
+      JSON.stringify(deckFactsFromContent(title, currentStructured, slidesFromContent(title, currentStructured))),
+      JSON.stringify(latestQa),
+      round,
+      MAX_DECK_REVISION_ROUNDS,
+      job.id,
+      job.org_id
+    ).run().catch(() => {});
+
+    await updateDeckJobPhase(env, job.id, job.org_id, 'render_qa', {
+      message: useCloudflareDeckRenderer(env)
+        ? 'Rendering screenshots with Cloudflare Browser Rendering'
+        : 'Rendering screenshots with the Playwright deck renderer',
+      revision_round: round,
+      max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
+      qa_status: latestQa.status,
+    });
+    const renderRequest: DeckRenderRequest = {
+      job_id: job.id,
+      title,
+      html: latestHtml,
+      style_pack: latestPlan.style_pack,
+      quality_mode: job.quality_mode || 'premium',
+      output_formats: outputFormats,
+      plan: latestPlan,
+      qa_report: latestQa,
+    };
+    latestRenderResult = useCloudflareDeckRenderer(env)
+      ? await renderDeckWithCloudflareBrowser(env, renderRequest)
+      : await callDeckRendererService(env, renderRequest);
+    latestQa = latestRenderResult.qa_report || latestQa;
+
+    if (latestRenderResult.error) break;
+    if (latestQa.status === 'pass' && !deckQaHasBlockingFindings(latestQa)) break;
+    if (round >= MAX_DECK_REVISION_ROUNDS) break;
+
+    const nextRound = round + 1;
+    latestRevisionRound = nextRound;
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET status = 'revising',
+              phase = 'repair',
+              revision_round = ?,
+              qa_report_json = ?,
+              blocked_reason = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(
+      nextRound,
+      JSON.stringify(latestQa),
+      latestQa.slideFindings.slice(0, 3).map(f => `${f.slideId}: ${f.issue}`).join('; '),
+      job.id,
+      job.org_id
+    ).run().catch(() => {});
+    await appendDeckJobEvent(env, job.id, job.org_id, 'repair', {
+      status: 'revising',
+      phase: 'repair',
+      revision_round: nextRound,
+      max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
+      qa_status: latestQa.status,
+      message: nextRound === 1
+        ? 'Revision 1/3: fixing overlap and density'
+        : nextRound === 2
+          ? 'Revision 2/3: tightening copy and hierarchy'
+          : 'Revision 3/3: switching to safe fallback layouts',
+      findings: latestQa.slideFindings.slice(0, 8),
+    }).catch(() => {});
+    currentStructured = await repairDeckSpecForQa(title, currentStructured, latestQa, nextRound, ctx, env);
+  }
+
+  if (!latestRenderResult) {
+    throw new Error('DECK_RENDER_DID_NOT_RETURN_RESULT');
+  }
+
+  if (latestRenderResult.error) {
+    await updateDeckJobPhase(env, job.id, job.org_id, 'failed', {
+      message: 'Deck render failed.',
+      error: latestRenderResult.error,
+    });
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET status = 'failed',
+              phase = 'failed',
+              render_result_json = ?,
+              error_code = 'DECK_RENDER_FAILED',
+              error_message = ?,
+              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(
+      JSON.stringify({ ...latestRenderResult, screenshots: latestRenderResult.screenshots?.map(s => ({ ...s, base64: undefined })) || [] }),
+      String(latestRenderResult.error).slice(0, 500),
+      job.id,
+      job.org_id
+    ).run().catch(() => {});
+    return;
+  }
+
+  if (latestQa.status === 'pass' && !deckQaHasBlockingFindings(latestQa)) {
+    await updateDeckJobPhase(env, job.id, job.org_id, 'export', {
+      message: 'Exporting PDF/PPTX',
+      revision_round: latestRevisionRound,
+      max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
+      qa_status: latestQa.status,
+    });
+    const artifact = await persistArtifact(ctx, env, {
+      kind: 'pptx',
+      title,
+      structuredContent: currentStructured,
+      sourceDocs,
+      prepared: true,
+      customFields: {
+        deck_tool: 'create_deck_artifact',
+        deck_job_id: job.id,
+        deck_quality_mode: job.quality_mode || 'premium',
+        requested_output_formats: outputFormats,
+        requested_audience: job.audience,
+        requested_objective: job.objective,
+        requested_style_pack: job.style_pack || 'medina_default',
+        async_deck_render_job: true,
+        final_screenshot_qa_status: latestQa.status,
+      },
+    });
+    const persisted = await env.D1.prepare(
+      `SELECT custom_fields FROM documents WHERE id = ? AND org_id = ?`
+    ).bind(artifact.document.id, job.org_id).first<{ custom_fields: string | null }>().catch(() => null);
+    const deckBundle = safeJsonParse<any>(persisted?.custom_fields, {})?.deck_bundle || null;
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET pptx_document_id = ?,
+              html_document_id = ?,
+              pdf_document_id = ?,
+              structured_content_json = ?,
+              plan_json = ?,
+              fact_ledger_json = ?,
+              qa_report_json = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(
+      artifact.document.id,
+      deckBundle?.html_document_id || null,
+      deckBundle?.pdf_document_id || null,
+      JSON.stringify(currentStructured),
+      JSON.stringify(latestPlan),
+      JSON.stringify(deckFactsFromContent(title, currentStructured, slidesFromContent(title, currentStructured))),
+      JSON.stringify(latestQa),
+      job.id,
+      job.org_id
+    ).run().catch(() => {});
+    await appendDeckJobEvent(env, job.id, job.org_id, 'artifact_bundle_created', {
+      status: 'running',
+      phase: 'export',
+      message: 'QA-approved deck artifacts created.',
+      pptx_document_id: artifact.document.id,
+      html_document_id: deckBundle?.html_document_id || null,
+      pdf_document_id: deckBundle?.pdf_document_id || null,
+    }).catch(() => {});
+    await applyDeckRenderResult(ctx, env, latestRenderResult);
+    return;
+  }
+
+  const draft = await persistDeckInternalHtmlDocument(ctx, env, {
     title,
-    html,
-    style_pack: plan.style_pack,
-    quality_mode: job.quality_mode || 'premium',
-    output_formats: outputFormats,
-    plan,
-    qa_report: qa,
-  };
-  const renderResult = useCloudflareDeckRenderer(env)
-    ? await renderDeckWithCloudflareBrowser(env, renderRequest)
-    : await callDeckRendererService(env, renderRequest);
-  await updateDeckJobPhase(env, job.id, job.org_id, 'export', {
-    message: 'Persisting renderer screenshots, QA report, and exports.',
-    qa_status: renderResult.qa_report?.status || renderResult.status,
+    html: latestHtml,
+    extractedText: [
+      latestPlan.title,
+      latestPlan.storyline.join('\n'),
+      ...latestQa.slideFindings.map(f => `${f.severity}: ${f.slideId}: ${f.issue}`),
+    ].join('\n').slice(0, 8000),
+    customFields: {
+      deck_job_id: job.id,
+      deck_qa_status: latestQa.status,
+      revision_round: MAX_DECK_REVISION_ROUNDS,
+    },
   });
-  await applyDeckRenderResult(ctx, env, renderResult);
+  await env.D1.prepare(
+    `UPDATE deck_artifact_jobs
+        SET html_document_id = ?,
+            structured_content_json = ?,
+            plan_json = ?,
+            fact_ledger_json = ?,
+            qa_report_json = ?,
+            revision_round = ?,
+            max_revision_rounds = ?,
+            blocked_reason = ?,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    draft.documentId,
+    JSON.stringify(currentStructured),
+    JSON.stringify(latestPlan),
+    JSON.stringify(deckFactsFromContent(title, currentStructured, slidesFromContent(title, currentStructured))),
+    JSON.stringify(latestQa),
+    MAX_DECK_REVISION_ROUNDS,
+    MAX_DECK_REVISION_ROUNDS,
+    latestQa.slideFindings.slice(0, 3).map(f => `${f.slideId}: ${f.issue}`).join('; ') || 'Screenshot QA blocked deck export.',
+    job.id,
+    job.org_id
+  ).run().catch(() => {});
+  await applyDeckRenderResult(ctx, env, latestRenderResult);
 }
 
 async function extractFullDocumentText(doc: DocumentRow, env: Env): Promise<string> {
@@ -3787,7 +4290,10 @@ export const __documentArtifactsTestHooks = {
   deckPlanFromContent,
   renderPremiumDeckHtml,
   evaluatePremiumDeckQa,
+  deckQaHasBlockingFindings,
+  deterministicDeckRepair,
   normalizeDeckOutputFormats,
   DECK_RENDER_WORK_DOMAIN,
   DECK_STYLE_PACKS,
+  MAX_DECK_REVISION_ROUNDS,
 };

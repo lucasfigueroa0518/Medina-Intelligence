@@ -157,7 +157,7 @@ async function inspectSlides(page) {
         }),
         999
       );
-      if (minMargin < 24) {
+      if (minMargin < 32) {
         metrics.bad_margin_count += 1;
         findings.push({ slideId, severity: 'high', issue: 'Slide has content too close to the edge.', requiredFix: 'Restore safe margins and rebalance the layout grid.' });
       }
@@ -175,7 +175,7 @@ async function inspectSlides(page) {
       }
 
       const background = style.backgroundColor || 'rgb(15,15,20)';
-      const lowContrast = contentEls.filter(el => contrast(window.getComputedStyle(el).color, background) < 3.4);
+      const lowContrast = contentEls.filter(el => contrast(window.getComputedStyle(el).color, background) < 3.8);
       if (lowContrast.length > Math.max(2, contentEls.length * 0.15)) {
         metrics.low_contrast_count += 1;
         findings.push({ slideId, severity: 'high', issue: 'Slide has low-contrast text.', requiredFix: 'Increase foreground/background contrast before export.' });
@@ -196,7 +196,7 @@ async function inspectSlides(page) {
         findings.push({ slideId, severity: 'critical', issue: 'Slide elements appear to overlap.', requiredFix: 'Reflow the slide and increase spacing between elements.' });
       }
 
-      const accent = slide.querySelector('.accent-line,.purple-line,.callout-accent,[data-accent-line]');
+      const accent = slide.querySelector('.slide-accent,.accent-line,.purple-line,.callout-accent,[data-accent-line]');
       if (accent) {
         const accentRect = rectFor(accent);
         const nearestTextLeft = Math.min(...contentEls.map(el => rectFor(el).left).filter(v => Number.isFinite(v)), rect.right);
@@ -218,7 +218,7 @@ async function applyRepairPass(page, pass) {
       :root { --accent-gutter: ${88 + pass * 10}px !important; }
       .slide { overflow: hidden !important; }
       .slide * { box-sizing: border-box !important; }
-      .accent-line, .purple-line, [data-accent-line] { margin-right: ${42 + pass * 8}px !important; }
+      .slide-accent, .accent-line, .purple-line, [data-accent-line] { margin-right: ${42 + pass * 8}px !important; }
       .slide p, .slide li, .slide td, .slide th { line-height: ${pass >= 2 ? 1.18 : 1.22} !important; }
       .slide .body, .slide .content, .slide .evidence-grid, .slide .table-wrap { max-width: 100% !important; }
     `,
