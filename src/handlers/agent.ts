@@ -14,6 +14,7 @@ import {
   createDocumentArtifactTool,
   editDocumentArtifactTool,
   findDocumentsTool,
+  getDeckJobSnapshot,
   normalizeDocumentCards,
   type MartyDocumentCard,
 } from '../lib/document-artifacts';
@@ -1103,7 +1104,80 @@ async function markAgentTurnCancelled(
             )
       WHERE ${predicates.join(' AND ')}`
   ).bind(...binds).run();
-  return Number(result.meta?.changes || 0);
+  const changed = Number(result.meta?.changes || 0);
+  if (changed > 0) {
+    await markDurableToolCallsCancelled(env, ctx, opts).catch(() => {});
+  }
+  return changed;
+}
+
+async function markDurableToolCallsCancelled(
+  env: Env,
+  ctx: AuthContext,
+  opts: {
+    requestId?: string | null;
+    assistantMessageId?: string | null;
+    sessionId?: string | null;
+  }
+): Promise<void> {
+  const predicates = [
+    `m.role = 'assistant'`,
+    `EXISTS (
+       SELECT 1
+       FROM agent_sessions s
+       LEFT JOIN users u ON u.id = s.user_id
+       WHERE s.id = m.session_id
+         AND s.org_id = ?
+         AND s.deleted_at IS NULL
+         AND (s.user_id = ? OR lower(u.email) = lower(?))
+     )`,
+  ];
+  const binds: any[] = [ctx.orgId, ctx.userId, ctx.email || ''];
+  if (opts.requestId) {
+    predicates.push(`json_extract(m.metadata, '$.request_id') = ?`);
+    binds.push(opts.requestId);
+  }
+  if (opts.assistantMessageId) {
+    predicates.push(`m.id = ?`);
+    binds.push(opts.assistantMessageId);
+  }
+  if (opts.sessionId) {
+    predicates.push(`m.session_id = ?`);
+    binds.push(opts.sessionId);
+  }
+  if (!opts.requestId && !opts.assistantMessageId && !opts.sessionId) return;
+
+  const rows = await env.D1.prepare(
+    `SELECT m.id, m.session_id, m.metadata
+       FROM agent_messages m
+      WHERE ${predicates.join(' AND ')}
+      ORDER BY m.created_at DESC
+      LIMIT 20`
+  ).bind(...binds).all<{ id: string; session_id: string; metadata: string | null }>();
+  const now = new Date().toISOString();
+  const updates = rows.results.map(row => {
+    const metadata = safeParseJsonObject(row.metadata);
+    const toolCalls = normalizeDurableToolCalls(metadata.tool_calls).map(tool => {
+      const runs = tool.runs.map(run => (
+        isTerminalDurableToolStatus(run.status)
+          ? run
+          : { ...run, status: 'cancelled' as DurableToolStatus, completed_at: now, result: { ...(run.result || {}), cancelled: true } }
+      ));
+      return {
+        ...tool,
+        status: aggregateDurableToolStatus(runs),
+        activeRunId: undefined,
+        runs,
+        updated_at: now,
+      };
+    });
+    if (toolCalls.length === 0) return null;
+    metadata.tool_calls = compactToolStateForStorage(toolCalls);
+    return env.D1.prepare(
+      `UPDATE agent_messages SET metadata = ? WHERE id = ? AND session_id = ?`
+    ).bind(JSON.stringify(metadata), row.id, row.session_id);
+  }).filter(Boolean) as D1PreparedStatement[];
+  if (updates.length > 0) await env.D1.batch(updates);
 }
 
 async function reserveAgentTurn(
@@ -1182,6 +1256,305 @@ async function persistRunEventSafe(
 function safeModelErrorText(): string {
   return 'MARTy hit a model handoff issue. Retry is safe.';
 }
+
+type DurableToolStatus = 'started' | 'executing' | 'done' | 'error' | 'cancelled';
+
+type DurableToolRun = {
+  id: string;
+  input?: any;
+  result?: any;
+  status: DurableToolStatus;
+  started_at?: string;
+  completed_at?: string;
+};
+
+type DurableToolCall = {
+  id: string;
+  tool: string;
+  input?: any;
+  result?: any;
+  status: DurableToolStatus;
+  collapsed: boolean;
+  activeRunId?: string;
+  runs: DurableToolRun[];
+  updated_at: string;
+};
+
+const TOOL_STATE_MAX_STRING = 4000;
+const TOOL_STATE_MAX_ARRAY_ITEMS = 80;
+const TOOL_STATE_MAX_OBJECT_KEYS = 80;
+const TOOL_STATE_MAX_JSON = 60_000;
+
+function safeParseJsonObject(raw: unknown): Record<string, any> {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw as Record<string, any>;
+  if (typeof raw !== 'string') return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, any>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function truncateToolString(value: string): string {
+  return value.length > TOOL_STATE_MAX_STRING
+    ? `${value.slice(0, TOOL_STATE_MAX_STRING)}... [truncated ${value.length - TOOL_STATE_MAX_STRING} chars]`
+    : value;
+}
+
+function sanitizeToolPayload(value: any, depth = 0): any {
+  if (value == null) return value;
+  if (typeof value === 'string') return truncateToolString(value);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (value instanceof Date) return value.toISOString();
+  if (depth >= 5) return '[truncated]';
+  if (Array.isArray(value)) {
+    return value.slice(0, TOOL_STATE_MAX_ARRAY_ITEMS).map(item => sanitizeToolPayload(item, depth + 1));
+  }
+  if (typeof value === 'object') {
+    const out: Record<string, any> = {};
+    for (const [key, nested] of Object.entries(value).slice(0, TOOL_STATE_MAX_OBJECT_KEYS)) {
+      if (/base64|raw_html|html_content|file_bytes|bytes|buffer/i.test(key)) {
+        out[key] = '[omitted]';
+      } else {
+        out[key] = sanitizeToolPayload(nested, depth + 1);
+      }
+    }
+    return out;
+  }
+  return String(value);
+}
+
+function compactToolStateForStorage(toolCalls: DurableToolCall[]): DurableToolCall[] {
+  const sanitized = toolCalls.map(tool => sanitizeToolPayload(tool) as DurableToolCall);
+  let json = JSON.stringify(sanitized);
+  if (json.length <= TOOL_STATE_MAX_JSON) return sanitized;
+
+  const trimmed = sanitized.map(tool => ({
+    ...tool,
+    runs: (tool.runs || []).slice(-6).map(run => ({
+      ...run,
+      result: run.result ? sanitizeToolPayload(run.result, 2) : run.result,
+    })),
+  }));
+  json = JSON.stringify(trimmed);
+  if (json.length <= TOOL_STATE_MAX_JSON) return trimmed;
+
+  return trimmed.map(tool => ({
+    ...tool,
+    runs: (tool.runs || []).slice(-3).map(run => ({
+      ...run,
+      result: run.result ? { summary: 'Tool result persisted in run events; metadata copy truncated.' } : run.result,
+    })),
+  }));
+}
+
+function isTerminalDurableToolStatus(status: DurableToolStatus | string | undefined): boolean {
+  return status === 'done' || status === 'error' || status === 'cancelled';
+}
+
+function aggregateDurableToolStatus(runs: DurableToolRun[]): DurableToolStatus {
+  if (runs.some(run => run.status === 'executing')) return 'executing';
+  if (runs.some(run => run.status === 'started')) return 'started';
+  if (runs.length > 0 && runs.every(run => run.status === 'cancelled')) return 'cancelled';
+  if (runs.length > 0 && runs.every(run => run.status === 'error')) return 'error';
+  return 'done';
+}
+
+function findLastOpenDurableRunIndex(runs: DurableToolRun[]): number {
+  for (let i = runs.length - 1; i >= 0; i -= 1) {
+    if (!isTerminalDurableToolStatus(runs[i]?.status)) return i;
+  }
+  return -1;
+}
+
+function normalizeDurableToolCalls(value: unknown): DurableToolCall[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(item => item && typeof item === 'object' && typeof (item as any).tool === 'string')
+    .map(item => {
+      const tool = item as any;
+      const runs = Array.isArray(tool.runs)
+        ? tool.runs
+            .filter((run: any) => run && typeof run === 'object')
+            .map((run: any) => ({
+              id: typeof run.id === 'string' && run.id ? run.id : crypto.randomUUID(),
+              input: run.input,
+              result: run.result,
+              status: isTerminalDurableToolStatus(run.status) || run.status === 'started' || run.status === 'executing'
+                ? run.status as DurableToolStatus
+                : 'done',
+              started_at: typeof run.started_at === 'string' ? run.started_at : undefined,
+              completed_at: typeof run.completed_at === 'string' ? run.completed_at : undefined,
+            }))
+        : [];
+      const fallbackRun: DurableToolRun = {
+        id: typeof tool.id === 'string' && tool.id ? `${tool.id}:run` : crypto.randomUUID(),
+        input: tool.input,
+        result: tool.result,
+        status: isTerminalDurableToolStatus(tool.status) || tool.status === 'started' || tool.status === 'executing'
+          ? tool.status as DurableToolStatus
+          : 'done',
+      };
+      const normalizedRuns = runs.length > 0 ? runs : [fallbackRun];
+      return {
+        id: typeof tool.id === 'string' && tool.id ? tool.id : crypto.randomUUID(),
+        tool: tool.tool,
+        input: tool.input,
+        result: tool.result,
+        status: aggregateDurableToolStatus(normalizedRuns),
+        collapsed: tool.collapsed !== false,
+        activeRunId: typeof tool.activeRunId === 'string' ? tool.activeRunId : undefined,
+        runs: normalizedRuns,
+        updated_at: typeof tool.updated_at === 'string' ? tool.updated_at : new Date().toISOString(),
+      };
+    });
+}
+
+function upsertDurableToolEvent(toolCalls: DurableToolCall[], event: any): DurableToolCall[] {
+  if (!event?.tool || !event?.status) return toolCalls;
+  const status = String(event.status) as DurableToolStatus;
+  if (!['started', 'executing', 'done', 'error', 'cancelled'].includes(status)) return toolCalls;
+
+  const toolName = String(event.tool);
+  const now = new Date().toISOString();
+  const existingIndex = toolCalls.findIndex(tool => tool.tool === toolName);
+  const createRun = (runStatus: DurableToolStatus): DurableToolRun => ({
+    id: crypto.randomUUID(),
+    input: sanitizeToolPayload(event.input),
+    result: sanitizeToolPayload(event.result),
+    status: runStatus,
+    started_at: now,
+    completed_at: isTerminalDurableToolStatus(runStatus) ? now : undefined,
+  });
+
+  if (existingIndex === -1) {
+    const run = createRun(status);
+    return compactToolStateForStorage([
+      ...toolCalls,
+      {
+        id: crypto.randomUUID(),
+        tool: toolName,
+        input: run.input,
+        result: run.result,
+        status: run.status,
+        collapsed: true,
+        activeRunId: isTerminalDurableToolStatus(run.status) ? undefined : run.id,
+        runs: [run],
+        updated_at: now,
+      },
+    ]);
+  }
+
+  const next = toolCalls.map(tool => ({ ...tool, runs: [...(tool.runs || [])] }));
+  const existing = next[existingIndex];
+  const runs = existing.runs.length > 0
+    ? existing.runs.map(run => ({ ...run }))
+    : [{
+        id: crypto.randomUUID(),
+        input: existing.input,
+        result: existing.result,
+        status: existing.status,
+      } as DurableToolRun];
+  let activeRunId = existing.activeRunId;
+
+  if (status === 'started') {
+    const run = createRun('started');
+    runs.push(run);
+    activeRunId = run.id;
+  } else if (status === 'executing') {
+    let runIndex = runs.findIndex(run => run.id === activeRunId && !isTerminalDurableToolStatus(run.status));
+    if (runIndex < 0) runIndex = findLastOpenDurableRunIndex(runs);
+    if (runIndex < 0) {
+      const run = createRun('executing');
+      runs.push(run);
+      activeRunId = run.id;
+    } else {
+      runs[runIndex] = {
+        ...runs[runIndex],
+        status: 'executing',
+        input: event.input !== undefined ? sanitizeToolPayload(event.input) : runs[runIndex].input,
+      };
+      activeRunId = runs[runIndex].id;
+    }
+  } else {
+    let runIndex = runs.findIndex(run => run.id === activeRunId && !isTerminalDurableToolStatus(run.status));
+    if (runIndex < 0) runIndex = findLastOpenDurableRunIndex(runs);
+    if (runIndex < 0) {
+      runs.push(createRun(status));
+    } else {
+      runs[runIndex] = {
+        ...runs[runIndex],
+        status,
+        result: event.result !== undefined ? sanitizeToolPayload(event.result) : runs[runIndex].result,
+        completed_at: now,
+      };
+    }
+    activeRunId = undefined;
+  }
+
+  const latestRun = runs[runs.length - 1];
+  next[existingIndex] = {
+    ...existing,
+    input: latestRun?.input,
+    result: latestRun?.result,
+    status: aggregateDurableToolStatus(runs),
+    runs,
+    activeRunId,
+    updated_at: now,
+  };
+  return compactToolStateForStorage(next);
+}
+
+async function persistAssistantToolCallsMetadata(
+  env: Env,
+  assistantMessageId: string,
+  sessionId: string,
+  toolCalls: DurableToolCall[]
+): Promise<void> {
+  if (!assistantMessageId || !sessionId) return;
+  const row = await env.D1.prepare(
+    `SELECT metadata FROM agent_messages WHERE id = ? AND session_id = ? LIMIT 1`
+  ).bind(assistantMessageId, sessionId).first<{ metadata: string | null }>().catch(() => null);
+  const metadata = safeParseJsonObject(row?.metadata);
+  metadata.tool_calls = compactToolStateForStorage(toolCalls);
+  await env.D1.prepare(
+    `UPDATE agent_messages SET metadata = ? WHERE id = ? AND session_id = ?`
+  ).bind(JSON.stringify(metadata), assistantMessageId, sessionId).run().catch(error => {
+    console.warn('[agent:tools] metadata persist failed:', error?.message || error);
+  });
+}
+
+function safeDeckJobForMessage(job: any): Record<string, any> | null {
+  if (!job?.id) return null;
+  return {
+    id: job.id,
+    assistant_message_id: job.assistant_message_id || null,
+    status: job.status,
+    phase: job.phase,
+    title: job.title,
+    status_label: job.status_label,
+    revision_round: job.revision_round,
+    max_revision_rounds: job.max_revision_rounds,
+    qa_summary: job.qa_summary || null,
+    qa_findings: Array.isArray(job.qa_findings) ? job.qa_findings.slice(0, 12) : [],
+    blocked_reason: job.blocked_reason || null,
+    visible_document_cards: normalizeDocumentCards(job.visible_document_cards || []),
+    diagnostic_document_cards: normalizeDocumentCards(job.diagnostic_document_cards || []),
+    last_event_seq: Number(job.last_event_seq || 0),
+    last_event_message: job.last_event_message || '',
+  };
+}
+
+export const __agentToolStateTestHooks = {
+  upsertDurableToolEvent,
+  normalizeDurableToolCalls,
+  compactToolStateForStorage,
+  safeDeckJobForMessage,
+};
 
 function compactRoutedToolResult(tool: string, result: any): any {
   if (!result || typeof result !== 'object') return result;
@@ -1393,7 +1766,8 @@ async function persistImmediateAgentResult(
   content: string,
   status: 'done' | 'error',
   documentCards: MartyDocumentCard[] = [],
-  error?: string
+  error?: string,
+  toolCalls: DurableToolCall[] = []
 ): Promise<void> {
   const metadataObj: Record<string, any> = {
     status,
@@ -1404,6 +1778,8 @@ async function persistImmediateAgentResult(
   if (error) metadataObj.error = error;
   const normalizedCards = normalizeDocumentCards(documentCards);
   if (normalizedCards.length > 0) metadataObj.document_cards = normalizedCards;
+  const normalizedTools = compactToolStateForStorage(toolCalls);
+  if (normalizedTools.length > 0) metadataObj.tool_calls = normalizedTools;
   const output = normalizeMartyOutputText(content, new Set());
   if (output.invalidCitationsStripped > 0) {
     metadataObj.invalid_citations_stripped = output.invalidCitationsStripped;
@@ -1462,6 +1838,12 @@ function createStreamingMaxSetResponse(args: {
       const started = Date.now();
       let heartbeat: ReturnType<typeof setInterval> | null = null;
       let maxJobId: string | null = null;
+      let durableToolCalls: DurableToolCall[] = [];
+      const recordToolEvent = async (event: any) => {
+        if (event?.type !== 'tool_call' && event?.type !== 'tool_result') return;
+        durableToolCalls = upsertDurableToolEvent(durableToolCalls, event);
+        await persistAssistantToolCallsMetadata(env, assistantMessageId, session.id, durableToolCalls);
+      };
       try {
         emit({ type: 'session', session_id: session.id });
         emit({ type: 'request', request_id: requestId });
@@ -1493,18 +1875,22 @@ function createStreamingMaxSetResponse(args: {
             status: 'running',
           });
         }
-        emit({ type: 'tool_call', tool: 'build_max_set', input, status: 'executing', forced: true });
+        const initialToolEvent = { type: 'tool_call', tool: 'build_max_set', input, status: 'executing', forced: true };
+        emit(initialToolEvent);
+        await recordToolEvent(initialToolEvent);
 
         heartbeat = setInterval(() => {
           try {
-            emit({
+            const heartbeatEvent = {
               type: 'tool_call',
               tool: 'build_max_set',
               status: 'executing',
               forced: true,
               heartbeat: true,
               elapsed_ms: Date.now() - started,
-            });
+            };
+            emit(heartbeatEvent);
+            void recordToolEvent(heartbeatEvent);
           } catch {
             // The client may have disconnected; the main path will handle it.
           }
@@ -1533,7 +1919,9 @@ function createStreamingMaxSetResponse(args: {
         if (documentCards.length > 0) {
           emit({ type: 'document_cards', document_cards: documentCards });
         }
-        emit({ type: 'tool_result', tool: 'build_max_set', result: compact, status: 'done', forced: true });
+        const doneToolEvent = { type: 'tool_result', tool: 'build_max_set', result: compact, status: 'done', forced: true };
+        emit(doneToolEvent);
+        await recordToolEvent(doneToolEvent);
 
         const finalText = formatMaxSetAnswer(result, Date.now() - started);
         emit({ text: finalText });
@@ -1564,7 +1952,8 @@ function createStreamingMaxSetResponse(args: {
           finalText,
           result?.error ? 'error' : 'done',
           documentCards,
-          result?.error
+          result?.error,
+          durableToolCalls
         );
         await updateAgentRunStatus(env, runId, result?.error ? 'error' : 'completed', {
           errorCode: result?.error ? 'MAX_SET_ERROR' : null,
@@ -1582,7 +1971,9 @@ function createStreamingMaxSetResponse(args: {
         const message = String(error?.message || error);
         if (signal?.aborted || /cancelled/i.test(message)) {
           const finalText = '_(cancelled before MARTy finished the MAX set-builder run)_';
-          emit({ type: 'tool_result', tool: 'build_max_set', result: { cancelled: true }, status: 'cancelled', forced: true });
+          const cancelledToolEvent = { type: 'tool_result', tool: 'build_max_set', result: { cancelled: true }, status: 'cancelled', forced: true };
+          emit(cancelledToolEvent);
+          await recordToolEvent(cancelledToolEvent);
           emit({ text: finalText });
           await markAgentTurnCancelled(env, ctx, {
             assistantMessageId,
@@ -1601,7 +1992,9 @@ function createStreamingMaxSetResponse(args: {
           '',
           'I did not create an export because the run did not complete safely.',
         ].join('\n');
-        emit({ type: 'tool_result', tool: 'build_max_set', result: { error: message }, status: 'error', forced: true });
+        const errorToolEvent = { type: 'tool_result', tool: 'build_max_set', result: { error: message }, status: 'error', forced: true };
+        emit(errorToolEvent);
+        await recordToolEvent(errorToolEvent);
         emit({ text: finalText });
         await persistImmediateAgentResult(
           env,
@@ -1614,7 +2007,8 @@ function createStreamingMaxSetResponse(args: {
           finalText,
           'error',
           [],
-          message
+          message,
+          durableToolCalls
         ).catch(() => {});
         await updateMaxModeJobRecordSafe(env, maxJobId, {
           status: 'failed',
@@ -1699,8 +2093,46 @@ export async function getSessionMessages(
   const messages = await env.D1.prepare(
     'SELECT * FROM agent_messages WHERE session_id = ? ORDER BY turn_index ASC'
   ).bind(normalizedId).all<Record<string, any>>();
+  const assistantMessageIds = messages.results
+    .filter(m => m.role === 'assistant' && typeof m.id === 'string')
+    .map(m => m.id);
+  const deckJobsByMessage = new Map<string, any[]>();
+  if (assistantMessageIds.length > 0) {
+    const placeholders = assistantMessageIds.map(() => '?').join(',');
+    const jobs = await env.D1.prepare(
+      `SELECT id, assistant_message_id
+         FROM deck_artifact_jobs
+        WHERE org_id = ?
+          AND session_id = ?
+          AND assistant_message_id IN (${placeholders})
+        ORDER BY created_at ASC`
+    ).bind(ctx.orgId, normalizedId, ...assistantMessageIds).all<{ id: string; assistant_message_id: string }>().catch(() => ({ results: [] as { id: string; assistant_message_id: string }[] }));
+    for (const jobRow of jobs.results) {
+      const snapshot = await getDeckJobSnapshot(ctx, env, jobRow.id).catch(() => null);
+      const safeSnapshot = safeDeckJobForMessage(snapshot);
+      if (!safeSnapshot || !jobRow.assistant_message_id) continue;
+      const existing = deckJobsByMessage.get(jobRow.assistant_message_id) || [];
+      existing.push(safeSnapshot);
+      deckJobsByMessage.set(jobRow.assistant_message_id, existing);
+    }
+  }
   const hydratedMessages = messages.results.map(m => ({
     ...m,
+    metadata: (() => {
+      const metadata = safeParseJsonObject(m.metadata);
+      const deckJobs = deckJobsByMessage.get(m.id);
+      if (deckJobs?.length) {
+        metadata.deck_jobs = deckJobs;
+        const visibleCards = normalizeDocumentCards(deckJobs.flatMap(job => job.visible_document_cards || []));
+        if (visibleCards.length > 0) {
+          metadata.document_cards = normalizeDocumentCards([
+            ...(Array.isArray(metadata.document_cards) ? metadata.document_cards : []),
+            ...visibleCards,
+          ]);
+        }
+      }
+      return JSON.stringify(metadata);
+    })(),
     sources: m.sources_json ? safeParseJson<CitationSource[]>(m.sources_json) : null,
     attachments: m.attachments ? safeParseJson<UploadSummary[]>(m.attachments) : null,
   }));
@@ -2141,6 +2573,12 @@ export async function queryAgent(
     session_id: session.id,
     mode: deepDive ? 'max' : 'agile',
   });
+  let durableToolCalls: DurableToolCall[] = [];
+  const recordToolEvent = async (event: any) => {
+    if (event?.type !== 'tool_call' && event?.type !== 'tool_result') return;
+    durableToolCalls = upsertDurableToolEvent(durableToolCalls, event);
+    await persistAssistantToolCallsMetadata(env, assistantMessageId, session.id, durableToolCalls);
+  };
 
   if (maxSetIntent.shouldBuild && maxSetIntent.input) {
     if (ddKey) {
@@ -2583,6 +3021,9 @@ export async function queryAgent(
               } else if (evt.type === 'tool_result' && evt.result?.document_cards) {
                 surfacedDocumentCards.push(...normalizeDocumentCards(evt.result.document_cards));
               }
+              if (evt.type === 'tool_call' || evt.type === 'tool_result') {
+                await recordToolEvent(evt);
+              }
             } catch { /* skip */ }
           }
         }
@@ -2647,6 +3088,10 @@ export async function queryAgent(
       }
       if (documentCards.length > 0) {
         metadataObj.document_cards = documentCards;
+      }
+      const normalizedToolCalls = compactToolStateForStorage(durableToolCalls);
+      if (normalizedToolCalls.length > 0) {
+        metadataObj.tool_calls = normalizedToolCalls;
       }
       const metadataJson = JSON.stringify(metadataObj);
       await env.D1.prepare(

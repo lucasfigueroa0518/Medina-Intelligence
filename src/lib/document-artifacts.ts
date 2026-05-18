@@ -2925,7 +2925,13 @@ async function persistDeckVisibleCardsOnMessage(
   await env.D1.prepare(
     `UPDATE agent_messages
         SET metadata = ?
-      WHERE id = ? AND org_id = ?`
+      WHERE id = ?
+        AND EXISTS (
+          SELECT 1
+            FROM agent_sessions s
+           WHERE s.id = agent_messages.session_id
+             AND s.org_id = ?
+        )`
   ).bind(JSON.stringify(metadata), assistantMessageId, ctx.orgId).run().catch(() => {});
 }
 

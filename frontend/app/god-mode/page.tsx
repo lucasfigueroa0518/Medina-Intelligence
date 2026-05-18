@@ -141,6 +141,7 @@ interface ToolRun {
 
 interface DeckJobView {
   id: string;
+  assistant_message_id?: string | null;
   status?: 'queued' | 'running' | 'revising' | 'qa_blocked' | 'completed' | 'failed' | 'cancelled' | string;
   phase?: string;
   title?: string;
@@ -166,6 +167,7 @@ interface DeckJobView {
   }>;
   latest_event_message?: string;
   last_event_message?: string;
+  last_event_seq?: number;
 }
 
 interface MartyDocumentCard {
@@ -203,6 +205,7 @@ interface Message {
   sources?: CitationSource[];
   attachments?: ChatUploadSummary[];
   documentCards?: MartyDocumentCard[];
+  deckJobs?: DeckJobView[];
 }
 
 interface RunningMartyStream {
@@ -571,7 +574,7 @@ function upsertToolEvent(toolCalls: ToolCall[], event: any): ToolCall[] {
       };
       activeRunId = runs[runIndex].id;
     }
-  } else if (event.status === 'done' || event.status === 'error') {
+  } else if (event.status === 'done' || event.status === 'error' || event.status === 'cancelled') {
     let runIndex = runs.findIndex(run => run.id === activeRunId && !isTerminalToolStatus(run.status));
     if (runIndex < 0) runIndex = runs.findLastIndex(run => !isTerminalToolStatus(run.status));
     if (runIndex < 0) {
@@ -722,10 +725,85 @@ function parseAgentMetadata(raw: unknown): Record<string, any> {
   }
 }
 
+function normalizeHydratedToolCalls(raw: unknown): ToolCall[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const calls = raw
+    .filter(item => item && typeof item === 'object' && typeof item.tool === 'string')
+    .map(item => {
+      const tool = item as any;
+      const runs: ToolRun[] = Array.isArray(tool.runs)
+        ? tool.runs
+            .filter((run: any) => run && typeof run === 'object')
+            .map((run: any) => ({
+              id: typeof run.id === 'string' && run.id ? run.id : crypto.randomUUID(),
+              input: run.input,
+              result: run.result,
+              status: ['started', 'executing', 'done', 'error', 'cancelled'].includes(String(run.status))
+                ? run.status
+                : 'done',
+            }))
+        : [];
+      const fallbackRun: ToolRun = {
+        id: typeof tool.id === 'string' && tool.id ? `${tool.id}:run` : crypto.randomUUID(),
+        input: tool.input,
+        result: tool.result,
+        status: ['started', 'executing', 'done', 'error', 'cancelled'].includes(String(tool.status))
+          ? tool.status
+          : 'done',
+      };
+      const normalizedRuns = runs.length > 0 ? runs : [fallbackRun];
+      const status = aggregateToolStatus(normalizedRuns);
+      const latest = normalizedRuns[normalizedRuns.length - 1];
+      return {
+        id: typeof tool.id === 'string' && tool.id ? tool.id : crypto.randomUUID(),
+        tool: String(tool.tool),
+        input: latest?.input ?? tool.input,
+        result: latest?.result ?? tool.result,
+        status,
+        collapsed: tool.collapsed !== false,
+        runs: normalizedRuns,
+        activeRunId: typeof tool.activeRunId === 'string' ? tool.activeRunId : undefined,
+        pulseKey: 0,
+      } satisfies ToolCall;
+    });
+  return calls.length > 0 ? calls : undefined;
+}
+
+function normalizeDeckJobs(raw: unknown): DeckJobView[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const jobs = raw
+    .filter(job => job && typeof job === 'object' && typeof (job as any).id === 'string')
+    .map(job => {
+      const j = job as any;
+      return {
+        id: j.id,
+        assistant_message_id: j.assistant_message_id || null,
+        status: j.status,
+        phase: j.phase,
+        title: j.title,
+        status_label: j.status_label,
+        revision_round: typeof j.revision_round === 'number' ? j.revision_round : Number(j.revision_round || 0),
+        max_revision_rounds: typeof j.max_revision_rounds === 'number' ? j.max_revision_rounds : Number(j.max_revision_rounds || 3),
+        qa_summary: j.qa_summary || null,
+        blocked_reason: j.blocked_reason || null,
+        visible_document_cards: mergeDocumentCards(undefined, j.visible_document_cards),
+        diagnostic_document_cards: mergeDocumentCards(undefined, j.diagnostic_document_cards),
+        qa_findings: Array.isArray(j.qa_findings) ? j.qa_findings : [],
+        latest_event_message: j.latest_event_message,
+        last_event_message: j.last_event_message,
+        last_event_seq: typeof j.last_event_seq === 'number' ? j.last_event_seq : Number(j.last_event_seq || 0),
+      } satisfies DeckJobView;
+    });
+  return jobs.length > 0 ? jobs : undefined;
+}
+
 function hydrateAgentMessage(m: any): Message {
   const meta = parseAgentMetadata(m.metadata);
   const running = m.role === 'assistant' && meta.status === 'running';
-  const documentCards = mergeDocumentCards(undefined, meta?.document_cards);
+  const toolCalls = normalizeHydratedToolCalls(meta?.tool_calls);
+  const deckJobs = normalizeDeckJobs(meta?.deck_jobs);
+  const deckVisibleCards = mergeDocumentCards(undefined, deckJobs?.flatMap(job => job.visible_document_cards || []));
+  const documentCards = mergeDocumentCards(mergeDocumentCards(undefined, meta?.document_cards), deckVisibleCards);
   return {
     id: m.id,
     role: m.role,
@@ -734,6 +812,8 @@ function hydrateAgentMessage(m: any): Message {
     attachments: m.attachments || undefined,
     sources: m.sources || undefined,
     documentCards,
+    toolCalls,
+    deckJobs,
     cancelled: !!meta.cancelled || meta.status === 'cancelled',
     streaming: running,
     pendingRequestId: running && typeof meta.request_id === 'string' ? meta.request_id : undefined,
@@ -744,6 +824,23 @@ function hydrateAgentMessage(m: any): Message {
 
 function hydrateAgentMessages(rows: any[]): Message[] {
   return rows.map(hydrateAgentMessage);
+}
+
+function preserveHydratedLocalUiState(serverMessages: Message[], localMessages: Message[]): Message[] {
+  const localById = new Map(localMessages.map(message => [message.id, message]));
+  return serverMessages.map(serverMessage => {
+    const local = localById.get(serverMessage.id);
+    if (!local?.toolCalls?.length || !serverMessage.toolCalls?.length) return serverMessage;
+    const localByTool = new Map(local.toolCalls.map(tool => [tool.id || tool.tool, tool]));
+    const localByName = new Map(local.toolCalls.map(tool => [tool.tool, tool]));
+    return {
+      ...serverMessage,
+      toolCalls: serverMessage.toolCalls.map(tool => {
+        const localTool = localByTool.get(tool.id || tool.tool) || localByName.get(tool.tool);
+        return localTool ? { ...tool, collapsed: localTool.collapsed } : tool;
+      }),
+    };
+  });
 }
 
 function getRunningAssistantMessage(messages: Message[]): Message | undefined {
@@ -916,6 +1013,39 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function DeckProductionPanel({ jobs }: { jobs?: DeckJobView[] }) {
+  const normalized = (jobs || []).filter(job => job?.id);
+  if (normalized.length === 0) return null;
+  const active = normalized.find(job => !isTerminalDeckJob(job));
+  const latest = active || normalized[normalized.length - 1];
+  const completedCards = mergeDocumentCards(undefined, latest.visible_document_cards);
+
+  return (
+    <div className="mb-4 rounded-xl border border-[#8B5CF6]/25 bg-[#0F0D16]/80 p-3 shadow-[0_0_30px_rgba(139,92,246,0.08)]">
+      <div className="mb-2 flex items-center gap-2">
+        {!isTerminalDeckJob(latest) ? <MartyEmblem size={18} animate /> : latest.status === 'completed' ? <CheckCircle2 size={16} className="text-semantic-success" /> : <AlertCircle size={16} className="text-semantic-error" />}
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-semibold text-text-primary" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+            Deck Production
+          </div>
+          <div className="truncate text-[11px] text-text-muted">{latest.title || 'Presentation deck'}</div>
+        </div>
+        {latest.revision_round ? (
+          <span className="rounded-full border border-accent-magenta/20 bg-accent-magenta/10 px-2 py-0.5 text-[10px] font-semibold text-accent-magenta">
+            {Math.min(Number(latest.revision_round), Number(latest.max_revision_rounds || 3))}/{Number(latest.max_revision_rounds || 3)}
+          </span>
+        ) : null}
+      </div>
+      <DeckJobProgress job={latest} />
+      {latest.status === 'completed' && completedCards?.length ? (
+        <div className="mt-3 text-[11px] text-text-muted">
+          Polished downloads are available in the document cards below.
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1604,6 +1734,12 @@ export default function GodModePage() {
       : job;
     updateSessionDraft(sessionId, current => current.map(msg => {
       let changed = false;
+      const targetsThisMessage = !job.assistant_message_id || job.assistant_message_id === msg.id;
+      const existingDeckJobs = msg.deckJobs || [];
+      const deckJobIndex = existingDeckJobs.findIndex(existing => existing.id === job.id);
+      const deckJobs = deckJobIndex >= 0
+        ? existingDeckJobs.map(existing => existing.id === job.id ? { ...existing, ...jobWithEvent } : existing)
+        : [...existingDeckJobs, jobWithEvent];
       const toolCalls = (msg.toolCalls || []).map(tool => {
         if (tool.tool !== 'create_deck_artifact') return tool;
         let toolChanged = false;
@@ -1637,18 +1773,22 @@ export default function GodModePage() {
           pulseKey: (tool.pulseKey || 0) + (toolChanged ? 1 : 0),
         };
       });
-      if (!changed) return msg;
+      const shouldAttachToMessage = changed
+        || deckJobIndex >= 0
+        || (targetsThisMessage && msg.role === 'assistant' && msg.id === current[current.length - 1]?.id);
+      if (!shouldAttachToMessage) return msg;
       return {
         ...msg,
         toolCalls,
+        deckJobs,
         documentCards: visibleCards?.length ? mergeDocumentCards(msg.documentCards, visibleCards) : msg.documentCards,
       };
     }));
   }, [updateSessionDraft]);
 
-  const startDeckJobPolling = React.useCallback((sessionId: string, jobId: string) => {
+  const startDeckJobPolling = React.useCallback((sessionId: string, jobId: string, initialSeq = 0) => {
     if (!jobId || deckJobPollersRef.current[jobId]) return;
-    const poller = { stopped: false, lastSeq: 0 };
+    const poller = { stopped: false, lastSeq: Math.max(0, Number(initialSeq || 0)) };
     deckJobPollersRef.current[jobId] = poller;
 
     const loop = async () => {
@@ -1677,9 +1817,12 @@ export default function GodModePage() {
     if (activeSessionId) sessionMessages[activeSessionId] = messagesSnapshotRef.current;
     for (const [sessionId, draftMessages] of Object.entries(sessionMessages)) {
       for (const msg of draftMessages || []) {
+        for (const job of msg.deckJobs || []) {
+          if (job && !isTerminalDeckJob(job)) startDeckJobPolling(sessionId, job.id, job.last_event_seq || 0);
+        }
         for (const tool of msg.toolCalls || []) {
           const job = deckJobFromTool(tool);
-          if (job && !isTerminalDeckJob(job)) startDeckJobPolling(sessionId, job.id);
+          if (job && !isTerminalDeckJob(job)) startDeckJobPolling(sessionId, job.id, job.last_event_seq || 0);
         }
       }
     }
@@ -1725,7 +1868,10 @@ export default function GodModePage() {
 
   const applyServerMessages = React.useCallback((rows: any[], sessionIdForPending?: string | null) => {
     const targetSessionId = sessionIdForPending || activeSessionIdRef.current;
-    const nextMessages = hydrateAgentMessages(rows);
+    const localMessages = targetSessionId
+      ? (sessionDraftsRef.current[targetSessionId] || (activeSessionIdRef.current === targetSessionId ? messagesSnapshotRef.current : []))
+      : messagesSnapshotRef.current;
+    const nextMessages = preserveHydratedLocalUiState(hydrateAgentMessages(rows), localMessages);
     const runningMessage = getRunningAssistantMessage(nextMessages);
     const existingRun = targetSessionId ? runningStreamsRef.current[targetSessionId] : null;
     if (targetSessionId && !runningMessage?.pendingRequestId && existingRun?.abortController) {
@@ -2491,10 +2637,20 @@ export default function GodModePage() {
           updateSessionDraft(requestSessionId!, m => m.map(msg => {
             if (msg.id !== assistantMsgId) return msg;
             const toolCalls = upsertToolEvent(msg.toolCalls || [], event);
+            const rawDeckJob = deckJobFromResult(event.result);
+            const deckJob = rawDeckJob ? { ...rawDeckJob, assistant_message_id: rawDeckJob.assistant_message_id || assistantMsgId } : null;
+            const deckJobs = deckJob
+              ? (() => {
+                  const existing = msg.deckJobs || [];
+                  return existing.some(job => job.id === deckJob.id)
+                    ? existing.map(job => job.id === deckJob.id ? { ...job, ...deckJob } : job)
+                    : [...existing, deckJob];
+                })()
+              : msg.deckJobs;
             const documentCards = event.result?.document_cards
               ? mergeDocumentCards(msg.documentCards, event.result.document_cards)
               : msg.documentCards;
-            return { ...msg, toolCalls, documentCards };
+            return { ...msg, toolCalls, deckJobs, documentCards };
           }));
         },
         uploadIds.length > 0 ? uploadIds : undefined,
@@ -2787,6 +2943,10 @@ export default function GodModePage() {
 
                     {m.streaming && activeSessionIsStreaming && isThinking && (
                       <ThinkingIndicator />
+                    )}
+
+                    {m.deckJobs && m.deckJobs.length > 0 && (
+                      <DeckProductionPanel jobs={m.deckJobs} />
                     )}
 
                     {m.documentCards && m.documentCards.length > 0 && (
