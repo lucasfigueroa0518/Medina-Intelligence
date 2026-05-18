@@ -166,23 +166,36 @@ function OtherDetectedDeals({
       <button
         type="button"
         onClick={onToggle}
-        className="w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-left transition-colors hover:border-accent-magenta/25 hover:bg-accent-magenta/[0.04]"
+        aria-expanded={open}
+        className="group w-full rounded-lg border border-accent-magenta/35 bg-accent-magenta/[0.08] px-3 py-3 text-left shadow-[0_0_22px_rgba(217,70,168,0.14)] transition-all hover:-translate-y-0.5 hover:border-accent-magenta/60 hover:bg-accent-magenta/[0.12] hover:shadow-[0_0_30px_rgba(217,70,168,0.20)]"
       >
         <div className="flex items-center justify-between gap-2">
-          <div className="min-w-0">
-            <div className="text-xs font-medium text-text-primary">Other detected deals</div>
-            <div className="mt-0.5 truncate text-[11px] text-text-muted">
-              {candidates.length > 0
-                ? `${candidates.length} below auto-threshold · 2+ strong evidence`
-                : 'None waiting for manual review'}
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-accent-magenta/35 bg-accent-magenta/[0.16] text-accent-magenta">
+              <Sparkles size={15} />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <div className="truncate text-sm font-semibold text-text-primary">Other detected deals</div>
+                {candidates.length > 0 && (
+                  <span className="rounded-full bg-accent-magenta px-2 py-0.5 text-[10px] font-bold leading-none text-white">
+                    {candidates.length}
+                  </span>
+                )}
+              </div>
+              <div className="mt-1 truncate text-[11px] text-text-secondary">
+                {candidates.length > 0
+                  ? `${candidates.length} below auto-threshold · 2+ strong evidence`
+                  : 'None waiting for manual review'}
+              </div>
             </div>
           </div>
-          <ChevronRight size={14} className={`shrink-0 text-text-muted transition-transform ${open ? 'rotate-90' : ''}`} />
+          <ChevronRight size={16} className={`shrink-0 text-accent-magenta transition-transform group-hover:text-text-primary ${open ? 'rotate-90' : ''}`} />
         </div>
       </button>
 
       {open && (
-        <div className="mt-2 space-y-2 rounded-lg border border-white/10 bg-bg-surface/60 p-2">
+        <div className="mt-2 space-y-2 rounded-lg border border-accent-magenta/20 bg-bg-surface/80 p-2 shadow-[0_12px_30px_rgba(0,0,0,0.22)]">
           {candidates.length === 0 ? (
             <div className="px-2 py-3 text-center text-xs text-text-muted">
               Detected deals will appear here after at least two strong evidence records.
@@ -193,7 +206,7 @@ function OtherDetectedDeals({
             const families = candidate.source_families.length > 0 ? candidate.source_families.join(', ') : 'source evidence';
             const pct = Math.round((candidate.avg_confidence || 0) * 100);
             return (
-              <article key={candidate.company_id} className="rounded-lg border border-white/10 bg-black/10 p-2">
+              <article key={candidate.company_id} className="rounded-lg border border-white/10 bg-black/20 p-2">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="truncate text-xs font-semibold text-text-primary">{candidate.company_name}</div>
@@ -205,7 +218,7 @@ function OtherDetectedDeals({
                     type="button"
                     disabled={busyCompanyId === candidate.company_id}
                     onClick={() => onPromote(candidate)}
-                    className="shrink-0 rounded-md border border-accent-magenta/20 bg-accent-magenta/[0.08] px-2 py-1 text-[11px] font-medium text-accent-magenta transition-colors hover:bg-accent-magenta/[0.12] disabled:opacity-50"
+                    className="shrink-0 rounded-md border border-accent-magenta/35 bg-accent-magenta/[0.12] px-2 py-1 text-[11px] font-medium text-accent-magenta transition-colors hover:bg-accent-magenta/[0.18] disabled:opacity-50"
                   >
                     {busyCompanyId === candidate.company_id ? <Loader2 size={12} className="animate-spin" /> : 'Add'}
                   </button>
@@ -506,9 +519,13 @@ export default function DealsPage() {
                 return (
                   <section
                     key={stage.key}
-                    className={`w-72 flex-shrink-0 rounded-xl p-3 transition-all duration-150 ${isDropTarget ? 'ring-2 ring-accent-magenta/40' : ''}`}
+                    className={`${stage.key === 'new' ? 'w-80 border border-accent-magenta/20 shadow-[0_0_34px_rgba(217,70,168,0.10)]' : 'w-72'} flex-shrink-0 rounded-xl p-3 transition-all duration-150 ${isDropTarget ? 'ring-2 ring-accent-magenta/40' : ''}`}
                     style={{
-                      background: isDropTarget ? 'rgba(217,70,168,0.06)' : 'rgba(17,17,20,0.4)',
+                      background: isDropTarget
+                        ? 'rgba(217,70,168,0.06)'
+                        : stage.key === 'new'
+                          ? 'linear-gradient(180deg, rgba(217,70,168,0.10), rgba(17,17,20,0.64) 34%, rgba(17,17,20,0.42))'
+                          : 'rgba(17,17,20,0.4)',
                     }}
                     onDragOver={e => { if (stage.key !== 'new') { e.preventDefault(); setDragOverStage(stage.key); } }}
                     onDragLeave={() => setDragOverStage(null)}
@@ -527,8 +544,20 @@ export default function DealsPage() {
 
                     {stage.key === 'new' && (
                       <>
-                        <div className="mb-3 rounded-lg border border-accent-magenta/15 bg-accent-magenta/[0.05] px-3 py-2 text-[11px] leading-4 text-text-secondary">
-                          Review AI-surfaced suggestions. Yes confirms the deal and moves it to Talking; drag cards afterward to set the right stage.
+                        <div className="mb-3 rounded-lg border border-accent-magenta/35 bg-accent-magenta/[0.10] px-3 py-3 shadow-[0_0_26px_rgba(217,70,168,0.16)]">
+                          <div className="flex items-start gap-3">
+                            <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-accent-magenta/35 bg-accent-magenta/[0.18] text-accent-magenta">
+                              <Sparkles size={15} />
+                            </div>
+                            <div className="min-w-0">
+                              <div className="text-sm font-semibold leading-5 text-text-primary">
+                                Review AI-surfaced suggestions
+                              </div>
+                              <div className="mt-1 text-[11px] leading-4 text-text-secondary">
+                                Yes confirms the deal and moves it to Talking; drag cards afterward to set the right stage.
+                              </div>
+                            </div>
+                          </div>
                         </div>
                         <OtherDetectedDeals
                           candidates={detectedCandidates}
