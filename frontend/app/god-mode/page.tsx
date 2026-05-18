@@ -148,6 +148,7 @@ interface DeckJobView {
   status_label?: string;
   revision_round?: number;
   max_revision_rounds?: number;
+  artifact_visibility?: 'polished' | 'draft_review' | 'none' | string;
   qa_summary?: {
     status?: string;
     findings?: number;
@@ -501,7 +502,7 @@ function deckJobStatusLabel(job: DeckJobView | null | undefined): string {
   if (job.status_label) return job.status_label;
   const phase = String(job.phase || job.status || 'queued').replace(/_/g, ' ');
   if (job.status === 'completed') return 'Deck ready';
-  if (job.status === 'qa_blocked') return 'QA blocked: needs revision';
+  if (job.status === 'qa_blocked') return 'Draft ready: review needed';
   if (job.status === 'failed') return 'Deck render failed';
   if (job.status === 'revising') {
     const round = Math.max(1, Number(job.revision_round || 1));
@@ -784,6 +785,7 @@ function normalizeDeckJobs(raw: unknown): DeckJobView[] | undefined {
         status_label: j.status_label,
         revision_round: typeof j.revision_round === 'number' ? j.revision_round : Number(j.revision_round || 0),
         max_revision_rounds: typeof j.max_revision_rounds === 'number' ? j.max_revision_rounds : Number(j.max_revision_rounds || 3),
+        artifact_visibility: j.artifact_visibility || 'none',
         qa_summary: j.qa_summary || null,
         blocked_reason: j.blocked_reason || null,
         visible_document_cards: mergeDocumentCards(undefined, j.visible_document_cards),
@@ -953,11 +955,13 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
   const latestMessage = job.latest_event_message || job.last_event_message || '';
   const findings = (job.qa_findings || []).slice(0, 3);
   const diagnostics = (job.diagnostic_document_cards || []).slice(0, 5);
-  const statusTone = failed || blocked
+  const statusTone = failed
     ? 'border-semantic-error/25 bg-semantic-error/5 text-semantic-error'
-    : completed
-      ? 'border-semantic-success/25 bg-semantic-success/5 text-semantic-success'
-      : 'border-accent-magenta/25 bg-accent-magenta/5 text-accent-magenta';
+    : blocked
+      ? 'border-[#F59E0B]/30 bg-[#F59E0B]/10 text-[#F59E0B]'
+      : completed
+        ? 'border-semantic-success/25 bg-semantic-success/5 text-semantic-success'
+        : 'border-accent-magenta/25 bg-accent-magenta/5 text-accent-magenta';
 
   return (
     <div className={`rounded-lg border p-3 ${statusTone}`}>
@@ -986,13 +990,13 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
       )}
       {blocked && (
         <div className="mt-2 text-[11px] leading-relaxed text-text-secondary">
-          {job.blocked_reason || 'Screenshot QA blocked polished export. MARTy did not expose the draft deck as a finished file.'}
+          {job.blocked_reason || 'A usable draft deck is available, but visual/export QA needs review before treating it as polished.'}
         </div>
       )}
       {blocked && findings.length > 0 && (
         <div className="mt-2 space-y-1.5">
           {findings.map((finding, index) => (
-            <div key={`${finding.slideId || 'slide'}-${index}`} className="rounded border border-semantic-error/15 bg-bg-root/50 px-2 py-1.5 text-[11px] leading-relaxed text-text-secondary">
+            <div key={`${finding.slideId || 'slide'}-${index}`} className="rounded border border-[#F59E0B]/20 bg-bg-root/50 px-2 py-1.5 text-[11px] leading-relaxed text-text-secondary">
               <span className="font-semibold text-text-primary">{finding.slideId || 'Slide'}</span>
               {finding.issue ? `: ${finding.issue}` : ''}
               {finding.requiredFix ? <span className="text-text-muted"> · {finding.requiredFix}</span> : null}
@@ -1027,7 +1031,7 @@ function DeckProductionPanel({ jobs }: { jobs?: DeckJobView[] }) {
   return (
     <div className="mb-4 rounded-xl border border-[#8B5CF6]/25 bg-[#0F0D16]/80 p-3 shadow-[0_0_30px_rgba(139,92,246,0.08)]">
       <div className="mb-2 flex items-center gap-2">
-        {!isTerminalDeckJob(latest) ? <MartyEmblem size={18} animate /> : latest.status === 'completed' ? <CheckCircle2 size={16} className="text-semantic-success" /> : <AlertCircle size={16} className="text-semantic-error" />}
+        {!isTerminalDeckJob(latest) ? <MartyEmblem size={18} animate /> : latest.status === 'completed' ? <CheckCircle2 size={16} className="text-semantic-success" /> : latest.status === 'qa_blocked' ? <AlertCircle size={16} className="text-[#F59E0B]" /> : <AlertCircle size={16} className="text-semantic-error" />}
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-semibold text-text-primary" style={{ fontFamily: "'DM Sans', sans-serif" }}>
             Deck Production
@@ -1046,6 +1050,11 @@ function DeckProductionPanel({ jobs }: { jobs?: DeckJobView[] }) {
           Polished downloads are available in the document cards below.
         </div>
       ) : null}
+      {latest.status === 'qa_blocked' && completedCards?.length ? (
+        <div className="mt-3 text-[11px] text-text-muted">
+          Draft-review downloads are available in the document cards below. Use them as working files until visual QA is cleared.
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1060,7 +1069,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
   const isDeckActive = Boolean(deckJob && !isTerminalDeckJob(deckJob));
   const isDeckBlocked = deckJob?.status === 'qa_blocked';
   const isRunning = tool.status === 'started' || tool.status === 'executing' || isDeckActive;
-  const isError = tool.status === 'error' || deckJob?.status === 'failed' || isDeckBlocked;
+  const isError = tool.status === 'error' || deckJob?.status === 'failed';
   const isCancelled = tool.status === 'cancelled';
   const isDone = tool.status === 'done';
   const runs = getToolRuns(tool);
@@ -1069,6 +1078,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
   return (
     <div className={`tool-slide-in rounded-lg border my-2 overflow-hidden transition-all ${
       isError ? 'border-semantic-error/30 bg-semantic-error/5' :
+      isDeckBlocked ? 'border-[#F59E0B]/30 bg-[#F59E0B]/5' :
       isCancelled ? 'border-text-muted/20 bg-white/[0.02]' :
       isRunning ? 'border-[#8B5CF6]/30 tool-shimmer' :
       'border-border bg-[#111114]/80 backdrop-blur-sm'
@@ -1078,6 +1088,8 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
           <MartyEmblem size={16} animate />
         ) : isError ? (
           <AlertCircle size={14} className="text-semantic-error shrink-0" />
+        ) : isDeckBlocked ? (
+          <AlertCircle size={14} className="text-[#F59E0B] shrink-0" />
         ) : isCancelled ? (
           <span className="h-3.5 w-3.5 rounded-[3px] bg-text-muted/70 shrink-0" />
         ) : (
@@ -1098,7 +1110,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
           </span>
         )}
         <span className={`text-[10px] ${
-          isError ? 'text-semantic-error' : isRunning ? 'text-text-muted' : isDone ? 'text-semantic-success' : isCancelled ? 'text-text-muted' : 'text-text-muted'
+          isError ? 'text-semantic-error' : isDeckBlocked ? 'text-[#F59E0B]' : isRunning ? 'text-text-muted' : isDone ? 'text-semantic-success' : isCancelled ? 'text-text-muted' : 'text-text-muted'
         }`} style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
           {isDone && !isRunning && !isError && '\u2713 '}{toolStatusText(tool)}
         </span>

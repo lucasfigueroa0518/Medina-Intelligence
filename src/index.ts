@@ -799,6 +799,8 @@ async function routeAuthenticated(
       return Admin.getEmbedQueueHealth(ctx, env);
     if (path === '/api/admin/process-embed-queue' && method === 'POST')
       return Admin.processEmbedQueue(ctx, env);
+    if (path === '/api/admin/reconcile-deck-jobs' && method === 'POST')
+      return Admin.reconcileDeckJobs(request, ctx, env);
     if (path === '/api/admin/rag-v2/backfill/start' && method === 'POST')
       return Admin.startRagV2Backfill(request, ctx, env);
     if (path === '/api/admin/rag-v2/backfill/status' && method === 'GET')

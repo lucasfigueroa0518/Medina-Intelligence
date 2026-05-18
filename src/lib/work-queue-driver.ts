@@ -217,6 +217,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
 
 export interface ProcessTickResult {
   swept: number;            // rows reclaimed from stale claims
+  deck_reconciled?: number; // active deck jobs terminalized from queue truth
   open_circuits: string[];  // upstreams skipped this tick
   per_domain: Array<{
     domain: string;
@@ -287,6 +288,17 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
     }
   } catch (e) {
     console.error('[work-queue] sweepStaleClaims failed:', e instanceof Error ? e.message : e);
+  }
+
+  try {
+    const { reconcileDeckArtifactJobs } = await import('./document-artifacts');
+    const deckReconcile = await reconcileDeckArtifactJobs(env, { limit: 5 });
+    result.deck_reconciled = deckReconcile.reconciled;
+    if (deckReconcile.reconciled > 0) {
+      console.log(`[work-queue] reconciled ${deckReconcile.reconciled} stale deck jobs`);
+    }
+  } catch (e) {
+    console.error('[work-queue] reconcileDeckArtifactJobs failed:', e instanceof Error ? e.message : e);
   }
 
   // No handlers registered → fast-exit. The watchdog still ran above.

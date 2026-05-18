@@ -669,6 +669,11 @@ export const api = {
     request<{ ok: boolean }>(`/admin/dlq/${id}/replay`, { method: 'POST' }),
   getEnrichmentStatus: () =>
     request<{ status: Record<string, unknown> }>('/admin/enrichment-status'),
+  reconcileDeckJobs: (limit = 20) =>
+    request<{ ok: boolean; scanned: number; reconciled: number; qa_blocked: number; failed: number }>('/admin/reconcile-deck-jobs', {
+      method: 'POST',
+      body: JSON.stringify({ limit }),
+    }),
   getAdminIntegrationStatus: () =>
     request<{ users: any[]; tokenHealth: Record<string, any> }>('/me/integration-status'),
   getSystemStatus: () => request<{ mode: string; cache_stale: boolean }>('/system/status'),

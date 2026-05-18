@@ -1,6 +1,50 @@
 import { describe, expect, it } from 'vitest';
 import JSZip from 'jszip';
-import { __documentArtifactsTestHooks } from '../src/lib/document-artifacts';
+import {
+  __documentArtifactsTestHooks,
+  markDeckRenderQueueFailure,
+  reconcileDeckArtifactJobs,
+} from '../src/lib/document-artifacts';
+
+function makeDeckD1Mock(job: Record<string, any>, queueRows: Array<Record<string, any>> = []) {
+  const updates: Array<{ sql: string; args: any[] }> = [];
+  const events: Array<{ event_type: string; payload: any; args: any[] }> = [];
+  const mock = {
+    updates,
+    events,
+    prepare(sql: string) {
+      return {
+        bind(...args: any[]) {
+          return {
+            async first() {
+              if (sql.includes('COALESCE(MAX(seq)')) return { seq: events.length + 1 };
+              if (sql.includes('FROM deck_artifact_jobs')) return { ...job };
+              return null;
+            },
+            async all() {
+              if (sql.includes('JOIN work_queue')) {
+                return { results: queueRows.map(row => ({ ...job, ...row })) };
+              }
+              return { results: [] };
+            },
+            async run() {
+              if (sql.includes('UPDATE deck_artifact_jobs')) updates.push({ sql, args });
+              if (sql.includes('INSERT INTO deck_artifact_job_events')) {
+                events.push({
+                  event_type: args[4],
+                  payload: JSON.parse(args[5] || '{}'),
+                  args,
+                });
+              }
+              return { meta: { changes: 1 } };
+            },
+          };
+        },
+      };
+    },
+  };
+  return mock;
+}
 
 describe('document artifact quality gates', () => {
   it('flags skeletal DOCX sections and raw markup leaks before generation', () => {
@@ -157,7 +201,7 @@ describe('document artifact quality gates', () => {
     expect(__documentArtifactsTestHooks.MAX_DECK_REVISION_ROUNDS).toBe(3);
   });
 
-  it('keeps polished deck cards hidden when screenshot QA blocks export', () => {
+  it('surfaces QA-blocked draft-review deck artifacts without treating them as polished', () => {
     const job = {
       pptx_document_id: 'pptx_1',
       html_document_id: 'html_1',
@@ -165,8 +209,100 @@ describe('document artifact quality gates', () => {
     };
 
     expect(__documentArtifactsTestHooks.deckVisibleDocumentIdsForQa(false, job, 'rendered_pdf_1')).toEqual([]);
+    expect(__documentArtifactsTestHooks.deckVisibleDocumentIdsForQa(false, job, 'rendered_pdf_1', { surfaceDraft: true })).toEqual(['pptx_1', 'html_1', 'rendered_pdf_1']);
+    expect(__documentArtifactsTestHooks.deckArtifactVisibilityForStatus('qa_blocked', ['html_1'])).toBe('draft_review');
+    expect(__documentArtifactsTestHooks.deckArtifactVisibilityForStatus('completed', ['pptx_1'])).toBe('polished');
+    expect(__documentArtifactsTestHooks.deckArtifactVisibilityForStatus('failed', [])).toBe('none');
     expect(__documentArtifactsTestHooks.deckDiagnosticDocumentIdsForStatus('qa_blocked', ['shot_1', 'shot_2'], 'qa_1')).toEqual(['shot_1', 'shot_2', 'qa_1']);
     expect(__documentArtifactsTestHooks.deckDiagnosticDocumentIdsForStatus('completed', ['shot_1'], 'qa_1')).toEqual([]);
     expect(__documentArtifactsTestHooks.deckVisibleDocumentIdsForQa(true, job, 'rendered_pdf_1')).toEqual(['pptx_1', 'html_1', 'rendered_pdf_1']);
+  });
+
+  it('sanitizes deck render results before D1 storage', () => {
+    const safe = __documentArtifactsTestHooks.sanitizeDeckRenderResultForStorage({
+      job_id: 'job_1',
+      status: 'needs_revision',
+      pdf_base64: 'JVBERi0x',
+      qa_report: {
+        status: 'needs_revision',
+        slideFindings: [],
+        checks: {
+          slide_count: 1,
+          visual_surface_count: 1,
+          average_words_per_slide: 20,
+          max_words_on_slide: 20,
+          accent_gutter_px: 104,
+          html_bytes: 1024,
+        },
+      },
+      screenshots: [{
+        slideId: 'slide_1',
+        index: 1,
+        fileName: 'slide.png',
+        mimeType: 'image/png',
+        width: 1600,
+        height: 900,
+        base64: 'iVBORw0KGgo=',
+        document_id: 'shot_1',
+      }],
+      metrics: { renderer: 'test' },
+    });
+
+    expect(JSON.stringify(safe)).not.toContain('pdf_base64');
+    expect(JSON.stringify(safe)).not.toContain('iVBORw0KGgo=');
+    expect((safe?.screenshots as any[])[0]).toMatchObject({ slideId: 'slide_1', document_id: 'shot_1' });
+  });
+
+  it('reconciles queue dead-lettered active deck jobs into draft-review terminal state when artifacts exist', async () => {
+    const job = {
+      id: 'job_1',
+      org_id: 'org_1',
+      user_id: null,
+      assistant_message_id: 'msg_1',
+      status: 'running',
+      phase: 'html_render',
+      title: 'NeuralSeek Deck',
+      html_document_id: 'html_1',
+      pdf_document_id: 'pdf_1',
+      pptx_document_id: null,
+    };
+    const d1 = makeDeckD1Mock(job, [{
+      queue_status: 'dead_letter',
+      queue_last_error: 'PPTX is too bullet-heavy',
+      queue_completed_at: '2026-05-18T00:00:00.000Z',
+    }]);
+
+    const result = await reconcileDeckArtifactJobs({ D1: d1 } as any, { limit: 5 });
+
+    expect(result).toMatchObject({ scanned: 1, reconciled: 1, qa_blocked: 1, failed: 0 });
+    expect(d1.updates[0].args[0]).toBe('qa_blocked');
+    expect(d1.updates[0].args[3]).toBe(JSON.stringify(['html_1', 'pdf_1']));
+    expect(d1.events.some(event => event.event_type === 'qa_blocked')).toBe(true);
+  });
+
+  it('marks renderer failures retrying before terminal failure', async () => {
+    const job = {
+      id: 'job_retry',
+      org_id: 'org_1',
+      user_id: null,
+      status: 'running',
+      phase: 'render_qa',
+      title: 'Retry Deck',
+    };
+    const d1 = makeDeckD1Mock(job);
+
+    await markDeckRenderQueueFailure({ D1: d1 } as any, 'job_retry', new Error('renderer timeout'), {
+      terminal: false,
+      attempt: 1,
+      maxAttempts: 2,
+    });
+
+    expect(d1.updates[0].args[0]).toContain('renderer timeout');
+    expect(d1.events.some(event => event.event_type === 'retry_scheduled')).toBe(true);
+    expect(d1.events.find(event => event.event_type === 'retry_scheduled')?.payload).toMatchObject({
+      status: 'queued',
+      attempt: 1,
+      max_attempts: 2,
+    });
   });
 });

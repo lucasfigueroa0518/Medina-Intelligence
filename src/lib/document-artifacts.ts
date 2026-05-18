@@ -80,6 +80,7 @@ export interface DeckQaReport {
 }
 
 export type DeckJobStatus = 'queued' | 'running' | 'revising' | 'qa_blocked' | 'completed' | 'failed' | 'cancelled';
+export type DeckArtifactVisibility = 'polished' | 'draft_review' | 'none';
 export type DeckJobPhase =
   | 'planning'
   | 'research'
@@ -2846,11 +2847,41 @@ function deckBlockingFindings(qa: DeckQaReport | null | undefined, limit = 6): D
 function deckVisibleDocumentIdsForQa(
   qaPassed: boolean,
   job: { pptx_document_id?: string | null; html_document_id?: string | null; pdf_document_id?: string | null },
-  rendererPdfDocumentId?: string | null
+  rendererPdfDocumentId?: string | null,
+  opts: { surfaceDraft?: boolean } = {}
 ): string[] {
-  if (!qaPassed) return [];
+  if (!qaPassed && !opts.surfaceDraft) return [];
   return [job.pptx_document_id, job.html_document_id, rendererPdfDocumentId || job.pdf_document_id]
     .filter(Boolean) as string[];
+}
+
+function deckArtifactVisibilityForStatus(
+  status: DeckJobStatus | string | null | undefined,
+  visibleDocumentIds: string[] = []
+): DeckArtifactVisibility {
+  if (status === 'completed' && visibleDocumentIds.length > 0) return 'polished';
+  if (status === 'qa_blocked' && visibleDocumentIds.length > 0) return 'draft_review';
+  return 'none';
+}
+
+function deckVisibleCardReason(visibility: DeckArtifactVisibility): string {
+  if (visibility === 'draft_review') return 'Draft-review deck export; usable but needs visual QA review';
+  if (visibility === 'polished') return 'QA-approved deck export';
+  return 'Deck export';
+}
+
+function sanitizeDeckRenderResultForStorage(result: DeckRenderResult | null | undefined): Record<string, unknown> | null {
+  if (!result) return null;
+  const { pdf_base64: _pdfBase64, screenshots, ...rest } = result as DeckRenderResult & Record<string, unknown>;
+  return {
+    ...rest,
+    screenshots: Array.isArray(screenshots)
+      ? screenshots.map(screenshot => {
+        const { base64: _base64, ...safeScreenshot } = screenshot;
+        return safeScreenshot;
+      })
+      : [],
+  };
 }
 
 function deckDiagnosticDocumentIdsForStatus(
@@ -2868,7 +2899,7 @@ function deckStatusLabel(job: any, qa: DeckQaReport | null | undefined): string 
   const round = Number(job?.revision_round || 0);
   const maxRounds = Number(job?.max_revision_rounds || MAX_DECK_REVISION_ROUNDS);
   if (status === 'completed') return 'Deck ready';
-  if (status === 'qa_blocked') return 'QA blocked: needs revision';
+  if (status === 'qa_blocked') return 'Draft ready: review needed';
   if (status === 'failed') return 'Deck render failed';
   if (status === 'cancelled') return 'Deck cancelled';
   if (status === 'revising' || phase === 'repair') return `Revision ${Math.min(Math.max(round, 1), maxRounds)}/${maxRounds}: fixing layout`;
@@ -2883,7 +2914,8 @@ async function documentCardsForIds(
   ctx: AuthContext,
   env: Env,
   ids: string[],
-  mode: MartyDocumentCardMode = 'dominant'
+  mode: MartyDocumentCardMode = 'dominant',
+  reason = 'QA-approved deck export'
 ): Promise<MartyDocumentCard[]> {
   const uniqueIds = Array.from(new Set(ids.filter(Boolean))).slice(0, 12);
   if (uniqueIds.length === 0) return [];
@@ -2899,7 +2931,7 @@ async function documentCardsForIds(
   return uniqueIds
     .map(id => byId.get(id))
     .filter((doc): doc is DocumentRow => Boolean(doc))
-    .map(doc => cardFromDoc(doc, mode, { reason: 'QA-approved deck export', confidence: 1, generated: true }));
+    .map(doc => cardFromDoc(doc, mode, { reason, confidence: 1, generated: true }));
 }
 
 async function persistDeckVisibleCardsOnMessage(
@@ -2950,9 +2982,10 @@ export async function getDeckJobSnapshot(
   if (!job) return null;
   const qa = safeJsonParse<DeckQaReport | null>(job.qa_report_json, null);
   const visibleIds = safeJsonParse<string[]>(job.user_visible_document_ids_json, []);
+  const artifactVisibility = deckArtifactVisibilityForStatus(job.status, visibleIds);
   const screenshotIds = safeJsonParse<string[]>(job.screenshot_document_ids_json, []);
   const diagnosticIds = deckDiagnosticDocumentIdsForStatus(job.status, screenshotIds, job.qa_document_id);
-  const visibleCards = await documentCardsForIds(ctx, env, visibleIds, 'dominant').catch(() => []);
+  const visibleCards = await documentCardsForIds(ctx, env, visibleIds, 'dominant', deckVisibleCardReason(artifactVisibility)).catch(() => []);
   const diagnosticCards = await documentCardsForIds(ctx, env, diagnosticIds, 'compact').catch(() => []);
   const latestEvent = await env.D1.prepare(
     `SELECT seq, event_type, payload_json, created_at
@@ -2973,6 +3006,7 @@ export async function getDeckJobSnapshot(
     output_formats: safeJsonParse(job.output_formats_json, []),
     screenshot_document_ids: screenshotIds,
     user_visible_document_ids: visibleIds,
+    artifact_visibility: artifactVisibility,
     visible_document_cards: visibleCards,
     diagnostic_document_ids: diagnosticIds,
     diagnostic_document_cards: diagnosticCards,
@@ -3031,17 +3065,17 @@ export async function applyDeckRenderResult(
   const participantUserIds = null;
   const visibility: DocumentVisibility = 'org_wide';
   const parentDocumentId = job.pptx_document_id || job.html_document_id || job.pdf_document_id;
-  if (!parentDocumentId) {
-    throw new Error('DECK_RENDER_PARENT_DOCUMENT_NOT_READY');
-  }
+  const effectiveResult: DeckRenderResult = !parentDocumentId && !result.error
+    ? { ...result, error: 'DECK_RENDER_PARENT_DOCUMENT_NOT_READY' }
+    : result;
 
   await updateDeckJobPhase(env, job.id, job.org_id, 'render_qa', {
-    status: result.status,
+    status: effectiveResult.status,
     findings: qa?.slideFindings?.length || 0,
   });
 
-  if (Array.isArray(result.screenshots)) {
-    for (const screenshot of result.screenshots.slice(0, 40)) {
+  if (parentDocumentId && Array.isArray(effectiveResult.screenshots)) {
+    for (const screenshot of effectiveResult.screenshots.slice(0, 40)) {
       if (!screenshot.base64) continue;
       const doc = await persistGeneratedCompanion(ctx, env, {
         title: `${job.title} - Slide ${screenshot.index}`,
@@ -3066,13 +3100,13 @@ export async function applyDeckRenderResult(
   }
 
   let rendererPdfDocumentId: string | null = null;
-  const qaPassed = (qa?.status || result.status) === 'pass' && !result.error;
-  if (qaPassed && result.pdf_base64) {
+  const qaPassed = (qa?.status || effectiveResult.status) === 'pass' && !effectiveResult.error;
+  if (parentDocumentId && !effectiveResult.error && effectiveResult.pdf_base64) {
     const pdfDoc = await persistGeneratedCompanion(ctx, env, {
       title: `${job.title} - Rendered PDF Export`,
       fileName: companionFileTitle(`${job.title} - Rendered PDF Export`, 'pdf'),
       mimeType: MIME_BY_KIND.pdf,
-      bytes: bytesFromBase64(result.pdf_base64),
+      bytes: bytesFromBase64(effectiveResult.pdf_base64),
       extractedText: `Rendered PDF export for ${job.title}.`,
       visibility,
       participantUserIds,
@@ -3080,19 +3114,20 @@ export async function applyDeckRenderResult(
       customFields: {
         deck_companion_kind: 'playwright_pdf_export',
         deck_job_id: job.id,
-        deck_qa_status: result.status,
+        deck_qa_status: effectiveResult.status,
+        draft_review: !qaPassed,
       },
     });
     rendererPdfDocumentId = pdfDoc.documentId;
   }
 
   let qaDocumentId: string | null = null;
-  if (qa) {
+  if (parentDocumentId && qa) {
     const qaDoc = await persistGeneratedCompanion(ctx, env, {
       title: `${job.title} - QA Report`,
       fileName: companionFileTitle(`${job.title} - QA Report`, 'json'),
       mimeType: 'application/json; charset=utf-8',
-      bytes: JSON.stringify({ job_id: job.id, qa_report: qa, metrics: result.metrics || {} }, null, 2),
+      bytes: JSON.stringify({ job_id: job.id, qa_report: qa, metrics: effectiveResult.metrics || {} }, null, 2),
       extractedText: [
         `Deck QA status: ${qa.status}`,
         ...qa.slideFindings.map(f => `${f.severity}: ${f.slideId}: ${f.issue} -> ${f.requiredFix}`),
@@ -3109,11 +3144,14 @@ export async function applyDeckRenderResult(
     qaDocumentId = qaDoc.documentId;
   }
 
-  const status: DeckJobStatus = result.error ? 'failed' : (qaPassed ? 'completed' : 'qa_blocked');
-  const phase: DeckJobPhase = result.error ? 'failed' : (qaPassed ? 'complete' : 'qa_blocked');
-  const userVisibleIds = deckVisibleDocumentIdsForQa(qaPassed, job, rendererPdfDocumentId);
+  const status: DeckJobStatus = effectiveResult.error ? 'failed' : (qaPassed ? 'completed' : 'qa_blocked');
+  const phase: DeckJobPhase = effectiveResult.error ? 'failed' : (qaPassed ? 'complete' : 'qa_blocked');
+  const userVisibleIds = deckVisibleDocumentIdsForQa(qaPassed, job, rendererPdfDocumentId, {
+    surfaceDraft: status === 'qa_blocked',
+  });
+  const artifactVisibility = deckArtifactVisibilityForStatus(status, userVisibleIds);
   const diagnosticIds = deckDiagnosticDocumentIdsForStatus(status, screenshotDocumentIds, qaDocumentId);
-  const blockedReason = !qaPassed && !result.error
+  const blockedReason = !qaPassed && !effectiveResult.error
     ? deckBlockingFindings(qa, 3)
       .slice(0, 3)
       .map(f => `${f.slideId}: ${f.issue}`)
@@ -3139,39 +3177,52 @@ export async function applyDeckRenderResult(
     status,
     phase,
     qa ? JSON.stringify(qa) : null,
-    JSON.stringify({ ...result, screenshots: result.screenshots?.map(s => ({ ...s, base64: undefined })) || [] }),
+    JSON.stringify(sanitizeDeckRenderResultForStorage(effectiveResult)),
     rendererPdfDocumentId,
     JSON.stringify(screenshotDocumentIds),
     qaDocumentId,
     blockedReason,
-    qaPassed ? JSON.stringify(userVisibleIds) : null,
-    result.error ? 'DECK_RENDER_FAILED' : null,
-    result.error ? String(result.error).slice(0, 500) : null,
+    userVisibleIds.length > 0 ? JSON.stringify(userVisibleIds) : null,
+    effectiveResult.error ? 'DECK_RENDER_FAILED' : null,
+    effectiveResult.error ? String(effectiveResult.error).slice(0, 500) : null,
     status,
     job.id,
     job.org_id
   ).run();
 
-  if (qaPassed && userVisibleIds.length > 0) {
-    const visibleCards = await documentCardsForIds(ctx, env, userVisibleIds, 'dominant').catch(() => []);
+  if (userVisibleIds.length > 0) {
+    const visibleCards = await documentCardsForIds(
+      ctx,
+      env,
+      userVisibleIds,
+      'dominant',
+      deckVisibleCardReason(artifactVisibility)
+    ).catch(() => []);
     await persistDeckVisibleCardsOnMessage(ctx, env, job.assistant_message_id, visibleCards).catch(() => {});
   }
 
   await appendDeckJobEvent(env, job.id, job.org_id, status === 'completed' ? 'complete' : status, {
     status,
     phase,
-    qa_status: qa?.status || result.status,
+    qa_status: qa?.status || effectiveResult.status,
     status_label: deckStatusLabel({ ...job, status, phase, revision_round: job.revision_round, max_revision_rounds: job.max_revision_rounds }, qa),
+    artifact_visibility: artifactVisibility,
     screenshot_document_ids: screenshotDocumentIds,
     pdf_document_id: rendererPdfDocumentId,
     qa_document_id: qaDocumentId,
     qa_findings: deckBlockingFindings(qa),
     user_visible_document_ids: userVisibleIds,
-    visible_document_cards: qaPassed ? await documentCardsForIds(ctx, env, userVisibleIds, 'dominant').catch(() => []) : [],
+    visible_document_cards: await documentCardsForIds(
+      ctx,
+      env,
+      userVisibleIds,
+      'dominant',
+      deckVisibleCardReason(artifactVisibility)
+    ).catch(() => []),
     diagnostic_document_ids: diagnosticIds,
     diagnostic_document_cards: status === 'qa_blocked' ? await documentCardsForIds(ctx, env, diagnosticIds, 'compact').catch(() => []) : [],
     blocked_reason: blockedReason,
-    error: result.error || null,
+    error: effectiveResult.error || null,
   }).catch(() => {});
 }
 
@@ -3679,6 +3730,205 @@ interface DeckArtifactJobRow {
   source_document_ids_json: string | null;
   plan_json: string | null;
   fact_ledger_json: string | null;
+  qa_report_json?: string | null;
+  render_result_json?: string | null;
+  pptx_document_id?: string | null;
+  html_document_id?: string | null;
+  pdf_document_id?: string | null;
+  screenshot_document_ids_json?: string | null;
+  qa_document_id?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+}
+
+function recoverableDeckDocumentIds(job: {
+  pptx_document_id?: string | null;
+  html_document_id?: string | null;
+  pdf_document_id?: string | null;
+}): string[] {
+  return [job.pptx_document_id, job.html_document_id, job.pdf_document_id].filter(Boolean) as string[];
+}
+
+async function authContextForDeckJob(env: Env, job: {
+  org_id: string;
+  user_id?: string | null;
+}): Promise<AuthContext | null> {
+  if (!job.user_id) return null;
+  const user = await env.D1.prepare(
+    `SELECT id, email, role
+       FROM users
+      WHERE id = ? AND org_id = ? AND deleted_at IS NULL
+      LIMIT 1`
+  ).bind(job.user_id, job.org_id).first<{ id: string; email: string; role: AuthContext['userRole'] }>().catch(() => null);
+  if (!user) return null;
+  return {
+    orgId: job.org_id,
+    userId: user.id,
+    userRole: user.role || 'member',
+    email: user.email,
+  };
+}
+
+async function terminalizeDeckJobFromQueueState(
+  env: Env,
+  job: DeckArtifactJobRow,
+  opts: {
+    source: 'queue_dead_letter' | 'queue_completed_without_terminal_state' | 'handler_terminal_failure';
+    message: string;
+    errorCode?: string;
+  }
+): Promise<{ status: DeckJobStatus; artifact_visibility: DeckArtifactVisibility; visible_document_ids: string[] }> {
+  const visibleDocumentIds = recoverableDeckDocumentIds(job);
+  const status: DeckJobStatus = visibleDocumentIds.length > 0 ? 'qa_blocked' : 'failed';
+  const phase: DeckJobPhase = status === 'qa_blocked' ? 'qa_blocked' : 'failed';
+  const artifactVisibility = deckArtifactVisibilityForStatus(status, visibleDocumentIds);
+  const blockedReason = status === 'qa_blocked'
+    ? opts.message || 'Deck job stopped after creating draft artifacts. Review the draft output before circulating it.'
+    : null;
+  const errorMessage = opts.message.slice(0, 500);
+
+  await env.D1.prepare(
+    `UPDATE deck_artifact_jobs
+        SET status = ?,
+            phase = ?,
+            blocked_reason = ?,
+            user_visible_document_ids_json = ?,
+            error_code = ?,
+            error_message = ?,
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?
+        AND status IN ('queued','running','revising')`
+  ).bind(
+    status,
+    phase,
+    blockedReason,
+    visibleDocumentIds.length > 0 ? JSON.stringify(visibleDocumentIds) : null,
+    opts.errorCode || (status === 'failed' ? 'DECK_RENDER_FAILED' : 'DECK_RENDER_QA_BLOCKED'),
+    status === 'failed' ? errorMessage : null,
+    job.id,
+    job.org_id
+  ).run();
+
+  const ctx = await authContextForDeckJob(env, job);
+  const visibleCards = ctx && visibleDocumentIds.length > 0
+    ? await documentCardsForIds(ctx, env, visibleDocumentIds, 'dominant', deckVisibleCardReason(artifactVisibility)).catch(() => [])
+    : [];
+  if (ctx && visibleCards.length > 0) {
+    await persistDeckVisibleCardsOnMessage(ctx, env, job.assistant_message_id, visibleCards).catch(() => {});
+  }
+
+  await appendDeckJobEvent(env, job.id, job.org_id, status === 'qa_blocked' ? 'qa_blocked' : 'failed', {
+    status,
+    phase,
+    source: opts.source,
+    message: status === 'qa_blocked'
+      ? 'Draft-review deck artifacts are available. Polished export did not complete cleanly.'
+      : 'Deck job failed before any recoverable artifact was created.',
+    artifact_visibility: artifactVisibility,
+    user_visible_document_ids: visibleDocumentIds,
+    visible_document_cards: visibleCards,
+    blocked_reason: blockedReason,
+    error_code: opts.errorCode || null,
+    error_message: errorMessage,
+  }).catch(() => {});
+
+  return { status, artifact_visibility: artifactVisibility, visible_document_ids: visibleDocumentIds };
+}
+
+export async function markDeckRenderQueueFailure(
+  env: Env,
+  jobId: string,
+  error: unknown,
+  opts: {
+    terminal: boolean;
+    attempt?: number;
+    maxAttempts?: number;
+  }
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  const job = await env.D1.prepare(
+    `SELECT *
+       FROM deck_artifact_jobs
+      WHERE id = ?
+      LIMIT 1`
+  ).bind(jobId).first<DeckArtifactJobRow>().catch(() => null);
+  if (!job || ['completed', 'qa_blocked', 'failed', 'cancelled'].includes(String(job.status))) return;
+
+  if (opts.terminal) {
+    await terminalizeDeckJobFromQueueState(env, job, {
+      source: 'handler_terminal_failure',
+      message: message || 'Deck render job exhausted its retry budget.',
+      errorCode: 'DECK_RENDER_FAILED',
+    });
+    return;
+  }
+
+  const attemptText = opts.attempt && opts.maxAttempts
+    ? ` Attempt ${opts.attempt} of ${opts.maxAttempts}; retry scheduled.`
+    : ' Retry scheduled.';
+  await env.D1.prepare(
+    `UPDATE deck_artifact_jobs
+        SET status = 'queued',
+            error_code = 'DECK_RENDER_RETRYING',
+            error_message = ?,
+            heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?
+        AND status IN ('queued','running','revising')`
+  ).bind(`${message.slice(0, 420)}${attemptText}`.slice(0, 500), job.id, job.org_id).run().catch(() => {});
+  await appendDeckJobEvent(env, job.id, job.org_id, 'retry_scheduled', {
+    status: 'queued',
+    phase: job.phase,
+    message: `Deck render hit a transient failure and will retry.${attemptText}`,
+    attempt: opts.attempt || null,
+    max_attempts: opts.maxAttempts || null,
+    error: message.slice(0, 500),
+  }).catch(() => {});
+}
+
+export async function reconcileDeckArtifactJobs(
+  env: Env,
+  opts: { limit?: number } = {}
+): Promise<{ scanned: number; reconciled: number; qa_blocked: number; failed: number }> {
+  const limit = Math.max(1, Math.min(Number(opts.limit || 10), 50));
+  const rows = await env.D1.prepare(
+    `SELECT j.*,
+            w.status AS queue_status,
+            w.last_error AS queue_last_error,
+            w.completed_at AS queue_completed_at
+       FROM deck_artifact_jobs j
+       JOIN work_queue w
+         ON w.domain = ?
+        AND json_extract(w.payload, '$.deck_job_id') = j.id
+      WHERE j.status IN ('queued','running','revising')
+        AND w.status IN ('dead_letter','completed')
+      ORDER BY COALESCE(j.updated_at, j.created_at) ASC
+      LIMIT ?`
+  ).bind(DECK_RENDER_WORK_DOMAIN, limit).all<DeckArtifactJobRow & {
+    queue_status: string | null;
+    queue_last_error: string | null;
+    queue_completed_at: string | null;
+  }>();
+
+  const stats = { scanned: rows.results.length, reconciled: 0, qa_blocked: 0, failed: 0 };
+  for (const row of rows.results) {
+    const source = row.queue_status === 'dead_letter'
+      ? 'queue_dead_letter'
+      : 'queue_completed_without_terminal_state';
+    const message = row.queue_status === 'dead_letter'
+      ? (row.queue_last_error || 'Deck render queue dead-lettered before the deck job reached a terminal state.')
+      : 'Deck render queue completed without writing a terminal deck job state.';
+    const terminal = await terminalizeDeckJobFromQueueState(env, row, {
+      source,
+      message,
+      errorCode: row.queue_status === 'dead_letter' ? 'DECK_RENDER_QUEUE_DEAD_LETTER' : 'DECK_RENDER_QUEUE_COMPLETED_STALE',
+    });
+    stats.reconciled += 1;
+    if (terminal.status === 'qa_blocked') stats.qa_blocked += 1;
+    if (terminal.status === 'failed') stats.failed += 1;
+  }
+  return stats;
 }
 
 async function callDeckRendererService(
@@ -3944,7 +4194,8 @@ async function renderDeckWithCloudflareBrowser(
 
 export async function processDeckRenderJob(
   env: Env,
-  jobId: string
+  jobId: string,
+  opts: { attempt?: number; maxAttempts?: number } = {}
 ): Promise<void> {
   const job = await env.D1.prepare(
     `SELECT *
@@ -3953,7 +4204,7 @@ export async function processDeckRenderJob(
       LIMIT 1`
   ).bind(jobId).first<DeckArtifactJobRow>();
   if (!job) throw new Error(`deck job ${jobId} not found`);
-  if (job.status === 'completed' || job.status === 'cancelled') return;
+  if (['completed', 'qa_blocked', 'failed', 'cancelled'].includes(String(job.status))) return;
 
   const user = job.user_id
     ? await env.D1.prepare(
@@ -4106,6 +4357,9 @@ export async function processDeckRenderJob(
   }
 
   if (latestRenderResult.error) {
+    if (!opts.maxAttempts || !opts.attempt || opts.attempt < opts.maxAttempts) {
+      throw new Error(latestRenderResult.error);
+    }
     await updateDeckJobPhase(env, job.id, job.org_id, 'failed', {
       message: 'Deck render failed.',
       error: latestRenderResult.error,
@@ -4121,7 +4375,7 @@ export async function processDeckRenderJob(
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         WHERE id = ? AND org_id = ?`
     ).bind(
-      JSON.stringify({ ...latestRenderResult, screenshots: latestRenderResult.screenshots?.map(s => ({ ...s, base64: undefined })) || [] }),
+      JSON.stringify(sanitizeDeckRenderResultForStorage(latestRenderResult)),
       String(latestRenderResult.error).slice(0, 500),
       job.id,
       job.org_id
@@ -4136,24 +4390,135 @@ export async function processDeckRenderJob(
       max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
       qa_status: latestQa.status,
     });
-    const artifact = await persistArtifact(ctx, env, {
-      kind: 'pptx',
-      title,
-      structuredContent: currentStructured,
-      sourceDocs,
-      prepared: true,
-      customFields: {
-        deck_tool: 'create_deck_artifact',
-        deck_job_id: job.id,
-        deck_quality_mode: job.quality_mode || 'premium',
-        requested_output_formats: outputFormats,
-        requested_audience: job.audience,
-        requested_objective: job.objective,
-        requested_style_pack: job.style_pack || 'medina_default',
-        async_deck_render_job: true,
-        final_screenshot_qa_status: latestQa.status,
-      },
-    });
+    const artifactCustomFields = {
+      deck_tool: 'create_deck_artifact',
+      deck_job_id: job.id,
+      deck_quality_mode: job.quality_mode || 'premium',
+      requested_output_formats: outputFormats,
+      requested_audience: job.audience,
+      requested_objective: job.objective,
+      requested_style_pack: job.style_pack || 'medina_default',
+      async_deck_render_job: true,
+      final_screenshot_qa_status: latestQa.status,
+    };
+    let artifact: { card: MartyDocumentCard; document: { id: string; title: string; file_name: string; mime_type: string } };
+    try {
+      artifact = await persistArtifact(ctx, env, {
+        kind: 'pptx',
+        title,
+        structuredContent: currentStructured,
+        sourceDocs,
+        prepared: true,
+        customFields: artifactCustomFields,
+      });
+    } catch (firstExportError: any) {
+      const exportQa = mergeDeckQaReport(latestQa, [{
+        slideId: 'deck_export',
+        severity: 'high',
+        issue: 'PPTX export failed validation',
+        requiredFix: 'Review the draft HTML/PDF and simplify dense slides before circulating polished PPTX.',
+      }], {
+        export_repair_attempted: true,
+        export_error: String(firstExportError?.message || firstExportError).slice(0, 220),
+      });
+      const safeStructured = deterministicDeckRepair(title, currentStructured, exportQa, MAX_DECK_REVISION_ROUNDS);
+      try {
+        artifact = await persistArtifact(ctx, env, {
+          kind: 'pptx',
+          title,
+          structuredContent: safeStructured,
+          sourceDocs,
+          prepared: true,
+          customFields: {
+            ...artifactCustomFields,
+            deterministic_safe_export_repair: true,
+          },
+        });
+        currentStructured = safeStructured;
+        latestHtml = renderPremiumDeckHtml(title, currentStructured);
+        latestPlan = deckPlanFromContent(title, currentStructured);
+        latestQa = mergeDeckQaReport(evaluatePremiumDeckQa(title, currentStructured, latestHtml), [{
+          slideId: 'deck_export',
+          severity: 'high',
+          issue: 'PPTX export required deterministic safe-export repair after screenshot QA',
+          requiredFix: 'Review the repaired draft before treating it as a polished deck.',
+        }], {
+          export_repair_attempted: true,
+          export_repair_succeeded: true,
+        });
+        latestRenderResult = {
+          ...latestRenderResult,
+          status: latestQa.status,
+          qa_report: latestQa,
+        };
+      } catch (secondExportError: any) {
+        currentStructured = safeStructured;
+        latestHtml = renderPremiumDeckHtml(title, currentStructured);
+        latestPlan = deckPlanFromContent(title, currentStructured);
+        latestQa = mergeDeckQaReport(evaluatePremiumDeckQa(title, currentStructured, latestHtml), [{
+          slideId: 'deck_export',
+          severity: 'high',
+          issue: 'PPTX export failed after deterministic safe-export repair',
+          requiredFix: 'Use the draft-review HTML/PDF while the export template is inspected.',
+        }], {
+          export_repair_attempted: true,
+          export_error: String(secondExportError?.message || secondExportError).slice(0, 220),
+        });
+        const draft = await persistDeckInternalHtmlDocument(ctx, env, {
+          title,
+          html: latestHtml,
+          extractedText: [
+            latestPlan.title,
+            latestPlan.storyline.join('\n'),
+            ...latestQa.slideFindings.map(f => `${f.severity}: ${f.slideId}: ${f.issue}`),
+          ].join('\n').slice(0, 8000),
+          customFields: {
+            deck_job_id: job.id,
+            deck_qa_status: latestQa.status,
+            revision_round: latestRevisionRound,
+            export_failure: String(secondExportError?.message || secondExportError).slice(0, 300),
+          },
+        });
+        await env.D1.prepare(
+          `UPDATE deck_artifact_jobs
+              SET html_document_id = ?,
+                  structured_content_json = ?,
+                  plan_json = ?,
+                  fact_ledger_json = ?,
+                  qa_report_json = ?,
+                  revision_round = ?,
+                  max_revision_rounds = ?,
+                  blocked_reason = ?,
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ? AND org_id = ?`
+        ).bind(
+          draft.documentId,
+          JSON.stringify(currentStructured),
+          JSON.stringify(latestPlan),
+          JSON.stringify(deckFactsFromContent(title, currentStructured, slidesFromContent(title, currentStructured))),
+          JSON.stringify(latestQa),
+          latestRevisionRound,
+          MAX_DECK_REVISION_ROUNDS,
+          latestQa.slideFindings.slice(0, 3).map(f => `${f.slideId}: ${f.issue}`).join('; ') || 'PPTX export failed after safe-export repair.',
+          job.id,
+          job.org_id
+        ).run().catch(() => {});
+        await appendDeckJobEvent(env, job.id, job.org_id, 'qa_blocked', {
+          status: 'qa_blocked',
+          phase: 'qa_blocked',
+          message: 'PPTX export failed, but draft-review HTML/PDF outputs are being surfaced.',
+          artifact_visibility: 'draft_review',
+          error: String(secondExportError?.message || secondExportError).slice(0, 500),
+        }).catch(() => {});
+        await applyDeckRenderResult(ctx, env, {
+          ...latestRenderResult,
+          status: latestQa.status,
+          qa_report: latestQa,
+          error: undefined,
+        });
+        return;
+      }
+    }
     const persisted = await env.D1.prepare(
       `SELECT custom_fields FROM documents WHERE id = ? AND org_id = ?`
     ).bind(artifact.document.id, job.org_id).first<{ custom_fields: string | null }>().catch(() => null);
@@ -4344,6 +4709,8 @@ export const __documentArtifactsTestHooks = {
   deckQaHasBlockingFindings,
   deterministicDeckRepair,
   deckVisibleDocumentIdsForQa,
+  deckArtifactVisibilityForStatus,
+  sanitizeDeckRenderResultForStorage,
   deckDiagnosticDocumentIdsForStatus,
   normalizeDeckOutputFormats,
   DECK_RENDER_WORK_DOMAIN,

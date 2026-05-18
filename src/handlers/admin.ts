@@ -16,6 +16,7 @@ import { rebuildEntityIndex } from '../lib/entity-index';
 // (currently only embed_retry; future pilots transparently included).
 import { processWorkQueueTick } from '../lib/work-queue-driver';
 import { enqueueWork } from '../lib/work-queue';
+import { reconcileDeckArtifactJobs } from '../lib/document-artifacts';
 import { parseParticipantUserIds } from '../lib/helpers';
 import {
   getRagV2Status,
@@ -1167,6 +1168,33 @@ export async function processEmbedQueue(
     after: Object.fromEntries(after.results.map(r => [mapStatus(r.status), r.n])),
     drain: tick,
   });
+}
+
+export async function reconcileDeckJobs(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner') {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can reconcile deck jobs.');
+  }
+  const url = new URL(request.url);
+  let limit = Number(url.searchParams.get('limit') || 20);
+  if (request.headers.get('content-type')?.includes('application/json')) {
+    const body = await parseJsonBody<{ limit?: number }>(request);
+    if (typeof body?.limit === 'number') limit = body.limit;
+  }
+  const result = await reconcileDeckArtifactJobs(env, { limit });
+  await emitAudit(env, {
+    org_id: ctx.orgId,
+    user_id: ctx.userId,
+    action: 'update',
+    entity_type: 'document',
+    entity_id: `deck_reconcile:${Date.now()}`,
+    metadata: { sub_action: 'reconcile_deck_artifact_jobs', ...result },
+    created_at: new Date().toISOString(),
+  }).catch(() => {});
+  return jsonResponse({ ok: true, ...result });
 }
 
 // Progressive backfill: split a long historical pull into N small windows

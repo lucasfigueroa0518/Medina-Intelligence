@@ -1,6 +1,7 @@
 import type { Env } from '../../types/env';
 import {
   DECK_RENDER_WORK_DOMAIN,
+  markDeckRenderQueueFailure,
   processDeckRenderJob,
 } from '../document-artifacts';
 import type { WorkQueueHandler } from '../work-queue-driver';
@@ -25,6 +26,20 @@ export const deckRenderHandler: WorkQueueHandler = {
     if (!payload.deck_job_id) {
       throw new Error(`deck_render payload missing deck_job_id: ${item.payload}`);
     }
-    await processDeckRenderJob(env, payload.deck_job_id);
+    const nextAttempt = Number(item.attempt || 0) + 1;
+    const maxAttempts = Number(item.max_attempts || 1);
+    try {
+      await processDeckRenderJob(env, payload.deck_job_id, {
+        attempt: nextAttempt,
+        maxAttempts,
+      });
+    } catch (error) {
+      await markDeckRenderQueueFailure(env, payload.deck_job_id, error, {
+        terminal: nextAttempt >= maxAttempts,
+        attempt: nextAttempt,
+        maxAttempts,
+      }).catch(() => {});
+      throw error;
+    }
   },
 };
