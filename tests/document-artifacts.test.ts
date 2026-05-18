@@ -218,6 +218,46 @@ describe('document artifact quality gates', () => {
     expect(__documentArtifactsTestHooks.deckVisibleDocumentIdsForQa(true, job, 'rendered_pdf_1')).toEqual(['pptx_1', 'html_1', 'rendered_pdf_1']);
   });
 
+  it('preserves assistant tool metadata when adding visible deck cards', () => {
+    const existingMetadata = JSON.stringify({
+      tool_calls: [{ id: 'tool_1', tool: 'create_deck_artifact', runs: [{ status: 'done' }] }],
+      document_cards: [{
+        document_id: 'existing_doc',
+        title: 'Existing document',
+        file_name: 'existing.pdf',
+        mime_type: 'application/pdf',
+        document_type: 'pdf',
+        mode: 'compact',
+      }],
+    });
+    const metadata = __documentArtifactsTestHooks.mergeDeckCardsIntoMessageMetadata(
+      existingMetadata,
+      [{
+        document_id: 'draft_html',
+        title: 'Draft HTML Deck',
+        file_name: 'draft.html',
+        mime_type: 'text/html; charset=utf-8',
+        document_type: 'html',
+        mode: 'dominant',
+        reason: 'Draft-review deck export; usable but needs visual QA review',
+        actions: { preview: true, download: true, send_to_marty: true },
+      }],
+      {
+        id: 'deck_job_1',
+        status: 'qa_blocked',
+        phase: 'qa_blocked',
+        title: 'Pipeline deck',
+        artifact_visibility: 'draft_review',
+        visible_document_cards: [{ document_id: 'draft_html', title: 'Draft HTML Deck' }],
+      }
+    );
+
+    expect(metadata.tool_calls?.[0]).toMatchObject({ id: 'tool_1', tool: 'create_deck_artifact' });
+    expect(metadata.document_cards.map((card: any) => card.document_id)).toEqual(['existing_doc', 'draft_html']);
+    expect(metadata.deck_jobs).toHaveLength(1);
+    expect(metadata.deck_jobs[0]).toMatchObject({ id: 'deck_job_1', artifact_visibility: 'draft_review' });
+  });
+
   it('sanitizes deck render results before D1 storage', () => {
     const safe = __documentArtifactsTestHooks.sanitizeDeckRenderResultForStorage({
       job_id: 'job_1',

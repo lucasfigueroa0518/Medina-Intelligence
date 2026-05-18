@@ -1536,6 +1536,7 @@ function safeDeckJobForMessage(job: any): Record<string, any> | null {
     status: job.status,
     phase: job.phase,
     title: job.title,
+    artifact_visibility: job.artifact_visibility || null,
     status_label: job.status_label,
     revision_round: job.revision_round,
     max_revision_rounds: job.max_revision_rounds,

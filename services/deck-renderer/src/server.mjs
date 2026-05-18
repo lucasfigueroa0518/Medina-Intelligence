@@ -115,6 +115,11 @@ async function inspectSlides(page) {
       return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
     }
 
+    function isTransparentColor(value) {
+      const normalized = String(value || '').replace(/\s+/g, '').toLowerCase();
+      return !normalized || normalized === 'transparent' || normalized === 'rgba(0,0,0,0)' || normalized === 'rgb(0,0,0,0)';
+    }
+
     function rectFor(el) {
       const r = el.getBoundingClientRect();
       return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
@@ -129,15 +134,29 @@ async function inspectSlides(page) {
       return area / smaller > 0.08;
     }
 
+    function effectiveBackground(el, slide, fallback) {
+      let node = el;
+      while (node) {
+        const bg = window.getComputedStyle(node).backgroundColor;
+        if (!isTransparentColor(bg)) return bg;
+        if (node === slide) break;
+        node = node.parentElement;
+      }
+      return fallback;
+    }
+
     slides.forEach((slide, index) => {
       const slideId = slide.id || `slide_${index + 1}`;
       const rect = rectFor(slide);
       const style = window.getComputedStyle(slide);
       const text = (slide.textContent || '').replace(/\s+/g, ' ').trim();
-      const contentEls = Array.from(slide.querySelectorAll('h1,h2,h3,p,li,td,th,.headline,.takeaway,.evidence-card,.metric-card,.table-wrap'))
+      const contentEls = Array.from(slide.querySelectorAll('h1,h2,h3,p,li,td,th,.headline,.takeaway,.metric-value,.metric-label,.evidence-card strong,.evidence-card span,.table-title'))
         .filter(el => {
           const r = el.getBoundingClientRect();
           return r.width > 8 && r.height > 8;
+        })
+        .filter((el, _index, all) => {
+          return !all.some(other => other !== el && el.contains(other));
         });
 
       if (!text && slide.querySelectorAll('img,svg,canvas,table').length === 0) {
@@ -174,18 +193,22 @@ async function inspectSlides(page) {
         findings.push({ slideId, severity: 'medium', issue: `Slide has ${bullets} bullets.`, requiredFix: 'Convert the list into a table, matrix, timeline, or proof surface.' });
       }
 
-      const background = style.backgroundColor || 'rgb(15,15,20)';
-      const lowContrast = contentEls.filter(el => contrast(window.getComputedStyle(el).color, background) < 3.8);
+      const background = isTransparentColor(style.backgroundColor) ? 'rgb(15,15,20)' : style.backgroundColor;
+      const lowContrast = contentEls.filter(el => {
+        const elementStyle = window.getComputedStyle(el);
+        return contrast(elementStyle.color, effectiveBackground(el, slide, background)) < 3.8;
+      });
       if (lowContrast.length > Math.max(2, contentEls.length * 0.15)) {
         metrics.low_contrast_count += 1;
         findings.push({ slideId, severity: 'high', issue: 'Slide has low-contrast text.', requiredFix: 'Increase foreground/background contrast before export.' });
       }
 
-      const blocks = contentEls.slice(0, 60).map(rectFor);
+      const blocks = contentEls.slice(0, 60).map(el => ({ el, rect: rectFor(el) }));
       let overlap = false;
       for (let i = 0; i < blocks.length && !overlap; i += 1) {
         for (let j = i + 1; j < blocks.length; j += 1) {
-          if (intersects(blocks[i], blocks[j])) {
+          if (blocks[i].el.contains(blocks[j].el) || blocks[j].el.contains(blocks[i].el)) continue;
+          if (intersects(blocks[i].rect, blocks[j].rect)) {
             overlap = true;
             break;
           }

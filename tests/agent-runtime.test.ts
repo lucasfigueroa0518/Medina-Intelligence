@@ -123,6 +123,7 @@ describe('MARTy turn runtime contracts', () => {
       status: 'qa_blocked',
       phase: 'qa_blocked',
       title: 'NeuralSeek deck',
+      artifact_visibility: 'draft_review',
       status_label: 'QA blocked',
       qa_summary: { critical: 1 },
       qa_findings: [{ slideId: 's1', severity: 'critical', issue: 'overflow' }],
@@ -137,6 +138,7 @@ describe('MARTy turn runtime contracts', () => {
     expect(job).toMatchObject({
       id: 'deck-job-1',
       status: 'qa_blocked',
+      artifact_visibility: 'draft_review',
       last_event_seq: 7,
       last_event_message: 'QA found layout issues',
     });

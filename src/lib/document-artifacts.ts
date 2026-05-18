@@ -2938,22 +2938,18 @@ async function persistDeckVisibleCardsOnMessage(
   ctx: AuthContext,
   env: Env,
   assistantMessageId: string | null | undefined,
-  cards: MartyDocumentCard[]
+  cards: MartyDocumentCard[],
+  deckJobSnapshot?: Record<string, any> | null
 ): Promise<void> {
-  if (!assistantMessageId || cards.length === 0) return;
+  if (!assistantMessageId || (cards.length === 0 && !deckJobSnapshot?.id)) return;
   const row = await env.D1.prepare(
-    `SELECT metadata
-       FROM agent_messages
-      WHERE id = ? AND org_id = ?
+    `SELECT m.metadata
+       FROM agent_messages m
+       JOIN agent_sessions s ON s.id = m.session_id
+      WHERE m.id = ? AND s.org_id = ?
       LIMIT 1`
   ).bind(assistantMessageId, ctx.orgId).first<{ metadata: string | null }>().catch(() => null);
-  let metadata: Record<string, any> = {};
-  try {
-    metadata = row?.metadata ? JSON.parse(row.metadata) : {};
-  } catch {
-    metadata = {};
-  }
-  metadata.document_cards = normalizeDocumentCards([...(metadata.document_cards || []), ...cards]);
+  const metadata = mergeDeckCardsIntoMessageMetadata(row?.metadata, cards, deckJobSnapshot);
   await env.D1.prepare(
     `UPDATE agent_messages
         SET metadata = ?
@@ -2965,6 +2961,64 @@ async function persistDeckVisibleCardsOnMessage(
              AND s.org_id = ?
         )`
   ).bind(JSON.stringify(metadata), assistantMessageId, ctx.orgId).run().catch(() => {});
+}
+
+function mergeDeckCardsIntoMessageMetadata(
+  existingMetadata: unknown,
+  cards: MartyDocumentCard[],
+  deckJobSnapshot?: Record<string, any> | null
+): Record<string, any> {
+  const parsed = typeof existingMetadata === 'string'
+    ? safeJsonParse<Record<string, any>>(existingMetadata, {})
+    : existingMetadata;
+  const metadata = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? { ...(parsed as Record<string, any>) }
+    : {};
+  if (cards.length > 0) {
+    metadata.document_cards = normalizeDocumentCards([...(metadata.document_cards || []), ...cards]);
+  }
+  if (deckJobSnapshot?.id) {
+    const existingJobs = Array.isArray(metadata.deck_jobs) ? metadata.deck_jobs : [];
+    metadata.deck_jobs = [
+      ...existingJobs.filter((job: any) => job?.id !== deckJobSnapshot.id),
+      deckJobSnapshot,
+    ].slice(-12);
+  }
+  return metadata;
+}
+
+function deckJobSnapshotForMessage(
+  job: Partial<DeckArtifactJobRow> & { id: string; assistant_message_id?: string | null; title?: string | null },
+  opts: {
+    status: DeckJobStatus;
+    phase: DeckJobPhase;
+    artifactVisibility: DeckArtifactVisibility;
+    visibleCards?: MartyDocumentCard[];
+    diagnosticCards?: MartyDocumentCard[];
+    qa?: DeckQaReport | null;
+    blockedReason?: string | null;
+    lastEventMessage?: string;
+  }
+): Record<string, any> {
+  const qa = opts.qa ?? safeJsonParse<DeckQaReport | null>(job.qa_report_json, null);
+  return {
+    id: job.id,
+    assistant_message_id: job.assistant_message_id || null,
+    status: opts.status,
+    phase: opts.phase,
+    title: job.title || 'Deck',
+    artifact_visibility: opts.artifactVisibility,
+    status_label: deckStatusLabel({ ...job, status: opts.status, phase: opts.phase }, qa),
+    revision_round: Number(job.revision_round || 0),
+    max_revision_rounds: Number(job.max_revision_rounds || MAX_DECK_REVISION_ROUNDS),
+    qa_summary: deckQaSummary(qa),
+    qa_findings: deckBlockingFindings(qa),
+    blocked_reason: opts.blockedReason ?? job.blocked_reason ?? null,
+    visible_document_cards: normalizeDocumentCards(opts.visibleCards || []),
+    diagnostic_document_cards: normalizeDocumentCards(opts.diagnosticCards || []),
+    last_event_seq: 0,
+    last_event_message: opts.lastEventMessage || '',
+  };
 }
 
 export async function getDeckJobSnapshot(
@@ -3190,16 +3244,34 @@ export async function applyDeckRenderResult(
     job.org_id
   ).run();
 
-  if (userVisibleIds.length > 0) {
-    const visibleCards = await documentCardsForIds(
+  const visibleCards = userVisibleIds.length > 0
+    ? await documentCardsForIds(
       ctx,
       env,
       userVisibleIds,
       'dominant',
       deckVisibleCardReason(artifactVisibility)
-    ).catch(() => []);
-    await persistDeckVisibleCardsOnMessage(ctx, env, job.assistant_message_id, visibleCards).catch(() => {});
-  }
+    ).catch(() => [])
+    : [];
+  const diagnosticCards = status === 'qa_blocked'
+    ? await documentCardsForIds(ctx, env, diagnosticIds, 'compact').catch(() => [])
+    : [];
+  await persistDeckVisibleCardsOnMessage(
+    ctx,
+    env,
+    job.assistant_message_id,
+    visibleCards,
+    deckJobSnapshotForMessage(job, {
+      status,
+      phase,
+      artifactVisibility,
+      visibleCards,
+      diagnosticCards,
+      qa,
+      blockedReason,
+      lastEventMessage: blockedReason || (status === 'completed' ? 'Deck ready.' : 'Deck render failed.'),
+    })
+  ).catch(() => {});
 
   await appendDeckJobEvent(env, job.id, job.org_id, status === 'completed' ? 'complete' : status, {
     status,
@@ -3212,15 +3284,9 @@ export async function applyDeckRenderResult(
     qa_document_id: qaDocumentId,
     qa_findings: deckBlockingFindings(qa),
     user_visible_document_ids: userVisibleIds,
-    visible_document_cards: await documentCardsForIds(
-      ctx,
-      env,
-      userVisibleIds,
-      'dominant',
-      deckVisibleCardReason(artifactVisibility)
-    ).catch(() => []),
+    visible_document_cards: visibleCards,
     diagnostic_document_ids: diagnosticIds,
-    diagnostic_document_cards: status === 'qa_blocked' ? await documentCardsForIds(ctx, env, diagnosticIds, 'compact').catch(() => []) : [],
+    diagnostic_document_cards: diagnosticCards,
     blocked_reason: blockedReason,
     error: effectiveResult.error || null,
   }).catch(() => {});
@@ -3814,8 +3880,23 @@ async function terminalizeDeckJobFromQueueState(
   const visibleCards = ctx && visibleDocumentIds.length > 0
     ? await documentCardsForIds(ctx, env, visibleDocumentIds, 'dominant', deckVisibleCardReason(artifactVisibility)).catch(() => [])
     : [];
-  if (ctx && visibleCards.length > 0) {
-    await persistDeckVisibleCardsOnMessage(ctx, env, job.assistant_message_id, visibleCards).catch(() => {});
+  if (ctx) {
+    await persistDeckVisibleCardsOnMessage(
+      ctx,
+      env,
+      job.assistant_message_id,
+      visibleCards,
+      deckJobSnapshotForMessage(job, {
+        status,
+        phase,
+        artifactVisibility,
+        visibleCards,
+        blockedReason,
+        lastEventMessage: status === 'qa_blocked'
+          ? 'Draft-review deck artifacts are available. Polished export did not complete cleanly.'
+          : 'Deck job failed before any recoverable artifact was created.',
+      })
+    ).catch(() => {});
   }
 
   await appendDeckJobEvent(env, job.id, job.org_id, status === 'qa_blocked' ? 'qa_blocked' : 'failed', {
@@ -4003,6 +4084,11 @@ async function inspectRenderedDeckPage(page: any): Promise<{
       return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
     }
 
+    function isTransparentColor(value: string): boolean {
+      const normalized = String(value || '').replace(/\s+/g, '').toLowerCase();
+      return !normalized || normalized === 'transparent' || normalized === 'rgba(0,0,0,0)' || normalized === 'rgb(0,0,0,0)';
+    }
+
     function rectFor(el: any): { left: number; right: number; top: number; bottom: number; width: number; height: number } {
       const r = el.getBoundingClientRect();
       return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
@@ -4017,15 +4103,29 @@ async function inspectRenderedDeckPage(page: any): Promise<{
       return area / smaller > 0.08;
     }
 
+    function effectiveBackground(el: any, slide: any, fallback: string): string {
+      let node = el;
+      while (node) {
+        const bg = win.getComputedStyle(node).backgroundColor;
+        if (!isTransparentColor(bg)) return bg;
+        if (node === slide) break;
+        node = node.parentElement;
+      }
+      return fallback;
+    }
+
     slides.forEach((slide, index) => {
       const slideId = slide.id || `slide_${index + 1}`;
       const rect = rectFor(slide);
       const style = win.getComputedStyle(slide);
       const text = (slide.textContent || '').replace(/\s+/g, ' ').trim();
-      const contentEls = Array.from(slide.querySelectorAll('h1,h2,h3,p,li,td,th,.headline,.takeaway,.evidence-card,.metric-card,.table-wrap'))
-        .filter(el => {
+      const contentEls = (Array.from(slide.querySelectorAll('h1,h2,h3,p,li,td,th,.headline,.takeaway,.metric-value,.metric-label,.evidence-card strong,.evidence-card span,.table-title')) as any[])
+        .filter((el: any) => {
           const r = (el as any).getBoundingClientRect();
           return r.width > 8 && r.height > 8;
+        })
+        .filter((el: any, _index, all: any[]) => {
+          return !all.some(other => other !== el && el.contains(other));
         });
 
       if (!text && slide.querySelectorAll('img,svg,canvas,table').length === 0) {
@@ -4063,18 +4163,22 @@ async function inspectRenderedDeckPage(page: any): Promise<{
         findings.push({ slideId, severity: 'medium', issue: `Slide has ${bullets} bullets.`, requiredFix: 'Convert the list into a table, matrix, timeline, or proof surface.' });
       }
 
-      const background = style.backgroundColor || 'rgb(15,15,20)';
-      const lowContrast = contentEls.filter(el => contrast(win.getComputedStyle(el).color, background) < minContrastRatio);
+      const background = isTransparentColor(style.backgroundColor) ? 'rgb(15,15,20)' : style.backgroundColor;
+      const lowContrast = contentEls.filter(el => {
+        const elementStyle = win.getComputedStyle(el);
+        return contrast(elementStyle.color, effectiveBackground(el, slide, background)) < minContrastRatio;
+      });
       if (lowContrast.length > Math.max(2, contentEls.length * 0.15)) {
         metrics.low_contrast_count += 1;
         findings.push({ slideId, severity: 'high', issue: 'Slide has low-contrast text.', requiredFix: 'Increase foreground/background contrast before export.' });
       }
 
-      const blocks = contentEls.slice(0, 60).map(el => rectFor(el));
+      const blocks = contentEls.slice(0, 60).map(el => ({ el, rect: rectFor(el) }));
       let overlap = false;
       for (let i = 0; i < blocks.length && !overlap; i += 1) {
         for (let j = i + 1; j < blocks.length; j += 1) {
-          if (intersects(blocks[i], blocks[j])) {
+          if (blocks[i].el.contains(blocks[j].el) || blocks[j].el.contains(blocks[i].el)) continue;
+          if (intersects(blocks[i].rect, blocks[j].rect)) {
             overlap = true;
             break;
           }
@@ -4710,6 +4814,7 @@ export const __documentArtifactsTestHooks = {
   deterministicDeckRepair,
   deckVisibleDocumentIdsForQa,
   deckArtifactVisibilityForStatus,
+  mergeDeckCardsIntoMessageMetadata,
   sanitizeDeckRenderResultForStorage,
   deckDiagnosticDocumentIdsForStatus,
   normalizeDeckOutputFormats,
