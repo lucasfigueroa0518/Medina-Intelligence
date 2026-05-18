@@ -3971,7 +3971,7 @@ async function inspectRenderedDeckPage(page: any): Promise<{
   findings: DeckQaReport['slideFindings'];
   metrics: Record<string, unknown>;
 }> {
-  return page.evaluate(() => {
+  return page.evaluate((minContrastRatio: number) => {
     const win = globalThis as any;
     const doc = win.document;
     const slides = Array.from(doc.querySelectorAll('.slide')) as any[];
@@ -4064,7 +4064,7 @@ async function inspectRenderedDeckPage(page: any): Promise<{
       }
 
       const background = style.backgroundColor || 'rgb(15,15,20)';
-      const lowContrast = contentEls.filter(el => contrast(win.getComputedStyle(el).color, background) < DECK_MIN_CONTRAST_RATIO);
+      const lowContrast = contentEls.filter(el => contrast(win.getComputedStyle(el).color, background) < minContrastRatio);
       if (lowContrast.length > Math.max(2, contentEls.length * 0.15)) {
         metrics.low_contrast_count += 1;
         findings.push({ slideId, severity: 'high', issue: 'Slide has low-contrast text.', requiredFix: 'Increase foreground/background contrast before export.' });
@@ -4099,7 +4099,7 @@ async function inspectRenderedDeckPage(page: any): Promise<{
     });
 
     return { findings, metrics };
-  });
+  }, DECK_MIN_CONTRAST_RATIO);
 }
 
 async function applyDeckRenderRepairPass(page: any, pass: number): Promise<void> {
