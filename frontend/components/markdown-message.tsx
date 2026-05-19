@@ -6,6 +6,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { Check, Copy } from 'lucide-react';
 import { citationsRemarkPlugin, findSourceByHashPrefix, type CitationSource } from '@/lib/citations';
+import { copySelectionAsPortableContent } from '@/lib/portable-copy';
 import { CitationPill } from './citation-pill';
 
 // React-markdown's defaultUrlTransform allowlists http/https/mailto/tel/#fragments
@@ -67,7 +68,12 @@ export function MarkdownMessage({
   }, [sources]);
 
   return (
-    <div className="markdown-body text-sm text-text-primary leading-relaxed" style={BODY_STYLE}>
+    <div
+      className="markdown-body text-sm text-text-primary leading-relaxed"
+      data-marty-copy-root="true"
+      onCopyCapture={event => copySelectionAsPortableContent(event, event.currentTarget)}
+      style={BODY_STYLE}
+    >
       <ReactMarkdown
         remarkPlugins={[citationsRemarkPlugin, remarkGfm]}
         rehypePlugins={[rehypeHighlight]}

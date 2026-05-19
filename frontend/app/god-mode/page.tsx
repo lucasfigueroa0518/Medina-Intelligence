@@ -17,6 +17,7 @@ import { PendingUploadPill, SentUploadPill, formatBytes } from '@/components/cha
 import { UploadPreviewModal } from '@/components/upload-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { trimPartialCitation, type CitationSource } from '@/lib/citations';
+import { copyElementAsPortableContent, copySelectionAsPortableContent, textToPortableHtml, writePortableClipboard } from '@/lib/portable-copy';
 import type { ChatUploadSummary } from '@/lib/api';
 import { demoMartySessions, useDemoMode } from '@/lib/demo-mode';
 
@@ -1399,6 +1400,7 @@ export default function GodModePage() {
   const [previewUpload, setPreviewUpload] = React.useState<ChatUploadSummary | null>(null);
   const [uploadToast, setUploadToast] = React.useState<string | null>(null);
   const messagesRef = React.useRef<HTMLDivElement>(null);
+  const messageCopyRootsRef = React.useRef<Record<string, HTMLElement | null>>({});
   const inputRef = React.useRef<HTMLTextAreaElement>(null);
   const lastSentQueryRef = React.useRef('');
 
@@ -2256,11 +2258,27 @@ export default function GodModePage() {
     finally { setEditingTitleId(null); }
   }
 
-  function handleCopyMessage(msgId: string, content: string) {
+  async function handleCopyMessage(msgId: string, content: string) {
     const role = messages.find(m => m.id === msgId)?.role;
-    navigator.clipboard.writeText(role === 'assistant' ? normalizeMartySentenceSpacing(content) : content);
-    setCopiedMsgId(msgId);
-    setTimeout(() => setCopiedMsgId(null), 2000);
+    const text = role === 'assistant' ? normalizeMartySentenceSpacing(content) : content;
+    try {
+      if (role === 'assistant') {
+        const root = messageCopyRootsRef.current[msgId];
+        if (root) {
+          await copyElementAsPortableContent(root, text);
+        } else {
+          await writePortableClipboard({ text, html: textToPortableHtml(text) });
+        }
+      } else {
+        await writePortableClipboard({ text, html: textToPortableHtml(text) });
+      }
+      setCopiedMsgId(msgId);
+      setTimeout(() => setCopiedMsgId(null), 2000);
+    } catch {
+      await navigator.clipboard.writeText(text);
+      setCopiedMsgId(msgId);
+      setTimeout(() => setCopiedMsgId(null), 2000);
+    }
   }
 
   function retryFrom(assistantMsgId: string) {
@@ -2908,6 +2926,7 @@ export default function GodModePage() {
         {/* Messages — the ONLY scrollable element */}
         <div
           ref={messagesRef}
+          onCopyCapture={event => copySelectionAsPortableContent(event, event.currentTarget)}
           onScroll={handleMessagesScroll}
           className="flex-1 overflow-y-auto px-4 md:px-8 py-4 md:py-6"
           style={{ paddingBottom: 140 }}
@@ -2986,7 +3005,7 @@ export default function GodModePage() {
                         </div>
                       )}
                       <div className="bg-bg-surface rounded-2xl rounded-br-sm px-5 py-3">
-                        <div className="text-sm text-text-primary whitespace-pre-wrap" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
+                        <div className="text-sm text-text-primary whitespace-pre-wrap" data-marty-copy-root="true" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
                           {m.content}
                         </div>
                         {m.timestamp && (
@@ -3054,11 +3073,16 @@ export default function GodModePage() {
                       <div className="relative">
                         <div className={`border-l-2 ${m.cancelled ? 'border-text-muted/40' : 'border-[#8B5CF6]/30'} pl-4`}>
                           {!m.streaming && <TableOfContents content={m.content} />}
-                          <MarkdownMessage
-                            content={normalizeMartySentenceSpacing(m.streaming ? trimPartialCitation(m.content) : m.content)}
-                            sources={m.sources}
-                            onCitationClick={handleCitationClick(m.id)}
-                          />
+                          <div
+                            ref={el => { messageCopyRootsRef.current[m.id] = el; }}
+                            data-marty-copy-root="true"
+                          >
+                            <MarkdownMessage
+                              content={normalizeMartySentenceSpacing(m.streaming ? trimPartialCitation(m.content) : m.content)}
+                              sources={m.sources}
+                              onCitationClick={handleCitationClick(m.id)}
+                            />
+                          </div>
                           {m.cancelled && (
                             <div className="mt-2 inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-medium bg-text-muted/15 text-text-muted" style={{ fontFamily: "'Exo 2', sans-serif" }}>
                               <span style={{ width: 6, height: 6, background: 'currentColor', borderRadius: 1 }} />
