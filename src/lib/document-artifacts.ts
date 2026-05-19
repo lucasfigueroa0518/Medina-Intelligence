@@ -9,6 +9,7 @@ import { preprocessQuery, retrieveContext } from './retrieval';
 import { callClaude } from './claude';
 import { truncateToTokens } from './tokens';
 import { enqueueWork } from './work-queue';
+import { webSearch } from './agent-web-search';
 import {
   MEDINA_DECK_ENGINE_VERSION,
   buildMedinaDeckStudio,
@@ -93,9 +94,12 @@ export type DeckArtifactVisibility = 'polished' | 'draft_review' | 'none';
 export type DeckJobPhase =
   | 'planning'
   | 'research'
+  | 'source_ledger'
   | 'claim_spine'
   | 'design_system'
+  | 'slide_modules'
   | 'critic'
+  | 'critique'
   | 'contact_sheet'
   | 'narrative'
   | 'visual_direction'
@@ -144,6 +148,54 @@ export interface DeckRenderResult {
   pdf_base64?: string;
   metrics?: Record<string, unknown>;
   error?: string;
+}
+
+export interface DeckSourcePacket {
+  internal_sources?: Array<{
+    id?: string;
+    document_id?: string;
+    type?: string;
+    title?: string;
+    date?: string;
+    excerpt?: string;
+    text?: string;
+  }>;
+  web_sources?: Array<{
+    url: string;
+    title?: string;
+    date?: string;
+    freshness?: string;
+    excerpt?: string;
+  }>;
+  open_questions?: Array<string | { question?: string; text?: string; source_id?: string }>;
+}
+
+interface DeckArtifactBuildRequest {
+  job_id: string;
+  title: string;
+  prompt: string;
+  audience?: string | null;
+  objective?: string | null;
+  quality_mode: 'premium';
+  output_formats: Array<'html' | 'pdf' | 'pptx'>;
+  source_document_ids: string[];
+  source_packet: DeckSourcePacket;
+  structured_content: Record<string, any>;
+  web_fill_policy?: 'allow' | 'deny';
+}
+
+interface DeckArtifactBuildResult extends DeckRenderResult {
+  engine_version?: string;
+  pptx_base64?: string;
+  html?: string;
+  contact_sheet?: DeckScreenshot | null;
+  layout_json?: unknown;
+  source_ledger?: unknown;
+  claim_spine?: unknown;
+  deck_profile?: string | null;
+  contact_sheet_summary?: unknown;
+  critic_report?: any;
+  repair_log?: unknown;
 }
 
 export interface DeckRepairPatch {
@@ -237,6 +289,7 @@ const MIME_BY_KIND: Record<ArtifactKind, string> = {
 
 const DECK_HTML_MIME = 'text/html; charset=utf-8';
 export const DECK_RENDER_WORK_DOMAIN = 'deck_render';
+const ARTIFACT_TOOL_DECK_ENGINE_VERSION = 'artifact_tool_v1';
 
 const DECK_STYLE_PACKS: Record<DeckStylePackId, DeckStylePack> = {
   medina_default: {
@@ -2993,6 +3046,65 @@ async function persistGeneratedCompanion(
   return { documentId: persisted.documentId, r2Key: persisted.r2Key, fileName: opts.fileName };
 }
 
+async function persistGeneratedDeckFile(
+  ctx: AuthContext,
+  env: Env,
+  opts: {
+    title: string;
+    fileName: string;
+    mimeType: string;
+    bytes: Uint8Array | string;
+    extractedText: string;
+    sourceDocs: DocumentRow[];
+    parentDocumentId?: string | null;
+    embed?: boolean;
+    customFields: Record<string, unknown>;
+  }
+): Promise<{ documentId: string; r2Key: string; fileName: string }> {
+  const visibility = restrictiveVisibility(opts.sourceDocs);
+  const participantUserIds = participantUnion(opts.sourceDocs, ctx, visibility);
+  const links: DocumentLink[] = [];
+  const primarySource = opts.sourceDocs.find(d => d.deal_id || d.company_id || d.contact_id);
+  if (primarySource?.deal_id) links.push({ entityType: 'deal', entityId: primarySource.deal_id, linkKind: 'derived', linkSource: 'llm_extracted' });
+  else if (primarySource?.company_id) links.push({ entityType: 'company', entityId: primarySource.company_id, linkKind: 'derived', linkSource: 'llm_extracted' });
+  else if (primarySource?.contact_id) links.push({ entityType: 'contact', entityId: primarySource.contact_id, linkKind: 'derived', linkSource: 'llm_extracted' });
+
+  const file = new File([opts.bytes], opts.fileName, { type: opts.mimeType });
+  const persisted = await persistDocument({
+    file,
+    orgId: ctx.orgId,
+    source: 'marty_generated',
+    visibility,
+    participantUserIds,
+    uploadedBy: ctx.userId,
+    links,
+    title: opts.title,
+    documentType: 'presentation',
+    parentDocumentId: opts.parentDocumentId || undefined,
+    preExtractedText: opts.extractedText,
+    dedupOnContentHash: false,
+    embed: opts.embed !== false,
+  }, env);
+  await persisted.finalize();
+  await env.D1.prepare(
+    `UPDATE documents
+        SET custom_fields = ?
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    JSON.stringify({
+      marty_generated: true,
+      artifact_kind: opts.fileName.split('.').pop() || 'deck',
+      artifact_schema_version: 5,
+      source_document_ids: opts.sourceDocs.map(d => d.id),
+      parent_deck_document_id: opts.parentDocumentId || null,
+      ...opts.customFields,
+    }),
+    persisted.documentId,
+    ctx.orgId
+  ).run().catch(() => {});
+  return { documentId: persisted.documentId, r2Key: persisted.r2Key, fileName: opts.fileName };
+}
+
 async function persistDeckInternalHtmlDocument(
   ctx: AuthContext,
   env: Env,
@@ -3093,7 +3205,14 @@ function deckVisibleCardReason(visibility: DeckArtifactVisibility): string {
 
 function sanitizeDeckRenderResultForStorage(result: DeckRenderResult | null | undefined): Record<string, unknown> | null {
   if (!result) return null;
-  const { pdf_base64: _pdfBase64, screenshots, ...rest } = result as DeckRenderResult & Record<string, unknown>;
+  const {
+    pdf_base64: _pdfBase64,
+    pptx_base64: _pptxBase64,
+    html: _html,
+    screenshots,
+    contact_sheet: contactSheet,
+    ...rest
+  } = result as DeckRenderResult & Record<string, unknown>;
   return {
     ...rest,
     screenshots: Array.isArray(screenshots)
@@ -3102,6 +3221,12 @@ function sanitizeDeckRenderResultForStorage(result: DeckRenderResult | null | un
         return safeScreenshot;
       })
       : [],
+    contact_sheet: contactSheet && typeof contactSheet === 'object'
+      ? (() => {
+        const { base64: _base64, ...safeContactSheet } = contactSheet as Record<string, unknown>;
+        return safeContactSheet;
+      })()
+      : contactSheet || null,
   };
 }
 
@@ -3125,9 +3250,11 @@ function deckStatusLabel(job: any, qa: DeckQaReport | null | undefined): string 
   if (status === 'cancelled') return 'Deck cancelled';
   if (status === 'revising' || phase === 'repair') return `Revision ${Math.min(Math.max(round, 1), maxRounds)}/${maxRounds}: fixing layout`;
   if (phase === 'planning' || phase === 'narrative') return 'Extracting story';
+  if (phase === 'source_ledger') return 'Building source ledger';
   if (phase === 'claim_spine') return 'Writing claim spine';
   if (phase === 'design_system' || phase === 'visual_direction') return 'Locking design system';
-  if (phase === 'critic') return 'Scoring deck critic';
+  if (phase === 'slide_modules') return 'Building slide modules';
+  if (phase === 'critic' || phase === 'critique') return 'Scoring deck critic';
   if (phase === 'contact_sheet') return 'Rendering contact sheet';
   if (phase === 'html_render') return 'Building HTML';
   if (phase === 'render_qa') return qa?.status && qa.status !== 'pass' ? 'QA found layout issues' : 'Rendering contact sheet';
@@ -3794,6 +3921,96 @@ export async function createDocumentArtifactTool(
   };
 }
 
+function normalizeDeckSourcePacket(raw: unknown): DeckSourcePacket {
+  const packet = raw && typeof raw === 'object' ? raw as DeckSourcePacket : {};
+  return {
+    internal_sources: Array.isArray(packet.internal_sources) ? packet.internal_sources : [],
+    web_sources: Array.isArray(packet.web_sources) ? packet.web_sources : [],
+    open_questions: Array.isArray(packet.open_questions) ? packet.open_questions : [],
+  };
+}
+
+function deckSourcePacketFromInputs(
+  inputPacket: unknown,
+  sourceDocs: DocumentRow[],
+  structured: Record<string, any>
+): DeckSourcePacket {
+  const base = normalizeDeckSourcePacket(inputPacket || structured.source_packet);
+  const existingIds = new Set((base.internal_sources || []).map(source => String(source.id || source.document_id || '')));
+  const docSources = sourceDocs
+    .filter(doc => !existingIds.has(doc.id))
+    .map(doc => ({
+      id: doc.id,
+      document_id: doc.id,
+      type: doc.document_type || 'document',
+      title: doc.title || doc.file_name || 'Source document',
+      date: doc.created_at || '',
+      excerpt: truncateToTokens(doc.extracted_text_preview || '', 900),
+    }));
+  const stringArray = (value: unknown) => asArray(value)
+    .map(item => typeof item === 'string' ? item : cleanArtifactText((item as any)?.question || (item as any)?.text || (item as any)?.label || ''))
+    .filter(Boolean);
+  const structuredOpenQuestions = [
+    ...stringArray(structured.open_questions),
+    ...stringArray(structured.gaps),
+    ...stringArray(structured.diligence_questions),
+  ].filter(Boolean);
+  return {
+    internal_sources: [...(base.internal_sources || []), ...docSources],
+    web_sources: base.web_sources || [],
+    open_questions: [...(base.open_questions || []), ...structuredOpenQuestions],
+  };
+}
+
+async function maybeWebFillDeckSourcePacket(
+  ctx: AuthContext,
+  env: Env,
+  opts: {
+    title: string;
+    prompt: string;
+    sourcePacket: DeckSourcePacket;
+  }
+): Promise<DeckSourcePacket> {
+  const internalCount = (opts.sourcePacket.internal_sources || []).length;
+  const webCount = (opts.sourcePacket.web_sources || []).length;
+  if (webCount > 0 || internalCount >= 2) return opts.sourcePacket;
+  const query = truncateToTokens(`${opts.title} ${opts.prompt} company investment opportunity latest official sources`, 120);
+  try {
+    const result = await webSearch(query, 5, ctx, env);
+    const sources = Array.isArray(result?.sources) ? result.sources : [];
+    const summary = cleanArtifactText(result?.summary || '');
+    const webSources = sources
+      .map((source: any, index: number) => ({
+        url: String(source.uri || source.url || ''),
+        title: cleanArtifactText(source.title || source.name || `Web source ${index + 1}`),
+        date: cleanArtifactText(source.date || source.published_at || ''),
+        freshness: cleanArtifactText(source.search_mode || result?.search_mode || 'web_fill'),
+        excerpt: truncateToTokens(cleanArtifactText(source.snippet || source.summary || summary), 650),
+      }))
+      .filter((source: any) => source.url || source.title || source.excerpt)
+      .slice(0, 5);
+    if (webSources.length === 0) return {
+      ...opts.sourcePacket,
+      open_questions: [
+        ...(opts.sourcePacket.open_questions || []),
+        'Web-fill did not return usable sources; attach source material before treating the deck as polished.',
+      ],
+    };
+    return {
+      ...opts.sourcePacket,
+      web_sources: [...(opts.sourcePacket.web_sources || []), ...webSources],
+    };
+  } catch (error: any) {
+    return {
+      ...opts.sourcePacket,
+      open_questions: [
+        ...(opts.sourcePacket.open_questions || []),
+        `Web-fill failed: ${String(error?.message || error).slice(0, 160)}`,
+      ],
+    };
+  }
+}
+
 export async function createDeckArtifactTool(
   ctx: AuthContext,
   input: {
@@ -3806,6 +4023,7 @@ export async function createDeckArtifactTool(
     quality_mode?: 'fast' | 'premium';
     structured_content?: any;
     source_document_ids?: string[];
+    source_packet?: DeckSourcePacket;
   },
   env: Env,
   opts: {
@@ -3824,6 +4042,7 @@ export async function createDeckArtifactTool(
   const sourceIds = Array.isArray(input.source_document_ids)
     ? input.source_document_ids.filter(id => typeof id === 'string')
     : [];
+  const sourceDocs = await loadAccessibleDocuments(sourceIds, ctx, env);
   let structured = normalizeStructuredArtifactContent(input.structured_content || {
     title,
     subtitle: 'Prepared by MARTy',
@@ -3836,16 +4055,25 @@ export async function createDeckArtifactTool(
   structured.objective = input.objective || structured.objective;
   structured.style_pack = input.style_pack || structured.style_pack || 'medina_default';
   structured.deck_request = prompt;
-  const studio = buildMedinaSkillDeckContent(title, structured, {
-    prompt,
-    audience: input.audience || structured.audience,
-    objective: input.objective || structured.objective,
-    sourceDocumentIds: sourceIds,
-  });
+  structured.source_packet = deckSourcePacketFromInputs(input.source_packet, sourceDocs, structured);
+  const studio = qualityMode === 'fast'
+    ? buildMedinaSkillDeckContent(title, structured, {
+      prompt,
+      audience: input.audience || structured.audience,
+      objective: input.objective || structured.objective,
+      sourceDocumentIds: sourceIds,
+    })
+    : {
+      structured: {
+        ...structured,
+        engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+      },
+      critic: null,
+    };
   structured = studio.structured;
   const plan = deckPlanFromContent(title, structured);
   const facts = deckFactsFromContent(title, structured, slidesFromContent(title, structured));
-  const asyncRenderer = qualityMode === 'premium' && isDeckRendererEnabled(env);
+  const asyncRenderer = qualityMode === 'premium';
 
   await env.D1.prepare(
     `INSERT INTO deck_artifact_jobs
@@ -3886,7 +4114,8 @@ export async function createDeckArtifactTool(
     revision_round: 0,
     max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
     message: 'Extracting story',
-    engine_version: MEDINA_DECK_ENGINE_VERSION,
+    engine_version: qualityMode === 'premium' ? ARTIFACT_TOOL_DECK_ENGINE_VERSION : MEDINA_DECK_ENGINE_VERSION,
+    artifact_engine_required: qualityMode === 'premium',
     deck_profile: structured.deck_profile || null,
     critic_summary: studio.critic,
   }).catch(() => {});
@@ -3905,7 +4134,8 @@ export async function createDeckArtifactTool(
       status: 'queued',
       revision_round: 0,
       max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
-      message: 'Premium deck job queued for HTML render, screenshot QA, and export.',
+      message: 'Premium artifact-tool deck job queued for source ledger, claim spine, slide build, contact sheet, critique, and export.',
+      engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
     }).catch(() => {});
     return {
       ok: true,
@@ -3917,12 +4147,13 @@ export async function createDeckArtifactTool(
         title,
         quality_mode: qualityMode,
         output_formats: outputFormats,
-        engine_version: MEDINA_DECK_ENGINE_VERSION,
+        engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+        artifact_engine_required: true,
         deck_profile: structured.deck_profile || null,
         critic_summary: studio.critic,
       },
       document_cards: [],
-      message: 'Premium deck job queued. MARTy will render, QA, and export the deck before marking it complete.',
+      message: 'Premium artifact-tool deck job queued. MARTy will build an editable deck, render previews, critique it, and export PPTX/PDF/HTML before marking it complete.',
     };
   }
 
@@ -4293,6 +4524,46 @@ async function callDeckRendererService(
   }
 }
 
+function isArtifactToolDeckRendererConfigured(env: Env): boolean {
+  return Boolean(env.DECK_RENDERER_URL && env.DECK_RENDERER_TOKEN);
+}
+
+async function callDeckArtifactBuildService(
+  env: Env,
+  request: DeckArtifactBuildRequest
+): Promise<DeckArtifactBuildResult> {
+  if (!isArtifactToolDeckRendererConfigured(env)) {
+    throw new Error('ARTIFACT_TOOL_DECK_RENDERER_NOT_CONFIGURED');
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DECK_RENDERER_TIMEOUT_MS * 2);
+  try {
+    const base = env.DECK_RENDERER_URL!.replace(/\/+$/, '');
+    const res = await fetch(`${base}/deck/build`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.DECK_RENDERER_TOKEN}`,
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let parsed: any = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { /* handled below */ }
+    if (!res.ok) {
+      if (parsed?.job_id && parsed?.qa_report) return parsed as DeckArtifactBuildResult;
+      throw new Error(parsed?.error || parsed?.message || `artifact-tool deck builder returned ${res.status}`);
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('artifact-tool deck builder returned malformed JSON');
+    }
+    return parsed as DeckArtifactBuildResult;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function inspectRenderedDeckPage(page: any): Promise<{
   findings: DeckQaReport['slideFindings'];
   metrics: Record<string, unknown>;
@@ -4613,6 +4884,481 @@ async function renderDeckWithCloudflareBrowser(
   }
 }
 
+function artifactToolExtractedText(title: string, result: DeckArtifactBuildResult): string {
+  return [
+    title,
+    cleanArtifactText((result.claim_spine as any)?.thesis || ''),
+    cleanArtifactText((result.claim_spine as any)?.arc || ''),
+    ...(Array.isArray((result.source_ledger as any)?.sources)
+      ? (result.source_ledger as any).sources.map((source: any) => `${source.label || source.id || 'source'}: ${source.title || ''} ${source.excerpt || ''}`)
+      : []),
+    ...(result.qa_report?.slideFindings || []).map(f => `${f.severity}: ${f.slideId}: ${f.issue}`),
+  ].filter(Boolean).join('\n').slice(0, 8000);
+}
+
+async function persistArtifactToolDeckBuildResult(
+  ctx: AuthContext,
+  env: Env,
+  job: DeckArtifactJobRow,
+  sourceDocs: DocumentRow[],
+  result: DeckArtifactBuildResult,
+  structured: Record<string, any>,
+  outputFormats: Array<'html' | 'pdf' | 'pptx'>
+): Promise<void> {
+  const title = job.title || (result.claim_spine as any)?.title || 'MARTy deck';
+  const qa = result.qa_report || safeJsonParse<DeckQaReport | null>(job.qa_report_json, null) || {
+    status: result.error ? 'failed' : 'needs_revision',
+    slideFindings: result.error ? [{
+      slideId: 'artifact_tool',
+      severity: 'critical' as DeckQaSeverity,
+      issue: result.error,
+      requiredFix: 'Inspect the artifact-tool deck renderer logs and retry.',
+    }] : [],
+    checks: {
+      slide_count: 0,
+      visual_surface_count: 0,
+      average_words_per_slide: 0,
+      max_words_on_slide: 0,
+      accent_gutter_px: 0,
+      html_bytes: 0,
+      engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+    },
+  };
+  const qaPassed = qa.status === 'pass' && !deckQaHasBlockingFindings(qa) && !result.error;
+  const extractedText = artifactToolExtractedText(title, result);
+  const baseFields = {
+    deck_tool: 'create_deck_artifact',
+    deck_job_id: job.id,
+    deck_quality_mode: job.quality_mode || 'premium',
+    requested_output_formats: outputFormats,
+    requested_audience: job.audience,
+    requested_objective: job.objective,
+    requested_style_pack: job.style_pack || 'medina_default',
+    engine_version: result.engine_version || ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+    deck_profile: result.deck_profile || null,
+    source_ledger: result.source_ledger || null,
+    contact_sheet_summary: result.contact_sheet_summary || null,
+    critic_report: result.critic_report || null,
+    repair_log: result.repair_log || null,
+    draft_review: !qaPassed,
+  };
+
+  let pptxDocumentId: string | null = null;
+  let htmlDocumentId: string | null = null;
+  let pdfDocumentId: string | null = null;
+  const screenshotDocumentIds: string[] = [];
+  let contactSheetDocumentId: string | null = null;
+  let qaDocumentId: string | null = null;
+
+  if (result.pptx_base64) {
+    const pptxDoc = await persistGeneratedDeckFile(ctx, env, {
+      title: qaPassed ? title : `${title} - QA Draft PPTX`,
+      fileName: fileTitle(qaPassed ? title : `${title} - QA Draft`, 'pptx'),
+      mimeType: MIME_BY_KIND.pptx,
+      bytes: bytesFromBase64(result.pptx_base64),
+      extractedText,
+      sourceDocs,
+      customFields: {
+        ...baseFields,
+        deck_companion_kind: 'artifact_tool_pptx',
+        editable_artifact_tool_pptx: true,
+      },
+    });
+    pptxDocumentId = pptxDoc.documentId;
+  }
+
+  const parentDocumentId = pptxDocumentId;
+  if (result.html) {
+    const htmlFileName = companionFileTitle(`${title} - Artifact HTML Preview`, 'html');
+    const htmlDoc = parentDocumentId
+      ? await persistGeneratedCompanion(ctx, env, {
+        title: `${title} - Artifact HTML Preview`,
+        fileName: htmlFileName,
+        mimeType: DECK_HTML_MIME,
+        bytes: result.html,
+        extractedText,
+        visibility: restrictiveVisibility(sourceDocs),
+        participantUserIds: participantUnion(sourceDocs, ctx, restrictiveVisibility(sourceDocs)),
+        parentDocumentId,
+        customFields: {
+          ...baseFields,
+          deck_companion_kind: 'artifact_tool_html_preview',
+          html_source_of_truth: false,
+        },
+      })
+      : await persistGeneratedDeckFile(ctx, env, {
+        title: `${title} - Artifact HTML Preview`,
+        fileName: htmlFileName,
+        mimeType: DECK_HTML_MIME,
+        bytes: result.html,
+        extractedText,
+        sourceDocs,
+        customFields: {
+          ...baseFields,
+          deck_companion_kind: 'artifact_tool_html_preview',
+          html_source_of_truth: false,
+        },
+      });
+    htmlDocumentId = htmlDoc.documentId;
+  }
+
+  if (result.pdf_base64) {
+    const pdfFileName = companionFileTitle(`${title} - Rendered PDF Export`, 'pdf');
+    const pdfDoc = parentDocumentId
+      ? await persistGeneratedCompanion(ctx, env, {
+        title: `${title} - Rendered PDF Export`,
+        fileName: pdfFileName,
+        mimeType: MIME_BY_KIND.pdf,
+        bytes: bytesFromBase64(result.pdf_base64),
+        extractedText: `Rendered PDF export for ${title}.`,
+        visibility: restrictiveVisibility(sourceDocs),
+        participantUserIds: participantUnion(sourceDocs, ctx, restrictiveVisibility(sourceDocs)),
+        parentDocumentId,
+        customFields: {
+          ...baseFields,
+          deck_companion_kind: 'artifact_tool_pdf_export',
+        },
+      })
+      : await persistGeneratedDeckFile(ctx, env, {
+        title: `${title} - Rendered PDF Export`,
+        fileName: pdfFileName,
+        mimeType: MIME_BY_KIND.pdf,
+        bytes: bytesFromBase64(result.pdf_base64),
+        extractedText: `Rendered PDF export for ${title}.`,
+        sourceDocs,
+        customFields: {
+          ...baseFields,
+          deck_companion_kind: 'artifact_tool_pdf_export',
+        },
+      });
+    pdfDocumentId = pdfDoc.documentId;
+  }
+
+  if (parentDocumentId && result.contact_sheet?.base64) {
+    const doc = await persistGeneratedCompanion(ctx, env, {
+      title: `${title} - Contact Sheet`,
+      fileName: companionFileTitle(`${title} - Contact Sheet`, 'png'),
+      mimeType: 'image/png',
+      bytes: bytesFromBase64(result.contact_sheet.base64),
+      extractedText: `Rendered artifact-tool contact sheet for ${title}.`,
+      visibility: restrictiveVisibility(sourceDocs),
+      participantUserIds: participantUnion(sourceDocs, ctx, restrictiveVisibility(sourceDocs)),
+      parentDocumentId,
+      customFields: {
+        ...baseFields,
+        deck_companion_kind: 'artifact_tool_contact_sheet',
+      },
+    });
+    contactSheetDocumentId = doc.documentId;
+  }
+
+  if (parentDocumentId && Array.isArray(result.screenshots)) {
+    for (const screenshot of result.screenshots.slice(0, 12)) {
+      if (!screenshot.base64) continue;
+      const doc = await persistGeneratedCompanion(ctx, env, {
+        title: `${title} - Slide ${screenshot.index}`,
+        fileName: companionFileTitle(`${title} - slide-${String(screenshot.index).padStart(2, '0')}`, 'png'),
+        mimeType: screenshot.mimeType || 'image/png',
+        bytes: bytesFromBase64(screenshot.base64),
+        extractedText: `Rendered artifact-tool screenshot for ${title}, slide ${screenshot.index}.`,
+        visibility: restrictiveVisibility(sourceDocs),
+        participantUserIds: participantUnion(sourceDocs, ctx, restrictiveVisibility(sourceDocs)),
+        parentDocumentId,
+        customFields: {
+          ...baseFields,
+          deck_companion_kind: 'artifact_tool_slide_screenshot',
+          slide_id: screenshot.slideId,
+          slide_index: screenshot.index,
+          width: screenshot.width,
+          height: screenshot.height,
+        },
+      });
+      screenshotDocumentIds.push(doc.documentId);
+    }
+  }
+
+  if (parentDocumentId) {
+    const qaDoc = await persistGeneratedCompanion(ctx, env, {
+      title: `${title} - Artifact Tool QA Report`,
+      fileName: companionFileTitle(`${title} - Artifact Tool QA Report`, 'json'),
+      mimeType: 'application/json; charset=utf-8',
+      bytes: JSON.stringify({
+        job_id: job.id,
+        qa_report: qa,
+        source_ledger: result.source_ledger || null,
+        contact_sheet_summary: result.contact_sheet_summary || null,
+        critic_report: result.critic_report || null,
+        repair_log: result.repair_log || null,
+        layout_json: result.layout_json || null,
+        metrics: result.metrics || {},
+      }, null, 2),
+      extractedText: [
+        `Artifact-tool deck QA status: ${qa.status}`,
+        ...qa.slideFindings.map(f => `${f.severity}: ${f.slideId}: ${f.issue} -> ${f.requiredFix}`),
+      ].join('\n').slice(0, 8000),
+      visibility: restrictiveVisibility(sourceDocs),
+      participantUserIds: participantUnion(sourceDocs, ctx, restrictiveVisibility(sourceDocs)),
+      parentDocumentId,
+      customFields: {
+        ...baseFields,
+        deck_companion_kind: 'artifact_tool_qa_report',
+        deck_qa_status: qa.status,
+      },
+    });
+    qaDocumentId = qaDoc.documentId;
+  }
+
+  const visibleIds = [pptxDocumentId, htmlDocumentId, pdfDocumentId].filter(Boolean) as string[];
+  const status: DeckJobStatus = result.error && visibleIds.length === 0
+    ? 'failed'
+    : qaPassed
+      ? 'completed'
+      : 'qa_blocked';
+  const phase: DeckJobPhase = status === 'completed' ? 'complete' : status === 'qa_blocked' ? 'qa_blocked' : 'failed';
+  const artifactVisibility = deckArtifactVisibilityForStatus(status, visibleIds);
+  const blockedReason = status === 'qa_blocked'
+    ? deckBlockingFindings(qa, 3).map(f => `${f.slideId}: ${f.issue}`).join('; ') || result.error || 'Artifact-tool deck needs review before polished circulation.'
+    : null;
+  const diagnosticIds = deckDiagnosticDocumentIdsForStatus(status, [contactSheetDocumentId, ...screenshotDocumentIds].filter(Boolean) as string[], qaDocumentId);
+  const nextStructured = {
+    ...structured,
+    engine_version: result.engine_version || ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+    deck_profile: result.deck_profile || structured.deck_profile || null,
+    source_ledger: result.source_ledger || null,
+    claim_spine: result.claim_spine || null,
+    contact_sheet_summary: result.contact_sheet_summary || null,
+    critic_summary: result.critic_report || null,
+    repair_log: result.repair_log || null,
+    artifact_tool_layout_json_available: Boolean(result.layout_json),
+  };
+
+  await env.D1.prepare(
+    `UPDATE deck_artifact_jobs
+        SET status = ?,
+            phase = ?,
+            pptx_document_id = ?,
+            html_document_id = ?,
+            pdf_document_id = ?,
+            screenshot_document_ids_json = ?,
+            qa_document_id = ?,
+            structured_content_json = ?,
+            fact_ledger_json = ?,
+            qa_report_json = ?,
+            render_result_json = ?,
+            blocked_reason = ?,
+            user_visible_document_ids_json = ?,
+            error_code = ?,
+            error_message = ?,
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    status,
+    phase,
+    pptxDocumentId,
+    htmlDocumentId,
+    pdfDocumentId,
+    JSON.stringify(screenshotDocumentIds),
+    qaDocumentId,
+    JSON.stringify(nextStructured),
+    JSON.stringify(result.source_ledger || {}),
+    JSON.stringify(qa),
+    JSON.stringify(sanitizeDeckRenderResultForStorage(result)),
+    blockedReason,
+    visibleIds.length > 0 ? JSON.stringify(visibleIds) : null,
+    status === 'failed' ? 'ARTIFACT_TOOL_DECK_BUILD_FAILED' : null,
+    status === 'failed' ? String(result.error || blockedReason || 'Artifact-tool deck build failed.').slice(0, 500) : null,
+    job.id,
+    job.org_id
+  ).run();
+
+  const visibleCards = visibleIds.length > 0
+    ? await documentCardsForIds(ctx, env, visibleIds, 'dominant', deckVisibleCardReason(artifactVisibility)).catch(() => [])
+    : [];
+  const diagnosticCards = status === 'qa_blocked'
+    ? await documentCardsForIds(ctx, env, diagnosticIds, 'compact').catch(() => [])
+    : [];
+
+  await persistDeckVisibleCardsOnMessage(
+    ctx,
+    env,
+    job.assistant_message_id,
+    visibleCards,
+    deckJobSnapshotForMessage({ ...job, structured_content_json: JSON.stringify(nextStructured), qa_report_json: JSON.stringify(qa) }, {
+      status,
+      phase,
+      artifactVisibility,
+      visibleCards,
+      diagnosticCards,
+      qa,
+      blockedReason,
+      lastEventMessage: status === 'completed'
+        ? 'Artifact-tool deck ready.'
+        : status === 'qa_blocked'
+          ? 'Draft-review artifact-tool deck is available; QA details are attached.'
+          : 'Artifact-tool deck failed before recoverable outputs were created.',
+    })
+  ).catch(() => {});
+
+  await appendDeckJobEvent(env, job.id, job.org_id, status === 'completed' ? 'complete' : status, {
+    status,
+    phase,
+    qa_status: qa.status,
+    status_label: deckStatusLabel({ ...job, status, phase }, qa),
+    artifact_visibility: artifactVisibility,
+    user_visible_document_ids: visibleIds,
+    visible_document_cards: visibleCards,
+    diagnostic_document_ids: diagnosticIds,
+    diagnostic_document_cards: diagnosticCards,
+    source_ledger: result.source_ledger || null,
+    contact_sheet_summary: result.contact_sheet_summary || null,
+    critic_summary: result.critic_report || null,
+    repair_log: result.repair_log || null,
+    blocked_reason: blockedReason,
+    message: status === 'completed'
+      ? 'Artifact-tool deck ready.'
+      : status === 'qa_blocked'
+        ? 'Draft-review artifact-tool deck is available.'
+        : 'Artifact-tool deck failed.',
+  }).catch(() => {});
+}
+
+async function processArtifactToolDeckJob(
+  env: Env,
+  job: DeckArtifactJobRow,
+  ctx: AuthContext,
+  sourceDocs: DocumentRow[],
+  structured: Record<string, any>,
+  outputFormats: Array<'html' | 'pdf' | 'pptx'>,
+  opts: { attempt?: number; maxAttempts?: number } = {}
+): Promise<void> {
+  const title = job.title || structured.title || 'MARTy deck';
+  let sourcePacket = deckSourcePacketFromInputs(structured.source_packet, sourceDocs, structured);
+  sourcePacket = await maybeWebFillDeckSourcePacket(ctx, env, {
+    title,
+    prompt: job.prompt,
+    sourcePacket,
+  });
+  structured.source_packet = sourcePacket;
+  const sourceCount = (sourcePacket.internal_sources || []).length + (sourcePacket.web_sources || []).length;
+
+  await updateDeckJobPhase(env, job.id, job.org_id, 'source_ledger', {
+    message: sourceCount > 0 ? 'Building source ledger' : 'Source ledger is empty',
+    revision_round: Number(job.revision_round || 0),
+    max_revision_rounds: 2,
+    engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+    source_ledger_summary: {
+      internal_sources: (sourcePacket.internal_sources || []).length,
+      web_sources: (sourcePacket.web_sources || []).length,
+      open_questions: (sourcePacket.open_questions || []).length,
+    },
+  });
+
+  if (!isArtifactToolDeckRendererConfigured(env)) {
+    const error = 'Artifact-tool deck renderer is not configured. Premium deck generation cannot fall back to the legacy HTML renderer.';
+    await env.D1.prepare(
+      `UPDATE deck_artifact_jobs
+          SET status = 'failed',
+              phase = 'failed',
+              error_code = 'ARTIFACT_TOOL_DECK_RENDERER_NOT_CONFIGURED',
+              error_message = ?,
+              completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(error.slice(0, 500), job.id, job.org_id).run();
+    await appendDeckJobEvent(env, job.id, job.org_id, 'failed', {
+      status: 'failed',
+      phase: 'failed',
+      message: error,
+      engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+      artifact_visibility: 'none',
+    }).catch(() => {});
+    return;
+  }
+
+  await updateDeckJobPhase(env, job.id, job.org_id, 'claim_spine', {
+    message: 'Writing source-backed claim spine',
+    engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+  });
+  await updateDeckJobPhase(env, job.id, job.org_id, 'design_system', {
+    message: 'Locking artifact-tool Medina design system',
+    engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+  });
+  await updateDeckJobPhase(env, job.id, job.org_id, 'slide_modules', {
+    message: 'Building editable slide modules',
+    engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+  });
+
+  let buildResult: DeckArtifactBuildResult;
+  try {
+    buildResult = await callDeckArtifactBuildService(env, {
+      job_id: job.id,
+      title,
+      prompt: job.prompt,
+      audience: job.audience,
+      objective: job.objective,
+      quality_mode: 'premium',
+      output_formats: outputFormats,
+      source_document_ids: safeJsonParse<string[]>(job.source_document_ids_json, []),
+      source_packet: sourcePacket,
+      structured_content: structured,
+      web_fill_policy: 'allow',
+    });
+  } catch (error: any) {
+    if (!opts.maxAttempts || !opts.attempt || opts.attempt < opts.maxAttempts) throw error;
+    buildResult = {
+      job_id: job.id,
+      status: 'failed',
+      engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+      qa_report: {
+        status: 'failed',
+        slideFindings: [{
+          slideId: 'artifact_tool',
+          severity: 'critical',
+          issue: String(error?.message || error).slice(0, 300),
+          requiredFix: 'Retry after the artifact-tool renderer service is healthy.',
+        }],
+        checks: {
+          slide_count: 0,
+          visual_surface_count: 0,
+          average_words_per_slide: 0,
+          max_words_on_slide: 0,
+          accent_gutter_px: 0,
+          html_bytes: 0,
+          engine_version: ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+        },
+      },
+      error: String(error?.message || error).slice(0, 500),
+      metrics: { renderer: 'artifact-tool' },
+    };
+  }
+
+  await updateDeckJobPhase(env, job.id, job.org_id, 'contact_sheet', {
+    message: 'Rendered contact sheet',
+    engine_version: buildResult.engine_version || ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+    contact_sheet_summary: buildResult.contact_sheet_summary || null,
+  });
+  await updateDeckJobPhase(env, job.id, job.org_id, 'critique', {
+    message: 'Scored source, story, and design critic',
+    engine_version: buildResult.engine_version || ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+    qa_status: buildResult.qa_report?.status || buildResult.status,
+    critic_summary: buildResult.critic_report || null,
+  });
+  if (buildResult.repair_log) {
+    await updateDeckJobPhase(env, job.id, job.org_id, 'repair', {
+      message: 'Applied deterministic artifact-tool repair policy',
+      engine_version: buildResult.engine_version || ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+      repair_log: buildResult.repair_log,
+    });
+  }
+  await updateDeckJobPhase(env, job.id, job.org_id, 'export', {
+    message: 'Persisting artifact-tool PPTX/PDF/HTML exports',
+    engine_version: buildResult.engine_version || ARTIFACT_TOOL_DECK_ENGINE_VERSION,
+    qa_status: buildResult.qa_report?.status || buildResult.status,
+  });
+  await persistArtifactToolDeckBuildResult(ctx, env, job, sourceDocs, buildResult, structured, outputFormats);
+}
+
 export async function processDeckRenderJob(
   env: Env,
   jobId: string,
@@ -4648,6 +5394,10 @@ export async function processDeckRenderJob(
   const sourceDocumentIds = safeJsonParse<string[]>(job.source_document_ids_json, []);
   const title = job.title || structured.title || 'MARTy deck';
   const sourceDocs = await loadAccessibleDocuments(sourceDocumentIds, ctx, env);
+  if ((job.quality_mode || 'premium') !== 'fast') {
+    await processArtifactToolDeckJob(env, job, ctx, sourceDocs, structured, outputFormats, opts);
+    return;
+  }
   let currentStructured: any = normalizeStructuredArtifactContent(structured);
   const initialStudio = buildMedinaSkillDeckContent(title, currentStructured, {
     prompt: job.prompt,

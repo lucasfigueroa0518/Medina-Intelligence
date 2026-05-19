@@ -163,6 +163,7 @@ interface DeckJobView {
   } | null;
   critic_summary?: {
     status?: string;
+    score?: number;
     score_total?: number;
     max_score?: number;
     top_findings?: Array<{
@@ -571,9 +572,11 @@ function deckJobStatusLabel(job: DeckJobView | null | undefined): string {
     const max = Math.max(round, Number(job.max_revision_rounds || 3));
     return `Revision ${round}/${max}: fixing layout`;
   }
+  if (job.phase === 'source_ledger') return 'Building source ledger';
   if (job.phase === 'claim_spine') return 'Writing claim spine';
   if (job.phase === 'design_system' || job.phase === 'visual_direction') return 'Locking design system';
-  if (job.phase === 'critic') return 'Scoring deck critic';
+  if (job.phase === 'slide_modules') return 'Building slide modules';
+  if (job.phase === 'critic' || job.phase === 'critique') return 'Scoring deck critic';
   if (job.phase === 'contact_sheet') return 'Rendering contact sheet';
   if (job.phase === 'html_render') return 'Building HTML';
   if (job.phase === 'render_qa') return 'Rendering contact sheet';
@@ -1097,7 +1100,7 @@ function DeckJobProgress({ job, showQaDetails = true }: { job: DeckJobView; show
       )}
       {pending && (
         <div className="mt-3 grid grid-cols-2 gap-1.5 text-[10px] text-text-secondary sm:grid-cols-4">
-          {['Story', 'Claim spine', 'Design', 'Export'].map((stage, index) => (
+          {['Source ledger', 'Claim spine', 'Slide build', 'Contact sheet', 'Critique', 'Export'].map((stage, index) => (
             <div key={stage} className={`rounded border px-2 py-1 ${index === 0 ? 'border-accent-magenta/25 bg-accent-magenta/10 text-accent-magenta' : 'border-white/[0.05] bg-bg-root/45'}`}>
               {stage}
             </div>
@@ -1117,7 +1120,7 @@ function DeckJobProgress({ job, showQaDetails = true }: { job: DeckJobView; show
           <div className="flex items-center justify-between gap-2">
             <span className="font-semibold text-text-primary">Deck critic</span>
             <span className="text-text-muted">
-              {critic?.score_total ?? qa?.critic_score}/{critic?.max_score || 45}
+              {critic?.score_total ?? critic?.score ?? qa?.critic_score}/{critic?.max_score || 60}
               {critic?.status ? ` · ${String(critic.status).replace(/_/g, ' ')}` : ''}
             </span>
           </div>

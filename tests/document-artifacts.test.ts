@@ -343,6 +343,8 @@ describe('document artifact quality gates', () => {
       job_id: 'job_1',
       status: 'needs_revision',
       pdf_base64: 'JVBERi0x',
+      pptx_base64: 'UEsDBBQ=',
+      html: '<html>large inline preview</html>',
       qa_report: {
         status: 'needs_revision',
         slideFindings: [],
@@ -365,12 +367,25 @@ describe('document artifact quality gates', () => {
         base64: 'iVBORw0KGgo=',
         document_id: 'shot_1',
       }],
+      contact_sheet: {
+        slideId: 'contact_sheet',
+        index: 0,
+        fileName: 'contact.png',
+        mimeType: 'image/png',
+        width: 1800,
+        height: 1200,
+        base64: 'contactSheetBase64',
+      },
       metrics: { renderer: 'test' },
-    });
+    } as any);
 
     expect(JSON.stringify(safe)).not.toContain('pdf_base64');
+    expect(JSON.stringify(safe)).not.toContain('pptx_base64');
+    expect(JSON.stringify(safe)).not.toContain('large inline preview');
     expect(JSON.stringify(safe)).not.toContain('iVBORw0KGgo=');
+    expect(JSON.stringify(safe)).not.toContain('contactSheetBase64');
     expect((safe?.screenshots as any[])[0]).toMatchObject({ slideId: 'slide_1', document_id: 'shot_1' });
+    expect(safe?.contact_sheet).toMatchObject({ slideId: 'contact_sheet', fileName: 'contact.png' });
   });
 
   it('reconciles queue dead-lettered active deck jobs into draft-review terminal state when artifacts exist', async () => {

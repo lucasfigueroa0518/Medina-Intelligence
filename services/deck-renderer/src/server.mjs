@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { artifactToolUnavailableResult, buildArtifactToolDeck } from './artifact-builder.mjs';
 
 const PORT = Number(process.env.PORT || 4317);
 const TOKEN = process.env.DECK_RENDERER_TOKEN || '';
@@ -412,6 +413,26 @@ async function handleRender(req, res) {
   }
 }
 
+async function handleDeckBuild(req, res) {
+  if (TOKEN && bearer(req) !== TOKEN) {
+    json(res, 401, { error: 'UNAUTHORIZED' });
+    return;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch (e) {
+    json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+    return;
+  }
+  try {
+    json(res, 200, await buildArtifactToolDeck(payload));
+  } catch (e) {
+    const result = artifactToolUnavailableResult(String(payload?.job_id || 'unknown'), e);
+    json(res, 500, result);
+  }
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     json(res, 200, { ok: true, service: 'marty-deck-renderer' });
@@ -419,6 +440,10 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === 'POST' && req.url === '/render') {
     handleRender(req, res).catch(e => json(res, 500, { error: e instanceof Error ? e.message : String(e) }));
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/deck/build') {
+    handleDeckBuild(req, res).catch(e => json(res, 500, { error: e instanceof Error ? e.message : String(e) }));
     return;
   }
   json(res, 404, { error: 'NOT_FOUND' });

@@ -160,7 +160,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'create_deck_artifact',
-    description: 'Create a premium, HTML-first presentation deck bundle and save it to Documents. Use for decks, slide decks, PowerPoint presentations, board/IC decks, recaps, pitches, and any request where visual composition matters. Produces a PPTX plus HTML/PDF companion exports after deck QA.',
+    description: 'Create a premium artifact-tool presentation deck bundle and save it to Documents. Use for decks, slide decks, PowerPoint presentations, board/IC decks, recaps, pitches, and any request where visual composition matters. Premium mode produces editable PPTX plus HTML/PDF companion exports after source-ledger, contact-sheet, and critic QA.',
     input_schema: {
       type: 'object',
       properties: {
@@ -173,6 +173,15 @@ const AGENT_TOOLS: ToolDefinition[] = [
         quality_mode: { type: 'string', enum: ['fast', 'premium'], description: 'Use premium unless the user explicitly asks for rough/fast.' },
         structured_content: { type: 'object', description: 'Optional complete deck content. Include slides, metrics, tables, evidence_blocks, and speaker_notes when known.' },
         source_document_ids: { type: 'array', items: { type: 'string' }, description: 'Optional source document IDs used to create the deck.' },
+        source_packet: {
+          type: 'object',
+          description: 'Optional source ledger for premium artifact-tool decks. Include internal_sources with ids/titles/excerpts, web_sources with URLs/titles/dates/excerpts, and open_questions for missing evidence. Every factual claim should map to a source or open question.',
+          properties: {
+            internal_sources: { type: 'array', items: { type: 'object' } },
+            web_sources: { type: 'array', items: { type: 'object' } },
+            open_questions: { type: 'array', items: { type: 'string' } },
+          },
+        },
       },
       required: ['prompt'],
     },

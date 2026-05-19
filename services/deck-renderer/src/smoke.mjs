@@ -63,6 +63,47 @@ try {
     throw new Error(`Smoke render failed: ${JSON.stringify(body).slice(0, 500)}`);
   }
   console.log(`[deck-renderer] smoke ok: status=${body.status}, screenshots=${body.screenshots.length}`);
+
+  const artifactRes = await fetch(`http://127.0.0.1:${port}/deck/build`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      job_id: 'artifact-smoke',
+      title: 'Artifact Tool Smoke Deck',
+      prompt: 'Build an investment-style deck that proves artifact-tool PPTX/PDF/HTML generation works.',
+      audience: 'internal IC',
+      objective: 'decide',
+      quality_mode: 'premium',
+      output_formats: ['pptx', 'pdf', 'html'],
+      source_packet: {
+        internal_sources: [
+          {
+            id: 'crm_1',
+            title: 'CRM opportunity record',
+            excerpt: 'The opportunity entered the pipeline on May 9, 2026. The source record identifies a founder, a product thesis, and a missing pitch deck as an open diligence item.',
+          },
+          {
+            id: 'memo_1',
+            title: 'Diligence memo excerpt',
+            excerpt: 'The strongest current signal is decision-intelligence positioning for finance and energy users, but commercial traction and fundraising terms remain unverified.',
+          },
+        ],
+        web_sources: [
+          {
+            url: 'https://example.com/company',
+            title: 'Company public page',
+            excerpt: 'Public materials describe predictive analytics, risk workflows, and executive decision support.',
+          },
+        ],
+        open_questions: ['Confirm current customer traction and financing terms.'],
+      },
+    }),
+  });
+  const artifactBody = await artifactRes.json();
+  if (!artifactRes.ok || !artifactBody.pptx_base64 || !artifactBody.pdf_base64 || !artifactBody.html || artifactBody.screenshots?.length < 6) {
+    throw new Error(`Artifact smoke failed: ${JSON.stringify(artifactBody).slice(0, 500)}`);
+  }
+  console.log(`[deck-renderer] artifact smoke ok: status=${artifactBody.status}, screenshots=${artifactBody.screenshots.length}, pptx=${artifactBody.pptx_base64.length}`);
 } finally {
   server.kill('SIGTERM');
 }
