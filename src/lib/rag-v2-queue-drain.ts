@@ -12,7 +12,11 @@ import { RAG_V2_WORK_QUEUE_DOMAIN } from './rag-v2';
 
 const DEFAULT_DISPATCH_BATCH = 600;
 const DEFAULT_MAX_ACTIVE = 720;
-const RAG_V2_QUEUE_LOCK_TTL_MS = 30 * 60 * 1000;
+// Queue messages may wait behind earlier large-document jobs before the
+// consumer starts auto-heartbeating the row. Keep this lease comfortably
+// above the dispatch backlog window so healthy queued work is not reclaimed
+// as stale before it has a chance to run.
+const RAG_V2_QUEUE_LOCK_TTL_MS = 2 * 60 * 60 * 1000;
 
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value || '', 10);

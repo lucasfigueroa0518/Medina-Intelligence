@@ -170,6 +170,7 @@ import { dealReplayEvidenceHandler } from './work-queue-handlers/deal-replay-evi
 import { intelligentImportHandler } from './work-queue-handlers/intelligent-import';
 import { martyLabExperimentHandler } from './work-queue-handlers/marty-lab-experiment';
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
+import { semanticIntelligenceHandler } from './work-queue-handlers/semantic-intelligence';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -203,6 +204,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   intelligentImportHandler,
   martyLabExperimentHandler,
   ragReindexV2Handler,
+  semanticIntelligenceHandler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────
@@ -343,6 +345,77 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
         // locked_until elapses.
         stats.failed++;
       }
+    }
+    result.per_domain.push(stats);
+  }
+
+  return result;
+}
+
+export async function processWorkQueueDomainBurst(
+  env: Env,
+  domain: string,
+  maxBatches: number
+): Promise<ProcessTickResult> {
+  const result: ProcessTickResult = {
+    swept: 0,
+    open_circuits: [],
+    per_domain: [],
+  };
+  const handler = WORK_QUEUE_HANDLERS.find(h => h.domain === domain);
+  if (!handler) return result;
+
+  const batchCount = Math.max(1, Math.min(Math.floor(maxBatches), 16));
+  try {
+    result.open_circuits = await getOpenCircuits(env);
+  } catch (e) {
+    console.error('[work-queue] burst getOpenCircuits failed:', e instanceof Error ? e.message : e);
+    result.open_circuits = [];
+  }
+
+  for (let i = 0; i < batchCount; i++) {
+    const stats = { domain: handler.domain, claimed: 0, completed: 0, failed: 0 };
+    let claimLimit = Math.min(handler.batchSize, 10);
+    try {
+      if (handler.maxConcurrent !== undefined) {
+        const active = await env.D1.prepare(
+          `SELECT COUNT(*) AS count FROM work_queue
+            WHERE domain = ? AND status = 'in_progress'`
+        ).bind(handler.domain).first<{ count: number }>();
+        const activeCount = active?.count ?? 0;
+        const available = handler.maxConcurrent - activeCount;
+        if (available <= 0) {
+          result.per_domain.push(stats);
+          break;
+        }
+        claimLimit = Math.min(claimLimit, available);
+      }
+
+      const claimed = await claimNextBatch(
+        env,
+        handler.domain,
+        claimLimit,
+        result.open_circuits
+      );
+      stats.claimed = claimed.length;
+      if (claimed.length === 0) {
+        result.per_domain.push(stats);
+        break;
+      }
+
+      for (const item of claimed) {
+        try {
+          const itemResult = await processClaimedWorkItem(env, handler, item);
+          if (itemResult.completed) stats.completed++;
+          if (itemResult.failed) stats.failed++;
+        } catch {
+          stats.failed++;
+        }
+      }
+    } catch (e) {
+      console.error(`[work-queue] burst failed for ${handler.domain}:`, e instanceof Error ? e.message : e);
+      result.per_domain.push(stats);
+      break;
     }
     result.per_domain.push(stats);
   }

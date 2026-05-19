@@ -15,6 +15,7 @@ import {
   normalizeDocumentCards,
   type MartyDocumentCard,
 } from '../lib/document-artifacts';
+import { structuredDataQueryTool } from '../lib/structured-query';
 import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { SESSION_TITLE_PROMPT } from '../prompts/session-title';
 import { estimateTokens, truncateToTokens } from '../lib/tokens';
@@ -101,6 +102,38 @@ const AGENT_TOOLS: ToolDefinition[] = [
         limit: { type: 'number', description: 'Max results. Default 20, max 50.' },
       },
       required: ['query'],
+    },
+  },
+
+  {
+    name: 'structured_data_query',
+    description: 'Run deterministic structured CRM/semantic queries and optionally export the result to Excel. Use this instead of recall when the user asks "how many", "count", "list all", "pull names/emails", "export", "Excel", "mail merge", or asks for database-wide entity aggregation. Covers companies/funds, contacts, contacts at matching companies/funds, deals, documents, people rows inside documents/spreadsheets, events, event people/attendees/invitees, and campaign recipients. Uses CRM fields plus evidence-backed semantic assertions. event_people also scans matching attendee/contact spreadsheets and document rows when the user names an event or document. Examples: Florida cybersecurity venture funds → target="companies", operation="list" or "count", filters={investor_only:true, locations:["Florida","Miami","Orlando","Tampa","South Florida"], sectors:["cybersecurity"], semantic_terms:["cybersecurity"]}. Outreach list for those funds → target="company_contacts", operation="export_xlsx", filters={investor_only:true, locations:["Florida"], sectors:["cybersecurity"], semantic_terms:["cybersecurity"], has_email:true}. Named spreadsheet mail merge → target="document_people", operation="export_xlsx", filters={document_query:"South Florida VC directory v0", has_email:true}. Webinar mail merge → target="event_people", operation="export_xlsx", filters={event_title:"Intelligent Infrastructure", event_date:"2026-05-07", invited_by_users:["me","Raul"], include_internal:false, has_email:true}, fields=["first_name","email","full_name","company_name","source_title","source_type"].',
+    input_schema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          enum: ['companies', 'company_contacts', 'contacts', 'deals', 'document_people', 'events', 'event_people', 'campaign_recipients', 'documents'],
+          description: 'Entity family to query. Use company_contacts for people at companies/funds matching semantic/company filters. Use document_people for names/emails inside a named spreadsheet/document. Use event_people for attendee/invitee/mail-merge lists because it combines campaign recipients, event attendees, and matching attendee/contact spreadsheets.',
+        },
+        operation: {
+          type: 'string',
+          enum: ['count', 'list', 'export_xlsx'],
+          description: 'Use count for aggregate totals, list for rows, export_xlsx when the user asks for Excel/download/mail merge.',
+        },
+        filters: {
+          type: 'object',
+          description: 'Structured filters. Supported keys include keyword, keywords, company_types, contact_types, stages, statuses, sectors, locations, semantic_terms, semantic_predicates, investor_only, has_email, event_title, event_date, date_from, date_to, invited_by_users, include_internal, document_types, document_query, source_document_ids, include_document_people.',
+        },
+        fields: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional output columns. For mail merge use first_name and email. If omitted, sensible defaults from the query are returned.',
+        },
+        limit: { type: 'number', description: 'Max rows. Default 100 for list, 5000 for count scans, and 2500 for Excel. Max 500 list, 2500 export.' },
+        export_title: { type: 'string', description: 'Title for the generated Excel file when operation=export_xlsx.' },
+      },
+      required: ['target'],
     },
   },
 
@@ -631,6 +664,7 @@ async function executeTool(
     case 'search_companies': return searchCompanies(ctx, toolInput, env);
     case 'search_deals': return searchDeals(ctx, toolInput, env);
     case 'search_conversations': return searchConversations(ctx, toolInput, env);
+    case 'structured_data_query': return structuredDataQueryTool(ctx, toolInput, env);
     case 'find_documents': return findDocumentsTool(ctx, toolInput, env);
     case 'create_document_artifact': return createDocumentArtifactTool(ctx, toolInput, env);
     case 'edit_document_artifact': return editDocumentArtifactTool(ctx, toolInput, env);

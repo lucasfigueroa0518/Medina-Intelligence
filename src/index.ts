@@ -6,7 +6,7 @@ import type { AuthContext } from './types/interfaces';
 import type { AuditEvent } from './types/audit';
 import type { WebhookQueueMessage } from './types/webhooks';
 
-import { requireAuth, requireRole } from './handlers/auth';
+import { normalizeBearerToken, requireAuth, requireRole } from './handlers/auth';
 import { isTokenRevoked } from './handlers/auth-login';
 import * as AuthLogin from './handlers/auth-login';
 import { jsonResponse, errorResponse } from './handlers/utils';
@@ -191,8 +191,8 @@ if (path === '/webhooks/firefly' && method === 'POST') {
   // Check token revocation. Mirrors requireAuth: header preferred, ?token= fallback
   // so the revocation check applies to browser-initiated GETs (e.g. <img> avatars) too.
   const authHeader = request.headers.get('Authorization') || '';
-  let rawToken = authHeader.replace(/^Bearer\s+/i, '');
-  if (!rawToken) rawToken = url.searchParams.get('token') || '';
+  let rawToken = normalizeBearerToken(authHeader);
+  if (!rawToken) rawToken = normalizeBearerToken(url.searchParams.get('token') || '');
   if (rawToken) {
     const revoked = await isTokenRevoked(rawToken, env);
     if (revoked) {
@@ -777,10 +777,18 @@ async function routeAuthenticated(
       return Admin.getRagV2BackfillStatus(ctx, env);
     if (path === '/api/admin/rag-v2/eval/run' && method === 'POST')
       return Admin.runRagV2Eval(request, ctx, env);
+    if (path === '/api/admin/marty-workflows/smoke-test' && method === 'POST')
+      return Admin.runMartyWorkflowSmokeTest(request, ctx, env);
     if (path === '/api/admin/rag-v2/cutover' && method === 'POST')
       return Admin.cutoverRagV2(request, ctx, env);
     if (path === '/api/admin/rag-v2/rollback' && method === 'POST')
       return Admin.rollbackRagV2(request, ctx, env);
+    if (path === '/api/admin/semantic-intelligence/backfill/start' && method === 'POST')
+      return Admin.startSemanticIntelligenceBackfill(request, ctx, env);
+    if (path === '/api/admin/semantic-intelligence/backfill/status' && method === 'GET')
+      return Admin.getSemanticIntelligenceBackfillStatus(ctx, env);
+    if (path === '/api/admin/semantic-intelligence/watchdog/run' && method === 'POST')
+      return Admin.runSemanticIntelligenceWatchdog(request, ctx, env);
     if (path === '/api/admin/recover-deal-conversation-links' && method === 'POST')
       return Admin.recoverDealConversationLinks(request, ctx, env);
     if (path === '/api/admin/progressive-backfill' && method === 'POST')
@@ -1092,10 +1100,39 @@ export async function handleScheduled(
           try {
             const { processWorkQueueTick } = await import('./lib/work-queue-driver');
             await processWorkQueueTick(env);
+            const semanticBurstTicks = Math.max(
+              0,
+              Math.min(parseInt(env.SEMANTIC_INTELLIGENCE_BURST_TICKS || '0', 10) || 0, 16)
+            );
+            if (semanticBurstTicks > 0) {
+              const { processWorkQueueDomainBurst } = await import('./lib/work-queue-driver');
+              const { SEMANTIC_INTELLIGENCE_DOMAIN } = await import('./lib/semantic-intelligence');
+              const result = await processWorkQueueDomainBurst(env, SEMANTIC_INTELLIGENCE_DOMAIN, semanticBurstTicks);
+              const completed = result.per_domain.reduce((sum, row) => sum + row.completed, 0);
+              if (completed > 0) {
+                console.log(`[semantic-intelligence] burst org=${org.id} completed=${completed}`);
+              }
+            }
           } catch (e) {
             console.error(`work-queue tick failed for ${org.id}:`, e);
           }
         })());
+
+        if ((env.SEMANTIC_INTELLIGENCE_WATCHDOG_ENABLED || '').toLowerCase() === 'true') {
+          ctxExec.waitUntil((async () => {
+            try {
+              const { enqueueSemanticIntelligenceBackfill } = await import('./lib/semantic-intelligence');
+              await enqueueSemanticIntelligenceBackfill(env, org.id, {
+                limitPerTable: 150,
+                dryRun: false,
+                useLlm: false,
+                force: false,
+              });
+            } catch (e) {
+              console.error(`semantic intelligence watchdog failed for ${org.id}:`, e);
+            }
+          })());
+        }
 
         ctxExec.waitUntil((async () => {
           try {

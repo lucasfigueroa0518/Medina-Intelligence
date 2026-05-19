@@ -22,6 +22,14 @@ import {
   RAG_V2_WORK_QUEUE_DOMAIN,
   type RagV2ReindexPayload,
 } from '../lib/rag-v2';
+import {
+  enqueueSemanticIntelligenceBackfill,
+  getSemanticIntelligenceStatus,
+  SEMANTIC_INTELLIGENCE_VERSION,
+  SEMANTIC_SOURCE_TABLES,
+} from '../lib/semantic-intelligence';
+import { runMartyWorkflowSmoke } from '../lib/marty-workflow-smoke';
+import type { SemanticSourceTable } from '../types/semantic-intelligence';
 import { getEmbeddingProfile, RAG_V2_EMBEDDING_PROFILES } from '../lib/embedding';
 import {
   createProgressiveBackfill as libCreateProgressiveBackfill,
@@ -452,6 +460,25 @@ export async function runRagV2Eval(
   });
 }
 
+export async function runMartyWorkflowSmokeTest(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner' && ctx.userRole !== 'admin' && ctx.userRole !== 'super_admin') {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only admins can run MARTy workflow smoke tests.');
+  }
+  const body = await parseJsonBody<{ case_ids?: string[]; sample_rows?: number }>(request);
+  const result = await runMartyWorkflowSmoke(ctx, env, {
+    caseIds: Array.isArray(body?.case_ids) ? body.case_ids : undefined,
+    sampleRows: body?.sample_rows,
+  });
+  return jsonResponse({
+    ...result,
+    note: 'Runs boss-style MARTy structured workflow acceptance checks through structured_data_query. It does not create export artifacts or enable LLM extraction.',
+  }, (result as any).ok ? 200 : 500);
+}
+
 export async function cutoverRagV2(
   request: Request,
   ctx: AuthContext,
@@ -493,6 +520,76 @@ export async function rollbackRagV2(
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
   ).bind(ctx.orgId, body?.notes || null, ctx.userId).run();
   return jsonResponse({ ok: true, retrieval_version: 'v1' });
+}
+
+function normalizeSemanticSourceTables(raw: unknown): SemanticSourceTable[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const tables = raw
+    .map(value => String(value || '').trim())
+    .filter((table): table is SemanticSourceTable => SEMANTIC_SOURCE_TABLES.includes(table as SemanticSourceTable));
+  return tables.length > 0 ? tables : undefined;
+}
+
+export async function startSemanticIntelligenceBackfill(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    source_tables?: SemanticSourceTable[];
+    limit_per_table?: number;
+    dry_run?: boolean;
+    use_llm?: boolean;
+    force?: boolean;
+  }>(request);
+  const result = await enqueueSemanticIntelligenceBackfill(env, ctx.orgId, {
+    sourceTables: normalizeSemanticSourceTables(body?.source_tables),
+    limitPerTable: Math.max(1, Math.min(body?.limit_per_table ?? 100, 5000)),
+    dryRun: body?.dry_run === true,
+    useLlm: body?.use_llm === true,
+    force: body?.force === true,
+  });
+  return jsonResponse({
+    ...result,
+    note: result.use_llm
+      ? 'LLM semantic extraction was explicitly requested for these queued rows.'
+      : 'Deterministic/evidence-backed semantic indexing only; no LLM calls queued.',
+  });
+}
+
+export async function getSemanticIntelligenceBackfillStatus(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  return jsonResponse(await getSemanticIntelligenceStatus(env, ctx.orgId));
+}
+
+export async function runSemanticIntelligenceWatchdog(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const body = await parseJsonBody<{
+    source_tables?: SemanticSourceTable[];
+    limit_per_table?: number;
+    dry_run?: boolean;
+    use_llm?: boolean;
+  }>(request);
+  const result = await enqueueSemanticIntelligenceBackfill(env, ctx.orgId, {
+    sourceTables: normalizeSemanticSourceTables(body?.source_tables),
+    limitPerTable: Math.max(1, Math.min(body?.limit_per_table ?? 250, 5000)),
+    dryRun: body?.dry_run !== false,
+    useLlm: body?.use_llm === true,
+    force: false,
+  });
+  return jsonResponse({
+    ...result,
+    semantic_version: SEMANTIC_INTELLIGENCE_VERSION,
+    watchdog_mode: true,
+    note: result.dry_run
+      ? 'Dry run only. Pass {"dry_run": false} to enqueue missing/stale completed RAG sources.'
+      : 'Queued missing/stale completed RAG sources for semantic refresh.',
+  });
 }
 
 // Manual trigger for the daily cron handler (matches the 0 0 * * * cron).

@@ -10,6 +10,7 @@ export async function verifyJwt(
   token: string,
   env: Env
 ): Promise<AuthContext | null> {
+  token = normalizeBearerToken(token);
   const parts = token.split('.');
   if (parts.length !== 3) return null;
 
@@ -24,13 +25,18 @@ export async function verifyJwt(
     ['verify']
   );
 
-  const sigBytes = base64UrlDecode(sigB64);
-  const valid = await crypto.subtle.verify(
-    'HMAC',
-    key,
-    sigBytes,
-    new TextEncoder().encode(data)
-  );
+  let valid = false;
+  try {
+    const sigBytes = base64UrlDecode(sigB64);
+    valid = await crypto.subtle.verify(
+      'HMAC',
+      key,
+      sigBytes,
+      new TextEncoder().encode(data)
+    );
+  } catch {
+    return null;
+  }
   if (!valid) return null;
 
   let payload: any;
@@ -65,6 +71,7 @@ export async function verifyPurposeJwt(
   env: Env,
   purpose: string
 ): Promise<{ sub: string; org_id: string; email: string; purpose: string; exp: number } | null> {
+  token = normalizeBearerToken(token);
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const [headerB64, payloadB64, sigB64] = parts;
@@ -76,8 +83,13 @@ export async function verifyPurposeJwt(
     false,
     ['verify']
   );
-  const sigBytes = base64UrlDecode(sigB64);
-  const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(data));
+  let valid = false;
+  try {
+    const sigBytes = base64UrlDecode(sigB64);
+    valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(data));
+  } catch {
+    return null;
+  }
   if (!valid) return null;
   let payload: any;
   try {
@@ -135,8 +147,17 @@ function base64UrlEncodeBytes(bytes: Uint8Array): string {
     .replace(/=+$/, '');
 }
 function base64UrlDecode(b64: string): Uint8Array {
-  const padded = b64.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (b64.length % 4)) % 4);
+  const normalized = String(b64 || '').trim().replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  if (normalized.length % 4 === 1) throw new Error('Invalid base64url length');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
   return Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+}
+
+export function normalizeBearerToken(token: string): string {
+  let normalized = String(token || '').trim();
+  normalized = normalized.replace(/^Bearer\s+/i, '').trim();
+  normalized = normalized.replace(/^['"]|['"]$/g, '').trim();
+  return normalized.replace(/\s+/g, '');
 }
 
 /**
@@ -148,13 +169,13 @@ export async function requireAuth(
   env: Env
 ): Promise<AuthContext | Response> {
   const authHeader = request.headers.get('Authorization') || '';
-  let token = authHeader.replace(/^Bearer\s+/i, '');
+  let token = normalizeBearerToken(authHeader);
   // Fallback for browser-initiated GETs that can't set Authorization headers
   // (e.g. <img src> for avatars). Header is preferred when present.
   if (!token) {
     try {
       const url = new URL(request.url);
-      token = url.searchParams.get('token') || '';
+      token = normalizeBearerToken(url.searchParams.get('token') || '');
     } catch { /* ignore */ }
   }
   if (!token) {
