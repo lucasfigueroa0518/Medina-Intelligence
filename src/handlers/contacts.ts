@@ -10,6 +10,7 @@ import { isDocumentAccessibleToUser } from '../lib/document-acl';
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { updateContactFields } from '../lib/entity-writes';
+import { cleanIntelligenceBrief } from '../lib/intelligence-briefing';
 
 // --- GET /api/contacts ---
 
@@ -117,14 +118,77 @@ export async function listContacts(
     binds.push(filter.meetings_last_30d_min);
   }
 
-  // Search — joins `name`, `email`, and the linked company name. The LEFT
-  // JOIN to companies is already present (we select co.name), so this LIKE
-  // adds no extra round-trip.
+  // Search — contact text plus company intelligence. In addition to the
+  // direct company_id join, match companies connected through associations,
+  // active deal membership, and email-domain inference so searching for
+  // "Trivest" finds people at/around Trivest even when the contact row has
+  // not been explicitly linked yet.
   const search = sp.get('search') ?? filter.keyword;
   if (search) {
     const pat = `%${search}%`;
-    where.push('(c.full_name LIKE ? OR c.email LIKE ? OR co.name LIKE ?)');
-    binds.push(pat, pat, pat);
+    where.push(`(
+      c.full_name LIKE ?
+      OR c.email LIKE ?
+      OR c.job_title LIKE ?
+      OR c.bio_summary LIKE ?
+      OR c.custom_fields LIKE ?
+      OR co.name LIKE ?
+      OR co.domain LIKE ?
+      OR co.website LIKE ?
+      OR EXISTS (
+        SELECT 1
+          FROM entity_associations ea
+          JOIN companies eco
+            ON eco.id = CASE
+                 WHEN ea.entity_a_type = 'company' THEN ea.entity_a_id
+                 ELSE ea.entity_b_id
+               END
+         WHERE ea.org_id = c.org_id
+           AND eco.org_id = c.org_id
+           AND eco.deleted_at IS NULL
+           AND eco.merged_into IS NULL
+           AND (
+             (ea.entity_a_type = 'contact' AND ea.entity_a_id = c.id AND ea.entity_b_type = 'company')
+             OR (ea.entity_b_type = 'contact' AND ea.entity_b_id = c.id AND ea.entity_a_type = 'company')
+           )
+           AND (eco.name LIKE ? OR eco.domain LIKE ? OR eco.website LIKE ?)
+      )
+      OR EXISTS (
+        SELECT 1
+          FROM deal_contacts dc
+          JOIN deals d ON d.id = dc.deal_id
+          JOIN companies dco ON dco.id = d.company_id
+         WHERE dc.contact_id = c.id
+           AND d.org_id = c.org_id
+           AND d.deleted_at IS NULL
+           AND dco.org_id = c.org_id
+           AND dco.deleted_at IS NULL
+           AND dco.merged_into IS NULL
+           AND (dco.name LIKE ? OR dco.domain LIKE ? OR dco.website LIKE ?)
+      )
+      OR EXISTS (
+        SELECT 1
+          FROM companies sco
+         WHERE sco.org_id = c.org_id
+           AND sco.deleted_at IS NULL
+           AND sco.merged_into IS NULL
+           AND sco.domain IS NOT NULL
+           AND sco.domain != ''
+           AND c.email IS NOT NULL
+           AND (sco.name LIKE ? OR sco.domain LIKE ? OR sco.website LIKE ?)
+           AND (
+             LOWER(c.email) LIKE '%@' || LOWER(sco.domain)
+             OR LOWER(c.email) LIKE '%@%.' || LOWER(sco.domain)
+           )
+      )
+    )`);
+    binds.push(
+      pat, pat, pat, pat, pat,
+      pat, pat, pat,
+      pat, pat, pat,
+      pat, pat, pat,
+      pat, pat, pat,
+    );
   }
 
   if (filter.has_followup_overdue) {
@@ -184,8 +248,63 @@ export async function listContacts(
   // matches user expectation; otherwise just append id for stable pagination.
   const tieBreak = sortKey === 'status' ? ', c.full_name ASC' : ', c.id ASC';
 
+  const companyNameSql = `
+    COALESCE(
+      co.name,
+      (
+        SELECT eco.name
+          FROM entity_associations ea
+          JOIN companies eco
+            ON eco.id = CASE
+                 WHEN ea.entity_a_type = 'company' THEN ea.entity_a_id
+                 ELSE ea.entity_b_id
+               END
+         WHERE ea.org_id = c.org_id
+           AND eco.org_id = c.org_id
+           AND eco.deleted_at IS NULL
+           AND eco.merged_into IS NULL
+           AND (
+             (ea.entity_a_type = 'contact' AND ea.entity_a_id = c.id AND ea.entity_b_type = 'company')
+             OR (ea.entity_b_type = 'contact' AND ea.entity_b_id = c.id AND ea.entity_a_type = 'company')
+           )
+         ORDER BY ea.strength DESC
+         LIMIT 1
+      ),
+      (
+        SELECT dco.name
+          FROM deal_contacts dc
+          JOIN deals d ON d.id = dc.deal_id
+          JOIN companies dco ON dco.id = d.company_id
+         WHERE dc.contact_id = c.id
+           AND d.org_id = c.org_id
+           AND d.deleted_at IS NULL
+           AND dco.org_id = c.org_id
+           AND dco.deleted_at IS NULL
+           AND dco.merged_into IS NULL
+         ORDER BY d.updated_at DESC
+         LIMIT 1
+      ),
+      (
+        SELECT sco.name
+          FROM companies sco
+         WHERE sco.org_id = c.org_id
+           AND sco.deleted_at IS NULL
+           AND sco.merged_into IS NULL
+           AND sco.domain IS NOT NULL
+           AND sco.domain != ''
+           AND c.email IS NOT NULL
+           AND (
+             LOWER(c.email) LIKE '%@' || LOWER(sco.domain)
+             OR LOWER(c.email) LIKE '%@%.' || LOWER(sco.domain)
+           )
+         ORDER BY LENGTH(sco.domain) DESC
+         LIMIT 1
+      )
+    )
+  `;
+
   const sql = `
-    SELECT c.*, co.name as company_name
+    SELECT c.*, ${companyNameSql} as company_name
     FROM contacts c
     LEFT JOIN companies co ON c.company_id = co.id
     ${tagJoin}
@@ -1018,10 +1137,10 @@ export async function getContactEnrichment(
   let fullBio: string | null = null;
   try {
     const parsed = JSON.parse(raw) as { full_bio?: string };
-    fullBio = parsed.full_bio ?? null;
+    fullBio = cleanIntelligenceBrief(parsed.full_bio) || null;
   } catch {
     // Legacy format: raw body IS the bio text.
-    fullBio = raw;
+    fullBio = cleanIntelligenceBrief(raw) || null;
   }
 
   return jsonResponse({

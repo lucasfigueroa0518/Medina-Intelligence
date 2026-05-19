@@ -18,6 +18,7 @@ import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
+import { cleanIntelBrief } from '@/lib/intelligence-briefing';
 import {
   DEMO_IDS,
   demoContactDetailFixture,
@@ -1420,16 +1421,6 @@ function cleanValue(raw: any): string {
     if (typeof parsed === 'string') return parsed;
   } catch { /* not JSON */ }
   return s;
-}
-
-function cleanIntelBrief(raw: string | null | undefined): string {
-  if (!raw) return '';
-  return raw
-    .replace(/^\s*\[(?:source|sources?)\s*:\s*[^\]]+\]\s*/gim, '')
-    .replace(/\s*\[(?:source|sources?)\s*:\s*[^\]]+\]\s*/gi, ' ')
-    .replace(/^\s*(?:source|sources?)\s*:\s*(?:gemini|claude|web_search|reversecontact)[^\n]*\n?/gim, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
 }
 
 function shortUrl(v: string): string {

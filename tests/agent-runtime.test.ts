@@ -67,6 +67,35 @@ describe('MARTy turn runtime contracts', () => {
     expect(planDeterministicSourceRouting('What should I do next?').calls).toHaveLength(0);
   });
 
+  it('routes platform operations questions through telemetry instead of CRM recall', () => {
+    const plan = planDeterministicSourceRouting('How many emails has Raul ingested into the platform? Has he run a backfill?');
+
+    expect(plan.intent).toBe('platform');
+    expect(plan.calls).toHaveLength(1);
+    expect(plan.calls[0]).toMatchObject({
+      tool: 'inspect_platform_telemetry',
+      input: { topic: 'auto' },
+    });
+  });
+
+  it('routes MARTy runtime questions through platform telemetry', () => {
+    const plan = planDeterministicSourceRouting('What model are you running and what is the runtime fingerprint?');
+
+    expect(plan.intent).toBe('platform');
+    expect(plan.calls[0].tool).toBe('inspect_platform_telemetry');
+  });
+
+  it('routes enrichment, news, and Gemini cadence questions through platform telemetry', () => {
+    const plan = planDeterministicSourceRouting('how often is company enrichment happening? the news? How consistently are we calling gemini?');
+
+    expect(plan.intent).toBe('platform');
+    expect(plan.calls).toHaveLength(1);
+    expect(plan.calls[0]).toMatchObject({
+      tool: 'inspect_platform_telemetry',
+      input: { topic: 'auto' },
+    });
+  });
+
   it('routes portfolio and pipeline questions through the firm-state snapshot first', () => {
     const plan = planDeterministicSourceRouting('rank our current portfolio companies by the strength of their financials');
 

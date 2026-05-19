@@ -248,6 +248,9 @@ type MartyMode = 'fast' | 'max';
 const MARTY_MODE_STORAGE_KEY = 'marty_chat_mode';
 const MARTY_PENDING_STORAGE_KEY = 'marty_pending';
 const MARTY_PENDING_RUNS_STORAGE_KEY = 'marty_pending_runs';
+const MARTY_ACTIVE_SESSION_STORAGE_KEY = 'marty_active_session';
+const MARTY_COMPOSER_DRAFTS_STORAGE_KEY = 'marty_composer_drafts_v1';
+const MARTY_NEW_SESSION_DRAFT_KEY = '__new__';
 
 // Selected/in-flight uploads (state local to the input bar before send).
 interface PendingUpload {
@@ -264,7 +267,7 @@ interface PendingUpload {
   failed?: string | null;
 }
 
-const ACCEPTED_FILE_EXTS = '.pdf,.png,.jpg,.jpeg,.webp,.gif,.docx,.xlsx,.xls,.pptx,.csv,.txt,.md,.json';
+const ACCEPTED_FILE_EXTS = 'image/*,.pdf,.docx,.xlsx,.xls,.pptx,.csv,.txt,.md,.json,.png,.jpg,.jpeg,.webp,.gif';
 const MAX_PENDING_UPLOADS = 5;
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
 
@@ -289,6 +292,115 @@ function detectClientUploadType(file: File): import('@/lib/api').ChatUploadType 
     case 'txt': case 'md': return 'text';
     default: return null;
   }
+}
+
+function extensionForMime(mimeType: string): string {
+  switch ((mimeType || '').toLowerCase()) {
+    case 'application/pdf': return 'pdf';
+    case 'image/png': return 'png';
+    case 'image/jpeg':
+    case 'image/jpg': return 'jpg';
+    case 'image/webp': return 'webp';
+    case 'image/gif': return 'gif';
+    case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': return 'docx';
+    case 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': return 'xlsx';
+    case 'application/vnd.ms-excel': return 'xls';
+    case 'application/vnd.openxmlformats-officedocument.presentationml.presentation': return 'pptx';
+    case 'text/csv': return 'csv';
+    case 'text/markdown': return 'md';
+    case 'application/json': return 'json';
+    case 'text/plain': return 'txt';
+    default: return 'bin';
+  }
+}
+
+function normalizeClipboardFileName(file: File, index: number): File {
+  const name = (file.name || '').trim();
+  if (name) return file;
+  const type = detectClientUploadType(file);
+  const noun = type === 'image' ? 'image' : 'document';
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
+  const ext = extensionForMime(file.type);
+  return new File([file], `pasted-${noun}-${stamp}${index > 0 ? `-${index + 1}` : ''}.${ext}`, {
+    type: file.type,
+    lastModified: file.lastModified || Date.now(),
+  });
+}
+
+function filesFromClipboard(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  const files: File[] = [];
+  const seen = new Set<string>();
+  const add = (file: File | null) => {
+    if (!file) return;
+    const key = `${file.name}:${file.type}:${file.size}:${file.lastModified}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    files.push(file);
+  };
+
+  for (const item of Array.from(data.items || [])) {
+    if (item.kind === 'file') add(item.getAsFile());
+  }
+  for (const file of Array.from(data.files || [])) add(file);
+
+  return files.map(normalizeClipboardFileName);
+}
+
+function composerDraftKey(sessionId: string | null | undefined): string {
+  return sessionId || MARTY_NEW_SESSION_DRAFT_KEY;
+}
+
+function readComposerDrafts(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(MARTY_COMPOSER_DRAFTS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeComposerDrafts(drafts: Record<string, string>) {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(MARTY_COMPOSER_DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
+  } catch { /* ignore localStorage quota/private mode */ }
+}
+
+function readComposerDraft(sessionId: string | null | undefined): string {
+  return readComposerDrafts()[composerDraftKey(sessionId)] || '';
+}
+
+function persistComposerDraft(sessionId: string | null | undefined, value: string) {
+  const drafts = readComposerDrafts();
+  const key = composerDraftKey(sessionId);
+  if (value.length > 0) drafts[key] = value;
+  else delete drafts[key];
+  writeComposerDrafts(drafts);
+}
+
+function clearComposerDraft(sessionId: string | null | undefined) {
+  persistComposerDraft(sessionId, '');
+}
+
+function readStoredActiveMartySession(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const value = localStorage.getItem(MARTY_ACTIVE_SESSION_STORAGE_KEY);
+    return value && value !== 'undefined' && value !== 'null' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistActiveMartySession(sessionId: string | null) {
+  if (typeof window === 'undefined') return;
+  try {
+    if (sessionId) localStorage.setItem(MARTY_ACTIVE_SESSION_STORAGE_KEY, sessionId);
+    else localStorage.removeItem(MARTY_ACTIVE_SESSION_STORAGE_KEY);
+  } catch { /* ignore localStorage quota/private mode */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,7 +1557,7 @@ export default function GodModePage() {
   const demoMode = useDemoMode();
   const [sessions, setSessions] = React.useState<any[]>([]);
   const [sessionsLoading, setSessionsLoading] = React.useState(true);
-  const [activeSessionId, setActiveSessionId] = React.useState<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = React.useState<string | null>(readStoredActiveMartySession);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [input, setInput] = React.useState('');
   const [streaming, setStreaming] = React.useState(false);
@@ -1720,6 +1832,13 @@ export default function GodModePage() {
     }
   }, [pendingUploads.length, activeSessionId, showToast]);
 
+  const handleComposerPaste = React.useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = filesFromClipboard(event.clipboardData);
+    if (files.length === 0) return;
+    event.preventDefault();
+    handleFilesPicked(files);
+  }, [handleFilesPicked]);
+
   const togglePendingSave = React.useCallback((localId: string) => {
     setPendingUploads(prev => prev.map(u => {
       if (u.localId !== localId) return u;
@@ -1751,11 +1870,22 @@ export default function GodModePage() {
 
   React.useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
+    if (!demoMode) persistActiveMartySession(activeSessionId);
     syncRunningIndicators();
     const activeDraft = activeSessionId ? sessionDraftsRef.current[activeSessionId] : null;
     const runningMessage = activeDraft ? getRunningAssistantMessage(activeDraft) : null;
     setIsThinking(Boolean(activeSessionId && runningStreamsRef.current[activeSessionId] && !runningMessage?.content));
-  }, [activeSessionId, syncRunningIndicators]);
+  }, [activeSessionId, demoMode, syncRunningIndicators]);
+
+  React.useEffect(() => {
+    const draft = readComposerDraft(activeSessionId);
+    setInput(draft);
+    requestAnimationFrame(() => {
+      if (!inputRef.current) return;
+      inputRef.current.style.height = 'auto';
+      inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 200)}px`;
+    });
+  }, [activeSessionId]);
 
   React.useEffect(() => {
     messagesSnapshotRef.current = messages;
@@ -1832,6 +1962,7 @@ export default function GodModePage() {
   const removeSessionFromSidebar = React.useCallback((sessionId: string) => {
     deletedSessionIdsRef.current.add(sessionId);
     provisionalSessionIdsRef.current.delete(sessionId);
+    clearComposerDraft(sessionId);
     const nextDrafts = { ...sessionDraftsRef.current };
     delete nextDrafts[sessionId];
     sessionDraftsRef.current = nextDrafts;
@@ -2350,7 +2481,9 @@ export default function GodModePage() {
 
   // Fix 2: Auto-resize textarea
   function handleInputChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
-    setInput(e.target.value);
+    const nextValue = e.target.value;
+    setInput(nextValue);
+    persistComposerDraft(activeSessionIdRef.current, nextValue);
     e.target.style.height = 'auto';
     e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
   }
@@ -2358,6 +2491,10 @@ export default function GodModePage() {
   const sendMessage = async (queryText: string) => {
     const trimmedQuery = queryText.trim();
     if (!trimmedQuery) return;
+    if (pendingUploads.some(u => u.uploading)) {
+      showToast('Give the attachments a moment to finish uploading, then send.');
+      return;
+    }
 
     // Blue-chip interrupt behavior: a new prompt steers only the current chat.
     // Background chats keep running so users can work across sessions.
@@ -2422,6 +2559,7 @@ export default function GodModePage() {
     ] as Message[];
     setMessages(optimisticMessages);
     setInput('');
+    clearComposerDraft(activeSessionIdRef.current);
     setPlaceholderText('Ask MARTy anything...');
 
     if (!demoMode && creatingNewSession && requestSessionId) {
@@ -2840,6 +2978,7 @@ export default function GodModePage() {
     if (card.prompt === '__focus_input__') {
       setPlaceholderText('What would you like me to draft?');
       setInput('');
+      clearComposerDraft(activeSessionIdRef.current);
       setTimeout(() => inputRef.current?.focus(), 50);
     } else {
       sendMessage(card.prompt);
@@ -2848,9 +2987,10 @@ export default function GodModePage() {
 
   const isEmptyState = messages.length === 0;
   const hasInput = input.trim().length > 0;
+  const hasUploadingPending = pendingUploads.some(u => u.uploading);
   const activeSessionIsStreaming = Boolean(activeSessionId && runningSessionIds.includes(activeSessionId));
   const showStopButton = activeSessionIsStreaming && !hasInput;
-  const canSend = hasInput;
+  const canSend = hasInput && !hasUploadingPending;
 
   return (
     <div className="h-full flex overflow-hidden">
@@ -3043,9 +3183,9 @@ export default function GodModePage() {
               {messages.map(m =>
                 m.role === 'user' ? (
                   <div key={m.id} className="flex justify-end group/msg msg-slide-in">
-                    <div className="relative max-w-[92%] md:max-w-[75%]">
+                    <div className="relative flex max-w-[92%] md:max-w-[75%] flex-col items-end gap-2">
                       {m.attachments && m.attachments.length > 0 && (
-                        <div className="flex flex-wrap gap-1.5 justify-end mb-2">
+                        <div className="flex max-w-full flex-wrap justify-end gap-2">
                           {m.attachments.map(a => (
                             <SentUploadPill
                               key={a.id}
@@ -3233,24 +3373,6 @@ export default function GodModePage() {
               </span>
             </div>
           )}
-          {/* Pending uploads (selected but not yet sent) */}
-          {pendingUploads.length > 0 && (
-            <div className="mb-2 flex flex-wrap gap-2">
-              {pendingUploads.map(p => (
-                <PendingUploadPill
-                  key={p.localId}
-                  filename={p.file.name}
-                  sizeBytes={p.file.size}
-                  uploadType={p.uploadType}
-                  uploading={p.uploading}
-                  failed={p.failed}
-                  saveToDocuments={p.saveToDocuments}
-                  onToggleSave={() => togglePendingSave(p.localId)}
-                  onRemove={() => removePending(p.localId)}
-                />
-              ))}
-            </div>
-          )}
           {/* Toast */}
           {uploadToast && (
             <div className="mb-2 px-3 py-2 rounded-lg bg-semantic-error/15 border border-semantic-error/30 text-semantic-error text-xs"
@@ -3259,6 +3381,24 @@ export default function GodModePage() {
             </div>
           )}
           <div className="floating-input-bar" style={{ padding: '12px 16px' }}>
+            {pendingUploads.length > 0 && (
+              <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {pendingUploads.map(p => (
+                  <PendingUploadPill
+                    key={p.localId}
+                    file={p.file}
+                    filename={p.file.name}
+                    sizeBytes={p.file.size}
+                    uploadType={p.uploadType}
+                    uploading={p.uploading}
+                    failed={p.failed}
+                    saveToDocuments={p.saveToDocuments}
+                    onToggleSave={() => togglePendingSave(p.localId)}
+                    onRemove={() => removePending(p.localId)}
+                  />
+                ))}
+              </div>
+            )}
             <div className="flex items-center gap-3">
               {/* Paperclip — fixed 36x36, multi-select */}
               <label className="w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer shrink-0 transition-colors"
@@ -3323,6 +3463,7 @@ export default function GodModePage() {
                 ref={inputRef}
                 value={input}
                 onChange={handleInputChange}
+                onPaste={handleComposerPaste}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); }
                   if (e.key === 'd' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
@@ -3330,7 +3471,7 @@ export default function GodModePage() {
                     setMartyMode(mode => mode === 'max' ? 'fast' : 'max');
                   }
                 }}
-                placeholder={deepDive ? 'MAX mode — sweeping across everything...' : placeholderText}
+                placeholder={pendingUploads.length > 0 ? 'Ask about the attached files...' : (deepDive ? 'MAX mode — sweeping across everything...' : placeholderText)}
                 onBlur={() => {
                   setTimeout(() => {
                     if (document.activeElement !== inputRef.current) {
@@ -3375,7 +3516,7 @@ export default function GodModePage() {
                 <button
                   onClick={() => sendMessage(input)}
                   disabled={!canSend}
-                  title={activeSessionIsStreaming ? 'Stop current response and send' : 'Send'}
+                  title={hasUploadingPending ? 'Uploading attachments...' : (activeSessionIsStreaming ? 'Stop current response and send' : 'Send')}
                   className="w-9 h-9 flex items-center justify-center shrink-0 transition-all"
                   style={{
                     borderRadius: 10,

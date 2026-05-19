@@ -22,6 +22,7 @@ import { extractTextFromFile } from './file-extraction';
 import { classifyDocument } from './document-intelligence';
 import { classifyByFilename } from './document-filename-classifier';
 import { chunkEmbedAndPersistAll } from './embedding';
+import { enqueueDocumentEmbeddingRepair } from './document-embedding';
 
 // Wave 5 Phase E canonicalized to 4 active values. Legacy 'upload' and
 // 'manual' strings are migrated to canonical names by 0068 backfill.
@@ -144,6 +145,19 @@ async function computeSha256Hex(buf: ArrayBuffer): Promise<string> {
     .join('');
 }
 
+async function enqueueEmbeddingRepairBestEffort(
+  env: Env,
+  orgId: string,
+  documentId: string,
+  context: string
+): Promise<void> {
+  try {
+    await enqueueDocumentEmbeddingRepair(env, orgId, documentId, { priority: 30 });
+  } catch (e: any) {
+    console.error(`[persistDocument:${context}] failed to enqueue embed repair for ${documentId}:`, e?.message || e);
+  }
+}
+
 export async function persistDocument(
   input: PersistDocumentInput,
   env: Env
@@ -263,9 +277,12 @@ export async function persistDocument(
                     ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
                   )
                 );
+              } else {
+                await enqueueEmbeddingRepairBestEffort(env, input.orgId, existing.id, 'dedup-finalize');
               }
             } catch (e: any) {
               console.error(`[persistDocument:dedup-finalize] embed failed for ${existing.id}:`, e?.message || e);
+              await enqueueEmbeddingRepairBestEffort(env, input.orgId, existing.id, 'dedup-finalize');
             }
           }
 
@@ -485,9 +502,12 @@ export async function persistDocument(
                 ).bind(e.vectorId, e.entityId, e.sourceTable, e.orgId)
               )
             );
+          } else {
+            await enqueueEmbeddingRepairBestEffort(env, input.orgId, documentId, 'finalize');
           }
         } catch (e: any) {
           console.error(`[persistDocument:finalize] embed failed for ${documentId}:`, e?.message || e);
+          await enqueueEmbeddingRepairBestEffort(env, input.orgId, documentId, 'finalize');
         }
       }
 

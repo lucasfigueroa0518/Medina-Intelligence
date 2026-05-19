@@ -31,6 +31,7 @@ out
 
 # Claude Code
 .claude/scheduled_tasks.lock
+.claude/worktrees/
 
 # Logs
 *.log
@@ -48,3 +49,4 @@ Thumbs.db
 coverage
 **/coverage
 *.tsbuildinfo
+outputs/

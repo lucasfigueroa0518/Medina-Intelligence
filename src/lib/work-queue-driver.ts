@@ -168,9 +168,6 @@ import { calendarRefreshHandler } from './work-queue-handlers/calendar-refresh';
 import { fireflyWindowHandler } from './work-queue-handlers/firefly-window';
 import { dealReplayEvidenceHandler } from './work-queue-handlers/deal-replay-evidence';
 import { intelligentImportHandler } from './work-queue-handlers/intelligent-import';
-import { martyLabExperimentHandler } from './work-queue-handlers/marty-lab-experiment';
-import { martyLabArtifactReviewHandler } from './work-queue-handlers/marty-lab-artifact-review';
-import { martyLabCodePatchHandler } from './work-queue-handlers/marty-lab-code-patch';
 import { contactEnrichmentHandler } from './work-queue-handlers/contact-enrichment';
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 import { deckRenderHandler } from './work-queue-handlers/deck-render';
@@ -206,9 +203,8 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   dealReplayEvidenceHandler,
   intelligentImportHandler,
   contactEnrichmentHandler,
-  martyLabExperimentHandler,
-  martyLabArtifactReviewHandler,
-  martyLabCodePatchHandler,
+  // MARTy Sandbox handlers are intentionally not registered while the
+  // sandbox is disabled; queued sandbox rows must not consume model credits.
   ragReindexV2Handler,
   deckRenderHandler,
 ];

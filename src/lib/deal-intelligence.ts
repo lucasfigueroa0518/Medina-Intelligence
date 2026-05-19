@@ -26,6 +26,7 @@
 import type { Env } from '../types/env';
 import { callClaude } from './claude';
 import { canReadConversationContent, getSharingFlags, parseParticipantUserIds } from './helpers';
+import { cleanIntelligenceBrief } from './intelligence-briefing';
 
 // Tunables. Stored as constants so behavior is auditable.
 export const STALENESS_WINDOW_MS = 60 * 60 * 1000;            // 1h per locked freshness contract
@@ -98,7 +99,7 @@ function shapeRow(row: RawRow): DealIntelligence {
     momentum: (row.momentum as Momentum) ?? null,
     momentum_score: row.momentum_score,
     conversation_count: row.conversation_count,
-    brief_summary: row.brief_summary,
+    brief_summary: cleanIntelligenceBrief(row.brief_summary) || null,
     computed_at: row.computed_at,
     is_stale: stale,
   };
@@ -282,8 +283,8 @@ function parseClaudeIntelligence(raw: string): ClaudeIntelligence | null {
         : [],
       momentum: momentum as Momentum,
       momentum_score: typeof parsed.momentum_score === 'number' ? parsed.momentum_score : null,
-      brief_summary: typeof parsed.brief_summary === 'string' && parsed.brief_summary.trim().length > 0
-        ? parsed.brief_summary.trim().slice(0, 500)
+      brief_summary: typeof parsed.brief_summary === 'string'
+        ? (cleanIntelligenceBrief(parsed.brief_summary).slice(0, 500) || null)
         : null,
     };
   } catch { return null; }

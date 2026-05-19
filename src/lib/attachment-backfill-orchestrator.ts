@@ -362,20 +362,12 @@ async function processOneConversation(
         });
       }
 
-      // 3d. Queue embed for deferred processing. Phase 6 1a (2026-05-05):
-      // routes to work_queue via enqueueWork. Idempotency_key mirrors the
-      // prior UNIQUE(org_id, entity_id, source_table) — a re-run with
-      // the same documentId collapses cleanly via partial UNIQUE on
-      // (domain, idempotency_key).
+      // 3d. Queue embed for deferred processing. Document repairs use a
+      // rotating audit key so a prior terminal-but-unembedded work row cannot
+      // suppress a future self-heal pass.
       try {
-        const { enqueueWork } = await import('./work-queue');
-        await enqueueWork(env, ctx.orgId, 'embed_retry',
-          { entity_id: persisted.documentId, source_table: 'documents' },
-          {
-            upstream: 'bge',
-            idempotency_key: `${ctx.orgId}:${persisted.documentId}:documents`,
-          }
-        );
+        const { enqueueDocumentEmbeddingRepair } = await import('./document-embedding');
+        await enqueueDocumentEmbeddingRepair(env, ctx.orgId, persisted.documentId, { priority: 30 });
       } catch (e: any) {
         stats.errors.push({
           conversation_id: conversationId,

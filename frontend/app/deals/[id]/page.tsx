@@ -24,6 +24,7 @@ import { DocumentActions } from '@/components/document-actions';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { ExpandableText } from '@/components/expandable-text';
 import { ApiError, api } from '@/lib/api';
+import { cleanIntelBrief } from '@/lib/intelligence-briefing';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 import { demoDealDetailFixture, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import {
@@ -373,6 +374,7 @@ export default function DealDetailPage() {
       ? { value: dealAgeText.replace(' day', ''), unit: 'day' }
       : { value: dealAgeText, unit: '' };
   const topics = (effectiveIntelligence?.topics || []).slice(0, 8);
+  const briefSummary = cleanIntelBrief(effectiveIntelligence?.brief_summary);
   const sentimentLine = effectiveIntelligence?.sentiment
     ? `Recent internal tone is ${effectiveIntelligence.sentiment}${effectiveIntelligence.conversation_count ? ` across ${effectiveIntelligence.conversation_count} readable source${effectiveIntelligence.conversation_count === 1 ? '' : 's'}` : ''}.`
     : 'Recent source messages linked to this deal are shown below when you have access.';
@@ -517,7 +519,7 @@ export default function DealDetailPage() {
             </button>
           </div>
           <p className="max-w-5xl text-sm leading-6 text-text-secondary">
-            {effectiveIntelligence?.brief_summary || 'MARTy has not generated a current brief yet. As more readable activity is linked to this startup, this will summarize what is happening now with recency bias.'}
+            {briefSummary || 'MARTy has not generated a current brief yet. As more readable activity is linked to this startup, this will summarize what is happening now with recency bias.'}
           </p>
           <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
             <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2">

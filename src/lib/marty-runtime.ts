@@ -4,10 +4,10 @@ import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { CLAUDE_MODEL } from './claude';
 import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from './max-mode';
 
-export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-17-max-brand-v1';
-export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-17-live-agent-max-brand-v1';
+export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-19-platform-aware-v1';
+export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-19-live-platform-aware-v1';
 export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v2';
-export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-17-agent-tools-max-brand-v1';
+export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-19-agent-tools-platform-telemetry-v1';
 export const MARTY_ARTIFACT_RUNTIME_VERSION = '2026-05-15-office-artifacts-v1';
 
 export interface MartyRuntimeFingerprint {
@@ -97,8 +97,17 @@ ACCESS BOUNDARY - LOAD-BEARING:
 - Owner-level users may see firm-wide private interactions. Members and admins should be treated as participant-scoped unless the retrieved SOURCES explicitly show otherwise.`;
 }
 
+export function buildMartyPlatformAwarenessPrompt(): string {
+  return `PLATFORM AWARENESS - LOAD-BEARING:
+- You can answer questions about the Medina/MARTy platform itself, not just CRM content.
+- For operational questions about ingestion counts, whether a user ran a backfill, Outlook connector health, sync jobs, task runs, enrichment/news scheduler cadence, company/contact enrichment freshness, Gemini/API call budget or circuit state, embedding/searchability coverage, work queues, dead letters, runtime/deploy/model fingerprint, or system status, use inspect_platform_telemetry before answering.
+- Do not infer platform metrics from recall/search_contacts/search_conversations alone. CRM content tells you what exists; platform telemetry tells you how it got there and whether the system is healthy.
+- When reporting ingestion counts, preserve the tool's metric definition. Distinguish mailbox-ingested rows from messages where a user's email merely appears in From/To/Cc, and say when counts are deduped conversation rows rather than raw Microsoft Graph message totals.
+- If the telemetry tool returns a forbidden or unresolved-user result, say that directly and ask for the missing email/name only if needed.`;
+}
+
 export function buildMartyBaseSystemPrompt(ctx: AuthContext, now: Date = new Date()): string {
-  return `${GOD_MODE_SYSTEM_PROMPT}\n\n${buildMartyTimelineAwarenessPrompt(now)}\n\n${buildMartyCurrentUserPrivacyPrompt(ctx)}`;
+  return `${GOD_MODE_SYSTEM_PROMPT}\n\n${buildMartyTimelineAwarenessPrompt(now)}\n\n${buildMartyCurrentUserPrivacyPrompt(ctx)}\n\n${buildMartyPlatformAwarenessPrompt()}`;
 }
 
 export function buildMartyMaxModePrompt(stats?: {
@@ -141,6 +150,7 @@ function productionRuntimeComponents(env: Env, deepDive: boolean): Record<string
     prompt_scaffolding: {
       timeline_awareness_version: 'shared-v1',
       current_user_privacy_version: 'shared-v1',
+      platform_awareness_version: 'platform-telemetry-v1',
       max_mode_addendum_version: 'max-set-builder-v2-forced',
     },
     claude: {

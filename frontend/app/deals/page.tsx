@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
 import { ExpandableText } from '@/components/expandable-text';
 import { api, type DealReplayStatusSnapshot, type DetectedDealCandidate } from '@/lib/api';
+import { cleanIntelBrief } from '@/lib/intelligence-briefing';
 import { useDealIntelligence } from '@/lib/use-deal-intelligence';
 import { demoDeals, demoDetectedDeals, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import {
@@ -76,7 +77,7 @@ function DealCard({
   onOpen: () => void;
 }) {
   const { intelligence } = useDealIntelligence(deal.id);
-  const brief = intelligence?.brief_summary || deal.notes || 'No current intel brief yet.';
+  const brief = cleanIntelBrief(intelligence?.brief_summary) || cleanIntelBrief(deal.notes) || 'No current intel brief yet.';
 
   return (
     <article

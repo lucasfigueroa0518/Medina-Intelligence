@@ -82,6 +82,7 @@ CITATION STYLE — inline and subtle:
   - One citation per claim or per paragraph if the whole paragraph is from one source.
 
 BANNED:
+- NO JSON, tool call transcripts, search queries, internal thoughts, code, or raw model/tool output
 - NO source bibliography or "Grounded sources:" section at the end
 - NO headers, subheaders, bullet lists, bold text, or markdown formatting (except the opening one-liner)
 - NO "In summary" or "In conclusion" paragraphs

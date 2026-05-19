@@ -36,6 +36,7 @@ import {
   getMartyLabStatusSnapshot,
   type MartyLabStatusSnapshot,
 } from '../lib/marty-lab';
+import { canViewMartySandbox } from '../lib/marty-sandbox-access';
 import { getRagV2Status } from '../lib/rag-v2';
 
 export interface SystemStatusActiveTask {
@@ -124,11 +125,22 @@ function metric(current: number, total: number): CompletenessMetric {
   return { current, total, percentage: pct(current, total) };
 }
 
+function isMartySandboxWorkQueueDomain(domain: string | null | undefined): boolean {
+  return domain === 'marty_lab_experiment'
+    || domain === 'marty_lab_artifact_review'
+    || domain === 'marty_lab_code_patch';
+}
+
+function isMartySandboxDeadLetter(row: DeadLetterRow): boolean {
+  return row.source.startsWith('work_queue:marty_lab_');
+}
+
 export async function getSystemStatus(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
   const orgId = ctx.orgId;
+  const showMartySandbox = canViewMartySandbox(ctx);
   const nowMs = Date.now();
 
   // ── Active tasks: sync_jobs WHERE status='running' ──────────────────────
@@ -275,7 +287,7 @@ export async function getSystemStatus(
     // MARTy Human Conversation Lab cockpit. This is sandbox visibility
     // only: experiments and candidate upgrades are tracked here without
     // mutating the live assistant.
-    ctx.userRole === 'owner' || ctx.userRole === 'admin'
+    showMartySandbox
       ? getMartyLabStatusSnapshot(env, orgId)
       : Promise.resolve(emptyMartyLabStatusSnapshot()),
     // Safe Six-Week Deals Rebuild cockpit. Keep this in System Status so
@@ -314,17 +326,27 @@ export async function getSystemStatus(
     ragV2 = { error: e instanceof Error ? e.message : String(e) };
   }
 
+  const workQueueInventory = showMartySandbox
+    ? snapshot.work_queue_inventory
+    : snapshot.work_queue_inventory.filter(row => !isMartySandboxWorkQueueDomain(row.domain));
+  const stuckWorkQueue = showMartySandbox
+    ? snapshot.stuck_work_queue
+    : snapshot.stuck_work_queue.filter(row => !isMartySandboxWorkQueueDomain(row.domain));
+  const deadLetter = showMartySandbox
+    ? snapshot.dead_letter
+    : snapshot.dead_letter.filter(row => !isMartySandboxDeadLetter(row));
+
   return jsonResponse({
     active_tasks,
     run_history,
     completeness,
     pipelines: snapshot.pipelines,
-    dead_letter: snapshot.dead_letter,
+    dead_letter: deadLetter,
     stuck_runs: snapshot.stuck_runs,
     budgets: snapshot.budgets,
     firefly_credentials: snapshot.firefly_credentials,
-    work_queue_inventory: snapshot.work_queue_inventory,
-    stuck_work_queue: snapshot.stuck_work_queue,
+    work_queue_inventory: workQueueInventory,
+    stuck_work_queue: stuckWorkQueue,
     marty_lab: martyLab,
     deal_replay: dealReplay,
     rag_v2: ragV2,

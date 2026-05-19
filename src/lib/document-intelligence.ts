@@ -5,11 +5,12 @@ import { callClaude } from './claude';
 import { jaroWinkler, scoreSimilarity } from './dedup';
 import { isCompanyInternal } from './internal-entity';
 import { chunkEmbedAndPersistAll } from './embedding';
-import { extractTextFromFile } from './file-extraction';
+import { extractTextFromFile, isTextExtractionSupported, textExtractionUnsupportedMessage } from './file-extraction';
 import { emitAudit } from './audit';
 import { persistDocument } from './persist-document';
 import { classifyByFilename } from './document-filename-classifier';
-import { enqueueWork } from './work-queue';
+import { enqueueDocumentEmbeddingRepair } from './document-embedding';
+import { isVerifiedContactCompanyAffiliation } from './contact-company-affiliation';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types
@@ -1114,13 +1115,18 @@ async function routeContact(
   env: Env,
   preferredCompanyId?: string | null
 ): Promise<{ created: boolean; updated: boolean; skipped: boolean; id: string | null; skip_reason?: string }> {
+  const companyIdForAssignment = preferredCompanyId &&
+    (await isVerifiedContactCompanyAffiliation(env, orgId, extracted.email || null, preferredCompanyId)).verified
+      ? preferredCompanyId
+      : null;
+
   if (match.matched_id && match.match_type !== 'new') {
     const hasUpdates = !!(
       extracted.job_title ||
       extracted.phone ||
       extracted.linkedin_url ||
       extracted.location ||
-      preferredCompanyId
+      companyIdForAssignment
     );
     if (hasUpdates) {
       await env.D1.prepare(
@@ -1137,7 +1143,7 @@ async function routeContact(
         extracted.phone || null, extracted.phone || null,
         extracted.linkedin_url || null, extracted.linkedin_url || null,
         extracted.location || null, extracted.location || null,
-        preferredCompanyId || null, preferredCompanyId || null,
+        companyIdForAssignment, companyIdForAssignment,
         match.matched_id, orgId
       ).run();
     }
@@ -1158,7 +1164,7 @@ async function routeContact(
   const contactId = crypto.randomUUID();
   const now = new Date().toISOString();
 
-  const companyId: string | null = preferredCompanyId || null;
+  const companyId: string | null = companyIdForAssignment;
 
   await env.D1.prepare(
     `INSERT INTO contacts
@@ -1355,7 +1361,15 @@ export async function processIntelligentImport(
     errors.push(`Text extraction: ${extractionError}`);
   }
   const hasUsableText = !!text && text.trim().length >= 20;
-  if (!hasUsableText) extractionFailed = true;
+  if (!hasUsableText) {
+    extractionFailed = true;
+    if (!extractionError) {
+      extractionError = isTextExtractionSupported(file)
+        ? 'No readable text could be extracted from this file. The original file was stored, but no CRM records were created from its contents.'
+        : textExtractionUnsupportedMessage(file);
+      errors.push(`Text extraction: ${extractionError}`);
+    }
+  }
 
   // Wave 5 Phase C: cheap filename classifier first. high → skip LLM,
   // medium → pass as hint to LLM, null → LLM-only path. Even when text
@@ -1537,13 +1551,7 @@ export async function processIntelligentImport(
           WHERE id = ? AND org_id = ?`
       ).bind(category, text.slice(0, 4000), documentId, orgId).run();
 
-      await enqueueWork(env, orgId, 'embed_retry',
-        { entity_id: documentId, source_table: 'documents' },
-        {
-          upstream: 'bge',
-          idempotency_key: `${orgId}:${documentId}:documents`,
-        }
-      );
+      await enqueueDocumentEmbeddingRepair(env, orgId, documentId, { priority: 30 });
     }
   } catch (e: any) {
     errors.push(`Document store: ${e?.message || e}`);
@@ -1629,11 +1637,15 @@ export async function processIntelligentImport(
       continue;
     }
     try {
-      let preferredCompanyId = contact.company_name ? companyLookup.get(contact.company_name.toLowerCase()) : null;
-      if (!preferredCompanyId && contact.email) {
+      let candidateCompanyId = contact.company_name ? companyLookup.get(contact.company_name.toLowerCase()) : null;
+      if (!candidateCompanyId && contact.email) {
         const emailDomain = normalizeLookupDomain(contact.email.split('@')[1]);
-        preferredCompanyId = companyDomainLookup.get(emailDomain) || null;
+        candidateCompanyId = companyDomainLookup.get(emailDomain) || null;
       }
+      const preferredCompanyId = candidateCompanyId &&
+        (await isVerifiedContactCompanyAffiliation(env, orgId, contact.email || null, candidateCompanyId)).verified
+          ? candidateCompanyId
+          : null;
       const match = matchContactFromIndexes(contact, contactCandidates, contactByEmail, contactByName, preferredCompanyId);
       const result = await routeContact(contact, match, orgId, documentId, env, preferredCompanyId);
       if (result.skipped) {
@@ -1663,7 +1675,10 @@ export async function processIntelligentImport(
 
       if (contact.company_name && result.id) {
         const companyId = companyLookup.get(contact.company_name.toLowerCase());
-        if (companyId) {
+        const verified = companyId
+          ? await isVerifiedContactCompanyAffiliation(env, orgId, contact.email || null, companyId)
+          : null;
+        if (companyId && verified?.verified) {
           const sql = result.created
             ? 'UPDATE contacts SET company_id = ? WHERE id = ?'
             : 'UPDATE contacts SET company_id = ? WHERE id = ? AND company_id IS NULL';

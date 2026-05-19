@@ -15,6 +15,7 @@ import { proposeMultipleUpdates } from './progressive-enrichment';
 import { callClaude } from './claude';
 import { rebuildEntityIndex } from './entity-index';
 import { enqueueDueContactEnrichment } from './contact-enrichment-queue';
+import { embedDocumentItem as embedDocumentItemForRepair } from './document-embedding';
 
 // Mirrors the visibility logic in classification.ts:233 — emails are always
 // 'private' regardless of source-side hint, transcripts/manual notes are
@@ -649,40 +650,57 @@ export async function enqueueBackfillEvents(orgId: string, env: Env): Promise<nu
 
 /**
  * Continuous document embedding health: completed documents with original
- * binaries should be searchable by MARTy. This scanner only enqueues missing
- * vectors; embedSingleItem(..., 'documents', ...) remains the execution path.
+ * binaries should be searchable by MARTy. This scanner prioritizes missing
+ * vectors, then trickles through stale/unaudited documents so D1, Vectorize,
+ * and KV can be checked against the actual extracted chunk set.
  */
 export async function enqueueBackfillDocuments(orgId: string, env: Env): Promise<number> {
-  const { enqueueWork } = await import('./work-queue');
+  const {
+    DOCUMENT_EMBEDDING_AUDIT_VERSION,
+    enqueueDocumentEmbeddingRepair,
+  } = await import('./document-embedding');
+  const auditKey = new Date().toISOString().slice(0, 10);
   const rows = await env.D1.prepare(
-    `SELECT d.id
+    `SELECT d.id, COUNT(vei.vector_id) AS vector_count
        FROM documents d
+       LEFT JOIN vector_entity_index vei
+         ON vei.source_table = 'documents'
+        AND vei.entity_id = d.id
+        AND vei.org_id = d.org_id
       WHERE d.org_id = ?
         AND d.deleted_at IS NULL
         AND d.processing_status = 'completed'
-        AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1
+        AND COALESCE(json_extract(
+              CASE WHEN d.custom_fields IS NOT NULL AND json_valid(d.custom_fields)
+                   THEN d.custom_fields ELSE '{}' END,
+              '$.marty_lab_generated'
+            ), 0) != 1
         AND d.r2_key IS NOT NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM vector_entity_index vei
-           WHERE vei.source_table = 'documents'
-             AND vei.entity_id = d.id
-             AND vei.org_id = d.org_id
-        )
-      ORDER BY d.created_at DESC
+      GROUP BY d.id
+      HAVING COUNT(vei.vector_id) = 0
+          OR COALESCE(json_extract(
+               CASE WHEN d.custom_fields IS NOT NULL AND json_valid(d.custom_fields)
+                    THEN d.custom_fields ELSE '{}' END,
+               '$.embedding_audit_version'
+             ), '') != ?
+          OR COALESCE(json_extract(
+               CASE WHEN d.custom_fields IS NOT NULL AND json_valid(d.custom_fields)
+                    THEN d.custom_fields ELSE '{}' END,
+               '$.embedding_audit_at'
+             ), '') < strftime('%Y-%m-%dT%H:%M:%fZ','now','-7 days')
+      ORDER BY CASE WHEN COUNT(vei.vector_id) = 0 THEN 0 ELSE 1 END,
+               d.created_at DESC
       LIMIT 40`
-  ).bind(orgId).all<{ id: string }>();
+  ).bind(orgId, DOCUMENT_EMBEDDING_AUDIT_VERSION).all<{ id: string; vector_count: number }>();
   if (rows.results.length === 0) return 0;
 
   let enqueued = 0;
   for (const row of rows.results) {
     try {
-      await enqueueWork(env, orgId, 'embed_retry',
-        { entity_id: row.id, source_table: 'documents' },
-        {
-          upstream: 'bge',
-          idempotency_key: `${orgId}:${row.id}:documents`,
-        }
-      );
+      await enqueueDocumentEmbeddingRepair(env, orgId, row.id, {
+        auditKey,
+        priority: Number(row.vector_count || 0) === 0 ? 20 : 5,
+      });
       enqueued++;
     } catch (e) {
       console.error(`[daily-cron:enqueueBackfillDocuments] failed for ${row.id}:`, e instanceof Error ? e.message : e);
@@ -1241,91 +1259,8 @@ export async function processEmbedRetryQueue(
   return result ?? { processed: 0, succeeded: 0, failed: 0, stale_reset: 0 };
 }
 
-export interface DocumentEmbedResult {
-  status: 'embedded' | 'skipped' | 'missing' | 'partial';
-  next_cursor?: number;
-  total_chunks?: number;
-}
-
-export async function embedDocumentItem(
-  entityId: string,
-  orgId: string,
-  env: Env,
-  cursor = 0,
-  maxChunks = Number.POSITIVE_INFINITY
-): Promise<DocumentEmbedResult> {
-  const row = await env.D1.prepare(
-    `SELECT id, title, document_type, r2_key, created_at,
-            contact_id, company_id, conversation_id
-       FROM documents
-      WHERE id = ?
-        AND org_id = ?
-        AND deleted_at IS NULL
-        AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1`
-  ).bind(entityId, orgId).first<{
-    id: string; title: string; document_type: string; r2_key: string;
-    created_at: string; contact_id: string | null; company_id: string | null; conversation_id: string | null;
-  }>();
-  if (!row) return { status: 'missing' };
-  if (!row.r2_key) return { status: 'missing' };
-
-  const { chunkEmbedAndPersist } = await import('./embedding');
-  const { createSplitter } = await import('./chunking');
-  const { extractTextFromFile } = await import('./file-extraction');
-
-  const obj = await env.R2.get(row.r2_key);
-  if (!obj) return { status: 'missing' };
-  const buffer = await obj.arrayBuffer();
-  const file = new File([buffer], row.title, { type: '' });
-
-  let text: string;
-  try {
-    text = await extractTextFromFile(file);
-  } catch (e: any) {
-    console.error(`[self-heal] extract failed for doc ${entityId}:`, e?.message || e);
-    return { status: 'missing' };
-  }
-  if (!text || text.trim().length < 10) return { status: 'missing' };
-
-  const splitter = createSplitter(row.document_type || 'reference');
-  const chunks = await splitter.splitText(text);
-  if (chunks.length === 0) return { status: 'missing' };
-
-  const existing = await env.D1.prepare(
-    `SELECT COUNT(*) AS count FROM vector_entity_index
-       WHERE entity_id = ? AND source_table = 'documents' AND org_id = ?`
-  ).bind(row.id, orgId).first<{ count: number }>();
-  const existingCount = existing?.count || 0;
-  if (existingCount >= chunks.length) return { status: 'skipped', total_chunks: chunks.length };
-
-  const start = Math.max(0, cursor, existingCount);
-  const end = Math.min(chunks.length, start + Math.max(1, maxChunks));
-  if (start >= chunks.length) return { status: 'skipped', total_chunks: chunks.length };
-
-  for (let i = start; i < end; i++) {
-    const entry = await chunkEmbedAndPersist(chunks[i], {
-      org_id: orgId,
-      visibility: 'private',
-      document_type: row.document_type,
-      source_table: 'documents',
-      source_id: row.id,
-      r2_key: row.r2_key,
-      created_at: row.created_at,
-      primary_entity_id: row.contact_id || row.company_id || row.id,
-      entity_name: row.title,
-    }, i, chunks.length, env);
-
-    await env.D1.prepare(
-      'INSERT OR IGNORE INTO vector_entity_index (vector_id, entity_id, source_table, org_id) VALUES (?,?,?,?)'
-    ).bind(entry.vectorId, entry.entityId, entry.sourceTable, entry.orgId).run();
-  }
-
-  if (end < chunks.length) {
-    return { status: 'partial', next_cursor: end, total_chunks: chunks.length };
-  }
-
-  return { status: 'embedded', total_chunks: chunks.length };
-}
+export type { DocumentEmbedResult } from './document-embedding';
+export { embedDocumentItemForRepair as embedDocumentItem };
 
 // Re-embed a single item from its source table. Returns:
 //   'embedded' — vectors written to vector_entity_index
@@ -1484,8 +1419,10 @@ export async function embedSingleItem(
   }
 
   if (sourceTable === 'documents') {
-    const result = await embedDocumentItem(entityId, orgId, env);
-    return result.status === 'partial' ? 'embedded' : result.status;
+    const result = await embedDocumentItemForRepair(entityId, orgId, env);
+    if (result.status === 'partial') return 'embedded';
+    if (result.status === 'unembeddable') return 'skipped';
+    return result.status;
   }
 
   throw new Error(`unknown source_table: ${sourceTable}`);

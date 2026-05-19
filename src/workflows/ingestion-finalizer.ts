@@ -109,7 +109,7 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
                 WHERE d.org_id = ?
                   AND d.created_at >= ?
                   AND d.deleted_at IS NULL
-                  AND d.processing_status != 'skipped'
+                  AND d.processing_status = 'completed'
                   AND vei.entity_id IS NULL`
             ).bind(org_id, startedAt.started_at).all<{ id: string }>();
 
@@ -131,6 +131,7 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
             // UNIQUE(org_id, entity_id, source_table) so re-enqueue during
             // drain collapses cleanly.
             const { enqueueWork } = await import('../lib/work-queue');
+            const { enqueueDocumentEmbeddingRepair } = await import('../lib/document-embedding');
             const enqueueGap = async (entity_id: string, source_table: string) => {
               await enqueueWork(this.env, org_id, 'embed_retry',
                 { entity_id, source_table },
@@ -142,7 +143,9 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
             };
             for (const g of convoGaps.results) await enqueueGap(g.id, 'conversations');
             for (const g of eventGaps.results) await enqueueGap(g.id, 'events');
-            for (const g of docGaps.results) await enqueueGap(g.id, 'documents');
+            for (const g of docGaps.results) {
+              await enqueueDocumentEmbeddingRepair(this.env, org_id, g.id, { priority: 20 });
+            }
 
             await this.env.D1.prepare(
               `UPDATE sync_jobs SET metadata = json_set(

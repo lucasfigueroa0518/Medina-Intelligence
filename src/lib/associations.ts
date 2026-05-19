@@ -1,5 +1,9 @@
 // TRD §7.9 — Unified entity association engine + legacy auto-link helpers
 import type { Env } from '../types/env';
+import {
+  evaluateContactCompanyAffiliation,
+  repairInvalidCompanyAffiliations,
+} from './contact-company-affiliation';
 
 // --- Canonical ordering: ensures entity_a < entity_b to prevent duplicates ---
 
@@ -76,19 +80,27 @@ export async function calculateAssociationsForContact(
   let count = 0;
 
   const contact = await env.D1.prepare(
-    `SELECT id, company_id, topics_of_interest FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    `SELECT id, email, company_id, topics_of_interest FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
   ).bind(contactId, orgId).first<{
-    id: string; company_id: string | null; topics_of_interest: string | null;
+    id: string; email: string | null; company_id: string | null; topics_of_interest: string | null;
   }>();
   if (!contact) return 0;
+
+  const repair = await repairInvalidCompanyAffiliations(orgId, env, { contactId, limit: 1 });
+  if (repair.unlinked > 0) {
+    contact.company_id = null;
+  }
 
   // CONTACT → COMPANY
   if (contact.company_id) {
     const company = await env.D1.prepare(
-      `SELECT id, name, sector FROM companies WHERE id = ? AND deleted_at IS NULL`
-    ).bind(contact.company_id).first<{ id: string; name: string; sector: string | null }>();
+      `SELECT id, name, domain, website, sector FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    ).bind(contact.company_id, orgId).first<{
+      id: string; name: string; domain: string | null; website: string | null; sector: string | null;
+    }>();
 
-    if (company) {
+    const verifiedCompany = company && evaluateContactCompanyAffiliation(contact, company).verified;
+    if (company && verifiedCompany) {
       await upsertAssociation(orgId,
         { type: 'contact', id: contactId },
         { type: 'company', id: company.id },
@@ -225,16 +237,21 @@ export async function calculateAssociationsForCompany(
   let count = 0;
 
   const company = await env.D1.prepare(
-    `SELECT id, name, sector FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-  ).bind(companyId, orgId).first<{ id: string; name: string; sector: string | null }>();
+    `SELECT id, name, domain, website, sector FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(companyId, orgId).first<{
+    id: string; name: string; domain: string | null; website: string | null; sector: string | null;
+  }>();
   if (!company) return 0;
+
+  await repairInvalidCompanyAffiliations(orgId, env, { companyId, limit: 500 });
 
   // CONTACTS at this company
   const contacts = await env.D1.prepare(
-    `SELECT id, full_name FROM contacts WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL`
-  ).bind(companyId, orgId).all<{ id: string; full_name: string }>();
+    `SELECT id, full_name, email FROM contacts WHERE company_id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(companyId, orgId).all<{ id: string; full_name: string; email: string | null }>();
 
   for (const c of contacts.results) {
+    if (!evaluateContactCompanyAffiliation(c, company).verified) continue;
     await upsertAssociation(orgId,
       { type: 'company', id: companyId },
       { type: 'contact', id: c.id },
@@ -296,6 +313,18 @@ export async function recalculateAllAssociations(
   orgId: string,
   env: Env
 ): Promise<void> {
+  try {
+    const repaired = await repairInvalidCompanyAffiliations(orgId, env, { limit: 1000 });
+    if (repaired.unlinked > 0) {
+      console.log(
+        `[associations] repaired invalid company affiliations org=${orgId} ` +
+        `unlinked=${repaired.unlinked} associations_deleted=${repaired.associations_deleted}`
+      );
+    }
+  } catch (e) {
+    console.error(`[associations] invalid affiliation repair failed for org ${orgId}:`, e);
+  }
+
   const contacts = await env.D1.prepare(
     `SELECT id FROM contacts WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL LIMIT 500`
   ).bind(orgId).all<{ id: string }>();

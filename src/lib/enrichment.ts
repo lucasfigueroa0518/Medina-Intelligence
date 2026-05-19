@@ -25,8 +25,10 @@ import { enrichContactFromLinkedIn } from '../integrations/reversecontact';
 import { discoverLinkedInUrl, assessLinkedInUrlAuthenticity } from './linkedin-discovery';
 import { fallbackWebSearch } from './agent-web-search';
 import { findCompanyByDomain, findOrCreateCompanyByDomain, PERSONAL_DOMAINS } from './discovery';
+import { cleanIntelligenceBrief } from './intelligence-briefing';
 import { proposeEntityUpdate, proposeMultipleUpdates } from './progressive-enrichment';
 import { jaroWinkler } from './dedup';
+import { isVerifiedContactCompanyAffiliation } from './contact-company-affiliation';
 
 // Returns true if two company names plausibly refer to the same entity:
 // exact match, high Jaro-Winkler similarity (catches typos/spellings), or
@@ -63,45 +65,7 @@ try {
 
 /** Strip Claude's internal <tool_call>/<tool_response> XML blocks from web search output. */
 function stripToolArtifacts(text: string): string {
-  let t = text
-    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
-    .replace(/<tool_response>[\s\S]*?<\/tool_response>/gi, '')
-    .replace(/<tool_result>[\s\S]*?<\/tool_result>/gi, '')
-    // Remove any other XML-ish tags like </s>, <s>, <thinking>, <search>, etc.
-    .replace(/<\/?[a-zA-Z][^>]{0,120}>/g, '');
-
-  // Strip known preamble phrases when they appear at the start of a line/paragraph,
-  // up to the next sentence end or newline.
-  const preamblePatterns = [
-    /^[\s\S]*?I'll research[^\n.]*[.!\n]\s*/i,
-    /^[\s\S]*?Let me (start|begin)[^\n.]*[.!\n]\s*/i,
-    /^[\s\S]*?I've (now )?gathered[^\n.]*[.!\n]\s*/i,
-    /^[\s\S]*?I now have (enough|sufficient)[^\n.]*[.!\n]\s*/i,
-    /^[\s\S]*?Here is the (polished |thorough |comprehensive |detailed )?(professional )?bio[^\n:]*[:\n]\s*/i,
-    /^[\s\S]*?Here it is[^\n:]*[:\n]\s*/i,
-    /^[\s\S]*?Here's (the|a) (polished |thorough |comprehensive |detailed )?(professional )?bio[^\n:]*[:\n]\s*/i,
-  ];
-  for (const pat of preamblePatterns) {
-    const m = t.match(pat);
-    // Only strip if the match is within the first 600 chars — avoid gutting the body.
-    if (m && m.index !== undefined && m.index + m[0].length < 600) {
-      t = t.slice(m.index + m[0].length);
-    }
-  }
-
-  // If the text still begins with a "---" divider (sometimes preceded by whitespace),
-  // strip everything up to and including it so the bio starts clean.
-  const dividerMatch = t.match(/^[\s\S]{0,400}?---+\s*\n/);
-  if (dividerMatch) t = t.slice(dividerMatch[0].length);
-
-  // Remove leading/trailing "---" separators.
-  t = t.replace(/^\s*-{3,}\s*\n?/, '').replace(/\n?\s*-{3,}\s*$/, '');
-
-  // Strip any trailing "Grounded sources:" bibliography block.
-  t = t.replace(/\n*-{3,}\s*\n\s*Grounded sources:[\s\S]*$/i, '');
-  t = t.replace(/\n*Grounded sources:\s*\n[\s\S]*$/i, '');
-
-  return t.replace(/\n{3,}/g, '\n\n').trim();
+  return cleanIntelligenceBrief(text);
 }
 
 /** Short bio for D1 (≤500 chars, sentence-boundary truncation). */
@@ -292,18 +256,44 @@ async function applyUnifiedEnrichment(
     const proposedName = String(extracted.company_name).trim();
     if (proposedName.length >= 2) {
       const link = await env.D1.prepare(
-        'SELECT company_id FROM contacts WHERE id = ?'
-      ).bind(contactId).first<{ company_id: string | null }>();
+        'SELECT company_id, email FROM contacts WHERE id = ? AND org_id = ?'
+      ).bind(contactId, orgId).first<{ company_id: string | null; email: string | null }>();
 
       if (!link?.company_id) {
         const matchedCompany = await env.D1.prepare(
           'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) = LOWER(?) AND deleted_at IS NULL LIMIT 1'
         ).bind(orgId, proposedName).first<{ id: string }>();
         if (matchedCompany) {
-          dbUpdates.push('company_id = ?');
-          dbBinds.push(matchedCompany.id);
-          autoApplied['company_id'] = matchedCompany.id;
-          console.log(`[enrichment] ${contactId}: auto-link to company "${proposedName}" id=${matchedCompany.id}`);
+          const evidence = await isVerifiedContactCompanyAffiliation(env, orgId, link?.email || null, matchedCompany.id);
+          if (evidence.verified) {
+            dbUpdates.push('company_id = ?');
+            dbBinds.push(matchedCompany.id);
+            autoApplied['company_id'] = matchedCompany.id;
+            console.log(`[enrichment] ${contactId}: auto-link to company "${proposedName}" id=${matchedCompany.id}`);
+          } else {
+            const slug = proposedName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+            const idempotencyKey = `${orgId}:${contactId}:company_unverified:${slug}`;
+            const proposedValue = JSON.stringify({
+              value: matchedCompany.id,
+              metadata: {
+                source_type: 'enrichment',
+                source_description: `Bio named ${proposedName}, but contact email domain did not verify employment`,
+                context: {
+                  proposed_company_name: proposedName,
+                  reason: evidence.reason,
+                  contact_domain: evidence.contact_domain || null,
+                  company_domains: evidence.company_domains,
+                },
+              },
+            });
+            await env.D1.prepare(
+              `INSERT OR IGNORE INTO approval_queue
+                 (org_id, idempotency_key, entity_type, entity_id, change_type, field_name,
+                  proposed_value, confidence, status)
+               VALUES (?, ?, 'contact', ?, 'update_contact', 'company_id', ?, 0.45, 'pending')`
+            ).bind(orgId, idempotencyKey, contactId, proposedValue).run();
+            console.log(`[enrichment] ${contactId}: queued unverified company link approval — proposed="${proposedName}" reason=${evidence.reason}`);
+          }
         }
       } else {
         const current = await env.D1.prepare(
@@ -789,7 +779,9 @@ export async function triggerCompanyEnrichment(
     const recentNews = await env.D1.prepare(
       `SELECT title, summary, relevance_tag, published_at FROM news_articles
        WHERE company_id = ? AND org_id = ?
-       ORDER BY published_at DESC LIMIT 5`
+       ORDER BY CASE WHEN relevance_tag = 'direct_mention' THEN 0 ELSE 1 END,
+                published_at DESC
+       LIMIT 5`
     ).bind(companyId, orgId).all<{
       title: string; summary: string | null; relevance_tag: string; published_at: string | null;
     }>();

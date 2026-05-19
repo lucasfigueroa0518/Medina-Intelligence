@@ -4,6 +4,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { callClaude } from '../lib/claude';
 import { IMPORT_COLUMN_MAPPING_PROMPT } from '../prompts/import-mapping';
+import { isTextExtractionSupported } from '../lib/file-extraction';
 
 interface ImportJobRow {
   id: string;
@@ -37,6 +38,7 @@ interface ImportDocumentReport {
   file_size: number | null;
   processing_status: string | null;
   error_message: string | null;
+  extracted_text_length: number | null;
   created_at: string | null;
   updated_at: string | null;
   vector_count: number;
@@ -96,6 +98,12 @@ interface ImportReport {
   work_items: ImportWorkItem[];
   errors: string[];
   notes: string[];
+  ingestion: {
+    stored_only: boolean;
+    readable: boolean;
+    reason: 'unsupported_format' | 'no_extractable_text' | 'extraction_failed' | null;
+    message: string | null;
+  };
 }
 
 function numberish(value: unknown): number {
@@ -115,6 +123,13 @@ function stageStatusForJob(status: string): 'completed' | 'running' | 'pending' 
   if (status === 'cancelled') return 'warning';
   if (status === 'processing') return 'running';
   return 'pending';
+}
+
+function documentSupportsTextExtraction(doc: ImportDocumentReport, fallbackName: string): boolean {
+  return isTextExtractionSupported({
+    name: doc.file_name || doc.title || fallbackName,
+    type: doc.mime_type || '',
+  });
 }
 
 export async function listImports(
@@ -296,6 +311,7 @@ async function buildImportReport(job: ImportJobRow, env: Env): Promise<ImportRep
   const documents = await env.D1.prepare(
     `SELECT d.id, d.title, d.file_name, d.document_type, d.source, d.mime_type,
             d.file_size, d.processing_status, d.error_message, d.created_at, d.updated_at,
+            LENGTH(COALESCE(d.extracted_text_preview, '')) AS extracted_text_length,
             COUNT(vei.vector_id) AS vector_count
        FROM import_lineage il
        JOIN documents d
@@ -318,23 +334,60 @@ async function buildImportReport(job: ImportJobRow, env: Env): Promise<ImportRep
   const errors = await loadImportErrors(job, env, workItems, documentRows);
 
   const totalVectors = documentRows.reduce((sum, doc) => sum + numberish(doc.vector_count), 0);
+  const readableDocumentCount = documentRows.filter(doc =>
+    numberish(doc.extracted_text_length) >= 20 || numberish(doc.vector_count) > 0
+  ).length;
+  const unreadableDocuments = documentRows.filter(doc =>
+    numberish(doc.extracted_text_length) < 20 && numberish(doc.vector_count) === 0
+  );
+  const unsupportedDocuments = unreadableDocuments.filter(doc => !documentSupportsTextExtraction(doc, fileName));
+  const extractionFailedDocuments = unreadableDocuments.filter(doc =>
+    doc.processing_status === 'failed' || /extract|readable|unsupported/i.test(doc.error_message || '')
+  );
+  const crmRoutedRows = counters.created_rows + counters.updated_rows;
+  const storedOnly = job.status === 'completed' &&
+    documentRows.length > 0 &&
+    readableDocumentCount === 0 &&
+    crmRoutedRows === 0;
+  const ingestionReason: ImportReport['ingestion']['reason'] = storedOnly
+    ? unsupportedDocuments.length > 0
+        ? 'unsupported_format'
+        : extractionFailedDocuments.length > 0
+          ? 'extraction_failed'
+          : 'no_extractable_text'
+    : null;
+  const ingestionMessage = storedOnly
+    ? ingestionReason === 'unsupported_format'
+      ? `${fileName} was stored in Documents, but this file format is not readable by the importer. No CRM records were created or updated, and no document chunks were added to MARTy.`
+      : `${fileName} was stored in Documents, but no readable text could be extracted. No CRM records were created or updated, and no document chunks were added to MARTy.`
+    : null;
   const documentStageStatus = documentRows.length === 0
     ? 'pending'
-    : documentRows.some(doc => doc.processing_status === 'failed')
-      ? 'failed'
-      : documentRows.every(doc => doc.processing_status === 'completed')
-        ? 'completed'
-        : 'running';
+    : 'completed';
+  const extractionStageStatus: ImportReport['stages'][number]['status'] = documentRows.length === 0
+    ? 'pending'
+    : storedOnly
+      ? 'warning'
+      : documentRows.some(doc => doc.processing_status === 'failed')
+        ? 'failed'
+        : documentRows.every(doc => doc.processing_status === 'completed')
+          ? 'completed'
+          : 'running';
+  const routingStageStatus = storedOnly
+    ? 'warning'
+    : stageStatusForJob(job.status);
   const embedWork = workItems.filter(item => item.domain === 'embed_retry');
-  const embeddingStageStatus = totalVectors > 0
-    ? 'completed'
-    : embedWork.some(item => item.status === 'dead_letter' || item.status === 'failed')
-      ? 'failed'
-      : embedWork.some(item => item.status === 'pending' || item.status === 'in_progress')
-        ? 'running'
-        : documentRows.length > 0
-          ? 'pending'
-          : 'pending';
+  const embeddingStageStatus: ImportReport['stages'][number]['status'] = storedOnly
+    ? 'warning'
+    : totalVectors > 0
+      ? 'completed'
+      : embedWork.some(item => item.status === 'dead_letter' || item.status === 'failed')
+        ? 'failed'
+        : embedWork.some(item => item.status === 'pending' || item.status === 'in_progress')
+          ? 'running'
+          : documentRows.length > 0
+            ? 'pending'
+            : 'pending';
 
   const stages: ImportReport['stages'] = [
     {
@@ -354,9 +407,11 @@ async function buildImportReport(job: ImportJobRow, env: Env): Promise<ImportRep
     {
       key: 'classification',
       label: 'Classified and extracted',
-      status: documentStageStatus,
-      detail: documentRows[0]?.document_type
-        ? `Classified as ${documentRows[0].document_type.replace(/_/g, ' ')}.`
+      status: extractionStageStatus,
+      detail: ingestionMessage
+        ? 'No readable content was extracted, so the importer stored the file without ingesting CRM data.'
+        : documentRows[0]?.document_type
+          ? `Classified as ${documentRows[0].document_type.replace(/_/g, ' ')}.`
         : job.status === 'failed'
           ? 'Classification or extraction failed.'
           : 'Classification details are not available yet.',
@@ -364,14 +419,18 @@ async function buildImportReport(job: ImportJobRow, env: Env): Promise<ImportRep
     {
       key: 'routing',
       label: 'Routed into CRM',
-      status: stageStatusForJob(job.status),
-      detail: `${counters.processed_rows || 0} processed, ${counters.created_rows || 0} created, ${counters.updated_rows || 0} updated, ${counters.failed_rows || 0} failed.`,
+      status: routingStageStatus,
+      detail: ingestionMessage
+        ? 'CRM routing had no readable contact, company, or deal data to ingest.'
+        : `${counters.processed_rows || 0} processed, ${counters.created_rows || 0} created, ${counters.updated_rows || 0} updated, ${counters.failed_rows || 0} failed.`,
     },
     {
       key: 'embedding',
       label: 'Made searchable by MARTy',
       status: embeddingStageStatus,
-      detail: totalVectors > 0
+      detail: ingestionMessage
+        ? 'No searchable chunks were created because the importer could not read text from the file.'
+        : totalVectors > 0
         ? `${totalVectors} document chunk${totalVectors === 1 ? '' : 's'} embedded for semantic search.`
         : 'No document vectors found yet. Preview/download still works, but MARTy semantic retrieval is weaker until embedding completes.',
     },
@@ -384,8 +443,13 @@ async function buildImportReport(job: ImportJobRow, env: Env): Promise<ImportRep
   if (job.status === 'reverted') {
     notes.push('This import has been reverted. Created records were soft-deleted and document vectors were removed where available.');
   }
+  if (ingestionMessage) {
+    notes.push(ingestionMessage);
+  }
 
-  const summary = job.status === 'completed'
+  const summary = ingestionMessage
+    ? ingestionMessage
+    : job.status === 'completed'
     ? `${fileName} was analyzed and routed. ${counters.created_rows} records were created, ${counters.updated_rows} existing records were updated, and ${totalVectors} document chunks are searchable by MARTy.`
     : job.status === 'processing'
       ? `${fileName} is still being analyzed in the background.`
@@ -408,12 +472,19 @@ async function buildImportReport(job: ImportJobRow, env: Env): Promise<ImportRep
       ...doc,
       vector_count: numberish(doc.vector_count),
       file_size: doc.file_size == null ? null : numberish(doc.file_size),
+      extracted_text_length: numberish(doc.extracted_text_length),
     })),
     created_entities: createdEntities,
     stages,
     work_items: workItems,
     errors,
     notes,
+    ingestion: {
+      stored_only: storedOnly,
+      readable: readableDocumentCount > 0,
+      reason: ingestionReason,
+      message: ingestionMessage,
+    },
   };
 }
 

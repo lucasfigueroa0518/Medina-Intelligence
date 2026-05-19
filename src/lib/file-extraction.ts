@@ -44,6 +44,37 @@ async function getPdfjs(): Promise<any> {
   return pdfjsCache;
 }
 
+export function isTextExtractionSupported(file: Pick<File, 'name' | 'type'>): boolean {
+  const mimeType = (file.type || '').toLowerCase();
+  const fileName = (file.name || '').toLowerCase();
+
+  return (
+    mimeType === 'application/pdf' ||
+    fileName.endsWith('.pdf') ||
+    mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+    fileName.endsWith('.docx') ||
+    mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+    mimeType === 'application/vnd.ms-excel' ||
+    fileName.endsWith('.xlsx') ||
+    fileName.endsWith('.xls') ||
+    mimeType === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+    fileName.endsWith('.pptx') ||
+    mimeType === 'text/csv' ||
+    fileName.endsWith('.csv') ||
+    mimeType.startsWith('text/') ||
+    fileName.endsWith('.txt') ||
+    fileName.endsWith('.md') ||
+    fileName.endsWith('.json')
+  );
+}
+
+export function textExtractionUnsupportedMessage(file: Pick<File, 'name' | 'type'>): string {
+  const ext = (file.name || '').split('.').pop()?.toLowerCase();
+  const type = (file.type || '').trim();
+  const format = ext ? `.${ext}` : (type || 'this file type');
+  return `No readable text could be extracted from ${format}. The original file was stored, but no CRM records were created from its contents.`;
+}
+
 export async function extractTextFromFile(file: File): Promise<string> {
   const mimeType = file.type.toLowerCase();
   const fileName = file.name.toLowerCase();

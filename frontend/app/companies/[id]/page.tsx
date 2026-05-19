@@ -15,6 +15,7 @@ import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api } from '@/lib/api';
+import { cleanIntelBrief } from '@/lib/intelligence-briefing';
 import {
   demoCompanyDetailFixture,
   demoRecentObservationsForCompany,
@@ -50,6 +51,17 @@ const INVESTMENT_STATUS_OPTIONS = [
   { value: 'exited', label: 'Exited' },
   { value: 'none', label: 'None' },
 ];
+
+function sortCompanyNewsArticles(articles: any[] | undefined): any[] {
+  return [...(articles || [])].sort((a, b) => {
+    const aDirect = a?.relevance_tag === 'direct_mention';
+    const bDirect = b?.relevance_tag === 'direct_mention';
+    if (aDirect !== bDirect) return aDirect ? -1 : 1;
+    const aTime = Date.parse(a?.published_at || '');
+    const bTime = Date.parse(b?.published_at || '');
+    return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+  });
+}
 
 interface EditFormData {
   name: string;
@@ -294,8 +306,9 @@ export default function CompanyDetailPage() {
   }
 
   const company = data.company;
-  const bio = fullBio;
+  const bio = cleanIntelBrief(fullBio);
   const bioParas = bio ? bio.split(/\n{2,}/).map((p: string) => p.trim()).filter(Boolean) : [];
+  const newsArticles = sortCompanyNewsArticles(data.news_articles);
 
   return (
     <div className="flex-1 overflow-auto">
@@ -547,11 +560,11 @@ export default function CompanyDetailPage() {
           </div>
         </div>
 
-        {data.news_articles?.length > 0 && (
+        {newsArticles.length > 0 && (
           <div className="card">
             <div className="text-xs uppercase text-text-muted mb-3">Industry News</div>
             <div className="space-y-3">
-              {data.news_articles.map((article: any) => {
+              {newsArticles.map((article: any) => {
                 const hasValidUrl = article.source_url && !article.source_url.includes('vertexaisearch.cloud.google.com');
                 const domain = hasValidUrl ? (() => {
                   try { return new URL(article.source_url).hostname.replace(/^www\./, ''); } catch { return null; }

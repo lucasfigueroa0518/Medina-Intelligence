@@ -316,6 +316,16 @@ export async function runEmbedding(env: Env, text: string, orgId: string): Promi
   });
 }
 
+export function buildVectorId(
+  meta: Pick<ChunkMetadata, 'org_id' | 'source_table' | 'source_id'>,
+  chunkIndex: number
+): string {
+  // Vectorize max ID is 64 bytes. Compact: strip UUID dashes, truncate org_id.
+  const orgPrefix = meta.org_id.substring(0, 8);
+  const compactSourceId = meta.source_id.replace(/-/g, '');
+  return `${orgPrefix}_${meta.source_table}_${compactSourceId}_${chunkIndex}`;
+}
+
 export async function chunkEmbedAndPersist(
   text: string,
   meta: ChunkMetadata,
@@ -324,10 +334,7 @@ export async function chunkEmbedAndPersist(
   env: Env
 ): Promise<VectorIndexEntry> {
   const prefixedChunk = prefixChunk(text, meta);
-  // Vectorize max ID is 64 bytes. Compact: strip UUID dashes, truncate org_id.
-  const orgPrefix = meta.org_id.substring(0, 8);
-  const compactSourceId = meta.source_id.replace(/-/g, '');
-  const vectorId = `${orgPrefix}_${meta.source_table}_${compactSourceId}_${chunkIndex}`;
+  const vectorId = buildVectorId(meta, chunkIndex);
 
   const values = await runEmbedding(env, prefixedChunk, meta.org_id);
 

@@ -10,6 +10,11 @@ import { findDuplicateCompany } from '../lib/discovery';
 import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { updateCompanyFields } from '../lib/entity-writes';
 import { updateEntityInIndex } from '../lib/entity-index';
+import { cleanIntelligenceBrief } from '../lib/intelligence-briefing';
+import {
+  companyDomainCandidates,
+  evaluateContactCompanyAffiliation,
+} from '../lib/contact-company-affiliation';
 
 // News-score buckets. The underlying scale is 0-10 (see lib/news-scoring).
 function newsScorePredicate(bucket: string): string | null {
@@ -371,8 +376,18 @@ export async function getCompany(
   if (!company) return errorResponse('COMPANY_NOT_FOUND', 404);
 
   const contacts = await env.D1.prepare(
-    'SELECT id, full_name, job_title, email FROM contacts WHERE company_id = ? AND deleted_at IS NULL'
-  ).bind(id).all();
+    `SELECT id, full_name, job_title, email
+       FROM contacts
+      WHERE company_id = ?
+        AND org_id = ?
+        AND deleted_at IS NULL`
+  ).bind(id, ctx.orgId).all<{ id: string; full_name: string; job_title: string | null; email: string | null }>();
+  const companyDomains = companyDomainCandidates(company as any);
+  const visibleContacts = companyDomains.length === 0
+    ? contacts.results
+    : contacts.results.filter(c =>
+        evaluateContactCompanyAffiliation({ email: c.email }, company as any).verified
+      );
 
   const deals = await env.D1.prepare(
     'SELECT id, title, stage, amount, probability FROM deals WHERE company_id = ? AND deleted_at IS NULL'
@@ -389,12 +404,14 @@ export async function getCompany(
             relevance_tag, relevance_score
      FROM news_articles
      WHERE company_id = ? AND org_id = ?
-     ORDER BY published_at DESC LIMIT 10`
+     ORDER BY CASE WHEN relevance_tag = 'direct_mention' THEN 0 ELSE 1 END,
+              published_at DESC
+     LIMIT 10`
   ).bind(id, ctx.orgId).all();
 
   return jsonResponse({
     company,
-    contacts: contacts.results,
+    contacts: visibleContacts,
     deals: deals.results,
     tags: tags.results,
     news_articles: newsArticles.results,
@@ -480,7 +497,9 @@ export async function getCompanyNews(
             relevance_tag, relevance_score
      FROM news_articles
      WHERE company_id = ? AND org_id = ?
-     ORDER BY published_at DESC LIMIT 30`
+     ORDER BY CASE WHEN relevance_tag = 'direct_mention' THEN 0 ELSE 1 END,
+              published_at DESC
+     LIMIT 30`
   ).bind(id, ctx.orgId).all();
 
   // Fallback to legacy conversation-based news
@@ -544,9 +563,9 @@ export async function getCompanyEnrichment(
   let fullBio: string | null = null;
   try {
     const parsed = JSON.parse(raw) as { full_bio?: string };
-    fullBio = parsed.full_bio ?? null;
+    fullBio = cleanIntelligenceBrief(parsed.full_bio) || null;
   } catch {
-    fullBio = raw;
+    fullBio = cleanIntelligenceBrief(raw) || null;
   }
 
   return jsonResponse({
@@ -612,6 +631,12 @@ export async function getCompanyAssociations(
      LIMIT 100`
   ).bind(id, id, ctx.orgId, id, id).all();
 
+  const company = await env.D1.prepare(
+    'SELECT id, name, domain, website FROM companies WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(id, ctx.orgId).first<{ id: string; name: string; domain: string | null; website: string | null }>();
+  if (!company) return errorResponse('COMPANY_NOT_FOUND', 404);
+  const companyDomains = companyDomainCandidates(company);
+
   const hydrated = [];
   for (const row of rows.results as any[]) {
     let entityName: string | null = null;
@@ -619,8 +644,16 @@ export async function getCompanyAssociations(
 
     if (row.other_type === 'contact') {
       const c = await env.D1.prepare(
-        'SELECT full_name, job_title FROM contacts WHERE id = ? AND deleted_at IS NULL'
-      ).bind(row.other_id).first<{ full_name: string; job_title: string | null }>();
+        'SELECT full_name, job_title, email FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+      ).bind(row.other_id, ctx.orgId).first<{ full_name: string; job_title: string | null; email: string | null }>();
+      if (
+        c &&
+        row.association_type === 'same_company' &&
+        companyDomains.length > 0 &&
+        !evaluateContactCompanyAffiliation({ email: c.email }, company).verified
+      ) {
+        continue;
+      }
       if (c) { entityName = c.full_name; entityTitle = c.job_title; }
     } else if (row.other_type === 'company') {
       const c = await env.D1.prepare(

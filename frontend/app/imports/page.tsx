@@ -10,6 +10,7 @@ import {
   Upload, FileText, FileSpreadsheet, File, Presentation,
   Users, Building2, Handshake, Zap, ChevronDown, ChevronRight,
   Check, X as XIcon, Loader2, ArrowLeft, Sparkles, EyeOff, Trash2,
+  AlertTriangle,
 } from 'lucide-react';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -120,6 +121,7 @@ interface ImportReportDocument {
   file_size?: number | null;
   processing_status?: string | null;
   error_message?: string | null;
+  extracted_text_length?: number | null;
   vector_count: number;
 }
 
@@ -172,6 +174,12 @@ interface ImportReport {
   work_items: ImportWorkItem[];
   errors: string[];
   notes: string[];
+  ingestion?: {
+    stored_only: boolean;
+    readable: boolean;
+    reason: 'unsupported_format' | 'no_extractable_text' | 'extraction_failed' | null;
+    message: string | null;
+  };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -232,12 +240,60 @@ function importFileName(job: ImportJob): string {
 }
 
 function routedCount(job: ImportJob): number {
-  const routed = (job.created_rows ?? 0) + (job.updated_rows ?? 0);
-  return routed || job.processed_rows || job.total_rows || 0;
+  if (job.created_rows != null || job.updated_rows != null) {
+    return (job.created_rows || 0) + (job.updated_rows || 0);
+  }
+  return job.processed_rows || job.total_rows || 0;
 }
 
 function formatNumber(value: number | null | undefined): string {
   return new Intl.NumberFormat().format(Number(value || 0));
+}
+
+const TEXT_EXTRACTABLE_IMPORT_EXTENSIONS = new Set([
+  'pdf', 'docx', 'xlsx', 'xls', 'pptx', 'csv', 'txt', 'md', 'json',
+]);
+
+function unsupportedImportExtension(fileName: string): string | null {
+  const clean = fileName.split('?')[0]?.toLowerCase() || '';
+  const ext = clean.includes('.') ? clean.split('.').pop() || '' : '';
+  if (!ext) return null;
+  return TEXT_EXTRACTABLE_IMPORT_EXTENSIONS.has(ext) ? null : ext;
+}
+
+function likelyStoredOnlyJob(job: ImportJob): boolean {
+  if (job.status !== 'completed' || job.source_type !== 'intelligent') return false;
+  if (routedCount(job) > 0) return false;
+  return Boolean(unsupportedImportExtension(importFileName(job))) || (job.failed_rows || 0) > 0;
+}
+
+function reportStoredOnlyMessage(report: ImportReport | undefined): string | null {
+  if (!report) return null;
+  if (report.ingestion?.stored_only) {
+    return report.ingestion.message || 'The original file was stored, but no readable content was ingested into the CRM.';
+  }
+
+  const routed = (report.counters?.created_rows || 0) + (report.counters?.updated_rows || 0);
+  const hasReadableText = (report.documents || []).some(doc =>
+    (doc.extracted_text_length || 0) >= 20 || (doc.vector_count || 0) > 0
+  );
+  const hasUnsupportedFormat = (report.documents || []).some(doc =>
+    Boolean(unsupportedImportExtension(doc.file_name || doc.title || report.file_name))
+  );
+  const hasExtractionProblem = (report.documents || []).some(doc =>
+    doc.processing_status === 'failed' || /extract|readable|unsupported/i.test(doc.error_message || '')
+  );
+  const storedOnly =
+    report.status === 'completed' &&
+    (report.documents || []).length > 0 &&
+    routed === 0 &&
+    !hasReadableText &&
+    (hasUnsupportedFormat || hasExtractionProblem || (report.counters?.failed_rows || 0) > 0);
+
+  if (!storedOnly) return null;
+  return hasUnsupportedFormat
+    ? `${report.file_name} was stored in Documents, but this file format is not readable by the importer. No CRM records were created or updated, and no document chunks were added to MARTy.`
+    : `${report.file_name} was stored in Documents, but no readable text could be extracted. No CRM records were created or updated, and no document chunks were added to MARTy.`;
 }
 
 function confidenceBadge(c: number) {
@@ -323,7 +379,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
           setHistory(prev => prev.map(j => j.id === jobId ? { ...j, ...job } : j));
           if (job.status === 'completed' || job.status === 'failed' || job.status === 'reverted') {
             if (job.status === 'completed') {
-              setToast(`Analysis complete: ${routedCount(job)} entities routed. Click the row to view the report.`);
+              setToast(`Analysis complete: ${routedCount(job)} CRM records routed. Click the row to view the report.`);
             } else if (job.status === 'failed') {
               setToast('Import failed. Check the row in your history.');
             }
@@ -385,11 +441,15 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
       const freshJob = data.job || job;
       const report = (data as any).report as ImportReport | undefined;
       const docType = report?.documents?.[0]?.document_type || 'reference';
+      const storedOnly = reportStoredOnlyMessage(report);
+      const routed = report
+        ? (report.counters.created_rows || 0) + (report.counters.updated_rows || 0)
+        : routedCount(freshJob);
       setHistory(prev => prev.map(j => j.id === job.id ? { ...j, ...freshJob } : j));
       setResult({
         document_id: freshJob.id,
         category: docType,
-        summary: report?.summary || `Processed ${freshJob.total_rows || 0} entities from "${importFileName(freshJob)}".`,
+        summary: storedOnly || report?.summary || `Processed ${freshJob.total_rows || 0} entities from "${importFileName(freshJob)}".`,
         contacts_created: report?.lineage_counts?.contact || 0,
         contacts_updated: freshJob.updated_rows || 0,
         companies_created: report?.lineage_counts?.company || 0,
@@ -397,7 +457,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
         deals_created: report?.lineage_counts?.deal || 0,
         relationships_found: 0,
         signals_found: 0,
-        entities_routed: freshJob.processed_rows || routedCount(freshJob),
+        entities_routed: routed,
         errors: report?.errors || (freshJob.failed_rows ? [`${freshJob.failed_rows} rows failed`] : []),
         import_report: report,
       });
@@ -468,10 +528,14 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
         const job = data.job;
         if (job.status === 'completed') {
           const report = (data as any).report as ImportReport | undefined;
+          const storedOnly = reportStoredOnlyMessage(report);
+          const routed = report
+            ? (report.counters.created_rows || 0) + (report.counters.updated_rows || 0)
+            : routedCount(job);
           setResult({
             document_id: job.id,
             category: report?.documents?.[0]?.document_type || 'reference',
-            summary: report?.summary || `Processed ${job.total_rows || 0} entities from uploaded file.`,
+            summary: storedOnly || report?.summary || `Processed ${job.total_rows || 0} entities from uploaded file.`,
             contacts_created: report?.lineage_counts?.contact || 0,
             contacts_updated: job.updated_rows || 0,
             companies_created: report?.lineage_counts?.company || 0,
@@ -479,7 +543,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
             deals_created: report?.lineage_counts?.deal || 0,
             relationships_found: 0,
             signals_found: 0,
-            entities_routed: job.processed_rows || 0,
+            entities_routed: routed,
             errors: report?.errors || (job.failed_rows ? [`${job.failed_rows} rows failed`] : []),
             import_report: report,
           });
@@ -523,7 +587,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
 
   if (phase === 'upload') {
     return (
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 min-h-0 h-full flex flex-col overflow-hidden">
         {!embedded && (
           <TopBar
             title="Document Intelligence"
@@ -535,7 +599,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
             }
           />
         )}
-      <div className="flex-1 p-4 md:p-8 overflow-auto">
+      <div className="flex-1 min-h-0 p-4 md:p-8 overflow-auto">
           <div className="max-w-5xl mx-auto">
             {activeJobs.length > 0 && (
               <div className="card p-4 mb-5 border-accent-magenta/25 bg-accent-magenta/5">
@@ -682,6 +746,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
                     <tbody>
                       {history.map(job => {
                         const clickable = job.status === 'completed';
+                        const storedOnly = likelyStoredOnlyJob(job);
                         return (
                           <tr
                             key={job.id}
@@ -690,7 +755,14 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
                           >
                             <td className="px-4 py-3">
                               <div className="max-w-[260px] truncate text-text-primary">{importFileName(job)}</div>
-                              <div className="text-[11px] text-text-muted">{formatRelative(job.created_at)}</div>
+                              <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-text-muted">
+                                <span>{formatRelative(job.created_at)}</span>
+                                {storedOnly && (
+                                  <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-medium text-semantic-warning bg-semantic-warning/10">
+                                    <AlertTriangle size={10} /> Stored only
+                                  </span>
+                                )}
+                              </div>
                             </td>
                             <td className="px-4 py-3">
                               <span className="badge capitalize">{job.source_type}</span>
@@ -704,8 +776,8 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
                             <td className="px-4 py-3 text-right">
                               <div className="flex items-center justify-end gap-2">
                                 {job.status === 'completed' && (
-                                  <span className="text-xs text-accent-magenta">
-                                    {reportLoadingId === job.id ? 'opening…' : 'report'}
+                                  <span className={`text-xs ${storedOnly ? 'text-semantic-warning' : 'text-accent-magenta'}`}>
+                                    {reportLoadingId === job.id ? 'opening…' : storedOnly ? 'review' : 'report'}
                                   </span>
                                 )}
                                 {job.status === 'processing' && (
@@ -780,9 +852,9 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
 
   if (phase === 'analyzing') {
     return (
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 min-h-0 h-full flex flex-col overflow-hidden">
         {!embedded && <TopBar title="Document Intelligence" />}
-        <div className="flex-1 flex items-center justify-center">
+        <div className="flex-1 min-h-0 flex items-center justify-center">
           <div className="max-w-md w-full px-6">
             <div className="flex flex-col items-center mb-10">
               <div className="w-16 h-16 rounded-2xl bg-brand-gradient flex items-center justify-center mb-4">
@@ -834,13 +906,16 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
   const primaryDocument = importReport?.documents?.[0];
   const displayFileName = importReport?.file_name || primaryDocument?.file_name || file?.name || 'Uploaded file';
   const displayFileSize = primaryDocument?.file_size || file?.size || null;
-  const catConfig = CATEGORY_CONFIG[primaryDocument?.document_type || result.category] || CATEGORY_CONFIG.reference;
+  const storedOnlyMessage = reportStoredOnlyMessage(importReport);
+  const catConfig = storedOnlyMessage
+    ? { label: 'Stored File', color: '#F59E0B', bg: 'rgba(245,158,11,0.12)' }
+    : CATEGORY_CONFIG[primaryDocument?.document_type || result.category] || CATEGORY_CONFIG.reference;
   const totalContacts = result.contacts_created + result.contacts_updated;
   const totalCompanies = result.companies_created + result.companies_updated;
   const undoJobId = importReport?.job_id || result.document_id;
 
   return (
-    <div className="flex-1 flex flex-col">
+    <div className="flex-1 min-h-0 h-full flex flex-col overflow-hidden">
       <TopBar
         title="Intelligence Report"
         actions={
@@ -858,7 +933,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
           </div>
         }
       />
-      <div className="flex-1 p-6 overflow-auto">
+      <div className="flex-1 min-h-0 p-4 md:p-6 overflow-auto">
         <div className="max-w-4xl mx-auto space-y-6">
 
           {/* Document Summary Card */}
@@ -880,6 +955,20 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
               </div>
             </div>
           </div>
+
+          {storedOnlyMessage && (
+            <div className="rounded-lg border border-semantic-warning/30 bg-semantic-warning/10 px-4 py-3">
+              <div className="flex items-start gap-3">
+                <AlertTriangle size={17} className="text-semantic-warning shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-text-primary">Stored only</div>
+                  <div className="text-xs text-text-secondary mt-1 leading-relaxed">
+                    {storedOnlyMessage}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {importReport && <ImportRunReport report={importReport} onPreview={setPreviewDocId} />}
 
@@ -969,7 +1058,7 @@ export function ImportsPageContent({ embedded = false }: { embedded?: boolean } 
           {/* Result Summary Bar */}
           <div className="card p-4 flex items-center justify-between">
             <div className="text-sm text-text-secondary">
-              {result.entities_routed} entities processed · {result.errors.length} error{result.errors.length !== 1 ? 's' : ''}
+              {result.entities_routed} CRM record{result.entities_routed === 1 ? '' : 's'} routed · {result.errors.length} issue{result.errors.length !== 1 ? 's' : ''}
             </div>
             <button className="btn-primary flex items-center gap-2" onClick={resetToUpload}>
               <Upload size={14} /> Import Another

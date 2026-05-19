@@ -39,6 +39,8 @@ type MartyLabPriorityDimension =
 export const MARTY_LAB_EXPERIMENT_DOMAIN = 'marty_lab_experiment';
 export const MARTY_LAB_ARTIFACT_REVIEW_DOMAIN = 'marty_lab_artifact_review';
 export const MARTY_LAB_CODE_PATCH_DOMAIN = 'marty_lab_code_patch';
+export const MARTY_LAB_EXECUTION_DISABLED_REASON =
+  'MARTy Sandbox execution is disabled so it cannot run work or consume credits.';
 export const MARTY_LAB_AUTOPILOT_SUITE = 'marty_bootcamp_progressive_lab';
 export const MARTY_LAB_CANARY_SUITE = 'marty_bootcamp_canary_lab';
 export const MARTY_LAB_AUTOPILOT_COOLDOWN_MS = 15 * 60 * 1000;
@@ -67,6 +69,10 @@ export const MARTY_LAB_SEVERE_PRIORITY_REGRESSION_DELTA = -5;
 export const MARTY_LAB_MAX_REPLACEMENT_VALIDATION_CONVERSATIONS = 0;
 export const MARTY_LAB_MAX_SCREEN_RETRIES_PER_ROUND = 2;
 export const MARTY_LAB_PREFLIGHT_CANDIDATES = 3;
+
+export function martyLabExecutionIsDisabled(): boolean {
+  return true;
+}
 
 function martyLabApprovalRuleSummary(): string {
   return `Approval is baseline-relative and evidence-weighted: each experiment runs exactly ${MARTY_LAB_VALIDATION_CONVERSATIONS} validation conversations, then decides from the available evidence; automatic acceptance needs at least ${MARTY_LAB_MIN_DECISION_VALID_SAMPLES}/${MARTY_LAB_VALIDATION_CONVERSATIONS} clean paired grades, strong target-behavior improvement, positive net average/median deltas, no hard privacy/security or target-validity blocker, and human review for meaningful non-target regressions. Small unrelated losses are surfaced as context instead of automatically rejecting a strong fix.`;
@@ -5704,6 +5710,9 @@ export async function startMartyLabRun(
     auto_retry?: Record<string, unknown>;
   } = {}
 ): Promise<MartyLabStatusSnapshot> {
+  if (martyLabExecutionIsDisabled()) {
+    throw new Error(MARTY_LAB_EXECUTION_DISABLED_REASON);
+  }
   const requestedMode = normalizeMartyLabRunMode(opts.mode || 'canary');
   if (requestedMode !== 'canary') {
     throw new Error('Full labs are disabled while MARTy Sandbox is running canary-only improvement loops.');
@@ -8037,6 +8046,9 @@ export async function startMartyLabCodePatchJob(
   userId: string,
   opts: { focus_prompt?: string } = {}
 ): Promise<MartyLabStatusSnapshot> {
+  if (martyLabExecutionIsDisabled()) {
+    throw new Error(MARTY_LAB_EXECUTION_DISABLED_REASON);
+  }
   const [runRow, itemRow] = await Promise.all([
     env.D1.prepare(
       `SELECT * FROM marty_lab_runs WHERE org_id = ? AND id = ? LIMIT 1`
@@ -8124,6 +8136,7 @@ export async function startMartyLabCodePatchJob(
 }
 
 export async function processMartyLabCodePatchWorkItem(item: WorkQueueRow, env: Env): Promise<void> {
+  if (martyLabExecutionIsDisabled()) return;
   const orgId = item.org_id;
   const payload = safeJson<{ run_id?: string; code_patch_job_id?: string; deep_work_item_id?: string }>(item.payload, {});
   if (!payload.run_id || !payload.code_patch_job_id) {
@@ -10438,6 +10451,7 @@ async function gradeConversationPair(
 }
 
 export async function processMartyLabExperimentWorkItem(item: WorkQueueRow, env: Env): Promise<void> {
+  if (martyLabExecutionIsDisabled()) return;
   const orgId = item.org_id;
   const payload = safeJson<{ run_id?: string; experiment_id?: string }>(item.payload, {});
   const runId = payload.run_id;
@@ -11178,6 +11192,7 @@ export async function processMartyLabExperimentWorkItem(item: WorkQueueRow, env:
 }
 
 export async function processMartyLabArtifactReviewWorkItem(item: WorkQueueRow, env: Env): Promise<void> {
+  if (martyLabExecutionIsDisabled()) return;
   const orgId = item.org_id;
   const payload = safeJson<{ run_id?: string; experiment_id?: string }>(item.payload, {});
   if (!payload.run_id || !payload.experiment_id) {

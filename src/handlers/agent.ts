@@ -63,6 +63,7 @@ import {
 import { buildMaxSetTool, compactMaxSetResultForContext, detectMaxSetIntent } from '../lib/max-set-builder';
 import { TurnSourceRegistry } from '../lib/turn-source-registry';
 import { planDeterministicSourceRouting } from '../lib/source-router';
+import { inspectPlatformTelemetryTool } from '../lib/platform-telemetry';
 
 function normalizeMartySentenceSpacing(text: string): string {
   if (!text) return text;
@@ -97,7 +98,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
   // PRIMARY RETRIEVAL — call this FIRST for any content question
   {
     name: 'recall',
-    description: 'Semantic search across the firm intelligence — emails, Slack messages, meeting transcripts, documents, contacts, companies. THIS IS YOUR PRIMARY TOOL for any question about CRM content. Always call this FIRST when the user asks about communications, meetings, history, what was discussed, who said what, or any specific person/company/deal context. Results are already access-filtered for the current authenticated user; never try broader searches to bypass missing private content. The pre-populated SOURCES list at the top of context is just the initial framing — call recall to dig deeper, retrieve a specific source type, or recover when SOURCES looks empty for an asked-for type. Treat each returned source date as authoritative: relative phrases in an excerpt ("next week", "currently", "now") are relative to that source date, not today. Examples: "what\'s been happening on Slack" → recall("recent slack activity", source_types=["slack"]). "summarize the NeuralSeek meeting" → recall("NeuralSeek meeting", source_types=["meeting"]). "find Patrick\'s pitch emails" → recall("Patrick Dyer pitch", source_types=["email"]).',
+    description: 'Semantic search across the firm intelligence — emails, Slack messages, meeting transcripts, documents, contacts, companies. THIS IS YOUR PRIMARY TOOL for any question about CRM content. Use inspect_platform_telemetry instead for operational platform questions such as ingestion counts, backfills, sync health, embedding coverage, work queues, enrichment/news cadence, Gemini/API budget/circuit status, or connector/token status. Always call recall FIRST when the user asks about communications, meetings, history, what was discussed, who said what, or any specific person/company/deal context. Results are already access-filtered for the current authenticated user; never try broader searches to bypass missing private content. The pre-populated SOURCES list at the top of context is just the initial framing — call recall to dig deeper, retrieve a specific source type, or recover when SOURCES looks empty for an asked-for type. Treat each returned source date as authoritative: relative phrases in an excerpt ("next week", "currently", "now") are relative to that source date, not today. Examples: "what\'s been happening on Slack" → recall("recent slack activity", source_types=["slack"]). "summarize the NeuralSeek meeting" → recall("NeuralSeek meeting", source_types=["meeting"]). "find Patrick\'s pitch emails" → recall("Patrick Dyer pitch", source_types=["email"]).',
     input_schema: {
       type: 'object',
       properties: {
@@ -110,6 +111,26 @@ const AGENT_TOOLS: ToolDefinition[] = [
         limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 50. Max 50.' },
       },
       required: ['query'],
+    },
+  },
+  {
+    name: 'inspect_platform_telemetry',
+    description: 'Authoritative operational telemetry for the Medina/MARTy platform itself. Use this before answering questions about email/document ingestion, whether a user has run a backfill, Outlook connector or token status, sync jobs, task runs, enrichment scheduler cadence, company/contact enrichment freshness, news refresh cadence, Gemini/API usage budget, Gemini circuit/cooldown state, embedding/searchability coverage, work-queue/dead-letter health, runtime/deploy/model fingerprint, or why something may not be searchable. Do not infer these platform metrics from CRM recall/search results. Owner/super-admin users can inspect org-wide telemetry; non-owner users are limited to their own ingestion where allowed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        topic: {
+          type: 'string',
+          enum: ['auto', 'user_ingestion', 'data_coverage', 'pipeline_health', 'work_queue', 'platform_overview'],
+          description: 'Use auto unless the user clearly asked for a specific telemetry family.',
+        },
+        query: { type: 'string', description: 'The user’s original platform/system question.' },
+        subject: { type: 'string', description: 'Optional person/user name to inspect, e.g. Raul.' },
+        user_id: { type: 'string', description: 'Optional exact platform user ID.' },
+        email: { type: 'string', description: 'Optional exact platform user email.' },
+        days_back: { type: 'number', description: 'Optional lookback hint for future telemetry expansion.' },
+        limit: { type: 'number', description: 'Max recent runs/items to return. Default 10, max 50.' },
+      },
     },
   },
 
@@ -790,6 +811,7 @@ async function executeTool(
   switch (toolName) {
     case 'search_contacts': return searchContacts(ctx, toolInput, env, toolContext);
     case 'search_companies': return searchCompanies(ctx, toolInput, env, toolContext);
+    case 'inspect_platform_telemetry': return inspectPlatformTelemetryTool(ctx, toolInput || {}, env);
     case 'get_firm_relationship_snapshot': return getFirmRelationshipSnapshotTool(ctx, toolInput || {}, env);
     case 'set_firm_company_relationship': return setFirmCompanyRelationshipTool(ctx, toolInput || {}, env);
     case 'search_deals': return searchDeals(ctx, toolInput, env, toolContext);
@@ -1568,6 +1590,47 @@ export const __agentToolStateTestHooks = {
 
 function compactRoutedToolResult(tool: string, result: any): any {
   if (!result || typeof result !== 'object') return result;
+  if (tool === 'inspect_platform_telemetry') {
+    const compact: Record<string, unknown> = {
+      ok: result.ok,
+      topic: result.topic,
+      error: result.error,
+      message: result.message,
+      access_scope: result.access_scope,
+    };
+    if (result.user) compact.user = result.user;
+    if (result.email_ingestion) compact.email_ingestion = result.email_ingestion;
+    if (result.backfill) compact.backfill = result.backfill;
+    if (result.runtime) compact.runtime = result.runtime;
+    if (result.coverage) compact.coverage = result.coverage;
+    if (result.work_queue) compact.work_queue = result.work_queue;
+    if (result.pipeline_health) compact.pipeline_health = result.pipeline_health;
+    if (result.schedule_contract) compact.schedule_contract = result.schedule_contract;
+    if (result.settings) compact.settings = result.settings;
+    if (result.operational_cadence) compact.operational_cadence = result.operational_cadence;
+    if (Array.isArray(result.recent_sync_jobs)) compact.recent_sync_jobs = result.recent_sync_jobs.slice(0, 8);
+    if (Array.isArray(result.recent_task_runs)) compact.recent_task_runs = result.recent_task_runs.slice(0, 8);
+    if (result.recent_activity) {
+      compact.recent_activity = {
+        recent_matched_conversations: Array.isArray(result.recent_activity.recent_matched_conversations)
+          ? result.recent_activity.recent_matched_conversations.slice(0, 5)
+          : [],
+        user_related_sync_runs: Array.isArray(result.recent_activity.user_related_sync_runs)
+          ? result.recent_activity.user_related_sync_runs.slice(0, 8)
+          : [],
+        recent_org_ingestion_runs: Array.isArray(result.recent_activity.recent_org_ingestion_runs)
+          ? result.recent_activity.recent_org_ingestion_runs.slice(0, 5)
+          : [],
+        user_related_task_runs: Array.isArray(result.recent_activity.user_related_task_runs)
+          ? result.recent_activity.user_related_task_runs.slice(0, 5)
+          : [],
+        user_related_work_queue: result.recent_activity.user_related_work_queue,
+      };
+    }
+    if (Array.isArray(result.answer_guidance)) compact.answer_guidance = result.answer_guidance;
+    if (Array.isArray(result.candidates)) compact.candidates = result.candidates.slice(0, 5);
+    return compact;
+  }
   if (tool === 'get_firm_relationship_snapshot') {
     return {
       current_portfolio: Array.isArray(result.current_portfolio) ? result.current_portfolio : [],

@@ -28,6 +28,8 @@ import {
 import { useBackgroundTasks } from '@/components/background-task-indicator';
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
+const MARTY_SANDBOX_VISIBLE_EMAIL = 'intel@medinavc.com';
+const MARTY_SANDBOX_EXECUTION_DISABLED = true;
 
 type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals' | 'system' | 'marty-sandbox';
 
@@ -39,6 +41,10 @@ const TABS: { id: SettingsTab; label: string }[] = [
   { id: 'security', label: 'Security' },
   { id: 'approvals', label: 'Approval Queue' },
 ];
+
+function canViewMartySandboxEmail(email?: string | null): boolean {
+  return (email || '').trim().toLowerCase() === MARTY_SANDBOX_VISIBLE_EMAIL;
+}
 
 export default function SettingsPageWrapper() {
   return (
@@ -66,6 +72,36 @@ function SettingsPageInner() {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [showFirstConnect, setShowFirstConnect] = React.useState(false);
+  const [currentUser, setCurrentUser] = React.useState<UserProfile | null>(null);
+  const [currentUserLoaded, setCurrentUserLoaded] = React.useState(false);
+  const canViewMartySandbox = currentUserLoaded && canViewMartySandboxEmail(currentUser?.email);
+  const visibleTabs = React.useMemo(
+    () => TABS.filter(tab => tab.id !== 'marty-sandbox' || canViewMartySandbox),
+    [canViewMartySandbox]
+  );
+
+  React.useEffect(() => {
+    let active = true;
+    api.getMe()
+      .then(({ user }) => {
+        if (!active) return;
+        setCurrentUser(user);
+      })
+      .catch(() => {
+        if (!active) return;
+        setCurrentUser(null);
+      })
+      .finally(() => {
+        if (active) setCurrentUserLoaded(true);
+      });
+    return () => { active = false; };
+  }, []);
+
+  React.useEffect(() => {
+    if (!currentUserLoaded || activeTab !== 'marty-sandbox' || canViewMartySandbox) return;
+    setActiveTab('profile');
+    router.replace('/settings?tab=profile', { scroll: false });
+  }, [activeTab, canViewMartySandbox, currentUserLoaded, router]);
 
   const loadStatus = React.useCallback(async () => {
     setLoading(true);
@@ -152,7 +188,7 @@ function SettingsPageInner() {
       <div className="sticky top-0 z-20 bg-bg-root border-b border-white/5">
         <div className="max-w-4xl px-4 md:px-8 overflow-x-auto scrollbar-hide">
           <div className="flex gap-0 min-w-max">
-            {TABS.map(tab => (
+            {visibleTabs.map(tab => (
               <button
                 key={tab.id}
                 onClick={() => switchTab(tab.id)}
@@ -169,7 +205,7 @@ function SettingsPageInner() {
         </div>
       </div>
 
-      <div className={`p-4 md:p-8 w-full ${activeTab === 'marty-sandbox' ? 'max-w-[112rem]' : 'max-w-4xl'}`}>
+      <div className={`p-4 md:p-8 w-full ${activeTab === 'marty-sandbox' && canViewMartySandbox ? 'max-w-[112rem]' : 'max-w-4xl'}`}>
         {banner && (
           <div
             className={`card border-l-4 mb-6 ${
@@ -195,7 +231,10 @@ function SettingsPageInner() {
         )}
         {activeTab === 'approvals' && <ApprovalQueueSection />}
         {activeTab === 'system' && <SystemStatusSection />}
-        {activeTab === 'marty-sandbox' && <MartySandboxSection />}
+        {activeTab === 'marty-sandbox' && !currentUserLoaded && (
+          <div className="card p-6 text-sm text-text-muted">Loading settings...</div>
+        )}
+        {activeTab === 'marty-sandbox' && canViewMartySandbox && <MartySandboxSection />}
       </div>
 
       {showFirstConnect && (
@@ -4529,7 +4568,7 @@ function SandboxFocusComposer({
           disabled={startDisabled}
           className="inline-flex items-center gap-1 rounded-lg border border-accent-magenta/25 bg-accent-magenta/10 px-3 py-2 text-xs font-medium text-accent-magenta hover:bg-accent-magenta/15 disabled:opacity-50"
         >
-          <Sparkles size={14} /> {startingMode === 'canary' ? `${startVerb}ing...` : `${startVerb} experiment`}
+          <Sparkles size={14} /> {MARTY_SANDBOX_EXECUTION_DISABLED ? 'Execution disabled' : startingMode === 'canary' ? `${startVerb}ing...` : `${startVerb} experiment`}
         </button>
       </div>
     </section>
@@ -4901,7 +4940,7 @@ function SandboxCoverPage({
           </p>
         </div>
         {pausedForRoundReview ? (
-          <MartyLabRoundReviewButtons disabled={reviewingRound !== null} reviewing={reviewingRound} onReview={onReview} />
+          <MartyLabRoundReviewButtons disabled={MARTY_SANDBOX_EXECUTION_DISABLED || reviewingRound !== null} reviewing={reviewingRound} onReview={onReview} />
         ) : canShowRunDecision ? (
           <MartyLabDecisionButtons disabled={decisionDisabled} deciding={deciding} onDecide={onDecide} />
         ) : null}
@@ -5278,10 +5317,10 @@ function SandboxImprovementQueue({
                     <button
                       type="button"
                       onClick={() => onStartCodePatch(item)}
-                      disabled={Boolean(patchJob) || startingCodePatchId === item.id || !isViewingCurrent}
+                      disabled={MARTY_SANDBOX_EXECUTION_DISABLED || Boolean(patchJob) || startingCodePatchId === item.id || !isViewingCurrent}
                       className="rounded-md border border-accent-magenta/25 px-2 py-1 text-[10px] font-medium text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50"
                     >
-                      {startingCodePatchId === item.id ? 'Starting patch' : patchJob ? 'Patch started' : 'Start code patch'}
+                      {MARTY_SANDBOX_EXECUTION_DISABLED ? 'Execution disabled' : startingCodePatchId === item.id ? 'Starting patch' : patchJob ? 'Patch started' : 'Start code patch'}
                     </button>
                     <button type="button" onClick={() => onStartLab(focus)} disabled={startDisabled} className="rounded-md border border-white/10 px-2 py-1 text-[10px] font-medium text-text-secondary hover:bg-white/[0.04] disabled:opacity-50">{startVerb} canary</button>
                   </div>
@@ -5450,6 +5489,10 @@ function MartyLabStatusCard({
   }, [liveRun?.id, viewLab?.run?.id]);
 
   async function startLab(focusOverride?: string) {
+    if (MARTY_SANDBOX_EXECUTION_DISABLED) {
+      setError('MARTy Sandbox execution is disabled so it cannot run work or consume credits.');
+      return;
+    }
     setStartingMode('canary');
     setError(null);
     try {
@@ -5485,6 +5528,10 @@ function MartyLabStatusCard({
   }
 
   async function decideLab(decision: 'ship' | 'reject') {
+    if (MARTY_SANDBOX_EXECUTION_DISABLED) {
+      setError('MARTy Sandbox execution is disabled so it cannot change sandbox decisions.');
+      return;
+    }
     if (!run || !isViewingCurrent) return;
     setDeciding(decision);
     setError(null);
@@ -5499,6 +5546,10 @@ function MartyLabStatusCard({
   }
 
   async function reviewRound(decision: 'approve_continue' | 'reject_continue') {
+    if (MARTY_SANDBOX_EXECUTION_DISABLED) {
+      setError('MARTy Sandbox execution is disabled so it cannot continue rounds.');
+      return;
+    }
     if (!run || !isViewingCurrent) return;
     setReviewingRound(decision);
     setError(null);
@@ -5533,6 +5584,10 @@ function MartyLabStatusCard({
   }
 
   async function startCodePatch(item: MartyLabDeepWorkItemRow) {
+    if (MARTY_SANDBOX_EXECUTION_DISABLED) {
+      setError('MARTy Sandbox execution is disabled so it cannot start code-patch work.');
+      return;
+    }
     if (!run || !isViewingCurrent) return;
     setStartingCodePatchId(item.id);
     setError(null);
@@ -5653,12 +5708,12 @@ function MartyLabStatusCard({
     'one_active_lab_run_per_suite',
     'one_active_lab_run_per_org',
   ].includes(key) || (key === 'lab_work_queue_clear' && Boolean(liveRun) && !labQueueHasStaleRows));
-  const startDisabled = Boolean(startingMode || canRepairLabQueue || canArchiveLegacyRun || canQuarantineLabArtifacts || canResetLabBaseline || (!readiness.ok && !canQueueWhenBlocked));
+  const startDisabled = Boolean(MARTY_SANDBOX_EXECUTION_DISABLED || startingMode || canRepairLabQueue || canArchiveLegacyRun || canQuarantineLabArtifacts || canResetLabBaseline || (!readiness.ok && !canQueueWhenBlocked));
   const startVerb = readiness.ok && !liveRun ? 'Start' : 'Queue';
   const currentRunPhase = labRunPhase(run);
   const hasHumanDecision = currentRunPhase === 'human_shipped' || currentRunPhase === 'human_rejected';
   const pausedForRoundReview = Boolean(run?.status === 'running' && currentRunPhase === 'round_inconclusive_needs_review' && run.summary?.needs_human_round_review);
-  const decisionDisabled = Boolean(!run || !runIsCanary || selectedRunIsLegacyFullLab || !isViewingCurrent || isQuarantined || run.status === 'running' || run.status === 'configured' || hasHumanDecision || !activeTrial?.candidate_version_id);
+  const decisionDisabled = Boolean(MARTY_SANDBOX_EXECUTION_DISABLED || !run || !runIsCanary || selectedRunIsLegacyFullLab || !isViewingCurrent || isQuarantined || run.status === 'running' || run.status === 'configured' || hasHumanDecision || !activeTrial?.candidate_version_id);
   const canShowRunDecision = Boolean(run && runIsCanary && !selectedRunIsLegacyFullLab && labRunNeedsDecision(run) && isViewingCurrent && !pausedForRoundReview && !isQuarantined);
   const activeTrialExperimentPage = experimentPages.find(page => page.trial?.id === activeTrial?.id)
     || (currentRound > 0 ? experimentPages[currentRound - 1] : null)
@@ -5777,6 +5832,12 @@ function MartyLabStatusCard({
         )}
       />
 
+      {MARTY_SANDBOX_EXECUTION_DISABLED && (
+        <div className="rounded-lg border border-semantic-warning/20 bg-semantic-warning/10 px-3 py-2 text-xs leading-relaxed text-semantic-warning">
+          MARTy Sandbox execution is disabled. This view is available for inspection and cleanup only; sandbox jobs cannot start, continue, ship, or consume credits.
+        </div>
+      )}
+
       {error && (
         <div className="rounded-lg border border-semantic-error/20 bg-semantic-error/10 px-3 py-2 text-xs text-semantic-error">
           {error}
@@ -5788,7 +5849,7 @@ function MartyLabStatusCard({
         onChange={setFocusPrompt}
         onStart={() => startLab()}
         startDisabled={startDisabled}
-        startVerb={startVerb}
+        startVerb={MARTY_SANDBOX_EXECUTION_DISABLED ? 'Disabled' : startVerb}
         startingMode={startingMode}
         isBusy={Boolean(liveRun || queuedRuns.length > 0 || !readiness.ok)}
       />
@@ -6300,7 +6361,7 @@ function MartyLabStatusCardLegacy({
                 </div>
                 {pausedForRoundReview ? (
                   <MartyLabRoundReviewButtons
-                    disabled={reviewingRound !== null}
+                    disabled={MARTY_SANDBOX_EXECUTION_DISABLED || reviewingRound !== null}
                     reviewing={reviewingRound}
                     onReview={reviewRound}
                   />
@@ -6666,10 +6727,10 @@ function MartyLabStatusCardLegacy({
                     <button
                       type="button"
                       onClick={() => startCodePatch(item)}
-                      disabled={Boolean(patchJob) || startingCodePatchId === item.id || !isViewingCurrent}
+                      disabled={MARTY_SANDBOX_EXECUTION_DISABLED || Boolean(patchJob) || startingCodePatchId === item.id || !isViewingCurrent}
                       className="rounded-md border border-accent-magenta/25 px-2 py-1 text-[10px] font-medium text-accent-magenta hover:bg-accent-magenta/10 disabled:opacity-50"
                     >
-                      {startingCodePatchId === item.id ? 'Starting patch' : patchJob ? 'Patch started' : 'Start code patch'}
+                      {MARTY_SANDBOX_EXECUTION_DISABLED ? 'Execution disabled' : startingCodePatchId === item.id ? 'Starting patch' : patchJob ? 'Patch started' : 'Start code patch'}
                     </button>
                     <button
                       type="button"

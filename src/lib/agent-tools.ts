@@ -1506,8 +1506,12 @@ export async function getCompanyDetail(
       'SELECT t.id, t.name, t.color FROM company_tags ct JOIN tags t ON ct.tag_id = t.id WHERE ct.company_id = ?'
     ).bind(companyId).all(),
     env.D1.prepare(
-      `SELECT id, title, source, published_at, summary, relevance_score
-       FROM news_articles WHERE company_id = ? ORDER BY published_at DESC LIMIT ?`
+      `SELECT id, title, source, published_at, summary, relevance_tag, relevance_score
+       FROM news_articles
+       WHERE company_id = ?
+       ORDER BY CASE WHEN relevance_tag = 'direct_mention' THEN 0 ELSE 1 END,
+                published_at DESC
+       LIMIT ?`
     ).bind(companyId, toolContext.deepDive ? MAX_MODE_LIMITS.ragV1NewsReturn : 10).all().catch(() => ({ results: [] })),
     loadFirmRelationshipSnapshot(ctx, env, { includePipeline: true, limit: 1000 }).catch(() => null),
   ]);
