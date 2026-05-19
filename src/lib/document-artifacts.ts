@@ -1736,6 +1736,10 @@ function escapeHtml(value: any): string {
     .replace(/'/g, '&#39;');
 }
 
+function deckDisplayText(value: any): string {
+  return cleanArtifactText(value).replace(/\.{3,}/g, '…');
+}
+
 function wordsIn(value: string): number {
   return cleanArtifactText(value).split(/\s+/).filter(Boolean).length;
 }
@@ -1835,10 +1839,53 @@ function deckPlanFromContent(title: string, content: any): DeckPlan {
   };
 }
 
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const normalized = String(hex || '').replace('#', '').trim();
+  if (!/^[0-9a-f]{6}$/i.test(normalized)) return null;
+  return {
+    r: parseInt(normalized.slice(0, 2), 16),
+    g: parseInt(normalized.slice(2, 4), 16),
+    b: parseInt(normalized.slice(4, 6), 16),
+  };
+}
+
+function rgbToHex(rgb: { r: number; g: number; b: number }): string {
+  const channel = (value: number) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, '0').toUpperCase();
+  return `#${channel(rgb.r)}${channel(rgb.g)}${channel(rgb.b)}`;
+}
+
+function mixHex(a: string, b: string, weightA: number): string {
+  const ca = hexToRgb(a);
+  const cb = hexToRgb(b);
+  if (!ca || !cb) return a;
+  const w = Math.max(0, Math.min(1, weightA));
+  return rgbToHex({
+    r: ca.r * w + cb.r * (1 - w),
+    g: ca.g * w + cb.g * (1 - w),
+    b: ca.b * w + cb.b * (1 - w),
+  });
+}
+
+function enrichStyleTokens(base: Record<string, string>): Record<string, string> {
+  return {
+    ...base,
+    pageBg: mixHex(base.bg, '#000000', 0.72),
+    borderSoft: mixHex(base.border, base.bg, 0.72),
+    headlineText: mixHex(base.text, base.accent2, 0.92),
+    bodyText: mixHex(base.text, base.muted, 0.84),
+    tableText: mixHex(base.text, base.muted, 0.86),
+    tableHeaderBg: mixHex(base.panel, base.bg, 0.82),
+    tableRowBorder: mixHex(base.border, base.bg, 0.76),
+    panelBorder: mixHex(base.border, base.panel, 0.78),
+    qaBg: mixHex(base.panel, base.bg, 0.72),
+  };
+}
+
 function styleTokens(styleId: DeckStylePackId): Record<string, string> {
   const style = DECK_STYLE_PACKS[styleId] || DECK_STYLE_PACKS.medina_default;
+  let base: Record<string, string>;
   if (style.id === 'banker_clean') {
-    return {
+    base = {
       bg: '#FFFFFF',
       panel: '#F4F5F7',
       panel2: '#FFFFFF',
@@ -1848,9 +1895,10 @@ function styleTokens(styleId: DeckStylePackId): Record<string, string> {
       accent2: '#A855F7',
       border: '#D9DEE7',
     };
+    return enrichStyleTokens(base);
   }
   if (style.id === 'consulting_editorial') {
-    return {
+    base = {
       bg: '#FBFBFC',
       panel: '#ECEFF3',
       panel2: '#FFFFFF',
@@ -1860,9 +1908,10 @@ function styleTokens(styleId: DeckStylePackId): Record<string, string> {
       accent2: '#E11D48',
       border: '#D0D5DD',
     };
+    return enrichStyleTokens(base);
   }
   if (style.id === 'founder_story') {
-    return {
+    base = {
       bg: '#111827',
       panel: '#192132',
       panel2: '#243044',
@@ -1872,9 +1921,10 @@ function styleTokens(styleId: DeckStylePackId): Record<string, string> {
       accent2: '#F97316',
       border: '#334155',
     };
+    return enrichStyleTokens(base);
   }
   if (style.id === 'lp_report') {
-    return {
+    base = {
       bg: '#F8F7F4',
       panel: '#E8E1D7',
       panel2: '#FFFFFF',
@@ -1884,8 +1934,9 @@ function styleTokens(styleId: DeckStylePackId): Record<string, string> {
       accent2: '#0F766E',
       border: '#D6CFC4',
     };
+    return enrichStyleTokens(base);
   }
-  return {
+  base = {
     bg: '#08080D',
     panel: '#12121A',
     panel2: '#191923',
@@ -1895,13 +1946,68 @@ function styleTokens(styleId: DeckStylePackId): Record<string, string> {
     accent2: '#8B5CF6',
     border: '#2D2D36',
   };
+  return enrichStyleTokens(base);
 }
 
-function renderSlideTableHtml(table: any): string {
+function renderSlideTableHtml(table: any, opts: { maxRows?: number; maxCols?: number; compact?: boolean } = {}): string {
   const t = tableFromAny(table);
   if (!t || t.headers.length === 0) return '';
-  const rows = t.rows.slice(0, 6);
-  return `<div class="table-wrap">${t.title ? `<div class="table-title">${escapeHtml(t.title)}</div>` : ''}<table><thead><tr>${t.headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${t.headers.map((_, i) => `<td>${escapeHtml(row[i])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  const headers = t.headers.slice(0, opts.maxCols || 5);
+  const rows = t.rows.slice(0, opts.maxRows || 6);
+  return `<div class="table-wrap${opts.compact ? ' compact' : ''}">${t.title ? `<div class="table-title">${escapeHtml(deckDisplayText(t.title))}</div>` : ''}<table><thead><tr>${headers.map(h => `<th>${escapeHtml(deckDisplayText(h))}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${headers.map((_, i) => `<td>${escapeHtml(deckDisplayText(row[i]))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+
+function renderDeckMetricsHtml(metrics: any[], opts: { compact?: boolean } = {}): string {
+  const visible = metrics.slice(0, opts.compact ? 3 : 4);
+  if (visible.length === 0) return '';
+  return `<div class="metrics${opts.compact ? ' compact' : ''}">${visible.map((m: any) => `<div class="metric"><div class="metric-value">${escapeHtml(deckDisplayText(firstNonEmpty(m?.value, m?.metric, m)))}</div><div class="metric-label">${escapeHtml(deckDisplayText(firstNonEmpty(m?.label, m?.name, m?.context)))}</div></div>`).join('')}</div>`;
+}
+
+function renderDeckEvidenceHtml(evidence: string[], opts: { compact?: boolean; numbered?: boolean } = {}): string {
+  const visible = evidence.slice(0, opts.compact ? 3 : 4).map(deckDisplayText).filter(Boolean);
+  if (visible.length === 0) return '';
+  return `<div class="evidence-grid${opts.compact ? ' compact' : ''}">${visible.map((e, i) => `<div class="evidence-card"><span>${opts.numbered === false ? '•' : String(i + 1).padStart(2, '0')}</span><strong>${escapeHtml(e)}</strong></div>`).join('')}</div>`;
+}
+
+function renderTableCardsHtml(table: any, variant: 'deal' | 'risk' | 'action' | 'timeline' = 'deal'): string {
+  const t = tableFromAny(table);
+  if (!t || t.headers.length === 0 || t.rows.length === 0) return '';
+  const rows = t.rows.slice(0, variant === 'timeline' ? 5 : 4);
+  const headers = t.headers.map(deckDisplayText);
+  const titleFor = (row: any[]) => deckDisplayText(row[0] || row[1] || 'Item');
+  const detailFor = (row: any[]) => row
+    .slice(1, 4)
+    .map((cell, i) => {
+      const value = deckDisplayText(cell);
+      if (!value) return '';
+      const label = headers[i + 1] || '';
+      return label ? `${label}: ${value}` : value;
+    })
+    .filter(Boolean);
+  return `<div class="proof-card-grid ${variant}-cards">${rows.map((row, i) => {
+    const details = detailFor(row);
+    return `<article class="proof-card"><div class="proof-index">${String(i + 1).padStart(2, '0')}</div><div><h3>${escapeHtml(titleFor(row))}</h3>${details.length ? `<p>${escapeHtml(details.join(' · '))}</p>` : ''}</div></article>`;
+  }).join('')}</div>`;
+}
+
+function inferHtmlSlideLayout(
+  slide: any,
+  index: number,
+  opts: { metrics: any[]; evidence: string[]; table: any; bullets: string[]; body: string }
+): string {
+  const requested = cleanArtifactText(slide.layout).toLowerCase();
+  const titleText = `${slide.title || ''} ${slide.headline || ''}`.toLowerCase();
+  if (requested === 'cover' || index === 0) return 'cover';
+  if (requested === 'executive_summary') return 'executive';
+  if (requested === 'risk' || /\b(risk|open question|watchout|concern)\b/.test(titleText)) return 'risk-cards';
+  if (requested === 'timeline' || /\b(timeline|process|relationship|milestone)\b/.test(titleText)) return 'timeline-cards';
+  if (requested === 'next_steps' || /\b(next step|action|decision point|owner)\b/.test(titleText)) return 'action-cards';
+  if (/\b(deal|pipeline|prospect|account|customer)\b/.test(titleText) && opts.table) return 'deal-cards';
+  if (opts.metrics.length >= 2) return 'metric-dashboard';
+  if (opts.table && !opts.body && opts.bullets.length === 0 && opts.metrics.length === 0 && opts.evidence.length === 0) return 'full-table';
+  if (opts.table) return 'table-story';
+  if (opts.evidence.length >= 3) return 'evidence-wall';
+  return 'story';
 }
 
 function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaReport): string {
@@ -1913,44 +2019,57 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
   const slideHtml = slides.map((slide, index) => {
     const metrics = asArray(slide.metrics).slice(0, 4);
     const evidence = slideEvidenceBlocks(slide).slice(0, 4);
-    const tableHtml = renderSlideTableHtml(slide.table);
-    const bullets = asArray(slide.bullets).map(cleanArtifactText).filter(Boolean).slice(0, 4);
-    const layout = cleanArtifactText(slide.layout || 'evidence');
-    const body = cleanArtifactText(slide.body);
-    const metricHtml = metrics.length
-      ? `<div class="metrics">${metrics.map((m: any) => `<div class="metric"><div class="metric-value">${escapeHtml(firstNonEmpty(m?.value, m?.metric, m))}</div><div class="metric-label">${escapeHtml(firstNonEmpty(m?.label, m?.name, m?.context))}</div></div>`).join('')}</div>`
-      : '';
-    const evidenceHtml = evidence.length
-      ? `<div class="evidence-grid">${evidence.map((e, i) => `<div class="evidence-card"><span>${String(i + 1).padStart(2, '0')}</span><strong>${escapeHtml(e)}</strong></div>`).join('')}</div>`
-      : '';
+    const table = tableFromAny(slide.table);
+    const bullets = asArray(slide.bullets).map(deckDisplayText).filter(Boolean).slice(0, 4);
+    const body = deckDisplayText(slide.body);
+    const layout = inferHtmlSlideLayout(slide, index, { metrics, evidence, table, bullets, body });
+    const tableHtml = table ? renderSlideTableHtml(table, { maxRows: layout === 'full-table' ? 7 : 6, maxCols: layout === 'full-table' ? 5 : 4 }) : '';
+    const metricHtml = renderDeckMetricsHtml(metrics, { compact: layout !== 'metric-dashboard' });
+    const evidenceHtml = renderDeckEvidenceHtml(evidence, { compact: layout === 'cover' || layout === 'metric-dashboard' });
     const bulletHtml = bullets.length
       ? `<ul>${bullets.map(b => `<li>${escapeHtml(b)}</li>`).join('')}</ul>`
       : '';
-    const mainVisual = tableHtml || evidenceHtml || metricHtml || bulletHtml;
+    const titleText = deckDisplayText(slide.title);
+    const headlineText = deckDisplayText(firstNonEmpty(slide.headline, slide.takeaway));
+    const hasNarrative = Boolean(body || bulletHtml || (metricHtml && layout !== 'metric-dashboard'));
+    const tableCards = table && ['deal-cards', 'risk-cards', 'action-cards', 'timeline-cards'].includes(layout)
+      ? renderTableCardsHtml(table, layout === 'risk-cards' ? 'risk' : layout === 'action-cards' ? 'action' : layout === 'timeline-cards' ? 'timeline' : 'deal')
+      : '';
+    const mainVisual = tableCards || tableHtml || evidenceHtml || metricHtml || bulletHtml;
     if (layout === 'cover' || index === 0) {
       return `<section class="slide cover" data-slide="${index + 1}">
         <div class="slide-accent" data-accent-line="true"></div>
-        <div class="kicker">MEDINA VENTURES · ${escapeHtml(style.name)}</div>
-        <h1>${escapeHtml(slide.title || title)}</h1>
-        <p class="cover-subtitle">${escapeHtml(firstNonEmpty(slide.headline, slide.subtitle, content?.summary, 'Prepared by MARTy'))}</p>
-        <div class="cover-proof">${evidenceHtml || metricHtml || '<div class="evidence-grid"><div class="evidence-card"><span>01</span><strong>Claim spine</strong></div><div class="evidence-card"><span>02</span><strong>Visual system</strong></div><div class="evidence-card"><span>03</span><strong>QA-gated export</strong></div></div>'}</div>
+        <div class="cover-grid">
+          <div class="cover-main">
+            <div class="kicker">MEDINA VENTURES · ${escapeHtml(style.name)}</div>
+            <h1>${escapeHtml(deckDisplayText(slide.title || title))}</h1>
+            <p class="cover-subtitle">${escapeHtml(deckDisplayText(firstNonEmpty(slide.headline, slide.subtitle, content?.summary, 'Prepared by MARTy')))}</p>
+          </div>
+          <div class="cover-proof">${evidenceHtml || metricHtml || '<div class="evidence-grid compact"><div class="evidence-card"><span>01</span><strong>Claim spine</strong></div><div class="evidence-card"><span>02</span><strong>Evidence-first proof</strong></div><div class="evidence-card"><span>03</span><strong>QA-gated export</strong></div></div>'}</div>
+        </div>
         <footer>${escapeHtml(firstNonEmpty(slide.subtitle, 'Prepared by MARTy'))}</footer>
       </section>`;
     }
+    const narrativeHtml = hasNarrative
+      ? `<div class="narrative">
+          ${layout !== 'metric-dashboard' ? metricHtml : ''}
+          ${body ? `<p class="body">${escapeHtml(body)}</p>` : ''}
+          ${bulletHtml}
+        </div>`
+      : '';
+    const mainClass = hasNarrative && mainVisual && layout !== 'full-table'
+      ? layout
+      : `proof-full ${layout}`;
     return `<section class="slide ${escapeHtml(layout)}" data-slide="${index + 1}">
       <div class="slide-accent" data-accent-line="true"></div>
       <div class="kicker">${escapeHtml(inferSlideRole(slide, index).replace(/_/g, ' '))}</div>
       <header>
-        <h2>${escapeHtml(slide.title)}</h2>
-        <p>${escapeHtml(firstNonEmpty(slide.headline, slide.takeaway))}</p>
+        <h2>${escapeHtml(titleText)}</h2>
+        <p>${escapeHtml(headlineText)}</p>
       </header>
-      <main class="${tableHtml ? 'with-table' : evidence.length ? 'with-evidence' : 'with-bullets'}">
-        <div class="narrative">
-          ${metricHtml}
-          ${body ? `<p class="body">${escapeHtml(body)}</p>` : ''}
-          ${bulletHtml}
-        </div>
-        <div class="visual">${mainVisual}</div>
+      <main class="${escapeHtml(mainClass)}">
+        ${layout === 'metric-dashboard' && metricHtml ? `<div class="visual metric-surface">${metricHtml}</div>` : narrativeHtml}
+        <div class="visual${!hasNarrative || layout === 'metric-dashboard' ? ' full' : ''}">${mainVisual}</div>
       </main>
       ${slide.source_note ? `<div class="source-note">Source note: ${escapeHtml(slide.source_note)}</div>` : ''}
       <footer>${index + 1}/${slides.length}</footer>
@@ -1973,6 +2092,15 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
   --accent: ${T.accent};
   --accent-2: ${T.accent2};
   --border: ${T.border};
+  --page-bg: ${T.pageBg};
+  --border-soft: ${T.borderSoft};
+  --headline-text: ${T.headlineText};
+  --body-text: ${T.bodyText};
+  --table-text: ${T.tableText};
+  --table-header-bg: ${T.tableHeaderBg};
+  --table-row-border: ${T.tableRowBorder};
+  --panel-border: ${T.panelBorder};
+  --qa-bg: ${T.qaBg};
   --accent-gutter: ${DECK_ACCENT_GUTTER_PX}px;
   --safe-margin: ${DECK_SAFE_MARGIN_PX}px;
   --grid-gap: ${DECK_GRID_GAP_PX}px;
@@ -1982,42 +2110,55 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
   --slide-h: 720px;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: #050507; color: var(--text); font-family: Inter, Arial, sans-serif; }
+body { margin: 0; background: var(--page-bg); color: var(--text); font-family: Inter, Arial, sans-serif; }
 .deck-frame { min-height: 100vh; padding: 32px; display: grid; gap: 32px; place-items: center; }
 .deck-meta { width: min(1280px, 100%); color: #a1a1aa; display: flex; justify-content: space-between; gap: 16px; font-size: 12px; }
-.slide { position: relative; width: min(var(--slide-w), calc(100vw - 64px)); aspect-ratio: 16 / 9; overflow: hidden; background: var(--bg); border: 1px solid color-mix(in srgb, var(--border) 72%, transparent); box-shadow: 0 24px 90px rgba(0,0,0,.36); padding: var(--safe-margin) 76px var(--footer-reserved) calc(var(--accent-gutter) + 48px); }
+.slide { position: relative; width: min(var(--slide-w), calc(100vw - 64px)); aspect-ratio: 16 / 9; overflow: hidden; background: var(--bg); border: 1px solid var(--border-soft); box-shadow: 0 24px 90px rgba(0,0,0,.36); padding: var(--safe-margin) 76px var(--footer-reserved) calc(var(--accent-gutter) + 48px); }
 .slide-accent { position: absolute; left: 30px; top: var(--safe-margin); bottom: var(--safe-margin); width: 4px; border-radius: 999px; background: linear-gradient(180deg, var(--accent), var(--accent-2)); }
 .kicker { color: var(--accent-2); text-transform: uppercase; letter-spacing: .16em; font-size: 12px; font-weight: 700; margin-bottom: 22px; }
 h1, h2 { font-family: "DM Sans", Inter, Arial, sans-serif; letter-spacing: 0; margin: 0; color: var(--text); }
-h1 { font-size: 56px; line-height: 1; max-width: 840px; }
+h1 { font-size: 52px; line-height: 1.02; max-width: 680px; overflow-wrap: anywhere; }
 h2 { font-size: 32px; line-height: 1.06; max-width: 760px; }
-header p, .cover-subtitle { margin: 18px 0 0; color: color-mix(in srgb, var(--text) 90%, var(--accent-2)); font-size: 21px; line-height: 1.24; font-weight: 650; max-width: var(--text-max-width); }
-main { display: grid; grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr); gap: var(--grid-gap); align-items: start; margin-top: 30px; }
-.cover { display: grid; grid-template-rows: auto auto auto 1fr auto; }
-.cover-proof { position: absolute; right: 76px; top: 152px; width: 360px; }
+header p, .cover-subtitle { margin: 18px 0 0; color: var(--headline-text); font-size: 21px; line-height: 1.24; font-weight: 650; max-width: var(--text-max-width); }
+main { display: grid; grid-template-columns: minmax(0, .88fr) minmax(0, 1.12fr); gap: var(--grid-gap); align-items: start; margin-top: 30px; }
+main.proof-full { grid-template-columns: minmax(0, 1fr); margin-top: 26px; }
+main.metric-dashboard { grid-template-columns: minmax(0, .78fr) minmax(0, 1.22fr); }
+.cover { display: grid; }
+.cover-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 54px; align-items: end; min-height: 100%; padding-bottom: 42px; }
+.cover-main { min-width: 0; }
+.cover-proof { position: static; width: auto; align-self: center; }
 .cover footer, .slide footer { position: absolute; left: calc(var(--accent-gutter) + 48px); bottom: 30px; color: var(--muted); font-size: 12px; }
 .slide footer { left: auto; right: 52px; }
-.body { color: color-mix(in srgb, var(--text) 88%, var(--muted)); line-height: 1.4; font-size: 17px; margin: 0 0 18px; max-width: var(--text-max-width); }
+.body { color: var(--body-text); line-height: 1.4; font-size: 17px; margin: 0 0 18px; max-width: var(--text-max-width); }
 ul { margin: 0; padding: 0; display: grid; gap: 11px; list-style: none; }
-li { position: relative; padding-left: 22px; color: color-mix(in srgb, var(--text) 88%, var(--muted)); font-size: 16px; line-height: 1.32; }
+li { position: relative; padding-left: 22px; color: var(--body-text); font-size: 16px; line-height: 1.32; }
 li::before { content: ""; position: absolute; left: 0; top: .58em; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
 .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
-.metric, .evidence-card { background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--border); border-radius: 12px; }
+.metrics.compact { grid-template-columns: 1fr; }
+.metric, .evidence-card, .proof-card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px; }
 .metric { padding: 16px; }
 .metric-value { font-size: 30px; line-height: 1; font-weight: 800; color: var(--text); }
 .metric-label { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.25; text-transform: uppercase; letter-spacing: .08em; }
 .evidence-grid { display: grid; gap: 12px; }
+.evidence-grid.compact { gap: 10px; }
 .evidence-card { min-height: 82px; padding: 15px 17px; display: grid; grid-template-columns: 38px 1fr; gap: 12px; align-items: start; }
 .evidence-card span { color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: .1em; }
 .evidence-card strong { color: var(--text); font-size: 17px; line-height: 1.25; }
-.table-wrap { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.table-wrap { background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: 8px; overflow: hidden; }
 .table-title { padding: 12px 14px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--border); }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
-th, td { padding: 12px 13px; border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent); text-align: left; vertical-align: top; line-height: 1.25; }
-th { color: var(--accent-2); background: color-mix(in srgb, var(--panel) 90%, transparent); text-transform: uppercase; letter-spacing: .08em; font-size: 11px; }
-td { color: color-mix(in srgb, var(--text) 82%, var(--muted)); }
+th, td { padding: 11px 12px; border-bottom: 1px solid var(--table-row-border); text-align: left; vertical-align: top; line-height: 1.24; }
+th { color: var(--accent-2); background: var(--table-header-bg); text-transform: uppercase; letter-spacing: .08em; font-size: 11px; }
+td { color: var(--table-text); }
+.visual.full { min-width: 0; }
+.proof-card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.timeline-cards { grid-template-columns: 1fr; }
+.proof-card { min-height: 92px; padding: 16px 18px; display: grid; grid-template-columns: 44px 1fr; gap: 14px; align-items: start; }
+.proof-index { color: var(--accent); font-size: 13px; font-weight: 800; letter-spacing: .12em; }
+.proof-card h3 { margin: 0 0 7px; color: var(--text); font-size: 17px; line-height: 1.18; }
+.proof-card p { margin: 0; color: var(--body-text); font-size: 13px; line-height: 1.34; }
 .source-note { position: absolute; left: calc(var(--accent-gutter) + 48px); right: 92px; bottom: 30px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.qa-panel { width: min(1280px, 100%); padding: 18px 20px; border: 1px solid #2d2d36; border-radius: 14px; background: #101014; color: #d4d4d8; font-size: 13px; }
+.qa-panel { width: min(1280px, 100%); padding: 18px 20px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--qa-bg); color: var(--body-text); font-size: 13px; }
 .qa-panel strong { color: #fff; }
 @media print { body { background: white; } .deck-frame { padding: 0; gap: 0; } .deck-meta, .qa-panel { display: none; } .slide { width: 100vw; height: 100vh; box-shadow: none; border: 0; page-break-after: always; } }
 </style>
@@ -2050,6 +2191,9 @@ function evaluatePremiumDeckQa(title: string, content: any, html?: string): Deck
     }
     if (index > 0 && !firstNonEmpty(slide?.headline, slide?.takeaway)) {
       findings.push({ slideId, severity: 'high', issue: 'Slide title is topical instead of making a point.', requiredFix: 'Add a so-what headline that states the conclusion.' });
+    }
+    if (/\.\.\./.test(cleanArtifactText(`${slide?.title || ''} ${slide?.headline || ''} ${slide?.takeaway || ''}`))) {
+      findings.push({ slideId, severity: 'high', issue: 'Slide title or headline contains literal ellipses.', requiredFix: 'Rewrite compressed copy as a complete claim without trailing dot-dot-dot truncation.' });
     }
     if (wordCount > 155) {
       findings.push({ slideId, severity: 'high', issue: `Slide is too dense at ${wordCount} words.`, requiredFix: 'Split content into a proof object plus concise supporting copy.' });
@@ -2088,7 +2232,7 @@ function deckQaHasBlockingFindings(qa: DeckQaReport | null | undefined): boolean
 function wordsFromText(text: string, maxWords: number): string {
   const words = cleanArtifactText(text).split(/\s+/).filter(Boolean);
   if (words.length <= maxWords) return words.join(' ');
-  return `${words.slice(0, maxWords).join(' ')}...`;
+  return `${words.slice(0, maxWords).join(' ')}…`;
 }
 
 function findingSlideIndexes(qa: DeckQaReport): Set<number> {
@@ -4069,24 +4213,91 @@ async function inspectRenderedDeckPage(page: any): Promise<{
       accent_gutter_px: 0,
     };
 
-    function luminance(rgb: string): number {
-      const parts = String(rgb || '').match(/\d+(\.\d+)?/g)?.slice(0, 3).map(Number) || [0, 0, 0];
-      const [r, g, b] = parts.map(v => {
+    function parseAlpha(value: string | undefined): number {
+      const raw = String(value || '1').trim();
+      if (raw.endsWith('%')) return Math.max(0, Math.min(1, Number(raw.slice(0, -1)) / 100));
+      const n = Number(raw);
+      return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 1;
+    }
+
+    function parseRgbChannel(value: string | undefined, unitInterval: boolean): number {
+      const raw = String(value || '0').trim();
+      if (raw.endsWith('%')) return Math.max(0, Math.min(255, Number(raw.slice(0, -1)) * 2.55));
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return 0;
+      return Math.max(0, Math.min(255, unitInterval ? n * 255 : n));
+    }
+
+    function parseCssColor(value: string): { r: number; g: number; b: number; a: number } | null {
+      const raw = String(value || '').trim();
+      const normalized = raw.replace(/\s+/g, ' ').toLowerCase();
+      if (!normalized || normalized === 'transparent') return { r: 0, g: 0, b: 0, a: 0 };
+      const hex = normalized.match(/^#([0-9a-f]{3,8})$/i)?.[1];
+      if (hex) {
+        const expanded = hex.length === 3 || hex.length === 4
+          ? hex.split('').map(ch => ch + ch).join('')
+          : hex;
+        return {
+          r: parseInt(expanded.slice(0, 2), 16),
+          g: parseInt(expanded.slice(2, 4), 16),
+          b: parseInt(expanded.slice(4, 6), 16),
+          a: expanded.length >= 8 ? parseInt(expanded.slice(6, 8), 16) / 255 : 1,
+        };
+      }
+      const srgb = normalized.match(/^color\(\s*srgb\s+(.+)\)$/i);
+      if (srgb) {
+        const [channelsPart, alphaPart] = srgb[1].split('/');
+        const channels = channelsPart.trim().split(/\s+/);
+        return {
+          r: parseRgbChannel(channels[0], true),
+          g: parseRgbChannel(channels[1], true),
+          b: parseRgbChannel(channels[2], true),
+          a: parseAlpha(alphaPart),
+        };
+      }
+      const rgb = normalized.match(/^rgba?\((.+)\)$/i);
+      if (rgb) {
+        const parts = rgb[1].replace(/\s*\/\s*/, ',').split(/[,\s]+/).filter(Boolean);
+        return {
+          r: parseRgbChannel(parts[0], false),
+          g: parseRgbChannel(parts[1], false),
+          b: parseRgbChannel(parts[2], false),
+          a: parseAlpha(parts[3]),
+        };
+      }
+      return null;
+    }
+
+    function composite(top: { r: number; g: number; b: number; a: number }, bottom: { r: number; g: number; b: number; a: number }): { r: number; g: number; b: number; a: number } {
+      const a = top.a + bottom.a * (1 - top.a);
+      if (a <= 0) return { r: 0, g: 0, b: 0, a: 0 };
+      return {
+        r: (top.r * top.a + bottom.r * bottom.a * (1 - top.a)) / a,
+        g: (top.g * top.a + bottom.g * bottom.a * (1 - top.a)) / a,
+        b: (top.b * top.a + bottom.b * bottom.a * (1 - top.a)) / a,
+        a,
+      };
+    }
+
+    function luminance(color: { r: number; g: number; b: number }): number {
+      const [r, g, b] = [color.r, color.g, color.b].map(v => {
         const s = Math.max(0, Math.min(255, v)) / 255;
         return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
       });
       return 0.2126 * r + 0.7152 * g + 0.0722 * b;
     }
 
-    function contrast(a: string, b: string): number {
-      const l1 = luminance(a);
-      const l2 = luminance(b);
+    function contrast(foreground: string, background: { r: number; g: number; b: number; a: number }): number {
+      const fg = parseCssColor(foreground) || { r: 0, g: 0, b: 0, a: 1 };
+      const composited = composite(fg, background);
+      const l1 = luminance(composited);
+      const l2 = luminance(background);
       return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
     }
 
     function isTransparentColor(value: string): boolean {
-      const normalized = String(value || '').replace(/\s+/g, '').toLowerCase();
-      return !normalized || normalized === 'transparent' || normalized === 'rgba(0,0,0,0)' || normalized === 'rgb(0,0,0,0)';
+      const parsed = parseCssColor(value);
+      return !parsed || parsed.a <= 0;
     }
 
     function rectFor(el: any): { left: number; right: number; top: number; bottom: number; width: number; height: number } {
@@ -4103,15 +4314,20 @@ async function inspectRenderedDeckPage(page: any): Promise<{
       return area / smaller > 0.08;
     }
 
-    function effectiveBackground(el: any, slide: any, fallback: string): string {
+    function effectiveBackground(el: any, slide: any, fallback: string): { r: number; g: number; b: number; a: number } {
+      const chain: any[] = [];
       let node = el;
       while (node) {
-        const bg = win.getComputedStyle(node).backgroundColor;
-        if (!isTransparentColor(bg)) return bg;
+        chain.push(node);
         if (node === slide) break;
         node = node.parentElement;
       }
-      return fallback;
+      let bg = parseCssColor(fallback) || { r: 15, g: 15, b: 20, a: 1 };
+      for (let i = chain.length - 1; i >= 0; i -= 1) {
+        const parsed = parseCssColor(win.getComputedStyle(chain[i]).backgroundColor);
+        if (parsed && parsed.a > 0) bg = composite(parsed, bg);
+      }
+      return bg;
     }
 
     slides.forEach((slide, index) => {

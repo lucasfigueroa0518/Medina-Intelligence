@@ -145,9 +145,72 @@ describe('document artifact quality gates', () => {
     expect(plan.slides).toHaveLength(6);
     expect(html).toContain('--accent-gutter: 104px');
     expect(html).toContain('data-accent-line="true"');
+    expect(html).toContain('cover-grid');
     expect(html).toContain('HTML source of truth');
+    expect(html).not.toContain('color-mix(');
+    expect(html).not.toContain('...');
     expect(qa.status).toBe('pass');
     expect(qa.checks.visual_surface_count).toBeGreaterThanOrEqual(4);
+  });
+
+  it('renders table-only deck slides as full-width proof surfaces instead of empty narrative columns', () => {
+    const html = __documentArtifactsTestHooks.renderPremiumDeckHtml('NeuralSeek Deal Status Update', {
+      summary: 'Pipeline status update for internal review.',
+      slides: [
+        {
+          layout: 'cover',
+          title: 'NeuralSeek — Deal Status Update | May 2026',
+          headline: 'A long-form deal-review cover title should stay away from proof cards and metadata.',
+          evidence_blocks: ['Current valuation target: $250M', 'All-channel ARR: $1.8M', 'NS direct ARR: $168K'],
+        },
+        {
+          layout: 'matrix',
+          title: 'Financial Snapshot — As of Dec 31, 2025',
+          headline: 'All-channel ARR and channel dependency frame the underwriting question.',
+          table: {
+            headers: ['Dimension', 'Summary', 'Status'],
+            rows: [
+              ['Product', 'Agentic AI control-layer platform; no-code and multi-cloud', 'Validated'],
+              ['ARR', '$1,789,560 all channels; $168,000 NS-led', 'Needs split'],
+              ['Valuation', 'Seed round with target $250M via SaaS ARR growth', 'Open'],
+            ],
+          },
+        },
+        {
+          layout: 'matrix',
+          title: 'Pipeline Proof',
+          headline: 'Key evidence is stronger when the table owns the slide.',
+          table: {
+            headers: ['Signal', 'Evidence', 'Implication'],
+            rows: [['Customer count', '136 enterprise clients', 'Logo proof'], ['Geography', '24 countries', 'Enterprise reach']],
+          },
+        },
+        { title: 'Risk Register', headline: 'Open risks are explicit.', bullets: ['Revenue bridge', 'IBM channel concentration', 'Corporate structure'] },
+        { title: 'Action Grid', headline: 'Owners can resolve the next diligence push.', table: { headers: ['Step', 'Owner'], rows: [['Revenue bridge', 'Finance']] } },
+        { title: 'Decision Frame', headline: 'Proceed if revenue quality clears.', bullets: ['Confirm direct ARR', 'Validate customer depth'] },
+      ],
+    });
+
+    expect(html).toContain('class="proof-full full-table"');
+    expect(html).toContain('class="cover-grid"');
+    expect(html).not.toContain('<div class="cover-proof" style=');
+    expect(html).not.toContain('...');
+  });
+
+  it('flags literal dot-dot-dot truncation in generated deck titles and headlines', () => {
+    const qa = __documentArtifactsTestHooks.evaluatePremiumDeckQa('NeuralSeek Update', {
+      slides: [
+        { layout: 'cover', title: 'NeuralSeek Update', headline: 'Decision context' },
+        { title: 'Financial Snapshot...', headline: 'ARR evidence should be rewritten without dot-dot-dot truncation.' },
+        { title: 'Customer Proof', headline: 'Customer proof is directional.', bullets: ['136 clients', '24 countries'] },
+        { title: 'Risk Register', headline: 'Risks are explicit.', bullets: ['Revenue bridge', 'Channel dependence'] },
+        { title: 'Action Grid', headline: 'Owners need follow-through.', table: { headers: ['Action', 'Owner'], rows: [['ARR bridge', 'Finance']] } },
+        { title: 'Decision Frame', headline: 'Proceed after confirmatory diligence.', bullets: ['Confirm direct ARR', 'Validate customer depth'] },
+      ],
+    });
+
+    expect(qa.status).toBe('needs_revision');
+    expect(qa.slideFindings.some(f => /literal ellipses/i.test(f.issue))).toBe(true);
   });
 
   it('blocks critically unsafe deck QA before polished export', () => {

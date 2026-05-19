@@ -100,24 +100,91 @@ async function inspectSlides(page) {
       accent_gutter_px: 0,
     };
 
-    function luminance(rgb) {
-      const parts = String(rgb || '').match(/\d+(\.\d+)?/g)?.slice(0, 3).map(Number) || [0, 0, 0];
-      const [r, g, b] = parts.map(v => {
+    function parseAlpha(value) {
+      const raw = String(value || '1').trim();
+      if (raw.endsWith('%')) return Math.max(0, Math.min(1, Number(raw.slice(0, -1)) / 100));
+      const n = Number(raw);
+      return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 1;
+    }
+
+    function parseRgbChannel(value, unitInterval) {
+      const raw = String(value || '0').trim();
+      if (raw.endsWith('%')) return Math.max(0, Math.min(255, Number(raw.slice(0, -1)) * 2.55));
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return 0;
+      return Math.max(0, Math.min(255, unitInterval ? n * 255 : n));
+    }
+
+    function parseCssColor(value) {
+      const raw = String(value || '').trim();
+      const normalized = raw.replace(/\s+/g, ' ').toLowerCase();
+      if (!normalized || normalized === 'transparent') return { r: 0, g: 0, b: 0, a: 0 };
+      const hex = normalized.match(/^#([0-9a-f]{3,8})$/i)?.[1];
+      if (hex) {
+        const expanded = hex.length === 3 || hex.length === 4
+          ? hex.split('').map(ch => ch + ch).join('')
+          : hex;
+        return {
+          r: parseInt(expanded.slice(0, 2), 16),
+          g: parseInt(expanded.slice(2, 4), 16),
+          b: parseInt(expanded.slice(4, 6), 16),
+          a: expanded.length >= 8 ? parseInt(expanded.slice(6, 8), 16) / 255 : 1,
+        };
+      }
+      const srgb = normalized.match(/^color\(\s*srgb\s+(.+)\)$/i);
+      if (srgb) {
+        const [channelsPart, alphaPart] = srgb[1].split('/');
+        const channels = channelsPart.trim().split(/\s+/);
+        return {
+          r: parseRgbChannel(channels[0], true),
+          g: parseRgbChannel(channels[1], true),
+          b: parseRgbChannel(channels[2], true),
+          a: parseAlpha(alphaPart),
+        };
+      }
+      const rgb = normalized.match(/^rgba?\((.+)\)$/i);
+      if (rgb) {
+        const parts = rgb[1].replace(/\s*\/\s*/, ',').split(/[,\s]+/).filter(Boolean);
+        return {
+          r: parseRgbChannel(parts[0], false),
+          g: parseRgbChannel(parts[1], false),
+          b: parseRgbChannel(parts[2], false),
+          a: parseAlpha(parts[3]),
+        };
+      }
+      return null;
+    }
+
+    function composite(top, bottom) {
+      const a = top.a + bottom.a * (1 - top.a);
+      if (a <= 0) return { r: 0, g: 0, b: 0, a: 0 };
+      return {
+        r: (top.r * top.a + bottom.r * bottom.a * (1 - top.a)) / a,
+        g: (top.g * top.a + bottom.g * bottom.a * (1 - top.a)) / a,
+        b: (top.b * top.a + bottom.b * bottom.a * (1 - top.a)) / a,
+        a,
+      };
+    }
+
+    function luminance(color) {
+      const [r, g, b] = [color.r, color.g, color.b].map(v => {
         const s = Math.max(0, Math.min(255, v)) / 255;
         return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
       });
       return 0.2126 * r + 0.7152 * g + 0.0722 * b;
     }
 
-    function contrast(a, b) {
-      const l1 = luminance(a);
-      const l2 = luminance(b);
+    function contrast(foreground, background) {
+      const fg = parseCssColor(foreground) || { r: 0, g: 0, b: 0, a: 1 };
+      const composited = composite(fg, background);
+      const l1 = luminance(composited);
+      const l2 = luminance(background);
       return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
     }
 
     function isTransparentColor(value) {
-      const normalized = String(value || '').replace(/\s+/g, '').toLowerCase();
-      return !normalized || normalized === 'transparent' || normalized === 'rgba(0,0,0,0)' || normalized === 'rgb(0,0,0,0)';
+      const parsed = parseCssColor(value);
+      return !parsed || parsed.a <= 0;
     }
 
     function rectFor(el) {
@@ -135,14 +202,19 @@ async function inspectSlides(page) {
     }
 
     function effectiveBackground(el, slide, fallback) {
+      const chain = [];
       let node = el;
       while (node) {
-        const bg = window.getComputedStyle(node).backgroundColor;
-        if (!isTransparentColor(bg)) return bg;
+        chain.push(node);
         if (node === slide) break;
         node = node.parentElement;
       }
-      return fallback;
+      let bg = parseCssColor(fallback) || { r: 15, g: 15, b: 20, a: 1 };
+      for (let i = chain.length - 1; i >= 0; i -= 1) {
+        const parsed = parseCssColor(window.getComputedStyle(chain[i]).backgroundColor);
+        if (parsed && parsed.a > 0) bg = composite(parsed, bg);
+      }
+      return bg;
     }
 
     slides.forEach((slide, index) => {

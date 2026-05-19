@@ -142,6 +142,7 @@ interface ToolRun {
 interface DeckJobView {
   id: string;
   assistant_message_id?: string | null;
+  pending?: boolean;
   status?: 'queued' | 'running' | 'revising' | 'qa_blocked' | 'completed' | 'failed' | 'cancelled' | string;
   phase?: string;
   title?: string;
@@ -493,6 +494,44 @@ function deckJobFromTool(tool: ToolCall): DeckJobView | null {
   return deckJobFromResult(tool.result);
 }
 
+function pendingDeckJobFromTool(tool: ToolCall): DeckJobView | null {
+  if (tool.tool !== 'create_deck_artifact') return null;
+  if (deckJobFromTool(tool)) return null;
+  if (tool.status !== 'started' && tool.status !== 'executing') return null;
+  return {
+    id: `pending-${tool.id || 'deck'}`,
+    pending: true,
+    status: 'starting',
+    phase: 'starting',
+    title: typeof tool.input?.title === 'string' ? tool.input.title : 'Presentation deck',
+    status_label: 'Starting deck job',
+    revision_round: 0,
+    max_revision_rounds: 3,
+    artifact_visibility: 'none',
+    latest_event_message: 'MARTy is creating the deck job and preparing the render queue.',
+  };
+}
+
+function deckJobsForMessage(message: Message): DeckJobView[] {
+  const realJobs = message.deckJobs || [];
+  const pendingJobs = (message.toolCalls || [])
+    .map(pendingDeckJobFromTool)
+    .filter((job): job is DeckJobView => Boolean(job));
+  return realJobs.length > 0 ? realJobs : pendingJobs;
+}
+
+function latestDeckJobForMessage(message: Message): DeckJobView | null {
+  const jobs = deckJobsForMessage(message);
+  if (jobs.length === 0) return null;
+  return jobs.find(job => !isTerminalDeckJob(job)) || jobs[jobs.length - 1] || null;
+}
+
+function qaBlockedDeckJobWithCards(message: Message): DeckJobView | null {
+  const latest = latestDeckJobForMessage(message);
+  if (latest?.status !== 'qa_blocked') return null;
+  return (message.documentCards || []).length > 0 ? latest : null;
+}
+
 function isTerminalDeckJob(job: DeckJobView | null | undefined): boolean {
   return ['completed', 'failed', 'qa_blocked', 'cancelled'].includes(String(job?.status || ''));
 }
@@ -500,6 +539,7 @@ function isTerminalDeckJob(job: DeckJobView | null | undefined): boolean {
 function deckJobStatusLabel(job: DeckJobView | null | undefined): string {
   if (!job) return '';
   if (job.status_label) return job.status_label;
+  if (job.pending || job.status === 'starting') return 'Starting deck job';
   const phase = String(job.phase || job.status || 'queued').replace(/_/g, ' ');
   if (job.status === 'completed') return 'Deck ready';
   if (job.status === 'qa_blocked') return 'Draft ready: review needed';
@@ -631,7 +671,7 @@ function toolStatusText(tool: ToolCall): string {
 
   if ((tool.status === 'started' || tool.status === 'executing') && !deckJob) {
     const priorCount = totalCount !== null ? ` · ${totalCount} ${resultNoun(tool.tool)} so far` : '';
-    return `${toolActionLabel(tool.tool)}${runCount > 1 ? ` · ${runCount} runs` : ''}${priorCount}...`;
+    return `${toolActionLabel(tool.tool)}${runCount > 1 ? ` · ${runCount} runs` : ''}${priorCount}…`;
   }
   if (deckJob) return deckJobStatusLabel(deckJob);
   if (tool.status === 'error') return runCount > 1 ? `${runCount} runs failed` : 'Failed';
@@ -943,8 +983,53 @@ function DocumentCardList({
   );
 }
 
-function DeckJobProgress({ job }: { job: DeckJobView }) {
+function DeckJobQaDetails({ job }: { job: DeckJobView }) {
+  if (job.status !== 'qa_blocked') return null;
+  const findings = job.qa_findings || [];
+  const visibleFindings = findings.slice(0, 2);
+  const hiddenFindingCount = Math.max(0, findings.length - visibleFindings.length);
+  const diagnostics = (job.diagnostic_document_cards || []).slice(0, 5);
+  if (findings.length === 0 && diagnostics.length === 0) return null;
+
+  return (
+    <details className="mt-2 rounded-lg border border-[#F59E0B]/20 bg-[#120E0A]/70 px-3 py-2 text-[11px] text-text-secondary">
+      <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-[0.12em] text-[#F59E0B]">
+        Review QA details
+      </summary>
+      {findings.length > 0 && (
+        <div className="mt-2 space-y-1.5">
+          {visibleFindings.map((finding, index) => (
+            <div key={`${finding.slideId || 'slide'}-${index}`} className="rounded border border-[#F59E0B]/20 bg-bg-root/50 px-2 py-1.5 leading-relaxed">
+              <span className="font-semibold text-text-primary">{finding.slideId || 'Slide'}</span>
+              {finding.issue ? `: ${finding.issue}` : ''}
+              {finding.requiredFix ? <span className="text-text-muted"> · {finding.requiredFix}</span> : null}
+            </div>
+          ))}
+          {hiddenFindingCount > 0 && (
+            <div className="text-text-muted">+ {hiddenFindingCount} more findings hidden by default.</div>
+          )}
+        </div>
+      )}
+      {diagnostics.length > 0 && (
+        <div className="mt-2 border-t border-white/[0.05] pt-2">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-text-muted">Diagnostics</div>
+          <div className="space-y-1">
+            {diagnostics.map(card => (
+              <div key={card.document_id} className="flex min-w-0 items-center gap-1.5 text-[11px] text-text-secondary">
+                <FileText size={12} className="shrink-0 text-text-muted" />
+                <span className="truncate">{card.title || card.file_name || 'Diagnostic file'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </details>
+  );
+}
+
+function DeckJobProgress({ job, showQaDetails = true }: { job: DeckJobView; showQaDetails?: boolean }) {
   const status = String(job.status || '');
+  const pending = Boolean(job.pending || status === 'starting');
   const blocked = status === 'qa_blocked';
   const failed = status === 'failed';
   const completed = status === 'completed';
@@ -953,8 +1038,6 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
   const maxRounds = Number(job.max_revision_rounds || 3);
   const qa = job.qa_summary;
   const latestMessage = job.latest_event_message || job.last_event_message || '';
-  const findings = (job.qa_findings || []).slice(0, 3);
-  const diagnostics = (job.diagnostic_document_cards || []).slice(0, 5);
   const statusTone = failed
     ? 'border-semantic-error/25 bg-semantic-error/5 text-semantic-error'
     : blocked
@@ -980,6 +1063,15 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
       {latestMessage && active && (
         <div className="mt-2 text-[11px] leading-relaxed text-text-secondary">{latestMessage}</div>
       )}
+      {pending && (
+        <div className="mt-3 grid grid-cols-2 gap-1.5 text-[10px] text-text-secondary sm:grid-cols-4">
+          {['Queue', 'HTML', 'QA', 'Exports'].map((stage, index) => (
+            <div key={stage} className={`rounded border px-2 py-1 ${index === 0 ? 'border-accent-magenta/25 bg-accent-magenta/10 text-accent-magenta' : 'border-white/[0.05] bg-bg-root/45'}`}>
+              {stage}
+            </div>
+          ))}
+        </div>
+      )}
       {qa && (
         <div className="mt-2 grid grid-cols-4 gap-1.5 text-center text-[10px] text-text-secondary">
           <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">Critical {qa.critical || 0}</div>
@@ -993,35 +1085,12 @@ function DeckJobProgress({ job }: { job: DeckJobView }) {
           {job.blocked_reason || 'A usable draft deck is available, but visual/export QA needs review before treating it as polished.'}
         </div>
       )}
-      {blocked && findings.length > 0 && (
-        <div className="mt-2 space-y-1.5">
-          {findings.map((finding, index) => (
-            <div key={`${finding.slideId || 'slide'}-${index}`} className="rounded border border-[#F59E0B]/20 bg-bg-root/50 px-2 py-1.5 text-[11px] leading-relaxed text-text-secondary">
-              <span className="font-semibold text-text-primary">{finding.slideId || 'Slide'}</span>
-              {finding.issue ? `: ${finding.issue}` : ''}
-              {finding.requiredFix ? <span className="text-text-muted"> · {finding.requiredFix}</span> : null}
-            </div>
-          ))}
-        </div>
-      )}
-      {blocked && diagnostics.length > 0 && (
-        <div className="mt-2 rounded border border-white/[0.05] bg-bg-root/45 px-2 py-1.5">
-          <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-text-muted">Diagnostics</div>
-          <div className="space-y-1">
-            {diagnostics.map(card => (
-              <div key={card.document_id} className="flex min-w-0 items-center gap-1.5 text-[11px] text-text-secondary">
-                <FileText size={12} className="shrink-0 text-text-muted" />
-                <span className="truncate">{card.title || card.file_name || 'Diagnostic file'}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {showQaDetails && <DeckJobQaDetails job={job} />}
     </div>
   );
 }
 
-function DeckProductionPanel({ jobs }: { jobs?: DeckJobView[] }) {
+function DeckProductionPanel({ jobs, showQaDetails = true }: { jobs?: DeckJobView[]; showQaDetails?: boolean }) {
   const normalized = (jobs || []).filter(job => job?.id);
   if (normalized.length === 0) return null;
   const active = normalized.find(job => !isTerminalDeckJob(job));
@@ -1044,7 +1113,7 @@ function DeckProductionPanel({ jobs }: { jobs?: DeckJobView[] }) {
           </span>
         ) : null}
       </div>
-      <DeckJobProgress job={latest} />
+      <DeckJobProgress job={latest} showQaDetails={showQaDetails} />
       {latest.status === 'completed' && completedCards?.length ? (
         <div className="mt-3 text-[11px] text-text-muted">
           Polished downloads are available in the document cards below.
@@ -1066,10 +1135,11 @@ function DeckProductionPanel({ jobs }: { jobs?: DeckJobView[] }) {
 function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void }) {
   const Icon = TOOL_ICONS[tool.tool] || FileText;
   const deckJob = deckJobFromTool(tool);
-  const isDeckActive = Boolean(deckJob && !isTerminalDeckJob(deckJob));
-  const isDeckBlocked = deckJob?.status === 'qa_blocked';
+  const displayDeckJob = deckJob || pendingDeckJobFromTool(tool);
+  const isDeckActive = Boolean(displayDeckJob && !isTerminalDeckJob(displayDeckJob));
+  const isDeckBlocked = displayDeckJob?.status === 'qa_blocked';
   const isRunning = tool.status === 'started' || tool.status === 'executing' || isDeckActive;
-  const isError = tool.status === 'error' || deckJob?.status === 'failed';
+  const isError = tool.status === 'error' || displayDeckJob?.status === 'failed';
   const isCancelled = tool.status === 'cancelled';
   const isDone = tool.status === 'done';
   const runs = getToolRuns(tool);
@@ -1118,7 +1188,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
       </button>
       {!tool.collapsed && (
         <div className="border-t border-border/50 px-3 py-2 space-y-1.5">
-          {deckJob && <DeckJobProgress job={deckJob} />}
+          {displayDeckJob && <DeckJobProgress job={displayDeckJob} />}
           {runs.map((run, index) => (
             <div key={run.id} className="rounded-md border border-white/[0.04] bg-white/[0.02] p-2">
               <div className="mb-1 flex items-center justify-between gap-2">
@@ -2957,9 +3027,13 @@ export default function GodModePage() {
                       <ThinkingIndicator />
                     )}
 
-                    {m.deckJobs && m.deckJobs.length > 0 && (
-                      <DeckProductionPanel jobs={m.deckJobs} />
-                    )}
+                    {(() => {
+                      const visibleDeckJobs = deckJobsForMessage(m);
+                      const blockedDeckWithCards = qaBlockedDeckJobWithCards(m);
+                      return visibleDeckJobs.length > 0 ? (
+                        <DeckProductionPanel jobs={visibleDeckJobs} showQaDetails={!blockedDeckWithCards} />
+                      ) : null;
+                    })()}
 
                     {m.documentCards && m.documentCards.length > 0 && (
                       <DocumentCardList
@@ -2968,6 +3042,11 @@ export default function GodModePage() {
                         onDocumentAttached={handleDocumentAttachedToMarty}
                       />
                     )}
+
+                    {(() => {
+                      const blockedDeckWithCards = qaBlockedDeckJobWithCards(m);
+                      return blockedDeckWithCards ? <DeckJobQaDetails job={blockedDeckWithCards} /> : null;
+                    })()}
 
                     {m.content && m.error ? (
                       <ErrorCard message={m.content} retryable={m.retryable !== false} onRetry={() => retryFrom(m.id)} />
