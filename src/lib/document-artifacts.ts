@@ -9,6 +9,11 @@ import { preprocessQuery, retrieveContext } from './retrieval';
 import { callClaude } from './claude';
 import { truncateToTokens } from './tokens';
 import { enqueueWork } from './work-queue';
+import {
+  MEDINA_DECK_ENGINE_VERSION,
+  buildMedinaDeckStudio,
+  deckCriticFindingsAsQa,
+} from './deck-skill-engine';
 
 export type MartyDocumentCardMode = 'compact' | 'dominant';
 export type ArtifactKind = 'docx' | 'xlsx' | 'pptx' | 'pdf';
@@ -76,6 +81,10 @@ export interface DeckQaReport {
     max_words_on_slide: number;
     accent_gutter_px: number;
     html_bytes: number;
+    critic_score?: number;
+    critic_status?: string;
+    engine_version?: string;
+    [key: string]: unknown;
   };
 }
 
@@ -84,6 +93,10 @@ export type DeckArtifactVisibility = 'polished' | 'draft_review' | 'none';
 export type DeckJobPhase =
   | 'planning'
   | 'research'
+  | 'claim_spine'
+  | 'design_system'
+  | 'critic'
+  | 'contact_sheet'
   | 'narrative'
   | 'visual_direction'
   | 'html_render'
@@ -374,6 +387,15 @@ function mergeDeckQaReport(
       ...(metrics as any),
     },
   };
+}
+
+function mergeDeckCriticIntoQa(baseQa: DeckQaReport, critic: any): DeckQaReport {
+  if (!critic) return baseQa;
+  return mergeDeckQaReport(baseQa, deckCriticFindingsAsQa(critic) as DeckQaReport['slideFindings'], {
+    critic_score: Number(critic.score_total || 0),
+    critic_status: String(critic.status || ''),
+    engine_version: MEDINA_DECK_ENGINE_VERSION,
+  });
 }
 
 async function appendDeckJobEvent(
@@ -1740,6 +1762,24 @@ function deckDisplayText(value: any): string {
   return cleanArtifactText(value).replace(/\.{3,}/g, '…');
 }
 
+function isDeckPlaceholderTitle(value: any): boolean {
+  const key = cleanArtifactText(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  return /^slide \d+$/.test(key) || /^page \d+$/.test(key);
+}
+
+function isDeckSystemLanguage(value: any): boolean {
+  const text = cleanArtifactText(value).toLowerCase();
+  return [
+    'claim spine',
+    'evidence-first proof',
+    'qa-gated export',
+    'audience-ready claim spine',
+    'proof object',
+    'deck studio',
+    'semantic critic',
+  ].some(term => text.includes(term));
+}
+
 function wordsIn(value: string): number {
   return cleanArtifactText(value).split(/\s+/).filter(Boolean).length;
 }
@@ -1836,6 +1876,35 @@ function deckPlanFromContent(title: string, content: any): DeckPlan {
     style_pack: stylePack,
     slides: slideSpecs,
     facts: deckFactsFromContent(title, content, slides),
+  };
+}
+
+function buildMedinaSkillDeckContent(
+  title: string,
+  content: any,
+  opts: {
+    prompt?: string | null;
+    audience?: string | null;
+    objective?: string | null;
+    sourceDocumentIds?: string[];
+  } = {}
+): {
+  structured: any;
+  critic: any;
+  spec: any;
+} {
+  const base = normalizeStructuredArtifactContent(content || {});
+  if (opts.sourceDocumentIds?.length) base.source_document_ids = opts.sourceDocumentIds;
+  const studio = buildMedinaDeckStudio(title, base, {
+    prompt: opts.prompt,
+    audience: opts.audience,
+    objective: opts.objective,
+    source_document_ids: opts.sourceDocumentIds || [],
+  });
+  return {
+    structured: normalizeStructuredArtifactContent(studio.structuredContent),
+    critic: studio.critic,
+    spec: studio.spec,
   };
 }
 
@@ -2045,7 +2114,7 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
             <h1>${escapeHtml(deckDisplayText(slide.title || title))}</h1>
             <p class="cover-subtitle">${escapeHtml(deckDisplayText(firstNonEmpty(slide.headline, slide.subtitle, content?.summary, 'Prepared by MARTy')))}</p>
           </div>
-          <div class="cover-proof">${evidenceHtml || metricHtml || '<div class="evidence-grid compact"><div class="evidence-card"><span>01</span><strong>Claim spine</strong></div><div class="evidence-card"><span>02</span><strong>Evidence-first proof</strong></div><div class="evidence-card"><span>03</span><strong>QA-gated export</strong></div></div>'}</div>
+          <div class="cover-proof">${evidenceHtml || metricHtml || '<div class="evidence-grid compact"><div class="evidence-card"><span>01</span><strong>Decision thesis</strong></div><div class="evidence-card"><span>02</span><strong>Source-backed signals</strong></div><div class="evidence-card"><span>03</span><strong>Review path</strong></div></div>'}</div>
         </div>
         <footer>${escapeHtml(firstNonEmpty(slide.subtitle, 'Prepared by MARTy'))}</footer>
       </section>`;
@@ -2062,7 +2131,7 @@ function renderPremiumDeckHtml(title: string, content: any, qaReport?: DeckQaRep
       : `proof-full ${layout}`;
     return `<section class="slide ${escapeHtml(layout)}" data-slide="${index + 1}">
       <div class="slide-accent" data-accent-line="true"></div>
-      <div class="kicker">${escapeHtml(inferSlideRole(slide, index).replace(/_/g, ' '))}</div>
+      <div class="kicker">${escapeHtml(deckDisplayText(slide.kicker || inferSlideRole(slide, index).replace(/_/g, ' ')))}</div>
       <header>
         <h2>${escapeHtml(titleText)}</h2>
         <p>${escapeHtml(headlineText)}</p>
@@ -2189,11 +2258,17 @@ function evaluatePremiumDeckQa(title: string, content: any, html?: string): Deck
     if (!firstNonEmpty(slide?.title, slide?.headline)) {
       findings.push({ slideId, severity: 'critical', issue: 'Slide has no title or decision headline.', requiredFix: 'Add a clear decision headline before export.' });
     }
+    if (isDeckPlaceholderTitle(slide?.title)) {
+      findings.push({ slideId, severity: 'critical', issue: 'Slide has a placeholder title instead of a decision claim.', requiredFix: 'Replace Slide N titles with specific claim headlines before export.' });
+    }
     if (index > 0 && !firstNonEmpty(slide?.headline, slide?.takeaway)) {
       findings.push({ slideId, severity: 'high', issue: 'Slide title is topical instead of making a point.', requiredFix: 'Add a so-what headline that states the conclusion.' });
     }
     if (/\.\.\./.test(cleanArtifactText(`${slide?.title || ''} ${slide?.headline || ''} ${slide?.takeaway || ''}`))) {
       findings.push({ slideId, severity: 'high', issue: 'Slide title or headline contains literal ellipses.', requiredFix: 'Rewrite compressed copy as a complete claim without trailing dot-dot-dot truncation.' });
+    }
+    if (isDeckSystemLanguage(`${slide?.title || ''} ${slide?.headline || ''} ${slide?.takeaway || ''} ${slideEvidenceBlocks(slide).join(' ')}`)) {
+      findings.push({ slideId, severity: 'high', issue: 'Slide exposes internal deck-generation language.', requiredFix: 'Replace system labels with audience-facing investment, proof, risk, or action language.' });
     }
     if (wordCount > 155) {
       findings.push({ slideId, severity: 'high', issue: `Slide is too dense at ${wordCount} words.`, requiredFix: 'Split content into a proof object plus concise supporting copy.' });
@@ -2977,6 +3052,8 @@ function deckQaSummary(qa: DeckQaReport | null | undefined): Record<string, unkn
     high: bySeverity.high || 0,
     medium: bySeverity.medium || 0,
     low: bySeverity.low || 0,
+    critic_score: qa.checks?.critic_score ?? null,
+    critic_status: qa.checks?.critic_status ?? null,
     checks: qa.checks,
   };
 }
@@ -3047,9 +3124,13 @@ function deckStatusLabel(job: any, qa: DeckQaReport | null | undefined): string 
   if (status === 'failed') return 'Deck render failed';
   if (status === 'cancelled') return 'Deck cancelled';
   if (status === 'revising' || phase === 'repair') return `Revision ${Math.min(Math.max(round, 1), maxRounds)}/${maxRounds}: fixing layout`;
-  if (phase === 'planning' || phase === 'narrative') return 'Planning story';
+  if (phase === 'planning' || phase === 'narrative') return 'Extracting story';
+  if (phase === 'claim_spine') return 'Writing claim spine';
+  if (phase === 'design_system' || phase === 'visual_direction') return 'Locking design system';
+  if (phase === 'critic') return 'Scoring deck critic';
+  if (phase === 'contact_sheet') return 'Rendering contact sheet';
   if (phase === 'html_render') return 'Building HTML';
-  if (phase === 'render_qa') return qa?.status && qa.status !== 'pass' ? 'QA found layout issues' : 'Rendering screenshots';
+  if (phase === 'render_qa') return qa?.status && qa.status !== 'pass' ? 'QA found layout issues' : 'Rendering contact sheet';
   if (phase === 'export') return 'Exporting PDF/PPTX';
   return 'Working on deck';
 }
@@ -3131,6 +3212,16 @@ function mergeDeckCardsIntoMessageMetadata(
   return metadata;
 }
 
+function deckEngineSnapshotFields(job: { structured_content_json?: string | null }): Record<string, any> {
+  const structured = safeJsonParse<Record<string, any>>(job.structured_content_json, {});
+  return {
+    engine_version: structured.engine_version || structured.deck_studio_spec?.engine_version || null,
+    deck_profile: structured.deck_profile || structured.deck_studio_spec?.profile || null,
+    critic_summary: structured.critic_summary || null,
+    contact_sheet_summary: structured.contact_sheet_summary || structured.deck_studio_spec?.contact_sheet || null,
+  };
+}
+
 function deckJobSnapshotForMessage(
   job: Partial<DeckArtifactJobRow> & { id: string; assistant_message_id?: string | null; title?: string | null },
   opts: {
@@ -3162,6 +3253,7 @@ function deckJobSnapshotForMessage(
     diagnostic_document_cards: normalizeDocumentCards(opts.diagnosticCards || []),
     last_event_seq: 0,
     last_event_message: opts.lastEventMessage || '',
+    ...deckEngineSnapshotFields(job),
   };
 }
 
@@ -3212,6 +3304,7 @@ export async function getDeckJobSnapshot(
     revision_round: Number(job.revision_round || 0),
     max_revision_rounds: Number(job.max_revision_rounds || MAX_DECK_REVISION_ROUNDS),
     blocked_reason: job.blocked_reason || null,
+    ...deckEngineSnapshotFields(job),
     last_event_seq: Number(latestEvent?.seq || 0),
     last_event_type: latestEvent?.event_type || null,
     last_event_message: cleanArtifactText(latestPayload.message || ''),
@@ -3728,31 +3821,28 @@ export async function createDeckArtifactTool(
   const startedAt = new Date().toISOString();
   const qualityMode = input.quality_mode || 'premium';
   const outputFormats = normalizeDeckOutputFormats(input.output_formats);
-  const structured = normalizeStructuredArtifactContent(input.structured_content || {
+  const sourceIds = Array.isArray(input.source_document_ids)
+    ? input.source_document_ids.filter(id => typeof id === 'string')
+    : [];
+  let structured = normalizeStructuredArtifactContent(input.structured_content || {
     title,
     subtitle: 'Prepared by MARTy',
     summary: prompt,
     audience: input.audience,
     objective: input.objective,
     style_pack: input.style_pack || 'medina_default',
-    storyline: [
-      'Clarify the decision or narrative the audience needs.',
-      'Translate the strongest evidence into visual proof objects.',
-      'Close with the recommendation, owner, or next action.',
-    ],
-    slides: [
-      { layout: 'cover', title, subtitle: 'Prepared by MARTy', headline: prompt },
-      { layout: 'executive_summary', title: 'Executive Takeaway', headline: prompt, evidence_blocks: ['Audience-ready claim spine', 'Evidence-first slide plan', 'QA-gated export'] },
-      { layout: 'matrix', title: 'Narrative Spine', headline: 'The deck should move from context to evidence to action.', table: { headers: ['Section', 'Purpose', 'Proof object'], rows: [['Context', 'Set the stakes', 'Executive frame'], ['Evidence', 'Make the case', 'Metrics / table / map'], ['Action', 'Drive follow-through', 'Next-step owner list']] } },
-      { layout: 'evidence', title: 'Evidence To Build Around', headline: 'Each substantive slide needs one proof object, not a paragraph dump.', evidence_blocks: ['Confirmed facts from source material', 'Decision-useful metrics', 'Clear caveats and gaps'] },
-      { layout: 'risk', title: 'Open Questions And Risks', headline: 'Unverified claims should be visible before the deck is circulated.', bullets: ['Separate confirmed facts from assumptions', 'Move weak claims to notes or appendix', 'Flag missing source material'] },
-      { layout: 'next_steps', title: 'Next Steps', headline: 'Finish by making the next decision easy.', table: { headers: ['Step', 'Owner', 'Output'], rows: [['Review', 'MARTy / team', 'Tightened storyline'], ['Verify', 'Source owner', 'Confirmed metrics'], ['Circulate', 'Deck owner', 'PDF + PPTX bundle']] } },
-    ],
   });
   structured.audience = firstNonEmpty(input.audience, structured.audience);
   structured.objective = input.objective || structured.objective;
   structured.style_pack = input.style_pack || structured.style_pack || 'medina_default';
   structured.deck_request = prompt;
+  const studio = buildMedinaSkillDeckContent(title, structured, {
+    prompt,
+    audience: input.audience || structured.audience,
+    objective: input.objective || structured.objective,
+    sourceDocumentIds: sourceIds,
+  });
+  structured = studio.structured;
   const plan = deckPlanFromContent(title, structured);
   const facts = deckFactsFromContent(title, structured, slidesFromContent(title, structured));
   const asyncRenderer = qualityMode === 'premium' && isDeckRendererEnabled(env);
@@ -3780,7 +3870,7 @@ export async function createDeckArtifactTool(
     qualityMode,
     JSON.stringify(outputFormats),
     JSON.stringify(structured),
-    JSON.stringify(Array.isArray(input.source_document_ids) ? input.source_document_ids : []),
+    JSON.stringify(sourceIds),
     JSON.stringify(plan),
     JSON.stringify(facts),
     startedAt,
@@ -3795,7 +3885,10 @@ export async function createDeckArtifactTool(
     renderer_enabled: asyncRenderer,
     revision_round: 0,
     max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
-    message: 'Planning story',
+    message: 'Extracting story',
+    engine_version: MEDINA_DECK_ENGINE_VERSION,
+    deck_profile: structured.deck_profile || null,
+    critic_summary: studio.critic,
   }).catch(() => {});
 
   if (asyncRenderer) {
@@ -3824,6 +3917,9 @@ export async function createDeckArtifactTool(
         title,
         quality_mode: qualityMode,
         output_formats: outputFormats,
+        engine_version: MEDINA_DECK_ENGINE_VERSION,
+        deck_profile: structured.deck_profile || null,
+        critic_summary: studio.critic,
       },
       document_cards: [],
       message: 'Premium deck job queued. MARTy will render, QA, and export the deck before marking it complete.',
@@ -3833,13 +3929,15 @@ export async function createDeckArtifactTool(
   try {
     await env.D1.prepare(
       `UPDATE deck_artifact_jobs
-          SET phase = 'visual_direction',
+          SET phase = 'design_system',
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         WHERE id = ? AND org_id = ?`
     ).bind(deckJobId, ctx.orgId).run().catch(() => {});
     await appendDeckJobEvent(env, deckJobId, ctx.orgId, 'phase', {
-      phase: 'visual_direction',
-      message: 'Deck plan and style direction prepared.',
+      phase: 'design_system',
+      message: 'Deck plan and Medina design system prepared.',
+      engine_version: MEDINA_DECK_ENGINE_VERSION,
+      critic_summary: studio.critic,
     }).catch(() => {});
 
     const result = await createDocumentArtifactTool(ctx, {
@@ -3855,6 +3953,9 @@ export async function createDeckArtifactTool(
         requested_audience: input.audience || null,
         requested_objective: input.objective || null,
         requested_style_pack: input.style_pack || 'medina_default',
+        engine_version: structured.engine_version || MEDINA_DECK_ENGINE_VERSION,
+        deck_profile: structured.deck_profile || null,
+        critic_summary: structured.critic_summary || null,
       },
     }, env);
 
@@ -4547,10 +4648,34 @@ export async function processDeckRenderJob(
   const sourceDocumentIds = safeJsonParse<string[]>(job.source_document_ids_json, []);
   const title = job.title || structured.title || 'MARTy deck';
   const sourceDocs = await loadAccessibleDocuments(sourceDocumentIds, ctx, env);
+  let currentStructured: any = normalizeStructuredArtifactContent(structured);
+  const initialStudio = buildMedinaSkillDeckContent(title, currentStructured, {
+    prompt: job.prompt,
+    audience: job.audience,
+    objective: job.objective,
+    sourceDocumentIds,
+  });
+  currentStructured = initialStudio.structured;
 
   await updateDeckJobPhase(env, job.id, job.org_id, 'narrative', {
-    message: 'Planning story',
+    message: 'Extracting story',
     revision_round: Number(job.revision_round || 0),
+    engine_version: MEDINA_DECK_ENGINE_VERSION,
+  });
+
+  await updateDeckJobPhase(env, job.id, job.org_id, 'claim_spine', {
+    message: 'Writing claim spine',
+    revision_round: Number(job.revision_round || 0),
+    engine_version: MEDINA_DECK_ENGINE_VERSION,
+    deck_profile: currentStructured.deck_profile || null,
+    claim_count: initialStudio.spec?.slides?.length || 0,
+  });
+
+  await updateDeckJobPhase(env, job.id, job.org_id, 'design_system', {
+    message: 'Locking design system',
+    revision_round: Number(job.revision_round || 0),
+    engine_version: MEDINA_DECK_ENGINE_VERSION,
+    contact_sheet_summary: currentStructured.contact_sheet_summary || null,
   });
 
   if (!isDeckRendererEnabled(env)) {
@@ -4573,23 +4698,30 @@ export async function processDeckRenderJob(
     return;
   }
 
-  let currentStructured: any = normalizeStructuredArtifactContent(structured);
   let latestHtml = '';
   let latestPlan: DeckPlan = deckPlanFromContent(title, currentStructured);
-  let latestQa: DeckQaReport = evaluatePremiumDeckQa(title, currentStructured);
+  let latestQa: DeckQaReport = mergeDeckCriticIntoQa(evaluatePremiumDeckQa(title, currentStructured), initialStudio.critic);
   let latestRenderResult: DeckRenderResult | null = null;
   let latestRevisionRound = Number(job.revision_round || 0);
 
   for (let round = Number(job.revision_round || 0); round <= MAX_DECK_REVISION_ROUNDS; round += 1) {
     latestRevisionRound = round;
+    const roundStudio = buildMedinaSkillDeckContent(title, currentStructured, {
+      prompt: job.prompt,
+      audience: job.audience,
+      objective: job.objective,
+      sourceDocumentIds,
+    });
+    currentStructured = roundStudio.structured;
     await updateDeckJobPhase(env, job.id, job.org_id, 'html_render', {
       message: round === 0 ? 'Building HTML' : `Revision ${round}/${MAX_DECK_REVISION_ROUNDS}: rebuilding HTML`,
       revision_round: round,
       max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
+      engine_version: MEDINA_DECK_ENGINE_VERSION,
     });
     latestHtml = renderPremiumDeckHtml(title, currentStructured);
     latestPlan = deckPlanFromContent(title, currentStructured);
-    latestQa = evaluatePremiumDeckQa(title, currentStructured, latestHtml);
+    latestQa = mergeDeckCriticIntoQa(evaluatePremiumDeckQa(title, currentStructured, latestHtml), roundStudio.critic);
     await env.D1.prepare(
       `UPDATE deck_artifact_jobs
           SET structured_content_json = ?,
@@ -4611,13 +4743,25 @@ export async function processDeckRenderJob(
       job.org_id
     ).run().catch(() => {});
 
-    await updateDeckJobPhase(env, job.id, job.org_id, 'render_qa', {
-      message: useCloudflareDeckRenderer(env)
-        ? 'Rendering screenshots with Cloudflare Browser Rendering'
-        : 'Rendering screenshots with the Playwright deck renderer',
+    await updateDeckJobPhase(env, job.id, job.org_id, 'critic', {
+      message: 'Scoring deck critic',
       revision_round: round,
       max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
       qa_status: latestQa.status,
+      engine_version: MEDINA_DECK_ENGINE_VERSION,
+      critic_summary: roundStudio.critic,
+      contact_sheet_summary: currentStructured.contact_sheet_summary || null,
+    });
+
+    await updateDeckJobPhase(env, job.id, job.org_id, 'render_qa', {
+      message: useCloudflareDeckRenderer(env)
+        ? 'Rendering contact sheet with Cloudflare Browser Rendering'
+        : 'Rendering contact sheet with the Playwright deck renderer',
+      revision_round: round,
+      max_revision_rounds: MAX_DECK_REVISION_ROUNDS,
+      qa_status: latestQa.status,
+      engine_version: MEDINA_DECK_ENGINE_VERSION,
+      critic_summary: roundStudio.critic,
     });
     const renderRequest: DeckRenderRequest = {
       job_id: job.id,
@@ -4670,6 +4814,12 @@ export async function processDeckRenderJob(
       findings: latestQa.slideFindings.slice(0, 8),
     }).catch(() => {});
     currentStructured = await repairDeckSpecForQa(title, currentStructured, latestQa, nextRound, ctx, env);
+    currentStructured = buildMedinaSkillDeckContent(title, currentStructured, {
+      prompt: job.prompt,
+      audience: job.audience,
+      objective: job.objective,
+      sourceDocumentIds,
+    }).structured;
   }
 
   if (!latestRenderResult) {
@@ -4720,6 +4870,9 @@ export async function processDeckRenderJob(
       requested_style_pack: job.style_pack || 'medina_default',
       async_deck_render_job: true,
       final_screenshot_qa_status: latestQa.status,
+      engine_version: currentStructured.engine_version || MEDINA_DECK_ENGINE_VERSION,
+      deck_profile: currentStructured.deck_profile || null,
+      critic_summary: currentStructured.critic_summary || null,
     };
     let artifact: { card: MartyDocumentCard; document: { id: string; title: string; file_name: string; mime_type: string } };
     try {
@@ -4741,7 +4894,14 @@ export async function processDeckRenderJob(
         export_repair_attempted: true,
         export_error: String(firstExportError?.message || firstExportError).slice(0, 220),
       });
-      const safeStructured = deterministicDeckRepair(title, currentStructured, exportQa, MAX_DECK_REVISION_ROUNDS);
+      let safeStructured = deterministicDeckRepair(title, currentStructured, exportQa, MAX_DECK_REVISION_ROUNDS);
+      const safeStudio = buildMedinaSkillDeckContent(title, safeStructured, {
+        prompt: job.prompt,
+        audience: job.audience,
+        objective: job.objective,
+        sourceDocumentIds,
+      });
+      safeStructured = safeStudio.structured;
       try {
         artifact = await persistArtifact(ctx, env, {
           kind: 'pptx',
@@ -4757,7 +4917,7 @@ export async function processDeckRenderJob(
         currentStructured = safeStructured;
         latestHtml = renderPremiumDeckHtml(title, currentStructured);
         latestPlan = deckPlanFromContent(title, currentStructured);
-        latestQa = mergeDeckQaReport(evaluatePremiumDeckQa(title, currentStructured, latestHtml), [{
+        latestQa = mergeDeckQaReport(mergeDeckCriticIntoQa(evaluatePremiumDeckQa(title, currentStructured, latestHtml), safeStudio.critic), [{
           slideId: 'deck_export',
           severity: 'high',
           issue: 'PPTX export required deterministic safe-export repair after screenshot QA',
@@ -4775,7 +4935,7 @@ export async function processDeckRenderJob(
         currentStructured = safeStructured;
         latestHtml = renderPremiumDeckHtml(title, currentStructured);
         latestPlan = deckPlanFromContent(title, currentStructured);
-        latestQa = mergeDeckQaReport(evaluatePremiumDeckQa(title, currentStructured, latestHtml), [{
+        latestQa = mergeDeckQaReport(mergeDeckCriticIntoQa(evaluatePremiumDeckQa(title, currentStructured, latestHtml), safeStudio.critic), [{
           slideId: 'deck_export',
           severity: 'high',
           issue: 'PPTX export failed after deterministic safe-export repair',

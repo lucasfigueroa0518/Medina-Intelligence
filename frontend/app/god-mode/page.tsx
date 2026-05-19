@@ -158,7 +158,28 @@ interface DeckJobView {
     high?: number;
     medium?: number;
     low?: number;
+    critic_score?: number | null;
+    critic_status?: string | null;
   } | null;
+  critic_summary?: {
+    status?: string;
+    score_total?: number;
+    max_score?: number;
+    top_findings?: Array<{
+      slideId?: string;
+      severity?: string;
+      issue?: string;
+      requiredFix?: string;
+    }>;
+    strengths?: string[];
+  } | null;
+  contact_sheet_summary?: {
+    slide_count?: number;
+    layout_families?: string[];
+    rhythm_notes?: string[];
+  } | null;
+  engine_version?: string | null;
+  deck_profile?: string | null;
   blocked_reason?: string | null;
   visible_document_cards?: MartyDocumentCard[];
   diagnostic_document_cards?: MartyDocumentCard[];
@@ -509,7 +530,7 @@ function pendingDeckJobFromTool(tool: ToolCall): DeckJobView | null {
     revision_round: 0,
     max_revision_rounds: 3,
     artifact_visibility: 'none',
-    latest_event_message: 'MARTy is creating the deck job and preparing the render queue.',
+    latest_event_message: 'MARTy is starting the deck job and extracting the story.',
   };
 }
 
@@ -550,10 +571,14 @@ function deckJobStatusLabel(job: DeckJobView | null | undefined): string {
     const max = Math.max(round, Number(job.max_revision_rounds || 3));
     return `Revision ${round}/${max}: fixing layout`;
   }
+  if (job.phase === 'claim_spine') return 'Writing claim spine';
+  if (job.phase === 'design_system' || job.phase === 'visual_direction') return 'Locking design system';
+  if (job.phase === 'critic') return 'Scoring deck critic';
+  if (job.phase === 'contact_sheet') return 'Rendering contact sheet';
   if (job.phase === 'html_render') return 'Building HTML';
-  if (job.phase === 'render_qa') return 'Rendering screenshots';
+  if (job.phase === 'render_qa') return 'Rendering contact sheet';
   if (job.phase === 'export') return 'Exporting PDF/PPTX';
-  if (job.phase === 'narrative' || job.phase === 'planning') return 'Planning story';
+  if (job.phase === 'narrative' || job.phase === 'planning') return 'Extracting story';
   return `Deck job ${phase}`;
 }
 
@@ -828,6 +853,10 @@ function normalizeDeckJobs(raw: unknown): DeckJobView[] | undefined {
         max_revision_rounds: typeof j.max_revision_rounds === 'number' ? j.max_revision_rounds : Number(j.max_revision_rounds || 3),
         artifact_visibility: j.artifact_visibility || 'none',
         qa_summary: j.qa_summary || null,
+        critic_summary: j.critic_summary || null,
+        contact_sheet_summary: j.contact_sheet_summary || null,
+        engine_version: j.engine_version || null,
+        deck_profile: j.deck_profile || null,
         blocked_reason: j.blocked_reason || null,
         visible_document_cards: mergeDocumentCards(undefined, j.visible_document_cards),
         diagnostic_document_cards: mergeDocumentCards(undefined, j.diagnostic_document_cards),
@@ -1038,6 +1067,8 @@ function DeckJobProgress({ job, showQaDetails = true }: { job: DeckJobView; show
   const round = Number(job.revision_round || 0);
   const maxRounds = Number(job.max_revision_rounds || 3);
   const qa = job.qa_summary;
+  const critic = job.critic_summary;
+  const criticFindings = (critic?.top_findings || []).slice(0, 2);
   const latestMessage = job.latest_event_message || job.last_event_message || '';
   const statusTone = failed
     ? 'border-semantic-error/25 bg-semantic-error/5 text-semantic-error'
@@ -1066,7 +1097,7 @@ function DeckJobProgress({ job, showQaDetails = true }: { job: DeckJobView; show
       )}
       {pending && (
         <div className="mt-3 grid grid-cols-2 gap-1.5 text-[10px] text-text-secondary sm:grid-cols-4">
-          {['Queue', 'HTML', 'QA', 'Exports'].map((stage, index) => (
+          {['Story', 'Claim spine', 'Design', 'Export'].map((stage, index) => (
             <div key={stage} className={`rounded border px-2 py-1 ${index === 0 ? 'border-accent-magenta/25 bg-accent-magenta/10 text-accent-magenta' : 'border-white/[0.05] bg-bg-root/45'}`}>
               {stage}
             </div>
@@ -1079,6 +1110,27 @@ function DeckJobProgress({ job, showQaDetails = true }: { job: DeckJobView; show
           <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">High {qa.high || 0}</div>
           <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">Med {qa.medium || 0}</div>
           <div className="rounded border border-white/[0.05] bg-bg-root/60 px-1.5 py-1">Low {qa.low || 0}</div>
+        </div>
+      )}
+      {(critic || qa?.critic_score) && (
+        <div className="mt-2 rounded border border-white/[0.05] bg-bg-root/45 px-2 py-1.5 text-[11px] text-text-secondary">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-semibold text-text-primary">Deck critic</span>
+            <span className="text-text-muted">
+              {critic?.score_total ?? qa?.critic_score}/{critic?.max_score || 45}
+              {critic?.status ? ` · ${String(critic.status).replace(/_/g, ' ')}` : ''}
+            </span>
+          </div>
+          {criticFindings.length > 0 && (
+            <div className="mt-1 space-y-1">
+              {criticFindings.map((finding, index) => (
+                <div key={`${finding.slideId || 'deck'}-${index}`} className="leading-relaxed text-text-muted">
+                  {finding.issue}
+                  {finding.requiredFix ? <span> · {finding.requiredFix}</span> : null}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {blocked && (
@@ -1106,7 +1158,9 @@ function DeckProductionPanel({ jobs, showQaDetails = true }: { jobs?: DeckJobVie
           <div className="truncate text-xs font-semibold text-text-primary" style={{ fontFamily: "'DM Sans', sans-serif" }}>
             Deck Production
           </div>
-          <div className="truncate text-[11px] text-text-muted">{latest.title || 'Presentation deck'}</div>
+          <div className="truncate text-[11px] text-text-muted">
+            {[latest.title || 'Presentation deck', latest.deck_profile?.replace(/-/g, ' ')].filter(Boolean).join(' · ')}
+          </div>
         </div>
         {latest.revision_round ? (
           <span className="rounded-full border border-accent-magenta/20 bg-accent-magenta/10 px-2 py-0.5 text-[10px] font-semibold text-accent-magenta">

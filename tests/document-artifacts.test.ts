@@ -148,6 +148,7 @@ describe('document artifact quality gates', () => {
     expect(html).toContain('cover-grid');
     expect(html).toContain('HTML source of truth');
     expect(html).not.toContain('color-mix(');
+    expect(html).not.toMatch(/Claim spine|Evidence-first proof|QA-gated export/i);
     expect(html).not.toContain('...');
     expect(qa.status).toBe('pass');
     expect(qa.checks.visual_surface_count).toBeGreaterThanOrEqual(4);
@@ -211,6 +212,22 @@ describe('document artifact quality gates', () => {
 
     expect(qa.status).toBe('needs_revision');
     expect(qa.slideFindings.some(f => /literal ellipses/i.test(f.issue))).toBe(true);
+  });
+
+  it('flags placeholder Slide N titles before export', () => {
+    const qa = __documentArtifactsTestHooks.evaluatePremiumDeckQa('TOLUAI Opportunity', {
+      slides: [
+        { layout: 'cover', title: 'TOLUAI Opportunity', headline: 'Decision context' },
+        { title: 'Slide 2', headline: 'This should be a claim, not a placeholder title.', evidence_blocks: ['Founder call needed'] },
+        { title: 'Product workflow needs proof', headline: 'The workflow claim should be source-backed.', evidence_blocks: ['ToluAI 360'] },
+        { title: 'Market wedge depends on buyer urgency', headline: 'The wedge must connect to budgeted pain.', evidence_blocks: ['Finance and energy buyers'] },
+        { title: 'Risks are underwriteable if owners close the gaps', headline: 'Open diligence items are explicit.', bullets: ['Revenue proof', 'Customer validation'] },
+        { title: 'Next action is a source-backed founder call', headline: 'Request materials before circulation.', table: { headers: ['Action', 'Owner'], rows: [['Founder call', 'Deal team']] } },
+      ],
+    });
+
+    expect(qa.status).toBe('failed');
+    expect(qa.slideFindings.some(f => /placeholder title/i.test(f.issue))).toBe(true);
   });
 
   it('blocks critically unsafe deck QA before polished export', () => {
