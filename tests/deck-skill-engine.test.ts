@@ -77,7 +77,7 @@ describe('Medina deck skill engine', () => {
 
   it('keeps unsupported metrics as explicit source gaps instead of inventing values', () => {
     const result = buildMedinaDeckStudio('Early Stage Deal Review', {
-      summary: 'The company looks promising, but the current source pack has no revenue, customer, or pricing metrics.',
+      summary: 'The company looks promising in 2026, but the current source pack has no revenue, customer, or pricing metrics.',
       slides: [
         { title: 'Executive Summary', headline: 'The story is plausible but under-sourced.' },
         { title: 'Product', headline: 'The product claim needs proof.' },
@@ -88,7 +88,10 @@ describe('Medina deck skill engine', () => {
     const openQuestions = result.spec.slides.filter(slide => slide.proof_object.status === 'needs_source');
 
     expect(openQuestions.length).toBeGreaterThan(0);
+    expect(result.critic.status).toBe('needs_revision');
+    expect(result.critic.top_findings.some(finding => /no explicit source document IDs/i.test(finding.issue))).toBe(true);
     expect(JSON.stringify(result.structuredContent)).toMatch(/Source gap|Open source gap|Need source-backed evidence/i);
+    expect(JSON.stringify(result.structuredContent)).not.toMatch(/Use 2026 as proof/i);
     expect(JSON.stringify(result.structuredContent)).not.toMatch(/\$[0-9]/);
   });
 });

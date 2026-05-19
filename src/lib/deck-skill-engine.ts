@@ -244,6 +244,19 @@ function wordsFromText(text: string, maxWords: number): string {
   return words.slice(0, maxWords).join(' ');
 }
 
+function isYearOnlySignal(value: string): boolean {
+  const clean = cleanArtifactText(value).replace(/[,$%]/g, '');
+  return /^(19|20)\d{2}$/.test(clean);
+}
+
+function hasMeaningfulNumericSignal(value: string): boolean {
+  const clean = cleanArtifactText(value);
+  if (!/\d/.test(clean)) return false;
+  if (isYearOnlySignal(clean)) return false;
+  return /\$|%|x|\b(arr|mrr|revenue|clients?|customers?|countries|valuation|round|pipeline|stage|burn|runway|growth|margin)\b/i.test(clean)
+    || /\d[\d,.]+\s?(k|m|b)\b/i.test(clean);
+}
+
 function companyFromTitle(title: string): string {
   const clean = cleanArtifactText(title);
   const [first] = clean.split(/\s+[—|-]\s+|\s+about\s+/i);
@@ -269,7 +282,7 @@ function hasSystemLanguage(value: string): boolean {
 function extractValues(text: string): Array<{ label: string; value: string; context?: string }> {
   const clean = cleanArtifactText(text);
   const matches = clean.match(/\$?\b\d[\d,.]*(?:\s?(?:%|x|k|m|b|K|M|B))?\b(?:\s?(?:ARR|MRR|revenue|clients|customers|countries|round|valuation|pipeline|stage|weeks?))?/g) || [];
-  const unique = Array.from(new Set(matches.map(match => match.trim()).filter(match => /\d/.test(match)))).slice(0, 6);
+  const unique = Array.from(new Set(matches.map(match => match.trim()).filter(hasMeaningfulNumericSignal))).slice(0, 6);
   return unique.map((value, index) => ({
     label: index === 0 ? 'Primary signal' : `Signal ${index + 1}`,
     value,
@@ -425,7 +438,7 @@ function supportNoteFor(slide: any, claimTitle: string, brief: DeckBrief): strin
     return wordsFromText(note, 24);
   }
   const fact = brief.facts.find(item => item.value) || brief.facts[0];
-  if (fact?.value) return `Use ${fact.value} as proof, then tie the number to the decision and remaining source gap.`;
+  if (fact?.value) return `Tie ${fact.value} to the decision only after the source, context, and implication are explicit.`;
   return 'Treat unverified points as open questions until a source-backed proof object is available.';
 }
 
@@ -445,7 +458,7 @@ function proofObjectFor(content: any, slide: any, layout: DeckLayoutFamily, brie
   const rows = table?.rows?.length
     ? table.rows.slice(0, 7)
     : evidence.slice(0, 5).map((item, index) => [`${index + 1}`, wordsFromText(item, 15), sourceIds.length ? 'Source-backed' : 'Needs source']);
-  const hasValue = values.some(value => value.value) || rows.some(row => row.some(cell => /\d|[$%]/.test(cell)));
+  const hasValue = values.some(value => hasMeaningfulNumericSignal(value.value)) || rows.some(row => row.some(hasMeaningfulNumericSignal));
   const typeByLayout: Record<DeckLayoutFamily, DeckProofObjectType> = {
     cover: 'evidence_cards',
     investment_snapshot: values.length >= 2 ? 'metric' : 'evidence_cards',
@@ -459,7 +472,7 @@ function proofObjectFor(content: any, slide: any, layout: DeckLayoutFamily, brie
     action_grid: 'action_grid',
     appendix_source_table: 'table',
   };
-  const fallbackValue = brief.facts.find(fact => fact.value);
+  const fallbackValue = brief.facts.find(fact => fact.value && hasMeaningfulNumericSignal(fact.value));
   return {
     type: table ? 'table' : typeByLayout[layout],
     title: firstNonEmpty(table?.title, slide?.proof_title, slide?.title, layout.replace(/_/g, ' ')),
@@ -597,12 +610,15 @@ function scoreFromFindings(findings: DeckCriticFinding[], category: DeckCriticFi
 export function evaluateDeckStudioSpec(title: string, spec: DeckStudioSpec): DeckCriticReport {
   const findings: DeckCriticFinding[] = [];
   const layoutCounts = new Map<DeckLayoutFamily, number>();
+  const supportNoteCounts = new Map<string, number>();
   let valueBackedSlides = 0;
   spec.slides.forEach((slide, index) => {
     layoutCounts.set(slide.layout_family, (layoutCounts.get(slide.layout_family) || 0) + 1);
+    const supportKey = normalizeTextKey(slide.support_note);
+    if (supportKey.length > 24) supportNoteCounts.set(supportKey, (supportNoteCounts.get(supportKey) || 0) + 1);
     const claim = cleanArtifactText(slide.claim_title);
     const proof = slide.proof_object;
-    const hasValue = proof.values.some(value => /\d|[$%]/.test(value.value)) || proof.rows.some(row => row.some(cell => /\d|[$%]/.test(cell)));
+    const hasValue = proof.values.some(value => hasMeaningfulNumericSignal(value.value)) || proof.rows.some(row => row.some(hasMeaningfulNumericSignal));
     if (hasValue || proof.source_ids.length > 0) valueBackedSlides++;
     if (isPlaceholderTitle(claim)) {
       findings.push({
@@ -640,6 +656,15 @@ export function evaluateDeckStudioSpec(title: string, spec: DeckStudioSpec): Dec
         category: 'system_language',
       });
     }
+    if (/^tie .+ to the decision only after the source/i.test(slide.support_note)) {
+      findings.push({
+        slideId: slide.id,
+        severity: 'high',
+        issue: 'Slide support note is a generic proof instruction, not audience-facing analysis.',
+        requiredFix: 'Replace repair/instruction copy with the actual implication of the metric or mark the slide as a source gap.',
+        category: 'specificity',
+      });
+    }
     if (!hasValue && proof.rows.length === 0 && proof.values.length === 0) {
       findings.push({
         slideId: slide.id,
@@ -669,6 +694,27 @@ export function evaluateDeckStudioSpec(title: string, spec: DeckStudioSpec): Dec
       requiredFix: 'Use at least five layout families across an 8-10 slide deck.',
       category: 'rhythm',
     });
+  }
+  if (spec.brief.source_notes.some(note => /No explicit source document IDs/i.test(note))) {
+    findings.push({
+      slideId: 'deck',
+      severity: 'high',
+      issue: 'Deck engine received no explicit source document IDs.',
+      requiredFix: 'Do not score the deck as polished-quality unless source-backed facts, document IDs, or explicit source gaps are present.',
+      category: 'proof',
+    });
+  }
+  for (const [note, count] of supportNoteCounts.entries()) {
+    if (count > 2) {
+      findings.push({
+        slideId: 'deck',
+        severity: 'high',
+        issue: 'Multiple slides repeat the same support-note cadence.',
+        requiredFix: 'Rewrite repeated helper copy into slide-specific analysis, proof implications, or named source gaps.',
+        category: 'rhythm',
+      });
+      break;
+    }
   }
   for (const [layout, count] of layoutCounts.entries()) {
     if (layout !== 'cover' && count > 3) {
