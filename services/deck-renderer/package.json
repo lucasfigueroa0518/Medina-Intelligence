@@ -8,7 +8,10 @@
     "smoke": "node src/smoke.mjs"
   },
   "dependencies": {
-    "playwright": "^1.57.0"
+    "@cloudflare/containers": "^0.3.4",
+    "@oai/artifact-tool": "file:vendor/oai-artifact-tool",
+    "@oai/walnut": "file:vendor/oai-walnut",
+    "playwright": "1.57.0"
   },
   "devDependencies": {}
 }

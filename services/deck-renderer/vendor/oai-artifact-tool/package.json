@@ -1,0 +1,25 @@
+{
+  "name": "@oai/artifact-tool",
+  "version": "2.7.8",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@oai/walnut": "file:../oai-walnut",
+    "skia-canvas": "^3.0.8"
+  },
+  "exports": {
+    ".": "./dist/artifact_tool.mjs",
+    "./presentation-jsx": "./dist/presentation-jsx/index.mjs",
+    "./presentation-jsx/jsx-runtime": "./dist/presentation-jsx/jsx-runtime.mjs",
+    "./presentation-jsx/jsx-dev-runtime": "./dist/presentation-jsx/jsx-dev-runtime.mjs"
+  },
+  "files": [
+    "dist/**",
+    "LICENSE.md"
+  ],
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "skia-canvas"
+    ]
+  }
+}
