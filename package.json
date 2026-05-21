@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "bootstrap": "bash scripts/bootstrap-cloudflare.sh",
+    "preflight": "bash scripts/preflight.sh",
     "dev": "concurrently -n api,web -c magenta,cyan \"wrangler dev --remote\" \"npm --prefix frontend run dev\"",
     "dev:api": "wrangler dev --remote",
     "dev:web": "npm --prefix frontend run dev",
