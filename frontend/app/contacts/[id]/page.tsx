@@ -248,7 +248,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
         setToast(demoToastMessage('Contact edit'));
         return;
       }
-      await api.updateContact(id, {
+      const res = await api.updateContact(id, {
         full_name: editForm.full_name.trim(),
         email: editForm.email.trim() || null, phone: editForm.phone.trim() || null,
         job_title: editForm.job_title.trim() || null, contact_type: editForm.contact_type,
@@ -262,9 +262,17 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
         fund_name: editForm.fund_name.trim() || null,
         commitment_status: editForm.commitment_status.trim() || null,
       });
-      setEditMode(false);
-      setRefreshKey(k => k + 1);
-      setToast('Contact updated');
+      const rejected = res.rejected_fields ?? [];
+      if (rejected.length > 0) {
+        const first = rejected[0];
+        const label = humanField(first.field_name);
+        setToast(`${label} not saved: ${first.detail || first.reason}${rejected.length > 1 ? ` (+${rejected.length - 1} more)` : ''}`);
+        setRefreshKey(k => k + 1);
+      } else {
+        setEditMode(false);
+        setRefreshKey(k => k + 1);
+        setToast('Contact updated');
+      }
     } catch (e: any) { setToast(`Save failed: ${e.message || 'Unknown error'}`); }
     finally { setSaving(false); }
   }
