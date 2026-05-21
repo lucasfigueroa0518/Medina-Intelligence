@@ -949,9 +949,59 @@ export async function handleScheduled(
         // self-heal — its tiny subrequest footprint always wins under
         // the per-invocation cap before the heavier embed work depletes it.
         ctxExec.waitUntil((async () => {
-          const { renewExpiringSubscriptions } = await import('./lib/graph-subscriptions');
+          const { renewExpiringSubscriptions, ensureSubscriptionsForActiveUsers } = await import('./lib/graph-subscriptions');
           try { await renewExpiringSubscriptions(env); }
           catch (e) { console.error(`hourly self-heal: renewExpiringSubscriptions failed:`, e); }
+          // 2026-05-13 fix: renewExpiringSubscriptions deletes the D1 row on
+          // 404 (Microsoft already nuked the expired sub) but never recreates.
+          // ensureSubscriptionsForActiveUsers refills any missing resource
+          // set per active mailbox user. Idempotent — no-op when all 3
+          // resources already exist.
+          try { await ensureSubscriptionsForActiveUsers(env); }
+          catch (e) { console.error(`hourly self-heal: ensureSubscriptionsForActiveUsers failed:`, e); }
+        })());
+        // Hourly Outlook ingestion gap detector — see lib/ingestion-gap-
+        // detector.ts. Inspects actual conversation row counts per (user, day)
+        // for the last 14 days and enqueues a 1-day progressive backfill
+        // window for any day below MIN_DAILY_EMAILS. Closes the silent-
+        // failure mode where push subscriptions die and delta-poll
+        // underperforms — sync_jobs reports completed throughout but rows
+        // don't land. Idempotent + cooldown-gated.
+        ctxExec.waitUntil((async () => {
+          const { detectAndHealOutlookGaps } = await import('./lib/ingestion-gap-detector');
+          try {
+            const summary = await detectAndHealOutlookGaps(org.id, env);
+            if (summary.backfills_kicked > 0 || summary.users_with_gaps > 0) {
+              console.log(`[gap-detect] org=${org.id} checked=${summary.users_checked} gaps=${summary.users_with_gaps} kicked=${summary.backfills_kicked}`);
+            }
+          } catch (e) {
+            console.error(`hourly self-heal: detectAndHealOutlookGaps failed for ${org.id}:`, e);
+          }
+        })());
+        // Universal pipeline heartbeat watchdog — last-resort safety net
+        // covering Outlook, Firefly, and Slack. Runs AFTER the per-pipeline
+        // gap detectors above; if those didn't catch a regression (e.g.
+        // pipeline silently died with no baseline to compare against), the
+        // watchdog inspects single-most-recent timestamps in each pipeline's
+        // landing table and force-heals when they go past per-pipeline
+        // staleness thresholds (Outlook 6h, Firefly 36h, Slack 48h).
+        // Per-pipeline 4h KV cooldown prevents re-trigger thrash while a
+        // backfill is draining. See src/lib/pipeline-watchdog.ts for the
+        // full rationale + heal actions per pipeline.
+        ctxExec.waitUntil((async () => {
+          const { runPipelineWatchdog } = await import('./lib/pipeline-watchdog');
+          try {
+            const summary = await runPipelineWatchdog(org.id, env);
+            for (const p of summary.pipelines) {
+              if (p.status === 'stale') {
+                console.warn(
+                  `[watchdog] org=${org.id} pipeline=${p.pipeline} hours_stale=${p.hours_stale?.toFixed(1)} heal=${p.heal_triggered} summary=${p.heal_summary || '-'}`
+                );
+              }
+            }
+          } catch (e) {
+            console.error(`hourly self-heal: runPipelineWatchdog failed for ${org.id}:`, e);
+          }
         })());
         // Hourly contact + company embed backfill — backfillUnembeddedEntities
         // is the SOLE callsite of embedContactBio + embedCompanyDescription
