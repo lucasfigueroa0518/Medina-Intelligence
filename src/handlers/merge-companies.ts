@@ -37,6 +37,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
+import { safelyRebuildContactSearchIndexForCompany } from '../lib/contact-search';
 
 interface MergeBody {
   loser_id: string;
@@ -135,6 +136,8 @@ export async function handleMergeCompanies(
     after_data: { merged_into: survivor.id, repointed: counts },
     created_at: now,
   });
+
+  await safelyRebuildContactSearchIndexForCompany(env, ctx.orgId, survivor.id, loser.domain);
 
   return jsonResponse({
     dry_run: false,

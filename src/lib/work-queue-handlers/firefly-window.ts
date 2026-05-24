@@ -221,6 +221,34 @@ export const fireflyWindowHandler: WorkQueueHandler = {
 
     // ─── Result branching ────────────────────────────────────────────
 
+    if (result.status === 'completed' && result.failed > 0) {
+      await env.D1.prepare(
+        `UPDATE firefly_progressive_backfill_windows
+            SET status = 'failed',
+                completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                last_skip = ?,
+                transcripts_fetched           = transcripts_fetched + ?,
+                transcripts_persisted         = transcripts_persisted + ?,
+                transcripts_skipped_duplicate = transcripts_skipped_duplicate + ?,
+                transcripts_failed            = transcripts_failed + ?,
+                last_error = ?,
+                lock_expires_at = NULL
+          WHERE parent_id = ? AND window_index = ?
+            AND (SELECT status FROM firefly_progressive_backfill_jobs WHERE id = parent_id) = 'active'`
+      ).bind(
+        result.last_skip,
+        result.total_fetched,
+        result.ingested,
+        result.duplicates,
+        result.failed,
+        `${result.failed} per-transcript failures; retrying window`,
+        parent_id,
+        window_index
+      ).run();
+
+      throw new Error(`${result.failed} per-transcript failures; retrying firefly window`);
+    }
+
     if (result.status === 'completed') {
       // Update legacy window for UI continuity. Counters are absolute-
       // delta from this run (the runFireflyWindowBackfill returns

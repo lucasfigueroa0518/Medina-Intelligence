@@ -283,18 +283,12 @@ export async function fetchEventsForWindow(
 
   while (url) {
     if (Date.now() - startedAt > PER_WINDOW_BUDGET_MS) {
-      // Per-window wallclock cap reached. Return what we have so far;
-      // the next tick will repick the window (still 'in_progress' until
-      // outer code closes it). upsertOutlookEvent is idempotent so the
-      // partial set is safe to commit.
-      console.warn(
-        `[calendar-progressive] per-window budget exceeded for user=${userId} window=${windowStart} after ${events.length} events`
+      throw new Error(
+        `per_window_budget_exceeded user=${userId} window=${windowStart} events_so_far=${events.length}`
       );
-      break;
     }
     if (!(await checkGraphRateLimit(orgId, env))) {
-      console.log(`[calendar-progressive] Graph rate limit approaching, pausing`);
-      break;
+      throw new Error('graph_rate_limit_open');
     }
 
     const resp = await fetch(url, {

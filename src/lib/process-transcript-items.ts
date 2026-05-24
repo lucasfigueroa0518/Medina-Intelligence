@@ -21,6 +21,7 @@
 
 import type { Env } from '../types/env';
 import type { ChunkMetadata, SpeakerTurn } from '../types/interfaces';
+import { safelyUpsertEventTimelineItemsForContacts } from './contact-detail-read-model';
 
 export interface TranscriptItem {
   /** Firefly's transcript id — natural external key for race-safe read-back. */
@@ -340,7 +341,7 @@ export async function processTranscriptItems(
 
           if (user) internalUserIds.push(user.id);
 
-          await env.D1.prepare(
+          const attendeeInsert = await env.D1.prepare(
             `INSERT OR IGNORE INTO event_attendees
                (event_id, contact_id, user_id, email, display_name, role, is_internal)
              VALUES (?, ?, ?, ?, ?, 'attendee', ?)`
@@ -354,6 +355,15 @@ export async function processTranscriptItems(
               user ? 1 : 0
             )
             .run();
+          if (attendeeInsert.meta?.changes && contactId) {
+            await safelyUpsertEventTimelineItemsForContacts(
+              env,
+              ctx.orgId,
+              canonicalId,
+              [contactId],
+              'firefly_event_attendee_linked'
+            );
+          }
 
           stats.attendees_linked += 1;
         }

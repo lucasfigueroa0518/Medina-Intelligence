@@ -4,6 +4,7 @@ import type { TranscriptSignals, ContactSignal, CompanySignal, DealSignal, Relat
 import { hashShort } from './helpers';
 import { chunkEmbedAndPersistAll } from './embedding';
 import { recordSyntheticObservation } from './synthetic-observations';
+import { safelyUpsertConversationTimelineItemsForContacts } from './contact-detail-read-model';
 
 interface RoutedSignalResult {
   contact_signals_routed: number;
@@ -364,9 +365,18 @@ export async function distributeMeetingSummary(
       now, now
     ).run();
 
-    await env.D1.prepare(
+    const linkInsert = await env.D1.prepare(
       `INSERT OR IGNORE INTO conversation_contacts (conversation_id, contact_id) VALUES (?, ?)`
     ).bind(convId, att.contact_id).run();
+    if (linkInsert.meta?.changes) {
+      await safelyUpsertConversationTimelineItemsForContacts(
+        env,
+        orgId,
+        convId,
+        [att.contact_id],
+        'signal_router_conversation_linked'
+      );
+    }
 
     try {
       const meta: ChunkMetadata = {

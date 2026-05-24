@@ -17,6 +17,12 @@ import { loadFirmRelationshipSnapshot, upsertFirmCompanyRelationship } from './f
 import { preprocessQuery, retrieveContext } from './retrieval';
 import { buildSourcesAndContext } from './citations';
 import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
+import {
+  buildContactSearchQuery,
+  contactSearchCteBinds,
+  contactSearchCteSql,
+  ensureContactSearchIndexReady,
+} from './contact-search';
 
 export interface AgentToolContext {
   deepDive?: boolean;
@@ -951,11 +957,8 @@ export async function searchContacts(
 ): Promise<any> {
   const where: string[] = ['c.org_id = ?', 'c.deleted_at IS NULL'];
   const binds: unknown[] = [ctx.orgId];
+  const contactSearch = buildContactSearchQuery(input.keyword);
 
-  if (input.keyword) {
-    where.push('(c.full_name LIKE ? OR c.email LIKE ? OR co.name LIKE ?)');
-    binds.push(`%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`);
-  }
   if (input.contact_type) {
     where.push('c.contact_type = ?');
     binds.push(input.contact_type);
@@ -965,17 +968,45 @@ export async function searchContacts(
   }
 
   const limit = structuredLimit(input.limit, toolContext);
-  const result = await env.D1.prepare(
-    `SELECT c.id, c.full_name, c.email, c.phone, c.contact_type, c.job_title,
-            c.engagement_status, c.relationship_status, c.total_interactions,
-            c.last_contact_date, c.next_followup_date, c.location,
-            co.name AS company_name
-     FROM contacts c
-     LEFT JOIN companies co ON c.company_id = co.id
-     WHERE ${where.join(' AND ')}
-     ORDER BY c.last_contact_date DESC NULLS LAST
-     LIMIT ?`
-  ).bind(...binds, limit).all();
+  let result;
+  if (contactSearch) {
+    const ready = await ensureContactSearchIndexReady(env, ctx.orgId);
+    if (!ready.ok) {
+      return {
+        contacts: [],
+        count: 0,
+        error: ready.code,
+        message: ready.message,
+      };
+    }
+    const searchBinds = contactSearchCteBinds(contactSearch, ctx.orgId);
+    result = await env.D1.prepare(
+      `${contactSearchCteSql()}
+       SELECT c.id, c.full_name, c.email, c.phone, c.contact_type, c.job_title,
+              c.engagement_status, c.relationship_status, c.total_interactions,
+              c.last_contact_date, c.next_followup_date, c.location,
+              co.name AS company_name
+       FROM matched m
+       JOIN contacts c ON c.id = m.contact_id
+       LEFT JOIN companies co ON c.company_id = co.id
+       WHERE ${where.join(' AND ')}
+       GROUP BY c.id
+       ORDER BY m.search_rank ASC, m.fts_rank ASC, c.last_contact_date DESC NULLS LAST, c.full_name ASC
+       LIMIT ?`
+    ).bind(...searchBinds, ...binds, limit).all();
+  } else {
+    result = await env.D1.prepare(
+      `SELECT c.id, c.full_name, c.email, c.phone, c.contact_type, c.job_title,
+              c.engagement_status, c.relationship_status, c.total_interactions,
+              c.last_contact_date, c.next_followup_date, c.location,
+              co.name AS company_name
+       FROM contacts c
+       LEFT JOIN companies co ON c.company_id = co.id
+       WHERE ${where.join(' AND ')}
+       ORDER BY c.last_contact_date DESC NULLS LAST
+       LIMIT ?`
+    ).bind(...binds, limit).all();
+  }
 
   const contacts = result.results as any[];
   if (contacts.length > 0) {

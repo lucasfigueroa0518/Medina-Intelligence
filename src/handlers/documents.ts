@@ -6,6 +6,7 @@ import { emitAudit } from '../lib/audit';
 import { getSharingFlags, parseParticipantUserIds } from '../lib/helpers';
 import { isDocumentAccessibleToUser } from '../lib/document-acl';
 import { persistDocument, type DocumentLink, type DocumentVisibility } from '../lib/persist-document';
+import { safelyRebuildContactDetailReadModelForContact } from '../lib/contact-detail-read-model';
 
 const ALLOWED_VISIBILITIES: DocumentVisibility[] = ['private', 'org_wide', 'public', 'confidential'];
 
@@ -339,6 +340,14 @@ export async function uploadDocument(
 
   // Async finalize — extract + classify (if not user-provided) + embed + status='completed'.
   ctxExec.waitUntil(persisted.finalize());
+  if (contactId) {
+    ctxExec.waitUntil(safelyRebuildContactDetailReadModelForContact(
+      env,
+      ctx.orgId,
+      contactId,
+      'document_uploaded'
+    ));
+  }
 
   await emitAudit(env, {
     org_id: ctx.orgId,
@@ -415,6 +424,11 @@ export async function deleteDocument(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
+  const linkedContacts = await env.D1.prepare(
+    `SELECT entity_id FROM document_links
+      WHERE document_id = ? AND org_id = ? AND entity_type = 'contact' AND deleted_at IS NULL`
+  ).bind(id, ctx.orgId).all<{ entity_id: string }>();
+
   await env.D1.prepare(
     `UPDATE documents SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND org_id = ?`
   ).bind(id, ctx.orgId).run();
@@ -427,5 +441,8 @@ export async function deleteDocument(
     entity_id: id,
     created_at: new Date().toISOString(),
   });
+  await Promise.all(linkedContacts.results.map(row =>
+    safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, row.entity_id, 'document_deleted')
+  ));
   return jsonResponse({ ok: true });
 }

@@ -110,31 +110,35 @@ async function request<T>(
 
 export const api = {
   // Contacts
-  listContacts: (params?: Record<string, string>) => {
+  listContacts: (params?: Record<string, string>, options: RequestInit = {}) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ contacts: any[]; limit: number; offset: number; total: number; has_more?: boolean }>(`/contacts${q}`);
+    return request<{ contacts: any[]; limit: number; offset: number; total: number; has_more?: boolean }>(`/contacts${q}`, options);
   },
   listContactCompanies: () =>
     request<{ companies: { id: string; name: string; count: number }[] }>(`/contacts/companies`),
-  getContact: (id: string) =>
-    request<{ contact: any; tags: any[]; associations: any[] }>(`/contacts/${id}`),
+  getContact: (id: string, options: RequestInit = {}) =>
+    request<{ contact: any; tags: any[]; associations: any[]; canonical_contact_id?: string; redirected_from?: string | null }>(`/contacts/${id}`, options),
   createContact: (data: any) =>
     request<{ contact: any }>('/contacts', { method: 'POST', body: JSON.stringify(data) }),
   updateContact: (id: string, data: any) =>
     request<{ contact: any }>(`/contacts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteContact: (id: string) =>
     request<{ ok: boolean }>(`/contacts/${id}`, { method: 'DELETE' }),
-  getContactTimeline: (id: string) =>
-    request<{ entries: any[] }>(`/contacts/${id}/timeline`),
-  getContactEnrichment: (id: string) =>
+  getContactTimeline: (id: string, params?: Record<string, string>, options: RequestInit = {}) => {
+    const q = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<{ entries: any[]; next_cursor?: string | null; canonical_contact_id?: string; redirected_from?: string | null }>(`/contacts/${id}/timeline${q}`, options);
+  },
+  getContactEnrichment: (id: string, options: RequestInit = {}) =>
     request<{
       contact_id: string;
+      canonical_contact_id?: string;
+      redirected_from?: string | null;
       short_bio: string | null;
       full_bio: string | null;
       enrichment_confidence: number | null;
       enrichment_last_run: string | null;
       status: string;
-    }>(`/contacts/${id}/enrichment`),
+    }>(`/contacts/${id}/enrichment`, options),
   mergeContacts: (keep_id: string, discard_id: string) =>
     request<{ ok: boolean }>(`/contacts/merge`, {
       method: 'POST',
@@ -172,8 +176,8 @@ export const api = {
     }>(`/companies/${id}/enrichment`),
   enrichContact: (id: string) =>
     request<{ ok: boolean; message: string }>(`/contacts/${id}/enrich`, { method: 'POST' }),
-  getContactAssociations: (id: string) =>
-    request<{ associations: any[] }>(`/contacts/${id}/associations`),
+  getContactAssociations: (id: string, options: RequestInit = {}) =>
+    request<{ associations: any[]; canonical_contact_id?: string; redirected_from?: string | null }>(`/contacts/${id}/associations`, options),
   getCompanyAssociations: (id: string) =>
     request<{ associations: any[] }>(`/companies/${id}/associations`),
 
@@ -557,8 +561,8 @@ export const api = {
     request<{ ok: boolean }>(`/observations/${encodeURIComponent(observationId)}/dismiss`, {
       method: 'POST',
     }),
-  getContactPendingUpdates: (id: string) =>
-    request<{ updates: any[] }>(`/contacts/${id}/pending-updates`),
+  getContactPendingUpdates: (id: string, options: RequestInit = {}) =>
+    request<{ updates: any[] }>(`/contacts/${id}/pending-updates`, options),
 
   // Agent
   listSessions: () => request<{ sessions: any[] }>('/agent/sessions'),
@@ -951,7 +955,7 @@ export const api = {
     }),
 
   // Documents
-  listDocuments: (params?: Record<string, string>) => {
+  listDocuments: (params?: Record<string, string>, options: RequestInit = {}) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
     return request<{
       documents: any[];
@@ -959,7 +963,7 @@ export const api = {
       limit: number;
       offset: number;
       has_more: boolean;
-    }>(`/documents${q}`);
+    }>(`/documents${q}`, options);
   },
   getDocument: (id: string) =>
     request<{ document: any; downloadUrl: string }>(`/documents/${id}`),
@@ -1085,6 +1089,16 @@ export interface UserWarning {
   missed_days?: number;
   suggest_backfill_days?: 30;
   backfill_prompt?: string;
+  severity?: 'warning' | 'critical';
+  source?: string;
+  incident_id?: string;
+  code?: string;
+  first_seen_at?: string;
+  last_seen_at?: string;
+  recovery_status?: string;
+  human_action_required?: boolean;
+  recovery_window_start?: string | null;
+  recovery_window_end?: string | null;
 }
 
 // Resolve avatar_url for display. The backend stores R2-backed avatars as `r2:<key>`
@@ -1219,6 +1233,30 @@ export interface BudgetSnapshotRow {
   consecutive_successes: number;
   cap_lowered_at: string | null;
   last_429_at: string | null;
+}
+
+export interface IngestionIncident {
+  id: string;
+  org_id: string;
+  source: string;
+  scope_type: string;
+  scope_id: string;
+  status: 'open' | 'recovering' | 'blocked' | 'resolved';
+  severity: 'warning' | 'critical';
+  code: string;
+  title: string;
+  message: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  resolved_at: string | null;
+  last_success_at: string | null;
+  human_action_required: number;
+  recovery_status: 'idle' | 'repair_queued' | 'repairing' | 'blocked_on_auth';
+  recovery_window_start: string | null;
+  recovery_window_end: string | null;
+  repair_attempt_count: number;
+  last_repair_at: string | null;
+  metadata: string;
 }
 
 export type MartyLabRunStatus = 'queued' | 'configured' | 'running' | 'completed' | 'cancelled' | 'failed';
@@ -1563,6 +1601,7 @@ export interface SystemStatusResponse {
   // an empty-state card when registry is unpopulated.
   work_queue_inventory: WorkQueueInventoryEntry[];
   stuck_work_queue: StuckWorkQueueEntry[];
+  ingestion_incidents: IngestionIncident[];
   marty_lab: MartyLabStatusSnapshot;
   deal_replay: DealReplayStatusSnapshot;
   budgets: BudgetSnapshotRow[];

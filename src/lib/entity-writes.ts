@@ -30,6 +30,11 @@ import { emitAudit } from './audit';
 import { invalidateRagCache } from './cache';
 import { markFieldsHumanEdited } from './progressive-enrichment';
 import { recordApprovalOfDeletion } from './proposal-evaluator';
+import {
+  safelyRebuildContactSearchIndexForCompany,
+  safelyRebuildContactSearchIndexForContact,
+} from './contact-search';
+import { safelyRebuildContactDetailReadModelForContact } from './contact-detail-read-model';
 
 export type EntityType = 'contact' | 'company' | 'deal';
 
@@ -397,6 +402,17 @@ async function updateEntityFieldsCommon(
   }
 
   await invalidateRagCache(ctx.orgId, env);
+  if (entityType === 'contact') {
+    await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, entityId);
+    await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, entityId, 'contact_updated');
+  } else {
+    await safelyRebuildContactSearchIndexForCompany(
+      env,
+      ctx.orgId,
+      entityId,
+      typeof (before as any).domain === 'string' ? (before as any).domain : null
+    );
+  }
 
   return {
     ok: true,
@@ -655,6 +671,17 @@ export async function deleteEntityField(
   });
 
   await invalidateRagCache(ctx.orgId, env);
+  if (entityType === 'contact') {
+    await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, entityId);
+    await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, entityId, 'contact_field_deleted');
+  } else if (entityType === 'company') {
+    await safelyRebuildContactSearchIndexForCompany(
+      env,
+      ctx.orgId,
+      entityId,
+      typeof (before as any).domain === 'string' ? (before as any).domain : null
+    );
+  }
 
   return {
     ok: true,
@@ -737,6 +764,8 @@ export async function createContactRecord(
   });
 
   await invalidateRagCache(ctx.orgId, env);
+  await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, id);
+  await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, id, 'contact_created');
 
   return { ok: true, id };
 }
@@ -794,6 +823,9 @@ export async function createCompanyRecord(
   });
 
   await invalidateRagCache(ctx.orgId, env);
+  if (input.domain) {
+    await safelyRebuildContactSearchIndexForCompany(env, ctx.orgId, id, input.domain);
+  }
 
   return { ok: true, id };
 }

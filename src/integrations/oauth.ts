@@ -77,6 +77,37 @@ async function storedTokenChangedAndFresh(
   }
 }
 
+async function acquireIngestionLock(
+  env: Env,
+  lockKey: string,
+  ttlMs = 60_000
+): Promise<string | null> {
+  const owner = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  const row = await env.D1.prepare(
+    `INSERT INTO ingestion_locks (lock_key, owner, expires_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(lock_key) DO UPDATE SET
+       owner = excluded.owner,
+       expires_at = excluded.expires_at,
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE ingestion_locks.expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     RETURNING owner`
+  ).bind(lockKey, owner, expiresAt).first<{ owner: string }>();
+  return row?.owner === owner ? owner : null;
+}
+
+async function releaseIngestionLock(env: Env, lockKey: string, owner: string | null): Promise<void> {
+  if (!owner) return;
+  await env.D1.prepare(
+    `DELETE FROM ingestion_locks WHERE lock_key = ? AND owner = ?`
+  ).bind(lockKey, owner).run();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export async function refreshOutlookToken(
   userId: string,
   orgId: string,
@@ -95,12 +126,26 @@ export async function refreshOutlookToken(
 
   if (!user?.outlook_token) return { success: false, reason: 'missing_token' };
   const originalEncryptedToken = user.outlook_token;
+  const lockKey = `outlook_refresh:${userId}`;
+  let lockOwner: string | null = null;
 
   try {
     const decrypted = await decryptToken(originalEncryptedToken, env);
     if (accessTokenStillFresh(decrypted)) {
       await env.KV.delete(`token_failed:${userId}:outlook`);
       return { success: true, refreshed: false };
+    }
+
+    lockOwner = await acquireIngestionLock(env, lockKey);
+    if (!lockOwner) {
+      for (let i = 0; i < 6; i++) {
+        await sleep(500);
+        if (await storedTokenChangedAndFresh(userId, originalEncryptedToken, env)) {
+          await env.KV.delete(`token_failed:${userId}:outlook`);
+          return { success: true, refreshed: false };
+        }
+      }
+      return { success: false, reason: 'transient', errorCode: 'refresh_lock_busy' };
     }
 
     const tenantId = env.AZURE_TENANT_ID || 'common';
@@ -159,9 +204,13 @@ export async function refreshOutlookToken(
       ).bind(encrypted, userId).run();
     }
 
+    await releaseIngestionLock(env, lockKey, lockOwner);
+    lockOwner = null;
     await env.KV.delete(`token_failed:${userId}:outlook`);
     return { success: true, refreshed: true };
   } catch (e) {
+    await releaseIngestionLock(env, lockKey, lockOwner).catch(() => {});
+    lockOwner = null;
     if (await storedTokenChangedAndFresh(userId, originalEncryptedToken, env)) {
       await env.KV.delete(`token_failed:${userId}:outlook`);
       return { success: true, refreshed: false };

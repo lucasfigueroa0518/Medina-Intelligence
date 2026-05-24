@@ -109,19 +109,25 @@ export const calendarRefreshHandler: WorkQueueHandler = {
 
     // Per-event upsert. ON CONFLICT(outlook_event_id) makes this safe
     // to retry — the same window re-processed produces no duplicate
-    // events. A per-event failure is logged but doesn't fail the whole
-    // window (other events may still upsert successfully).
+    // events. A per-event failure now fails the whole work item so the
+    // window cannot be marked successfully synced with missing events.
     let upserted = 0;
+    const upsertErrors: string[] = [];
     for (const event of events) {
       try {
         await upsertOutlookEvent(event, item.org_id, env);
         upserted++;
       } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
         console.error(
           `[calendar-refresh] upsert failed for event=${event.id} user=${user_id}:`,
-          e instanceof Error ? e.message : e
+          msg
         );
+        upsertErrors.push(`${event.id}:${msg.slice(0, 160)}`);
       }
+    }
+    if (upsertErrors.length > 0) {
+      throw new Error(`calendar_upsert_failed count=${upsertErrors.length} sample=${upsertErrors.slice(0, 3).join('; ')}`);
     }
 
     // Update the calendar window's long-lived state. work_queue

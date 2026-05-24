@@ -2,6 +2,7 @@
 import type { Env } from '../types/env';
 import type { ClassifiableItem } from '../types/interfaces';
 import { getDecryptedSlackBotToken } from '../lib/helpers';
+import { reportIngestionFailure, reportIngestionSuccess } from '../lib/ingestion-health';
 
 interface SlackChannel {
   id: string;
@@ -117,6 +118,15 @@ export async function fetchSlackMessages(
     console.log(`[slack] token resolved for org ${orgId} (${botToken.slice(0, 8)}...)`);
   } catch (e) {
     console.error(`[slack] token resolution failed for org ${orgId}:`, e);
+    errors.push({ channel_id: '*', channel_name: '*', error: `token_resolution_failed:${e instanceof Error ? e.message : String(e)}` });
+    await reportIngestionFailure(env, {
+      orgId,
+      source: 'slack',
+      code: 'slack_token_resolution_failed',
+      message: `Slack ingestion cannot decrypt or resolve the bot token: ${e instanceof Error ? e.message : String(e)}`,
+      severity: 'critical',
+      humanActionRequired: true,
+    }).catch(() => {});
     return { messages, errors, channels_visible: 0 };
   }
 
@@ -137,6 +147,16 @@ export async function fetchSlackMessages(
     // counter and reflect it in the IntegrationRow.detail.
     const count = await recordSlackAuthFailure(orgId, env);
     console.error(`[slack] auth.test failed (${authData.error || 'unknown'}); consecutive_failures=${count}`);
+    errors.push({ channel_id: '*', channel_name: '*', error: `auth_failed:${authData.error || 'unknown'}` });
+    await reportIngestionFailure(env, {
+      orgId,
+      source: 'slack',
+      code: 'slack_auth_failed',
+      message: `Slack ingestion is blocked because auth.test failed (${authData.error || 'unknown'}).`,
+      severity: count >= 3 ? 'critical' : 'warning',
+      humanActionRequired: count >= 3,
+      metadata: { consecutive_failures: count, slack_error: authData.error || 'unknown' },
+    }).catch(() => {});
     return { messages, errors, channels_visible: 0 };
   }
   // Clear the counter on success — sustained-failure window resets the
@@ -154,9 +174,17 @@ export async function fetchSlackMessages(
   };
   console.log(`[slack] conversations.list: ok=${channelsData.ok} channels=${channelsData.channels?.length ?? 0} error=${channelsData.error || 'none'}`);
   if (!channelsData.ok) {
-    if (channelsData.error === 'ratelimited') {
-      errors.push({ channel_id: '*', channel_name: '*', error: 'ratelimited:conversations.list' });
-    }
+    const code = channelsData.error || 'unknown';
+    errors.push({ channel_id: '*', channel_name: '*', error: `${code}:conversations.list` });
+    await reportIngestionFailure(env, {
+      orgId,
+      source: 'slack',
+      code: 'slack_channels_list_failed',
+      message: `Slack channel inventory failed: ${code}. Automatic repair will retry with backoff.`,
+      severity: code === 'ratelimited' ? 'warning' : 'critical',
+      humanActionRequired: /invalid_auth|not_authed|account_inactive|missing_scope/i.test(code),
+      metadata: { slack_error: code },
+    }).catch(() => {});
     return { messages, errors, channels_visible: 0 };
   }
 
@@ -310,8 +338,8 @@ export async function fetchSlackMessages(
         if (msg.subtype && SKIP_SUBTYPES.has(msg.subtype)) continue;
         if (!msg.user) continue;
 
-        const userEmail = await resolveSlackUserEmail(msg.user, botToken, env);
-        if (!userEmail) continue;
+        const userEmail = await resolveSlackUserEmail(msg.user, botToken, env)
+          || `${msg.user.toLowerCase()}@slack.local`;
 
         messages.push({
           type: 'slack_message',
@@ -357,6 +385,13 @@ export async function fetchSlackMessages(
                 last_error = NULL
           WHERE org_id = ? AND channel_id = ?`
       ).bind(orgId, channel.id).run();
+      await reportIngestionSuccess(env, {
+        orgId,
+        source: 'slack',
+        scopeType: 'channel',
+        scopeId: channel.id,
+        metadata: { channel_name: channel.name },
+      }).catch(() => {});
     }
   }
 
@@ -365,6 +400,14 @@ export async function fetchSlackMessages(
   // user staring at the UI can tell when something was last ingested.
   if (anyChannelReturnedMessages) {
     await env.KV.put(`slack_last_sync:${orgId}`, new Date().toISOString());
+  }
+
+  if (errors.length === 0) {
+    await reportIngestionSuccess(env, {
+      orgId,
+      source: 'slack',
+      metadata: { channels_visible: channels.length, messages: messages.length },
+    }).catch(() => {});
   }
 
   console.log(
@@ -467,8 +510,8 @@ export async function backfillSlackChannelHistory(
     for (const msg of data.messages || []) {
       if (msg.subtype && SKIP_SUBTYPES.has(msg.subtype)) continue;
       if (!msg.user) continue;
-      const userEmail = await resolveSlackUserEmail(msg.user, botToken, env);
-      if (!userEmail) continue;
+      const userEmail = await resolveSlackUserEmail(msg.user, botToken, env)
+        || `${msg.user.toLowerCase()}@slack.local`;
       messages.push({
         type: 'slack_message',
         source: 'slack',

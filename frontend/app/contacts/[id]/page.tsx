@@ -17,7 +17,7 @@ import { DocumentUploadModal } from '@/components/document-upload-modal';
 import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
 import { cleanIntelBrief } from '@/lib/intelligence-briefing';
 import {
   DEMO_IDS,
@@ -72,6 +72,9 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
   const [enrichmentMeta, setEnrichmentMeta] = React.useState<any>(() => (isDemoContact ? demoFixture.enrichment_meta : null));
   const [activeTab, setActiveTab] = React.useState<Tab>('overview');
   const [loading, setLoading] = React.useState(!isDemoContact);
+  const [notFound, setNotFound] = React.useState(false);
+  const [timelineLoading, setTimelineLoading] = React.useState(false);
+  const [associationsLoading, setAssociationsLoading] = React.useState(false);
   const [editMode, setEditMode] = React.useState(false);
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
@@ -106,6 +109,12 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
   const docDropCounterRef = React.useRef(0);
   // Wave 5 Phase G — preview modal state
   const [previewDocId, setPreviewDocId] = React.useState<string | null>(null);
+  const detailSeqRef = React.useRef(0);
+  const timelineSeqRef = React.useRef(0);
+  const enrichmentSeqRef = React.useRef(0);
+  const associationsSeqRef = React.useRef(0);
+  const docsSeqRef = React.useRef(0);
+  const activeContactId = contact?.id || id;
 
   React.useEffect(() => {
     if (isDemoContact) {
@@ -123,31 +132,120 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       setPendingUpdates(fixture.pending_updates || []);
       setDocuments(fixture.documents || []);
       setApprovedFields(new Set());
+      setNotFound(false);
       setLoading(false);
       return;
     }
+
+    const controller = new AbortController();
+    const seq = ++detailSeqRef.current;
     setLoading(true);
-    Promise.all([
-      api.getContact(id),
-      api.getContactTimeline(id).catch(() => ({ entries: [] })),
-      api.getContactEnrichment(id).catch(() => null),
-      api.getContactAssociations(id).catch(() => ({ associations: [] })),
-      api.getContactPendingUpdates(id).catch(() => ({ updates: [] })),
-    ]).then(([c, t, e, ea, pu]) => {
+    setNotFound(false);
+    setContact(null);
+    setTimeline([]);
+    setEntityAssociations([]);
+    setDocuments([]);
+    setFullBio(null);
+    setEnrichmentMeta(null);
+    setPendingUpdates([]);
+    setApprovedFields(new Set());
+
+    api.getContact(id, { signal: controller.signal }).then(c => {
+      if (seq !== detailSeqRef.current) return;
+      const canonicalId = (c as any).canonical_contact_id;
+      if (canonicalId && canonicalId !== id && !forcedId) {
+        router.replace(`/contacts/${canonicalId}`);
+      }
       setContact(c.contact);
       setTags(c.tags);
       setAssociations((c as any).associations || []);
       setSignals((c as any).signals || []);
       setWeeklyInteractions((c as any).weekly_interactions || []);
       setFirstInteractionDate((c as any).first_interaction_date || null);
-      setTimeline(t.entries as TimelineEntry[]);
-      setFullBio(e?.full_bio ?? null);
-      setEnrichmentMeta(e);
-      setEntityAssociations(ea.associations || []);
-      setPendingUpdates(pu.updates || []);
-      setApprovedFields(new Set());
-    }).finally(() => setLoading(false));
-  }, [id, refreshKey, isDemoContact]);
+    }).catch(err => {
+      if (controller.signal.aborted || seq !== detailSeqRef.current) return;
+      setContact(null);
+      if (err instanceof ApiError && err.status === 404) {
+        setNotFound(true);
+      } else {
+        setToast(err?.message ? `Contact load failed: ${err.message}` : 'Contact load failed');
+      }
+    }).finally(() => {
+      if (seq === detailSeqRef.current) setLoading(false);
+    });
+
+    return () => controller.abort();
+  }, [id, refreshKey, isDemoContact, forcedId, router]);
+
+  React.useEffect(() => {
+    if (isDemoContact || !contact) return;
+    const controller = new AbortController();
+    const seq = ++enrichmentSeqRef.current;
+    Promise.allSettled([
+      api.getContactEnrichment(activeContactId, { signal: controller.signal }),
+      api.getContactPendingUpdates(activeContactId, { signal: controller.signal }),
+    ]).then(([enrichment, pending]) => {
+      if (controller.signal.aborted || seq !== enrichmentSeqRef.current) return;
+      if (enrichment.status === 'fulfilled') {
+        setFullBio(enrichment.value.full_bio ?? null);
+        setEnrichmentMeta(enrichment.value);
+      }
+      if (pending.status === 'fulfilled') {
+        setPendingUpdates(pending.value.updates || []);
+      }
+    });
+    return () => controller.abort();
+  }, [activeContactId, contact, refreshKey, isDemoContact]);
+
+  React.useEffect(() => {
+    if (isDemoContact) {
+      setTimeline(demoContactDetailFixture.timeline as TimelineEntry[]);
+      setTimelineLoading(false);
+      return;
+    }
+    if (!contact || activeTab !== 'timeline') return;
+    const controller = new AbortController();
+    const seq = ++timelineSeqRef.current;
+    setTimelineLoading(true);
+    api.getContactTimeline(activeContactId, undefined, { signal: controller.signal })
+      .then(r => {
+        if (controller.signal.aborted || seq !== timelineSeqRef.current) return;
+        setTimeline(r.entries as TimelineEntry[]);
+      })
+      .catch(err => {
+        if (controller.signal.aborted || seq !== timelineSeqRef.current) return;
+        setToast(err?.message ? `Timeline load failed: ${err.message}` : 'Timeline load failed');
+      })
+      .finally(() => {
+        if (seq === timelineSeqRef.current) setTimelineLoading(false);
+      });
+    return () => controller.abort();
+  }, [activeTab, activeContactId, contact, refreshKey, isDemoContact]);
+
+  React.useEffect(() => {
+    if (isDemoContact) {
+      setEntityAssociations(demoContactDetailFixture.entity_associations || []);
+      setAssociationsLoading(false);
+      return;
+    }
+    if (!contact || activeTab !== 'associations') return;
+    const controller = new AbortController();
+    const seq = ++associationsSeqRef.current;
+    setAssociationsLoading(true);
+    api.getContactAssociations(activeContactId, { signal: controller.signal })
+      .then(r => {
+        if (controller.signal.aborted || seq !== associationsSeqRef.current) return;
+        setEntityAssociations(r.associations || []);
+      })
+      .catch(err => {
+        if (controller.signal.aborted || seq !== associationsSeqRef.current) return;
+        setToast(err?.message ? `Associations load failed: ${err.message}` : 'Associations load failed');
+      })
+      .finally(() => {
+        if (seq === associationsSeqRef.current) setAssociationsLoading(false);
+      });
+    return () => controller.abort();
+  }, [activeTab, activeContactId, contact, refreshKey, isDemoContact]);
 
   React.useEffect(() => {
     if (!toast) return;
@@ -161,12 +259,18 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       setDocsLoading(false);
       return;
     }
-    if (activeTab !== 'documents') return;
+    if (!contact || activeTab !== 'documents') return;
+    const controller = new AbortController();
+    const seq = ++docsSeqRef.current;
     setDocsLoading(true);
-    api.listDocuments({ contact_id: id }).then(r => setDocuments(r.documents || []))
-      .catch(() => setDocuments([]))
-      .finally(() => setDocsLoading(false));
-  }, [activeTab, id, refreshKey, isDemoContact]);
+    api.listDocuments({ contact_id: activeContactId }, { signal: controller.signal }).then(r => {
+      if (controller.signal.aborted || seq !== docsSeqRef.current) return;
+      setDocuments(r.documents || []);
+    })
+      .catch(() => { if (!controller.signal.aborted && seq === docsSeqRef.current) setDocuments([]); })
+      .finally(() => { if (seq === docsSeqRef.current) setDocsLoading(false); });
+    return () => controller.abort();
+  }, [activeTab, activeContactId, contact, refreshKey, isDemoContact]);
 
   async function handleDocUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -178,7 +282,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
     }
     setUploading(true);
     try {
-      const res = await api.uploadDocument(file, { contact_id: id, visibility: uploadVisibility });
+      const res = await api.uploadDocument(file, { contact_id: activeContactId, visibility: uploadVisibility });
       if (res.duplicate) {
         setToast('Duplicate document — already exists');
       } else {
@@ -248,7 +352,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
         setToast(demoToastMessage('Contact edit'));
         return;
       }
-      await api.updateContact(id, {
+      await api.updateContact(activeContactId, {
         full_name: editForm.full_name.trim(),
         email: editForm.email.trim() || null, phone: editForm.phone.trim() || null,
         job_title: editForm.job_title.trim() || null, contact_type: editForm.contact_type,
@@ -277,7 +381,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       return;
     }
     try {
-      await api.updateContact(id, { engagement_status: v });
+      await api.updateContact(activeContactId, { engagement_status: v });
       setContact((c: any) => ({ ...c, engagement_status: v, engagement_status_manual: 1 }));
       setToast(`Status → ${v}`);
     } catch (e: any) { setToast(`Failed: ${e.message}`); }
@@ -295,7 +399,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
     }
     setEnriching(true);
     try {
-      await api.enrichContact(id);
+      await api.enrichContact(activeContactId);
       setToast('Enrichment started');
       setTimeout(() => { setEnriching(false); setEnriched(true); setRefreshKey(k => k + 1); }, 5000);
     } catch (e: any) { setToast(`Enrichment failed: ${e.message}`); setEnriching(false); }
@@ -341,7 +445,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       return;
     }
     try {
-      await api.approveAllForEntity('contact', id);
+      await api.approveAllForEntity('contact', activeContactId);
       setPendingUpdates([]);
       setToast('All suggestions approved');
       setTimeout(() => setRefreshKey(k => k + 1), 1000);
@@ -355,7 +459,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       return;
     }
     try {
-      await api.rejectAllForEntity('contact', id);
+      await api.rejectAllForEntity('contact', activeContactId);
       setPendingUpdates([]);
       setToast('All suggestions dismissed');
     } catch { setToast('Failed to dismiss all'); }
@@ -367,17 +471,18 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       return;
     }
     setDeleting(true);
-    try { await api.deleteContact(id); router.push('/contacts'); }
+    try { await api.deleteContact(activeContactId); router.push('/contacts'); }
     catch (e: any) { alert(e.message || 'Delete failed'); setDeleting(false); }
   }
 
   if (loading) return <div className="flex-1 flex items-center justify-center text-text-secondary">Loading...</div>;
-  if (!contact) return (
+  if (notFound) return (
     <div className="flex-1 flex flex-col items-center justify-center gap-4">
       <div className="text-text-secondary">Contact not found</div>
       <Link href="/contacts" className="btn-secondary">Back to Contacts</Link>
     </div>
   );
+  if (!contact) return <div className="flex-1 flex items-center justify-center text-text-secondary">Unable to load contact</div>;
 
   const es = ENGAGEMENT_STATUSES.find(s => s.value === contact.engagement_status) || ENGAGEMENT_STATUSES[2];
   const bio = cleanIntelBrief(fullBio || contact.bio_summary);
@@ -453,7 +558,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
                     value={editForm.contact_type} onChange={e => setEditForm(f => ({ ...f, contact_type: e.target.value }))} disabled={saving}>
                     {CONTACT_TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
-                  <TagPicker entityType="contact" entityId={id} tags={tags} onTagsChange={setTags} />
+                  <TagPicker entityType="contact" entityId={activeContactId} tags={tags} onTagsChange={setTags} />
                 </div>
               </>
             ) : (
@@ -483,7 +588,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
                     style={{ background: 'rgba(255,255,255,0.05)', color: '#A1A1AA' }}>
                     {contact.contact_type?.replace(/_/g, ' ')}
                   </span>
-                  <TagPicker entityType="contact" entityId={id} tags={tags} onTagsChange={setTags} />
+                  <TagPicker entityType="contact" entityId={activeContactId} tags={tags} onTagsChange={setTags} />
                 </div>
               </>
             )}
@@ -619,7 +724,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
                 itself when there's nothing to show. */}
             <RecentObservations
               entityType="contact"
-              entityId={id}
+              entityId={activeContactId}
               observationsOverride={isDemoContact ? demoRecentObservationsForContact : undefined}
             />
             {/* Pending Suggestions Banner */}
@@ -869,7 +974,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
                   <div className="text-[11px] uppercase tracking-[0.14em] font-medium text-text-muted font-display mb-3">In Common</div>
                   <div className="flex flex-wrap gap-2">
                     {associations.slice(0, 6).map((a: any, i: number) => {
-                      const oid = a.contact_id_a === id ? a.contact_id_b : a.contact_id_a;
+                      const oid = a.contact_id_a === activeContactId ? a.contact_id_b : a.contact_id_a;
                       const name = a.other_name || oid.slice(0, 8);
                       return (
                         <Link key={i} href={`/contacts/${oid}`}
@@ -920,10 +1025,16 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
           </div>
         )}
 
-        {activeTab === 'timeline' && <Timeline entries={timeline} />}
+        {activeTab === 'timeline' && (
+          timelineLoading && timeline.length === 0
+            ? <div className="text-center text-text-muted py-12">Loading timeline...</div>
+            : <Timeline entries={timeline} />
+        )}
         {activeTab === 'associations' && (
           <div className="space-y-2">
-            {entityAssociations.length === 0
+            {associationsLoading && entityAssociations.length === 0
+              ? <div className="text-center text-text-muted py-12">Loading associations...</div>
+              : entityAssociations.length === 0
               ? <div className="text-center text-text-muted py-12">No associations discovered yet</div>
               : <>
                   {entityAssociations.filter((a: any) => a.strength >= 60).length > 0 && (
@@ -1112,7 +1223,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
         onClose={() => { setDocUploadOpen(false); setDocUploadFiles([]); }}
         onUploaded={() => { setRefreshKey(k => k + 1); setToast('Documents uploaded'); }}
         initialFiles={docUploadFiles}
-        contactId={id}
+        contactId={activeContactId}
       />
 
       <DocumentPreviewModal

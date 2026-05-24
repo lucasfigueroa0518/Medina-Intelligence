@@ -445,8 +445,9 @@ async function inspectUserIngestionTelemetry(
     backfillProgress,
     tokenFailureState,
     syncConfig,
-    sentDeltaToken,
-  ] = await Promise.all([
+	    sentDeltaToken,
+	    activeIngestionIncidents,
+	  ] = await Promise.all([
     env.D1.prepare(
       `${matchedCte}
        SELECT COUNT(*) AS total_matched,
@@ -514,9 +515,20 @@ async function inspectUserIngestionTelemetry(
     ).bind(ctx.orgId, `%${user.id}%`, `%${email}%`, limit).all<any>(),
     safeKvGet(env, `backfill_progress:${user.id}`, 'json'),
     safeKvGet(env, `token_failed:${user.id}:outlook`, 'json'),
-    safeKvGet<{ sync_history_days?: number }>(env, `sync_config:${user.id}`, 'json'),
-    safeKvGet<string>(env, `sent_delta:${user.id}`),
-  ]);
+	    safeKvGet<{ sync_history_days?: number }>(env, `sync_config:${user.id}`, 'json'),
+	    safeKvGet<string>(env, `sent_delta:${user.id}`),
+	    env.D1.prepare(
+	      `SELECT id, source, scope_type, scope_id, status, severity, code, message,
+	              first_seen_at, last_seen_at, recovery_status, human_action_required,
+	              recovery_window_start, recovery_window_end
+	         FROM ingestion_incidents
+	        WHERE org_id = ?
+	          AND status IN ('open','recovering','blocked')
+	          AND (scope_id = ? OR scope_type = 'org')
+	        ORDER BY last_seen_at DESC
+	        LIMIT 10`
+	    ).bind(ctx.orgId, user.id).all<any>(),
+	  ]);
 
   let progressiveWindowSummary: any = null;
   let failedWindows: any[] = [];
@@ -598,13 +610,16 @@ async function inspectUserIngestionTelemetry(
       first_ingested_at: stats.first_ingested_at || null,
       last_ingested_at: stats.last_ingested_at || null,
     },
-    backfill: {
-      has_backfill_evidence: backfillEvidence,
-      latest_progressive_job: latestProgressiveParent || null,
-      latest_progressive_window_summary: progressiveWindowSummary,
-      failed_windows: failedWindows,
-      live_kv_progress: backfillProgress || null,
-    },
+	    backfill: {
+	      has_backfill_evidence: backfillEvidence,
+	      latest_progressive_job: latestProgressiveParent || null,
+	      latest_progressive_window_summary: progressiveWindowSummary,
+	      failed_windows: failedWindows,
+	      live_kv_progress: backfillProgress || null,
+	    },
+	    ingestion_health: {
+	      active_incidents: activeIngestionIncidents.results || [],
+	    },
     recent_activity: {
       recent_matched_conversations: (recentConversations.results || []).map(row => ({
         id: row.id,

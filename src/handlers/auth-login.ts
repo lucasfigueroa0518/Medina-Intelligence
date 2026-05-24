@@ -6,6 +6,7 @@ import { emitAudit } from '../lib/audit';
 import { generateSecret, otpauthUrl, verifyTotp, generateRecoveryCodes, hashRecoveryCode } from '../lib/totp';
 import { sendVerificationEmail } from '../lib/verification-email';
 import { sendResetEmail } from '../lib/reset-email';
+import { incidentsToUserWarnings, listActiveIngestionIncidents } from '../lib/ingestion-health';
 
 const PBKDF2_ITERATIONS = 100_000;
 const SALT_BYTES = 32;
@@ -333,6 +334,9 @@ export async function me(ctx: AuthContext, env: Env): Promise<Response> {
         : {}),
     });
   }
+
+  const incidents = await listActiveIngestionIncidents(env, ctx.orgId, 10).catch(() => []);
+  warnings.push(...incidentsToUserWarnings(incidents));
 
   return jsonResponse({ user, warnings });
 }

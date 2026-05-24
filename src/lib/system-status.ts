@@ -17,6 +17,7 @@
 import type { Env } from '../types/env';
 import { listFireflyKeyStatuses, type FireflyKeyStatus } from './firefly-credentials';
 import { countByDomain, type WorkQueueDomainCount } from './work-queue';
+import { listActiveIngestionIncidents, type IngestionIncident } from './ingestion-health';
 
 // ─── Pipeline health ─────────────────────────────────────────────────────
 
@@ -354,6 +355,7 @@ export interface SystemStatusSnapshot {
   // getDeadLetterItems; no separate field needed.
   work_queue_inventory: WorkQueueDomainCount[];
   stuck_work_queue: StuckWorkQueueRow[];
+  ingestion_incidents: IngestionIncident[];
 }
 
 /**
@@ -373,6 +375,7 @@ export async function getSystemStatusSnapshot(
     firefly_credentials,
     work_queue_inventory,
     stuck_work_queue,
+    ingestion_incidents,
   ] = await Promise.all([
     getPipelineHealth(env, orgId),
     getDeadLetterItems(env, orgId),
@@ -381,6 +384,7 @@ export async function getSystemStatusSnapshot(
     listFireflyKeyStatuses(orgId, env),
     countByDomain(env, orgId),
     getStuckWorkQueueRows(env),
+    listActiveIngestionIncidents(env, orgId),
   ]);
   return {
     generated_at: new Date().toISOString(),
@@ -391,5 +395,6 @@ export async function getSystemStatusSnapshot(
     firefly_credentials,
     work_queue_inventory,
     stuck_work_queue,
+    ingestion_incidents,
   };
 }

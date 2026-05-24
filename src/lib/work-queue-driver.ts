@@ -171,6 +171,7 @@ import { intelligentImportHandler } from './work-queue-handlers/intelligent-impo
 import { contactEnrichmentHandler } from './work-queue-handlers/contact-enrichment';
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 import { deckRenderHandler } from './work-queue-handlers/deck-render';
+import { slackChannelBackfillHandler } from './work-queue-handlers/slack-channel-backfill';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -207,6 +208,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   // sandbox is disabled; queued sandbox rows must not consume model credits.
   ragReindexV2Handler,
   deckRenderHandler,
+  slackChannelBackfillHandler,
 ];
 
 // ─── Driver ─────────────────────────────────────────────────────────
@@ -242,11 +244,29 @@ export async function processClaimedWorkItem(
     await withHeartbeat(env, item.id, AUTO_HEARTBEAT_INTERVAL_MS,
       () => handler.process(item, env));
     await completeWork(env, item.id);
+    try {
+      const { reportWorkQueueOutcome } = await import('./ingestion-health');
+      await reportWorkQueueOutcome(env, item, null);
+    } catch (e) {
+      console.error(
+        `[work-queue] ingestion-health success report failed for ${item.id}:`,
+        e instanceof Error ? e.message : e
+      );
+    }
     return { completed: true, failed: false };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     try {
       await failWork(env, item.id, msg);
+      try {
+        const { reportWorkQueueOutcome } = await import('./ingestion-health');
+        await reportWorkQueueOutcome(env, item, msg);
+      } catch (reportErr) {
+        console.error(
+          `[work-queue] ingestion-health failure report failed for ${item.id}:`,
+          reportErr instanceof Error ? reportErr.message : reportErr
+        );
+      }
       return { completed: false, failed: true, error: msg };
     } catch (innerE) {
       console.error(

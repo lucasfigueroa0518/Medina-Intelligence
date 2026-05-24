@@ -7,6 +7,7 @@ import type {
 } from '../types/interfaces';
 import { discoverNewContact, PERSONAL_DOMAINS, findOrCreateCompanyByDomain, type DiscoveryEligibility } from './discovery';
 import { runEmbedding } from './embedding';
+import { safelyUpsertConversationTimelineItemsForContacts } from './contact-detail-read-model';
 
 export async function classifyAndDeduplicate(
   items: ClassifiableItem[],
@@ -354,6 +355,13 @@ async function reconcileExistingConversation(
                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE id = ?`
       ).bind(item.sentAt, contactId).run();
+      await safelyUpsertConversationTimelineItemsForContacts(
+        env,
+        orgId,
+        conversationId,
+        [contactId],
+        'classification_conversation_linked'
+      );
     }
   }
 }

@@ -5,12 +5,26 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
 import { mergeContacts, resolveMergedContact, cleanupVectorsForEntity } from '../lib/merge';
-import { canReadConversationContent, getSharingFlags, hasOrgWidePrivateDataAccess, parseParticipantUserIds } from '../lib/helpers';
-import { isDocumentAccessibleToUser } from '../lib/document-acl';
 import { triggerContactEnrichment } from '../lib/enrichment';
-import { markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { updateContactFields } from '../lib/entity-writes';
 import { cleanIntelligenceBrief } from '../lib/intelligence-briefing';
+import {
+  buildContactSearchQuery,
+  contactSearchCteBinds,
+  contactSearchCteSql,
+  ensureContactSearchIndexReady,
+  rebuildContactSearchIndexForOrg,
+  safelyDeleteContactSearchIndexForContact,
+  safelyRebuildContactSearchIndexForContact,
+} from '../lib/contact-search';
+import {
+  listContactTimelineItems,
+  loadContactActivityRollup,
+  rebuildContactDetailReadModelForOrg,
+  resolveCanonicalContactId,
+  safelyDeleteContactDetailReadModelForContact,
+  safelyRebuildContactDetailReadModelForContact,
+} from '../lib/contact-detail-read-model';
 
 // --- GET /api/contacts ---
 
@@ -118,78 +132,8 @@ export async function listContacts(
     binds.push(filter.meetings_last_30d_min);
   }
 
-  // Search — contact text plus company intelligence. In addition to the
-  // direct company_id join, match companies connected through associations,
-  // active deal membership, and email-domain inference so searching for
-  // "Trivest" finds people at/around Trivest even when the contact row has
-  // not been explicitly linked yet.
   const search = sp.get('search') ?? filter.keyword;
-  if (search) {
-    const pat = `%${search}%`;
-    where.push(`(
-      c.full_name LIKE ?
-      OR c.email LIKE ?
-      OR c.job_title LIKE ?
-      OR c.bio_summary LIKE ?
-      OR c.custom_fields LIKE ?
-      OR co.name LIKE ?
-      OR co.domain LIKE ?
-      OR co.website LIKE ?
-      OR EXISTS (
-        SELECT 1
-          FROM entity_associations ea
-          JOIN companies eco
-            ON eco.id = CASE
-                 WHEN ea.entity_a_type = 'company' THEN ea.entity_a_id
-                 ELSE ea.entity_b_id
-               END
-         WHERE ea.org_id = c.org_id
-           AND eco.org_id = c.org_id
-           AND eco.deleted_at IS NULL
-           AND eco.merged_into IS NULL
-           AND (
-             (ea.entity_a_type = 'contact' AND ea.entity_a_id = c.id AND ea.entity_b_type = 'company')
-             OR (ea.entity_b_type = 'contact' AND ea.entity_b_id = c.id AND ea.entity_a_type = 'company')
-           )
-           AND (eco.name LIKE ? OR eco.domain LIKE ? OR eco.website LIKE ?)
-      )
-      OR EXISTS (
-        SELECT 1
-          FROM deal_contacts dc
-          JOIN deals d ON d.id = dc.deal_id
-          JOIN companies dco ON dco.id = d.company_id
-         WHERE dc.contact_id = c.id
-           AND d.org_id = c.org_id
-           AND d.deleted_at IS NULL
-           AND dco.org_id = c.org_id
-           AND dco.deleted_at IS NULL
-           AND dco.merged_into IS NULL
-           AND (dco.name LIKE ? OR dco.domain LIKE ? OR dco.website LIKE ?)
-      )
-      OR EXISTS (
-        SELECT 1
-          FROM companies sco
-         WHERE sco.org_id = c.org_id
-           AND sco.deleted_at IS NULL
-           AND sco.merged_into IS NULL
-           AND sco.domain IS NOT NULL
-           AND sco.domain != ''
-           AND c.email IS NOT NULL
-           AND (sco.name LIKE ? OR sco.domain LIKE ? OR sco.website LIKE ?)
-           AND (
-             LOWER(c.email) LIKE '%@' || LOWER(sco.domain)
-             OR LOWER(c.email) LIKE '%@%.' || LOWER(sco.domain)
-           )
-      )
-    )`);
-    binds.push(
-      pat, pat, pat, pat, pat,
-      pat, pat, pat,
-      pat, pat, pat,
-      pat, pat, pat,
-      pat, pat, pat,
-    );
-  }
+  const contactSearch = buildContactSearchQuery(search);
 
   if (filter.has_followup_overdue) {
     where.push(
@@ -303,31 +247,73 @@ export async function listContacts(
     )
   `;
 
-  const sql = `
-    SELECT c.*, ${companyNameSql} as company_name
-    FROM contacts c
-    LEFT JOIN companies co ON c.company_id = co.id
-    ${tagJoin}
-    WHERE ${where.join(' AND ')}
-    GROUP BY c.id
-    ${havingClause}
-    ORDER BY ${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
-    LIMIT ? OFFSET ?
-  `;
+  let sql: string;
+  let countSql: string;
+  let resultBinds: unknown[];
+  let countBinds: unknown[];
 
-  // Count query — same WHERE + same JOINs but bare COUNT, no GROUP BY/HAVING
-  // unless we're tag-filtering (which can change cardinality).
-  const countSql = `
-    SELECT COUNT(DISTINCT c.id) as n
-    FROM contacts c
-    LEFT JOIN companies co ON c.company_id = co.id
-    ${tagJoin}
-    WHERE ${where.join(' AND ')}
-  `;
+  if (contactSearch) {
+    const ready = await ensureContactSearchIndexReady(env, ctx.orgId);
+    if (!ready.ok) return errorResponse(ready.code, 503, ready.message);
+
+    const searchBinds = contactSearchCteBinds(contactSearch, ctx.orgId);
+    const cte = contactSearchCteSql();
+
+    sql = `
+      ${cte}
+      SELECT c.*, ${companyNameSql} as company_name
+      FROM matched m
+      JOIN contacts c ON c.id = m.contact_id
+      LEFT JOIN companies co ON c.company_id = co.id
+      ${tagJoin}
+      WHERE ${where.join(' AND ')}
+      GROUP BY c.id
+      ${havingClause}
+      ORDER BY m.search_rank ASC, m.fts_rank ASC, ${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
+      LIMIT ? OFFSET ?
+    `;
+
+    const countFrom = `
+      FROM matched m
+      JOIN contacts c ON c.id = m.contact_id
+      LEFT JOIN companies co ON c.company_id = co.id
+      ${tagJoin}
+      WHERE ${where.join(' AND ')}
+    `;
+    countSql = havingClause
+      ? `${cte} SELECT COUNT(*) as n FROM (SELECT c.id ${countFrom} GROUP BY c.id ${havingClause})`
+      : `${cte} SELECT COUNT(DISTINCT c.id) as n ${countFrom}`;
+    resultBinds = [...searchBinds, ...binds, limit, offset];
+    countBinds = [...searchBinds, ...binds];
+  } else {
+    sql = `
+      SELECT c.*, ${companyNameSql} as company_name
+      FROM contacts c
+      LEFT JOIN companies co ON c.company_id = co.id
+      ${tagJoin}
+      WHERE ${where.join(' AND ')}
+      GROUP BY c.id
+      ${havingClause}
+      ORDER BY ${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
+      LIMIT ? OFFSET ?
+    `;
+
+    const countFrom = `
+      FROM contacts c
+      LEFT JOIN companies co ON c.company_id = co.id
+      ${tagJoin}
+      WHERE ${where.join(' AND ')}
+    `;
+    countSql = havingClause
+      ? `SELECT COUNT(*) as n FROM (SELECT c.id ${countFrom} GROUP BY c.id ${havingClause})`
+      : `SELECT COUNT(DISTINCT c.id) as n ${countFrom}`;
+    resultBinds = [...binds, limit, offset];
+    countBinds = binds;
+  }
 
   const [result, countResult] = await Promise.all([
-    env.D1.prepare(sql).bind(...binds, limit, offset).all(),
-    env.D1.prepare(countSql).bind(...binds).first<{ n: number }>(),
+    env.D1.prepare(sql).bind(...resultBinds).all(),
+    env.D1.prepare(countSql).bind(...countBinds).first<{ n: number }>(),
   ]);
   const total = countResult?.n ?? 0;
 
@@ -563,6 +549,8 @@ export async function createContact(
   });
 
   await invalidateRagCache(ctx.orgId, env);
+  await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, id);
+  ctxExec.waitUntil(safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, id, 'contact_created'));
 
   if (body.auto_enrich !== false) {
     ctxExec.waitUntil(triggerContactEnrichment(id, ctx.orgId, env));
@@ -577,8 +565,13 @@ export async function createContact(
 export async function getContact(
   id: string,
   ctx: AuthContext,
-  env: Env
+  env: Env,
+  ctxExec?: ExecutionContext
 ): Promise<Response> {
+  const canonical = await resolveCanonicalContactId(env, ctx.orgId, id);
+  if (!canonical) return errorResponse('CONTACT_NOT_FOUND', 404);
+  const contactId = canonical.contactId;
+
   const contact = await env.D1.prepare(
     `SELECT c.*, co.name as company_name,
             u.full_name as owner_name, u.avatar_url as owner_avatar, u.email as owner_email
@@ -586,58 +579,51 @@ export async function getContact(
      LEFT JOIN companies co ON c.company_id = co.id
      LEFT JOIN users u ON c.relationship_owner_id = u.id
      WHERE c.id = ? AND c.org_id = ? AND c.deleted_at IS NULL`
-  ).bind(id, ctx.orgId).first();
+  ).bind(contactId, ctx.orgId).first();
 
   if (!contact) return errorResponse('CONTACT_NOT_FOUND', 404);
 
-  const tags = await env.D1.prepare(
-    `SELECT t.id, t.name, t.color FROM tags t
-     JOIN contact_tags ct ON t.id = ct.tag_id
-     WHERE ct.contact_id = ?`
-  ).bind(id).all();
+  const [tags, assocRows, signals, rollup] = await Promise.all([
+    env.D1.prepare(
+      `SELECT t.id, t.name, t.color FROM tags t
+       JOIN contact_tags ct ON t.id = ct.tag_id
+       WHERE ct.contact_id = ?`
+    ).bind(contactId).all(),
+    env.D1.prepare(
+      `SELECT ca.contact_id_a, ca.contact_id_b, ca.relationship, ca.confidence,
+              c2.full_name as other_name, c2.job_title as other_title, c2.company_id as other_company_id
+       FROM contact_associations ca
+       LEFT JOIN contacts c2 ON c2.id = CASE WHEN ca.contact_id_a = ? THEN ca.contact_id_b ELSE ca.contact_id_a END
+       WHERE (ca.contact_id_a = ? OR ca.contact_id_b = ?)
+       ORDER BY ca.confidence DESC
+       LIMIT 20`
+    ).bind(contactId, contactId, contactId).all(),
+    env.D1.prepare(
+      `SELECT field_name, proposed_value, confidence, status, change_type, source_communication_id, created_at
+       FROM approval_queue
+       WHERE org_id = ? AND entity_type = 'contact' AND entity_id = ?
+         AND change_type NOT IN ('enrichment_report', 'progressive_update')
+       ORDER BY created_at DESC LIMIT 10`
+    ).bind(ctx.orgId, contactId).all(),
+    loadContactActivityRollup(env, ctx.orgId, contactId),
+  ]);
 
-  const assocRows = await env.D1.prepare(
-    `SELECT ca.contact_id_a, ca.contact_id_b, ca.relationship, ca.confidence,
-            c2.full_name as other_name, c2.job_title as other_title, c2.company_id as other_company_id
-     FROM contact_associations ca
-     LEFT JOIN contacts c2 ON c2.id = CASE WHEN ca.contact_id_a = ? THEN ca.contact_id_b ELSE ca.contact_id_a END
-     WHERE (ca.contact_id_a = ? OR ca.contact_id_b = ?)
-     ORDER BY ca.confidence DESC
-     LIMIT 20`
-  ).bind(id, id, id).all();
-
-  const signals = await env.D1.prepare(
-    `SELECT field_name, proposed_value, confidence, status, change_type, source_communication_id, created_at
-     FROM approval_queue
-     WHERE org_id = ? AND entity_type = 'contact' AND entity_id = ?
-       AND change_type NOT IN ('enrichment_report', 'progressive_update')
-     ORDER BY created_at DESC LIMIT 10`
-  ).bind(ctx.orgId, id).all();
-
-  const weeklyInteractions = await env.D1.prepare(
-    `SELECT strftime('%Y-%W', conv.sent_at) as week,
-            MIN(conv.sent_at) as week_start,
-            COUNT(*) as cnt
-     FROM conversation_contacts cc
-     JOIN conversations conv ON cc.conversation_id = conv.id
-     WHERE cc.contact_id = ? AND conv.sent_at >= date('now', '-56 days')
-     GROUP BY week ORDER BY week`
-  ).bind(id).all();
-
-  const firstInteraction = await env.D1.prepare(
-    `SELECT MIN(conv.sent_at) as first_date
-     FROM conversation_contacts cc
-     JOIN conversations conv ON cc.conversation_id = conv.id
-     WHERE cc.contact_id = ?`
-  ).bind(id).first<{ first_date: string | null }>();
+  if (!rollup) {
+    ctxExec?.waitUntil(
+      safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, contactId, 'missing_rollup_on_detail_load')
+    );
+  }
 
   return jsonResponse({
     contact,
     tags: tags.results,
     associations: assocRows.results,
     signals: signals.results,
-    weekly_interactions: weeklyInteractions.results,
-    first_interaction_date: firstInteraction?.first_date || null,
+    weekly_interactions: rollup?.weekly_interactions || [],
+    first_interaction_date: rollup?.first_interaction_date || null,
+    activity_rollup: rollup,
+    canonical_contact_id: contactId,
+    redirected_from: canonical.redirectedFrom,
   });
 }
 
@@ -711,6 +697,8 @@ export async function deleteContact(
   });
 
   try { await cleanupVectorsForEntity(id, 'contacts', env); } catch { /* best-effort */ }
+  await safelyDeleteContactSearchIndexForContact(env, ctx.orgId, id);
+  await safelyDeleteContactDetailReadModelForContact(env, ctx.orgId, id);
   await invalidateRagCache(ctx.orgId, env);
   return jsonResponse({ ok: true });
 }
@@ -745,6 +733,8 @@ export async function applyContactTags(
   }
 
   await invalidateRagCache(ctx.orgId, env);
+  await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, id);
+  await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, id, 'contact_tags_changed');
   return jsonResponse({ ok: true });
 }
 
@@ -768,6 +758,8 @@ export async function removeContactTag(
     created_at: new Date().toISOString(),
   });
 
+  await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, id);
+  await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, id, 'contact_tags_changed');
   return jsonResponse({ ok: true });
 }
 
@@ -800,7 +792,48 @@ export async function postContactMerge(
     const status = result.error === 'MERGE_LOCK_CONFLICT' || result.error === 'ACTIVE_CAMPAIGN' ? 409 : 500;
     return jsonResponse({ error: result.error, message: result.message }, status);
   }
+  await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, body.keep_id);
+  await safelyDeleteContactSearchIndexForContact(env, ctx.orgId, body.discard_id);
+  await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, body.keep_id, 'contact_merge');
+  await safelyDeleteContactDetailReadModelForContact(env, ctx.orgId, body.discard_id);
   return jsonResponse({ ok: true });
+}
+
+export async function rebuildContactSearchIndexEndpoint(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner' && ctx.userRole !== 'admin' && ctx.userRole !== 'super_admin') {
+    return errorResponse('FORBIDDEN', 403, 'owner/admin only');
+  }
+  const result = await rebuildContactSearchIndexForOrg(env, ctx.orgId);
+  return jsonResponse({ ok: result.errors === 0, ...result });
+}
+
+export async function rebuildContactDetailReadModelEndpoint(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner' && ctx.userRole !== 'admin' && ctx.userRole !== 'super_admin') {
+    return errorResponse('FORBIDDEN', 403, 'owner/admin only');
+  }
+
+  const body = await parseJsonBody<{ contact_id?: string; limit?: number }>(request);
+  if (body?.contact_id) {
+    const canonical = await resolveCanonicalContactId(env, ctx.orgId, body.contact_id);
+    if (!canonical) return errorResponse('CONTACT_NOT_FOUND', 404);
+    await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, canonical.contactId, 'admin_rebuild');
+    return jsonResponse({
+      ok: true,
+      rebuilt: 1,
+      contact_id: canonical.contactId,
+      redirected_from: canonical.redirectedFrom,
+    });
+  }
+
+  const result = await rebuildContactDetailReadModelForOrg(env, ctx.orgId, body?.limit || 500);
+  return jsonResponse({ ok: result.errors === 0, ...result });
 }
 
 // --- GET /api/contacts/:id/timeline ---
@@ -811,175 +844,30 @@ export async function getContactTimeline(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
-  const sourceLimit = Math.min(limit * 4, 500);
+  const canonical = await resolveCanonicalContactId(env, ctx.orgId, id);
+  if (!canonical) return errorResponse('CONTACT_NOT_FOUND', 404);
 
-  const [events, conversations, tasks, documents, sharingFlags] = await Promise.all([
-    env.D1.prepare(
-      `SELECT e.id, e.title, e.start_time as timestamp, 'event' as type, e.event_type as subtype,
-              GROUP_CONCAT(all_ea.user_id) AS participant_user_ids
-       FROM events e
-       JOIN event_attendees ea ON e.id = ea.event_id
-       LEFT JOIN event_attendees all_ea ON all_ea.event_id = e.id
-       WHERE ea.contact_id = ? AND e.org_id = ? AND e.deleted_at IS NULL
-       GROUP BY e.id
-       ORDER BY e.start_time DESC LIMIT ?`
-    ).bind(id, ctx.orgId, sourceLimit).all(),
-    env.D1.prepare(
-      `SELECT c.id, c.subject as title, c.sent_at as timestamp, 'conversation' as type,
-              c.source as subtype, c.body_preview, c.participant_user_ids,
-              c.source as conv_source, c.is_campaign_email, c.from_email,
-              c.external_thread_id, c.external_message_id, sc.is_private AS slack_is_private,
-              c.has_attachments, c.attachment_count
-       FROM conversations c JOIN conversation_contacts cc ON c.id = cc.conversation_id
-       LEFT JOIN slack_channels sc
-         ON c.source = 'slack'
-        AND sc.org_id = c.org_id
-        AND sc.channel_id = CASE
-          WHEN instr(c.external_message_id, ':') > 0
-          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
-          ELSE c.external_message_id
-        END
-       WHERE cc.contact_id = ? AND c.org_id = ?
-       ORDER BY c.sent_at DESC LIMIT ?`
-    ).bind(id, ctx.orgId, sourceLimit).all(),
-    env.D1.prepare(
-      `SELECT id, title, due_date as timestamp, 'task' as type, status as subtype
-       FROM tasks WHERE contact_id = ? AND org_id = ? AND deleted_at IS NULL
-       ORDER BY due_date DESC LIMIT ?`
-    ).bind(id, ctx.orgId, sourceLimit).all(),
-    env.D1.prepare(
-      // Documents linked to this contact through the junction table. Includes
-      // ACL columns so the post-query filter can apply isDocumentAccessibleToUser.
-      `SELECT d.id, d.title, d.created_at as timestamp, 'document' as type, d.document_type as subtype,
-              d.visibility, d.participant_user_ids, d.uploaded_by
-         FROM documents d
-         JOIN document_links dl ON dl.document_id = d.id
-        WHERE dl.entity_type = 'contact' AND dl.entity_id = ?
-          AND dl.deleted_at IS NULL AND d.deleted_at IS NULL
-          AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1
-          AND d.org_id = ?
-        ORDER BY d.created_at DESC LIMIT ?`
-    ).bind(id, ctx.orgId, sourceLimit).all(),
-    getSharingFlags(ctx.orgId, env),
-  ]);
+  let result = await listContactTimelineItems(request, env, ctx, canonical.contactId);
 
-  const conversationIds = conversations.results
-    .filter((c: any) => c.has_attachments)
-    .map((c: any) => c.id);
-
-  let attachmentsByConv: Record<string, string[]> = {};
-  if (conversationIds.length > 0) {
-    const placeholders = conversationIds.map(() => '?').join(',');
-    // Junction-based lookup: find every document linked to any of these
-    // conversations. ACL fields included so we can hide rows the requester
-    // shouldn't see.
-    const attRows = await env.D1.prepare(
-      `SELECT dl.entity_id as conversation_id, d.file_name,
-              d.visibility, d.participant_user_ids, d.uploaded_by
-         FROM documents d
-         JOIN document_links dl ON dl.document_id = d.id
-        WHERE dl.entity_type = 'conversation' AND dl.entity_id IN (${placeholders})
-          AND dl.deleted_at IS NULL AND d.deleted_at IS NULL
-          AND COALESCE(json_extract(d.custom_fields, '$.marty_lab_generated'), 0) != 1
-          AND d.org_id = ?
-        ORDER BY d.created_at`
-    ).bind(...conversationIds, ctx.orgId).all<{
-      conversation_id: string; file_name: string;
-      visibility: string | null; participant_user_ids: string | null; uploaded_by: string | null;
-    }>();
-    const sharingSet = new Set(Object.keys(sharingFlags));
-    for (const row of attRows.results) {
-      if (!isDocumentAccessibleToUser(row, ctx.userId, ctx.userRole, sharingSet)) continue;
-      if (!attachmentsByConv[row.conversation_id]) attachmentsByConv[row.conversation_id] = [];
-      attachmentsByConv[row.conversation_id].push(row.file_name);
-    }
-  }
-
-  const conversationsWithAccess = conversations.results.map((c: any) => {
-    const canRead = canReadConversationContent(
-      {
-        source: c.conv_source,
-        participant_user_ids: c.participant_user_ids,
-        is_campaign_email: c.is_campaign_email,
-        slack_is_private: c.slack_is_private,
-      } as any,
-      ctx.userId,
-      ctx.userRole,
-      sharingFlags
+  // During rollout or after drift, do a bounded self-heal once instead of
+  // showing an empty timeline for a known contact. Warmed contacts stay on the
+  // indexed path after this repair.
+  if (result.entries.length === 0 && !new URL(request.url).searchParams.get('cursor')) {
+    await safelyRebuildContactDetailReadModelForContact(
+      env,
+      ctx.orgId,
+      canonical.contactId,
+      'empty_timeline_on_detail_load'
     );
-    return {
-      ...c,
-      canReadContent: canRead,
-      body_preview: canRead ? c.body_preview : null,
-      attachment_names: attachmentsByConv[c.id] || [],
-    };
-  }).filter((c: any) => c.canReadContent)
-    .map(({ participant_user_ids: _p, is_campaign_email: _i, slack_is_private: _s, external_message_id: _m, ...rest }: any) => rest);
-
-  // Contact timelines can be joined through several participant/import paths.
-  // Collapse the noisy duplicates users see as repeated same-day calendar rows
-  // and multi-message email threads while keeping the freshest representative.
-  const threadGroups = new Map<string, any>();
-  const standaloneConvs: any[] = [];
-  for (const c of conversationsWithAccess) {
-    const threadId = c.external_thread_id;
-    if (!threadId) {
-      standaloneConvs.push(c);
-      continue;
-    }
-    const existing = threadGroups.get(threadId);
-    const nextCount = (existing?.thread_count ?? 0) + 1;
-    if (!existing || String(c.timestamp) > String(existing.timestamp)) {
-      threadGroups.set(threadId, { ...c, thread_count: nextCount });
-    } else {
-      existing.thread_count = nextCount;
-    }
+    result = await listContactTimelineItems(request, env, ctx, canonical.contactId);
   }
-  const dedupedConvs = [...threadGroups.values(), ...standaloneConvs];
 
-  const eventGroups = new Map<string, any>();
-  const sharingSet = new Set(Object.keys(sharingFlags));
-  const eventsWithAccess = (events.results as any[]).filter(e => {
-    if (hasOrgWidePrivateDataAccess(ctx.userRole)) return true;
-    const participants = parseParticipantUserIds(e.participant_user_ids);
-    return participants.includes(ctx.userId) || participants.some(pid => sharingSet.has(pid));
-  }).map(({ participant_user_ids: _p, ...rest }) => rest);
-
-  for (const e of eventsWithAccess) {
-    const titleKey = String(e.title || '').trim().toLowerCase().replace(/\s+/g, ' ');
-    const dayKey = String(e.timestamp || '').slice(0, 10);
-    const key = `${titleKey}|${dayKey}`;
-    const existing = eventGroups.get(key);
-    const nextCount = (existing?.occurrence_count ?? 0) + 1;
-    if (!existing || String(e.timestamp) > String(existing.timestamp)) {
-      eventGroups.set(key, { ...e, occurrence_count: nextCount });
-    } else {
-      existing.occurrence_count = nextCount;
-    }
-  }
-  const dedupedEvents = [...eventGroups.values()];
-
-  // ACL-filter the contact-linked documents before they hit the timeline.
-  // Same gate as RAG / /api/documents — owner bypass, default-deny on missing
-  // visibility, participant-or-uploader for private. Strip the ACL fields
-  // from the response shape so the timeline sees only display columns.
-  const docSharingSet = new Set(Object.keys(sharingFlags));
-  const accessibleDocs = (documents.results as any[])
-    .filter(d => isDocumentAccessibleToUser(d, ctx.userId, ctx.userRole, docSharingSet))
-    .map(({ visibility: _v, participant_user_ids: _p, uploaded_by: _u, ...rest }) => rest);
-
-  const entries = [
-    ...dedupedEvents,
-    ...dedupedConvs,
-    ...tasks.results,
-    ...accessibleDocs,
-  ]
-    .sort((a: any, b: any) => String(b.timestamp).localeCompare(String(a.timestamp)))
-    .slice(0, limit);
-
-  return jsonResponse({ entries });
+  return jsonResponse({
+    entries: result.entries,
+    next_cursor: result.next_cursor,
+    canonical_contact_id: canonical.contactId,
+    redirected_from: canonical.redirectedFrom,
+  });
 }
 
 // --- GET /api/contacts/:id/associations ---
@@ -989,6 +877,10 @@ export async function getContactAssociations(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
+  const canonical = await resolveCanonicalContactId(env, ctx.orgId, id);
+  if (!canonical) return errorResponse('CONTACT_NOT_FOUND', 404);
+  const contactId = canonical.contactId;
+
   const rows = await env.D1.prepare(
     `SELECT ea.id, ea.entity_a_type, ea.entity_a_id, ea.entity_b_type, ea.entity_b_id,
             ea.association_type, ea.strength, ea.reason, ea.evidence_count,
@@ -1007,7 +899,44 @@ export async function getContactAssociations(
          OR (ea.entity_b_type = 'contact' AND ea.entity_b_id = ?))
      ORDER BY ea.strength DESC
      LIMIT 100`
-  ).bind(id, id, ctx.orgId, id, id).all();
+  ).bind(contactId, contactId, ctx.orgId, contactId, contactId).all<any>();
+
+  const byType = new Map<string, Set<string>>();
+  for (const row of rows.results) {
+    if (!byType.has(row.other_type)) byType.set(row.other_type, new Set());
+    byType.get(row.other_type)!.add(row.other_id);
+  }
+
+  const loadByIds = async <T extends Record<string, any>>(
+    table: string,
+    fields: string,
+    ids: string[]
+  ): Promise<Map<string, T>> => {
+    if (ids.length === 0) return new Map();
+    const placeholders = ids.map(() => '?').join(',');
+    const result = await env.D1.prepare(
+      `SELECT id, ${fields} FROM ${table} WHERE org_id = ? AND id IN (${placeholders}) AND deleted_at IS NULL`
+    ).bind(ctx.orgId, ...ids).all<T & { id: string }>();
+    return new Map(result.results.map(row => [row.id, row as T]));
+  };
+
+  const [contactMap, companyMap, dealMap] = await Promise.all([
+    loadByIds<{ full_name: string; job_title: string | null; avatar_url: string | null }>(
+      'contacts',
+      'full_name, job_title, avatar_url',
+      Array.from(byType.get('contact') || [])
+    ),
+    loadByIds<{ name: string; sector: string | null }>(
+      'companies',
+      'name, sector',
+      Array.from(byType.get('company') || [])
+    ),
+    loadByIds<{ title: string; stage: string | null }>(
+      'deals',
+      'title, stage',
+      Array.from(byType.get('deal') || [])
+    ),
+  ]);
 
   const hydrated = [];
   for (const row of rows.results as any[]) {
@@ -1016,40 +945,27 @@ export async function getContactAssociations(
     let entityAvatar: string | null = null;
 
     if (row.other_type === 'contact') {
-      const c = await env.D1.prepare(
-        'SELECT full_name, job_title, avatar_url FROM contacts WHERE id = ? AND deleted_at IS NULL'
-      ).bind(row.other_id).first<{ full_name: string; job_title: string | null; avatar_url: string | null }>();
+      const c = contactMap.get(row.other_id);
       if (c) {
         entityName = c.full_name;
         entityTitle = c.job_title;
         entityAvatar = c.avatar_url;
       }
     } else if (row.other_type === 'company') {
-      const c = await env.D1.prepare(
-        'SELECT name, sector FROM companies WHERE id = ? AND deleted_at IS NULL'
-      ).bind(row.other_id).first<{ name: string; sector: string | null }>();
+      const c = companyMap.get(row.other_id);
       if (c) {
         entityName = c.name;
         entityTitle = c.sector;
       }
     } else if (row.other_type === 'deal') {
-      const d = await env.D1.prepare(
-        'SELECT title, stage FROM deals WHERE id = ? AND deleted_at IS NULL'
-      ).bind(row.other_id).first<{ title: string; stage: string | null }>();
+      const d = dealMap.get(row.other_id);
       if (d) {
         entityName = d.title;
         entityTitle = d.stage;
       }
     }
 
-    if (entityName) {
-      hydrated.push({
-        ...row,
-        entity_name: entityName,
-        entity_title: entityTitle,
-        entity_avatar: entityAvatar,
-      });
-    }
+    if (entityName) hydrated.push({ ...row, entity_name: entityName, entity_title: entityTitle, entity_avatar: entityAvatar });
   }
 
   const grouped = new Map<string, any>();
@@ -1073,7 +989,11 @@ export async function getContactAssociations(
     }
   }
 
-  return jsonResponse({ associations: Array.from(grouped.values()) });
+  return jsonResponse({
+    associations: Array.from(grouped.values()),
+    canonical_contact_id: canonical.contactId,
+    redirected_from: canonical.redirectedFrom,
+  });
 }
 
 // --- POST /api/contacts/:id/enrich ---
@@ -1095,11 +1015,14 @@ export async function getContactEnrichment(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
+  const canonical = await resolveCanonicalContactId(env, ctx.orgId, id);
+  if (!canonical) return errorResponse('CONTACT_NOT_FOUND', 404);
+
   const contact = await env.D1.prepare(
     `SELECT id, full_name, web_enrichment_r2_key, bio_summary,
             enrichment_confidence, enrichment_last_run
      FROM contacts WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-  ).bind(id, ctx.orgId).first<{
+  ).bind(canonical.contactId, ctx.orgId).first<{
     id: string;
     full_name: string;
     web_enrichment_r2_key: string | null;
@@ -1113,6 +1036,8 @@ export async function getContactEnrichment(
   if (!contact.web_enrichment_r2_key) {
     return jsonResponse({
       contact_id: contact.id,
+      canonical_contact_id: canonical.contactId,
+      redirected_from: canonical.redirectedFrom,
       short_bio: contact.bio_summary,
       full_bio: null,
       enrichment_confidence: contact.enrichment_confidence,
@@ -1125,6 +1050,8 @@ export async function getContactEnrichment(
   if (!obj) {
     return jsonResponse({
       contact_id: contact.id,
+      canonical_contact_id: canonical.contactId,
+      redirected_from: canonical.redirectedFrom,
       short_bio: contact.bio_summary,
       full_bio: null,
       enrichment_confidence: contact.enrichment_confidence,
@@ -1145,6 +1072,8 @@ export async function getContactEnrichment(
 
   return jsonResponse({
     contact_id: contact.id,
+    canonical_contact_id: canonical.contactId,
+    redirected_from: canonical.redirectedFrom,
     short_bio: contact.bio_summary,
     full_bio: fullBio,
     enrichment_confidence: contact.enrichment_confidence,

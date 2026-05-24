@@ -20,6 +20,7 @@ import {
   type WorkQueueInventoryEntry,
   type StuckWorkQueueEntry,
   type BudgetSnapshotRow,
+  type IngestionIncident,
   type DealReplayEvidenceRow,
   type MartyLabStatusSnapshot,
   type MartyLabRunSnapshot,
@@ -3314,11 +3315,12 @@ function SystemStatusSection() {
     return <div className="card p-6 text-sm text-text-muted">Loading…</div>;
   }
 
-  return (
-    <div className="space-y-6">
-      <RateLimitIndicator budgets={data.budgets || []} />
-      <ActiveTasksCard tasks={data.active_tasks} />
-      <RunHistoryCard rows={data.run_history} />
+	  return (
+	    <div className="space-y-6">
+	      <RateLimitIndicator budgets={data.budgets || []} />
+	      <IngestionIncidentsCard incidents={data.ingestion_incidents || []} />
+	      <ActiveTasksCard tasks={data.active_tasks} />
+	      <RunHistoryCard rows={data.run_history} />
       <DataCompletenessCard c={data.completeness} />
       <WorkQueueCard
         inventory={data.work_queue_inventory}
@@ -7193,6 +7195,59 @@ function WorkQueueCard({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function IngestionIncidentsCard({ incidents }: { incidents: IngestionIncident[] }) {
+  const active = incidents.filter(i => i.status !== 'resolved');
+  if (active.length === 0) {
+    return (
+      <div className="card p-5">
+        <div className="flex items-start gap-3">
+          <Shield size={18} className="text-semantic-success shrink-0 mt-0.5" />
+          <div>
+            <div className="text-sm font-medium text-text-primary">Ingestion Health</div>
+            <div className="text-xs text-text-secondary mt-1">No active ingestion incidents. Source failures and dead letters will surface here automatically.</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card p-5 border-semantic-error/25 bg-semantic-error/[0.03]">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium text-text-primary">Ingestion Incidents</div>
+          <div className="text-xs text-text-secondary mt-1">Failures are durable, visible, and repaired automatically unless credentials need reconnecting.</div>
+        </div>
+        <span className="rounded-full border border-semantic-error/25 bg-semantic-error/10 px-2 py-1 text-[10px] font-medium text-semantic-error">
+          {active.length} active
+        </span>
+      </div>
+      <div className="space-y-2">
+        {active.slice(0, 8).map(incident => (
+          <div key={incident.id} className="rounded-lg border border-border/60 bg-bg-surface/60 px-3 py-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-xs font-medium text-text-primary">{incident.title}</div>
+              <div className={`text-[10px] font-medium ${incident.severity === 'critical' ? 'text-semantic-error' : 'text-semantic-warning'}`}>
+                {incident.status} · {incident.recovery_status.replace(/_/g, ' ')}
+              </div>
+            </div>
+            <div className="mt-1 text-xs text-text-secondary">{incident.message}</div>
+            <div className="mt-2 flex flex-wrap gap-2 text-[10px] text-text-muted">
+              <span>{incident.source.replace(/_/g, ' ')}</span>
+              {incident.scope_id && <span>{incident.scope_type}: {incident.scope_id}</span>}
+              <span>last seen {formatRelative(incident.last_seen_at)}</span>
+              {incident.recovery_window_start && incident.recovery_window_end && (
+                <span>repair window {new Date(incident.recovery_window_start).toLocaleDateString()} → {new Date(incident.recovery_window_end).toLocaleDateString()}</span>
+              )}
+              {incident.human_action_required === 1 && <span className="text-semantic-error">requires reconnect</span>}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

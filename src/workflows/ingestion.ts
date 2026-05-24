@@ -186,8 +186,14 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         },
         async (): Promise<{ outlook: ClassifiableItem[]; failures: Array<{ source: string; error: string }> }> => {
           try {
-            const items = await fetchOutlookDelta(org_id!, this.env);
-            return { outlook: items, failures: [] };
+            const result = await fetchOutlookDelta(org_id!, this.env);
+            return {
+              outlook: result.items,
+              failures: result.failures.map(f => ({
+                source: f.source || `outlook:${f.user_id}`,
+                error: f.error,
+              })),
+            };
           } catch (e: any) {
             // Convert step-internal failure into a soft failures entry so
             // the workflow continues to the next source. CF's retry config
@@ -398,13 +404,13 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
           };
           await this.env.D1.prepare(
             `UPDATE sync_jobs
-               SET status = 'completed',
+               SET status = ?,
                    completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
                    items_processed = 0,
                    metadata = ?
              WHERE id = ?`
-          ).bind(JSON.stringify(metadata), syncJobId).run();
-          console.log('[IngestionWorkflow] no items fetched — job marked completed');
+          ).bind(sourceData.failures.length > 0 ? 'partial' : 'completed', JSON.stringify(metadata), syncJobId).run();
+          console.log('[IngestionWorkflow] no items fetched — job marked closed');
           return;
         }
 

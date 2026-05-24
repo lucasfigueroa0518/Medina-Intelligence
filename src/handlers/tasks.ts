@@ -3,6 +3,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
+import { safelyRebuildContactDetailReadModelForContact } from '../lib/contact-detail-read-model';
 
 export async function listTasks(
   request: Request,
@@ -84,6 +85,9 @@ export async function createTask(
     after_data: { title: body.title },
     created_at: now,
   });
+  if (body.contact_id) {
+    await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, body.contact_id, 'task_created');
+  }
 
   const task = await env.D1.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first();
   return jsonResponse({ task }, 201);
@@ -130,6 +134,10 @@ export async function updateTask(
     after_data: after,
     created_at: new Date().toISOString(),
   });
+  const contactId = (after as any)?.contact_id || (before as any)?.contact_id;
+  if (contactId) {
+    await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, contactId, 'task_updated');
+  }
   return jsonResponse({ task: after });
 }
 
@@ -138,6 +146,10 @@ export async function deleteTask(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
+  const before = await env.D1.prepare(
+    'SELECT contact_id FROM tasks WHERE id = ? AND org_id = ? AND deleted_at IS NULL'
+  ).bind(id, ctx.orgId).first<{ contact_id: string | null }>();
+
   await env.D1.prepare(
     `UPDATE tasks SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND org_id = ?`
   ).bind(id, ctx.orgId).run();
@@ -150,5 +162,8 @@ export async function deleteTask(
     entity_id: id,
     created_at: new Date().toISOString(),
   });
+  if (before?.contact_id) {
+    await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, before.contact_id, 'task_deleted');
+  }
   return jsonResponse({ ok: true });
 }

@@ -5,6 +5,7 @@ import { hashShort, getOrgSettings } from './helpers';
 import { autoLinkAttendees, autoLinkConversationParticipants } from './associations';
 import { processEmailSignature, processDisplayNameUpdate } from './email-signature-parser';
 import { updateEntityInIndex } from './entity-index';
+import { safelyUpsertConversationTimelineItemsForContacts } from './contact-detail-read-model';
 
 /**
  * Stages classified items as approval queue entries (or writes them directly
@@ -121,6 +122,13 @@ export async function stageAndCommitApprovals(
       // Best-effort; per-contact failure swallowed so ingestion never blocks.
       // Idempotent (UNIQUE(deal_id, contact_id) drops dupes).
       if (newlyLinked.length > 0) {
+        await safelyUpsertConversationTimelineItemsForContacts(
+          env,
+          orgId,
+          item.entityId,
+          newlyLinked,
+          'stage_conversation_linked'
+        );
         try {
           const { propagateContactToOpenDeals } = await import('./deal-association');
           for (const cid of newlyLinked) {

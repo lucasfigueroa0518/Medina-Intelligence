@@ -12,6 +12,7 @@ import { refreshOutlookToken, recordTokenFailure } from './oauth';
 import { upsertOutlookEvent } from '../lib/reconciliation';
 import { checkGraphRateLimit, recordGraphApiCall } from '../lib/rate-limit';
 import { recordRateLimit } from '../lib/upstream-budget';
+import { reportIngestionFailure, reportIngestionSuccess } from '../lib/ingestion-health';
 
 // Per-HTTP-call timeout for Microsoft Graph. Naked `await fetch()` with no
 // signal can hang past the Workflow step budget when Graph is slow (504s,
@@ -68,6 +69,63 @@ interface FolderDeltaConfig {
   backfillFilter: string;
 }
 
+class OutlookDeltaFetchError extends Error {
+  constructor(
+    message: string,
+    public readonly status?: number,
+    public readonly code?: string
+  ) {
+    super(message);
+    this.name = 'OutlookDeltaFetchError';
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function graphFetchWithRetry(
+  url: string,
+  token: string,
+  orgId: string,
+  env: Env,
+  label: string,
+  maxAttempts = 3
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(GRAPH_REQUEST_TIMEOUT_MS),
+      });
+      await recordGraphApiCall(orgId, env);
+      if (resp.ok) return resp;
+
+      const retryable = resp.status === 429 || resp.status === 408 || resp.status >= 500;
+      if (!retryable || attempt === maxAttempts - 1) return resp;
+      if (resp.status === 429) await recordRateLimit(env, orgId, null, 'graph', 'ten_minute');
+      const retryAfter = parseInt(resp.headers.get('Retry-After') || '', 10);
+      const delayMs = Number.isFinite(retryAfter)
+        ? retryAfter * 1000
+        : 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+      console.warn(`[outlook] ${label} retryable HTTP ${resp.status}; retry ${attempt + 1}/${maxAttempts - 1} in ${delayMs}ms`);
+      await sleep(delayMs);
+    } catch (e) {
+      lastError = e;
+      if (attempt === maxAttempts - 1) break;
+      const delayMs = 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+      console.warn(`[outlook] ${label} network failure; retry ${attempt + 1}/${maxAttempts - 1} in ${delayMs}ms`);
+      await sleep(delayMs);
+    }
+  }
+  throw new OutlookDeltaFetchError(
+    `${label} fetch failed after retries: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    undefined,
+    'network_or_timeout'
+  );
+}
+
 async function fetchFolderDelta(
   token: string,
   userId: string,
@@ -77,41 +135,41 @@ async function fetchFolderDelta(
 ): Promise<OutlookMessage[]> {
   const deltaToken = await config.getDeltaToken();
 
-  let url: string;
-  if (deltaToken) {
-    url = deltaToken;
-  } else {
-    url = `https://graph.microsoft.com/v1.0/me/mailFolders/${config.folder}/messages/delta?${MSG_SELECT}&${config.backfillFilter}&$top=50`;
-  }
+  const initialUrl = `https://graph.microsoft.com/v1.0/me/mailFolders/${config.folder}/messages/delta?${MSG_SELECT}&${config.backfillFilter}&$top=50`;
+  let url = deltaToken || initialUrl;
+  let usingDeltaToken = Boolean(deltaToken);
 
   const messages: OutlookMessage[] = [];
 
   while (url) {
     if (!(await checkGraphRateLimit(orgId, env))) {
       console.log(`[outlook] Graph rate limit approaching for org ${orgId}, pausing sync`);
-      break;
+      throw new OutlookDeltaFetchError(
+        `${config.folder} delta paused because Graph rate-limit circuit is open`,
+        undefined,
+        'graph_rate_limit_open'
+      );
     }
 
-    const resp = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(GRAPH_REQUEST_TIMEOUT_MS),
-    });
-    await recordGraphApiCall(orgId, env);
+    const resp = await graphFetchWithRetry(url, token, orgId, env, `${config.folder} delta user=${userId}`);
 
     if (!resp.ok) {
       const errBody = await resp.text().catch(() => '');
       console.error(`[outlook] Delta fetch failed for ${config.folder} user ${userId}: ${resp.status} ${errBody.slice(0, 300)}`);
-      if (resp.status === 410) {
+      if (resp.status === 410 && usingDeltaToken) {
         await config.clearDeltaToken();
-        console.warn(`[outlook] Delta token expired (410) for ${config.folder} user ${userId}, cleared for full re-sync`);
+        console.warn(`[outlook] Delta token expired (410) for ${config.folder} user ${userId}, cleared and retrying bounded re-sync`);
+        url = initialUrl;
+        usingDeltaToken = false;
+        continue;
       } else if (resp.status === 401) {
         await recordTokenFailure(userId, 'outlook', env);
-      } else if (resp.status === 429) {
-        // Phase 3.1: feed the upstream_budget_ledger circuit breaker.
-        // 3 consecutive 429s → cap drops 10%, circuit opens 30 min.
-        await recordRateLimit(env, orgId, null, 'graph', 'ten_minute');
       }
-      break;
+      throw new OutlookDeltaFetchError(
+        `${config.folder} delta failed for user ${userId}: HTTP ${resp.status} ${errBody.slice(0, 300)}`,
+        resp.status,
+        resp.status === 410 ? 'delta_token_expired' : resp.status === 401 ? 'auth_failed' : 'graph_api_error'
+      );
     }
 
     const data = (await resp.json()) as {
@@ -260,27 +318,92 @@ export async function setUserSyncConfig(
   await env.KV.put(`sync_config:${userId}`, JSON.stringify({ ...current, ...config }));
 }
 
+export interface OutlookSourceFailure {
+  source: string;
+  user_id: string;
+  error: string;
+  code?: string;
+  http_status?: number;
+  human_action_required?: boolean;
+}
+
+export interface OutlookDeltaResult {
+  items: ClassifiableItem[];
+  failures: OutlookSourceFailure[];
+}
+
 export async function fetchOutlookDelta(
   orgId: string,
   env: Env
-): Promise<ClassifiableItem[]> {
+): Promise<OutlookDeltaResult> {
   const users = await getActiveUsersForOrg(orgId, env);
   const allItems: ClassifiableItem[] = [];
+  const failures: OutlookSourceFailure[] = [];
+
+  async function recordFailure(user: { id: string; email?: string }, failure: Omit<OutlookSourceFailure, 'user_id'>) {
+    const full: OutlookSourceFailure = { ...failure, user_id: user.id };
+    failures.push(full);
+    await reportIngestionFailure(env, {
+      orgId,
+      source: 'outlook_email',
+      scopeType: 'user',
+      scopeId: user.id,
+      code: full.code || full.error,
+      message: `Outlook email sync failed for ${user.email || user.id}: ${full.error}`,
+      severity: full.human_action_required ? 'critical' : 'warning',
+      humanActionRequired: full.human_action_required,
+      metadata: {
+        user_id: user.id,
+        email: user.email || null,
+        source: full.source,
+        http_status: full.http_status || null,
+      },
+    }).catch(e => console.error('[outlook] reportIngestionFailure failed:', e));
+  }
 
   for (const user of users) {
+    if (!user.outlook_token) continue;
+    let userHadFailure = false;
     const failState = await env.KV.get<{ count: number }>(
       `token_failed:${user.id}:outlook`,
       'json'
     );
-    if (failState && failState.count >= 3) continue;
+    if (failState && failState.count >= 3) {
+      userHadFailure = true;
+      await recordFailure(user, {
+        source: 'outlook',
+        error: 'token_failed_threshold_exceeded',
+        code: 'outlook_reauth_required',
+        human_action_required: true,
+      });
+      continue;
+    }
 
     const refreshResult = await refreshOutlookToken(user.id, orgId, env);
-    if (!refreshResult.success) continue;
+    if (!refreshResult.success) {
+      userHadFailure = true;
+      const human = refreshResult.reason === 'reauth_required' || refreshResult.reason === 'missing_token';
+      await recordFailure(user, {
+        source: 'outlook',
+        error: `token_refresh_failed:${refreshResult.reason || refreshResult.errorCode || 'unknown'}`,
+        code: human ? 'outlook_reauth_required' : 'outlook_token_refresh_transient',
+        http_status: refreshResult.status,
+        human_action_required: human,
+      });
+      continue;
+    }
 
     let token: string;
     try {
       token = await getDecryptedAccessToken(user.id, env);
     } catch {
+      userHadFailure = true;
+      await recordFailure(user, {
+        source: 'outlook',
+        error: 'token_decrypt_failed',
+        code: 'outlook_token_decrypt_failed',
+        human_action_required: true,
+      });
       continue;
     }
 
@@ -309,6 +432,14 @@ export async function fetchOutlookDelta(
       }, orgId, env);
     } catch (e) {
       console.error(`Outlook inbox sync error for user ${user.id}:`, e);
+      userHadFailure = true;
+      await recordFailure(user, {
+        source: 'outlook:inbox',
+        error: e instanceof Error ? e.message : String(e),
+        code: e instanceof OutlookDeltaFetchError ? e.code : 'outlook_inbox_sync_failed',
+        http_status: e instanceof OutlookDeltaFetchError ? e.status : undefined,
+        human_action_required: e instanceof OutlookDeltaFetchError && e.status === 401,
+      });
     }
 
     // Fetch sent items (delta token stored in KV)
@@ -328,6 +459,14 @@ export async function fetchOutlookDelta(
       }, orgId, env);
     } catch (e) {
       console.error(`Outlook sent sync error for user ${user.id}:`, e);
+      userHadFailure = true;
+      await recordFailure(user, {
+        source: 'outlook:sentitems',
+        error: e instanceof Error ? e.message : String(e),
+        code: e instanceof OutlookDeltaFetchError ? e.code : 'outlook_sent_sync_failed',
+        http_status: e instanceof OutlookDeltaFetchError ? e.status : undefined,
+        human_action_required: e instanceof OutlookDeltaFetchError && e.status === 401,
+      });
     }
 
     console.log(`[outlook] User ${user.id}: inbox=${inboxMessages.length}, sent=${sentMessages.length}`);
@@ -342,9 +481,23 @@ export async function fetchOutlookDelta(
       const direction = classifyDirection(msg, internalDomains);
       allItems.push(messageToClassifiableItem(msg, direction, user.id, orgId));
     }
+
+    if (!userHadFailure) {
+      await reportIngestionSuccess(env, {
+        orgId,
+        source: 'outlook_email',
+        scopeType: 'user',
+        scopeId: user.id,
+        metadata: {
+          inbox_messages: inboxMessages.length,
+          sent_messages: sentMessages.length,
+          email: user.email,
+        },
+      }).catch(e => console.error('[outlook] reportIngestionSuccess failed:', e));
+    }
   }
 
-  return allItems;
+  return { items: allItems, failures };
 }
 
 // --- Historical backfill ---

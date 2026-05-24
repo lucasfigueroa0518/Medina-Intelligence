@@ -25,6 +25,7 @@ import {
   type BudgetSnapshotRow,
   type StuckWorkQueueRow,
 } from '../lib/system-status';
+import type { IngestionIncident } from '../lib/ingestion-health';
 import type { FireflyKeyStatus } from '../lib/firefly-credentials';
 import type { WorkQueueDomainCount } from '../lib/work-queue';
 import {
@@ -99,6 +100,7 @@ export interface SystemStatusResponse {
   // separate field needed; getDeadLetterItems handles the merge).
   work_queue_inventory: WorkQueueDomainCount[];
   stuck_work_queue: StuckWorkQueueRow[];
+  ingestion_incidents: IngestionIncident[];
   marty_lab: MartyLabStatusSnapshot;
   deal_replay: DealReplayStatusSnapshot;
   rag_v2: Record<string, unknown>;
@@ -345,6 +347,7 @@ export async function getSystemStatus(
     stuck_runs: snapshot.stuck_runs,
     budgets: snapshot.budgets,
     firefly_credentials: snapshot.firefly_credentials,
+    ingestion_incidents: snapshot.ingestion_incidents,
     work_queue_inventory: workQueueInventory,
     stuck_work_queue: stuckWorkQueue,
     marty_lab: martyLab,

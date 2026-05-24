@@ -278,7 +278,7 @@ async function routeAuthenticated(
   let m = path.match(/^\/api\/contacts\/([^/]+)$/);
   if (m) {
     const id = m[1];
-    if (method === 'GET') return Contacts.getContact(id, ctx, env);
+    if (method === 'GET') return Contacts.getContact(id, ctx, env, ctxExec);
     if (method === 'PATCH') return Contacts.updateContact(request, id, ctx, env);
     if (method === 'DELETE') return Contacts.deleteContact(id, ctx, env);
   }
@@ -789,6 +789,10 @@ async function routeAuthenticated(
       return Admin.renamePlaceholderCompanies(request, ctx, env);
     if (path === '/api/admin/rebuild-entity-index' && method === 'POST')
       return Admin.rebuildEntityIndexEndpoint(ctx, env);
+    if (path === '/api/admin/rebuild-contact-search-index' && method === 'POST')
+      return Contacts.rebuildContactSearchIndexEndpoint(ctx, env);
+    if (path === '/api/admin/rebuild-contact-detail-read-model' && method === 'POST')
+      return Contacts.rebuildContactDetailReadModelEndpoint(request, ctx, env);
     if (path === '/api/admin/cleanup-vector-bloat' && method === 'POST')
       return Admin.cleanupVectorBloat(ctx, env);
     if (path === '/api/admin/calendar-token-health' && method === 'GET')
@@ -1104,6 +1108,20 @@ export async function handleScheduled(
             }
           } catch (e) {
             console.error(`rag-v2 queue dispatch failed for ${org.id}:`, e);
+          }
+        })());
+
+        ctxExec.waitUntil((async () => {
+          try {
+            const { scanAndRepairIngestion } = await import('./lib/ingestion-health');
+            const result = await scanAndRepairIngestion(org.id, env);
+            if (result.repairs_enqueued > 0 || result.dead_letters_requeued > 0) {
+              console.warn(
+                `[ingestion-health] org=${org.id} incidents=${result.incidents} repairs=${result.repairs_enqueued} dead_letters_requeued=${result.dead_letters_requeued}`
+              );
+            }
+          } catch (e) {
+            console.error(`ingestion-health scan failed for ${org.id}:`, e);
           }
         })());
 

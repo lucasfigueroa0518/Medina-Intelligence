@@ -125,7 +125,8 @@ function readFiltersFromUrl(sp: URLSearchParams): FilterState {
 
 function filtersToParams(f: FilterState): Record<string, string> {
   const p: Record<string, string> = {};
-  if (f.search) p.search = f.search;
+  const search = f.search.trim();
+  if (search.length >= 2) p.search = search;
   if (f.type.length) p.type = f.type.join(',');
   if (f.status.length) p.status = f.status.join(',');
   if (f.last_contact) p.last_contact = f.last_contact;
@@ -184,6 +185,8 @@ function ContactsPage() {
   );
   const [searchInput, setSearchInput] = React.useState(filters.search);
   const searchDebounceRef = React.useRef<ReturnType<typeof setTimeout>>();
+  const contactsRequestSeqRef = React.useRef(0);
+  const contactsAbortRef = React.useRef<AbortController | null>(null);
 
   const [contacts, setContacts] = React.useState<Contact[]>([]);
   const [total, setTotal] = React.useState(0);
@@ -257,21 +260,36 @@ function ContactsPage() {
       setTotal(q ? rows.length : DEMO_CONTACT_TOTAL);
       return Promise.resolve();
     }
+    contactsAbortRef.current?.abort();
+    const controller = new AbortController();
+    contactsAbortRef.current = controller;
+    const requestSeq = contactsRequestSeqRef.current + 1;
+    contactsRequestSeqRef.current = requestSeq;
     setLoading(true);
-    return api.listContacts(buildParams(0))
+    return api.listContacts(buildParams(0), { signal: controller.signal })
       .then(data => {
+        if (controller.signal.aborted || requestSeq !== contactsRequestSeqRef.current) return;
         setContacts(data.contacts as Contact[]);
         setTotal(data.total ?? data.contacts.length);
       })
-      .finally(() => setLoading(false));
+      .catch(error => {
+        if ((error as any)?.name === 'AbortError') return;
+        setToast('Unable to load contacts');
+      })
+      .finally(() => {
+        if (contactsAbortRef.current === controller) contactsAbortRef.current = null;
+        if (requestSeq === contactsRequestSeqRef.current) setLoading(false);
+      });
   }, [buildParams, demoMode, filters.search]);
 
   const loadMore = React.useCallback(() => {
     if (demoMode) return;
     if (loadingMore || contacts.length >= total) return;
+    const requestSeq = contactsRequestSeqRef.current;
     setLoadingMore(true);
     api.listContacts(buildParams(contacts.length))
       .then(data => {
+        if (requestSeq !== contactsRequestSeqRef.current) return;
         setContacts(prev => [...prev, ...(data.contacts as Contact[])]);
         if (typeof data.total === 'number') setTotal(data.total);
       })
@@ -279,6 +297,7 @@ function ContactsPage() {
   }, [buildParams, contacts.length, total, loadingMore, demoMode]);
 
   React.useEffect(() => { loadContacts(); }, [loadContacts]);
+  React.useEffect(() => () => contactsAbortRef.current?.abort(), []);
 
   React.useEffect(() => {
     if (!toast) return;

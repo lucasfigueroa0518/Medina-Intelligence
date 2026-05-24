@@ -25,6 +25,7 @@ import { emitAudit } from '../lib/audit';
 import { ensureSubscriptionsForUser } from '../lib/graph-subscriptions';
 import { createProgressiveBackfill } from '../lib/progressive-backfill';
 import { DEFAULT_ONBOARDING_BACKFILL_DAYS } from './backfill';
+import { reportIngestionSuccess, scanAndRepairIngestion } from '../lib/ingestion-health';
 
 interface OAuthStateRecord {
   user_id: string;
@@ -363,6 +364,34 @@ export async function outlookOAuthCallback(
   // bootstrap uses the configured Outlook history window cleanly.
   await env.KV.delete(`token_failed:${record.user_id}:outlook`);
   await env.KV.delete(`sent_delta:${record.user_id}`);
+  await reportIngestionSuccess(env, {
+    orgId: record.org_id,
+    source: 'outlook_email',
+    scopeType: 'user',
+    scopeId: record.user_id,
+    metadata: { connected_email: connectedEmail || null, reconnect: true },
+  }).catch(() => {});
+  await reportIngestionSuccess(env, {
+    orgId: record.org_id,
+    source: 'calendar',
+    scopeType: 'user',
+    scopeId: record.user_id,
+    metadata: { connected_email: connectedEmail || null, reconnect: true },
+  }).catch(() => {});
+  await env.D1.prepare(
+    `UPDATE ingestion_incidents
+        SET status = 'open',
+            human_action_required = 0,
+            recovery_status = 'idle',
+            message = 'Outlook credentials are healthy again. Automatic repair is starting for the missed ingestion window.',
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE org_id = ?
+        AND source IN ('outlook_email','calendar')
+        AND scope_type = 'user'
+        AND scope_id = ?
+        AND status = 'blocked'
+        AND code = 'outlook_reauth_required'`
+  ).bind(record.org_id, record.user_id).run().catch(() => {});
 
   // Read per-user sync window for first delta fetch logging
   const syncConfigRaw = await env.KV.get(`sync_config:${record.user_id}`, 'json') as { sync_history_days?: number } | null;
@@ -410,6 +439,12 @@ export async function outlookOAuthCallback(
     }
   } catch (e) {
     console.error('[auth-oauth] onboarding progressive backfill seed failed (non-fatal):', e);
+  }
+
+  try {
+    await scanAndRepairIngestion(record.org_id, env);
+  } catch (e) {
+    console.error('[auth-oauth] post-reconnect ingestion repair scan failed (non-fatal):', e);
   }
 
   await emitAudit(env, {

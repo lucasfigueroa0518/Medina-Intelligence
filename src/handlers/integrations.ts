@@ -9,6 +9,7 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse } from './utils';
+import { listActiveIngestionIncidents } from '../lib/ingestion-health';
 
 export type IntegrationStatus =
   | 'connected'
@@ -207,6 +208,24 @@ export async function getIntegrationsStatus(
         last_sync: null,
         webhook_url: webhookUrl,
       };
+
+  const incidents = await listActiveIngestionIncidents(env, ctx.orgId, 25).catch(() => []);
+  const attachIncidentWarnings = (row: IntegrationRow, sources: string[]) => {
+    const matching = incidents.filter(i => sources.includes(i.source));
+    if (matching.length === 0) return;
+    row.warnings = [
+      ...(row.warnings || []),
+      ...matching.slice(0, 4).map(i => `${i.severity === 'critical' ? 'Critical' : 'Warning'}: ${i.message}`),
+    ];
+    if (matching.some(i => i.severity === 'critical' || i.human_action_required === 1)) {
+      row.status = 'auth_failed';
+      row.label = row.label === 'Connected' ? 'Degraded' : row.label;
+    }
+  };
+
+  attachIncidentWarnings(outlook, ['outlook_email', 'calendar']);
+  attachIncidentWarnings(slack, ['slack']);
+  attachIncidentWarnings(firefly, ['firefly']);
 
   const body: IntegrationsStatusResponse = {
     outlook,

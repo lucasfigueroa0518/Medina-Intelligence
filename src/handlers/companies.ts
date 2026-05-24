@@ -15,6 +15,7 @@ import {
   companyDomainCandidates,
   evaluateContactCompanyAffiliation,
 } from '../lib/contact-company-affiliation';
+import { safelyRebuildContactSearchIndexForCompany } from '../lib/contact-search';
 
 // News-score buckets. The underlying scale is 0-10 (see lib/news-scoring).
 function newsScorePredicate(bucket: string): string | null {
@@ -359,6 +360,7 @@ export async function createCompany(
 
   ctxExec.waitUntil(triggerCompanyEnrichment(id, ctx.orgId, env));
   await invalidateRagCache(ctx.orgId, env);
+  await safelyRebuildContactSearchIndexForCompany(env, ctx.orgId, id, domain);
 
   const created = await env.D1.prepare('SELECT * FROM companies WHERE id = ?').bind(id).first();
   return jsonResponse({ company: created }, 201);
@@ -475,6 +477,12 @@ export async function deleteCompany(
 
   try { await cleanupVectorsForEntity(id, 'companies', env); } catch { /* best-effort */ }
   await invalidateRagCache(ctx.orgId, env);
+  await safelyRebuildContactSearchIndexForCompany(
+    env,
+    ctx.orgId,
+    id,
+    typeof (before as any).domain === 'string' ? (before as any).domain : null
+  );
   return jsonResponse({ ok: true });
 }
 

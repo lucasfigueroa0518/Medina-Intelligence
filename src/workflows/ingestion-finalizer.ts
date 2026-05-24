@@ -223,12 +223,17 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
       await trackedStep(this.env, step, sync_job_id, 'mark-job-completed', { timeout: '30 seconds' }, async () => {
         await this.env.D1.prepare(
           `UPDATE sync_jobs
-             SET status = 'completed',
+             SET status = CASE
+                   WHEN COALESCE(json_array_length(metadata, '$.source_failures'), 0) > 0
+                     OR COALESCE(json_extract(metadata, '$.embed_gaps_total'), 0) > 0
+                   THEN 'partial'
+                   ELSE 'completed'
+                 END,
                  completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
                  metadata = json_set(COALESCE(metadata, '{}'), '$.finalized_at', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
            WHERE id = ?`
         ).bind(sync_job_id).run();
-        console.log(`[IngestionFinalizerWorkflow] job=${sync_job_id} marked completed`);
+        console.log(`[IngestionFinalizerWorkflow] job=${sync_job_id} marked terminal`);
       });
     } catch (e) {
       console.error('[IngestionFinalizerWorkflow] FATAL:', errMessage(e));
