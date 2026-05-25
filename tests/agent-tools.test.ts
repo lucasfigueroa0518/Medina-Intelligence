@@ -25,4 +25,16 @@ describe('agent tool source contracts', () => {
     expect(__agentToolsTestHooks.deriveEventKeywordTerms('NeuralSeek meeting transcript recap')).toEqual(['neuralseek']);
     expect(__agentToolsTestHooks.deriveEventKeywordTerms('Bank of America upcoming meetings')).toEqual(['bank', 'america']);
   });
+
+  it('allows all-time conversation search and removes the old 365-day ceiling', () => {
+    expect(__agentToolsTestHooks.conversationLookbackDays(0)).toBeNull();
+    expect(__agentToolsTestHooks.conversationLookbackDays(1200)).toBe(1200);
+    expect(__agentToolsTestHooks.conversationLookbackDays(9000)).toBe(3650);
+  });
+
+  it('uses conversation FTS for keyword recall instead of LIKE scans', () => {
+    const sql = __agentToolsTestHooks.conversationSearchCteSql();
+    expect(sql).toContain('conversation_search_fts');
+    expect(sql).toContain('MATCH');
+  });
 });

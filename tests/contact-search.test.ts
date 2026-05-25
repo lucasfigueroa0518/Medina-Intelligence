@@ -6,6 +6,7 @@ const {
   extractContactSearchTerms,
   buildContactSearchQuery,
   contactSearchCteSql,
+  contactSearchDriftSql,
 } = __contactSearchTestHooks;
 
 describe('contact search query normalization', () => {
@@ -39,5 +40,11 @@ describe('contact search query normalization', () => {
 
   it('does not use bm25 in the CTE because D1 rejects it in this context', () => {
     expect(contactSearchCteSql()).not.toContain('bm25(');
+  });
+
+  it('checks drift through the indexed sidecar instead of anti-joining the FTS table', () => {
+    const sql = contactSearchDriftSql();
+    expect(sql).toContain('contact_search_index_state');
+    expect(sql).not.toContain('contact_search_fts');
   });
 });

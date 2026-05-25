@@ -298,11 +298,11 @@ const AGENT_TOOLS: ToolDefinition[] = [
     input_schema: {
       type: 'object',
       properties: {
-        keyword: { type: 'string', description: 'Search by subject, body preview, sender, To, or Cc' },
+        keyword: { type: 'string', description: 'Token-aware search by subject, body preview, sender, recipients, or linked participant names' },
         source: { type: 'string', enum: ['outlook', 'slack', 'manual', 'all'], description: 'Filter by conversation channel. Default: all. Meeting transcripts are not conversations; use search_events.' },
         contact_id: { type: 'string', description: 'Filter conversations involving a specific contact' },
         direction: { type: 'string', enum: ['inbound', 'outbound', 'all'], description: 'Filter by direction. Default: all' },
-        days_back: { type: 'number', description: 'How many days back to search. Default: 30, or 365 in MAX mode.' },
+        days_back: { type: 'number', description: 'How many days back to search. Use 0 for all time. Default: 30, or 365 in MAX mode. Max: 3650.' },
         limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 250. Max 50 normally, 1000 in MAX mode.' },
       },
     },
@@ -1090,10 +1090,12 @@ async function markAgentTurnCancelled(
     assistantMessageId?: string | null;
     sessionId?: string | null;
     reason?: string;
+    kind?: 'user_stop' | 'interrupt' | 'timeout' | 'server_cancel';
   }
 ): Promise<number> {
   const now = new Date().toISOString();
   const message = opts.reason || 'Stopped by user.';
+  const kind = opts.kind || 'user_stop';
   const predicates = [
     `m.role = 'assistant'`,
     `json_extract(m.metadata, '$.status') = 'running'`,
@@ -1107,7 +1109,7 @@ async function markAgentTurnCancelled(
          AND (s.user_id = ? OR lower(u.email) = lower(?))
      )`,
   ];
-  const binds: any[] = [message, ctx.userId, now, ctx.orgId, ctx.userId, ctx.email || ''];
+  const binds: any[] = [message, ctx.userId, now, kind, message, ctx.orgId, ctx.userId, ctx.email || ''];
   if (opts.requestId) {
     predicates.push(`json_extract(m.metadata, '$.request_id') = ?`);
     binds.push(opts.requestId);
@@ -1131,6 +1133,8 @@ async function markAgentTurnCancelled(
               '$.cancelled', 1,
               '$.cancelled_by', ?,
               '$.cancelled_at', ?,
+              '$.cancel_kind', ?,
+              '$.cancel_reason', ?,
               '$.retryable', 1
             )
       WHERE ${predicates.join(' AND ')}`
@@ -2052,6 +2056,7 @@ function createStreamingMaxSetResponse(args: {
             assistantMessageId,
             sessionId: session.id,
             reason: 'Stopped by user.',
+            kind: 'user_stop',
           }).catch(() => 0);
           await updateMaxModeJobRecordSafe(env, maxJobId, {
             status: 'cancelled',
@@ -2345,6 +2350,7 @@ export async function cancelAgentRequest(
     requestId,
     sessionId,
     reason: 'Stopped by user.',
+    kind: 'user_stop',
   }).catch(() => 0);
   // Audit the cancel for debugging — keeps a trace in case Lucas reports
   // "I clicked stop and nothing happened."
@@ -2518,6 +2524,7 @@ export async function queryAgent(
         assistantMessageId: runningTurn.id,
         sessionId: session.id,
         reason: 'Stopped because the user sent a new prompt.',
+        kind: 'interrupt',
       }).catch(() => 0);
       await repairAgentSessionTurnCount(session.id, env);
     } else {
@@ -2583,6 +2590,7 @@ export async function queryAgent(
           assistantMessageId: activeTurn.id,
           sessionId: session.id,
           reason: 'Stopped because the user sent a new prompt.',
+          kind: 'interrupt',
         }).catch(() => 0);
         await repairAgentSessionTurnCount(session.id, env);
         turnIndex = await getNextAgentTurnIndex(session.id, env);
@@ -2730,6 +2738,7 @@ export async function queryAgent(
       assistantMessageId,
       sessionId: session.id,
       reason: 'Stopped by user.',
+      kind: 'user_stop',
     }).catch(() => 0);
     await updateAgentRunStatus(env, agentRunId, 'cancelled').catch(() => {});
     unregisterRequest(requestId);

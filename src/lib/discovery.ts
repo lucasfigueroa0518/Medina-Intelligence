@@ -5,6 +5,7 @@ import { emitAudit } from './audit';
 import { isValidContactName, resolveContactName } from './name-quality';
 import { jaroWinkler } from './dedup';
 import { updateEntityInIndex } from './entity-index';
+import { safelyMaintainContactReadModels } from './contact-maintenance';
 
 // Domains whose mail is always automated/transactional — never discover as contacts.
 // Includes platform-noreply senders (slack.com, github.com), SaaS billing/notice
@@ -433,10 +434,14 @@ export async function linkContactToCompanyByEmail(
   const companyId = await findCompanyByDomain(domain, orgId, env);
   if (!companyId) return null;
 
-  await env.D1.prepare(
+  const result = await env.D1.prepare(
     `UPDATE contacts SET company_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      WHERE id = ? AND company_id IS NULL`
   ).bind(companyId, contactId).run();
+
+  if (result.meta?.changes) {
+    await safelyMaintainContactReadModels(env, orgId, contactId, 'contact_company_linked');
+  }
 
   console.log(`[discovery] linked contact ${contactId} to company ${companyId} via domain ${domain}`);
   return companyId;
@@ -552,6 +557,7 @@ export async function discoverNewContact(
   });
 
   try { await updateEntityInIndex(orgId, 'contact', contactId, env); } catch {}
+  await safelyMaintainContactReadModels(env, orgId, contactId, 'contact_discovered');
 
   return { id: contactId, created: true };
 }

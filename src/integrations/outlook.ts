@@ -922,7 +922,7 @@ export async function fetchOutlookCalendarDelta(
 
     const refreshResult = await refreshOutlookToken(user.id, orgId, env);
     if (!refreshResult.success) {
-      result.errors.push({ user_id: user.id, error: 'token_refresh_failed' });
+      result.errors.push({ user_id: user.id, error: `token_refresh_failed:${refreshResult.reason || refreshResult.errorCode || 'unknown'}` });
       continue;
     }
 

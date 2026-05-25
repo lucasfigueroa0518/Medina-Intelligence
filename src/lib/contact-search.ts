@@ -1,6 +1,7 @@
 import type { Env } from '../types/env';
 
 const MAX_SEARCH_TERMS = 8;
+const CONTACT_SEARCH_INLINE_REPAIR_LIMIT = 25;
 
 export interface ContactSearchQuery {
   raw: string;
@@ -26,6 +27,11 @@ interface ContactIndexRow {
   resolved_company_id: string | null;
   company_name: string | null;
   company_domain: string | null;
+}
+
+function isMissingContactSearchStateTable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /no such table:?\s*contact_search_index_state/i.test(message);
 }
 
 export function normalizeContactSearchText(input: string | null | undefined): string {
@@ -109,6 +115,26 @@ export function contactSearchCteSql(): string {
 
 export function contactSearchCteBinds(query: ContactSearchQuery, orgId: string): unknown[] {
   return [...contactSearchRankBinds(query), query.ftsMatch, orgId];
+}
+
+export function contactSearchDriftSql(): string {
+  return `
+    SELECT c.id
+      FROM contacts c
+      LEFT JOIN contact_search_index_state s
+        ON s.org_id = c.org_id
+       AND s.contact_id = c.id
+     WHERE c.org_id = ?
+       AND c.deleted_at IS NULL
+       AND c.merged_into IS NULL
+       AND (
+         s.contact_id IS NULL
+         OR s.status != 'indexed'
+         OR COALESCE(c.updated_at, c.created_at, '') > COALESCE(s.contact_updated_at, '')
+       )
+     ORDER BY c.updated_at DESC
+     LIMIT ?
+  `;
 }
 
 function emailLocalPart(email: string | null | undefined): string {
@@ -231,8 +257,60 @@ export async function recordContactSearchIndexRepair(
   }
 }
 
+async function upsertContactSearchIndexState(
+  env: Env,
+  orgId: string,
+  contactId: string,
+  args: {
+    contactUpdatedAt?: string | null;
+    indexedAt?: string | null;
+    status?: 'indexed' | 'stale' | 'failed' | 'deleted';
+    error?: unknown;
+  } = {}
+): Promise<void> {
+  const status = args.status || 'indexed';
+  const errorText = args.error instanceof Error ? args.error.message : args.error ? String(args.error) : null;
+  try {
+    await env.D1.prepare(
+      `INSERT INTO contact_search_index_state
+         (org_id, contact_id, contact_updated_at, indexed_at, status, last_error, repair_attempt_count, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ? = 'failed' THEN 1 ELSE 0 END, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+       ON CONFLICT(org_id, contact_id) DO UPDATE SET
+         contact_updated_at = excluded.contact_updated_at,
+         indexed_at = excluded.indexed_at,
+         status = excluded.status,
+         last_error = excluded.last_error,
+         repair_attempt_count = CASE
+           WHEN excluded.status = 'failed' THEN contact_search_index_state.repair_attempt_count + 1
+           WHEN excluded.status = 'indexed' THEN 0
+           ELSE contact_search_index_state.repair_attempt_count
+         END,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+    ).bind(
+      orgId,
+      contactId,
+      args.contactUpdatedAt || null,
+      args.indexedAt || (status === 'indexed' ? new Date().toISOString() : null),
+      status,
+      errorText,
+      status
+    ).run();
+  } catch (error) {
+    if (!isMissingContactSearchStateTable(error)) throw error;
+  }
+}
+
+async function deleteContactSearchIndexStateForContact(env: Env, contactId: string): Promise<void> {
+  try {
+    await env.D1.prepare('DELETE FROM contact_search_index_state WHERE contact_id = ?').bind(contactId).run();
+  } catch (error) {
+    if (!isMissingContactSearchStateTable(error)) throw error;
+  }
+}
+
 export async function deleteContactSearchIndexForContact(env: Env, contactId: string): Promise<void> {
   await env.D1.prepare('DELETE FROM contact_search_fts WHERE contact_id = ?').bind(contactId).run();
+  await deleteContactSearchIndexStateForContact(env, contactId);
 }
 
 export async function safelyDeleteContactSearchIndexForContact(
@@ -299,6 +377,11 @@ export async function rebuildContactSearchIndexForContact(
       row.updated_at || row.created_at || new Date().toISOString()
     ),
   ]);
+
+  await upsertContactSearchIndexState(env, orgId, contactId, {
+    contactUpdatedAt: row.updated_at || row.created_at || null,
+    status: 'indexed',
+  });
 }
 
 export async function safelyRebuildContactSearchIndexForContact(
@@ -309,6 +392,10 @@ export async function safelyRebuildContactSearchIndexForContact(
   try {
     await rebuildContactSearchIndexForContact(env, orgId, contactId);
   } catch (error) {
+    await upsertContactSearchIndexState(env, orgId, contactId, {
+      status: 'failed',
+      error,
+    }).catch(() => {});
     await recordContactSearchIndexRepair(env, orgId, {
       contactId,
       reason: 'upsert_failed',
@@ -385,6 +472,11 @@ export async function rebuildContactSearchIndexForOrg(
   limit = 10000
 ): Promise<{ active_contacts: number; rebuilt: number; errors: number }> {
   await env.D1.prepare('DELETE FROM contact_search_fts WHERE org_id = ?').bind(orgId).run();
+  try {
+    await env.D1.prepare('DELETE FROM contact_search_index_state WHERE org_id = ?').bind(orgId).run();
+  } catch (error) {
+    if (!isMissingContactSearchStateTable(error)) throw error;
+  }
   const rows = await env.D1.prepare(
     `SELECT id
        FROM contacts
@@ -413,35 +505,50 @@ export async function rebuildContactSearchIndexForOrg(
   return { active_contacts: rows.results.length, rebuilt, errors };
 }
 
+async function listContactSearchDriftRows(
+  env: Env,
+  orgId: string,
+  limit: number
+): Promise<Array<{ id: string }>> {
+  try {
+    const rows = await env.D1.prepare(contactSearchDriftSql()).bind(orgId, limit).all<{ id: string }>();
+    return rows.results || [];
+  } catch (error) {
+    if (!isMissingContactSearchStateTable(error)) throw error;
+    const rows = await env.D1.prepare(
+      `SELECT c.id
+         FROM contacts c
+         LEFT JOIN contact_search_fts f
+           ON f.contact_id = c.id
+          AND f.org_id = c.org_id
+        WHERE c.org_id = ?
+          AND c.deleted_at IS NULL
+          AND c.merged_into IS NULL
+          AND (
+            f.contact_id IS NULL
+            OR COALESCE(c.updated_at, c.created_at, '') > COALESCE(f.updated_at, '')
+          )
+        GROUP BY c.id
+        ORDER BY c.updated_at DESC
+        LIMIT ?`
+    ).bind(orgId, limit).all<{ id: string }>();
+    return rows.results || [];
+  }
+}
+
 export async function repairContactSearchIndexDrift(
   orgId: string,
   env: Env,
   limit = 200
 ): Promise<{ checked: number; repaired: number }> {
-  const rows = await env.D1.prepare(
-    `SELECT c.id
-       FROM contacts c
-       LEFT JOIN contact_search_fts f
-         ON f.contact_id = c.id
-        AND f.org_id = c.org_id
-      WHERE c.org_id = ?
-        AND c.deleted_at IS NULL
-        AND c.merged_into IS NULL
-        AND (
-          f.contact_id IS NULL
-          OR COALESCE(c.updated_at, c.created_at, '') > COALESCE(f.updated_at, '')
-        )
-      GROUP BY c.id
-      ORDER BY c.updated_at DESC
-      LIMIT ?`
-  ).bind(orgId, limit).all<{ id: string }>();
+  const rows = await listContactSearchDriftRows(env, orgId, limit);
 
   let repaired = 0;
-  for (const row of rows.results) {
+  for (const row of rows) {
     await safelyRebuildContactSearchIndexForContact(env, orgId, row.id);
     repaired++;
   }
-  return { checked: rows.results.length, repaired };
+  return { checked: rows.length, repaired };
 }
 
 export async function ensureContactSearchIndexReady(
@@ -457,11 +564,28 @@ export async function ensureContactSearchIndexReady(
           AND merged_into IS NULL`
     ).bind(orgId).first<{ n: number }>(),
     env.D1.prepare(
-      `SELECT COUNT(DISTINCT contact_id) AS n
-         FROM contact_search_fts
-        WHERE org_id = ?`
+      `SELECT COUNT(*) AS n
+         FROM contact_search_index_state
+        WHERE org_id = ?
+          AND status = 'indexed'`
     ).bind(orgId).first<{ n: number }>(),
-  ]);
+  ]).catch(async (error) => {
+    if (!isMissingContactSearchStateTable(error)) throw error;
+    return await Promise.all([
+      env.D1.prepare(
+        `SELECT COUNT(*) AS n
+           FROM contacts
+          WHERE org_id = ?
+            AND deleted_at IS NULL
+            AND merged_into IS NULL`
+      ).bind(orgId).first<{ n: number }>(),
+      env.D1.prepare(
+        `SELECT COUNT(DISTINCT contact_id) AS n
+           FROM contact_search_fts
+          WHERE org_id = ?`
+      ).bind(orgId).first<{ n: number }>(),
+    ]);
+  });
 
   const activeCount = active?.n || 0;
   const indexedCount = indexed?.n || 0;
@@ -477,10 +601,33 @@ export async function ensureContactSearchIndexReady(
     };
   }
 
-  if (indexedCount < activeCount) {
+  const driftRows = await listContactSearchDriftRows(env, orgId, CONTACT_SEARCH_INLINE_REPAIR_LIMIT + 1);
+  if (driftRows.length > 0) {
+    const inlineRows = driftRows.slice(0, CONTACT_SEARCH_INLINE_REPAIR_LIMIT);
+    for (const row of inlineRows) {
+      await safelyRebuildContactSearchIndexForContact(env, orgId, row.id);
+    }
+    const remainingDrift = await listContactSearchDriftRows(env, orgId, 1);
+    if (remainingDrift.length > 0) {
+      await recordContactSearchIndexRepair(env, orgId, {
+        reason: 'index_incomplete',
+        metadata: {
+          active_contacts: activeCount,
+          indexed_contacts: indexedCount,
+          inline_repaired: inlineRows.length,
+          remaining_sample: remainingDrift[0]?.id,
+        },
+      });
+      return {
+        ok: false,
+        code: 'CONTACT_SEARCH_INDEX_REPAIRING',
+        message: 'Contact search index is repairing drift. Retry shortly or run the contact search index rebuild if this persists.',
+      };
+    }
+
     await recordContactSearchIndexRepair(env, orgId, {
       reason: 'index_incomplete',
-      metadata: { active_contacts: activeCount, indexed_contacts: indexedCount },
+      metadata: { active_contacts: activeCount, indexed_contacts: indexedCount, inline_repaired: inlineRows.length },
     });
   }
 
@@ -492,4 +639,5 @@ export const __contactSearchTestHooks = {
   extractContactSearchTerms,
   buildContactSearchQuery,
   contactSearchCteSql,
+  contactSearchDriftSql,
 };

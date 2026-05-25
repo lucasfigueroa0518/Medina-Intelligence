@@ -123,6 +123,34 @@ function isHumanActionError(error: string): boolean {
   return /reauth|required|missing_token|missing token|no firefly key|credential missing|decrypt-failed|invalid_auth|account_inactive|not_authed|token_failed_threshold|permission|forbidden|revoked|invalid_grant/i.test(error);
 }
 
+function parseWorkQueuePayload(payload: string): Record<string, unknown> {
+  try {
+    return JSON.parse(payload || '{}') as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+async function isRepairBlockedByHumanAction(
+  env: Env,
+  row: { domain: string; payload: string; last_error?: string | null },
+  error: string
+): Promise<boolean> {
+  if (isHumanActionError(error)) return true;
+  if (!/token_refresh_failed/i.test(error)) return false;
+  const payload = parseWorkQueuePayload(row.payload);
+  const userId = typeof payload.user_id === 'string' ? payload.user_id : '';
+  if (!userId) return false;
+  const state = await env.KV.get<{ count: number; reason?: string; message?: string }>(
+    `token_failed:${userId}:outlook`,
+    'json'
+  ).catch(() => null);
+  return Boolean(state && (
+    state.count >= 3 ||
+    /reauth|required|missing_token|invalid_grant|revoked/i.test(`${state.reason || ''} ${state.message || ''}`)
+  ));
+}
+
 function workQueueSource(domain: string): IngestionSource {
   if (domain === 'calendar_refresh') return 'calendar';
   if (domain === 'firefly_window') return 'firefly';
@@ -447,8 +475,7 @@ export async function reportWorkQueueOutcome(
   error: string | null
 ): Promise<void> {
   const source = workQueueSource(row.domain);
-  let payload: Record<string, unknown> = {};
-  try { payload = JSON.parse(row.payload || '{}') as Record<string, unknown>; } catch { /* ignore */ }
+  const payload = parseWorkQueuePayload(row.payload);
   const userId = typeof payload.user_id === 'string' ? payload.user_id : '';
   const channelId = typeof payload.channel_id === 'string' ? payload.channel_id : '';
   const scopeType = channelId ? 'channel' : userId ? 'user' : 'work_item';
@@ -465,13 +492,16 @@ export async function reportWorkQueueOutcome(
     return;
   }
 
-  const human = isHumanActionError(error);
+  const human = await isRepairBlockedByHumanAction(env, row, error);
+  const code = human && /token_refresh_failed/i.test(error)
+    ? `${source}_reauth_required`
+    : `work_queue_${row.domain}_failed`;
   await reportIngestionFailure(env, {
     orgId: row.org_id,
     source,
     scopeType,
     scopeId: scId,
-    code: `work_queue_${row.domain}_failed`,
+    code,
     message: `${sourceTitle(source)} work item failed: ${truncate(error, 300)}`,
     severity: human ? 'critical' : 'warning',
     humanActionRequired: human,
@@ -543,7 +573,7 @@ export async function scanAndRepairIngestion(
   for (const row of deadLetters.results) {
     const error = row.last_error || 'dead_letter';
     await reportWorkQueueOutcome(env, row, error);
-    if (!isHumanActionError(error)) {
+    if (!(await isRepairBlockedByHumanAction(env, row, error))) {
       await env.D1.prepare(
         `UPDATE work_queue
             SET status = 'pending',

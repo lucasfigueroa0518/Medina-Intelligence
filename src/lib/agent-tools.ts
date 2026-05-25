@@ -23,6 +23,7 @@ import {
   contactSearchCteSql,
   ensureContactSearchIndexReady,
 } from './contact-search';
+import { safelyMaintainContactReadModels } from './contact-maintenance';
 
 export interface AgentToolContext {
   deepDive?: boolean;
@@ -46,6 +47,72 @@ function sweepLimit(inputLimit: number | undefined, toolContext?: AgentToolConte
     ? MAX_MODE_LIMITS.conversationSweepMax
     : NORMAL_MODE_LIMITS.structuredMax;
   return Math.min(Math.max(inputLimit ?? fallback, 1), max);
+}
+
+function conversationLookbackDays(
+  inputDays: number | undefined,
+  toolContext?: AgentToolContext
+): number | null {
+  if (typeof inputDays === 'number' && Number.isFinite(inputDays)) {
+    if (inputDays <= 0) return null;
+    return Math.min(Math.max(Math.floor(inputDays), 1), 3650);
+  }
+  const fallback = toolContext?.deepDive
+    ? MAX_MODE_LIMITS.conversationDaysBackDefault
+    : NORMAL_MODE_LIMITS.conversationDaysBackDefault;
+  return Math.min(Math.max(fallback, 1), 3650);
+}
+
+function conversationSearchRankSql(): string {
+  return `
+    CASE
+      WHEN lower(f.from_email) = ? THEN 0
+      WHEN lower(f.subject) = ? THEN 1
+      WHEN lower(f.from_email) LIKE ? THEN 2
+      WHEN lower(f.subject) LIKE ? THEN 3
+      WHEN lower(f.to_emails) LIKE ? THEN 4
+      WHEN lower(f.cc_emails) LIKE ? THEN 4
+      WHEN lower(f.participant_names) LIKE ? THEN 5
+      ELSE 10
+    END
+  `;
+}
+
+function conversationSearchRankBinds(query: NonNullable<ReturnType<typeof buildContactSearchQuery>>): unknown[] {
+  return [
+    query.normalized,
+    query.normalized,
+    query.prefix,
+    query.prefix,
+    query.contains,
+    query.contains,
+    query.contains,
+  ];
+}
+
+function conversationSearchCteSql(): string {
+  return `
+    WITH matched_conversations AS (
+      SELECT
+        f.conversation_id,
+        ${conversationSearchRankSql()} AS search_rank
+      FROM conversation_search_fts f
+      WHERE conversation_search_fts MATCH ?
+        AND f.org_id = ?
+    )
+  `;
+}
+
+function conversationSearchCteBinds(
+  query: NonNullable<ReturnType<typeof buildContactSearchQuery>>,
+  orgId: string
+): unknown[] {
+  return [...conversationSearchRankBinds(query), query.ftsMatch, orgId];
+}
+
+function isMissingConversationSearchFts(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /no such table:?\s*conversation_search_fts/i.test(message);
 }
 
 function normalizeEmail(value: unknown): string | null {
@@ -220,6 +287,7 @@ export async function searchConversations(
 ): Promise<any> {
   const where: string[] = ['c.org_id = ?'];
   const binds: unknown[] = [ctx.orgId];
+  const searchQuery = buildContactSearchQuery(input.keyword);
 
   if (input.source === 'firefly' || input.source === 'meeting' || input.source === 'meetings') {
     return {
@@ -240,23 +308,16 @@ export async function searchConversations(
     binds.push(input.direction);
   }
 
-  const daysBack = input.days_back || (
-    toolContext.deepDive
-      ? MAX_MODE_LIMITS.conversationDaysBackDefault
-      : NORMAL_MODE_LIMITS.conversationDaysBackDefault
-  );
-  where.push(`c.sent_at >= datetime('now', '-${Math.min(daysBack, 365)} days')`);
+  const daysBack = conversationLookbackDays(input.days_back, toolContext);
+  if (daysBack != null) {
+    where.push(`c.sent_at >= datetime('now', '-${daysBack} days')`);
+  }
 
   if (input.contact_id) {
     where.push(
       `(c.from_contact_id = ? OR c.id IN (SELECT conversation_id FROM conversation_contacts WHERE contact_id = ?))`
     );
     binds.push(input.contact_id, input.contact_id);
-  }
-
-  if (input.keyword) {
-    where.push('(c.subject LIKE ? OR c.body_preview LIKE ? OR c.from_email LIKE ? OR c.to_emails LIKE ? OR c.cc_emails LIKE ?)');
-    binds.push(`%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`, `%${input.keyword}%`);
   }
 
   const limit = structuredLimit(input.limit, toolContext);
@@ -266,30 +327,69 @@ export async function searchConversations(
     ? Math.min(limit * MAX_MODE_LIMITS.conversationOverfetchMultiplier, MAX_MODE_LIMITS.conversationFetchMax)
     : Math.min(limit * 2, 100);
 
-  const [result, sharingFlags] = await Promise.all([
-    env.D1.prepare(
-      `SELECT c.id, c.subject, c.from_email, c.direction, c.source, c.sent_at,
+  const cteSql = searchQuery ? conversationSearchCteSql() : '';
+  const fromSql = searchQuery
+    ? `FROM matched_conversations m
+       JOIN conversations c ON c.id = m.conversation_id`
+    : `FROM conversations c`;
+  const queryBinds = searchQuery
+    ? [...conversationSearchCteBinds(searchQuery, ctx.orgId), ...binds]
+    : binds;
+
+  const rowSql = (prefixSql: string, from: string, orderPrefix: string): string => (
+    `${prefixSql}
+     SELECT c.id, c.subject, c.from_email, c.direction, c.source, c.sent_at,
               c.body_preview, c.body_r2_key, c.sentiment, c.topics, c.action_items,
               c.to_emails, c.cc_emails, c.from_contact_id,
               c.participant_user_ids, c.is_campaign_email,
               c.external_message_id, sc.is_private AS slack_is_private,
               fc.full_name AS from_name
-       FROM conversations c
-       LEFT JOIN contacts fc ON c.from_contact_id = fc.id
-       LEFT JOIN slack_channels sc
-         ON c.source = 'slack'
-        AND sc.org_id = c.org_id
-        AND sc.channel_id = CASE
-          WHEN instr(c.external_message_id, ':') > 0
-          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
-          ELSE c.external_message_id
-        END
-       WHERE ${where.join(' AND ')}
-       ORDER BY c.sent_at DESC
-       LIMIT ?`
-    ).bind(...binds, fetchLimit).all(),
-    getSharingFlags(ctx.orgId, env),
-  ]);
+     ${from}
+     LEFT JOIN contacts fc ON c.from_contact_id = fc.id
+     LEFT JOIN slack_channels sc
+       ON c.source = 'slack'
+      AND sc.org_id = c.org_id
+      AND sc.channel_id = CASE
+        WHEN instr(c.external_message_id, ':') > 0
+        THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+        ELSE c.external_message_id
+      END
+     WHERE ${where.join(' AND ')}
+     ORDER BY ${orderPrefix} c.sent_at DESC
+     LIMIT ?`
+  );
+
+  let searchDegradedReason: string | null = null;
+  let result: any;
+  let sharingFlags: any;
+  try {
+    [result, sharingFlags] = await Promise.all([
+      env.D1.prepare(rowSql(cteSql, fromSql, searchQuery ? 'm.search_rank ASC,' : ''))
+        .bind(...queryBinds, fetchLimit)
+        .all(),
+      getSharingFlags(ctx.orgId, env),
+    ]);
+  } catch (error) {
+    if (!searchQuery || !isMissingConversationSearchFts(error)) throw error;
+    searchDegradedReason = 'conversation_search_fts_missing';
+    const legacyWhere = [
+      ...where,
+      '(c.subject LIKE ? OR c.body_preview LIKE ? OR c.from_email LIKE ? OR c.to_emails LIKE ? OR c.cc_emails LIKE ?)',
+    ];
+    const legacyBinds = [
+      ...binds,
+      searchQuery.contains,
+      searchQuery.contains,
+      searchQuery.contains,
+      searchQuery.contains,
+      searchQuery.contains,
+    ];
+    const legacySql = rowSql('', 'FROM conversations c', '').replace(where.join(' AND '), legacyWhere.join(' AND '));
+    [result, sharingFlags] = await Promise.all([
+      env.D1.prepare(legacySql).bind(...legacyBinds, fetchLimit).all(),
+      getSharingFlags(ctx.orgId, env),
+    ]);
+  }
 
   const conversations = (result.results as any[])
     .filter(c =>
@@ -349,7 +449,24 @@ export async function searchConversations(
     }
   }
 
-  return { conversations, count: conversations.length };
+  const timestamps = conversations
+    .map(c => c.sent_at)
+    .filter(Boolean)
+    .sort();
+
+  return {
+    conversations,
+    count: conversations.length,
+    coverage: {
+      days_back: daysBack,
+      all_time: daysBack == null,
+      keyword_terms: searchQuery?.terms || [],
+      oldest_returned_at: timestamps[0] || null,
+      newest_returned_at: timestamps[timestamps.length - 1] || null,
+      searched_with_fts: Boolean(searchQuery && !searchDegradedReason),
+      degraded_reason: searchDegradedReason,
+    },
+  };
 }
 
 type SearchEventsTimeframe = 'recent' | 'upcoming' | 'past' | 'recent_and_upcoming' | 'all';
@@ -1910,6 +2027,7 @@ export async function addNoteTool(
     await env.D1.prepare(
       "UPDATE contacts SET bio_summary = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?"
     ).bind(updated, input.entity_id).run();
+    await safelyMaintainContactReadModels(env, orgId, input.entity_id, 'contact_note_added');
 
     return { success: true, message: `Note added to contact "${contact.full_name}"` };
   }
@@ -2488,4 +2606,6 @@ async function setFieldLockHelper(
 export const __agentToolsTestHooks = {
   deriveEventKeywordTerms,
   cleanEventText,
+  conversationLookbackDays,
+  conversationSearchCteSql,
 };

@@ -5,6 +5,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { callClaude } from '../lib/claude';
 import { IMPORT_COLUMN_MAPPING_PROMPT } from '../prompts/import-mapping';
 import { isTextExtractionSupported } from '../lib/file-extraction';
+import { safelyMaintainContactReadModels } from '../lib/contact-maintenance';
 
 interface ImportJobRow {
   id: string;
@@ -730,6 +731,7 @@ async function processImport(id: string, orgId: string, env: Env): Promise<void>
             await env.D1.prepare(
               `UPDATE contacts SET ${fields.join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
             ).bind(...binds, contactId).run();
+            await safelyMaintainContactReadModels(env, orgId, contactId, 'csv_contact_updated');
           }
           updated++;
         } else {
@@ -748,6 +750,7 @@ async function processImport(id: string, orgId: string, env: Env): Promise<void>
               mapped.linkedin_url || null
             )
             .run();
+          await safelyMaintainContactReadModels(env, orgId, newId, 'csv_contact_created');
           created++;
         }
       } catch (e) {

@@ -11,6 +11,7 @@ import { persistDocument } from './persist-document';
 import { classifyByFilename } from './document-filename-classifier';
 import { enqueueDocumentEmbeddingRepair } from './document-embedding';
 import { isVerifiedContactCompanyAffiliation } from './contact-company-affiliation';
+import { safelyMaintainContactReadModels } from './contact-maintenance';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types
@@ -1146,6 +1147,7 @@ async function routeContact(
         companyIdForAssignment, companyIdForAssignment,
         match.matched_id, orgId
       ).run();
+      await safelyMaintainContactReadModels(env, orgId, match.matched_id, 'document_contact_updated');
     }
     return { created: false, updated: hasUpdates, skipped: false, id: match.matched_id };
   }
@@ -1183,6 +1185,8 @@ async function routeContact(
     extracted.confidence,
     now, now
   ).run();
+
+  await safelyMaintainContactReadModels(env, orgId, contactId, 'document_contact_created');
 
   return { created: true, updated: false, skipped: false, id: contactId };
 }
@@ -1682,7 +1686,10 @@ export async function processIntelligentImport(
           const sql = result.created
             ? 'UPDATE contacts SET company_id = ? WHERE id = ?'
             : 'UPDATE contacts SET company_id = ? WHERE id = ? AND company_id IS NULL';
-          await env.D1.prepare(sql).bind(companyId, result.id).run();
+          const assignment = await env.D1.prepare(sql).bind(companyId, result.id).run();
+          if (assignment.meta?.changes) {
+            await safelyMaintainContactReadModels(env, orgId, result.id, 'document_contact_company_linked');
+          }
         }
       }
     } catch (e: any) {

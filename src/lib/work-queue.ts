@@ -290,8 +290,8 @@ export async function recordHeartbeat(
  * have already transitioned via deadLetterWork" comment in the driver
  * was aspirational, not enforced.
  */
-export async function completeWork(env: Env, id: string): Promise<void> {
-  await env.D1.prepare(
+export async function completeWork(env: Env, id: string): Promise<boolean> {
+  const result = await env.D1.prepare(
     `UPDATE work_queue
         SET status       = 'completed',
             completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
@@ -299,6 +299,7 @@ export async function completeWork(env: Env, id: string): Promise<void> {
             last_error   = NULL
       WHERE id = ? AND status = 'in_progress'`
   ).bind(id).run();
+  return Number(result.meta?.changes || 0) > 0;
 }
 
 // ─── deferWork ─────────────────────────────────────────────────────

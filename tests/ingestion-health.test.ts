@@ -51,11 +51,11 @@ function makeD1Mock(options: {
   return d1;
 }
 
-function makeEnv(d1: any): any {
+function makeEnv(d1: any, kvValues: Record<string, unknown> = {}): any {
   return {
     D1: d1,
     KV: {
-      async get() { return null; },
+      async get(key: string) { return kvValues[key] ?? null; },
       async put() {},
       async delete() {},
     },
@@ -140,5 +140,32 @@ describe('ingestion health', () => {
       r.binds.includes('wq-1')
     )).toBe(true);
     expect(d1.runs.some((r: any) => r.sql.includes('INSERT INTO ingestion_incidents'))).toBe(true);
+  });
+
+  it('blocks repeated token refresh dead letters instead of requeueing forever', async () => {
+    const d1 = makeD1Mock({
+      deadLetters: [{
+        id: 'wq-auth',
+        org_id: 'org-1',
+        domain: 'calendar_refresh',
+        payload: JSON.stringify({ user_id: 'user-auth', window_id: 'win-1' }),
+        last_error: 'token_refresh_failed',
+        created_at: '2026-05-23T00:00:00.000Z',
+      }],
+    });
+
+    const result = await scanAndRepairIngestion('org-1', makeEnv(d1, {
+      'token_failed:user-auth:outlook': { count: 3, reason: 'reauth_required' },
+    }));
+
+    expect(result.dead_letters_requeued).toBe(0);
+    expect(d1.runs.some((r: any) =>
+      r.sql.includes('UPDATE work_queue') &&
+      r.sql.includes("status = 'pending'")
+    )).toBe(false);
+    const incidentInsert = d1.runs.find((r: any) => r.sql.includes('INSERT INTO ingestion_incidents'));
+    expect(incidentInsert?.binds).toContain('calendar_reauth_required');
+    expect(incidentInsert?.binds).toContain('critical');
+    expect(incidentInsert?.binds).toContain(1);
   });
 });

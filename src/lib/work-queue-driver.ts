@@ -243,7 +243,25 @@ export async function processClaimedWorkItem(
     // reclaimed while they are still actively writing.
     await withHeartbeat(env, item.id, AUTO_HEARTBEAT_INTERVAL_MS,
       () => handler.process(item, env));
-    await completeWork(env, item.id);
+    const completed = await completeWork(env, item.id);
+    if (!completed) {
+      const terminal = await env.D1.prepare(
+        `SELECT status, last_error FROM work_queue WHERE id = ?`
+      ).bind(item.id).first<{ status: string; last_error: string | null }>();
+      if (terminal?.status === 'dead_letter') {
+        try {
+          const { reportWorkQueueOutcome } = await import('./ingestion-health');
+          await reportWorkQueueOutcome(env, item, terminal.last_error || 'dead_letter');
+        } catch (e) {
+          console.error(
+            `[work-queue] ingestion-health explicit dead-letter report failed for ${item.id}:`,
+            e instanceof Error ? e.message : e
+          );
+        }
+        return { completed: false, failed: true, error: terminal.last_error || 'dead_letter' };
+      }
+      return { completed: false, failed: false };
+    }
     try {
       const { reportWorkQueueOutcome } = await import('./ingestion-health');
       await reportWorkQueueOutcome(env, item, null);

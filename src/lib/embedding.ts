@@ -326,6 +326,63 @@ export function buildVectorId(
   return `${orgPrefix}_${meta.source_table}_${compactSourceId}_${chunkIndex}`;
 }
 
+function compactText(value: unknown, max: number): string | undefined {
+  const text = String(value || '').trim();
+  if (!text) return undefined;
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+function addCompactMetadata(
+  out: Record<string, string | number | boolean>,
+  key: string,
+  value: unknown,
+  max = 240
+): void {
+  if (value == null) return;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    out[key] = value;
+    return;
+  }
+  if (typeof value === 'boolean') {
+    out[key] = value;
+    return;
+  }
+  const text = compactText(value, max);
+  if (text) out[key] = text;
+}
+
+export function compactVectorizeMetadata(
+  meta: ChunkMetadata,
+  chunkIndex: number,
+  totalChunks: number,
+  textPreview: string
+): Record<string, string | number | boolean> {
+  const out: Record<string, string | number | boolean> = {};
+  addCompactMetadata(out, 'org_id', meta.org_id, 80);
+  addCompactMetadata(out, 'user_id', meta.user_id, 80);
+  addCompactMetadata(out, 'visibility', meta.visibility, 32);
+  addCompactMetadata(out, 'participant_user_ids', meta.participant_user_ids, 800);
+  addCompactMetadata(out, 'document_type', meta.document_type, 80);
+  addCompactMetadata(out, 'source_table', meta.source_table, 80);
+  addCompactMetadata(out, 'source_id', meta.source_id, 120);
+  addCompactMetadata(out, 'r2_key', meta.r2_key, 500);
+  addCompactMetadata(out, 'created_at', meta.created_at, 80);
+  addCompactMetadata(out, 'primary_entity_id', meta.primary_entity_id, 120);
+  addCompactMetadata(out, 'secondary_entity_ids', meta.secondary_entity_ids, 800);
+  addCompactMetadata(out, 'reconciliation_status', meta.reconciliation_status, 80);
+  addCompactMetadata(out, 'speakers', meta.speakers, 500);
+  addCompactMetadata(out, 'primary_speaker', meta.primary_speaker, 160);
+  addCompactMetadata(out, 'entity_name', meta.entity_name, 220);
+  addCompactMetadata(out, 'deal_stage', meta.deal_stage, 80);
+  addCompactMetadata(out, 'date', meta.date, 80);
+  addCompactMetadata(out, 'chunk_index', chunkIndex);
+  addCompactMetadata(out, 'total_chunks', totalChunks);
+  addCompactMetadata(out, 'text_preview', textPreview, 200);
+  addCompactMetadata(out, 'embedding_model', 'bge-base-en-v1.5', 80);
+  addCompactMetadata(out, 'chunk_config_version', CURRENT_CHUNK_VERSION, 80);
+  return out;
+}
+
 export async function chunkEmbedAndPersist(
   text: string,
   meta: ChunkMetadata,
@@ -337,20 +394,19 @@ export async function chunkEmbedAndPersist(
   const vectorId = buildVectorId(meta, chunkIndex);
 
   const values = await runEmbedding(env, prefixedChunk, meta.org_id);
+  const metadata = compactVectorizeMetadata(
+    meta,
+    chunkIndex,
+    totalChunks,
+    prefixedChunk.substring(0, 200)
+  );
 
   await Promise.all([
     env.VECTORIZE.upsert([
       {
         id: vectorId,
         values,
-        metadata: {
-          ...meta,
-          chunk_index: chunkIndex,
-          total_chunks: totalChunks,
-          text_preview: prefixedChunk.substring(0, 200),
-          embedding_model: 'bge-base-en-v1.5',
-          chunk_config_version: CURRENT_CHUNK_VERSION,
-        },
+        metadata,
       },
     ]),
     // Retrying wrapper — bursty chunk writes (e.g., 15 chunks for a transcript

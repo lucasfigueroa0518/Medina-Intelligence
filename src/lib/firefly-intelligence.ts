@@ -19,6 +19,7 @@ import {
   PERSONAL_DOMAINS,
 } from './discovery';
 import { isValidContactName, toTitleCase } from './name-quality';
+import { safelyMaintainContactReadModels } from './contact-maintenance';
 
 export interface AutoContactResult {
   contactId: string;
@@ -118,6 +119,7 @@ export async function autoCreateContactFromAttendee(args: {
   }
 
   console.log(`[firefly-intel] auto-created contact ${cleanName} <${normalized}> id=${contactId} company=${companyId || 'none'}`);
+  await safelyMaintainContactReadModels(env, orgId, contactId, 'firefly_contact_created');
   return { contactId, created: true, companyId };
 }
 

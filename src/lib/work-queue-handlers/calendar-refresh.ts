@@ -40,6 +40,7 @@
 
 import type { Env } from '../../types/env';
 import type { WorkQueueHandler } from '../work-queue-driver';
+import { deadLetterWork } from '../work-queue';
 import { refreshOutlookToken } from '../../integrations/oauth';
 import { getDecryptedAccessToken } from '../helpers';
 import { upsertOutlookEvent } from '../reconciliation';
@@ -88,7 +89,13 @@ export const calendarRefreshHandler: WorkQueueHandler = {
     // System Status DLQ.
     const refreshResult = await refreshOutlookToken(user_id, item.org_id, env);
     if (!refreshResult.success) {
-      throw new Error('token_refresh_failed');
+      const reason = refreshResult.reason || refreshResult.errorCode || 'unknown';
+      const message = `token_refresh_failed:${reason}`;
+      if (/reauth_required|missing_token|invalid_grant|revoked|permission|forbidden/i.test(reason)) {
+        await deadLetterWork(env, item.id, message);
+        return;
+      }
+      throw new Error(message);
     }
     let token: string;
     try {
