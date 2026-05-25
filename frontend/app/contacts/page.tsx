@@ -274,6 +274,9 @@ function ContactsPage() {
       })
       .catch(error => {
         if ((error as any)?.name === 'AbortError') return;
+        if (requestSeq !== contactsRequestSeqRef.current) return;
+        setContacts([]);
+        setTotal(0);
         setToast('Unable to load contacts');
       })
       .finally(() => {

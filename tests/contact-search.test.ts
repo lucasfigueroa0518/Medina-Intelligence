@@ -5,6 +5,7 @@ const {
   normalizeContactSearchText,
   extractContactSearchTerms,
   buildContactSearchQuery,
+  contactSearchCteSql,
 } = __contactSearchTestHooks;
 
 describe('contact search query normalization', () => {
@@ -34,5 +35,9 @@ describe('contact search query normalization', () => {
   it('ignores one-character queries so the UI can fall back to normal listing', () => {
     expect(buildContactSearchQuery('a')).toBeNull();
     expect(buildContactSearchQuery('  ! ')).toBeNull();
+  });
+
+  it('does not use bm25 in the CTE because D1 rejects it in this context', () => {
+    expect(contactSearchCteSql()).not.toContain('bm25(');
   });
 });

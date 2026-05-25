@@ -99,7 +99,7 @@ export function contactSearchCteSql(): string {
       SELECT
         f.contact_id,
         ${contactSearchRankSql()} AS search_rank,
-        bm25(contact_search_fts, 8.0, 6.0, 4.0, 1.0, 1.0, 3.0, 5.0, 5.0, 2.0, 1.0, 1.0, 3.0) AS fts_rank
+        0 AS fts_rank
       FROM contact_search_fts f
       WHERE contact_search_fts MATCH ?
         AND f.org_id = ?
@@ -491,4 +491,5 @@ export const __contactSearchTestHooks = {
   normalizeContactSearchText,
   extractContactSearchTerms,
   buildContactSearchQuery,
+  contactSearchCteSql,
 };
