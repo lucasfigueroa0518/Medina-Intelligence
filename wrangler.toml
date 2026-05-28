@@ -28,8 +28,11 @@ CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
 GEMINI_MAX_RPM = "500"
 ALLOWED_ORIGINS = "https://medinaventures.ai,https://www.medinaventures.ai,http://localhost:3000"
 FRONTEND_URL = "https://medinaventures.ai"
+INTERNAL_DOMAINS = "medinavc.com,medinacapital.com"
 DECK_RENDERER_ENABLED = "true"
 DECK_RENDERER_PROVIDER = "cloudflare"
+OUTLOOK_AUTH_MODE = "app_only"
+INTERNAL_DOMAINS = "medinavc.com,medinacapital.com"
 
 [browser]
 binding = "BROWSER"
@@ -88,20 +91,13 @@ index_name = "medina-rag-v2-minilm-384"
 # workflow class binding; on deploy, CF reconciles ownership to
 # pipelines (the only remaining declarer).
 #
-# Side effects on api Worker:
-#   • env.INGESTION_WORKFLOW / env.ENRICHMENT_WORKFLOW /
-#     env.CAMPAIGN_WORKFLOW / etc. bindings no longer exist on api
-#   • 3 endpoints break at runtime until follow-up service-binding
-#     refactor lands tomorrow:
-#       POST /api/admin/trigger-ingestion (admin.ts:465)
-#       POST /api/admin/trigger-sync     (admin.ts:543)
-#       POST /api/campaigns/:id/send     (campaigns.ts:141)
-#   • Tony/Alvaro hold campaign sends for ~45 min during this window
-#     (Slack coordination 2026-05-06)
-#
-# Tomorrow's follow-up: add `[[services]] PIPELINES` binding to this
-# config + small `triggerWorkflow` method on pipelines + refactor the
-# 3 sites to call via service binding. Restores admin + campaign send.
+# The api Worker dispatches manual/admin workflow starts through the
+# pipelines Worker service binding instead of owning workflow bindings.
+
+[[services]]
+binding = "PIPELINES"
+service = "medina-ventures-pipelines"
+entrypoint = "PipelinesEntrypoint"
 
 # --- Cron Triggers ---
 #
