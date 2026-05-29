@@ -1395,6 +1395,10 @@ function shouldCheckSlackFreshness(input: { query: string; source_types?: string
   return Boolean(input.source_types?.includes('slack') || queryMentionsSlack(input.query));
 }
 
+function shouldUseDeterministicSlackRecentFallback(input: { query: string; source_types?: string[] }): boolean {
+  return shouldCheckSlackFreshness(input) && queryAsksForRecent(input.query);
+}
+
 function shouldUseSlackFreshnessFallback(freshness: RagV2FreshnessRow | null): boolean {
   if (!freshness || freshness.total_sources <= 0) return false;
   if (!freshness.latest_indexed_source_at) return true;
@@ -1573,7 +1577,15 @@ export async function recall(
   if (shouldCheckSlackFreshness(input)) {
     try {
       const slackFreshness = await getRagV2SourceFreshness(env, ctx.orgId, 'slack', { sourceTable: 'conversations' });
-      if (shouldUseSlackFreshnessFallback(slackFreshness)) {
+      const useDeterministicRecentFallback = shouldUseDeterministicSlackRecentFallback(input);
+      const useFreshnessFallback = shouldUseSlackFreshnessFallback(slackFreshness);
+      const scopedSlackMiss = Boolean(
+        input.source_types?.includes('slack') &&
+        filtered.filter(s => s.type === 'slack').length === 0 &&
+        slackFreshness &&
+        slackFreshness.total_sources > 0
+      );
+      if (useDeterministicRecentFallback || useFreshnessFallback || scopedSlackMiss) {
         const existingSourceIds = new Set(
           filtered
             .filter(s => s.type === 'slack')
@@ -1588,18 +1600,33 @@ export async function recall(
           nextSourceId
         );
         if (fallbackSources.length > 0) {
-          filtered = queryAsksForRecent(input.query)
+          filtered = useDeterministicRecentFallback
             ? [...fallbackSources, ...filtered]
             : [...filtered, ...fallbackSources];
           freshnessFallback = {
             source_family: 'slack',
-            reason: 'rag_v2_slack_freshness_lag',
+            reason: useDeterministicRecentFallback
+              ? 'deterministic_slack_recency'
+              : useFreshnessFallback
+                ? 'rag_v2_slack_freshness_lag'
+                : 'rag_v2_slack_semantic_miss',
             added_sources: fallbackSources.length,
+            deterministic_slack_fallback_count: useDeterministicRecentFallback ? fallbackSources.length : 0,
             latest_source_at: slackFreshness?.latest_source_at || null,
             latest_indexed_source_at: slackFreshness?.latest_indexed_source_at || null,
             freshness_lag_ms: slackFreshness?.freshness_lag_ms ?? null,
             missing_sources: slackFreshness?.missing_sources ?? null,
             incomplete_sources: slackFreshness?.incomplete_sources ?? null,
+          };
+        } else if (scopedSlackMiss || useDeterministicRecentFallback) {
+          freshnessFallback = {
+            source_family: 'slack',
+            reason: 'rag_v2_slack_fallback_empty',
+            added_sources: 0,
+            deterministic_slack_fallback_count: 0,
+            latest_source_at: slackFreshness?.latest_source_at || null,
+            latest_indexed_source_at: slackFreshness?.latest_indexed_source_at || null,
+            retrieval_warning: 'Slack rows exist, but no readable deterministic Slack fallback rows were available for this user.',
           };
         }
       }
@@ -1630,6 +1657,7 @@ export async function recall(
     limit,
     max_mode: !!toolContext.deepDive,
     freshness_fallback: freshnessFallback,
+    deterministic_slack_fallback_count: freshnessFallback?.deterministic_slack_fallback_count ?? 0,
   });
 
   return {
@@ -1646,9 +1674,13 @@ export async function recall(
       internal_doc_type_counts: internalDocTypeCounts,
       news_count: result.news.length,
       freshness_fallback: freshnessFallback,
+      deterministic_slack_fallback_count: freshnessFallback?.deterministic_slack_fallback_count ?? 0,
     },
     current_date: new Date().toISOString(),
     timeline_note: 'Dates are source dates. Relative phrases in excerpts such as "next week", "currently", "today", or "now" are relative to each source date, not the current date.',
+    message: trimmed.length === 0 && freshnessFallback?.retrieval_warning
+      ? freshnessFallback.retrieval_warning
+      : undefined,
     sources: trimmed.map(s => ({
       id: s.id,
       type: s.type,
@@ -2757,5 +2789,6 @@ export const __agentToolsTestHooks = {
   conversationSearchCteSql,
   shouldCheckSlackFreshness,
   shouldUseSlackFreshnessFallback,
+  shouldUseDeterministicSlackRecentFallback,
   queryAsksForRecent,
 };

@@ -44,6 +44,10 @@ describe('agent tool source contracts', () => {
       source_types: ['slack'],
     })).toBe(true);
     expect(__agentToolsTestHooks.queryAsksForRecent('what is the latest Slack message?')).toBe(true);
+    expect(__agentToolsTestHooks.shouldUseDeterministicSlackRecentFallback({
+      query: 'what is the most recent Slack message?',
+      source_types: ['slack'],
+    })).toBe(true);
     expect(__agentToolsTestHooks.shouldUseSlackFreshnessFallback({
       source_family: 'slack',
       source_table: 'conversations',

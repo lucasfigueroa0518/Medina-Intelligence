@@ -942,7 +942,7 @@ export async function hydrateRagV2Matches(
 export function fuseHybridCandidates(
   dense: DenseCandidate[],
   lexical: LexicalCandidate[],
-  weights: { denseBroad?: number; denseEntity?: number; lexical?: number } = {}
+  weights: { denseBroad?: number; denseEntity?: number; denseTargeted?: number; lexical?: number } = {}
 ): HybridCandidate[] {
   const byChunk = new Map<string, HybridCandidate>();
   const add = (
@@ -976,7 +976,11 @@ export function fuseHybridCandidates(
       candidate.source,
       candidate.rank,
       candidate.score,
-      candidate.source === 'vectorize_entity' ? weights.denseEntity ?? 1.2 : weights.denseBroad ?? 1.0,
+      candidate.source === 'vectorize_targeted'
+        ? weights.denseTargeted ?? 1.5
+        : candidate.source === 'vectorize_entity'
+          ? weights.denseEntity ?? 1.2
+          : weights.denseBroad ?? 1.0,
       'dense'
     );
   }
@@ -1044,18 +1048,34 @@ export async function queryDenseRagV2Candidates(
   queryEmbedding: number[],
   profileId: EmbeddingProfileId,
   entityIds: string[],
-  options: { entityLimit?: number; entityTopK?: number; broadTopK?: number } = {}
+  options: {
+    entityLimit?: number;
+    entityTopK?: number;
+    broadTopK?: number;
+    targetedTopK?: number;
+    documentTypes?: string[];
+    sourceFamilies?: string[];
+  } = {}
 ): Promise<DenseCandidate[]> {
   const index = getVectorBinding(env, profileId);
   if (!index) return [];
-  const filter = { org_id: orgId, document_type: { $nin: ['news'] } } as any;
+  const scopedDocumentTypes = Array.from(new Set((options.documentTypes || []).filter(Boolean)));
+  const scopedSourceFamilies = Array.from(new Set((options.sourceFamilies || []).filter(Boolean)));
+  const hasScopedFilter = scopedDocumentTypes.length > 0 || scopedSourceFamilies.length > 0;
+  const filter = { org_id: orgId } as any;
+  if (scopedDocumentTypes.length === 1) filter.document_type = scopedDocumentTypes[0];
+  else if (scopedDocumentTypes.length > 1) filter.document_type = { $in: scopedDocumentTypes };
+  else filter.document_type = { $nin: ['news'] };
+  if (scopedSourceFamilies.length === 1) filter.source_family = scopedSourceFamilies[0];
+  else if (scopedSourceFamilies.length > 1) filter.source_family = { $in: scopedSourceFamilies };
   const broadTopK = Math.max(1, Math.min(options.broadTopK ?? 100, 100));
+  const targetedTopK = Math.max(1, Math.min(options.targetedTopK ?? broadTopK, 100));
   const entityTopK = Math.max(1, Math.min(options.entityTopK ?? 50, 50));
   const entityLimit = Math.max(0, options.entityLimit ?? 10);
 
   const results = await Promise.all([
     index.query(queryEmbedding, {
-      topK: broadTopK,
+      topK: hasScopedFilter ? targetedTopK : broadTopK,
       filter,
       returnValues: false,
       returnMetadata: 'indexed',
@@ -1084,7 +1104,7 @@ export async function queryDenseRagV2Candidates(
       });
     });
   };
-  add(results[0]?.matches || [], 'vectorize_broad');
+  add(results[0]?.matches || [], hasScopedFilter ? 'vectorize_targeted' : 'vectorize_broad');
   for (const result of results.slice(1)) add(result?.matches || [], 'vectorize_entity');
   return candidates;
 }

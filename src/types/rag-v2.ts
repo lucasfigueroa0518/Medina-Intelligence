@@ -95,7 +95,7 @@ export interface DenseCandidate {
   vectorId: string;
   score: number;
   rank: number;
-  source: 'vectorize_broad' | 'vectorize_entity';
+  source: 'vectorize_broad' | 'vectorize_entity' | 'vectorize_targeted';
 }
 
 export interface HybridCandidate {

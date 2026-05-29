@@ -358,6 +358,33 @@ function sourceFamilyForDocType(docType: string): string {
   return 'documents';
 }
 
+function sourceFamiliesForForcedDocTypes(docTypes: string[]): string[] {
+  const byDocType: Record<string, string> = {
+    email: 'emails',
+    conversation: 'slack',
+    transcript: 'transcripts',
+    document: 'documents',
+  };
+  return Array.from(new Set(docTypes.map(docType => byDocType[docType]).filter(Boolean)));
+}
+
+function targetedVectorIdsForRagV2(
+  denseCandidates: Array<{ source: string; chunkId: string }>,
+  vectorMatches: VectorMatch[]
+): Set<string> | undefined {
+  const targetedChunkIds = new Set(
+    denseCandidates
+      .filter(candidate => candidate.source === 'vectorize_targeted')
+      .map(candidate => candidate.chunkId)
+  );
+  if (targetedChunkIds.size === 0) return undefined;
+  return new Set(
+    vectorMatches
+      .filter(match => targetedChunkIds.has(String(match.metadata.rag_chunk_id || '')))
+      .map(match => String(match.id))
+  );
+}
+
 function selectHydrationCandidates(
   chunks: VectorMatch[],
   limit: number,
@@ -460,6 +487,8 @@ async function retrieveContextV2(
   const queryEmbedding = embeddingProfile === 'bge-base-en-v1.5:cls:v3'
     ? pq.embeddedQuery
     : await runEmbeddingForProfile(env, pq.originalQuery, pq.orgId, embeddingProfile);
+  const forcedDocTypes = Array.from(new Set((options.forceDocTypes || []).filter(Boolean)));
+  const forcedSourceFamilies = sourceFamiliesForForcedDocTypes(forcedDocTypes);
 
   const denseStart = Date.now();
   const denseCandidates = await queryDenseRagV2Candidates(
@@ -473,16 +502,26 @@ async function retrieveContextV2(
           entityLimit: MAX_MODE_LIMITS.ragV1EntityFanout,
           entityTopK: 50,
           broadTopK: 100,
+          targetedTopK: 100,
+          documentTypes: forcedDocTypes.length > 0 ? forcedDocTypes : undefined,
+          sourceFamilies: forcedSourceFamilies.length > 0 ? forcedSourceFamilies : undefined,
         }
-      : undefined
+      : {
+          targetedTopK: 100,
+          documentTypes: forcedDocTypes.length > 0 ? forcedDocTypes : undefined,
+          sourceFamilies: forcedSourceFamilies.length > 0 ? forcedSourceFamilies : undefined,
+        }
   );
   const denseMs = Date.now() - denseStart;
+  const targetedDenseCount = denseCandidates.filter(candidate => candidate.source === 'vectorize_targeted').length;
 
   const lexicalStart = Date.now();
   const lexicalSharingFlags = await getSharingFlags(pq.orgId, env);
   const lexicalCandidates = await searchRagChunksD1Fts(env, pq.originalQuery, {
     orgId: pq.orgId,
     topK: options.deepDive ? MAX_MODE_LIMITS.ragV2LexicalTopK : 100,
+    documentTypes: forcedDocTypes.length > 0 ? forcedDocTypes : undefined,
+    sourceFamilies: forcedSourceFamilies.length > 0 ? forcedSourceFamilies : undefined,
     entityIds: pq.entityIds,
     userId: pq.userId,
     userRole: pq.userRole,
@@ -495,11 +534,13 @@ async function retrieveContextV2(
     fuseHybridCandidates(denseCandidates, lexicalCandidates, {
       denseBroad: 1.0,
       denseEntity: 1.2,
+      denseTargeted: 1.6,
       lexical: 1.0,
     }),
     options.deepDive ? MAX_MODE_LIMITS.ragV2FusionCandidates : 50
   );
   const vectorMatches = await buildRagV2VectorMatches(env, embeddingProfile, fused);
+  const targetedVectorIds = targetedVectorIdsForRagV2(denseCandidates, vectorMatches);
   const aclFiltered = await filterMatchesByAuthoritativeAcl(vectorMatches, pq, env);
   const fusionMs = Date.now() - fusionStart;
 
@@ -516,11 +557,12 @@ async function retrieveContextV2(
     pq.originalQuery,
     pq.orgId,
     env,
-    undefined,
+    targetedVectorIds,
     options.deepDive
       ? {
           outputLimit: MAX_MODE_LIMITS.ragV2RerankOutput,
           batchSize: MAX_MODE_LIMITS.rerankBatchSize,
+          targetedReserve: MAX_MODE_LIMITS.rerankTargetedReserve,
         }
       : undefined
   );
@@ -567,7 +609,18 @@ async function retrieveContextV2(
     aclAllowedCount: aclFiltered.length,
     rerankerInputCount: hydrated.length,
     rerankerOutputCount: reranked.length,
-    hydrationSummary,
+    hydrationSummary: {
+      ...hydrationSummary,
+      retrieval_scope: {
+        force_doc_types: forcedDocTypes,
+        source_families: forcedSourceFamilies,
+        targeted_dense_count: targetedDenseCount,
+        targeted_vector_count: targetedVectorIds?.size || 0,
+        targeted_lexical_count: forcedDocTypes.length > 0 || forcedSourceFamilies.length > 0
+          ? lexicalCandidates.length
+          : 0,
+      },
+    },
     topCandidates: aclFiltered.slice(0, 12).map(match => ({
       chunkId: match.id,
       score: match.score,
@@ -575,6 +628,7 @@ async function retrieveContextV2(
         source_table: match.metadata.source_table,
         source_id: match.metadata.source_id,
         document_type: match.metadata.document_type,
+        source_family: match.metadata.source_family,
       },
     })),
     latencies: {
@@ -2071,4 +2125,9 @@ export const TOKEN_BUDGET = {
   news: 2000,
   query: 1000,
   buffer: 4000,
+};
+
+export const __retrievalTestHooks = {
+  sourceFamiliesForForcedDocTypes,
+  targetedVectorIdsForRagV2,
 };
