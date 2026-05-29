@@ -54,6 +54,10 @@ function makeD1Mock(options: {
 function makeEnv(d1: any, kvValues: Record<string, unknown> = {}): any {
   return {
     D1: d1,
+    AZURE_CLIENT_ID: 'client-id',
+    AZURE_TENANT_ID: 'tenant-id',
+    AZURE_CLIENT_CERT_PRIVATE_KEY: 'pem',
+    AZURE_CLIENT_CERT_THUMBPRINT: 'thumbprint',
     KV: {
       async get(key: string) { return kvValues[key] ?? null; },
       async put() {},

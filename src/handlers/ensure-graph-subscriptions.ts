@@ -8,32 +8,23 @@
 // failure mode they can't see and didn't cause.
 //
 // This endpoint exposes the existing server-side primitive
-// `ensureSubscriptionsForUser` as an owner-only admin operation. The
-// stored refresh_token is offline_access scoped (~90-day persistence)
-// and survives long after the access_token expires, so we can mint
-// fresh subs without any user interaction as long as the refresh_token
-// hasn't been revoked.
+// `ensureSubscriptionsForUser` as an owner-only admin operation. In app-only
+// mode this uses the tenant certificate and the user's configured mailbox
+// target, with no user refresh token or reconnect path.
 //
-// Establishes the architectural pattern: users never reauth for
-// subscription failures — only for genuine OAuth grant revocations
-// (password change, IT policy, 90-day inactivity).
+// Establishes the architectural pattern: users never reauth for subscription
+// failures under the normal app-only Outlook path.
 //
 // POST /api/admin/ensure-graph-subscriptions
 // Body (optional): { user_id?: string } — defaults to ctx.userId
 // Returns:
 //   { ok: true, user_id, subs: [...] } on success
-//   { ok: false, reason: 'refresh_token_invalid' | 'unknown_error', detail? } on failure
+//   { ok: false, reason: 'app_only_subscription_create_failed' | 'unknown_error', detail? } on failure
 
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
-import { ensureSubscriptionsForUser } from '../lib/graph-subscriptions';
-
-const EXPECTED_RESOURCES = [
-  'me/mailFolders/inbox/messages',
-  'me/mailFolders/sentitems/messages',
-  'me/events',
-];
+import { ensureSubscriptionsForUser, expectedSubscriptionResourcesForMailbox } from '../lib/graph-subscriptions';
 
 interface RequestBody {
   user_id?: string;
@@ -55,12 +46,12 @@ export async function handleEnsureGraphSubscriptions(
   // for a user in org B. The check also confirms the target user is
   // active (deleted_at IS NULL).
   const target = await env.D1.prepare(
-    `SELECT id, email FROM users
+    `SELECT id, email, outlook_mailbox FROM users
        WHERE id = ? AND org_id = ? AND deleted_at IS NULL
        LIMIT 1`
   )
     .bind(targetUserId, ctx.orgId)
-    .first<{ id: string; email: string }>();
+    .first<{ id: string; email: string; outlook_mailbox: string | null }>();
 
   if (!target) {
     return errorResponse(
@@ -100,23 +91,27 @@ export async function handleEnsureGraphSubscriptions(
     .all<{ subscription_id: string; resource: string; expiration_at: string; updated_at: string }>();
 
   const afterResources = new Set(after.results.map(r => r.resource));
-  const missing = EXPECTED_RESOURCES.filter(r => !afterResources.has(r));
+  const targetMailbox = (target.outlook_mailbox || target.email || '').trim().toLowerCase();
+  const expectedResources = targetMailbox
+    ? expectedSubscriptionResourcesForMailbox(targetMailbox)
+    : [];
+  const missing = expectedResources.filter(r => !afterResources.has(r));
 
   // If any of the 3 expected resources is still missing after the call,
-  // the create-subscription path failed — almost always because
-  // refreshOutlookToken returned { success: false }, which means
-  // Microsoft rejected the stored refresh_token. Surface that reason
-  // explicitly so the caller knows to fall back to user-facing reauth.
+  // the create-subscription path failed. In app-only mode this means tenant
+  // config, Exchange scope, webhook URL, or Graph subscription permissions
+  // need operator attention.
   if (missing.length > 0) {
     return jsonResponse({
       ok: false,
-      reason: 'refresh_token_invalid',
+      reason: 'app_only_subscription_create_failed',
       detail:
         `Expected resources still missing after ensureSubscriptionsForUser: ` +
         missing.join(', ') +
-        ` — Microsoft likely rejected the stored refresh_token. User must reauth via OAuth.`,
+        ` — check app-only Graph subscription permissions, Exchange scope, and webhook URL.`,
       user_id: targetUserId,
       user_email: target.email,
+      target_mailbox: targetMailbox,
       subs_present: after.results,
     });
   }
@@ -125,6 +120,7 @@ export async function handleEnsureGraphSubscriptions(
     ok: true,
     user_id: targetUserId,
     user_email: target.email,
+    target_mailbox: targetMailbox,
     subs_existing_before: [...beforeResources],
     subs_present_after: after.results,
   });

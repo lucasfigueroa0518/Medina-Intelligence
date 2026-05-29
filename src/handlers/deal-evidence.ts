@@ -35,6 +35,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
 import { canReadConversationContent, getSharingFlags } from '../lib/helpers';
+import { conversationAclSql } from '../lib/email-derived-visibility';
 
 /* Phase F — manual-link candidate search.
  *
@@ -64,6 +65,7 @@ export async function getDealEvidenceCandidates(
   const out: any[] = [];
 
   if (type === 'conversation' || type === 'all') {
+    const acl = conversationAclSql('conv', ctx, sharingFlags, 'sc.is_private');
     const rows = await env.D1.prepare(
       `SELECT conv.id, conv.subject, conv.sent_at, conv.from_email, conv.from_name,
               conv.body_preview, conv.source AS conv_source, conv.participant_user_ids,
@@ -82,10 +84,11 @@ export async function getDealEvidenceCandidates(
           END
         WHERE conv.org_id = ?
           AND cd.deal_id IS NULL
+          AND ${acl.sql}
           AND (lower(conv.subject) LIKE ? OR lower(conv.body_preview) LIKE ?)
         ORDER BY conv.sent_at DESC
         LIMIT ?`
-    ).bind(dealId, ctx.orgId, qPattern, qPattern, limit).all<any>();
+    ).bind(dealId, ctx.orgId, ...acl.binds, qPattern, qPattern, limit).all<any>();
     for (const r of rows.results) {
       const canRead = canReadConversationContent(
         {

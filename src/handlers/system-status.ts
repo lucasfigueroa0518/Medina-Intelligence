@@ -39,6 +39,11 @@ import {
 } from '../lib/marty-lab';
 import { canViewMartySandbox } from '../lib/marty-sandbox-access';
 import { getRagV2Status } from '../lib/rag-v2';
+import {
+  filterOutlookIncidentsForUserReports,
+  getOutlookAppOnlyHealthSnapshot,
+  type OutlookAppOnlyHealthSnapshot,
+} from '../lib/outlook-app-only-health';
 
 export interface SystemStatusActiveTask {
   type: string;                  // human-readable
@@ -101,6 +106,7 @@ export interface SystemStatusResponse {
   work_queue_inventory: WorkQueueDomainCount[];
   stuck_work_queue: StuckWorkQueueRow[];
   ingestion_incidents: IngestionIncident[];
+  outlook_app_only_health: OutlookAppOnlyHealthSnapshot;
   marty_lab: MartyLabStatusSnapshot;
   deal_replay: DealReplayStatusSnapshot;
   rag_v2: Record<string, unknown>;
@@ -218,6 +224,7 @@ export async function getSystemStatus(
     eventTotalRow, eventEmbeddedRow, attendeeRow,
     userRow, userMissingRows,
     snapshot,
+    outlookHealth,
     martyLab,
     dealReplay,
   ] = await Promise.all([
@@ -275,17 +282,18 @@ export async function getSystemStatus(
     ).bind(orgId).first<{ total: number; linked: number }>(),
     env.D1.prepare(
       `SELECT COUNT(*) as total,
-              COUNT(CASE WHEN outlook_token IS NOT NULL THEN 1 END) as connected
+              COUNT(CASE WHEN COALESCE(outlook_mailbox, email) IS NOT NULL THEN 1 END) as connected
          FROM users WHERE org_id = ? AND deleted_at IS NULL`
     ).bind(orgId).first<{ total: number; connected: number }>(),
     env.D1.prepare(
       `SELECT full_name, email FROM users
-        WHERE org_id = ? AND outlook_token IS NULL AND deleted_at IS NULL
+        WHERE org_id = ? AND COALESCE(outlook_mailbox, email) IS NULL AND deleted_at IS NULL
         ORDER BY full_name`
     ).bind(orgId).all<{ full_name: string | null; email: string }>(),
     // Phase 1: observability surface. Returns
     // { pipelines, dead_letter, stuck_runs, budgets, generated_at }.
     getSystemStatusSnapshot(env, orgId),
+    getOutlookAppOnlyHealthSnapshot(orgId, env, { includeGraphProbes: true }),
     // MARTy Human Conversation Lab cockpit. This is sandbox visibility
     // only: experiments and candidate upgrades are tracked here without
     // mutating the live assistant.
@@ -347,7 +355,8 @@ export async function getSystemStatus(
     stuck_runs: snapshot.stuck_runs,
     budgets: snapshot.budgets,
     firefly_credentials: snapshot.firefly_credentials,
-    ingestion_incidents: snapshot.ingestion_incidents,
+    ingestion_incidents: filterOutlookIncidentsForUserReports(snapshot.ingestion_incidents, outlookHealth),
+    outlook_app_only_health: outlookHealth,
     work_queue_inventory: workQueueInventory,
     stuck_work_queue: stuckWorkQueue,
     marty_lab: martyLab,

@@ -30,6 +30,7 @@ export interface User {
   avatar_url?: string | null;
   role: 'owner' | 'admin' | 'member' | 'super_admin';
   outlook_token?: string | null;
+  outlook_mailbox?: string | null;
   slack_token?: string | null;
   outlook_delta_token?: string | null;
   is_active: number;

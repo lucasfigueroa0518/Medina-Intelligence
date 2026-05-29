@@ -1,16 +1,5 @@
 import type { Env } from '../types/env';
 import { sendViaOutlook } from '../integrations/outlook-send';
-import { refreshOutlookToken } from '../integrations/oauth';
-
-async function getSystemSenderUserId(orgId: string, env: Env): Promise<string | null> {
-  const row = await env.D1.prepare(
-    `SELECT id FROM users
-     WHERE org_id = ? AND outlook_token IS NOT NULL AND is_active = 1 AND deleted_at IS NULL
-     ORDER BY role = 'owner' DESC, created_at ASC
-     LIMIT 1`
-  ).bind(orgId).first<{ id: string }>();
-  return row?.id ?? null;
-}
 
 function buildResetHtml(fullName: string, resetUrl: string): string {
   return `
@@ -47,22 +36,11 @@ export async function sendResetEmail(
   env: Env
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const senderUserId = await getSystemSenderUserId(orgId, env);
-    if (!senderUserId) {
-      console.error(`[reset-email] No user with Outlook token in org ${orgId}`);
-      return { ok: false, error: 'No system sender available' };
-    }
-
-    const refreshResult = await refreshOutlookToken(senderUserId, orgId, env);
-    if (!refreshResult.success) {
-      console.error(`[reset-email] Token refresh failed for sender ${senderUserId}`);
-      return { ok: false, error: 'Failed to refresh sender token' };
-    }
-
     const html = buildResetHtml(fullName, resetUrl);
     const result = await sendViaOutlook(
       {
-        senderUserId,
+        senderUserId: 'system',
+        orgId,
         subject: 'Reset your Medina Intelligence password',
         body: html,
         toEmail,

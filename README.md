@@ -156,9 +156,12 @@ npx wrangler secret put GOOGLE_GEMINI_API_KEY       # optional, enables gemini e
 
 # Microsoft Graph (Outlook mail + calendar)
 npx wrangler secret put AZURE_CLIENT_ID
-npx wrangler secret put AZURE_CLIENT_SECRET
-npx wrangler secret put AZURE_TENANT_ID             # "common" for multi-tenant
-npx wrangler secret put AZURE_REDIRECT_URI          # e.g. https://<worker>/auth/outlook/callback
+npx wrangler secret put AZURE_TENANT_ID             # tenant UUID
+npx wrangler secret put AZURE_CLIENT_CERT_PRIVATE_KEY
+npx wrangler secret put AZURE_CLIENT_CERT_THUMBPRINT
+npx wrangler secret put OUTLOOK_SYSTEM_SENDER_EMAIL
+# Optional when AZURE_REDIRECT_URI is local/http: public HTTPS base for Graph webhooks
+npx wrangler secret put OUTLOOK_WEBHOOK_BASE_URL    # e.g. https://<worker>
 
 # Slack
 npx wrangler secret put SLACK_CLIENT_ID
@@ -248,10 +251,14 @@ Then open http://localhost:3000, sign up (uses `DEFAULT_SIGNUP_ORG_ID` if set, o
 | `TOKEN_ENCRYPTION_KEY` | secret | yes | AES-GCM key for OAuth token storage | `openssl rand -base64 32` (32-byte raw) |
 | `ANTHROPIC_API_KEY` | secret | yes | Claude (MARTy, classification, enrichment) | console.anthropic.com |
 | `GOOGLE_GEMINI_API_KEY` | secret | optional | Gemini 2.5 Flash enrichment | aistudio.google.com |
-| `AZURE_CLIENT_ID` | secret | yes for Outlook | Microsoft OAuth | Entra app registration |
-| `AZURE_CLIENT_SECRET` | secret | yes for Outlook | Microsoft OAuth | Entra app → Certificates & secrets |
-| `AZURE_TENANT_ID` | secret | yes for Outlook | `common` for multi-tenant | Entra app |
-| `AZURE_REDIRECT_URI` | secret | yes for Outlook | OAuth callback URL | matches Worker route |
+| `AZURE_CLIENT_ID` | secret | yes for Outlook | Microsoft Graph app id | Entra app registration |
+| `AZURE_TENANT_ID` | secret | yes for Outlook | tenant UUID | Entra app |
+| `AZURE_CLIENT_CERT_PRIVATE_KEY` | secret | yes for Outlook | PEM private key for app-only client assertion | certificate paired with Entra upload |
+| `AZURE_CLIENT_CERT_THUMBPRINT` | secret | yes for Outlook | certificate SHA-1 thumbprint for JWT `x5t` | Entra certificate blade |
+| `OUTLOOK_SYSTEM_SENDER_EMAIL` | secret | yes for campaign sends | mailbox used for system sends | in Exchange RBAC scope |
+| `OUTLOOK_WEBHOOK_BASE_URL` | secret | local/optional | public HTTPS base for Graph subscription callbacks | e.g. Worker URL or HTTPS tunnel |
+| `AZURE_REDIRECT_URI` | secret | delegated fallback only | OAuth callback URL | matches Worker route |
+| `AZURE_CLIENT_SECRET` | secret | delegated fallback only | Microsoft OAuth fallback secret | Entra app → Certificates & secrets |
 | `SLACK_CLIENT_ID` | secret | yes for Slack | OAuth client | api.slack.com → your app |
 | `SLACK_CLIENT_SECRET` | secret | yes for Slack | OAuth client | api.slack.com → your app |
 | `SLACK_SIGNING_SECRET` | secret | yes for Slack | webhook HMAC verification | Slack app → Basic Information |
@@ -269,12 +276,13 @@ No `.env.example` exists; this table is the source of truth.
 ### Microsoft Graph (Outlook mail + calendar)
 
 1. Entra portal → Identity → Applications → App registrations → New registration.
-2. Redirect URI: `https://<your-worker-domain>/auth/outlook/callback` (Web platform).
-3. API permissions → Add → Microsoft Graph → Delegated: `offline_access`, `Mail.Read`, `Calendars.Read`, `User.Read`, `MailboxSettings.Read`. Grant admin consent.
-4. Certificates & secrets → New client secret. Copy the value.
-5. Overview tab → copy Application (client) ID and Directory (tenant) ID. Use `common` for tenant ID if you want any Microsoft user to sign in; otherwise the tenant UUID for single-tenant.
-6. `wrangler secret put` for `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, `AZURE_REDIRECT_URI`.
-7. Verify: open `/settings/integrations`, click "Connect Outlook", complete OAuth. A row appears in D1 `integration_credentials`. An initial backfill is enqueued via `sync_jobs`.
+2. Upload the public certificate to the app registration and copy the certificate SHA-1 thumbprint.
+3. Grant Microsoft Graph application permissions required by the platform (`Mail.Read`, `Mail.Send`, `Calendars.Read`, `Contacts.Read`) and admin consent.
+4. Configure Exchange RBAC for Applications so the service principal is scoped to the approved mailbox set.
+5. `wrangler secret put` for `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_CERT_PRIVATE_KEY`, `AZURE_CLIENT_CERT_THUMBPRINT`, and `OUTLOOK_SYSTEM_SENDER_EMAIL`.
+6. Set `OUTLOOK_AUTH_MODE=app_only` and `INTERNAL_DOMAINS=medinavc.com,medinacapital.com` in Worker vars.
+7. Ensure Graph subscription callbacks resolve to a public HTTPS URL. If `AZURE_REDIRECT_URI` is local/http, set `OUTLOOK_WEBHOOK_BASE_URL=https://<public-worker-or-tunnel>`.
+8. Verify: open Settings → System Status. Outlook App-Only Health should show Graph probes passing, all provisioned mailboxes, and 3/3 current subscriptions per mailbox.
 
 ### Slack
 
@@ -444,7 +452,8 @@ git checkout main -- src wrangler.toml
 - **`subrequest limit hit` in Worker logs** — a handler is fanning out too many calls per step. Batch sizes for classify/extract/embed are capped at ≤10 items/step.
 - **D1 transient errors during dual-write** — when writing to two tables in the same step, follow the established ordering (parent before child; vector index after D1 commit). Don't introduce new dual-writes without re-reading `src/lib/persist-document.ts`.
 - **Embed pipeline coverage gap** — `POST /api/admin/backfill-unembedded` (chunked, idempotent). Track progress via `GET /api/admin/embed-queue-health`.
-- **OAuth redirect mismatch** — `AZURE_REDIRECT_URI` must EXACTLY match the redirect URI registered in Entra (including trailing slash if any).
+- **Graph subscription creation fails** — Microsoft Graph requires an HTTPS notification URL. Set `OUTLOOK_WEBHOOK_BASE_URL` to a public HTTPS Worker or tunnel URL for local validation.
+- **OAuth redirect mismatch** — only relevant when delegated fallback is explicitly enabled. `AZURE_REDIRECT_URI` must EXACTLY match the redirect URI registered in Entra.
 - **Slack signature verification fails** — `SLACK_SIGNING_SECRET` is the Basic-Information signing secret, not the OAuth client secret. Easy to mix up.
 - **Firefly webhook returns 401** — `FIREFLY_WEBHOOK_SECRET` in `wrangler secret` must equal the secret you entered in Firefly's webhook configuration; both are HMAC-SHA256.
 - **`waitUntil` task disappears mid-run** — Cloudflare provides no lifetime guarantees for `waitUntil` work; the app-side stale-reset + watchdog is the only cleanup. Don't put critical-path work in `waitUntil`. See `feedback_workflow_vs_waitUntil_lifetime.md`.

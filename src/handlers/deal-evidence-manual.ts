@@ -25,6 +25,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { linkConversationToDeal, linkEventToDeal } from '../lib/deal-association';
+import { canViewerReadConversation } from '../lib/email-derived-visibility';
 
 async function assertDealVisible(dealId: string, orgId: string, env: Env): Promise<boolean> {
   const row = await env.D1.prepare(
@@ -64,6 +65,9 @@ export async function linkConversationToDealEndpoint(
     `SELECT id FROM conversations WHERE id = ? AND org_id = ?`
   ).bind(body.conversation_id, ctx.orgId).first();
   if (!conv) return errorResponse('CONVERSATION_NOT_FOUND', 404);
+  if (!await canViewerReadConversation(env, ctx, body.conversation_id)) {
+    return errorResponse('CONVERSATION_FORBIDDEN', 403, 'Conversation is private and not readable by this viewer');
+  }
 
   const r = await linkConversationToDeal(
     body.conversation_id, dealId, 'manual', 1.0, ctx.orgId, env, ctx.userId

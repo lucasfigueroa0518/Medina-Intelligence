@@ -35,13 +35,14 @@ import {
   safelyRebuildContactSearchIndexForContact,
 } from './contact-search';
 import { safelyRebuildContactDetailReadModelForContact } from './contact-detail-read-model';
+import { loadConversationVisibilityMap } from './email-derived-visibility';
 
 export type EntityType = 'contact' | 'company' | 'deal';
 
 export interface WriteContext {
   orgId: string;
   userId: string;
-  userRole: string;
+  userRole: 'owner' | 'admin' | 'member' | 'super_admin';
   /** Distinguishes manual UI edits from MARTy-driven writes. The
    *  audit row carries this verbatim so we can answer "what did MARTy
    *  do?" without filtering by tool name. */
@@ -50,7 +51,7 @@ export interface WriteContext {
 
 export interface FieldRejection {
   field_name: string;
-  reason: 'permanently_locked' | 'human_edit_locked_other_user' | 'unknown_field' | 'not_writable';
+  reason: 'permanently_locked' | 'human_edit_locked_other_user' | 'unknown_field' | 'not_writable' | 'private_source_taint';
   detail?: string;
 }
 
@@ -271,6 +272,28 @@ interface UpdateEntityOptions {
    *  default (false) reports each rejection so the caller can show
    *  the user exactly what was blocked. */
   silentLockSkip?: boolean;
+  sourceConversationIds?: string[];
+}
+
+const CONTACT_PRIVATE_DERIVED_FIELDS = new Set(['bio_summary', 'custom_fields']);
+const DEAL_PRIVATE_DERIVED_FIELDS = new Set(['notes', 'custom_fields']);
+
+async function isMartyPrivateDerivedWriteAllowed(
+  field: string,
+  sensitiveFields: Set<string>,
+  ctx: WriteContext,
+  env: Env,
+  opts: UpdateEntityOptions
+): Promise<boolean> {
+  if (ctx.origin !== 'marty' || !sensitiveFields.has(field)) return true;
+  const sourceIds = opts.sourceConversationIds || [];
+  if (sourceIds.length === 0) return false;
+  const visibility = await loadConversationVisibilityMap(
+    env,
+    { orgId: ctx.orgId, userId: ctx.userId, userRole: ctx.userRole },
+    sourceIds
+  );
+  return sourceIds.every(id => visibility.get(id)?.can_read === true);
 }
 
 async function updateEntityFieldsCommon(
@@ -304,6 +327,16 @@ async function updateEntityFieldsCommon(
     if (!allowed.has(field)) {
       if (!opts.silentLockSkip) {
         rejected.push({ field_name: field, reason: 'unknown_field', detail: 'Field not writable through this surface' });
+      }
+      continue;
+    }
+    if (!(await isMartyPrivateDerivedWriteAllowed(field, CONTACT_PRIVATE_DERIVED_FIELDS, ctx, env, opts))) {
+      if (!opts.silentLockSkip) {
+        rejected.push({
+          field_name: field,
+          reason: 'private_source_taint',
+          detail: 'MARTy cannot write private email-derived content into org-visible fields unless every source is readable to this viewer.',
+        });
       }
       continue;
     }
@@ -467,6 +500,16 @@ export async function updateDealFields(
     if (!DEAL_WRITABLE.has(field)) {
       if (!opts.silentLockSkip) {
         rejected.push({ field_name: field, reason: 'unknown_field' });
+      }
+      continue;
+    }
+    if (!(await isMartyPrivateDerivedWriteAllowed(field, DEAL_PRIVATE_DERIVED_FIELDS, ctx, env, opts))) {
+      if (!opts.silentLockSkip) {
+        rejected.push({
+          field_name: field,
+          reason: 'private_source_taint',
+          detail: 'MARTy cannot write private email-derived content into org-visible fields unless every source is readable to this viewer.',
+        });
       }
       continue;
     }
@@ -722,6 +765,16 @@ export async function createContactRecord(
   if (input.email && !/^\S+@\S+\.\S+$/.test(input.email)) {
     return { ok: false, error: { code: 'VALIDATION_ERROR', status: 400, message: 'email is not valid' } };
   }
+  if (ctx.origin === 'marty' && input.bio_summary) {
+    return {
+      ok: false,
+      error: {
+        code: 'PRIVATE_SOURCE_TAINT',
+        status: 403,
+        message: 'MARTy cannot create org-visible bio summaries from potentially private email-derived context.',
+      },
+    };
+  }
   const allowedTypes = new Set(['individual', 'family', 'institutional_investor', 'company', 'other']);
   const contactType = input.contact_type && allowedTypes.has(input.contact_type) ? input.contact_type : 'individual';
 
@@ -860,6 +913,16 @@ export async function createDealRecord(
 ): Promise<{ ok: boolean; id?: string; error?: { code: string; status: number; message: string } }> {
   if (!input.company_id) {
     return { ok: false, error: { code: 'VALIDATION_ERROR', status: 400, message: 'company_id is required' } };
+  }
+  if (ctx.origin === 'marty' && input.notes) {
+    return {
+      ok: false,
+      error: {
+        code: 'PRIVATE_SOURCE_TAINT',
+        status: 403,
+        message: 'MARTy cannot create org-visible deal notes from potentially private email-derived context.',
+      },
+    };
   }
 
   // Wave 1 + 2 guards — same code path as the manual createDeal handler.

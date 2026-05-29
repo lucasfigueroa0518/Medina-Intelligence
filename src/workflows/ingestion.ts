@@ -51,6 +51,11 @@ function errMessage(e: unknown): string {
   }
 }
 
+function isWorkflowAlreadyExistsError(e: unknown): boolean {
+  const msg = errMessage(e).toLowerCase();
+  return msg.includes('already_exists') || (msg.includes('already') && msg.includes('exists'));
+}
+
 export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> {
   async run(event: WorkflowEvent<IngestionParams>, step: WorkflowStep): Promise<void> {
     console.log(
@@ -462,15 +467,23 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
           await Promise.all(
             batchChunkIds.map((chunkId, j) => {
               const i = batchStart + j;
+              const childId = `chunk-${syncJobId}-${i}`;
               return this.env.INGESTION_CHUNK_WORKFLOW.create({
-                id: `chunk-${syncJobId}-${i}`,
-                params: {
-                  org_id: org_id!,
-                  sync_job_id: syncJobId,
-                  chunk_index: i,
-                  chunk_r2_key: chunkKeys[i],
-                },
-              });
+                  id: childId,
+                  params: {
+                    org_id: org_id!,
+                    sync_job_id: syncJobId,
+                    chunk_index: i,
+                    chunk_r2_key: chunkKeys[i],
+                  },
+                })
+                .catch(e => {
+                  if (isWorkflowAlreadyExistsError(e)) {
+                    console.log(`[IngestionWorkflow] child workflow ${childId} already exists — treating fanout retry as idempotent`);
+                    return;
+                  }
+                  throw e;
+                });
             })
           );
 

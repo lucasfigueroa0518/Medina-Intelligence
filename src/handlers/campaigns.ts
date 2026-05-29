@@ -113,6 +113,9 @@ export async function sendCampaign(
     'SELECT * FROM email_campaigns WHERE id = ? AND org_id = ? AND status = ?'
   ).bind(id, ctx.orgId, 'draft').first<any>();
   if (!campaign) return errorResponse('CAMPAIGN_NOT_FOUND_OR_NOT_DRAFT', 404);
+  if (!env.PIPELINES) {
+    return errorResponse('WORKFLOW_BINDING_MISSING', 500, 'Pipelines service binding is not available.');
+  }
 
   // Build recipient list from filter_criteria
   const recipients = await buildRecipientListFromFilter(
@@ -137,8 +140,10 @@ export async function sendCampaign(
     `UPDATE email_campaigns SET status = 'scheduled', total_recipients = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
   ).bind(recipients.length, id).run();
 
-  // Trigger the CampaignSendWorkflow
-  await env.CAMPAIGN_WORKFLOW.create({
+  // Trigger the CampaignSendWorkflow through the pipelines Worker, which owns
+  // workflow bindings after the Phase 8 split.
+  await env.PIPELINES.triggerWorkflow({
+    workflow: 'campaign',
     id: `campaign-${id}`,
     params: { campaign_id: id, org_id: ctx.orgId },
   });

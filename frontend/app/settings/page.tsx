@@ -29,7 +29,11 @@ import {
 import { useBackgroundTasks } from '@/components/background-task-indicator';
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
-const MARTY_SANDBOX_VISIBLE_EMAIL = 'intel@medinavc.com';
+const INTERNAL_DOMAINS = (process.env.NEXT_PUBLIC_INTERNAL_DOMAINS ?? 'medinavc.com,medinacapital.com')
+  .split(',')
+  .map(d => d.trim().toLowerCase())
+  .filter(Boolean);
+const MARTY_SANDBOX_VISIBLE_LOCAL_PART = 'intel';
 const MARTY_SANDBOX_EXECUTION_DISABLED = true;
 
 type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals' | 'system' | 'marty-sandbox';
@@ -44,7 +48,8 @@ const TABS: { id: SettingsTab; label: string }[] = [
 ];
 
 function canViewMartySandboxEmail(email?: string | null): boolean {
-  return (email || '').trim().toLowerCase() === MARTY_SANDBOX_VISIBLE_EMAIL;
+  const [local, domain] = (email || '').trim().toLowerCase().split('@');
+  return local === MARTY_SANDBOX_VISIBLE_LOCAL_PART && INTERNAL_DOMAINS.includes(domain || '');
 }
 
 export default function SettingsPageWrapper() {
@@ -163,6 +168,13 @@ function SettingsPageInner() {
       setBanner({
         tone: 'error',
         message: 'NEXT_PUBLIC_API_URL is not set. Restart the dev server.',
+      });
+      return;
+    }
+    if (process.env.NEXT_PUBLIC_OUTLOOK_DELEGATED_FALLBACK_ENABLED !== 'true') {
+      setBanner({
+        tone: 'success',
+        message: 'Outlook uses app-only Microsoft Graph access. Ask an admin to update tenant configuration if sync is unhealthy.',
       });
       return;
     }
@@ -319,15 +331,17 @@ function SyncIntegrationsTab({
             <IntegrationRowView
               anchorId="outlook-integration-refresh"
               name="Microsoft Outlook 365"
-              description="Email, calendar, and contacts via Microsoft Graph. Also used for campaign sends."
+              description="Email, calendar, and contacts via app-only Microsoft Graph. Also used for campaign sends."
               row={status.outlook}
-              onPrimaryClick={connectOutlook}
+              onPrimaryClick={() => { window.location.href = '/settings?tab=system'; }}
               primaryLabel={
                 status.outlook.status === 'auth_failed' || status.outlook.token_healthy === false
-                  ? 'Refresh'
+                  ? 'Open status'
+                  : status.outlook.status === 'degraded'
+                    ? 'Repair'
                   : status.outlook.status === 'connected'
-                    ? 'Reconnect'
-                  : 'Connect'
+                    ? 'Healthy'
+                    : 'Open status'
               }
             />
             <IntegrationRowView
@@ -409,13 +423,22 @@ function connectionTone(row: IntegrationRow | null): {
       help: 'New email and calendar updates are syncing automatically.',
     };
   }
+  if (row.status === 'degraded') {
+    return {
+      label: 'Repair needed',
+      dot: 'bg-semantic-warning',
+      bg: 'bg-semantic-warning/10',
+      text: 'text-semantic-warning',
+      help: 'App-only Graph access is configured, but mailbox ingestion needs subscription or queue repair.',
+    };
+  }
   if (row.status === 'auth_failed' || row.token_healthy === false) {
     return {
-      label: 'Refresh needed',
+      label: 'Setup needed',
       dot: 'bg-semantic-error',
       bg: 'bg-semantic-error/10',
       text: 'text-semantic-error',
-      help: 'Live updates are paused while Outlook waits for a refresh. Use the Microsoft Outlook refresh button in Integrations below to resume email and calendar activity.',
+      help: 'Live updates are paused until Microsoft Graph app-only configuration is complete.',
     };
   }
   return {
@@ -423,7 +446,7 @@ function connectionTone(row: IntegrationRow | null): {
     dot: 'bg-text-muted',
     bg: 'bg-white/5',
     text: 'text-text-muted',
-    help: 'Connect Microsoft Outlook to sync email and meetings into MARTy.',
+    help: 'Configure a platform mailbox target to sync email and meetings into MARTy.',
   };
 }
 
@@ -544,7 +567,8 @@ function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
 
   const tone = connectionTone(outlook);
   const isHealthy = outlook?.status === 'connected' && outlook.token_healthy !== false;
-  const needsRefresh = outlook?.status === 'auth_failed' || outlook?.token_healthy === false;
+  const needsRepair = outlook?.status === 'degraded';
+  const needsSetup = outlook?.status === 'auth_failed' || outlook?.token_healthy === false;
 
   return (
     <div id="live-outlook-sync" className="card scroll-mt-24">
@@ -568,7 +592,9 @@ function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
       <div className={`rounded-lg border px-3 py-2 text-xs mb-4 ${
         isHealthy
           ? 'border-semantic-success/20 bg-semantic-success/5 text-text-secondary'
-          : needsRefresh
+          : needsRepair
+          ? 'border-semantic-warning/30 bg-semantic-warning/10 text-text-secondary'
+          : needsSetup
           ? 'border-semantic-error/30 bg-semantic-error/10 text-text-secondary'
           : 'border-border/60 bg-white/5 text-text-secondary'
       }`}>
@@ -582,7 +608,7 @@ function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
         <BackfillStat
           label="Mailbox"
           value={outlook?.connected_email || (isHealthy ? 'Connected' : 'Not connected')}
-          hint={outlook?.connected_email ? 'Connected Microsoft account' : 'Connect Outlook to identify the mailbox'}
+          hint={outlook?.connected_email ? 'Configured mailbox target' : 'Mailbox target is not configured'}
         />
         <BackfillStat
           label="First-time import"
@@ -591,13 +617,13 @@ function EmailSyncSection({ outlook }: { outlook: IntegrationRow | null }) {
         />
         <BackfillStat
           label="Live updates"
-          value={isHealthy ? 'On' : 'Paused'}
-          hint={isHealthy ? 'New mail and calendar changes keep flowing' : needsRefresh ? 'Refresh Outlook to resume automatic sync' : 'Connect Outlook to start automatic sync'}
+          value={isHealthy ? 'On' : needsRepair ? 'Repair' : 'Paused'}
+          hint={isHealthy ? 'New mail and calendar changes keep flowing' : needsRepair ? 'Repair subscriptions or stale app-only transition state' : needsSetup ? 'Complete Graph app-only setup to resume automatic sync' : 'Configure a mailbox target to start automatic sync'}
         />
       </div>
 
       <div>
-        <div className="text-xs text-text-muted mb-2">Default history for new Outlook connections</div>
+        <div className="text-xs text-text-muted mb-2">Default history for provisioned Outlook mailboxes</div>
         <div className="text-xs text-text-secondary mb-2 max-w-xl">
           Choose how much older email to pull the first time a mailbox connects. You can import more history later without keeping this page open.
         </div>
@@ -784,7 +810,7 @@ function EmailHistoricalBackfillSection({
 
       {needsOutlookRefresh && (
         <div className="mb-4 rounded-lg border border-semantic-error/30 bg-semantic-error/10 px-3 py-2 text-xs leading-5 text-text-secondary">
-          Refresh Outlook in the Integrations section below before starting a catch-up import.
+          Complete Microsoft Graph app-only setup before starting a catch-up import.
         </div>
       )}
 
@@ -3037,6 +3063,7 @@ function statusColor(s: IntegrationRow['status']): string {
     case 'webhook_ready':
       return 'text-semantic-success';
     case 'configured_no_channels':
+    case 'degraded':
       return 'text-semantic-warning';
     case 'auth_failed':
     case 'not_connected':
@@ -3318,6 +3345,7 @@ function SystemStatusSection() {
 	  return (
 	    <div className="space-y-6">
 	      <RateLimitIndicator budgets={data.budgets || []} />
+	      <OutlookAppOnlyHealthCard health={data.outlook_app_only_health} />
 	      <IngestionIncidentsCard incidents={data.ingestion_incidents || []} />
 	      <ActiveTasksCard tasks={data.active_tasks} />
 	      <RunHistoryCard rows={data.run_history} />
@@ -7220,7 +7248,7 @@ function IngestionIncidentsCard({ incidents }: { incidents: IngestionIncident[] 
       <div className="mb-3 flex items-center justify-between gap-3">
         <div>
           <div className="text-sm font-medium text-text-primary">Ingestion Incidents</div>
-          <div className="text-xs text-text-secondary mt-1">Failures are durable, visible, and repaired automatically unless credentials need reconnecting.</div>
+          <div className="text-xs text-text-secondary mt-1">Failures are durable, visible, and repaired automatically unless tenant or mailbox configuration needs operator action.</div>
         </div>
         <span className="rounded-full border border-semantic-error/25 bg-semantic-error/10 px-2 py-1 text-[10px] font-medium text-semantic-error">
           {active.length} active
@@ -7243,10 +7271,100 @@ function IngestionIncidentsCard({ incidents }: { incidents: IngestionIncident[] 
               {incident.recovery_window_start && incident.recovery_window_end && (
                 <span>repair window {new Date(incident.recovery_window_start).toLocaleDateString()} → {new Date(incident.recovery_window_end).toLocaleDateString()}</span>
               )}
-              {incident.human_action_required === 1 && <span className="text-semantic-error">requires reconnect</span>}
+              {incident.human_action_required === 1 && <span className="text-semantic-error">requires operator action</span>}
             </div>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function OutlookAppOnlyHealthCard({ health }: { health: SystemStatusResponse['outlook_app_only_health'] | null | undefined }) {
+  if (!health) return null;
+  const tone =
+    health.status === 'healthy'
+      ? { icon: 'text-semantic-success', border: 'border-semantic-success/20', bg: 'bg-semantic-success/[0.03]' }
+      : health.status === 'degraded'
+        ? { icon: 'text-semantic-warning', border: 'border-semantic-warning/25', bg: 'bg-semantic-warning/[0.04]' }
+        : { icon: 'text-semantic-error', border: 'border-semantic-error/25', bg: 'bg-semantic-error/[0.04]' };
+
+  return (
+    <div className={`card p-5 ${tone.border} ${tone.bg}`}>
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex items-start gap-3 min-w-0">
+          <Mail size={18} className={`${tone.icon} shrink-0 mt-0.5`} />
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-text-primary">Outlook App-Only Health</div>
+            <div className="text-xs text-text-secondary mt-1">{health.label}: {health.detail}</div>
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-2 text-center text-[10px] text-text-muted sm:min-w-[260px]">
+          <div>
+            <div className="text-sm font-medium text-text-primary">{health.summary.healthy_mailboxes}</div>
+            healthy
+          </div>
+          <div>
+            <div className="text-sm font-medium text-text-primary">{health.summary.missing_subscriptions + health.summary.expired_subscriptions}</div>
+            subscription gaps
+          </div>
+          <div>
+            <div className="text-sm font-medium text-text-primary">{health.summary.stale_delegated_incidents}</div>
+            stale legacy
+          </div>
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-left text-text-muted border-b border-border/60">
+              <th className="pb-2 pr-3">Mailbox</th>
+              <th className="pb-2 pr-3">Graph</th>
+              <th className="pb-2 pr-3">Subscriptions</th>
+              <th className="pb-2 pr-3">Last email</th>
+              <th className="pb-2 pr-3">Calendar</th>
+              <th className="pb-2">Queue</th>
+            </tr>
+          </thead>
+          <tbody>
+            {health.mailboxes.map(m => {
+              const graphOk = m.graph.messages_ok === true && m.graph.calendar_ok === true;
+              return (
+                <tr key={m.user_id} className="border-b border-border/30 last:border-0">
+                  <td className="py-2 pr-3">
+                    <div className="font-medium text-text-primary">{m.full_name || m.email || m.user_id}</div>
+                    <div className="text-text-muted">{m.mailbox || 'No mailbox target'}</div>
+                  </td>
+                  <td className="py-2 pr-3">
+                    <span className={graphOk ? 'text-semantic-success' : m.graph.checked_at ? 'text-semantic-error' : 'text-text-muted'}>
+                      {graphOk ? 'Passing' : m.graph.checked_at ? 'Failing' : 'Not checked'}
+                    </span>
+                    {m.graph.error && <div className="max-w-[220px] truncate text-text-muted">{m.graph.error}</div>}
+                  </td>
+                  <td className="py-2 pr-3">
+                    <span className={m.subscriptions.current.length === m.subscriptions.expected.length ? 'text-semantic-success' : 'text-semantic-warning'}>
+                      {m.subscriptions.current.length}/{m.subscriptions.expected.length} current
+                    </span>
+                    {(m.subscriptions.missing.length > 0 || m.subscriptions.expired.length > 0 || m.subscriptions.legacy.length > 0) && (
+                      <div className="text-text-muted">
+                        {m.subscriptions.missing.length} missing · {m.subscriptions.expired.length} expired · {m.subscriptions.legacy.length} legacy
+                      </div>
+                    )}
+                  </td>
+                  <td className="py-2 pr-3 text-text-muted">
+                    {m.last_email_ingested_at ? formatRelative(m.last_email_ingested_at) : 'No evidence'}
+                  </td>
+                  <td className="py-2 pr-3 text-text-muted">
+                    {m.last_calendar_success_at ? formatRelative(m.last_calendar_success_at) : 'No sync evidence'}
+                  </td>
+                  <td className="py-2 text-text-muted">
+                    {m.pending_work} pending · {m.dead_letter_work} dead-lettered
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   );

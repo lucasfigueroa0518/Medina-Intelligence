@@ -5,8 +5,8 @@ import { jsonResponse } from './utils';
 import { extractIdempotencyKey } from '../lib/idempotency';
 import { verifyFireflySignature } from '../integrations/firefly';
 import { verifySlackSignature } from '../integrations/slack';
-import { getDecryptedAccessToken, getOrgDomains, stripHtml } from '../lib/helpers';
-import { refreshOutlookToken } from '../integrations/oauth';
+import { getOrgDomains, stripHtml } from '../lib/helpers';
+import { getGraphMailboxAuthForUser, graphMailboxUrl } from '../lib/graph-auth';
 import { classifyAndDeduplicate } from '../lib/classification';
 import { processClassifiedItems, persistClassifiedStats } from '../lib/ingestion-shared';
 
@@ -191,21 +191,15 @@ async function processOneNotification(
   if (seen) return;
   await env.KV.put(idemKey, '1', { expirationTtl: 86400 });
 
-  // Refresh token and fetch full message
-  const refreshResult = await refreshOutlookToken(userId, orgId, env);
-  if (!refreshResult.success) {
-    console.error(`[graph-webhook] Token refresh failed for user ${userId}`);
-    return;
-  }
-
-  let token: string;
+  let auth: { token: string; mailbox: string };
   try {
-    token = await getDecryptedAccessToken(userId, env);
-  } catch {
+    auth = await getGraphMailboxAuthForUser(userId, orgId, env);
+  } catch (e) {
+    console.error(`[graph-webhook] Graph auth failed for user ${userId}:`, e);
     return;
   }
 
-  const isCalendar = sub.resource === 'me/events';
+  const isCalendar = sub.resource === 'me/events' || /\/?users\/[^/]+\/events$/i.test(sub.resource || '');
 
   if (isCalendar) {
     // Calendar notifications — trigger a delta sync via the existing cron path
@@ -220,8 +214,8 @@ async function processOneNotification(
   // and the conversation lands as a permanent orphan. Pre-fix the webhook
   // ingestion path silently dropped every attachment that arrived this way.
   const msgResp = await fetch(
-    `https://graph.microsoft.com/v1.0/me/messages/${messageId}?$select=id,subject,bodyPreview,body,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,conversationId,importance,hasAttachments&$expand=attachments($select=id,name,size,contentType,isInline)`,
-    { headers: { Authorization: `Bearer ${token}` } }
+    graphMailboxUrl(auth.mailbox, `/messages/${messageId}?$select=id,subject,bodyPreview,body,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,conversationId,importance,hasAttachments&$expand=attachments($select=id,name,size,contentType,isInline)`),
+    { headers: { Authorization: `Bearer ${auth.token}` } }
   );
 
   if (!msgResp.ok) {

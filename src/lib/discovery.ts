@@ -6,6 +6,7 @@ import { isValidContactName, resolveContactName } from './name-quality';
 import { jaroWinkler } from './dedup';
 import { updateEntityInIndex } from './entity-index';
 import { safelyMaintainContactReadModels } from './contact-maintenance';
+import { getConfiguredInternalDomains, internalEmailVariants } from './internal-domains';
 
 // Domains whose mail is always automated/transactional — never discover as contacts.
 // Includes platform-noreply senders (slack.com, github.com), SaaS billing/notice
@@ -467,9 +468,13 @@ export async function discoverNewContact(
 
   const normalizedEmail = email.toLowerCase().trim();
 
+  const emailVariants = internalEmailVariants(normalizedEmail, getConfiguredInternalDomains(env));
   const existing = await env.D1.prepare(
-    'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
-  ).bind(orgId, normalizedEmail).first<{ id: string }>();
+    `SELECT id FROM contacts
+      WHERE org_id = ? AND LOWER(email) IN (${emailVariants.map(() => '?').join(',')})
+        AND deleted_at IS NULL
+      LIMIT 1`
+  ).bind(orgId, ...emailVariants).first<{ id: string }>();
   if (existing) {
     // Backfill: if existing contact has no company, try to link now
     const hasCompany = await env.D1.prepare(
@@ -529,8 +534,11 @@ export async function discoverNewContact(
 
   if (!result.meta?.changes) {
     const raced = await env.D1.prepare(
-      'SELECT id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(orgId, normalizedEmail).first<{ id: string }>();
+      `SELECT id FROM contacts
+        WHERE org_id = ? AND LOWER(email) IN (${emailVariants.map(() => '?').join(',')})
+          AND deleted_at IS NULL
+        LIMIT 1`
+    ).bind(orgId, ...emailVariants).first<{ id: string }>();
     if (raced) {
       return { id: raced.id, created: false };
     }

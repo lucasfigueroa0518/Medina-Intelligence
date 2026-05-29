@@ -120,6 +120,9 @@ export async function refreshOutlookToken(
   status?: number;
   refreshed?: boolean;
 }> {
+  if (env.OUTLOOK_AUTH_MODE !== 'delegated_fallback' || env.OUTLOOK_DELEGATED_FALLBACK_ENABLED !== 'true') {
+    return { success: false, reason: 'config_error', errorCode: 'delegated_fallback_disabled' };
+  }
   const user = await env.D1.prepare(
     'SELECT outlook_token FROM users WHERE id = ?'
   ).bind(userId).first<{ outlook_token: string | null }>();
@@ -156,7 +159,7 @@ export async function refreshOutlookToken(
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
           client_id: env.AZURE_CLIENT_ID,
-          client_secret: env.AZURE_CLIENT_SECRET,
+          client_secret: env.AZURE_CLIENT_SECRET || '',
           refresh_token: decrypted.refresh_token,
           grant_type: 'refresh_token',
           scope: OUTLOOK_REFRESH_SCOPES,

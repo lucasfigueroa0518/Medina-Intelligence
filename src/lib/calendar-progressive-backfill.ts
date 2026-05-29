@@ -34,8 +34,9 @@
 //                        auto-bootstrap as time advances.
 
 import type { Env } from '../types/env';
-import { getActiveUsersForOrg, getDecryptedAccessToken } from './helpers';
-import { refreshOutlookToken, recordTokenFailure } from '../integrations/oauth';
+import { getActiveUsersForOrg } from './helpers';
+import { recordTokenFailure } from '../integrations/oauth';
+import { graphMailboxUrl } from './graph-auth';
 import { upsertOutlookEvent, type OutlookEventLike } from './reconciliation';
 import { checkGraphRateLimit, recordGraphApiCall } from './rate-limit';
 import type { CalendarSyncResult } from '../integrations/outlook';
@@ -261,12 +262,13 @@ interface ApiCalendarEvent extends OutlookEventLike {
 }
 
 /**
- * Paginate through /me/calendarView for the given window's date range.
+ * Paginate through a mailbox-scoped Graph calendarView for the given window's date range.
  * Per-fetch AbortSignal, paginate via @odata.nextLink. Returns the
  * collected events. Throws on hard failure (caller decides retry).
  */
 export async function fetchEventsForWindow(
   token: string,
+  mailbox: string,
   userId: string,
   windowStart: string,
   windowEnd: string,
@@ -274,9 +276,9 @@ export async function fetchEventsForWindow(
   env: Env
 ): Promise<ApiCalendarEvent[]> {
   let url: string =
-    `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${encodeURIComponent(
+    graphMailboxUrl(mailbox, `/calendarView?startDateTime=${encodeURIComponent(
       windowStart
-    )}&endDateTime=${encodeURIComponent(windowEnd)}&$top=50`;
+    )}&endDateTime=${encodeURIComponent(windowEnd)}&$top=50`);
 
   const events: ApiCalendarEvent[] = [];
   const startedAt = Date.now();
@@ -437,21 +439,6 @@ export async function driveCalendarProgressiveBackfill(
   const users = await getActiveUsersForOrg(orgId, env);
 
   for (const user of users) {
-    // Skip users whose Outlook tokens have failed too many times.
-    // Preserved here (vs leaving to the handler) so a permanently-
-    // broken-token user doesn't churn through bootstrap → enqueue →
-    // handler-fail → dead_letter on every tick. The handler also
-    // checks via refreshOutlookToken's success flag, but heading off
-    // the enqueue saves cycles.
-    const failState = await env.KV.get<{ count: number }>(
-      `token_failed:${user.id}:outlook`,
-      'json'
-    );
-    if (failState && failState.count >= 3) {
-      result.errors.push({ user_id: user.id, error: 'token_failed_threshold_exceeded' });
-      continue;
-    }
-
     // Bootstrap any missing window rows. INSERT OR IGNORE so this is a
     // no-op after first run; cheap (a single batch).
     try {

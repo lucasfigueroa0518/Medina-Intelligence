@@ -2,6 +2,7 @@
 import type { Env } from '../types/env';
 import type { OrgSettings, User, Conversation } from '../types/interfaces';
 import { decryptToken } from './encryption';
+import { getGraphMailboxAuthForUser } from './graph-auth';
 
 // --- §18.4: array / hash / html ---
 
@@ -130,7 +131,7 @@ export async function getOrgSettings(orgId: string, env: Env): Promise<OrgSettin
 
 export async function getActiveUsersForOrg(orgId: string, env: Env): Promise<User[]> {
   const result = await env.D1.prepare(
-    'SELECT id, org_id, email, full_name, role, outlook_token, outlook_delta_token, slack_token, is_active, created_at, updated_at FROM users WHERE org_id = ? AND is_active = 1 AND deleted_at IS NULL'
+    'SELECT id, org_id, email, full_name, role, outlook_mailbox, outlook_token, outlook_delta_token, slack_token, is_active, created_at, updated_at FROM users WHERE org_id = ? AND is_active = 1 AND deleted_at IS NULL'
   ).bind(orgId).all<User>();
   return result.results;
 }
@@ -176,6 +177,10 @@ export async function getDecryptedAccessToken(userId: string, env: Env): Promise
   }
   const tokens = await decryptToken(user.outlook_token, env);
   return tokens.access_token;
+}
+
+export async function getGraphAccessTokenForUser(userId: string, orgId: string, env: Env): Promise<string> {
+  return (await getGraphMailboxAuthForUser(userId, orgId, env)).token;
 }
 
 export async function getDecryptedSlackBotToken(orgId: string, env: Env): Promise<string> {

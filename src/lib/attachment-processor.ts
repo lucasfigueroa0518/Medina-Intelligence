@@ -1,7 +1,6 @@
 import type { Env } from '../types/env';
 import type { ClassifiedItem } from '../types/interfaces';
-import { getDecryptedAccessToken } from './helpers';
-import { refreshOutlookToken } from '../integrations/oauth';
+import { getGraphMailboxAuthForUser, graphMailboxUrl } from './graph-auth';
 import { extractTextFromFile } from './file-extraction';
 import { classifyDocument } from './document-intelligence';
 import { emitAudit } from './audit';
@@ -55,12 +54,11 @@ export async function processEmailAttachments(
   const result: AttachmentProcessResult = { documents_created: 0, documents_skipped: 0, errors: [] };
   if (!item.attachments?.length || !item.userId) return result;
 
-  let token: string;
+  let auth: { token: string; mailbox: string };
   try {
-    await refreshOutlookToken(item.userId, orgId, env);
-    token = await getDecryptedAccessToken(item.userId, env);
+    auth = await getGraphMailboxAuthForUser(item.userId, orgId, env);
   } catch (e: any) {
-    result.errors.push(`Token refresh failed: ${e.message}`);
+    result.errors.push(`Graph auth failed: ${e.message}`);
     return result;
   }
 
@@ -151,8 +149,8 @@ export async function processEmailAttachments(
     }
 
     try {
-      const graphUrl = `https://graph.microsoft.com/v1.0/me/messages/${item.externalId}/attachments/${att.id}/$value`;
-      const resp = await fetch(graphUrl, { headers: { Authorization: `Bearer ${token}` } });
+      const graphUrl = graphMailboxUrl(auth.mailbox, `/messages/${item.externalId}/attachments/${att.id}/$value`);
+      const resp = await fetch(graphUrl, { headers: { Authorization: `Bearer ${auth.token}` } });
       if (!resp.ok) {
         result.errors.push(`Attachment "${att.name}": Graph API ${resp.status}`);
         continue;

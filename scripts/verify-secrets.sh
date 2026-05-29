@@ -11,17 +11,18 @@ set -euo pipefail
 
 CONFIG="${1:-wrangler.pipelines.toml}"
 
-# Canonical list. 14 entries. Source of truth: which secrets are referenced
+# Canonical list. Source of truth: which secrets are referenced
 # by code paths that move to pipelines (see Phase 8 audit §10).
 REQUIRED_SECRETS=(
-  # Encryption / decryption (decrypt Outlook tokens, Firefly creds)
+  # Encryption / decryption (Firefly creds and delegated fallback only)
   TOKEN_ENCRYPTION_KEY
 
-  # Outlook OAuth refresh (graph-subscriptions + token-refresh paths)
+  # Outlook app-only Graph auth + sends/subscriptions
   AZURE_CLIENT_ID
-  AZURE_CLIENT_SECRET
   AZURE_TENANT_ID
-  AZURE_REDIRECT_URI
+  AZURE_CLIENT_CERT_PRIVATE_KEY
+  AZURE_CLIENT_CERT_THUMBPRINT
+  OUTLOOK_SYSTEM_SENDER_EMAIL
 
   # LLM upstreams (enrichment workflow, deal intelligence, daily cron)
   GOOGLE_GEMINI_API_KEY
@@ -48,6 +49,10 @@ REQUIRED_SECRETS=(
 # Secrets that are NOT moved (api-only):
 #   JWT_SECRET           — user auth (api endpoints only)
 #   DEFAULT_SIGNUP_ORG_ID — signup flow (api only)
+# Optional / environment-specific:
+#   OUTLOOK_WEBHOOK_BASE_URL — required when AZURE_REDIRECT_URI does not
+#     resolve to a public HTTPS Worker URL for Graph subscription callbacks.
+#   AZURE_CLIENT_SECRET, AZURE_REDIRECT_URI — delegated OAuth fallback only.
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "ERROR: config file not found: $CONFIG" >&2

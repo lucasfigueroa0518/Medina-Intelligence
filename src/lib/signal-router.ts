@@ -5,6 +5,7 @@ import { hashShort } from './helpers';
 import { chunkEmbedAndPersistAll } from './embedding';
 import { recordSyntheticObservation } from './synthetic-observations';
 import { safelyUpsertConversationTimelineItemsForContacts } from './contact-detail-read-model';
+import { syncConversationParticipants } from './conversation-participants';
 
 interface RoutedSignalResult {
   contact_signals_routed: number;
@@ -364,6 +365,7 @@ export async function distributeMeetingSummary(
       startTime,
       now, now
     ).run();
+    await syncConversationParticipants(env, orgId, convId, []);
 
     const linkInsert = await env.D1.prepare(
       `INSERT OR IGNORE INTO conversation_contacts (conversation_id, contact_id) VALUES (?, ?)`

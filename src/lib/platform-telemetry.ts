@@ -2,6 +2,10 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { getOrgSettings, hasOrgWidePrivateDataAccess } from './helpers';
 import { buildLiveMartyRuntimeFingerprint } from './marty-runtime';
+import {
+  filterOutlookIncidentsForUserReports,
+  getOutlookAppOnlyHealthSnapshot,
+} from './outlook-app-only-health';
 
 export type PlatformTelemetryTopic =
   | 'auto'
@@ -252,7 +256,7 @@ export function scoreTelemetryUserCandidate(
 async function loadTelemetryUsers(ctx: AuthContext, env: Env): Promise<TelemetryUserRow[]> {
   const rows = await env.D1.prepare(
     `SELECT id, email, full_name, role, is_active, created_at, updated_at,
-            outlook_token IS NOT NULL AS has_outlook_token,
+            COALESCE(outlook_mailbox, email) IS NOT NULL AS has_outlook_token,
             outlook_delta_token IS NOT NULL AS has_inbox_delta_token
        FROM users
       WHERE org_id = ?
@@ -422,18 +426,22 @@ async function inspectUserIngestionTelemetry(
   const user = resolved.user;
   const email = user.email.toLowerCase();
   const emailLike = `%${email}%`;
-  const mailboxLike = `%${user.id}%`;
   const addressCase = `(LOWER(c.from_email) = ? OR LOWER(c.to_emails) LIKE ? OR LOWER(c.cc_emails) LIKE ?)`;
   const matchedCte = `
     WITH matched AS (
       SELECT c.*,
-             CASE WHEN c.participant_user_ids LIKE ? THEN 1 ELSE 0 END AS mailbox_match,
+             CASE WHEN EXISTS (
+               SELECT 1 FROM conversation_participants cp
+                WHERE cp.org_id = c.org_id
+                  AND cp.conversation_id = c.id
+                  AND cp.user_id = ?
+             ) THEN 1 ELSE 0 END AS mailbox_match,
              CASE WHEN ${addressCase} THEN 1 ELSE 0 END AS address_match
         FROM conversations c
        WHERE c.org_id = ?
          AND c.source = 'outlook'
     )`;
-  const matchedBinds: unknown[] = [mailboxLike, email, emailLike, emailLike, ctx.orgId];
+  const matchedBinds: unknown[] = [user.id, email, emailLike, emailLike, ctx.orgId];
 
   const [
     conversationStats,
@@ -447,8 +455,9 @@ async function inspectUserIngestionTelemetry(
     syncConfig,
 	    sentDeltaToken,
 	    activeIngestionIncidents,
+      outlookHealth,
 	  ] = await Promise.all([
-    env.D1.prepare(
+		    env.D1.prepare(
       `${matchedCte}
        SELECT COUNT(*) AS total_matched,
               SUM(mailbox_match) AS mailbox_ingested,
@@ -527,8 +536,9 @@ async function inspectUserIngestionTelemetry(
 	          AND (scope_id = ? OR scope_type = 'org')
 	        ORDER BY last_seen_at DESC
 	        LIMIT 10`
-	    ).bind(ctx.orgId, user.id).all<any>(),
-	  ]);
+		    ).bind(ctx.orgId, user.id).all<any>(),
+        getOutlookAppOnlyHealthSnapshot(ctx.orgId, env, { includeGraphProbes: true }),
+		  ]);
 
   let progressiveWindowSummary: any = null;
   let failedWindows: any[] = [];
@@ -577,6 +587,8 @@ async function inspectUserIngestionTelemetry(
       || (run.metadata as any)?.trigger === 'manual_date_range'
     )
   );
+  const mailboxHealth = outlookHealth.mailboxes.find(m => m.user_id === user.id) || null;
+  const filteredIncidents = filterOutlookIncidentsForUserReports(activeIngestionIncidents.results || [], outlookHealth);
 
   return {
     ok: true,
@@ -588,11 +600,17 @@ async function inspectUserIngestionTelemetry(
       full_name: user.full_name,
       role: user.role,
       is_active: Boolean(user.is_active),
-      outlook_connected: Boolean(user.has_outlook_token),
+      outlook_connected: Boolean(mailboxHealth?.mailbox) && mailboxHealth?.status !== 'blocked' && mailboxHealth?.status !== 'missing_mailbox',
       inbox_delta_token_present: Boolean(user.has_inbox_delta_token),
       sent_delta_token_present: Boolean(sentDeltaToken),
       sync_history_days: syncConfig?.sync_history_days ?? 30,
-      token_failure_state: tokenFailureState || { healthy: true },
+      token_failure_state: {
+        healthy: mailboxHealth?.status === 'healthy' || mailboxHealth?.status === 'degraded',
+        auth_mode: outlookHealth.auth_mode,
+        status: mailboxHealth?.status || outlookHealth.status,
+        suppressed_legacy_state: Boolean(tokenFailureState),
+      },
+      outlook_app_only_health: mailboxHealth,
     },
     email_ingestion: {
       metric_definition: 'Counts are Outlook conversation rows stored in conversations. mailbox_ingested_conversations uses the participant_user_ids mailbox stamp from the ingestion pipeline; address_involved_conversations matches the user email in From/To/Cc. Duplicate Graph messages are deduped by external_message_id before/while persisting.',
@@ -618,7 +636,7 @@ async function inspectUserIngestionTelemetry(
 	      live_kv_progress: backfillProgress || null,
 	    },
 	    ingestion_health: {
-	      active_incidents: activeIngestionIncidents.results || [],
+	      active_incidents: filteredIncidents,
 	    },
     recent_activity: {
       recent_matched_conversations: (recentConversations.results || []).map(row => ({
@@ -657,6 +675,7 @@ async function inspectDataCoverage(ctx: AuthContext, env: Env): Promise<any> {
     eventsTotal,
     eventsEmbedded,
     connectedUsers,
+    outlookHealth,
   ] = await Promise.all([
     env.D1.prepare(`SELECT COUNT(*) AS n FROM conversations WHERE org_id = ?`).bind(ctx.orgId).first<{ n: number }>(),
     env.D1.prepare(`SELECT COUNT(DISTINCT entity_id) AS n FROM vector_entity_index WHERE org_id = ? AND source_table = 'conversations'`).bind(ctx.orgId).first<{ n: number }>(),
@@ -684,11 +703,12 @@ async function inspectDataCoverage(ctx: AuthContext, env: Env): Promise<any> {
     env.D1.prepare(`SELECT COUNT(DISTINCT entity_id) AS n FROM vector_entity_index WHERE org_id = ? AND source_table = 'events'`).bind(ctx.orgId).first<{ n: number }>(),
     env.D1.prepare(
       `SELECT COUNT(*) AS total,
-              COUNT(CASE WHEN outlook_token IS NOT NULL THEN 1 END) AS outlook_connected
+              COUNT(CASE WHEN COALESCE(outlook_mailbox, email) IS NOT NULL THEN 1 END) AS outlook_connected
          FROM users
         WHERE org_id = ?
           AND deleted_at IS NULL`
     ).bind(ctx.orgId).first<{ total: number; outlook_connected: number }>(),
+    getOutlookAppOnlyHealthSnapshot(ctx.orgId, env),
   ]);
 
   const convTotal = asNumber(conversationsTotal?.n);
@@ -708,8 +728,12 @@ async function inspectDataCoverage(ctx: AuthContext, env: Env): Promise<any> {
       meetings: { total: eventTotal, embedded: eventEmbedded, percentage: pct(eventEmbedded, eventTotal) },
       users: {
         total: asNumber(connectedUsers?.total),
-        outlook_connected: asNumber(connectedUsers?.outlook_connected),
+        outlook_connected: outlookHealth.summary.healthy_mailboxes + outlookHealth.summary.degraded_mailboxes,
       },
+    },
+    outlook_app_only_health: {
+      status: outlookHealth.status,
+      summary: outlookHealth.summary,
     },
   };
 }

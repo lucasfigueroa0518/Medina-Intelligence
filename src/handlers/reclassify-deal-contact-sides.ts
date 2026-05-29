@@ -2,9 +2,8 @@
 // using the new domain-based rule.
 //
 // Old logic: deal_contacts inserts always defaulted to side='theirs'
-// regardless of contact email or relation. So Manuel Medina (mdm@
-// medinacapital.com) at Third Summit appeared as 'theirs' even though
-// medinacapital.com is internal.
+// regardless of contact email or relation. Internal-domain contacts could
+// therefore appear on the counterparty side until this recovery ran.
 //
 // New rule (mirrors classifyContactSide):
 //   1. ours   — contact email domain in internal_domains

@@ -2,7 +2,7 @@ import type { Env } from '../types/env';
 import type { AgentSession, AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { preprocessQuery, retrieveContext, TOKEN_BUDGET, type RetrievalOptions } from '../lib/retrieval';
-import { buildSourcesAndContext, type CitationSource } from '../lib/citations';
+import { buildSourcesAndContext, filterCitationSourcesForViewer, type CitationSource } from '../lib/citations';
 import { normalizeCitationMarkers } from '../lib/citation-format';
 import { verifySampleClaims } from '../lib/citation-verifier';
 import { callClaude, callClaudeStreaming } from '../lib/claude';
@@ -346,7 +346,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         include_recipients: { type: 'boolean', description: 'When true, deduplicates To/Cc recipients into first_name/email rows for mail merges.' },
         include_body: { type: 'boolean', description: 'When true, fetches fuller R2 body excerpts for returned rows. Keep false for pure recipient/export sweeps.' },
         body_fetch_limit: { type: 'number', description: 'Max full bodies to fetch when include_body is true. Default 80, max 200 in MAX mode.' },
-        exclude_domains: { type: 'array', items: { type: 'string' }, description: 'Optional recipient domains to exclude from rollup, e.g. medinavc.com.' },
+        exclude_domains: { type: 'array', items: { type: 'string' }, description: 'Optional recipient domains to exclude from rollup, e.g. an internal email domain.' },
         limit: { type: 'number', description: 'Rows to return. Default 300 in MAX mode, max 1000.' },
         offset: { type: 'number', description: 'Pagination offset. If has_more is true, call again with the next offset before finalizing exhaustive answers.' },
       },
@@ -2194,7 +2194,10 @@ export async function getSessionMessages(
       deckJobsByMessage.set(jobRow.assistant_message_id, existing);
     }
   }
-  const hydratedMessages = messages.results.map(m => ({
+  const hydratedMessages: Array<Record<string, any> & {
+    sources: CitationSource[] | null;
+    attachments: UploadSummary[] | null;
+  }> = (messages.results as any[]).map(m => ({
     ...m,
     metadata: (() => {
       const metadata = safeParseJsonObject(m.metadata);
@@ -2214,6 +2217,16 @@ export async function getSessionMessages(
     sources: m.sources_json ? safeParseJson<CitationSource[]>(m.sources_json) : null,
     attachments: m.attachments ? safeParseJson<UploadSummary[]>(m.attachments) : null,
   }));
+  for (const message of hydratedMessages) {
+    if (!message.sources || message.sources.length === 0) continue;
+    const filteredSources = await filterCitationSourcesForViewer(message.sources, ctx.orgId, env, ctx);
+    if (filteredSources.length !== message.sources.length) {
+      message.sources = filteredSources;
+      if (message.role === 'assistant') {
+        message.content = 'This prior MARTy response included private sources you cannot read, so its generated content is hidden for this viewer.';
+      }
+    }
+  }
   return jsonResponse({ session, messages: hydratedMessages });
 }
 
@@ -2808,7 +2821,7 @@ export async function queryAgent(
     ctx.orgId,
     env,
     query,
-    { deepDive }
+    { deepDive, viewer: ctx }
   );
   const sourceRegistry = new TurnSourceRegistry(sources);
   const routedSourceResults: Array<{ tool: string; reason: string; result: any }> = [];

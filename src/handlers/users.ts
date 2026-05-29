@@ -6,6 +6,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
+import { invalidateDealIntelligenceForAclChange } from '../lib/deal-intelligence';
 
 const PROFILE_FIELDS = ['full_name', 'phone', 'job_title', 'linkedin_url', 'bio', 'avatar_url'] as const;
 type ProfileField = typeof PROFILE_FIELDS[number] | 'share_emails_org_wide';
@@ -54,6 +55,7 @@ export async function updateMyProfile(
   if ('share_emails_org_wide' in body && typeof body.share_emails_org_wide === 'boolean') {
     updates.push({ col: 'share_emails_org_wide', value: body.share_emails_org_wide ? 1 : 0 });
   }
+  const aclAffectingChange = updates.some(u => u.col === 'share_emails_org_wide');
 
   if (updates.length === 0) {
     return errorResponse('NO_UPDATES', 400, 'No valid fields to update');
@@ -66,6 +68,9 @@ export async function updateMyProfile(
   await env.D1.prepare(
     `UPDATE users SET ${setClause}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND deleted_at IS NULL`
   ).bind(...binds).run();
+  if (aclAffectingChange) {
+    await invalidateDealIntelligenceForAclChange(ctx.orgId, env);
+  }
 
   const user = await env.D1.prepare(
     `SELECT id, email, full_name, role, org_id, avatar_url, phone, job_title, linkedin_url, bio, last_login_at, share_emails_org_wide

@@ -271,7 +271,12 @@ function EnrichmentTab() {
 
 function SyncTab() {
   const [status, setStatus] = React.useState<any>(null);
-  const [userHealth, setUserHealth] = React.useState<{ users: any[]; tokenHealth: Record<string, any> } | null>(null);
+  const [userHealth, setUserHealth] = React.useState<{
+    users: any[];
+    tokenHealth: Record<string, any>;
+    mailboxHealth?: Record<string, any>;
+    outlookHealth?: any;
+  } | null>(null);
 
   React.useEffect(() => {
     const load = () => api.getSyncStatus().then(setStatus);
@@ -320,7 +325,12 @@ function SyncTab() {
 
       {userHealth && (
         <div className="card">
-          <div className="font-medium mb-3">User Token Health</div>
+          <div className="font-medium mb-3">Outlook Mailbox Health</div>
+          {userHealth.outlookHealth && (
+            <div className="mb-3 text-xs text-text-secondary">
+              {userHealth.outlookHealth.label}: {userHealth.outlookHealth.detail}
+            </div>
+          )}
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-xs text-text-muted border-b border-border">
@@ -329,16 +339,17 @@ function SyncTab() {
                 <th className="pb-2">Role</th>
                 <th className="pb-2">Sharing</th>
                 <th className="pb-2">Outlook</th>
-                <th className="pb-2">Failures</th>
+                <th className="pb-2">Subscriptions</th>
               </tr>
             </thead>
             <tbody>
               {userHealth.users.map((u: any) => {
                 const health = userHealth.tokenHealth[u.id];
-                const failures = health?.count || 0;
-                const rowColor = failures >= 3
+                const mailbox = userHealth.mailboxHealth?.[u.id] || null;
+                const failures = (mailbox?.dead_letter_work || 0) + (mailbox?.subscriptions?.missing?.length || 0) + (mailbox?.subscriptions?.expired?.length || 0);
+                const rowColor = mailbox?.status === 'blocked' || mailbox?.status === 'missing_mailbox'
                   ? 'bg-semantic-error/5'
-                  : failures >= 1
+                  : mailbox?.status === 'degraded' || failures >= 1
                     ? 'bg-semantic-warning/5'
                     : '';
                 return (
@@ -358,18 +369,23 @@ function SyncTab() {
                       )}
                     </td>
                     <td className="py-2">
-                      {!u.has_outlook ? (
-                        <span className="text-text-muted">Not connected</span>
-                      ) : failures >= 3 ? (
-                        <span className="text-semantic-error">Failing</span>
-                      ) : failures >= 1 ? (
-                        <span className="text-semantic-warning">Degraded ({failures})</span>
+                      {!mailbox?.mailbox ? (
+                        <span className="text-text-muted">No mailbox</span>
+                      ) : mailbox.status === 'blocked' || mailbox.status === 'missing_mailbox' ? (
+                        <span className="text-semantic-error">Blocked</span>
+                      ) : mailbox.status === 'degraded' ? (
+                        <span className="text-semantic-warning">Repair needed</span>
                       ) : (
                         <span className="text-semantic-success">Healthy</span>
                       )}
+                      {mailbox?.mailbox && <div className="text-[10px] text-text-muted">{mailbox.mailbox}</div>}
+                      {health?.suppressed_legacy_state && <div className="text-[10px] text-text-muted">legacy token state suppressed</div>}
                     </td>
                     <td className="py-2 text-text-muted">
-                      {failures > 0 ? failures : '—'}
+                      {mailbox?.subscriptions
+                        ? `${mailbox.subscriptions.current.length}/${mailbox.subscriptions.expected.length} current`
+                        : '—'}
+                      {mailbox?.dead_letter_work ? <div className="text-[10px] text-semantic-warning">{mailbox.dead_letter_work} dead-lettered</div> : null}
                     </td>
                   </tr>
                 );

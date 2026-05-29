@@ -137,6 +137,115 @@ export async function loadContactActivityRollup(
   };
 }
 
+function emptyRollup(): ContactActivityRollup {
+  return {
+    first_interaction_date: null,
+    last_activity_at: null,
+    last_conversation_at: null,
+    last_event_at: null,
+    last_task_at: null,
+    last_document_at: null,
+    conversation_count: 0,
+    event_count: 0,
+    task_count: 0,
+    document_count: 0,
+    weekly_interactions: [],
+  };
+}
+
+function weekKey(iso: string): { week: string; week_start: string } | null {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  start.setUTCDate(start.getUTCDate() - start.getUTCDay());
+  const yearStart = new Date(Date.UTC(start.getUTCFullYear(), 0, 1));
+  const week = Math.floor((start.getTime() - yearStart.getTime()) / 604800000);
+  return {
+    week: `${start.getUTCFullYear()}-${String(week).padStart(2, '0')}`,
+    week_start: start.toISOString(),
+  };
+}
+
+export async function loadContactActivityRollupForViewer(
+  env: Env,
+  ctx: AuthContext,
+  contactId: string
+): Promise<ContactActivityRollup> {
+  const rows = await env.D1.prepare(
+    `SELECT id, org_id, contact_id, item_type, item_id, item_timestamp, title, subtype,
+            body_preview, source, external_thread_id, external_message_id, participant_user_ids,
+            visibility, uploaded_by, metadata
+       FROM contact_timeline_items
+      WHERE org_id = ? AND contact_id = ?
+      ORDER BY item_timestamp DESC
+      LIMIT 2000`
+  ).bind(ctx.orgId, contactId).all<TimelineItemRow>();
+
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+  const sharingSet = new Set(Object.keys(sharingFlags).filter(id => sharingFlags[id]));
+  const rollup = emptyRollup();
+  const weekly = new Map<string, { week: string; week_start: string; cnt: number }>();
+  const weeklyCutoff = Date.now() - 56 * 86400000;
+
+  for (const row of rows.results) {
+    const metadata = parseMetadata(row.metadata);
+    let readable = true;
+    if (row.item_type === 'conversation') {
+      readable = canReadConversationContent(
+        {
+          source: row.source,
+          participant_user_ids: row.participant_user_ids,
+          is_campaign_email: metadata.is_campaign_email,
+          slack_is_private: metadata.slack_is_private,
+        } as any,
+        ctx.userId,
+        ctx.userRole,
+        sharingFlags
+      );
+    } else if (row.item_type === 'event') {
+      if (!hasOrgWidePrivateDataAccess(ctx.userRole)) {
+        const participants = parseParticipantUserIds(row.participant_user_ids);
+        readable = participants.includes(ctx.userId) || participants.some(pid => sharingSet.has(pid));
+      }
+    } else if (row.item_type === 'document') {
+      readable = isDocumentAccessibleToUser(row, ctx.userId, ctx.userRole, sharingSet);
+    }
+    if (!readable) continue;
+
+    const ts = row.item_timestamp;
+    if ((row.item_type === 'conversation' || row.item_type === 'event') &&
+        (!rollup.first_interaction_date || ts < rollup.first_interaction_date)) {
+      rollup.first_interaction_date = ts;
+    }
+    if (!rollup.last_activity_at || ts > rollup.last_activity_at) rollup.last_activity_at = ts;
+    if (row.item_type === 'conversation') {
+      rollup.conversation_count++;
+      if (!rollup.last_conversation_at || ts > rollup.last_conversation_at) rollup.last_conversation_at = ts;
+      const parsedTs = Date.parse(ts);
+      if (Number.isFinite(parsedTs) && parsedTs >= weeklyCutoff) {
+        const wk = weekKey(ts);
+        if (wk) {
+          const existing = weekly.get(wk.week) || { ...wk, cnt: 0 };
+          existing.cnt++;
+          weekly.set(wk.week, existing);
+        }
+      }
+    } else if (row.item_type === 'event') {
+      rollup.event_count++;
+      if (!rollup.last_event_at || ts > rollup.last_event_at) rollup.last_event_at = ts;
+    } else if (row.item_type === 'task') {
+      rollup.task_count++;
+      if (!rollup.last_task_at || ts > rollup.last_task_at) rollup.last_task_at = ts;
+    } else if (row.item_type === 'document') {
+      rollup.document_count++;
+      if (!rollup.last_document_at || ts > rollup.last_document_at) rollup.last_document_at = ts;
+    }
+  }
+
+  rollup.weekly_interactions = Array.from(weekly.values()).sort((a, b) => a.week.localeCompare(b.week));
+  return rollup;
+}
+
 export async function recordContactDetailReadModelRepair(
   env: Env,
   orgId: string,

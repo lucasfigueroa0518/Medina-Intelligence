@@ -5,10 +5,10 @@ import {
   getActiveUsersForOrg,
   getOrgDomains,
   getOrgSettings,
-  getDecryptedAccessToken,
 } from '../lib/helpers';
 import { stripHtml, stripQuotedReplies } from '../lib/helpers';
-import { refreshOutlookToken, recordTokenFailure } from './oauth';
+import { recordTokenFailure } from './oauth';
+import { getGraphMailboxAuthForUser, graphMailboxUrl } from '../lib/graph-auth';
 import { upsertOutlookEvent } from '../lib/reconciliation';
 import { checkGraphRateLimit, recordGraphApiCall } from '../lib/rate-limit';
 import { recordRateLimit } from '../lib/upstream-budget';
@@ -84,6 +84,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+export function isDelegatedGraphDeltaLink(deltaLink: string | null | undefined): boolean {
+  if (!deltaLink) return false;
+  try {
+    const url = new URL(deltaLink);
+    if (url.hostname !== 'graph.microsoft.com') return false;
+    return /^\/v1\.0\/me(?:\/|$)/i.test(url.pathname);
+  } catch {
+    return /^https:\/\/graph\.microsoft\.com\/v1\.0\/me(?:\/|$)/i.test(deltaLink);
+  }
+}
+
 async function graphFetchWithRetry(
   url: string,
   token: string,
@@ -129,15 +140,22 @@ async function graphFetchWithRetry(
 async function fetchFolderDelta(
   token: string,
   userId: string,
+  mailbox: string,
   config: FolderDeltaConfig,
   orgId: string,
   env: Env
 ): Promise<OutlookMessage[]> {
   const deltaToken = await config.getDeltaToken();
 
-  const initialUrl = `https://graph.microsoft.com/v1.0/me/mailFolders/${config.folder}/messages/delta?${MSG_SELECT}&${config.backfillFilter}&$top=50`;
+  const initialUrl = graphMailboxUrl(mailbox, `/mailFolders/${config.folder}/messages/delta?${MSG_SELECT}&${config.backfillFilter}&$top=50`);
   let url = deltaToken || initialUrl;
   let usingDeltaToken = Boolean(deltaToken);
+  if (isDelegatedGraphDeltaLink(deltaToken)) {
+    await config.clearDeltaToken();
+    console.warn(`[outlook] Ignoring delegated /me delta token for ${config.folder} user ${userId}; restarting app-only mailbox delta.`);
+    url = initialUrl;
+    usingDeltaToken = false;
+  }
 
   const messages: OutlookMessage[] = [];
 
@@ -362,46 +380,16 @@ export async function fetchOutlookDelta(
   }
 
   for (const user of users) {
-    if (!user.outlook_token) continue;
     let userHadFailure = false;
-    const failState = await env.KV.get<{ count: number }>(
-      `token_failed:${user.id}:outlook`,
-      'json'
-    );
-    if (failState && failState.count >= 3) {
-      userHadFailure = true;
-      await recordFailure(user, {
-        source: 'outlook',
-        error: 'token_failed_threshold_exceeded',
-        code: 'outlook_reauth_required',
-        human_action_required: true,
-      });
-      continue;
-    }
-
-    const refreshResult = await refreshOutlookToken(user.id, orgId, env);
-    if (!refreshResult.success) {
-      userHadFailure = true;
-      const human = refreshResult.reason === 'reauth_required' || refreshResult.reason === 'missing_token';
-      await recordFailure(user, {
-        source: 'outlook',
-        error: `token_refresh_failed:${refreshResult.reason || refreshResult.errorCode || 'unknown'}`,
-        code: human ? 'outlook_reauth_required' : 'outlook_token_refresh_transient',
-        http_status: refreshResult.status,
-        human_action_required: human,
-      });
-      continue;
-    }
-
-    let token: string;
+    let auth: { token: string; mailbox: string };
     try {
-      token = await getDecryptedAccessToken(user.id, env);
-    } catch {
+      auth = await getGraphMailboxAuthForUser(user.id, orgId, env);
+    } catch (e) {
       userHadFailure = true;
       await recordFailure(user, {
         source: 'outlook',
-        error: 'token_decrypt_failed',
-        code: 'outlook_token_decrypt_failed',
+        error: e instanceof Error ? e.message : String(e),
+        code: 'outlook_app_auth_failed',
         human_action_required: true,
       });
       continue;
@@ -415,7 +403,7 @@ export async function fetchOutlookDelta(
     // Fetch inbox (delta token stored in D1 users table)
     let inboxMessages: OutlookMessage[] = [];
     try {
-      inboxMessages = await fetchFolderDelta(token, user.id, {
+      inboxMessages = await fetchFolderDelta(auth.token, user.id, auth.mailbox, {
         folder: 'inbox',
         getDeltaToken: async () => user.outlook_delta_token || null,
         setDeltaToken: async (dt) => {
@@ -446,7 +434,7 @@ export async function fetchOutlookDelta(
     let sentMessages: OutlookMessage[] = [];
     try {
       const sentDeltaKey = `sent_delta:${user.id}`;
-      sentMessages = await fetchFolderDelta(token, user.id, {
+      sentMessages = await fetchFolderDelta(auth.token, user.id, auth.mailbox, {
         folder: 'sentitems',
         getDeltaToken: async () => await env.KV.get(sentDeltaKey),
         setDeltaToken: async (dt) => {
@@ -557,33 +545,12 @@ export async function runHistoricalBackfill(
     };
   }
 
-  const failState = await env.KV.get<{ count: number }>(
-    `token_failed:${userId}:outlook`,
-    'json'
-  );
-  if (failState && failState.count >= 3) {
-    progress.status = 'failed';
-    progress.error = 'Token has too many failures — reconnect Outlook first';
-    progress.updated_at = new Date().toISOString();
-    await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
-    return progress;
-  }
-
-  const refreshResult = await refreshOutlookToken(userId, orgId, env);
-  if (!refreshResult.success) {
-    progress.status = 'failed';
-    progress.error = 'Token refresh failed';
-    progress.updated_at = new Date().toISOString();
-    await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
-    return progress;
-  }
-
-  let token: string;
+  let auth: { token: string; mailbox: string };
   try {
-    token = await getDecryptedAccessToken(userId, env);
-  } catch {
+    auth = await getGraphMailboxAuthForUser(userId, orgId, env);
+  } catch (e) {
     progress.status = 'failed';
-    progress.error = 'Cannot decrypt access token';
+    progress.error = e instanceof Error ? e.message : 'Cannot get Outlook app-only token';
     progress.updated_at = new Date().toISOString();
     await env.KV.put(progressKey, JSON.stringify(progress), { expirationTtl: 86400 });
     return progress;
@@ -688,7 +655,7 @@ export async function runHistoricalBackfill(
   let url = progress.last_page_url;
   if (!url) {
     const startFilter = `$filter=receivedDateTime ge ${progress.target_start_date} and receivedDateTime lt ${progress.target_end_date}`;
-    url = `https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?${MSG_SELECT}&${startFilter}&$top=50&$orderby=receivedDateTime asc`;
+    url = graphMailboxUrl(auth.mailbox, `/mailFolders/inbox/messages?${MSG_SELECT}&${startFilter}&$top=50&$orderby=receivedDateTime asc`);
   }
 
   const internalDomains = await getOrgDomains(orgId, env);
@@ -726,7 +693,7 @@ export async function runHistoricalBackfill(
     }
 
     const resp = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${auth.token}` },
       signal: AbortSignal.timeout(GRAPH_REQUEST_TIMEOUT_MS),
     });
     await recordGraphApiCall(orgId, env);
@@ -911,26 +878,11 @@ export async function fetchOutlookCalendarDelta(
   const users = await getActiveUsersForOrg(orgId, env);
 
   for (const user of users) {
-    const failState = await env.KV.get<{ count: number }>(
-      `token_failed:${user.id}:outlook`,
-      'json'
-    );
-    if (failState && failState.count >= 3) {
-      result.errors.push({ user_id: user.id, error: 'token_failed_threshold_exceeded' });
-      continue;
-    }
-
-    const refreshResult = await refreshOutlookToken(user.id, orgId, env);
-    if (!refreshResult.success) {
-      result.errors.push({ user_id: user.id, error: `token_refresh_failed:${refreshResult.reason || refreshResult.errorCode || 'unknown'}` });
-      continue;
-    }
-
-    let token: string;
+    let auth: { token: string; mailbox: string };
     try {
-      token = await getDecryptedAccessToken(user.id, env);
-    } catch {
-      result.errors.push({ user_id: user.id, error: 'token_decrypt_failed' });
+      auth = await getGraphMailboxAuthForUser(user.id, orgId, env);
+    } catch (e) {
+      result.errors.push({ user_id: user.id, error: e instanceof Error ? e.message : 'app_only_auth_failed' });
       continue;
     }
 
@@ -942,13 +894,13 @@ export async function fetchOutlookCalendarDelta(
     // permanently un-reconcilable simply because we never fetched the
     // matching calendar entry. 120 days covers his earliest backfilled
     // transcripts (oldest ≈ 2026-01-30) with a small buffer; the 200-channel
-    // upper bound on /me/calendarView pagination doesn't kick in for the
+    // upper bound on Graph calendarView pagination doesn't kick in for the
     // observed event volume (~10/30d for Tony => ~40/120d, two pages max).
     const start = new Date(Date.now() - 120 * 86400000).toISOString();
     const end = new Date(Date.now() + 90 * 86400000).toISOString();
 
-    // Calendar sync via non-delta /me/calendarView. We previously used
-    // /me/calendarView/delta with a calendar_delta:<user_id> KV cursor, but
+    // Calendar sync via non-delta calendarView. We previously used
+    // calendarView/delta with a calendar_delta:<user_id> KV cursor, but
     // production audit 2026-04-30 found `fetched_calendar=0` on every recent
     // run with no KV delta tokens stored for any user, despite the diagnostic
     // /api/admin/diagnose-calendar-sync (which uses non-delta) returning real
@@ -967,9 +919,9 @@ export async function fetchOutlookCalendarDelta(
     //   • tradeoff: deletions in Outlook aren't reflected (no tombstones).
     //     Acceptable for now; can layer a soft-delete pass later if needed.
     let url: string =
-      `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${encodeURIComponent(
+      graphMailboxUrl(auth.mailbox, `/calendarView?startDateTime=${encodeURIComponent(
         start
-      )}&endDateTime=${encodeURIComponent(end)}&$top=50`;
+      )}&endDateTime=${encodeURIComponent(end)}&$top=50`);
 
     const events: OutlookCalendarEvent[] = [];
     const userStartedAt = Date.now();
@@ -992,7 +944,7 @@ export async function fetchOutlookCalendarDelta(
 
         const resp = await fetch(url, {
           headers: {
-            Authorization: `Bearer ${token}`,
+            Authorization: `Bearer ${auth.token}`,
             Prefer: 'odata.maxpagesize=50, outlook.timezone="UTC"',
           },
           signal: AbortSignal.timeout(GRAPH_REQUEST_TIMEOUT_MS),

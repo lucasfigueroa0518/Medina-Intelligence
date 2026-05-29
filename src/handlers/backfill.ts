@@ -265,8 +265,8 @@ export async function cancelBackfill(
  * GET /api/backfill/eligible-users  (owner-only)
  *
  * Powers the owner-only user-picker in the Settings UI. Returns users in the
- * caller's org who have Outlook OAuth connected. The auto-resolved "yourself"
- * option in the UI doesn't need this list — it's purely the picker for
+ * caller's org with a provisioned platform user mailbox. The auto-resolved
+ * "yourself" option in the UI doesn't need this list — it's purely the picker for
  * impersonating other users.
  */
 export async function listEligibleUsers(
@@ -277,11 +277,11 @@ export async function listEligibleUsers(
     return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can list eligible users.');
   }
   const users = await env.D1.prepare(
-    `SELECT id, email, full_name, role
+    `SELECT id, COALESCE(outlook_mailbox, email) AS email, full_name, role
        FROM users
       WHERE org_id = ?
         AND deleted_at IS NULL
-        AND outlook_token IS NOT NULL
+        AND COALESCE(outlook_mailbox, email) IS NOT NULL
       ORDER BY (id = ?) DESC, full_name ASC`
   ).bind(ctx.orgId, ctx.userId).all<{
     id: string;

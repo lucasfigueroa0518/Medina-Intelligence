@@ -22,6 +22,7 @@
 import type { Env } from './types/env';
 import type { AuditEvent } from './types/audit';
 import type { WebhookQueueMessage } from './types/webhooks';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 
 // Workflow class re-exports — declares pipelines as the runtime owner
 // of these Workflow names. wrangler.pipelines.toml declares the
@@ -41,6 +42,29 @@ export { DailyCronWorkflow } from './workflows/daily-cron';
 // the handlers, non-arbitrated paths (workflow create, daily cron)
 // double-fire as accepted overhead.
 import { handleScheduled, handleQueue } from './index';
+
+export class PipelinesEntrypoint extends WorkerEntrypoint<Env> {
+  async triggerWorkflow(input: {
+    workflow: 'ingestion' | 'enrichment' | 'campaign';
+    id?: string;
+    params?: unknown;
+  }): Promise<{ id: string }> {
+    const binding =
+      input.workflow === 'ingestion' ? this.env.INGESTION_WORKFLOW :
+      input.workflow === 'enrichment' ? this.env.ENRICHMENT_WORKFLOW :
+      this.env.CAMPAIGN_WORKFLOW;
+
+    if (!binding) {
+      throw new Error(`WORKFLOW_BINDING_MISSING:${input.workflow}`);
+    }
+
+    const instance = await binding.create({
+      id: input.id,
+      params: input.params,
+    });
+    return { id: instance.id };
+  }
+}
 
 // /health endpoint — ping each binding type. Single curl test for
 // Phase 1 verification.

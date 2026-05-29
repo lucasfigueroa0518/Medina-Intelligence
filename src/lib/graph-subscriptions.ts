@@ -1,12 +1,21 @@
 import type { Env } from '../types/env';
-import { getDecryptedAccessToken } from './helpers';
-import { refreshOutlookToken } from '../integrations/oauth';
+import { getGraphMailboxAuthForUser } from './graph-auth';
 
 const GRAPH_SUBSCRIPTIONS_URL = 'https://graph.microsoft.com/v1.0/subscriptions';
 const MAX_EXPIRATION_MINUTES = 4230; // Graph max for mail: ~2.94 days
 
-function webhookUrl(env: Env): string {
-  const base = env.AZURE_REDIRECT_URI.replace('/auth/outlook/callback', '');
+type SubscriptionCreateResult = { subscriptionId: string } | { error: string };
+
+export function graphSubscriptionWebhookUrl(env: Env): string {
+  const configuredBase = (env.OUTLOOK_WEBHOOK_BASE_URL || '').trim();
+  const redirect = env.AZURE_REDIRECT_URI || '';
+  const base = (configuredBase || redirect.replace('/auth/outlook/callback', '')).replace(/\/+$/, '');
+  if (!base) {
+    throw new Error('OUTLOOK_WEBHOOK_BASE_URL or AZURE_REDIRECT_URI is required for Graph subscriptions');
+  }
+  if (!/^https:\/\//i.test(base)) {
+    throw new Error('Graph subscription notification URL must be HTTPS. Set OUTLOOK_WEBHOOK_BASE_URL to a public HTTPS Worker or tunnel URL for local validation.');
+  }
   return `${base}/webhooks/outlook-mail`;
 }
 
@@ -15,26 +24,46 @@ function expirationDateTime(): string {
   return exp.toISOString();
 }
 
+export function expectedSubscriptionResourcesForMailbox(mailbox: string): string[] {
+  const encoded = encodeURIComponent(mailbox.trim().toLowerCase());
+  return [
+    `users/${encoded}/mailFolders/inbox/messages`,
+    `users/${encoded}/mailFolders/sentitems/messages`,
+    `users/${encoded}/events`,
+  ];
+}
+
+async function deleteExistingResourceRows(userId: string, orgId: string, resource: string, env: Env): Promise<void> {
+  await env.D1.prepare(
+    `DELETE FROM graph_subscriptions
+      WHERE user_id = ? AND org_id = ? AND resource = ?`
+  ).bind(userId, orgId, resource).run();
+}
+
 export async function createMailSubscription(
   userId: string,
   orgId: string,
   env: Env
-): Promise<{ subscriptionId: string } | null> {
-  const refreshResult = await refreshOutlookToken(userId, orgId, env);
-  if (!refreshResult.success) return null;
-
-  let token: string;
+): Promise<SubscriptionCreateResult | null> {
+  let auth: { token: string; mailbox: string };
   try {
-    token = await getDecryptedAccessToken(userId, env);
-  } catch {
-    return null;
+    auth = await getGraphMailboxAuthForUser(userId, orgId, env);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+  let notificationUrl: string;
+  try {
+    notificationUrl = graphSubscriptionWebhookUrl(env);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
   }
 
   const clientState = `${orgId}:${userId}`;
+  const resource = `users/${encodeURIComponent(auth.mailbox)}/mailFolders/inbox/messages`;
   const body = {
     changeType: 'created',
-    notificationUrl: webhookUrl(env),
-    resource: 'me/mailFolders/inbox/messages',
+    notificationUrl,
+    resource,
     expirationDateTime: expirationDateTime(),
     clientState,
   };
@@ -42,7 +71,7 @@ export async function createMailSubscription(
   const resp = await fetch(GRAPH_SUBSCRIPTIONS_URL, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${auth.token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -51,15 +80,16 @@ export async function createMailSubscription(
   if (!resp.ok) {
     const err = await resp.text();
     console.error(`[graph-sub] Failed to create mail subscription for user ${userId}:`, resp.status, err);
-    return null;
+    return { error: `HTTP ${resp.status}: ${err.slice(0, 500)}` };
   }
 
   const sub = (await resp.json()) as { id: string; expirationDateTime: string };
 
+  await deleteExistingResourceRows(userId, orgId, resource, env);
   await env.D1.prepare(
     `INSERT INTO graph_subscriptions (org_id, user_id, subscription_id, resource, expiration_at, client_state)
      VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(orgId, userId, sub.id, 'me/mailFolders/inbox/messages', sub.expirationDateTime, clientState).run();
+  ).bind(orgId, userId, sub.id, resource, sub.expirationDateTime, clientState).run();
 
   console.log(`[graph-sub] Created mail subscription ${sub.id} for user ${userId}, expires ${sub.expirationDateTime}`);
   return { subscriptionId: sub.id };
@@ -69,22 +99,26 @@ export async function createSentMailSubscription(
   userId: string,
   orgId: string,
   env: Env
-): Promise<{ subscriptionId: string } | null> {
-  const refreshResult = await refreshOutlookToken(userId, orgId, env);
-  if (!refreshResult.success) return null;
-
-  let token: string;
+): Promise<SubscriptionCreateResult | null> {
+  let auth: { token: string; mailbox: string };
   try {
-    token = await getDecryptedAccessToken(userId, env);
-  } catch {
-    return null;
+    auth = await getGraphMailboxAuthForUser(userId, orgId, env);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+  let notificationUrl: string;
+  try {
+    notificationUrl = graphSubscriptionWebhookUrl(env);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
   }
 
   const clientState = `${orgId}:${userId}`;
+  const resource = `users/${encodeURIComponent(auth.mailbox)}/mailFolders/sentitems/messages`;
   const body = {
     changeType: 'created',
-    notificationUrl: webhookUrl(env),
-    resource: 'me/mailFolders/sentitems/messages',
+    notificationUrl,
+    resource,
     expirationDateTime: expirationDateTime(),
     clientState,
   };
@@ -92,7 +126,7 @@ export async function createSentMailSubscription(
   const resp = await fetch(GRAPH_SUBSCRIPTIONS_URL, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${auth.token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -101,15 +135,16 @@ export async function createSentMailSubscription(
   if (!resp.ok) {
     const err = await resp.text();
     console.error(`[graph-sub] Failed to create sent-mail subscription for user ${userId}:`, resp.status, err);
-    return null;
+    return { error: `HTTP ${resp.status}: ${err.slice(0, 500)}` };
   }
 
   const sub = (await resp.json()) as { id: string; expirationDateTime: string };
 
+  await deleteExistingResourceRows(userId, orgId, resource, env);
   await env.D1.prepare(
     `INSERT INTO graph_subscriptions (org_id, user_id, subscription_id, resource, expiration_at, client_state)
      VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(orgId, userId, sub.id, 'me/mailFolders/sentitems/messages', sub.expirationDateTime, clientState).run();
+  ).bind(orgId, userId, sub.id, resource, sub.expirationDateTime, clientState).run();
 
   console.log(`[graph-sub] Created sent-mail subscription ${sub.id} for user ${userId}, expires ${sub.expirationDateTime}`);
   return { subscriptionId: sub.id };
@@ -119,22 +154,26 @@ export async function createCalendarSubscription(
   userId: string,
   orgId: string,
   env: Env
-): Promise<{ subscriptionId: string } | null> {
-  const refreshResult = await refreshOutlookToken(userId, orgId, env);
-  if (!refreshResult.success) return null;
-
-  let token: string;
+): Promise<SubscriptionCreateResult | null> {
+  let auth: { token: string; mailbox: string };
   try {
-    token = await getDecryptedAccessToken(userId, env);
-  } catch {
-    return null;
+    auth = await getGraphMailboxAuthForUser(userId, orgId, env);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+  let notificationUrl: string;
+  try {
+    notificationUrl = graphSubscriptionWebhookUrl(env);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
   }
 
   const clientState = `${orgId}:${userId}`;
+  const resource = `users/${encodeURIComponent(auth.mailbox)}/events`;
   const body = {
     changeType: 'created,updated',
-    notificationUrl: webhookUrl(env),
-    resource: 'me/events',
+    notificationUrl,
+    resource,
     expirationDateTime: expirationDateTime(),
     clientState,
   };
@@ -142,7 +181,7 @@ export async function createCalendarSubscription(
   const resp = await fetch(GRAPH_SUBSCRIPTIONS_URL, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${auth.token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -151,15 +190,16 @@ export async function createCalendarSubscription(
   if (!resp.ok) {
     const err = await resp.text();
     console.error(`[graph-sub] Failed to create calendar subscription for user ${userId}:`, resp.status, err);
-    return null;
+    return { error: `HTTP ${resp.status}: ${err.slice(0, 500)}` };
   }
 
   const sub = (await resp.json()) as { id: string; expirationDateTime: string };
 
+  await deleteExistingResourceRows(userId, orgId, resource, env);
   await env.D1.prepare(
     `INSERT INTO graph_subscriptions (org_id, user_id, subscription_id, resource, expiration_at, client_state)
      VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(orgId, userId, sub.id, 'me/events', sub.expirationDateTime, clientState).run();
+  ).bind(orgId, userId, sub.id, resource, sub.expirationDateTime, clientState).run();
 
   console.log(`[graph-sub] Created calendar subscription ${sub.id} for user ${userId}, expires ${sub.expirationDateTime}`);
   return { subscriptionId: sub.id };
@@ -171,12 +211,9 @@ export async function renewSubscription(
   orgId: string,
   env: Env
 ): Promise<boolean> {
-  const refreshResult = await refreshOutlookToken(userId, orgId, env);
-  if (!refreshResult.success) return false;
-
-  let token: string;
+  let auth: { token: string };
   try {
-    token = await getDecryptedAccessToken(userId, env);
+    auth = await getGraphMailboxAuthForUser(userId, orgId, env);
   } catch {
     return false;
   }
@@ -184,7 +221,7 @@ export async function renewSubscription(
   const resp = await fetch(`${GRAPH_SUBSCRIPTIONS_URL}/${subscriptionId}`, {
     method: 'PATCH',
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${auth.token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ expirationDateTime: expirationDateTime() }),
@@ -216,10 +253,14 @@ export async function deleteSubscription(
   env: Env
 ): Promise<void> {
   try {
-    const token = await getDecryptedAccessToken(userId, env);
+    const row = await env.D1.prepare(
+      'SELECT org_id FROM graph_subscriptions WHERE subscription_id = ? AND user_id = ?'
+    ).bind(subscriptionId, userId).first<{ org_id: string }>();
+    if (!row) throw new Error('subscription not found');
+    const auth = await getGraphMailboxAuthForUser(userId, row.org_id, env);
     await fetch(`${GRAPH_SUBSCRIPTIONS_URL}/${subscriptionId}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${auth.token}` },
     });
   } catch {
     // Best-effort — subscription will expire on its own
@@ -232,36 +273,111 @@ export async function deleteSubscription(
 export async function renewExpiringSubscriptions(env: Env): Promise<void> {
   const cutoff = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   const expiring = await env.D1.prepare(
-    `SELECT subscription_id, user_id, org_id FROM graph_subscriptions
+    `SELECT subscription_id, user_id, org_id, resource FROM graph_subscriptions
      WHERE expiration_at < ? ORDER BY expiration_at ASC LIMIT 50`
-  ).bind(cutoff).all<{ subscription_id: string; user_id: string; org_id: string }>();
+  ).bind(cutoff).all<{ subscription_id: string; user_id: string; org_id: string; resource: string }>();
 
   for (const sub of expiring.results) {
+    if (!sub.resource.startsWith('users/')) {
+      continue;
+    }
     const ok = await renewSubscription(sub.subscription_id, sub.user_id, sub.org_id, env);
     if (!ok) {
       console.warn(`[graph-sub] Renewal failed for ${sub.subscription_id}, will recreate on next daily cron`);
     }
   }
+
+  const users = await env.D1.prepare(
+    `SELECT id, org_id FROM users
+      WHERE deleted_at IS NULL
+        AND is_active = 1
+        AND COALESCE(outlook_mailbox, email) IS NOT NULL
+      ORDER BY org_id, email
+      LIMIT 200`
+  ).all<{ id: string; org_id: string }>();
+  for (const user of users.results || []) {
+    await ensureSubscriptionsForUser(user.id, user.org_id, env);
+  }
+}
+
+export interface EnsureSubscriptionsResult {
+  user_id: string;
+  mailbox: string;
+  expected: string[];
+  existing: string[];
+  created: string[];
+  errors: string[];
+  deleted_legacy: number;
+  deleted_expired: number;
 }
 
 export async function ensureSubscriptionsForUser(
   userId: string,
   orgId: string,
   env: Env
-): Promise<void> {
+): Promise<EnsureSubscriptionsResult | null> {
+  const user = await env.D1.prepare(
+    `SELECT email, outlook_mailbox FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(userId, orgId).first<{ email: string | null; outlook_mailbox: string | null }>();
+  const mailbox = (user?.outlook_mailbox || user?.email || '').trim().toLowerCase();
+  if (!mailbox) return null;
+
+  const expected = expectedSubscriptionResourcesForMailbox(mailbox);
   const existing = await env.D1.prepare(
-    'SELECT resource FROM graph_subscriptions WHERE user_id = ?'
-  ).bind(userId).all<{ resource: string }>();
+    `SELECT resource, expiration_at FROM graph_subscriptions
+      WHERE user_id = ? AND org_id = ?`
+  ).bind(userId, orgId).all<{ resource: string; expiration_at: string }>();
 
-  const resources = new Set(existing.results.map(r => r.resource));
+  const legacy = existing.results.filter(r => /^me\//i.test(r.resource));
+  const expiredExpected = existing.results.filter(r =>
+    expected.includes(r.resource) && Date.parse(r.expiration_at) <= Date.now()
+  );
 
-  if (!resources.has('me/mailFolders/inbox/messages')) {
-    await createMailSubscription(userId, orgId, env);
+  const activeResources = new Set(
+    existing.results
+      .filter(r => expected.includes(r.resource) && Date.parse(r.expiration_at) > Date.now())
+      .map(r => r.resource)
+  );
+  const created: string[] = [];
+  const errors: string[] = [];
+  if (!activeResources.has(expected[0])) {
+    const result = await createMailSubscription(userId, orgId, env);
+    if (result && 'subscriptionId' in result) created.push(expected[0]);
+    else errors.push(`inbox:${result && 'error' in result ? result.error : 'unknown subscription create failure'}`);
   }
-  if (!resources.has('me/mailFolders/sentitems/messages')) {
-    await createSentMailSubscription(userId, orgId, env);
+  if (!activeResources.has(expected[1])) {
+    const result = await createSentMailSubscription(userId, orgId, env);
+    if (result && 'subscriptionId' in result) created.push(expected[1]);
+    else errors.push(`sentitems:${result && 'error' in result ? result.error : 'unknown subscription create failure'}`);
   }
-  if (!resources.has('me/events')) {
-    await createCalendarSubscription(userId, orgId, env);
+  if (!activeResources.has(expected[2])) {
+    const result = await createCalendarSubscription(userId, orgId, env);
+    if (result && 'subscriptionId' in result) created.push(expected[2]);
+    else errors.push(`events:${result && 'error' in result ? result.error : 'unknown subscription create failure'}`);
   }
+
+  const expectedSatisfied = expected.every(resource => activeResources.has(resource) || created.includes(resource));
+  let deletedLegacy = 0;
+  let deletedExpired = 0;
+  if (expectedSatisfied && (legacy.length > 0 || expiredExpected.length > 0)) {
+    await env.D1.prepare(
+      `DELETE FROM graph_subscriptions
+        WHERE user_id = ? AND org_id = ?
+          AND (resource LIKE 'me/%'
+            OR (resource IN (${expected.map(() => '?').join(',')}) AND expiration_at <= ?))`
+    ).bind(userId, orgId, ...expected, new Date().toISOString()).run();
+    deletedLegacy = legacy.length;
+    deletedExpired = expiredExpected.length;
+  }
+
+  return {
+    user_id: userId,
+    mailbox,
+    expected,
+    existing: existing.results.map(r => r.resource),
+    created,
+    errors,
+    deleted_legacy: deletedLegacy,
+    deleted_expired: deletedExpired,
+  };
 }

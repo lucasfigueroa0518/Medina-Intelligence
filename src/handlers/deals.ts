@@ -26,6 +26,12 @@ import {
   REQUIRED_SUGGESTION_EVIDENCE,
   promoteDetectedDealCandidate,
 } from '../lib/deal-suggestions';
+import {
+  changedFieldsFromSanitizedSnapshots,
+  filterReadableConversationRows,
+  loadConversationVisibilityMap,
+  sanitizeEmailDerivedSnapshot,
+} from '../lib/email-derived-visibility';
 
 // ---------------------------------------------------------------------------
 // GET /api/deals
@@ -155,12 +161,65 @@ export async function listDeals(
     ).bind(...binds).first<{ total: number }>(),
   ]);
 
+  const deals = await attachLastReadableActivity(result.results as any[], ctx, env);
+
   return jsonResponse({
-    deals: result.results,
+    deals,
     total: countResult?.total || 0,
     limit,
     offset,
     has_more: offset + limit < (countResult?.total || 0),
+  });
+}
+
+async function attachLastReadableActivity<T extends Record<string, any>>(
+  deals: T[],
+  ctx: AuthContext,
+  env: Env
+): Promise<T[]> {
+  if (deals.length === 0) return deals;
+  const ids = deals.map(d => d.id).filter(Boolean);
+  const ph = ids.map(() => '?').join(',');
+  const rows = await env.D1.prepare(
+    `SELECT dc.deal_id,
+            conv.id,
+            conv.subject,
+            conv.sent_at,
+            COALESCE(c.full_name, conv.from_email) AS sender,
+            conv.source,
+            conv.participant_user_ids,
+            conv.is_campaign_email,
+            sc.is_private AS slack_is_private
+       FROM deal_contacts dc
+       JOIN conversation_contacts cc ON dc.contact_id = cc.contact_id
+       JOIN conversations conv ON cc.conversation_id = conv.id
+       LEFT JOIN contacts c ON conv.from_contact_id = c.id
+       LEFT JOIN slack_channels sc
+         ON conv.source = 'slack'
+        AND sc.org_id = conv.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(conv.external_message_id, ':') > 0
+          THEN substr(conv.external_message_id, 1, instr(conv.external_message_id, ':') - 1)
+          ELSE conv.external_message_id
+        END
+      WHERE dc.org_id = ? AND dc.deal_id IN (${ph})
+      ORDER BY conv.sent_at DESC`
+  ).bind(ctx.orgId, ...ids).all<any>();
+
+  const readable = await filterReadableConversationRows(env, ctx, rows.results as any[]);
+  const byDeal = new Map<string, any>();
+  for (const row of readable) {
+    if (!byDeal.has(row.deal_id)) byDeal.set(row.deal_id, row);
+  }
+
+  return deals.map(deal => {
+    const latest = byDeal.get(deal.id);
+    return {
+      ...deal,
+      last_inferred_activity_date: latest?.sent_at || null,
+      last_inferred_activity_subject: latest?.subject || null,
+      last_inferred_activity_sender: latest?.sender || null,
+    };
   });
 }
 
@@ -249,24 +308,42 @@ export async function listDetectedDealCandidates(
       ORDER BY COALESCE(source_date, created_at) DESC, confidence DESC`
   ).bind(ctx.orgId, ...companyIds, MIN_STRONG_EVIDENCE_CONFIDENCE).all<any>();
 
+  const sourceVisibility = await loadConversationVisibilityMap(
+    env,
+    ctx,
+    (evidenceRows.results || [])
+      .filter((row: any) => row.source_type === 'conversation')
+      .map((row: any) => row.source_id)
+  );
+
   const evidenceByCompany = new Map<string, any[]>();
   for (const row of evidenceRows.results || []) {
+    if (row.source_type === 'conversation' && sourceVisibility.get(row.source_id)?.can_read !== true) {
+      continue;
+    }
     const list = evidenceByCompany.get(row.company_id) || [];
     if (list.length < 3) list.push(row);
     evidenceByCompany.set(row.company_id, list);
   }
 
-  return jsonResponse({
-    candidates: candidates.map((candidate: any) => {
+  const visibleCandidates = candidates
+    .map((candidate: any) => {
       const evidence = evidenceByCompany.get(candidate.company_id) || [];
+      return { candidate, evidence };
+    })
+    .filter(({ evidence }) => evidence.length >= MANUAL_DETECTED_EVIDENCE_MIN);
+
+  return jsonResponse({
+    candidates: visibleCandidates.map(({ candidate, evidence }) => {
+      const confidenceValues = evidence.map((e: any) => Number(e.confidence || 0));
       return {
         ...candidate,
-        evidence_count: Number(candidate.evidence_count || 0),
-        source_family_count: Number(candidate.source_family_count || 0),
-        source_families: String(candidate.source_families || '').split(',').filter(Boolean),
-        avg_confidence: Number(candidate.avg_confidence || 0),
-        max_confidence: Number(candidate.max_confidence || 0),
-        amount_usd: candidate.amount_usd ?? null,
+        evidence_count: evidence.length,
+        source_family_count: new Set(evidence.map((e: any) => e.source_type)).size,
+        source_families: Array.from(new Set(evidence.map((e: any) => e.source_type))),
+        avg_confidence: confidenceValues.reduce((sum, v) => sum + v, 0) / Math.max(confidenceValues.length, 1),
+        max_confidence: Math.max(...confidenceValues, 0),
+        amount_usd: evidence.find((e: any) => e.amount_usd != null)?.amount_usd ?? null,
         latest_evidence: evidence[0] || null,
         evidence,
       };
@@ -491,6 +568,8 @@ export async function getDeal(
 
   if (!deal) return errorResponse('DEAL_NOT_FOUND', 404);
 
+  const [dealWithReadableActivity] = await attachLastReadableActivity([deal as any], ctx, env);
+
   const [contacts, actionItems, notes, openActionCount, usersResult] = await Promise.all([
     env.D1.prepare(
       `SELECT dc.id AS deal_contact_id, dc.role, dc.side, dc.added_at,
@@ -546,7 +625,7 @@ export async function getDeal(
   const origin = await resolveDealOrigin(deal as any, ctx, env);
 
   return jsonResponse({
-    deal,
+    deal: dealWithReadableActivity,
     origin,
     contacts: contactsByGroup,
     action_items: actionItems.results,
@@ -670,7 +749,7 @@ async function resolveDealOrigin(
     approved_by_name: approverName,
     approved_at: origin.approved_at ?? null,
     confidence: typeof origin.confidence === 'number' ? origin.confidence : null,
-    evidence: typeof origin.evidence === 'string' ? origin.evidence : null,
+    evidence: canRead && typeof origin.evidence === 'string' ? origin.evidence : null,
     can_read_source: canRead,
   };
 }
@@ -1241,16 +1320,15 @@ export async function getDealTimeline(
     try { before = JSON.parse(row.before_data || 'null'); } catch {}
     try { after = JSON.parse(row.after_data || 'null'); } catch {}
 
-    const changedFields: string[] = [];
-    if (row.action === 'update' && before && after) {
-      const skip = new Set(['updated_at', 'last_activity_date', 'stage_changed_at', 'days_in_stage', 'source_metadata', 'custom_fields']);
-      for (const key of Object.keys(after)) {
-        if (skip.has(key)) continue;
-        if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) {
-          changedFields.push(key);
-        }
-      }
-    }
+    const safeBefore = sanitizeEmailDerivedSnapshot(before);
+    const safeAfter = sanitizeEmailDerivedSnapshot(after);
+    const safeMetadata = sanitizeEmailDerivedSnapshot(metadata) as Record<string, unknown>;
+    delete safeMetadata.source_communication_id;
+    delete safeMetadata.source_excerpt;
+    delete safeMetadata.evidence;
+    const changedFields = row.action === 'update'
+      ? changedFieldsFromSanitizedSnapshots(safeBefore, safeAfter)
+      : [];
 
     return {
       id: row.id,
@@ -1258,9 +1336,9 @@ export async function getDealTimeline(
       action: row.action,
       timestamp: row.timestamp,
       user_name: row.user_name,
-      metadata,
+      metadata: safeMetadata,
       changed_fields: changedFields,
-      after_snapshot: after,
+      after_snapshot: safeAfter,
     };
   });
 
@@ -2108,7 +2186,7 @@ export async function getDealIntelligence(
   ).bind(id, ctx.orgId).first();
   if (!deal) return errorResponse('DEAL_NOT_FOUND', 404);
 
-  let intelligence = await readDealIntelligence(id, ctx.userId, env);
+  let intelligence = await readDealIntelligence(id, ctx, env);
 
   // Cold path — first read for this (deal, user) pair triggers a
   // synchronous compute. Subsequent reads serve from cache.

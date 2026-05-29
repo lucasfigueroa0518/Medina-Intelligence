@@ -6,7 +6,12 @@ import { useRouter } from 'next/navigation';
 import { MedinaLogo } from '@/components/medina-logo';
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL ?? '';
-const ALLOWED_DOMAIN = 'medinavc.com';
+const ALLOWED_DOMAINS = (process.env.NEXT_PUBLIC_INTERNAL_DOMAINS ?? 'medinavc.com,medinacapital.com')
+  .split(',')
+  .map(d => d.trim().toLowerCase())
+  .filter(Boolean);
+const PRIMARY_ALLOWED_DOMAIN = ALLOWED_DOMAINS[0] || 'medinavc.com';
+const ALLOWED_DOMAIN_LABEL = ALLOWED_DOMAINS.map(d => `@${d}`).join(' or ');
 
 export default function SignupPage() {
   const router = useRouter();
@@ -22,8 +27,9 @@ export default function SignupPage() {
     setError('');
     if (password.length < 8) { setError('Password must be at least 8 characters.'); return; }
     if (password !== confirm) { setError('Passwords do not match.'); return; }
-    if (!email.toLowerCase().endsWith('@' + ALLOWED_DOMAIN)) {
-      setError(`Signup is restricted to @${ALLOWED_DOMAIN} email addresses.`);
+    const domain = email.toLowerCase().split('@').pop() || '';
+    if (!ALLOWED_DOMAINS.includes(domain)) {
+      setError(`Signup is restricted to approved Medina email addresses.`);
       return;
     }
     setLoading(true);
@@ -37,7 +43,7 @@ export default function SignupPage() {
         const data = await res.json().catch(() => ({} as any));
         const code = data.error as string | undefined;
         const friendly: Record<string, string> = {
-          DOMAIN_NOT_ALLOWED: `Signup is restricted to @${ALLOWED_DOMAIN} email addresses.`,
+          DOMAIN_NOT_ALLOWED: `Signup is restricted to approved Medina email addresses.`,
           EMAIL_EXISTS: 'An account with that email already exists. Try signing in instead.',
           WEAK_PASSWORD: 'Password must be at least 8 characters.',
           MISSING_FIELDS: 'Please fill in every field.',
@@ -93,8 +99,8 @@ export default function SignupPage() {
             <input id="email" type="email" required autoComplete="email"
               value={email} onChange={e => setEmail(e.target.value)}
               className="w-full h-10 px-3 rounded-lg bg-bg-input border border-border text-text-primary text-sm placeholder:text-text-muted focus:outline-none focus:border-accent-purple focus:ring-1 focus:ring-accent-purple/40 transition-colors"
-              placeholder={`you@${ALLOWED_DOMAIN}`} />
-            <p className="text-[11px] text-text-muted mt-1">Only @{ALLOWED_DOMAIN} addresses are allowed.</p>
+              placeholder={`you@${PRIMARY_ALLOWED_DOMAIN}`} />
+            <p className="text-[11px] text-text-muted mt-1">Only {ALLOWED_DOMAIN_LABEL} addresses are allowed.</p>
           </div>
 
           <div>

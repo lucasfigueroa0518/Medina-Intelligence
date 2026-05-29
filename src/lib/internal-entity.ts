@@ -18,8 +18,7 @@
 //   • domain matches a user email domain at this org → internal.
 //   • catch-all name patterns: 'Medina Ventures', 'Medina Capital',
 //     'Medina Partners', 'Medina Fund', 'Gryphon Capital', 'JFG Family'.
-//   • known fund-family domains: medinacapital.com, gryphcap.com,
-//     jfgfamilyoffice.com.
+//   • configured internal domains (env.INTERNAL_DOMAINS, with safe defaults).
 //
 // All three signals are independent — any one fires and the company is
 // internal. Enforcement is at write (deal create / proposal commit) and
@@ -27,6 +26,7 @@
 // companies before spending a Claude call).
 
 import type { Env } from '../types/env';
+import { getConfiguredInternalDomains } from './internal-domains';
 
 const INTERNAL_NAME_PATTERNS = [
   /^medina ventures\b/i,
@@ -36,12 +36,6 @@ const INTERNAL_NAME_PATTERNS = [
   /^gryphon capital\b/i,
   /^jfg family\b/i,
 ];
-
-const KNOWN_INTERNAL_DOMAINS = new Set([
-  'medinacapital.com',
-  'gryphcap.com',
-  'jfgfamilyoffice.com',
-]);
 
 /** Pull the org's authoritative internal-domain set: every user email
  *  domain at the org. Cached per request via a Map (caller passes one
@@ -58,9 +52,8 @@ export async function resolveInternalDomains(
       WHERE org_id = ? AND deleted_at IS NULL`
   ).bind(orgId).all<{ domain: string }>();
   // Wave 5: also include domains of every company flagged is_internal_entity.
-  // Picks up Medina Capital / Gryphon / JFG without hard-coding their
-  // domains here — Wave 1 backfill already flagged them, and the column
-  // is the source of truth.
+  // Picks up fund-family domains from backfilled company rows while
+  // env.INTERNAL_DOMAINS remains the configurable baseline.
   const companyRows = await env.D1.prepare(
     `SELECT DISTINCT lower(domain) AS domain
        FROM companies
@@ -74,7 +67,7 @@ export async function resolveInternalDomains(
   for (const r of companyRows.results) {
     if (r.domain) set.add(r.domain);
   }
-  for (const d of KNOWN_INTERNAL_DOMAINS) set.add(d);
+  for (const d of getConfiguredInternalDomains(env)) set.add(d);
   cache?.set(orgId, set);
   return set;
 }
@@ -194,8 +187,8 @@ export async function classifyCompanyInternal(
 // ─── Wave 5: deal_contacts.side classification ─────────────────────────
 //
 // A contact's side relative to a specific deal:
-//   • 'ours'  — contact's email domain is in the org's internal-domain set
-//               (user emails ∪ KNOWN_INTERNAL_DOMAINS ∪ companies flagged
+  //   • 'ours'  — contact's email domain is in the org's internal-domain set
+  //               (user emails ∪ env.INTERNAL_DOMAINS ∪ companies flagged
 //               is_internal_entity). Captures Medina-side participants
 //               regardless of whether they have a user account yet.
 //   • 'theirs'— contact.company_id matches deal.company_id (they work at

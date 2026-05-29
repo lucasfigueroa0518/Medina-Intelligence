@@ -7,11 +7,19 @@ import { generateSecret, otpauthUrl, verifyTotp, generateRecoveryCodes, hashReco
 import { sendVerificationEmail } from '../lib/verification-email';
 import { sendResetEmail } from '../lib/reset-email';
 import { incidentsToUserWarnings, listActiveIngestionIncidents } from '../lib/ingestion-health';
+import {
+  filterOutlookIncidentsForUserReports,
+  getOutlookAppOnlyHealthSnapshot,
+} from '../lib/outlook-app-only-health';
+import {
+  getAllowedSignupDomains,
+  getConfiguredInternalDomains,
+  internalEmailVariants,
+} from '../lib/internal-domains';
 
 const PBKDF2_ITERATIONS = 100_000;
 const SALT_BYTES = 32;
 const HASH_BYTES = 32;
-const SEVERAL_MISSED_SYNC_DAYS = 3;
 
 type UserWarning = {
   type: string;
@@ -23,11 +31,22 @@ type UserWarning = {
   backfill_prompt?: string;
 };
 
-function daysSince(iso: string | null | undefined): number | null {
-  if (!iso) return null;
-  const ts = Date.parse(iso);
-  if (!Number.isFinite(ts)) return null;
-  return Math.max(0, Math.floor((Date.now() - ts) / 86400000));
+function inClause(values: unknown[]): string {
+  return values.map(() => '?').join(',');
+}
+
+async function findExistingInternalAliasUser(
+  email: string,
+  orgId: string,
+  env: Env
+): Promise<{ id: string } | null> {
+  const domains = getConfiguredInternalDomains(env);
+  const variants = internalEmailVariants(email, domains);
+  return env.D1.prepare(
+    `SELECT id FROM users
+      WHERE org_id = ? AND lower(email) IN (${inClause(variants)}) AND deleted_at IS NULL
+      LIMIT 1`
+  ).bind(orgId, ...variants).first<{ id: string }>();
 }
 
 async function hashPassword(password: string): Promise<string> {
@@ -153,9 +172,7 @@ export async function register(request: Request, env: Env): Promise<Response> {
     return errorResponse('ORG_NOT_FOUND', 404, 'Organization not found');
   }
 
-  const existing = await env.D1.prepare(
-    'SELECT id FROM users WHERE email = ? AND deleted_at IS NULL'
-  ).bind(email.toLowerCase()).first();
+  const existing = await findExistingInternalAliasUser(email, org_id, env);
   if (existing) {
     return errorResponse('EMAIL_EXISTS', 409, 'A user with this email already exists');
   }
@@ -211,11 +228,16 @@ export async function login(request: Request, env: Env): Promise<Response> {
     return errorResponse('MISSING_FIELDS', 400, 'email and password are required');
   }
 
+  const normalizedEmail = email.toLowerCase();
+  const variants = internalEmailVariants(normalizedEmail, getConfiguredInternalDomains(env));
   const user = await env.D1.prepare(
     `SELECT id, org_id, email, full_name, role, password_hash, is_active,
             email_verified, mfa_enabled
-     FROM users WHERE email = ? AND deleted_at IS NULL`
-  ).bind(email.toLowerCase()).first<{
+     FROM users
+     WHERE lower(email) IN (${inClause(variants)}) AND deleted_at IS NULL
+     ORDER BY CASE WHEN lower(email) = ? THEN 0 ELSE 1 END
+     LIMIT 1`
+  ).bind(...variants, normalizedEmail).first<{
     id: string; org_id: string; email: string; full_name: string;
     role: string; password_hash: string | null; is_active: number;
     email_verified: number | null; mfa_enabled: number | null;
@@ -308,35 +330,18 @@ export async function me(ctx: AuthContext, env: Env): Promise<Response> {
 
   const warnings: UserWarning[] = [];
 
-  const tokenFailState = await env.KV.get<{ count: number; last_failed?: string }>(
-    `token_failed:${ctx.userId}:outlook`,
-    'json'
-  );
-  if (tokenFailState && tokenFailState.count >= 3) {
-    const lastSync = await env.D1.prepare(
-      `SELECT completed_at FROM sync_jobs
-        WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'completed'
-        ORDER BY completed_at DESC LIMIT 1`
-    ).bind(ctx.orgId).first<{ completed_at: string | null }>();
-    const missedDays = daysSince(lastSync?.completed_at);
-
+  const [incidents, outlookHealth] = await Promise.all([
+    listActiveIngestionIncidents(env, ctx.orgId, 10).catch(() => []),
+    getOutlookAppOnlyHealthSnapshot(ctx.orgId, env, { includeGraphProbes: true }).catch(() => null),
+  ]);
+  const filteredIncidents = filterOutlookIncidentsForUserReports(incidents, outlookHealth);
+  warnings.push(...incidentsToUserWarnings(filteredIncidents));
+  if (outlookHealth && (outlookHealth.status === 'missing_config' || outlookHealth.status === 'blocked')) {
     warnings.push({
-      type: 'outlook_token_expired',
-      message: 'Outlook needs a quick refresh to keep email and calendar updates flowing.',
-      consecutive_failures: tokenFailState.count,
-      last_successful_sync: lastSync?.completed_at || null,
-      ...(missedDays !== null && missedDays >= SEVERAL_MISSED_SYNC_DAYS
-        ? {
-            missed_days: missedDays,
-            suggest_backfill_days: 30 as const,
-            backfill_prompt: `It looks like about ${missedDays} day${missedDays === 1 ? '' : 's'} may need a catch-up import. Refresh Outlook first, then start a 30-day backfill.`,
-          }
-        : {}),
+      type: 'outlook_app_only_health',
+      message: outlookHealth.detail,
     });
   }
-
-  const incidents = await listActiveIngestionIncidents(env, ctx.orgId, 10).catch(() => []);
-  warnings.push(...incidentsToUserWarnings(incidents));
 
   return jsonResponse({ user, warnings });
 }
@@ -565,13 +570,11 @@ export async function setInitialPassword(request: Request, env: Env): Promise<Re
 // =====================================================================
 
 function isAllowedSignupDomain(email: string, env: Env): boolean {
-  const domains = (env.ALLOWED_SIGNUP_DOMAINS || 'medinavc.com')
-    .split(',').map(d => d.trim().toLowerCase()).filter(Boolean);
   const lower = email.toLowerCase();
   const at = lower.lastIndexOf('@');
   if (at === -1) return false;
   const domain = lower.slice(at + 1);
-  return domains.includes(domain);
+  return getAllowedSignupDomains(env).has(domain);
 }
 
 /**
@@ -609,9 +612,7 @@ export async function signup(request: Request, env: Env): Promise<Response> {
   }
 
   const lowerEmail = email.toLowerCase();
-  const existing = await env.D1.prepare(
-    'SELECT id FROM users WHERE email = ? AND deleted_at IS NULL'
-  ).bind(lowerEmail).first();
+  const existing = await findExistingInternalAliasUser(lowerEmail, orgId, env);
   if (existing) {
     return errorResponse('EMAIL_EXISTS', 409, 'An account with this email already exists');
   }

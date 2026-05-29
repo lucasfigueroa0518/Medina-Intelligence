@@ -1,5 +1,4 @@
 import type { Env } from '../types/env';
-import { getActiveUsersForOrg } from './helpers';
 import { enqueueWork } from './work-queue';
 
 export type IngestionSeverity = 'warning' | 'critical';
@@ -516,41 +515,30 @@ export async function scanAndRepairIngestion(
   let repairs = 0;
   let deadLettersRequeued = 0;
 
-  const users = await getActiveUsersForOrg(orgId, env);
-  for (const user of users) {
-    if (!user.outlook_token) continue;
-    const state = await env.KV.get<{ count: number; last_failed?: string; reason?: string; message?: string }>(
-      `token_failed:${user.id}:outlook`,
-      'json'
-    );
-    if (state && state.count >= 3) {
-      await reportIngestionFailure(env, {
-        orgId,
-        source: 'outlook_email',
-        scopeType: 'user',
-        scopeId: user.id,
-        code: 'outlook_reauth_required',
-        title: 'Outlook reconnect required',
-        message: `Outlook ingestion is blocked for ${user.email}. Refresh Microsoft Outlook to resume email and calendar sync; automatic repair will run after reconnect.`,
-        severity: 'critical',
-        humanActionRequired: true,
-        occurredAt: state.last_failed,
-        metadata: { email: user.email, consecutive_failures: state.count, reason: state.reason, message: state.message },
-      });
-      await reportIngestionFailure(env, {
-        orgId,
-        source: 'calendar',
-        scopeType: 'user',
-        scopeId: user.id,
-        code: 'outlook_reauth_required',
-        title: 'Calendar reconnect required',
-        message: `Calendar ingestion is blocked for ${user.email}. Refresh Microsoft Outlook to resume calendar sync; automatic repair will run after reconnect.`,
-        severity: 'critical',
-        humanActionRequired: true,
-        occurredAt: state.last_failed,
-        metadata: { email: user.email, consecutive_failures: state.count, reason: state.reason, message: state.message },
-      });
-    }
+  const missingGraphConfig = !env.AZURE_CLIENT_ID ||
+    !env.AZURE_TENANT_ID ||
+    !env.AZURE_CLIENT_CERT_PRIVATE_KEY ||
+    !env.AZURE_CLIENT_CERT_THUMBPRINT;
+  if (missingGraphConfig) {
+    await reportIngestionFailure(env, {
+      orgId,
+      source: 'outlook_email',
+      scopeType: 'org',
+      scopeId: orgId,
+      code: 'outlook_app_only_config_missing',
+      title: 'Outlook app-only configuration incomplete',
+      message: 'Outlook ingestion requires app-only Microsoft Graph certificate configuration.',
+      severity: 'critical',
+      humanActionRequired: true,
+      metadata: {
+        missing: [
+          !env.AZURE_CLIENT_ID ? 'AZURE_CLIENT_ID' : null,
+          !env.AZURE_TENANT_ID ? 'AZURE_TENANT_ID' : null,
+          !env.AZURE_CLIENT_CERT_PRIVATE_KEY ? 'AZURE_CLIENT_CERT_PRIVATE_KEY' : null,
+          !env.AZURE_CLIENT_CERT_THUMBPRINT ? 'AZURE_CLIENT_CERT_THUMBPRINT' : null,
+        ].filter(Boolean),
+      },
+    });
   }
 
   const deadLetters = await env.D1.prepare(

@@ -29,6 +29,7 @@ import {
   getProgressiveStatus,
   listProgressiveBackfills,
 } from '../lib/progressive-backfill';
+import { getOutlookAppOnlyHealthSnapshot } from '../lib/outlook-app-only-health';
 
 export async function listDlq(
   request: Request,
@@ -367,8 +368,10 @@ export async function repairVectorizeParticipantIds(
   const limit = Math.min(Math.max(body.limit ?? 25, 1), 100);
 
   const conversations = await env.D1.prepare(
-    `SELECT id FROM conversations WHERE participant_user_ids LIKE ? AND org_id = ?`
-  ).bind(`%${body.new_user_id}%`, ctx.orgId).all<{ id: string }>();
+    `SELECT conversation_id AS id
+       FROM conversation_participants
+      WHERE user_id = ? AND org_id = ?`
+  ).bind(body.new_user_id, ctx.orgId).all<{ id: string }>();
 
   if (conversations.results.length === 0) {
     return jsonResponse({ updated: 0, skipped: 0, errors: [], total_candidate_vectors: 0, message: 'No conversations match new_user_id' });
@@ -641,17 +644,28 @@ export async function triggerIngestion(
     return jsonResponse({ ok: true, instance_id: jobId, progress });
   }
 
-  // No date range: trigger the standard ingestion workflow
-  const binding = env.INGESTION_WORKFLOW;
-  if (!binding) {
-    return errorResponse('WORKFLOW_BINDING_MISSING', 500, 'Ingestion workflow binding is not available.');
+  // No date range: trigger the standard ingestion workflow through the
+  // pipelines Worker, which owns workflow bindings after the Phase 8 split.
+  if (!env.PIPELINES) {
+    return errorResponse('WORKFLOW_BINDING_MISSING', 500, 'Pipelines service binding is not available.');
   }
 
   const instanceId = `ingestion-manual-${ctx.orgId}-${Date.now()}`;
-  const instance = await binding.create({
-    id: instanceId,
-    params: { org_id: ctx.orgId },
-  });
+  let instance: { id: string };
+  try {
+    instance = await env.PIPELINES.triggerWorkflow({
+      workflow: 'ingestion',
+      id: instanceId,
+      params: { org_id: ctx.orgId },
+    });
+  } catch (e) {
+    console.error('[trigger-ingestion] workflow create failed:', e);
+    return errorResponse(
+      'WORKFLOW_CREATE_FAILED',
+      500,
+      `Failed to dispatch ingestion workflow: ${(e as Error).message}`
+    );
+  }
 
   return jsonResponse({ ok: true, instance_id: instance.id });
 }
@@ -672,18 +686,36 @@ export async function getIntegrationStatus(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const users = await env.D1.prepare(
-    `SELECT id, email, full_name, role, share_emails_org_wide, outlook_token IS NOT NULL as has_outlook, slack_token IS NOT NULL as has_slack
+  const [users, outlookHealth] = await Promise.all([
+    env.D1.prepare(
+      `SELECT id, email, full_name, role, share_emails_org_wide, COALESCE(outlook_mailbox, email) IS NOT NULL as has_outlook, slack_token IS NOT NULL as has_slack
      FROM users WHERE org_id = ? AND deleted_at IS NULL`
-  ).bind(ctx.orgId).all();
+    ).bind(ctx.orgId).all(),
+    getOutlookAppOnlyHealthSnapshot(ctx.orgId, env, { includeGraphProbes: true }),
+  ]);
 
   const tokenHealth: Record<string, unknown> = {};
+  const mailboxHealth: Record<string, unknown> = {};
   for (const u of users.results as any[]) {
     const state = await env.KV.get(`token_failed:${u.id}:outlook`, 'json');
-    tokenHealth[u.id] = state || { healthy: true };
+    const mailbox = outlookHealth.mailboxes.find(m => m.user_id === u.id) || null;
+    mailboxHealth[u.id] = mailbox;
+    tokenHealth[u.id] = {
+      healthy: mailbox?.status === 'healthy' || mailbox?.status === 'degraded',
+      auth_mode: outlookHealth.auth_mode,
+      status: mailbox?.status || outlookHealth.status,
+      suppressed_legacy_state: Boolean(state),
+      mailbox: mailbox?.mailbox || null,
+      warnings: mailbox?.warnings || [],
+      blockers: mailbox?.blockers || [],
+      graph: mailbox?.graph || null,
+      subscriptions: mailbox?.subscriptions || null,
+      last_email_ingested_at: mailbox?.last_email_ingested_at || null,
+      last_calendar_success_at: mailbox?.last_calendar_success_at || null,
+    };
   }
 
-  return jsonResponse({ users: users.results, tokenHealth });
+  return jsonResponse({ users: users.results, tokenHealth, mailboxHealth, outlookHealth });
 }
 
 /**
@@ -720,12 +752,11 @@ export async function triggerSync(
     );
   }
 
-  const binding = workflow === 'ingestion' ? env.INGESTION_WORKFLOW : env.ENRICHMENT_WORKFLOW;
-  if (!binding) {
+  if (!env.PIPELINES) {
     return errorResponse(
       'WORKFLOW_BINDING_MISSING',
       500,
-      `${workflow} workflow binding is not available on this Worker.`
+      'Pipelines service binding is not available on this Worker.'
     );
   }
 
@@ -736,7 +767,8 @@ export async function triggerSync(
 
   let instance: { id: string };
   try {
-    instance = await binding.create({
+    instance = await env.PIPELINES.triggerWorkflow({
+      workflow,
       id: instanceId,
       params: { org_id: ctx.orgId },
     });
@@ -1015,65 +1047,26 @@ export async function cleanupVectorBloat(
   });
 }
 
-// Calendar OAuth health + recovery (audit 2026-04-28 Issue 1).
-//
-// 4 users have been failing token_refresh_failed every ingestion for >24h.
-// Calendars.Read is in the requested scope (auth-oauth.ts:37) so the issue
-// is stale refresh tokens — the user revoked access in Microsoft, changed
-// their password with MFA enabled, or didn't grant the calendar consent on
-// their original sign-in (pre-scope-addition).
-//
-// This endpoint:
-//   GET   — surfaces who's affected and the count, so you know who to ask to
-//           reconnect
-//   POST  — clears KV failure state + calendar_delta for affected users; the
-//           next sync after they re-OAuth will pick up calendar from scratch.
-//
-// Owner-only — destructive (clears state).
+// Legacy route kept for operator bookmarks. In app-only mode it now reports
+// mailbox-level Graph/subscription health instead of delegated refresh tokens.
 export async function getCalendarTokenHealth(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const users = await env.D1.prepare(
-    `SELECT id, email, full_name, outlook_token IS NOT NULL AS has_token
-       FROM users WHERE org_id = ? AND deleted_at IS NULL
-       ORDER BY email`
-  ).bind(ctx.orgId).all<{ id: string; email: string; full_name: string | null; has_token: number }>();
-
-  const report: Array<{
-    user_id: string;
-    email: string;
-    full_name: string | null;
-    has_outlook_token: boolean;
-    consecutive_failures: number;
-    last_failed: string | null;
-    has_calendar_delta: boolean;
-  }> = [];
-
-  for (const u of users.results) {
-    const failState = await env.KV.get<{ count: number; last_failed: string }>(
-      `token_failed:${u.id}:outlook`,
-      'json'
-    );
-    const calDelta = await env.KV.get(`calendar_delta:${u.id}`);
-    report.push({
-      user_id: u.id,
-      email: u.email,
-      full_name: u.full_name,
-      has_outlook_token: !!u.has_token,
-      consecutive_failures: failState?.count ?? 0,
-      last_failed: failState?.last_failed ?? null,
-      has_calendar_delta: !!calDelta,
-    });
-  }
-
-  const affected = report.filter(r => r.consecutive_failures > 0);
+  const health = await getOutlookAppOnlyHealthSnapshot(ctx.orgId, env, {
+    includeGraphProbes: true,
+  });
+  const affected = health.mailboxes.filter(m =>
+    m.status !== 'healthy' || m.stale_delegated_incident_ids.length > 0
+  );
   return jsonResponse({
     ok: true,
-    total_users: report.length,
+    auth_mode: health.auth_mode,
+    total_users: health.summary.total_mailboxes,
     affected_count: affected.length,
     affected,
-    all_users: report,
+    all_users: health.mailboxes,
+    outlook_health: health,
   });
 }
 
@@ -1083,6 +1076,13 @@ export async function invalidateStaleCalendarTokens(
 ): Promise<Response> {
   if (ctx.userRole !== 'owner') {
     return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can invalidate calendar tokens.');
+  }
+  if (env.OUTLOOK_DELEGATED_FALLBACK_ENABLED !== 'true') {
+    return errorResponse(
+      'DELEGATED_FALLBACK_DISABLED',
+      409,
+      'Delegated OAuth fallback is disabled. Use /api/admin/outlook-app-only-repair with apply=true for app-only transition repair.'
+    );
   }
 
   const users = await env.D1.prepare(
@@ -1121,7 +1121,7 @@ export async function invalidateStaleCalendarTokens(
     cleared_count: cleared.length,
     cleared,
     next_steps:
-      'Affected users must reconnect Outlook in Settings → Sync & Integrations. After reconnect, their next ingestion run does a full calendar sync.',
+      'Delegated fallback is enabled; affected users must complete the emergency OAuth fallback before calendar sync resumes.',
   });
 }
 

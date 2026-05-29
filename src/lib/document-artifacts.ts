@@ -816,7 +816,7 @@ async function searchDocumentsByVector(
   const pq = await preprocessQuery(query, session, env, {});
   const forceDocTypes = documentTypes.length > 0 ? documentTypes : ['document'];
   const result = await retrieveContext(pq, env, { forceDocTypes });
-  const { sources } = await buildSourcesAndContext(result.internal, [], undefined, ctx.orgId, env, query);
+  const { sources } = await buildSourcesAndContext(result.internal, [], undefined, ctx.orgId, env, query, { viewer: ctx });
   const docSources = sources.filter(s => s.type === 'document').slice(0, Math.max(limit * 2, 8));
   const docs = await loadAccessibleDocuments(docSources.map(s => s.source_id), ctx, env);
   const byId = new Map(docs.map(d => [d.id, d]));

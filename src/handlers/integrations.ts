@@ -10,6 +10,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse } from './utils';
 import { listActiveIngestionIncidents } from '../lib/ingestion-health';
+import { getOutlookAppOnlyHealthSnapshot, type OutlookAppOnlyHealthSnapshot } from '../lib/outlook-app-only-health';
 
 export type IntegrationStatus =
   | 'connected'
@@ -17,6 +18,7 @@ export type IntegrationStatus =
   | 'configured'
   | 'not_configured'
   | 'configured_no_channels'
+  | 'degraded'
   | 'auth_failed'
   | 'webhook_ready';
 
@@ -39,6 +41,7 @@ export interface IntegrationRow {
   channels_visible?: number;
   messages_synced?: number;
   warnings?: string[];
+  outlook_health?: OutlookAppOnlyHealthSnapshot;
 }
 
 export interface IntegrationsStatusResponse {
@@ -69,62 +72,36 @@ export async function getIntegrationsStatus(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  // --- Outlook: check the current user's row ---
-  const user = await env.D1.prepare(
-    `SELECT email, outlook_token, outlook_delta_token, updated_at
-       FROM users
-      WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
-  ).bind(ctx.userId, ctx.orgId).first<{
-    email: string;
-    outlook_token: string | null;
-    outlook_delta_token: string | null;
-    updated_at: string;
-  }>();
-
-  const outlookConnected = Boolean(user?.outlook_token);
-
-  // Token refresh health counter (§5.3)
-  const failState = outlookConnected
-    ? await env.KV.get<{ count: number; last_failed?: string }>(
-        `token_failed:${ctx.userId}:outlook`,
-        'json'
-      )
-    : null;
-  const tokenHealthy = !failState || (failState.count || 0) < 3;
-  const outlookStatus: IntegrationStatus = !outlookConnected
-    ? 'not_connected'
-    : tokenHealthy
-      ? 'connected'
-      : 'auth_failed';
-
-  // Last ingestion sync for this org (proxy for "last email sync ran")
-  const lastSync = outlookConnected
-    ? await env.D1.prepare(
-        `SELECT completed_at, items_processed, items_failed FROM sync_jobs
-          WHERE org_id = ? AND workflow_type = 'ingestion' AND status = 'completed'
-          ORDER BY completed_at DESC LIMIT 1`
-      )
-        .bind(ctx.orgId)
-        .first<{ completed_at: string | null; items_processed: number; items_failed: number }>()
-    : null;
-
+  // --- Outlook: shared app-only health model across reports + notifications ---
+  const outlookHealth = await getOutlookAppOnlyHealthSnapshot(ctx.orgId, env, {
+    includeGraphProbes: true,
+  });
+  const currentMailbox = outlookHealth.mailboxes.find(m => m.user_id === ctx.userId) || outlookHealth.mailboxes[0] || null;
+  const outlookStatus: IntegrationStatus = outlookHealth.status === 'healthy'
+    ? 'connected'
+    : outlookHealth.status === 'degraded'
+      ? 'degraded'
+      : outlookHealth.status === 'missing_config' || outlookHealth.status === 'blocked'
+        ? 'auth_failed'
+        : 'not_connected';
+  const lastEmailIngested = outlookHealth.mailboxes
+    .map(m => m.last_email_ingested_at)
+    .filter((v): v is string => Boolean(v))
+    .sort();
+  const latestEmailIngested = lastEmailIngested.length > 0 ? lastEmailIngested[lastEmailIngested.length - 1] : null;
+  const itemsProcessed = outlookHealth.mailboxes.reduce((sum, m) => sum + m.conversation_count, 0);
+  const itemsFailed = outlookHealth.mailboxes.reduce((sum, m) => sum + m.dead_letter_work, 0);
   const outlook: IntegrationRow = {
     status: outlookStatus,
-    label: outlookStatus === 'connected'
-      ? 'Connected'
-      : outlookStatus === 'auth_failed'
-        ? 'Refresh needed'
-        : 'Not connected',
-    detail: outlookStatus === 'connected'
-      ? `Signed in as ${user?.email || 'unknown'}`
-      : outlookStatus === 'auth_failed'
-        ? `Refresh Microsoft Outlook for ${user?.email || 'this mailbox'} to resume live email and calendar updates.`
-        : 'Click Connect to authorize email, calendar, and Sent-folder access.',
-    last_sync: lastSync?.completed_at || null,
-    connected_email: outlookConnected ? user?.email || null : null,
-    token_healthy: outlookConnected ? tokenHealthy : undefined,
-    items_processed: lastSync?.items_processed || 0,
-    items_failed: lastSync?.items_failed || 0,
+    label: outlookHealth.label,
+    detail: outlookHealth.detail,
+    last_sync: latestEmailIngested,
+    connected_email: currentMailbox?.mailbox || null,
+    token_healthy: outlookHealth.configured && outlookHealth.status !== 'blocked' && outlookHealth.status !== 'missing_config',
+    items_processed: itemsProcessed,
+    items_failed: itemsFailed,
+    warnings: [...outlookHealth.blockers, ...outlookHealth.warnings].slice(0, 6),
+    outlook_health: outlookHealth,
   };
 
   // --- Slack: pre-configured bot token + live auth/channel probe ---
@@ -210,20 +187,23 @@ export async function getIntegrationsStatus(
       };
 
   const incidents = await listActiveIngestionIncidents(env, ctx.orgId, 25).catch(() => []);
-  const attachIncidentWarnings = (row: IntegrationRow, sources: string[]) => {
+  const attachIncidentWarnings = (
+    row: IntegrationRow,
+    sources: string[],
+    options: { degradeOnCritical?: boolean } = {}
+  ) => {
     const matching = incidents.filter(i => sources.includes(i.source));
     if (matching.length === 0) return;
     row.warnings = [
       ...(row.warnings || []),
       ...matching.slice(0, 4).map(i => `${i.severity === 'critical' ? 'Critical' : 'Warning'}: ${i.message}`),
     ];
-    if (matching.some(i => i.severity === 'critical' || i.human_action_required === 1)) {
+    if (options.degradeOnCritical !== false && matching.some(i => i.severity === 'critical' || i.human_action_required === 1)) {
       row.status = 'auth_failed';
       row.label = row.label === 'Connected' ? 'Degraded' : row.label;
     }
   };
 
-  attachIncidentWarnings(outlook, ['outlook_email', 'calendar']);
   attachIncidentWarnings(slack, ['slack']);
   attachIncidentWarnings(firefly, ['firefly']);
 

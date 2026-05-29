@@ -5,8 +5,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { reconcileFireflyToOutlook } from '../lib/reconciliation';
-import { refreshOutlookToken } from '../integrations/oauth';
-import { getDecryptedAccessToken } from '../lib/helpers';
+import { getGraphMailboxAuthForUser, graphMailboxUrl } from '../lib/graph-auth';
 
 interface ReconcileBody {
   dry_run?: boolean;
@@ -123,11 +122,11 @@ interface DiagnoseBody {
 /**
  * POST /api/admin/diagnose-calendar-sync
  *
- * One-shot Graph `/me/calendarView` (NOT delta) call against a target user's
+ * One-shot Graph mailbox-scoped `calendarView` (NOT delta) call against a target user's
  * stored token. Returns the count + first 5 events so we can see what Graph
  * actually returns. Owner-only.
  *
- * The hourly ingestion's calendar sync uses `/me/calendarView/delta` and has
+ * The hourly ingestion's calendar sync uses mailbox-scoped Graph calendar reads and has
  * been returning 0 events for every recent run with no delta token in KV
  * (which would imply a fresh-sync attempt). This endpoint bypasses delta to
  * see whether the underlying API call works at all.
@@ -152,34 +151,24 @@ export async function handleDiagnoseCalendarSync(
   ).bind(userId, ctx.orgId).first<{ id: string; email: string }>();
   if (!userRow) return errorResponse('USER_NOT_FOUND', 404, 'User not in org');
 
-  const refreshResult = await refreshOutlookToken(userId, ctx.orgId, env);
-  if (!refreshResult.success) {
-    return jsonResponse({
-      ok: false,
-      stage: 'token_refresh',
-      consecutive_failures: refreshResult.consecutiveFailures,
-      message: 'Token refresh failed — user must reconnect Outlook.',
-    });
-  }
-
-  let token: string;
+  let auth: { token: string; mailbox: string };
   try {
-    token = await getDecryptedAccessToken(userId, env);
+    auth = await getGraphMailboxAuthForUser(userId, ctx.orgId, env);
   } catch (e: any) {
     return jsonResponse({
       ok: false,
-      stage: 'token_decrypt',
+      stage: 'graph_auth',
       error: String(e?.message || e).slice(0, 200),
     });
   }
 
   const start = new Date(Date.now() - daysBack * 86400000).toISOString();
   const end = new Date(Date.now() + 90 * 86400000).toISOString();
-  const url = `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${encodeURIComponent(start)}&endDateTime=${encodeURIComponent(end)}&$top=10&$select=id,subject,start,end,attendees,organizer`;
+  const url = graphMailboxUrl(auth.mailbox, `/calendarView?startDateTime=${encodeURIComponent(start)}&endDateTime=${encodeURIComponent(end)}&$top=10&$select=id,subject,start,end,attendees,organizer`);
 
   const resp = await fetch(url, {
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${auth.token}`,
       Prefer: 'outlook.timezone="UTC"',
     },
   });
@@ -196,7 +185,7 @@ export async function handleDiagnoseCalendarSync(
       user_email: userRow.email,
       error_body: parsed || text.slice(0, 500),
       diagnostic: resp.status === 401 || resp.status === 403
-        ? 'Token rejected or scope missing — user must reconnect Outlook with Calendars.Read consent.'
+        ? 'Graph calendar access was rejected. Check app-only certificate config, Exchange RBAC scope, and mailbox target.'
         : `Graph API returned ${resp.status} — investigate response body.`,
     });
   }

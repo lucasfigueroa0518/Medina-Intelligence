@@ -33,9 +33,6 @@ function displayMessage(w: Warning): string {
   if (w.type.startsWith('ingestion_incident:')) {
     return w.message;
   }
-  if (w.type === 'outlook_token_expired') {
-    return 'Outlook needs a quick refresh to keep email and calendar updates flowing.';
-  }
   return w.message;
 }
 
@@ -50,12 +47,10 @@ export function IntegrationWarningBanner() {
       .then((data: any) => {
         const nextWarnings = data.warnings || [];
         if (nextWarnings.length) setWarnings(nextWarnings);
-        if (nextWarnings.some((w: Warning) => w.type === 'outlook_token_expired')) {
-          api
-            .getIntegrationsStatus()
-            .then(status => setOutlookLastSync(status.outlook.last_sync || null))
-            .catch(() => {});
-        }
+        api
+          .getIntegrationsStatus()
+          .then(status => setOutlookLastSync(status.outlook.last_sync || null))
+          .catch(() => {});
       })
       .catch(() => {});
   }, []);
@@ -66,16 +61,19 @@ export function IntegrationWarningBanner() {
   return (
     <>
       {visible.map(w => {
+        const isIncident = w.type.startsWith('ingestion_incident:');
+        const isOutlookHealth = w.type === 'outlook_app_only_health';
         const missedDays = w.missed_days ?? daysSince(w.last_successful_sync || outlookLastSync);
         const shouldSuggestBackfill =
-          w.suggest_backfill_days === 30 ||
-          (missedDays !== null && missedDays >= SEVERAL_MISSED_SYNC_DAYS);
+          !isOutlookHealth && (
+            w.suggest_backfill_days === 30 ||
+            (missedDays !== null && missedDays >= SEVERAL_MISSED_SYNC_DAYS)
+          );
 	        const backfillPrompt = w.backfill_prompt || (
 	          shouldSuggestBackfill && missedDays !== null
-	            ? `It looks like about ${missedDays} day${missedDays === 1 ? '' : 's'} may need a catch-up import. Refresh Outlook first, then start a 30-day backfill.`
+	            ? `It looks like about ${missedDays} day${missedDays === 1 ? '' : 's'} may need a catch-up import. Check System Status, then start a 30-day backfill.`
 	            : null
 	        );
-	        const isIncident = w.type.startsWith('ingestion_incident:');
 	        const canDismiss = w.severity !== 'critical';
 
 	        return (
@@ -88,7 +86,7 @@ export function IntegrationWarningBanner() {
 	              {isIncident && (
 	                <span className="block mt-1 text-xs text-text-secondary">
 	                  {w.human_action_required
-	                    ? 'Human reconnect is required. Automatic repair will run after credentials are healthy.'
+	                    ? 'Admin configuration is required. Automatic repair will run after Graph access is healthy.'
 	                    : `Automatic repair is ${w.recovery_status === 'repair_queued' || w.recovery_status === 'repairing' ? 'queued' : 'active'} for the affected window.`}
 	                </span>
 	              )}
@@ -100,10 +98,10 @@ export function IntegrationWarningBanner() {
             </div>
             <div className="flex shrink-0 flex-wrap items-center gap-3">
 	              <Link
-	                href={isIncident ? '/settings?tab=system' : '/settings?tab=integrations#outlook-integration-refresh'}
+	                href={isIncident || isOutlookHealth ? '/settings?tab=system' : '/settings?tab=integrations#outlook-integration-refresh'}
 	                className="text-sm text-accent-magenta underline underline-offset-2"
 	              >
-	                {isIncident ? 'Open System Status' : 'Refresh Outlook'}
+	                {isIncident || isOutlookHealth ? 'Open System Status' : 'Open Integrations'}
 	              </Link>
 	              {isIncident && (
 	                <Link

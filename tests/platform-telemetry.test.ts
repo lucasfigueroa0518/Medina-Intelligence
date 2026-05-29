@@ -28,7 +28,7 @@ describe('platform telemetry routing helpers', () => {
       'How many emails has Raul ingested?',
       {
         id: 'user-raul',
-        email: 'raul@medinavc.com',
+        email: 'raul@medinacapital.com',
         full_name: 'Raul Medina',
       }
     );

@@ -16,8 +16,8 @@
 // to the caller; sync_jobs gets a row for observability.
 
 import type { Env } from '../types/env';
-import { parseParticipantUserIds, getDecryptedAccessToken } from './helpers';
-import { refreshOutlookToken } from '../integrations/oauth';
+import { parseParticipantUserIds } from './helpers';
+import { getGraphMailboxAuthForUser, graphMailboxUrl } from './graph-auth';
 import { persistDocument, type DocumentLink } from './persist-document';
 
 export interface OrchestratorConfig {
@@ -157,14 +157,13 @@ async function writeUnrecoverableMarker(
   }
 }
 
-// Per-batch token resolver. Outlook's /me/messages is mailbox-scoped — a
-// caller's token can only see messages in their OWN mailbox. The previous
+// Per-batch mailbox resolver. Graph message IDs are mailbox-scoped. The previous
 // "try every candidate participant" implementation generated 2-4 redundant
 // 404s per conversation since Graph message IDs are mailbox-scoped (the same
 // physical email has different IDs in each user's mailbox). Wave 3 picks ONE
 // originating user and accepts a 404 from that mailbox as the final answer —
 // see resolveOriginatingUserId below.
-type TokenResolver = (userId: string) => Promise<string | null>;
+type MailboxResolver = (userId: string) => Promise<{ token: string; mailbox: string } | null>;
 type UserEmailMap = Map<string, string>;  // lowercase email → user_id
 
 // Identify the single user whose mailbox most likely contains this message.
@@ -188,7 +187,7 @@ function resolveOriginatingUserId(
 
 async function processOneConversation(
   conversationId: string,
-  ctx: { orgId: string; jobId: string; getTokenForUser: TokenResolver; userEmailMap: UserEmailMap },
+  ctx: { orgId: string; jobId: string; getMailboxForUser: MailboxResolver; userEmailMap: UserEmailMap },
   env: Env
 ): Promise<ConversationStats> {
   const stats: ConversationStats = {
@@ -225,8 +224,8 @@ async function processOneConversation(
     return stats;
   }
 
-  const token = await ctx.getTokenForUser(originatingUserId);
-  if (!token) {
+  const mailboxAuth = await ctx.getMailboxForUser(originatingUserId);
+  if (!mailboxAuth) {
     // Token resolution failed (refresh or decrypt error). Treat as transient
     // — don't write a marker; the next drain iteration will retry once the
     // user re-authenticates or token refresh succeeds.
@@ -239,8 +238,8 @@ async function processOneConversation(
   let attachmentList: GraphAttachmentMeta[] = [];
   try {
     const listRes = await fetch(
-      `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(conv.external_message_id)}/attachments?$select=id,name,size,contentType,isInline`,
-      { headers: { Authorization: `Bearer ${token}` } }
+      graphMailboxUrl(mailboxAuth.mailbox, `/messages/${encodeURIComponent(conv.external_message_id)}/attachments?$select=id,name,size,contentType,isInline`),
+      { headers: { Authorization: `Bearer ${mailboxAuth.token}` } }
     );
 
     if (listRes.status === 404) {
@@ -272,9 +271,8 @@ async function processOneConversation(
     return stats;
   }
 
-  // From here on, `token` is the originating user's token — also used for
+  // From here on, `mailboxAuth` is the originating mailbox auth — also used for
   // per-attachment download calls below.
-  const resolvedToken = token;
   if (attachmentList.length === 0) {
     // Header said has_attachments=1 but Graph returns nothing usable (all
     // inline signature images, only reference attachments, or zero after
@@ -304,8 +302,8 @@ async function processOneConversation(
     try {
       // 3a. Download binary via $value endpoint.
       const dlRes = await fetch(
-        `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(conv.external_message_id!)}/attachments/${encodeURIComponent(att.id)}/$value`,
-        { headers: { Authorization: `Bearer ${resolvedToken}` } }
+        graphMailboxUrl(mailboxAuth.mailbox, `/messages/${encodeURIComponent(conv.external_message_id!)}/attachments/${encodeURIComponent(att.id)}/$value`),
+        { headers: { Authorization: `Bearer ${mailboxAuth.token}` } }
       );
       if (!dlRes.ok) {
         const body = await dlRes.text();
@@ -416,19 +414,18 @@ export async function runAttachmentBackfillBatch(
     })
   ).run();
 
-  // Per-user token cache. Refresh + decrypt is expensive — pay once per user
-  // across the whole batch. Failed lookups cache as null so we don't retry.
-  const tokenCache = new Map<string, string | null>();
-  const getTokenForUser: TokenResolver = async (userId: string) => {
-    if (tokenCache.has(userId)) return tokenCache.get(userId) ?? null;
+  // Per-user mailbox auth cache. App-only token acquisition is cached globally;
+  // this avoids repeated user/mailbox lookups inside one batch.
+  const mailboxCache = new Map<string, { token: string; mailbox: string } | null>();
+  const getMailboxForUser: MailboxResolver = async (userId: string) => {
+    if (mailboxCache.has(userId)) return mailboxCache.get(userId) ?? null;
     try {
-      await refreshOutlookToken(userId, config.orgId, env);
-      const t = await getDecryptedAccessToken(userId, env);
-      tokenCache.set(userId, t);
-      return t;
+      const auth = await getGraphMailboxAuthForUser(userId, config.orgId, env);
+      mailboxCache.set(userId, auth);
+      return auth;
     } catch (e: any) {
-      console.warn(`[backfill-orchestrator] no valid token for user ${userId}: ${e?.message || e}`);
-      tokenCache.set(userId, null);
+      console.warn(`[backfill-orchestrator] no valid Graph mailbox auth for user ${userId}: ${e?.message || e}`);
+      mailboxCache.set(userId, null);
       return null;
     }
   };
@@ -446,7 +443,7 @@ export async function runAttachmentBackfillBatch(
   const perConvResults = await runWithConcurrency(
     config.conversationIds,
     concurrency,
-    convId => processOneConversation(convId, { orgId: config.orgId, jobId, getTokenForUser, userEmailMap }, env)
+    convId => processOneConversation(convId, { orgId: config.orgId, jobId, getMailboxForUser, userEmailMap }, env)
   );
 
   const result: OrchestratorResult = {

@@ -4,7 +4,7 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
 import { invalidateRagCache } from '../lib/cache';
-import { canReadConversationContent, getSharingFlags } from '../lib/helpers';
+import { loadConversationVisibilityMap } from '../lib/email-derived-visibility';
 import { commitProgressiveApproval, markFieldsHumanEdited } from '../lib/progressive-enrichment';
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { recordApproval, recordApprovalOfDeletion, recordRejection } from '../lib/proposal-evaluator';
@@ -15,6 +15,65 @@ function tableForEntity(t: 'contact' | 'company' | 'deal'): string {
   if (t === 'contact') return 'contacts';
   if (t === 'company') return 'companies';
   return 'deals';
+}
+
+function parseApprovalValue(row: any): {
+  proposed_value: string;
+  current_value: unknown;
+  source_description: string | null;
+  source_type: string | null;
+  metadata: any;
+} {
+  let proposedDisplay = row.proposed_value;
+  let metadata: any = null;
+  try {
+    const parsed = JSON.parse(row.proposed_value);
+    if (parsed && typeof parsed === 'object' && parsed.value !== undefined) {
+      proposedDisplay = String(parsed.value);
+      metadata = parsed.metadata || null;
+    } else if (typeof parsed === 'string') {
+      proposedDisplay = parsed;
+    }
+  } catch {
+    // use raw value
+  }
+  return {
+    proposed_value: proposedDisplay,
+    current_value: metadata?.current_value ?? null,
+    source_description: metadata?.source_description ?? row.change_type ?? null,
+    source_type: metadata?.source_type ?? row.change_type ?? null,
+    metadata,
+  };
+}
+
+export function shapeApprovalRowForViewer(row: any, canReadSource: boolean): any {
+  const parsed = parseApprovalValue(row);
+  const hasEmailSource = Boolean(row.source_communication_id);
+  const base = {
+    ...row,
+    evidence_visible: !hasEmailSource || canReadSource,
+  };
+  delete (base as any).source_visibility;
+
+  if (hasEmailSource && !canReadSource) {
+    delete (base as any).proposed_value;
+    delete (base as any).current_value;
+    delete (base as any).metadata;
+    delete (base as any).source_description;
+    delete (base as any).source_type;
+    return {
+      ...base,
+      source_note: 'Private email · evidence not visible',
+    };
+  }
+
+  return {
+    ...base,
+    proposed_value: parsed.proposed_value,
+    current_value: parsed.current_value,
+    source_description: parsed.source_description,
+    source_type: parsed.source_type,
+  };
 }
 
 export async function listApprovalQueue(
@@ -37,67 +96,22 @@ export async function listApprovalQueue(
   const offset = parseInt(url.searchParams.get('offset') || '0', 10);
   const whereClause = where.join(' AND ');
 
-  const [rows, countResult, sharingFlags] = await Promise.all([
+  const [rows, countResult] = await Promise.all([
     env.D1.prepare(
       `SELECT * FROM approval_queue WHERE ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
     ).bind(...binds, limit, offset).all(),
     env.D1.prepare(
       `SELECT COUNT(*) as total FROM approval_queue WHERE ${whereClause}`
     ).bind(...binds).first<{ total: number }>(),
-    getSharingFlags(ctx.orgId, env),
   ]);
 
-  const entries = await Promise.all(
-    rows.results.map(async (row: any) => {
-      let proposedDisplay = row.proposed_value;
-      let metadata: any = null;
-      try {
-        const parsed = JSON.parse(row.proposed_value);
-        if (parsed && typeof parsed === 'object' && parsed.value !== undefined) {
-          proposedDisplay = String(parsed.value);
-          metadata = parsed.metadata || null;
-        } else if (typeof parsed === 'string') {
-          proposedDisplay = parsed;
-        }
-      } catch { /* use raw value */ }
-
-      const base = {
-        ...row,
-        proposed_value: proposedDisplay,
-        current_value: metadata?.current_value ?? null,
-        source_description: metadata?.source_description ?? row.change_type ?? null,
-        source_type: metadata?.source_type ?? row.change_type ?? null,
-      };
-
-      if (row.source_communication_id && row.source_visibility === 'private') {
-        const conv = await env.D1.prepare(
-          `SELECT c.source, c.participant_user_ids, c.is_campaign_email, sc.is_private AS slack_is_private
-             FROM conversations c
-             LEFT JOIN slack_channels sc
-               ON c.source = 'slack'
-              AND sc.org_id = c.org_id
-              AND sc.channel_id = CASE
-                WHEN instr(c.external_message_id, ':') > 0
-                THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
-                ELSE c.external_message_id
-              END
-            WHERE c.id = ? AND c.org_id = ?`
-        ).bind(row.source_communication_id, ctx.orgId).first<any>();
-
-        const canRead = conv
-          ? canReadConversationContent(conv, ctx.userId, ctx.userRole, sharingFlags)
-          : false;
-
-        if (!canRead) {
-          return {
-            ...base,
-            evidence_visible: false,
-            source_note: 'Private email · evidence not visible',
-          };
-        }
-      }
-      return { ...base, evidence_visible: true };
-    })
+  const sourceVisibility = await loadConversationVisibilityMap(
+    env,
+    ctx,
+    rows.results.map((row: any) => row.source_communication_id)
+  );
+  const entries = rows.results.map((row: any) =>
+    shapeApprovalRowForViewer(row, sourceVisibility.get(row.source_communication_id)?.can_read === true)
   );
 
   return jsonResponse({
@@ -569,35 +583,31 @@ export async function getPendingUpdates(
   env: Env
 ): Promise<Response> {
   const rows = await env.D1.prepare(
-    `SELECT id, field_name, proposed_value, confidence, source_communication_id, created_at, change_type
+    `SELECT id, field_name, proposed_value, confidence, source_communication_id, source_visibility, created_at, change_type
      FROM approval_queue
      WHERE org_id = ? AND entity_type = ? AND entity_id = ? AND status = 'pending'
      ORDER BY created_at DESC
      LIMIT 50`
   ).bind(ctx.orgId, entityType, entityId).all();
 
+  const sourceVisibility = await loadConversationVisibilityMap(
+    env,
+    ctx,
+    rows.results.map((row: any) => row.source_communication_id)
+  );
   const updates = rows.results.map((row: any) => {
-    let proposedDisplay = row.proposed_value;
-    let metadata: any = null;
-    try {
-      const parsed = JSON.parse(row.proposed_value);
-      if (parsed && typeof parsed === 'object' && parsed.value !== undefined) {
-        proposedDisplay = String(parsed.value);
-        metadata = parsed.metadata || null;
-      } else if (typeof parsed === 'string') {
-        proposedDisplay = parsed;
-      }
-    } catch { /* use raw value */ }
-
+    const shaped = shapeApprovalRowForViewer(row, sourceVisibility.get(row.source_communication_id)?.can_read === true);
     return {
-      id: row.id,
-      field_name: row.field_name,
-      proposed_value: proposedDisplay,
-      confidence: row.confidence,
-      source_description: metadata?.source_description || metadata?.source_type || row.change_type,
-      source_type: metadata?.source_type || row.change_type,
-      current_value: metadata?.current_value || null,
-      created_at: row.created_at,
+      id: shaped.id,
+      field_name: shaped.field_name,
+      ...(shaped.proposed_value !== undefined ? { proposed_value: shaped.proposed_value } : {}),
+      confidence: shaped.confidence,
+      ...(shaped.source_description !== undefined ? { source_description: shaped.source_description } : {}),
+      ...(shaped.source_type !== undefined ? { source_type: shaped.source_type } : {}),
+      ...(shaped.current_value !== undefined ? { current_value: shaped.current_value } : {}),
+      evidence_visible: shaped.evidence_visible,
+      source_note: shaped.source_note,
+      created_at: shaped.created_at,
     };
   });
 

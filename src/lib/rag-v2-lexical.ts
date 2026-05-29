@@ -1,5 +1,6 @@
 import type { Env } from '../types/env';
 import type { LexicalCandidate, RagChunkRecord } from '../types/rag-v2';
+import { hasOrgWidePrivateDataAccess } from './helpers';
 
 interface LexicalSearchOptions {
   orgId: string;
@@ -8,6 +9,9 @@ interface LexicalSearchOptions {
   documentTypes?: string[];
   sourceFamilies?: string[];
   sourceTable?: string;
+  userId?: string;
+  userRole?: string;
+  sharedUserIds?: string[];
 }
 
 type SearchableChunk = RagChunkRecord & { body: string };
@@ -78,6 +82,21 @@ export async function searchRagChunksD1Fts(
   if (options.sourceTable) {
     where.push('c.source_table = ?');
     params.push(options.sourceTable);
+  }
+  if (options.userId && !hasOrgWidePrivateDataAccess(options.userRole)) {
+    const readableUserIds = [options.userId, ...(options.sharedUserIds || [])];
+    const placeholders = readableUserIds.map(() => '?').join(',');
+    where.push(`(
+      c.source_table != 'conversations'
+      OR c.visibility IN ('org_wide', 'public', 'org')
+      OR EXISTS (
+        SELECT 1 FROM conversation_participants cp_fts
+         WHERE cp_fts.org_id = c.org_id
+           AND cp_fts.conversation_id = c.source_id
+           AND cp_fts.user_id IN (${placeholders})
+      )
+    )`);
+    params.push(...readableUserIds);
   }
   if (options.entityIds?.length) {
     const entityClauses = options.entityIds.flatMap(() => [

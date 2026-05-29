@@ -47,7 +47,7 @@ describe('MAX set builder contracts', () => {
       query: 'Pull all names and emails myself or Raul invited to the Intelligent Infrastructure webinar on May 7, 2026',
       task_type: 'invite_roster' as const,
       entity_kind: 'person' as const,
-      named_people: ['tony@medinavc.com', 'Raul Henriquez', 'raul@medinavc.com'],
+      named_people: ['tony@medinacapital.com', 'Raul Henriquez', 'raul@medinacapital.com'],
       artifact_kind: 'xlsx' as const,
     };
     const profile = __maxSetTestHooks.buildProfile(input);
@@ -98,7 +98,7 @@ describe('MAX set builder contracts', () => {
       query: 'List everyone Raul invited to the Intelligent Infrastructure webinar on May 7, 2026',
       task_type: 'invite_roster' as const,
       entity_kind: 'person' as const,
-      named_people: ['Raul Henriquez', 'raul@medinavc.com'],
+      named_people: ['Raul Henriquez', 'raul@medinacapital.com'],
       artifact_kind: 'xlsx' as const,
     };
     const profile = __maxSetTestHooks.buildProfile(input);

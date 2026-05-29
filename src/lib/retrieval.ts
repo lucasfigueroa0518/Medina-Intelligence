@@ -479,10 +479,14 @@ async function retrieveContextV2(
   const denseMs = Date.now() - denseStart;
 
   const lexicalStart = Date.now();
+  const lexicalSharingFlags = await getSharingFlags(pq.orgId, env);
   const lexicalCandidates = await searchRagChunksD1Fts(env, pq.originalQuery, {
     orgId: pq.orgId,
     topK: options.deepDive ? MAX_MODE_LIMITS.ragV2LexicalTopK : 100,
     entityIds: pq.entityIds,
+    userId: pq.userId,
+    userRole: pq.userRole,
+    sharedUserIds: Object.keys(lexicalSharingFlags).filter(id => lexicalSharingFlags[id]),
   });
   const lexicalMs = Date.now() - lexicalStart;
 
@@ -564,7 +568,15 @@ async function retrieveContextV2(
     rerankerInputCount: hydrated.length,
     rerankerOutputCount: reranked.length,
     hydrationSummary,
-    topCandidates: fused.slice(0, 12),
+    topCandidates: aclFiltered.slice(0, 12).map(match => ({
+      chunkId: match.id,
+      score: match.score,
+      metadata: {
+        source_table: match.metadata.source_table,
+        source_id: match.metadata.source_id,
+        document_type: match.metadata.document_type,
+      },
+    })),
     latencies: {
       dense: denseMs,
       lexical: lexicalMs,

@@ -8,6 +8,7 @@ import { mergeContacts, resolveMergedContact, cleanupVectorsForEntity } from '..
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { updateContactFields } from '../lib/entity-writes';
 import { cleanIntelligenceBrief } from '../lib/intelligence-briefing';
+import { getSharingFlags } from '../lib/helpers';
 import {
   buildContactSearchQuery,
   contactSearchCteBinds,
@@ -19,21 +20,23 @@ import {
 } from '../lib/contact-search';
 import {
   listContactTimelineItems,
-  loadContactActivityRollup,
+  loadContactActivityRollupForViewer,
   rebuildContactDetailReadModelForOrg,
   resolveCanonicalContactId,
   safelyDeleteContactDetailReadModelForContact,
   safelyRebuildContactDetailReadModelForContact,
 } from '../lib/contact-detail-read-model';
+import { conversationAclSql, loadConversationVisibilityMap } from '../lib/email-derived-visibility';
+import { shapeApprovalRowForViewer } from './approval';
 
 // --- GET /api/contacts ---
 
 // Maps the `sort` query param to a SQL column. Defaults to last_contact.
 const CONTACT_SORT_MAP: Record<string, { col: string; defaultDir: 'ASC' | 'DESC' }> = {
-  last_contact: { col: 'c.last_contact_date', defaultDir: 'DESC' },
+  last_contact: { col: 'vr.viewer_last_contact_date', defaultDir: 'DESC' },
   name: { col: 'c.full_name', defaultDir: 'ASC' },
   company: { col: 'co.name', defaultDir: 'ASC' },
-  interactions: { col: 'c.total_interactions', defaultDir: 'DESC' },
+  interactions: { col: 'COALESCE(vr.viewer_total_interactions, 0)', defaultDir: 'DESC' },
   status: { col: 'c.engagement_status', defaultDir: 'ASC' },
   type: { col: 'c.contact_type', defaultDir: 'ASC' },
   created_at: { col: 'c.created_at', defaultDir: 'DESC' },
@@ -43,25 +46,25 @@ const CONTACT_SORT_MAP: Record<string, { col: string; defaultDir: 'ASC' | 'DESC'
 // rely on D1's strftime/datetime functions; null handling stays explicit so
 // `never` doesn't accidentally match every NULL row when the user picks a
 // different bucket.
-function lastContactPredicate(bucket: string): string | null {
+function lastContactPredicate(bucket: string, col = 'vr.viewer_last_contact_date'): string | null {
   switch (bucket) {
-    case 'today': return `c.last_contact_date >= datetime('now','start of day')`;
-    case 'this_week': return `c.last_contact_date >= datetime('now','-7 days')`;
-    case 'this_month': return `c.last_contact_date >= datetime('now','-30 days')`;
-    case '1_3_months': return `c.last_contact_date >= datetime('now','-90 days') AND c.last_contact_date < datetime('now','-30 days')`;
-    case '3_plus_months': return `c.last_contact_date IS NOT NULL AND c.last_contact_date < datetime('now','-90 days')`;
-    case 'never': return `c.last_contact_date IS NULL`;
+    case 'today': return `${col} >= datetime('now','start of day')`;
+    case 'this_week': return `${col} >= datetime('now','-7 days')`;
+    case 'this_month': return `${col} >= datetime('now','-30 days')`;
+    case '1_3_months': return `${col} >= datetime('now','-90 days') AND ${col} < datetime('now','-30 days')`;
+    case '3_plus_months': return `${col} IS NOT NULL AND ${col} < datetime('now','-90 days')`;
+    case 'never': return `${col} IS NULL`;
     default: return null;
   }
 }
 
-function interactionsPredicate(bucket: string): string | null {
+function interactionsPredicate(bucket: string, col = 'COALESCE(vr.viewer_total_interactions, 0)'): string | null {
   switch (bucket) {
-    case '0': return `(c.total_interactions IS NULL OR c.total_interactions = 0)`;
-    case '1_10': return `c.total_interactions BETWEEN 1 AND 10`;
-    case '11_50': return `c.total_interactions BETWEEN 11 AND 50`;
-    case '51_200': return `c.total_interactions BETWEEN 51 AND 200`;
-    case '200_plus': return `c.total_interactions > 200`;
+    case '0': return `${col} = 0`;
+    case '1_10': return `${col} BETWEEN 1 AND 10`;
+    case '11_50': return `${col} BETWEEN 11 AND 50`;
+    case '51_200': return `${col} BETWEEN 51 AND 200`;
+    case '200_plus': return `${col} > 200`;
     default: return null;
   }
 }
@@ -112,11 +115,11 @@ export async function listContacts(
 
   // Legacy date range filters still honored.
   if (filter.last_contact_before) {
-    where.push('c.last_contact_date < ?');
+    where.push('vr.viewer_last_contact_date < ?');
     binds.push(filter.last_contact_before);
   }
   if (filter.last_contact_after) {
-    where.push('c.last_contact_date > ?');
+    where.push('vr.viewer_last_contact_date > ?');
     binds.push(filter.last_contact_after);
   }
 
@@ -192,6 +195,31 @@ export async function listContacts(
   // matches user expectation; otherwise just append id for stable pagination.
   const tieBreak = sortKey === 'status' ? ', c.full_name ASC' : ', c.id ASC';
 
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+  const rollupAcl = conversationAclSql('vc', ctx, sharingFlags, 'vsc.is_private');
+  const viewerRollupBinds: unknown[] = [ctx.orgId, ...rollupAcl.binds];
+  const viewerRollupJoin = `
+    LEFT JOIN (
+      SELECT cc.contact_id,
+             MAX(vc.sent_at) AS viewer_last_contact_date,
+             COUNT(*) AS viewer_total_interactions
+        FROM conversation_contacts cc
+        JOIN conversations vc
+          ON vc.id = cc.conversation_id
+         AND vc.org_id = ?
+        LEFT JOIN slack_channels vsc
+          ON vc.source = 'slack'
+         AND vsc.org_id = vc.org_id
+         AND vsc.channel_id = CASE
+           WHEN instr(vc.external_message_id, ':') > 0
+           THEN substr(vc.external_message_id, 1, instr(vc.external_message_id, ':') - 1)
+           ELSE vc.external_message_id
+         END
+       WHERE ${rollupAcl.sql}
+       GROUP BY cc.contact_id
+    ) vr ON vr.contact_id = c.id
+  `;
+
   const companyNameSql = `
     COALESCE(
       co.name,
@@ -262,10 +290,11 @@ export async function listContacts(
     sql = `
       ${cte}
       SELECT c.*, ${companyNameSql} as company_name
-      FROM matched m
-      JOIN contacts c ON c.id = m.contact_id
-      LEFT JOIN companies co ON c.company_id = co.id
-      ${tagJoin}
+	      FROM matched m
+	      JOIN contacts c ON c.id = m.contact_id
+	      LEFT JOIN companies co ON c.company_id = co.id
+	      ${viewerRollupJoin}
+	      ${tagJoin}
       WHERE ${where.join(' AND ')}
       GROUP BY c.id
       ${havingClause}
@@ -274,23 +303,25 @@ export async function listContacts(
     `;
 
     const countFrom = `
-      FROM matched m
-      JOIN contacts c ON c.id = m.contact_id
-      LEFT JOIN companies co ON c.company_id = co.id
-      ${tagJoin}
+	      FROM matched m
+	      JOIN contacts c ON c.id = m.contact_id
+	      LEFT JOIN companies co ON c.company_id = co.id
+	      ${viewerRollupJoin}
+	      ${tagJoin}
       WHERE ${where.join(' AND ')}
     `;
     countSql = havingClause
       ? `${cte} SELECT COUNT(*) as n FROM (SELECT c.id ${countFrom} GROUP BY c.id ${havingClause})`
       : `${cte} SELECT COUNT(DISTINCT c.id) as n ${countFrom}`;
-    resultBinds = [...searchBinds, ...binds, limit, offset];
-    countBinds = [...searchBinds, ...binds];
-  } else {
+	    resultBinds = [...searchBinds, ...viewerRollupBinds, ...binds, limit, offset];
+	    countBinds = [...searchBinds, ...viewerRollupBinds, ...binds];
+	  } else {
     sql = `
       SELECT c.*, ${companyNameSql} as company_name
-      FROM contacts c
-      LEFT JOIN companies co ON c.company_id = co.id
-      ${tagJoin}
+	      FROM contacts c
+	      LEFT JOIN companies co ON c.company_id = co.id
+	      ${viewerRollupJoin}
+	      ${tagJoin}
       WHERE ${where.join(' AND ')}
       GROUP BY c.id
       ${havingClause}
@@ -299,17 +330,18 @@ export async function listContacts(
     `;
 
     const countFrom = `
-      FROM contacts c
-      LEFT JOIN companies co ON c.company_id = co.id
-      ${tagJoin}
+	      FROM contacts c
+	      LEFT JOIN companies co ON c.company_id = co.id
+	      ${viewerRollupJoin}
+	      ${tagJoin}
       WHERE ${where.join(' AND ')}
     `;
     countSql = havingClause
       ? `SELECT COUNT(*) as n FROM (SELECT c.id ${countFrom} GROUP BY c.id ${havingClause})`
       : `SELECT COUNT(DISTINCT c.id) as n ${countFrom}`;
-    resultBinds = [...binds, limit, offset];
-    countBinds = binds;
-  }
+	    resultBinds = [...viewerRollupBinds, ...binds, limit, offset];
+	    countBinds = [...viewerRollupBinds, ...binds];
+	  }
 
   const [result, countResult] = await Promise.all([
     env.D1.prepare(sql).bind(...resultBinds).all(),
@@ -335,6 +367,13 @@ export async function listContacts(
     for (const c of contacts) {
       c.tags = tagMap.get(c.id) || [];
     }
+    const rollups = await Promise.all(contacts.map(c => loadContactActivityRollupForViewer(env, ctx, c.id)));
+    contacts.forEach((contact, index) => {
+      const rollup = rollups[index];
+      contact.last_contact_date = rollup.last_conversation_at || rollup.last_event_at || null;
+      contact.total_interactions = rollup.conversation_count + rollup.event_count;
+      contact.activity_rollup = rollup;
+    });
   }
 
   return jsonResponse({
@@ -605,7 +644,7 @@ export async function getContact(
          AND change_type NOT IN ('enrichment_report', 'progressive_update')
        ORDER BY created_at DESC LIMIT 10`
     ).bind(ctx.orgId, contactId).all(),
-    loadContactActivityRollup(env, ctx.orgId, contactId),
+    loadContactActivityRollupForViewer(env, ctx, contactId),
   ]);
 
   if (!rollup) {
@@ -614,11 +653,20 @@ export async function getContact(
     );
   }
 
+  const signalVisibility = await loadConversationVisibilityMap(
+    env,
+    ctx,
+    signals.results.map((row: any) => row.source_communication_id)
+  );
+  const visibleSignals = signals.results.map((row: any) =>
+    shapeApprovalRowForViewer(row, signalVisibility.get(row.source_communication_id)?.can_read === true)
+  );
+
   return jsonResponse({
     contact,
     tags: tags.results,
     associations: assocRows.results,
-    signals: signals.results,
+    signals: visibleSignals,
     weekly_interactions: rollup?.weekly_interactions || [],
     first_interaction_date: rollup?.first_interaction_date || null,
     activity_rollup: rollup,

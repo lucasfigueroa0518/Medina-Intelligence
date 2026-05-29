@@ -719,6 +719,10 @@ async function routeAuthenticated(
       const { handleEnsureGraphSubscriptions } = await import('./handlers/ensure-graph-subscriptions');
       return handleEnsureGraphSubscriptions(request, ctx, env);
     }
+    if (path === '/api/admin/outlook-app-only-repair' && method === 'POST') {
+      const { handleOutlookAppOnlyRepair } = await import('./handlers/outlook-app-only-repair');
+      return handleOutlookAppOnlyRepair(request, ctx, env);
+    }
     if (path === '/api/admin/reconcile-orphaned-fireflies' && method === 'POST') {
       const { handleReconcileOrphanedFireflies } = await import('./handlers/firefly-reconcile');
       return handleReconcileOrphanedFireflies(request, ctx, env);
@@ -831,10 +835,19 @@ async function routeAuthenticated(
     return Admin.getIntegrationStatus(ctx, env);
   if (path === '/api/integrations/status' && method === 'GET')
     return Integrations.getIntegrationsStatus(request, ctx, env);
+  if (path === '/api/outlook/app-only-health' && method === 'GET') {
+    const forbidden = requireRole(ctx, ['owner', 'admin', 'super_admin']);
+    if (forbidden) return forbidden;
+    const { handleOutlookAppOnlyHealth } = await import('./handlers/outlook-app-only-repair');
+    return handleOutlookAppOnlyHealth(ctx, env);
+  }
 
   // --- Settings → System Status tab ---
-  if (path === '/api/settings/system-status' && method === 'GET')
+  if (path === '/api/settings/system-status' && method === 'GET') {
+    const forbidden = requireRole(ctx, ['owner', 'admin', 'super_admin']);
+    if (forbidden) return forbidden;
     return SystemStatusHandler.getSystemStatus(ctx, env);
+  }
   if (path === '/api/integrations/firefly/webhook-secret' && method === 'GET')
     return Integrations.getFireflyWebhookSecret(ctx, env);
 

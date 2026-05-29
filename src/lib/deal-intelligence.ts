@@ -24,8 +24,10 @@
 //     conversation per canReadEmailContent.
 
 import type { Env } from '../types/env';
+import type { AuthContext } from '../types/interfaces';
 import { callClaude } from './claude';
 import { canReadConversationContent, getSharingFlags, parseParticipantUserIds } from './helpers';
+import { readableConversationFingerprint } from './email-derived-visibility';
 import { cleanIntelligenceBrief } from './intelligence-briefing';
 
 // Tunables. Stored as constants so behavior is auditable.
@@ -75,6 +77,8 @@ interface RawRow {
   brief_summary: string | null;
   computed_at: string;
   invalidated_at: string | null;
+  acl_fingerprint?: string | null;
+  acl_computed_at?: string | null;
 }
 
 /**
@@ -379,6 +383,11 @@ export async function computeDealIntelligence(
   const sharingFlags = await getSharingFlags(orgId, env);
   const allConvs = await fetchDealConversations(dealId, orgId, env);
   const readable = filterConversationsByAcl(allConvs, { userId, userRole, sharingFlags });
+  const acl_fingerprint = await readableConversationFingerprint(
+    env,
+    { orgId, userId, userRole } as AuthContext,
+    allConvs
+  );
 
   if (readable.length === 0) {
     await upsertIntelligence({
@@ -388,6 +397,7 @@ export async function computeDealIntelligence(
       momentum: null, momentum_score: null,
       conversation_count: 0,
       brief_summary: null,
+      acl_fingerprint,
     }, env);
     return { reason: 'no_readable_conversations', intelligence: shapeRow(await readRow(dealId, userId, env)) };
   }
@@ -415,6 +425,7 @@ export async function computeDealIntelligence(
       momentum: null, momentum_score: null,
       conversation_count: readable.length,
       brief_summary: null,
+      acl_fingerprint,
     }, env);
     return { reason: 'compute_failed_returned_null', intelligence: shapeRow(await readRow(dealId, userId, env)) };
   }
@@ -429,6 +440,7 @@ export async function computeDealIntelligence(
       momentum: null, momentum_score: null,
       conversation_count: readable.length,
       brief_summary: null,
+      acl_fingerprint,
     }, env);
     return { reason: 'compute_failed_returned_null', intelligence: shapeRow(await readRow(dealId, userId, env)) };
   }
@@ -440,6 +452,7 @@ export async function computeDealIntelligence(
     momentum: parsed.momentum, momentum_score: parsed.momentum_score,
     conversation_count: readable.length,
     brief_summary: parsed.brief_summary,
+    acl_fingerprint,
   }, env);
 
   return { reason: 'computed', intelligence: shapeRow(await readRow(dealId, userId, env)) };
@@ -456,6 +469,7 @@ interface UpsertInput {
   momentum_score: number | null;
   conversation_count: number;
   brief_summary: string | null;
+  acl_fingerprint: string;
 }
 
 async function upsertIntelligence(input: UpsertInput, env: Env): Promise<void> {
@@ -463,8 +477,9 @@ async function upsertIntelligence(input: UpsertInput, env: Env): Promise<void> {
   await env.D1.prepare(
     `INSERT INTO deal_intelligence
        (deal_id, user_id, sentiment, sentiment_score, topics, risk_signals,
-        momentum, momentum_score, conversation_count, brief_summary, computed_at, invalidated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        momentum, momentum_score, conversation_count, brief_summary,
+        computed_at, invalidated_at, acl_fingerprint, acl_computed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
      ON CONFLICT(deal_id, user_id) DO UPDATE SET
        sentiment = excluded.sentiment,
        sentiment_score = excluded.sentiment_score,
@@ -475,7 +490,9 @@ async function upsertIntelligence(input: UpsertInput, env: Env): Promise<void> {
        conversation_count = excluded.conversation_count,
        brief_summary = excluded.brief_summary,
        computed_at = excluded.computed_at,
-       invalidated_at = NULL`
+       invalidated_at = NULL,
+       acl_fingerprint = excluded.acl_fingerprint,
+       acl_computed_at = excluded.acl_computed_at`
   ).bind(
     input.dealId, input.userId,
     input.sentiment, input.sentiment_score,
@@ -484,6 +501,8 @@ async function upsertIntelligence(input: UpsertInput, env: Env): Promise<void> {
     input.momentum, input.momentum_score,
     input.conversation_count,
     input.brief_summary,
+    now,
+    input.acl_fingerprint,
     now
   ).run();
 }
@@ -492,7 +511,7 @@ async function readRow(dealId: string, userId: string, env: Env): Promise<RawRow
   const row = await env.D1.prepare(
     `SELECT deal_id, user_id, sentiment, sentiment_score, topics, risk_signals,
             momentum, momentum_score, conversation_count, brief_summary,
-            computed_at, invalidated_at
+            computed_at, invalidated_at, acl_fingerprint, acl_computed_at
        FROM deal_intelligence
        WHERE deal_id = ? AND user_id = ?`
   ).bind(dealId, userId).first<RawRow>();
@@ -508,17 +527,44 @@ async function readRow(dealId: string, userId: string, env: Env): Promise<RawRow
  */
 export async function readDealIntelligence(
   dealId: string,
-  userId: string,
+  ctx: AuthContext,
   env: Env
 ): Promise<DealIntelligence | null> {
   const row = await env.D1.prepare(
     `SELECT deal_id, user_id, sentiment, sentiment_score, topics, risk_signals,
             momentum, momentum_score, conversation_count, brief_summary,
-            computed_at, invalidated_at
+            computed_at, invalidated_at, acl_fingerprint, acl_computed_at
        FROM deal_intelligence
        WHERE deal_id = ? AND user_id = ?`
-  ).bind(dealId, userId).first<RawRow>();
-  return row ? shapeRow(row) : null;
+  ).bind(dealId, ctx.userId).first<RawRow>();
+  if (!row) return null;
+  if (row.invalidated_at) return null;
+
+  const allConvs = await fetchDealConversations(dealId, ctx.orgId, env);
+  const fingerprint = await readableConversationFingerprint(env, ctx, allConvs);
+  if (!row.acl_fingerprint || row.acl_fingerprint !== fingerprint) {
+    await env.D1.prepare(
+      `UPDATE deal_intelligence
+          SET invalidated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE deal_id = ? AND user_id = ?`
+    ).bind(dealId, ctx.userId).run();
+    return null;
+  }
+  return shapeRow(row);
+}
+
+export async function invalidateDealIntelligenceForAclChange(
+  orgId: string,
+  env: Env
+): Promise<{ invalidated: number }> {
+  const result = await env.D1.prepare(
+    `UPDATE deal_intelligence
+        SET invalidated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE user_id IN (
+        SELECT id FROM users WHERE org_id = ? AND deleted_at IS NULL
+      )`
+  ).bind(orgId).run();
+  return { invalidated: result.meta.changes ?? 0 };
 }
 
 // ───────────────────────── invalidation ─────────────────────────

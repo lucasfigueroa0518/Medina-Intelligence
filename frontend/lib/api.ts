@@ -679,7 +679,12 @@ export const api = {
       body: JSON.stringify({ limit }),
     }),
   getAdminIntegrationStatus: () =>
-    request<{ users: any[]; tokenHealth: Record<string, any> }>('/me/integration-status'),
+    request<{
+      users: any[];
+      tokenHealth: Record<string, any>;
+      mailboxHealth?: Record<string, OutlookMailboxHealth | null>;
+      outlookHealth?: OutlookAppOnlyHealthSnapshot;
+    }>('/me/integration-status'),
   getSystemStatus: () => request<{ mode: string; cache_stale: boolean }>('/system/status'),
 
   // Sync
@@ -851,6 +856,13 @@ export const api = {
   // Integrations
   getIntegrationsStatus: () =>
     request<IntegrationsStatusResponse>('/integrations/status'),
+  getOutlookAppOnlyHealth: () =>
+    request<{ ok: boolean; health: OutlookAppOnlyHealthSnapshot }>('/outlook/app-only-health'),
+  repairOutlookAppOnlyState: (apply = false) =>
+    request<any>('/admin/outlook-app-only-repair', {
+      method: 'POST',
+      body: JSON.stringify({ apply }),
+    }),
 
   // Settings → System Status tab (distinct from getSystemStatus above which
   // hits /system/status for admin mode/cache info).
@@ -1121,8 +1133,67 @@ export type IntegrationStatus =
   | 'configured'
   | 'not_configured'
   | 'configured_no_channels'
+  | 'degraded'
   | 'auth_failed'
   | 'webhook_ready';
+
+export interface OutlookMailboxHealth {
+  user_id: string;
+  email: string | null;
+  full_name: string | null;
+  role: string | null;
+  mailbox: string | null;
+  status: 'healthy' | 'degraded' | 'blocked' | 'missing_mailbox';
+  blockers: string[];
+  warnings: string[];
+  graph: {
+    checked_at: string | null;
+    messages_status: number | null;
+    calendar_status: number | null;
+    messages_ok: boolean | null;
+    calendar_ok: boolean | null;
+    error: string | null;
+  };
+  subscriptions: {
+    expected: string[];
+    current: string[];
+    missing: string[];
+    expired: string[];
+    legacy: string[];
+  };
+  last_email_ingested_at: string | null;
+  last_email_sent_at: string | null;
+  conversation_count: number;
+  last_calendar_success_at: string | null;
+  last_calendar_failure_at: string | null;
+  pending_work: number;
+  dead_letter_work: number;
+  stale_delegated_incident_ids: string[];
+}
+
+export interface OutlookAppOnlyHealthSnapshot {
+  generated_at: string;
+  auth_mode: 'app_only' | 'delegated_fallback';
+  configured: boolean;
+  status: 'healthy' | 'degraded' | 'blocked' | 'missing_config';
+  label: string;
+  detail: string;
+  summary: {
+    total_mailboxes: number;
+    healthy_mailboxes: number;
+    degraded_mailboxes: number;
+    blocked_mailboxes: number;
+    missing_mailboxes: number;
+    missing_subscriptions: number;
+    expired_subscriptions: number;
+    legacy_subscriptions: number;
+    stale_delegated_incidents: number;
+  };
+  mailboxes: OutlookMailboxHealth[];
+  suppressed_incident_ids: string[];
+  warnings: string[];
+  blockers: string[];
+}
 
 export interface IntegrationRow {
   status: IntegrationStatus;
@@ -1143,6 +1214,7 @@ export interface IntegrationRow {
   channels_visible?: number;
   messages_synced?: number;
   warnings?: string[];
+  outlook_health?: OutlookAppOnlyHealthSnapshot;
 }
 
 export interface IntegrationsStatusResponse {
@@ -1602,6 +1674,7 @@ export interface SystemStatusResponse {
   work_queue_inventory: WorkQueueInventoryEntry[];
   stuck_work_queue: StuckWorkQueueEntry[];
   ingestion_incidents: IngestionIncident[];
+  outlook_app_only_health: OutlookAppOnlyHealthSnapshot;
   marty_lab: MartyLabStatusSnapshot;
   deal_replay: DealReplayStatusSnapshot;
   budgets: BudgetSnapshotRow[];

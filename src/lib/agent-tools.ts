@@ -17,6 +17,7 @@ import { loadFirmRelationshipSnapshot, upsertFirmCompanyRelationship } from './f
 import { preprocessQuery, retrieveContext } from './retrieval';
 import { buildSourcesAndContext } from './citations';
 import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
+import { canViewerReadConversation, conversationAclSql } from './email-derived-visibility';
 import {
   buildContactSearchQuery,
   contactSearchCteBinds,
@@ -873,9 +874,21 @@ export async function sweepConversations(
     limit * (toolContext.deepDive ? MAX_MODE_LIMITS.conversationOverfetchMultiplier : 2),
     toolContext.deepDive ? MAX_MODE_LIMITS.conversationFetchMax : 200
   );
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+  const acl = conversationAclSql('c', ctx, sharingFlags, 'sc.is_private');
+  where.push(acl.sql);
+  binds.push(...acl.binds);
   const whereClause = where.join(' AND ');
+  const slackJoin = `LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END`;
 
-  const [rowsResult, countResult, sharingFlags] = await Promise.all([
+  const [rowsResult, countResult] = await Promise.all([
     env.D1.prepare(
       `SELECT c.id, c.subject, c.from_email, c.direction, c.source, c.sent_at,
               c.body_preview, c.body_r2_key, c.to_emails, c.cc_emails,
@@ -884,21 +897,13 @@ export async function sweepConversations(
               fc.full_name AS from_name
        FROM conversations c
        LEFT JOIN contacts fc ON c.from_contact_id = fc.id
-       LEFT JOIN slack_channels sc
-         ON c.source = 'slack'
-        AND sc.org_id = c.org_id
-        AND sc.channel_id = CASE
-          WHEN instr(c.external_message_id, ':') > 0
-          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
-          ELSE c.external_message_id
-        END
+       ${slackJoin}
        WHERE ${whereClause}
        ORDER BY c.sent_at DESC
        LIMIT ? OFFSET ?`
     ).bind(...binds, fetchLimit, offset).all(),
-    env.D1.prepare(`SELECT COUNT(*) AS total FROM conversations c WHERE ${whereClause}`)
+    env.D1.prepare(`SELECT COUNT(*) AS total FROM conversations c ${slackJoin} WHERE ${whereClause}`)
       .bind(...binds).first<{ total: number }>(),
-    getSharingFlags(ctx.orgId, env),
   ]);
 
   const accessibleRows = (rowsResult.results as any[])
@@ -916,11 +921,8 @@ export async function sweepConversations(
       )
     );
   const accessible = accessibleRows.slice(0, limit);
-  const rawCandidateCount = countResult?.total || 0;
-  const canReportRawCandidateCount = hasOrgWidePrivateDataAccess(ctx.userRole);
-  const hasMore = canReportRawCandidateCount
-    ? rawCandidateCount > offset + fetchLimit || accessibleRows.length > limit
-    : accessibleRows.length > limit || (rowsResult.results as any[]).length === fetchLimit;
+  const filteredCandidateCount = countResult?.total || 0;
+  const hasMore = filteredCandidateCount > offset + limit || accessibleRows.length > limit;
 
   const conversationIds = accessible.map(c => c.id);
   const participantMap = new Map<string, Array<{ full_name: string; email?: string | null }>>();
@@ -1029,7 +1031,7 @@ export async function sweepConversations(
       end_date: input.end_date || null,
       days_back: input.days_back || null,
     },
-    candidate_count_matching_filters: canReportRawCandidateCount ? rawCandidateCount : undefined,
+    candidate_count_matching_filters: filteredCandidateCount,
     returned_count: accessible.length,
     effective_limit: limit,
     offset,
@@ -1448,7 +1450,7 @@ export async function recall(
     ctx.orgId,
     env,
     input.query,
-    { deepDive: !!toolContext.deepDive }
+    { deepDive: !!toolContext.deepDive, viewer: ctx }
   );
 
   // Post-hydration source-type filter — applied AFTER D1 enrichment
@@ -2244,6 +2246,9 @@ export async function linkConversationToDealTool(
 ): Promise<any> {
   if (!(await verifyConversationInOrg(input.conversation_id, ctx.orgId, env))) {
     return { error: 'Conversation not found in your org' };
+  }
+  if (!(await canViewerReadConversation(env, ctx, input.conversation_id))) {
+    return { error: 'Conversation is private and not readable by this viewer' };
   }
   if (!(await verifyDealInOrg(input.deal_id, ctx.orgId, env))) {
     return { error: 'Deal not found in your org' };

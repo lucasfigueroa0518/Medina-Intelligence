@@ -1,7 +1,6 @@
 // TRD §12.2 — CampaignSendWorkflow: step-per-recipient with 429 retry handling
 import type { Env } from '../types/env';
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
-import { refreshOutlookToken } from '../integrations/oauth';
 import { sendViaOutlook } from '../integrations/outlook-send';
 import { resolveVariables } from '../lib/variables';
 import { emitAudit } from '../lib/audit';
@@ -22,11 +21,6 @@ export class CampaignSendWorkflow extends WorkflowEntrypoint<Env, CampaignParams
       ).bind(campaign_id, org_id).first<any>();
       if (!c) throw new Error('Campaign not found');
       if (!c.sender_user_id) throw new Error('No sender configured');
-
-      const refreshResult = await refreshOutlookToken(c.sender_user_id, org_id, this.env);
-      if (!refreshResult.success) {
-        throw new Error('AUTH_TOKEN_INVALID: sender Outlook token expired');
-      }
 
       await this.env.D1.prepare(
         `UPDATE email_campaigns SET status = 'sending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
@@ -72,6 +66,7 @@ export class CampaignSendWorkflow extends WorkflowEntrypoint<Env, CampaignParams
           const result = await sendViaOutlook(
             {
               senderUserId: campaign.sender_user_id,
+              orgId: org_id,
               subject: campaign.subject,
               body,
               toEmail: recipient.email,

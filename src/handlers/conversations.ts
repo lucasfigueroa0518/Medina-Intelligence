@@ -3,6 +3,7 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse } from './utils';
 import { canReadConversationContent, getSharingFlags } from '../lib/helpers';
+import { conversationAclSql } from '../lib/email-derived-visibility';
 
 export async function listConversations(
   request: Request,
@@ -39,28 +40,32 @@ export async function listConversations(
 
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 500);
   const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+  const acl = conversationAclSql('c', ctx, sharingFlags, 'sc.is_private');
+  where.push(acl.sql);
+  binds.push(...acl.binds);
   const whereClause = where.join(' AND ');
-
-  const [result, countResult, sharingFlags] = await Promise.all([
-    env.D1.prepare(
-      `SELECT c.*, sc.is_private AS slack_is_private
-       FROM conversations c
-       ${join}
-       LEFT JOIN slack_channels sc
+  const slackJoin = `LEFT JOIN slack_channels sc
          ON c.source = 'slack'
         AND sc.org_id = c.org_id
         AND sc.channel_id = CASE
           WHEN instr(c.external_message_id, ':') > 0
           THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
           ELSE c.external_message_id
-        END
+        END`;
+
+  const [result, countResult] = await Promise.all([
+    env.D1.prepare(
+      `SELECT c.*, sc.is_private AS slack_is_private
+       FROM conversations c
+       ${join}
+       ${slackJoin}
        WHERE ${whereClause}
        ORDER BY c.sent_at DESC LIMIT ? OFFSET ?`
     ).bind(...binds, limit, offset).all(),
     env.D1.prepare(
-      `SELECT COUNT(*) as total FROM conversations c ${join} WHERE ${whereClause}`
+      `SELECT COUNT(*) as total FROM conversations c ${join} ${slackJoin} WHERE ${whereClause}`
     ).bind(...binds).first<{ total: number }>(),
-    getSharingFlags(ctx.orgId, env),
   ]);
 
   const conversations = result.results.map((c: any) => {
@@ -88,10 +93,10 @@ export async function listConversations(
 
   return jsonResponse({
     conversations,
-    total: conversations.length,
+    total: countResult?.total || 0,
     limit,
     offset,
-    has_more: conversations.length === limit && offset + limit < (countResult?.total || 0),
+    has_more: offset + limit < (countResult?.total || 0),
   });
 }
 

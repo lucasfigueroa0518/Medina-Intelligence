@@ -6,6 +6,7 @@ import { autoLinkAttendees, autoLinkConversationParticipants } from './associati
 import { processEmailSignature, processDisplayNameUpdate } from './email-signature-parser';
 import { updateEntityInIndex } from './entity-index';
 import { safelyUpsertConversationTimelineItemsForContacts } from './contact-detail-read-model';
+import { syncConversationParticipants } from './conversation-participants';
 
 /**
  * Stages classified items as approval queue entries (or writes them directly
@@ -102,6 +103,7 @@ export async function stageAndCommitApprovals(
         item.metadata.source_id = resolved.id;
         item.entityId = resolved.id;
       }
+      await syncConversationParticipants(env, orgId, item.entityId, item.participantUserIds || []);
 
       // Junction rows for conversation_contacts. Only bump total_interactions
       // for links that were newly inserted — replays/dedup must not double-count.

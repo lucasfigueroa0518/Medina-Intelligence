@@ -1,16 +1,5 @@
 import type { Env } from '../types/env';
 import { sendViaOutlook } from '../integrations/outlook-send';
-import { refreshOutlookToken } from '../integrations/oauth';
-
-async function getSystemSenderUserId(orgId: string, env: Env): Promise<string | null> {
-  const row = await env.D1.prepare(
-    `SELECT id FROM users
-     WHERE org_id = ? AND outlook_token IS NOT NULL AND is_active = 1 AND deleted_at IS NULL
-     ORDER BY role = 'owner' DESC, created_at ASC
-     LIMIT 1`
-  ).bind(orgId).first<{ id: string }>();
-  return row?.id ?? null;
-}
 
 function buildVerificationHtml(fullName: string, verifyUrl: string): string {
   return `
@@ -49,26 +38,14 @@ export async function sendVerificationEmail(
   env: Env
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const senderUserId = await getSystemSenderUserId(orgId, env);
-    if (!senderUserId) {
-      console.error(`[verification-email] No user with Outlook token in org ${orgId}`);
-      return { ok: false, error: 'No user with Outlook token available to send verification email' };
-    }
-    console.log(`[verification-email] Using sender ${senderUserId} for ${email}`);
-
-    const refreshResult = await refreshOutlookToken(senderUserId, orgId, env);
-    if (!refreshResult.success) {
-      console.error(`[verification-email] Token refresh failed for sender ${senderUserId}`);
-      return { ok: false, error: 'Failed to refresh sender Outlook token' };
-    }
-
     const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
     const verifyUrl = `${frontendUrl}/auth/verify?token=${encodeURIComponent(verificationToken)}`;
     const html = buildVerificationHtml(fullName, verifyUrl);
 
     const result = await sendViaOutlook(
       {
-        senderUserId,
+        senderUserId: 'system',
+        orgId,
         subject: 'Verify your Medina Intelligence account',
         body: html,
         toEmail: email,

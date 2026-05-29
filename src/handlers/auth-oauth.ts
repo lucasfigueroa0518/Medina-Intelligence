@@ -26,6 +26,7 @@ import { ensureSubscriptionsForUser } from '../lib/graph-subscriptions';
 import { createProgressiveBackfill } from '../lib/progressive-backfill';
 import { DEFAULT_ONBOARDING_BACKFILL_DAYS } from './backfill';
 import { reportIngestionSuccess, scanAndRepairIngestion } from '../lib/ingestion-health';
+import { requireDelegatedOutlookFallback } from '../lib/graph-auth';
 
 interface OAuthStateRecord {
   user_id: string;
@@ -166,6 +167,9 @@ export async function outlookOAuthStart(
   request: Request,
   env: Env
 ): Promise<Response> {
+  const fallbackDisabled = requireDelegatedOutlookFallback(env);
+  if (fallbackDisabled) return fallbackDisabled;
+
   const cfgError = requireAzureConfig(env);
   if (cfgError) {
     console.error('[auth-oauth] AZURE_CONFIG_ERROR:', cfgError);
@@ -206,7 +210,7 @@ export async function outlookOAuthStart(
   const authorize = new URL(tenantAuthorizeUrl(env));
   authorize.searchParams.set('client_id', env.AZURE_CLIENT_ID);
   authorize.searchParams.set('response_type', 'code');
-  authorize.searchParams.set('redirect_uri', env.AZURE_REDIRECT_URI);
+  authorize.searchParams.set('redirect_uri', env.AZURE_REDIRECT_URI || '');
   authorize.searchParams.set('response_mode', 'query');
   authorize.searchParams.set('scope', SCOPES);
   authorize.searchParams.set('state', state);
@@ -226,6 +230,9 @@ export async function outlookOAuthCallback(
   request: Request,
   env: Env
 ): Promise<Response> {
+  const fallbackDisabled = requireDelegatedOutlookFallback(env);
+  if (fallbackDisabled) return fallbackDisabled;
+
   const cfgError = requireAzureConfig(env);
   if (cfgError) {
     console.error('[auth-oauth] AZURE_CONFIG_ERROR:', cfgError);
@@ -281,9 +288,9 @@ export async function outlookOAuthCallback(
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       client_id: env.AZURE_CLIENT_ID,
-      client_secret: env.AZURE_CLIENT_SECRET,
+      client_secret: env.AZURE_CLIENT_SECRET || '',
       code,
-      redirect_uri: env.AZURE_REDIRECT_URI,
+      redirect_uri: env.AZURE_REDIRECT_URI || '',
       grant_type: 'authorization_code',
       scope: SCOPES,
     }),

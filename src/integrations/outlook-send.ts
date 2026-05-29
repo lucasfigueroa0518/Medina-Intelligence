@@ -1,9 +1,10 @@
 // TRD §12.2 — Microsoft Graph Mail.Send helper
 import type { Env } from '../types/env';
-import { getDecryptedAccessToken } from '../lib/helpers';
+import { getGraphMailboxAuthForUser, getSystemSenderMailboxAuth, graphMailboxUrl } from '../lib/graph-auth';
 
 export interface SendMailParams {
   senderUserId: string;
+  orgId: string;
   subject: string;
   body: string;
   toEmail: string;
@@ -20,17 +21,19 @@ export async function sendViaOutlook(
   params: SendMailParams,
   env: Env
 ): Promise<SendMailResult> {
-  let token: string;
+  let auth: { token: string; mailbox: string };
   try {
-    token = await getDecryptedAccessToken(params.senderUserId, env);
+    auth = params.senderUserId === 'system'
+      ? await getSystemSenderMailboxAuth(params.orgId, env)
+      : await getGraphMailboxAuthForUser(params.senderUserId, params.orgId, env);
   } catch {
     return { ok: false, status: 401, errorMessage: 'AUTH_TOKEN_INVALID' };
   }
 
-  const resp = await fetch('https://graph.microsoft.com/v1.0/me/sendMail', {
+  const resp = await fetch(graphMailboxUrl(auth.mailbox, '/sendMail'), {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${auth.token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({

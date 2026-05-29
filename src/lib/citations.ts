@@ -3,9 +3,10 @@
 // frontend can render as pills. The same shape is persisted alongside the
 // assistant message so reloads keep their citations.
 import type { Env } from '../types/env';
-import type { HydratedChunk } from '../types/interfaces';
+import type { AuthContext, HydratedChunk } from '../types/interfaces';
 import { estimateTokens, truncateToTokens } from './tokens';
 import { MAX_MODE_LIMITS } from './max-mode';
+import { loadConversationVisibilityMap } from './email-derived-visibility';
 
 export type CitationSourceType =
   | 'email'
@@ -161,7 +162,8 @@ function timelineNoteForSource(sourceId: number, source?: CitationSource, nowMs:
 async function hydrateSources(
   refs: { id: number; chunk: HydratedChunk }[],
   orgId: string,
-  env: Env
+  env: Env,
+  viewer?: AuthContext
 ): Promise<CitationSource[]> {
   // Bucket by table for batched lookups.
   const byTable = new Map<string, { id: number; chunk: HydratedChunk; sourceId: string }[]>();
@@ -179,6 +181,15 @@ async function hydrateSources(
   for (const r of refs) out.set(r.id, placeholderSource(r.id, r.chunk));
 
   const lookups: Promise<void>[] = [];
+  const conversationVisibility = viewer
+    ? await loadConversationVisibilityMap(
+      env,
+      viewer,
+      refs
+        .filter(r => String(r.chunk.metadata.source_table || '') === 'conversations')
+        .map(r => String(r.chunk.metadata.source_id || r.chunk.id))
+    )
+    : null;
 
   // Conversations (emails + slack messages share this table).
   const convRows = byTable.get('conversations');
@@ -219,6 +230,10 @@ async function hydrateSources(
           for (const ref of convRows) {
             const row = byId.get(ref.sourceId);
             if (!row) continue;
+            if (conversationVisibility && conversationVisibility.get(ref.sourceId)?.can_read !== true) {
+              out.delete(ref.id);
+              continue;
+            }
             const isTranscript = String(ref.chunk.metadata.document_type || '') === 'transcript';
             const isSlack = !isTranscript && row.source === 'slack';
             const senderName =
@@ -490,6 +505,44 @@ async function hydrateSources(
   return Array.from(out.values()).sort((a, b) => a.id - b.id);
 }
 
+async function filterChunksForViewer(
+  chunks: HydratedChunk[],
+  env: Env,
+  viewer?: AuthContext
+): Promise<HydratedChunk[]> {
+  if (!viewer || chunks.length === 0) return chunks;
+  const conversationChunks = chunks.filter(chunk => String(chunk.metadata.source_table || '') === 'conversations');
+  if (conversationChunks.length === 0) return chunks;
+  const visibility = await loadConversationVisibilityMap(
+    env,
+    viewer,
+    conversationChunks.map(chunk => String(chunk.metadata.source_id || chunk.id))
+  );
+  return chunks.filter(chunk => {
+    if (String(chunk.metadata.source_table || '') !== 'conversations') return true;
+    const sourceId = String(chunk.metadata.source_id || chunk.id);
+    return visibility.get(sourceId)?.can_read === true;
+  });
+}
+
+export async function filterCitationSourcesForViewer(
+  sources: CitationSource[],
+  orgId: string,
+  env: Env,
+  viewer: AuthContext
+): Promise<CitationSource[]> {
+  void orgId;
+  const conversationIds = sources
+    .filter(source => source.source_table === 'conversations')
+    .map(source => source.source_id);
+  if (conversationIds.length === 0) return sources;
+  const visibility = await loadConversationVisibilityMap(env, viewer, conversationIds);
+  return sources.filter(source =>
+    source.source_table !== 'conversations' ||
+    visibility.get(source.source_id)?.can_read === true
+  );
+}
+
 export function formatSourceLine(s: CitationSource, nowMs: number = Date.now()): string {
   const date = sourceDateSuffix(s.date, nowMs);
   switch (s.type) {
@@ -565,8 +618,10 @@ export async function buildSourcesAndContext(
   orgId: string,
   env: Env,
   query?: string,
-  options: { deepDive?: boolean } = {}
+  options: { deepDive?: boolean; viewer?: AuthContext } = {}
 ): Promise<BuildSourcesResult> {
+  const visibleInternal = await filterChunksForViewer(internal, env, options.viewer);
+  const visibleNews = await filterChunksForViewer(news, env, options.viewer);
   // Assign one source number per unique (source_table, source_id) — multiple
   // chunks from the same email/meeting collapse to a single citation.
   const sourceIdByKey = new Map<string, number>();
@@ -574,7 +629,7 @@ export async function buildSourcesAndContext(
   const orderedChunks: ChunkRef[] = [];
 
   let nextId = 1;
-  for (const chunk of [...internal, ...news]) {
+  for (const chunk of [...visibleInternal, ...visibleNews]) {
     const key = sourceKeyFor(chunk);
     if (!sourceIdByKey.has(key)) {
       sourceIdByKey.set(key, nextId);
@@ -584,12 +639,12 @@ export async function buildSourcesAndContext(
     orderedChunks.push({ chunk, sourceKey: key });
   }
 
-  const sources = await hydrateSources(refs, orgId, env);
+  const sources = await hydrateSources(refs, orgId, env, options.viewer);
   sourceLog('assemble', {
     query: query?.slice(0, 80) || null,
-    internal_chunk_count: internal.length,
-    news_chunk_count: news.length,
-    input_chunk_doc_type_counts: countChunksByDocType([...internal, ...news]),
+    internal_chunk_count: visibleInternal.length,
+    news_chunk_count: visibleNews.length,
+    input_chunk_doc_type_counts: countChunksByDocType([...visibleInternal, ...visibleNews]),
     unique_sources_count: sources.length,
     ordered_chunks_count: orderedChunks.length,
     source_type_counts: countSourcesByType(sources),

@@ -21,7 +21,7 @@
 //     work for never-synced AND stale-completed windows.
 //
 // Subrequest budget per handler invocation (steady state):
-//   • 1 token refresh (refreshOutlookToken hits Graph)
+//   • 1 app-only token lookup/cache hit
 //   • N pages (1 per ~50 events; usually 1, occasionally 2)
 //   • N events (1 D1 INSERT/UPSERT each via upsertOutlookEvent)
 // Heavy exec week: ~103 subreqs/window. With batchSize=5, worst-case
@@ -35,14 +35,13 @@
 //     backfill_windows → work_queue's three-tier backoff [5min, 30min]
 //     then dead_letter. Failed cycles surface as work_queue:
 //     calendar_refresh in System Status DLQ.
-//   • Token-failure threshold (3 consecutive failures → user skipped)
-//     is preserved via recordTokenFailure on 401 inside fetchEventsForWindow.
+//   • Auth failures route through work_queue retry/dead-letter. Per-user
+//     delegated refresh is only available when the emergency fallback is enabled.
 
 import type { Env } from '../../types/env';
 import type { WorkQueueHandler } from '../work-queue-driver';
 import { deadLetterWork } from '../work-queue';
-import { refreshOutlookToken } from '../../integrations/oauth';
-import { getDecryptedAccessToken } from '../helpers';
+import { getGraphMailboxAuthForUser } from '../graph-auth';
 import { upsertOutlookEvent } from '../reconciliation';
 import {
   fetchEventsForWindow,
@@ -81,27 +80,16 @@ export const calendarRefreshHandler: WorkQueueHandler = {
       throw new Error(`payload missing required fields: ${item.payload}`);
     }
 
-    // Refresh OAuth token before the fetch loop. refreshOutlookToken
-    // returns {success: false} when the token-failure-count threshold
-    // is exceeded for this user (3 consecutive 401s); throwing here
-    // routes through driver's failWork → 3-tier backoff. After 3
-    // total attempts the work_queue row dead-letters and surfaces in
-    // System Status DLQ.
-    const refreshResult = await refreshOutlookToken(user_id, item.org_id, env);
-    if (!refreshResult.success) {
-      const reason = refreshResult.reason || refreshResult.errorCode || 'unknown';
-      const message = `token_refresh_failed:${reason}`;
-      if (/reauth_required|missing_token|invalid_grant|revoked|permission|forbidden/i.test(reason)) {
-        await deadLetterWork(env, item.id, message);
+    let auth: { token: string; mailbox: string };
+    try {
+      auth = await getGraphMailboxAuthForUser(user_id, item.org_id, env);
+    } catch (e) {
+      const message = `graph_auth_failed:${e instanceof Error ? e.message : String(e)}`;
+      if (/missing app-only|not set|No Outlook mailbox/i.test(message)) {
+        await deadLetterWork(env, item.id, message.slice(0, 500));
         return;
       }
       throw new Error(message);
-    }
-    let token: string;
-    try {
-      token = await getDecryptedAccessToken(user_id, env);
-    } catch {
-      throw new Error('token_decrypt_failed');
     }
 
     // Fetch events for this single window. fetchEventsForWindow does
@@ -111,7 +99,7 @@ export const calendarRefreshHandler: WorkQueueHandler = {
     // the driver's failWork apply backoff. recordRateLimit / 429
     // tracking happens inside checkGraphRateLimit's downstream callers.
     const events = await fetchEventsForWindow(
-      token, user_id, window_start, window_end, item.org_id, env
+      auth.token, auth.mailbox, user_id, window_start, window_end, item.org_id, env
     );
 
     // Per-event upsert. ON CONFLICT(outlook_event_id) makes this safe

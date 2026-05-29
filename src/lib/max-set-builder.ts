@@ -6,6 +6,7 @@ import { createDocumentArtifactTool, type MartyDocumentCard } from './document-a
 import { extractTextFromFile } from './file-extraction';
 import { MAX_MODE_LIMITS } from './max-mode';
 import { searchRagChunksD1Fts } from './rag-v2-lexical';
+import { getConfiguredInternalDomains } from './internal-domains';
 
 export type MaxSetTaskType =
   | 'invite_roster'
@@ -231,12 +232,7 @@ const CONFIDENCE_RANK: Record<MaxSetConfidence, number> = {
 };
 
 const MAX_TEXT_TERMS = 14;
-const INTERNAL_DOMAINS = new Set([
-  'medinavc.com',
-  'medinaventures.ai',
-  'medinaventures.com',
-  'medinacapital.com',
-]);
+const INTERNAL_DOMAINS = getConfiguredInternalDomains();
 const DOCUMENT_TEXT_EXTRACT_LIMIT = 25;
 const INVITE_ROSTER_DOCUMENT_TEXT_EXTRACT_LIMIT = 3;
 const D1_IN_BATCH_SIZE = 50;
@@ -1539,6 +1535,7 @@ async function scanCommunications(
   const inviterEmails = profile.plan?.target_scope.named_people
     .filter(person => person.role === 'inviter' && person.email)
     .map(person => person.email!.toLowerCase()) || [];
+  const configuredInternalDomains = getConfiguredInternalDomains(env);
   const communicationTerms = profile.taskType === 'invite_roster'
     ? unique([...(profile.plan?.target_scope.title_terms || []), ...profile.includeTerms]).slice(0, 8)
     : [
@@ -1562,7 +1559,8 @@ async function scanCommunications(
       where.push(`LOWER(c.from_email) IN (${inviterEmails.map(() => '?').join(',')})`);
       binds.push(...inviterEmails);
     } else {
-      where.push("(c.direction = 'outbound' OR LOWER(c.from_email) LIKE '%@medinavc.com')");
+      where.push(`(c.direction = 'outbound' OR ${Array.from(configuredInternalDomains).map(() => 'LOWER(c.from_email) LIKE ?').join(' OR ')})`);
+      binds.push(...Array.from(configuredInternalDomains).map(domain => `%@${domain}`));
     }
   }
   addDateRange(where, binds, 'c.sent_at', profile);
@@ -1650,6 +1648,9 @@ async function scanCommunications(
     orgId: ctx.orgId,
     topK: 200,
     sourceTable: 'conversations',
+    userId: ctx.userId,
+    userRole: ctx.userRole,
+    sharedUserIds: Object.keys(sharingFlags).filter(id => sharingFlags[id]),
   }).catch(error => {
     stat.errors.push(`rag_chunks_v2_fts: ${String(error?.message || error).slice(0, 220)}`);
     return [];
@@ -2792,8 +2793,9 @@ export function detectMaxSetIntent(
     namedPeople.push(opts.currentUserEmail);
   }
   if (/\braul\b/.test(lower)) {
-    if (taskType !== 'invite_roster') aliases.push('Raul', 'Henriquez', 'Raul Henriquez', 'raul@medinavc.com');
-    namedPeople.push('Raul Henriquez', 'raul@medinavc.com');
+    const raulEmails = Array.from(INTERNAL_DOMAINS).map(domain => `raul@${domain}`);
+    if (taskType !== 'invite_roster') aliases.push('Raul', 'Henriquez', 'Raul Henriquez', ...raulEmails);
+    namedPeople.push('Raul Henriquez', ...raulEmails);
   }
   return {
     shouldBuild,

@@ -8,6 +8,7 @@ import type {
 import { discoverNewContact, PERSONAL_DOMAINS, findOrCreateCompanyByDomain, type DiscoveryEligibility } from './discovery';
 import { runEmbedding } from './embedding';
 import { safelyUpsertConversationTimelineItemsForContacts } from './contact-detail-read-model';
+import { syncConversationParticipants } from './conversation-participants';
 
 export async function classifyAndDeduplicate(
   items: ClassifiableItem[],
@@ -75,6 +76,7 @@ export async function classifyAndDeduplicate(
           await env.D1.prepare(
             'UPDATE conversations SET participant_user_ids = ? WHERE id = ?'
           ).bind(JSON.stringify(existingParticipants), existingConversationId).run();
+          await syncConversationParticipants(env, orgId, existingConversationId, existingParticipants);
 
           // Re-upsert Vectorize chunks with new participant string (P-1 fix)
           const updatedParticipantStr = existingParticipants.join(',');

@@ -23,6 +23,9 @@ export interface Env {
   WEBHOOK_DLQ: Queue<WebhookQueueMessage>;
   RAG_REINDEX_QUEUE?: Queue<RagReindexQueueMessage>;
 
+  // --- Service bindings ---
+  PIPELINES?: PipelinesService;
+
   // --- Workflows ---
   INGESTION_WORKFLOW: Workflow;
   INGESTION_CHUNK_WORKFLOW: Workflow;
@@ -59,9 +62,15 @@ export interface Env {
 
   // --- Secrets (via `wrangler secret put`) ---
   AZURE_CLIENT_ID: string;
-  AZURE_CLIENT_SECRET: string;
+  AZURE_CLIENT_SECRET?: string;
   AZURE_TENANT_ID: string;
-  AZURE_REDIRECT_URI: string;
+  AZURE_REDIRECT_URI?: string;
+  AZURE_CLIENT_CERT_PRIVATE_KEY?: string;
+  AZURE_CLIENT_CERT_THUMBPRINT?: string;
+  OUTLOOK_AUTH_MODE?: 'app_only' | 'delegated_fallback';
+  OUTLOOK_DELEGATED_FALLBACK_ENABLED?: string;
+  OUTLOOK_SYSTEM_SENDER_EMAIL?: string;
+  OUTLOOK_WEBHOOK_BASE_URL?: string;
 
   ANTHROPIC_API_KEY: string;
   GOOGLE_GEMINI_API_KEY: string;
@@ -86,7 +95,9 @@ export interface Env {
   JWT_SECRET: string;
 
   // --- Signup ---
-  // Comma-separated list of email domains permitted for self-signup, e.g. "medinavc.com".
+  // Comma-separated list of first-class internal email domains, e.g. "medinavc.com,medinacapital.com".
+  INTERNAL_DOMAINS?: string;
+  // Legacy override for self-signup. When unset, INTERNAL_DOMAINS is used.
   ALLOWED_SIGNUP_DOMAINS?: string;
   // Org assigned to self-signups.
   DEFAULT_SIGNUP_ORG_ID?: string;
@@ -108,4 +119,16 @@ export interface Workflow {
 export interface WorkflowInstance {
   id: string;
   status(): Promise<{ status: string }>;
+}
+
+export type PipelineWorkflowName = 'ingestion' | 'enrichment' | 'campaign';
+
+export interface PipelineWorkflowDispatch {
+  workflow: PipelineWorkflowName;
+  id?: string;
+  params?: unknown;
+}
+
+export interface PipelinesService {
+  triggerWorkflow(input: PipelineWorkflowDispatch): Promise<{ id: string }>;
 }
