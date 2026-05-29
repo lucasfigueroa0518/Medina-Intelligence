@@ -15,12 +15,11 @@ import { rebuildEntityIndex } from '../lib/entity-index';
 // universal work-queue tick which iterates every registered domain
 // (currently only embed_retry; future pilots transparently included).
 import { processWorkQueueTick } from '../lib/work-queue-driver';
-import { enqueueWork } from '../lib/work-queue';
 import { reconcileDeckArtifactJobs } from '../lib/document-artifacts';
 import { parseParticipantUserIds } from '../lib/helpers';
 import {
+  enqueueRagV2SourceReindex,
   getRagV2Status,
-  RAG_V2_WORK_QUEUE_DOMAIN,
   type RagV2ReindexPayload,
 } from '../lib/rag-v2';
 import { getEmbeddingProfile, RAG_V2_EMBEDDING_PROFILES } from '../lib/embedding';
@@ -173,14 +172,12 @@ export async function startRagV2Backfill(
     let enqueued = 0;
     if (!dryRun) {
       for (const sourceId of ids) {
-        const payload: RagV2ReindexPayload = { source_table: sourceTable, source_id: sourceId, profiles };
-        const result = await enqueueWork(env, ctx.orgId, RAG_V2_WORK_QUEUE_DOMAIN, payload, {
-          upstream: 'bge',
-          idempotency_key: `${ctx.orgId}:${sourceTable}:${sourceId}:${profiles.join('+')}:v3`,
-          max_attempts: 5,
+        const result = await enqueueRagV2SourceReindex(env, ctx.orgId, sourceTable, sourceId, {
+          profiles,
+          maxAttempts: 5,
           priority: sourceTable === 'documents' || sourceTable === 'conversations' ? 10 : 0,
         });
-        if (result.inserted) enqueued++;
+        if (result.status === 'enqueued') enqueued++;
       }
     }
     perTable.push({ source_table: sourceTable, candidate_count: ids.length, enqueued });

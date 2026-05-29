@@ -74,6 +74,18 @@ preview_id = "59205fe013c84c548579bc2b503750f6"
 binding = "VECTORIZE"
 index_name = "medina-ventures-main"
 
+[[vectorize]]
+binding = "VECTORIZE_RAG_V2_BGE"
+index_name = "medina-rag-v2-bge-768"
+
+[[vectorize]]
+binding = "VECTORIZE_RAG_V2_QWEN3"
+index_name = "medina-rag-v2-qwen3-1024"
+
+[[vectorize]]
+binding = "VECTORIZE_RAG_V2_MINILM"
+index_name = "medina-rag-v2-minilm-384"
+
 # --- Workflows ---
 #
 # All 6 workflow class declarations move to pipelines. After this

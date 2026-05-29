@@ -15,9 +15,10 @@ import {
 import { linkConversationToDeal, linkEventToDeal } from './deal-association';
 import { loadFirmRelationshipSnapshot, upsertFirmCompanyRelationship } from './firm-relationship-state';
 import { preprocessQuery, retrieveContext } from './retrieval';
-import { buildSourcesAndContext } from './citations';
+import { buildSourcesAndContext, type CitationSource } from './citations';
 import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
 import { canViewerReadConversation, conversationAclSql } from './email-derived-visibility';
+import { getRagV2SourceFreshness, type RagV2FreshnessRow } from './rag-v2';
 import {
   buildContactSearchQuery,
   contactSearchCteBinds,
@@ -29,6 +30,8 @@ import { safelyMaintainContactReadModels } from './contact-maintenance';
 export interface AgentToolContext {
   deepDive?: boolean;
 }
+
+const SLACK_RAG_V2_FRESHNESS_FALLBACK_MS = 15 * 60 * 1000;
 
 function structuredLimit(inputLimit: number | undefined, toolContext?: AgentToolContext): number {
   const fallback = toolContext?.deepDive
@@ -1380,6 +1383,101 @@ function countRecallSourceTypes(sources: Array<{ type?: string }>): Record<strin
   return counts;
 }
 
+function queryMentionsSlack(query: string): boolean {
+  return /\b(slack|channel|channels|dm|dms)\b/i.test(query);
+}
+
+function queryAsksForRecent(query: string): boolean {
+  return /\b(recent|latest|newest|most recent|today|yesterday|this week|last\s+\d+\s+days|what'?s been happening)\b/i.test(query);
+}
+
+function shouldCheckSlackFreshness(input: { query: string; source_types?: string[] }): boolean {
+  return Boolean(input.source_types?.includes('slack') || queryMentionsSlack(input.query));
+}
+
+function shouldUseSlackFreshnessFallback(freshness: RagV2FreshnessRow | null): boolean {
+  if (!freshness || freshness.total_sources <= 0) return false;
+  if (!freshness.latest_indexed_source_at) return true;
+  if (freshness.missing_sources > 0 || freshness.incomplete_sources > 0) return true;
+  return typeof freshness.freshness_lag_ms === 'number' &&
+    freshness.freshness_lag_ms > SLACK_RAG_V2_FRESHNESS_FALLBACK_MS;
+}
+
+async function fetchRecentSlackFallbackSources(
+  ctx: AuthContext,
+  env: Env,
+  existingSourceIds: Set<string>,
+  limit: number,
+  startingId: number
+): Promise<CitationSource[]> {
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+  const acl = conversationAclSql('c', ctx, sharingFlags, 'sc.is_private');
+  const rows = await env.D1.prepare(
+    `SELECT c.id, c.subject, c.from_email, c.from_contact_id, c.sent_at,
+            c.body_preview, c.body_r2_key, c.participant_user_ids, c.is_campaign_email,
+            sc.is_private AS slack_is_private, fc.full_name AS from_name
+       FROM conversations c
+       LEFT JOIN contacts fc ON c.from_contact_id = fc.id
+       LEFT JOIN slack_channels sc
+         ON c.source = 'slack'
+        AND sc.org_id = c.org_id
+        AND sc.channel_id = CASE
+          WHEN instr(c.external_message_id, ':') > 0
+          THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+          ELSE c.external_message_id
+        END
+      WHERE c.org_id = ?
+        AND c.source = 'slack'
+        AND ${acl.sql}
+      ORDER BY c.sent_at DESC
+      LIMIT ?`
+  ).bind(ctx.orgId, ...acl.binds, Math.max(1, Math.min(limit * 2, 20))).all<any>();
+
+  const sources: CitationSource[] = [];
+  let nextId = startingId;
+  for (const row of rows.results || []) {
+    if (existingSourceIds.has(row.id)) continue;
+    if (!canReadConversationContent(
+      {
+        source: 'slack',
+        participant_user_ids: row.participant_user_ids,
+        is_campaign_email: row.is_campaign_email,
+        slack_is_private: row.slack_is_private,
+      },
+      ctx.userId,
+      ctx.userRole,
+      sharingFlags
+    )) continue;
+
+    let excerpt = String(row.body_preview || '').replace(/\s+/g, ' ').trim();
+    if (row.body_r2_key) {
+      try {
+        const obj = await env.R2.get(row.body_r2_key);
+        if (obj) excerpt = (await obj.text()).replace(/\s+/g, ' ').trim();
+      } catch {
+        // Keep body_preview.
+      }
+    }
+    if (excerpt.length > 400) excerpt = `${excerpt.slice(0, 400).trim()}...`;
+    const sender = row.from_name || row.from_email || 'Unknown sender';
+    sources.push({
+      id: nextId++,
+      type: 'slack',
+      source_table: 'conversations',
+      source_id: row.id,
+      entity_id: row.from_contact_id || undefined,
+      title: row.subject || excerpt.slice(0, 60) || 'Slack message',
+      subtitle: `Slack — ${sender}`,
+      date: row.sent_at || undefined,
+      url_path: `/conversations/${row.id}`,
+      excerpt: excerpt || undefined,
+    });
+    existingSourceIds.add(row.id);
+    if (sources.length >= limit) break;
+  }
+  return sources;
+}
+
 export async function recall(
   ctx: AuthContext,
   input: {
@@ -1471,6 +1569,48 @@ export async function recall(
     ? MAX_MODE_LIMITS.recallMax
     : NORMAL_MODE_LIMITS.recallMax;
   const limit = Math.min(Math.max(input.limit ?? defaultLimit, 1), maxLimit);
+  let freshnessFallback: Record<string, unknown> | null = null;
+  if (shouldCheckSlackFreshness(input)) {
+    try {
+      const slackFreshness = await getRagV2SourceFreshness(env, ctx.orgId, 'slack', { sourceTable: 'conversations' });
+      if (shouldUseSlackFreshnessFallback(slackFreshness)) {
+        const existingSourceIds = new Set(
+          filtered
+            .filter(s => s.type === 'slack')
+            .map(s => s.source_id)
+        );
+        const nextSourceId = Math.max(0, ...sources.map(s => s.id)) + 1;
+        const fallbackSources = await fetchRecentSlackFallbackSources(
+          ctx,
+          env,
+          existingSourceIds,
+          Math.max(limit, 3),
+          nextSourceId
+        );
+        if (fallbackSources.length > 0) {
+          filtered = queryAsksForRecent(input.query)
+            ? [...fallbackSources, ...filtered]
+            : [...filtered, ...fallbackSources];
+          freshnessFallback = {
+            source_family: 'slack',
+            reason: 'rag_v2_slack_freshness_lag',
+            added_sources: fallbackSources.length,
+            latest_source_at: slackFreshness?.latest_source_at || null,
+            latest_indexed_source_at: slackFreshness?.latest_indexed_source_at || null,
+            freshness_lag_ms: slackFreshness?.freshness_lag_ms ?? null,
+            missing_sources: slackFreshness?.missing_sources ?? null,
+            incomplete_sources: slackFreshness?.incomplete_sources ?? null,
+          };
+        }
+      }
+    } catch (e) {
+      freshnessFallback = {
+        source_family: 'slack',
+        reason: 'rag_v2_slack_freshness_check_failed',
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
   const trimmed = filtered.slice(0, limit);
   const sourceTypeCountsAfterFilter = countRecallSourceTypes(filtered);
   const sourceTypeCountsBeforeFilter = countRecallSourceTypes(sources);
@@ -1489,6 +1629,7 @@ export async function recall(
     trimmed_count: trimmed.length,
     limit,
     max_mode: !!toolContext.deepDive,
+    freshness_fallback: freshnessFallback,
   });
 
   return {
@@ -1504,6 +1645,7 @@ export async function recall(
       source_type_counts_after_filter: sourceTypeCountsAfterFilter,
       internal_doc_type_counts: internalDocTypeCounts,
       news_count: result.news.length,
+      freshness_fallback: freshnessFallback,
     },
     current_date: new Date().toISOString(),
     timeline_note: 'Dates are source dates. Relative phrases in excerpts such as "next week", "currently", "today", or "now" are relative to each source date, not the current date.',
@@ -2613,4 +2755,7 @@ export const __agentToolsTestHooks = {
   cleanEventText,
   conversationLookbackDays,
   conversationSearchCteSql,
+  shouldCheckSlackFreshness,
+  shouldUseSlackFreshnessFallback,
+  queryAsksForRecent,
 };

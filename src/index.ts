@@ -1023,6 +1023,23 @@ export async function handleScheduled(
           try { await enqueueBackfillDocuments(org.id, env); }
           catch (e) { console.error(`hourly self-heal: enqueueBackfillDocuments failed for ${org.id}:`, e); }
         })());
+        // Hourly RAG v2 source coverage self-heal. This is the primary
+        // retrieval index Marty uses for v2 orgs; legacy vector coverage can
+        // be healthy while rag_source_index_state is stale. The scanner is
+        // bounded per source family and idempotent by source hash.
+        ctxExec.waitUntil((async () => {
+          const { scanAndRepairRagV2Coverage } = await import('./lib/rag-v2');
+          try {
+            const result = await scanAndRepairRagV2Coverage(env, org.id, { limitPerSpec: 75 });
+            if (result.enqueued > 0 || result.errors.length > 0) {
+              console.warn(
+                `[rag-v2-self-heal] org=${org.id} candidates=${result.candidates} enqueued=${result.enqueued} already=${result.already_queued} skipped=${result.skipped} errors=${result.errors.length}`
+              );
+            }
+          } catch (e) {
+            console.error(`hourly self-heal: scanAndRepairRagV2Coverage failed for ${org.id}:`, e);
+          }
+        })());
         // deal_intelligence batch refresh — recompute the oldest 50
         // stale-or-invalidated rows for this org. Bounded subrequest
         // budget by HOURLY_BATCH_LIMIT (1 Claude call + ~3 D1 calls per

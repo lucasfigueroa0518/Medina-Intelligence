@@ -77,6 +77,7 @@ export interface UserFacingIngestionWarning {
 
 const REPAIR_PADDING_DAYS = 14;
 const AUTO_REPAIR_COOLDOWN_MS = 15 * 60 * 1000;
+const RAG_V2_FRESHNESS_SLO_MS = 15 * 60 * 1000;
 
 function scopeId(input: string | null | undefined): string {
   return input || '';
@@ -90,6 +91,12 @@ function truncate(input: string, max = 800): string {
   return input.length > max ? input.slice(0, max) : input;
 }
 
+function errToString(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  try { return JSON.stringify(e); } catch { return String(e); }
+}
+
 function sourceTitle(source: string): string {
   switch (source) {
     case 'outlook_email': return 'Outlook email ingestion';
@@ -97,6 +104,7 @@ function sourceTitle(source: string): string {
     case 'slack': return 'Slack ingestion';
     case 'firefly': return 'Meeting transcript ingestion';
     case 'embedding': return 'Embedding repair';
+    case 'rag_v2': return 'MARTy RAG v2 indexing';
     default: return source.replace(/[_-]+/g, ' ');
   }
 }
@@ -154,6 +162,7 @@ function workQueueSource(domain: string): IngestionSource {
   if (domain === 'calendar_refresh') return 'calendar';
   if (domain === 'firefly_window') return 'firefly';
   if (domain === 'embed_retry') return 'embedding';
+  if (domain === 'rag_reindex_v2') return 'rag_v2';
   if (domain === 'slack_channel_backfill') return 'slack';
   return 'work_queue';
 }
@@ -440,6 +449,19 @@ async function repairFireflyIncident(env: Env, incident: IngestionIncident, star
   return result.created || /already has active firefly parent/i.test(result.reason || '');
 }
 
+async function repairRagV2Incident(env: Env, incident: IngestionIncident): Promise<boolean> {
+  const { scanAndRepairRagV2Coverage } = await import('./rag-v2');
+  const sourceFamilies = incident.scope_type === 'source_family' && incident.scope_id
+    ? [incident.scope_id]
+    : undefined;
+  const result = await scanAndRepairRagV2Coverage(env, incident.org_id, {
+    sourceFamilies,
+    limitPerSpec: 100,
+    priority: 30,
+  });
+  return result.enqueued > 0 || result.already_queued > 0 || result.candidates > 0;
+}
+
 export async function enqueueAutomaticRepairForIncident(
   env: Env,
   incident: IngestionIncident
@@ -460,6 +482,7 @@ export async function enqueueAutomaticRepairForIncident(
   else if (incident.source === 'calendar') repaired = await repairCalendarIncident(env, incident, start, end);
   else if (incident.source === 'slack') repaired = await repairSlackIncident(env, incident, start);
   else if (incident.source === 'firefly') repaired = await repairFireflyIncident(env, incident, start, end);
+  else if (incident.source === 'rag_v2') repaired = await repairRagV2Incident(env, incident);
   else if (incident.source === 'embedding') repaired = true;
 
   if (repaired) {
@@ -546,7 +569,7 @@ export async function scanAndRepairIngestion(
        FROM work_queue
       WHERE org_id = ?
         AND status = 'dead_letter'
-        AND domain IN ('calendar_refresh','firefly_window','embed_retry','slack_channel_backfill')
+        AND domain IN ('calendar_refresh','firefly_window','embed_retry','rag_reindex_v2','slack_channel_backfill')
       ORDER BY completed_at DESC
       LIMIT 100`
   ).bind(orgId).all<{
@@ -610,6 +633,66 @@ export async function scanAndRepairIngestion(
       severity: isHumanActionError(message) ? 'critical' : 'warning',
       humanActionRequired: /cannot_join|not_in_channel|missing_scope|restricted_action/i.test(message),
       metadata: { channel_name: ch.channel_name, last_sync_at: ch.last_sync_at },
+    });
+  }
+
+  try {
+    const { scanAndRepairRagV2Coverage, getRagV2SourceFreshness } = await import('./rag-v2');
+    const repair = await scanAndRepairRagV2Coverage(env, orgId, {
+      sourceFamilies: ['slack'],
+      limitPerSpec: 100,
+      priority: 30,
+    });
+    repairs += repair.enqueued;
+
+    const slackFreshness = repair.freshness.find(row => row.source_family === 'slack') ||
+      await getRagV2SourceFreshness(env, orgId, 'slack');
+    const lag = slackFreshness?.freshness_lag_ms;
+    const hasUnindexedSlack = Boolean(slackFreshness && (
+      slackFreshness.missing_sources > 0 ||
+      slackFreshness.incomplete_sources > 0 ||
+      (typeof lag === 'number' && lag > RAG_V2_FRESHNESS_SLO_MS) ||
+      (slackFreshness.total_sources > 0 && !slackFreshness.latest_indexed_source_at)
+    ));
+
+    if (hasUnindexedSlack && slackFreshness) {
+      await reportIngestionFailure(env, {
+        orgId,
+        source: 'rag_v2',
+        scopeType: 'source_family',
+        scopeId: 'slack',
+        code: 'rag_v2_slack_freshness_lag',
+        title: 'MARTy Slack retrieval index is behind',
+        message: `MARTy RAG v2 Slack index is stale: latest Slack source=${slackFreshness.latest_source_at || 'none'}, latest indexed=${slackFreshness.latest_indexed_source_at || 'none'}, missing=${slackFreshness.missing_sources}, incomplete=${slackFreshness.incomplete_sources}.`,
+        severity: 'warning',
+        humanActionRequired: false,
+        metadata: {
+          ...slackFreshness,
+          repair_enqueued: repair.enqueued,
+          repair_already_queued: repair.already_queued,
+          repair_errors: repair.errors.slice(0, 5),
+        },
+      });
+    } else if (slackFreshness) {
+      await reportIngestionSuccess(env, {
+        orgId,
+        source: 'rag_v2',
+        scopeType: 'source_family',
+        scopeId: 'slack',
+        metadata: slackFreshness as unknown as Record<string, unknown>,
+      });
+    }
+  } catch (e) {
+    await reportIngestionFailure(env, {
+      orgId,
+      source: 'rag_v2',
+      scopeType: 'source_family',
+      scopeId: 'slack',
+      code: 'rag_v2_slack_freshness_scan_failed',
+      title: 'MARTy Slack retrieval index scan failed',
+      message: `RAG v2 Slack freshness scanner failed: ${truncate(errToString(e), 300)}`,
+      severity: 'warning',
+      humanActionRequired: false,
     });
   }
 

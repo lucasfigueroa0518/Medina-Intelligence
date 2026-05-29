@@ -27,7 +27,7 @@ const MAX_RAG_V2_CHUNKS_PER_JOB = 80;
 const RAG_V2_RANGE_CHUNK_SIZE = 60;
 const RAG_V2_EMBEDDING_BATCH_SIZE = 16;
 
-type RagV2SourceTable = 'conversations' | 'events' | 'documents' | 'contacts' | 'companies' | 'deals' | 'news_articles';
+export type RagV2SourceTable = 'conversations' | 'events' | 'documents' | 'contacts' | 'companies' | 'deals' | 'news_articles';
 
 interface RagV2Source {
   orgId: string;
@@ -65,6 +65,53 @@ export interface RagV2ReindexResult {
   errors: string[];
 }
 
+export interface RagV2EnqueueResult {
+  status: 'enqueued' | 'already_queued' | 'missing' | 'skipped';
+  source_table: RagV2SourceTable;
+  source_id: string;
+  source_family?: string;
+  source_created_at?: string;
+  source_hash?: string;
+  work_queue_id?: string;
+  idempotency_key?: string;
+  reason?: string;
+}
+
+export interface RagV2FreshnessRow {
+  source_family: string;
+  source_table: RagV2SourceTable;
+  total_sources: number;
+  indexed_sources: number;
+  missing_sources: number;
+  incomplete_sources: number;
+  skipped_sources: number;
+  latest_source_at: string | null;
+  latest_indexed_source_at: string | null;
+  freshness_lag_ms: number | null;
+  queue_pending: number;
+  queue_in_progress: number;
+  queue_failed: number;
+  queue_dead_letter: number;
+}
+
+export interface RagV2CoverageRepairResult {
+  scanned: number;
+  candidates: number;
+  enqueued: number;
+  already_queued: number;
+  skipped: number;
+  missing: number;
+  errors: string[];
+  freshness: RagV2FreshnessRow[];
+}
+
+interface RagV2SourceSpec {
+  sourceTable: RagV2SourceTable;
+  sourceFamily: string;
+  sourceSql: string;
+  sourceWhere: string;
+}
+
 function fnv1a(text: string): string {
   let hash = 2166136261;
   for (let i = 0; i < text.length; i++) {
@@ -96,6 +143,137 @@ export function sourceFamilyForRagV2(documentType: string): string {
   if (documentType === 'deal_record') return 'deal_records';
   if (documentType === 'news') return 'news';
   return 'documents';
+}
+
+const RAG_V2_SOURCE_SPECS: RagV2SourceSpec[] = [
+  {
+    sourceTable: 'conversations',
+    sourceFamily: 'slack',
+    sourceSql: `
+      SELECT id, sent_at AS source_created_at
+        FROM conversations
+       WHERE org_id = ?
+         AND source = 'slack'
+         AND (body_r2_key IS NOT NULL OR length(COALESCE(body_preview, '')) >= 10)
+    `,
+    sourceWhere: "src.source_table = 'conversations' AND src.source_family = 'slack'",
+  },
+  {
+    sourceTable: 'conversations',
+    sourceFamily: 'emails',
+    sourceSql: `
+      SELECT id, sent_at AS source_created_at
+        FROM conversations
+       WHERE org_id = ?
+         AND source = 'outlook'
+         AND (body_r2_key IS NOT NULL OR length(COALESCE(body_preview, '')) >= 10)
+    `,
+    sourceWhere: "src.source_table = 'conversations' AND src.source_family = 'emails'",
+  },
+  {
+    sourceTable: 'conversations',
+    sourceFamily: 'transcripts',
+    sourceSql: `
+      SELECT id, sent_at AS source_created_at
+        FROM conversations
+       WHERE org_id = ?
+         AND source = 'manual'
+         AND (body_r2_key IS NOT NULL OR length(COALESCE(body_preview, '')) >= 10)
+    `,
+    sourceWhere: "src.source_table = 'conversations' AND src.source_family = 'transcripts'",
+  },
+  {
+    sourceTable: 'events',
+    sourceFamily: 'transcripts',
+    sourceSql: `
+      SELECT id, start_time AS source_created_at
+        FROM events
+       WHERE org_id = ?
+         AND deleted_at IS NULL
+         AND (transcript_r2_key IS NOT NULL OR length(COALESCE(summary, '')) >= 10)
+    `,
+    sourceWhere: "src.source_table = 'events' AND src.source_family = 'transcripts'",
+  },
+  {
+    sourceTable: 'documents',
+    sourceFamily: 'documents',
+    sourceSql: `
+      SELECT id, created_at AS source_created_at
+        FROM documents
+       WHERE org_id = ?
+         AND deleted_at IS NULL
+         AND processing_status = 'completed'
+         AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1
+         AND (r2_key IS NOT NULL OR length(COALESCE(extracted_text_preview, '')) >= 10)
+    `,
+    sourceWhere: "src.source_table = 'documents' AND src.source_family = 'documents'",
+  },
+  {
+    sourceTable: 'contacts',
+    sourceFamily: 'entity_context',
+    sourceSql: `
+      SELECT id, updated_at AS source_created_at
+        FROM contacts
+       WHERE org_id = ?
+         AND deleted_at IS NULL
+         AND merged_into IS NULL
+         AND length(COALESCE(bio_summary, '')) >= 10
+    `,
+    sourceWhere: "src.source_table = 'contacts' AND src.source_family = 'entity_context'",
+  },
+  {
+    sourceTable: 'companies',
+    sourceFamily: 'entity_context',
+    sourceSql: `
+      SELECT id, updated_at AS source_created_at
+        FROM companies
+       WHERE org_id = ?
+         AND deleted_at IS NULL
+         AND merged_into IS NULL
+         AND length(COALESCE(description, '')) >= 10
+    `,
+    sourceWhere: "src.source_table = 'companies' AND src.source_family = 'entity_context'",
+  },
+  {
+    sourceTable: 'deals',
+    sourceFamily: 'deal_records',
+    sourceSql: `
+      SELECT id, updated_at AS source_created_at
+        FROM deals
+       WHERE org_id = ?
+         AND deleted_at IS NULL
+    `,
+    sourceWhere: "src.source_table = 'deals' AND src.source_family = 'deal_records'",
+  },
+  {
+    sourceTable: 'news_articles',
+    sourceFamily: 'news',
+    sourceSql: `
+      SELECT id, COALESCE(published_at, created_at) AS source_created_at
+        FROM news_articles
+       WHERE org_id = ?
+         AND length(COALESCE(summary, '')) >= 10
+    `,
+    sourceWhere: "src.source_table = 'news_articles' AND src.source_family = 'news'",
+  },
+];
+
+function vectorCountColumnForProfile(profileId: EmbeddingProfileId): 'vectorized_bge_count' | 'vectorized_qwen3_count' | 'vectorized_minilm_count' {
+  if (profileId === 'qwen3-embedding-0.6b:v3') return 'vectorized_qwen3_count';
+  if (profileId === 'all-MiniLM-L6-v2:v3') return 'vectorized_minilm_count';
+  return 'vectorized_bge_count';
+}
+
+function specsForRagV2Coverage(options: {
+  sourceTables?: RagV2SourceTable[];
+  sourceFamilies?: string[];
+} = {}): RagV2SourceSpec[] {
+  const tables = options.sourceTables?.length ? new Set(options.sourceTables) : null;
+  const families = options.sourceFamilies?.length ? new Set(options.sourceFamilies) : null;
+  return RAG_V2_SOURCE_SPECS.filter(spec =>
+    (!tables || tables.has(spec.sourceTable)) &&
+    (!families || families.has(spec.sourceFamily))
+  );
 }
 
 function compactParticipantIds(raw: string | null | undefined): string | undefined {
@@ -385,6 +563,318 @@ export async function getRagV2RuntimeConfig(env: Env, orgId: string): Promise<Ra
     retrievalVersion: envVersion === 'v2' || envVersion === 'shadow' ? envVersion : 'v1',
     embeddingProfile: envProfile,
     shadowEnabled: envVersion === 'shadow',
+  };
+}
+
+export async function getRagV2SourceHash(
+  env: Env,
+  orgId: string,
+  payload: Pick<RagV2ReindexPayload, 'source_table' | 'source_id'>
+): Promise<{
+  source: RagV2Source | null;
+  sourceHash: string | null;
+  reason?: string;
+}> {
+  const source = await loadRagV2Source(payload as RagV2ReindexPayload, orgId, env);
+  if (!source) return { source: null, sourceHash: null, reason: 'source_not_found' };
+  if (!source.text || source.text.trim().length < 10) {
+    return { source, sourceHash: null, reason: 'source_text_too_short' };
+  }
+  return { source, sourceHash: await sha256Short(source.text, 32) };
+}
+
+export async function enqueueRagV2SourceReindex(
+  env: Env,
+  orgId: string,
+  sourceTable: RagV2SourceTable,
+  sourceId: string,
+  options: {
+    profiles?: EmbeddingProfileId[];
+    priority?: number;
+    maxAttempts?: number;
+  } = {}
+): Promise<RagV2EnqueueResult> {
+  const profiles = options.profiles?.length ? options.profiles : [DEFAULT_RAG_V2_EMBEDDING_PROFILE];
+  const { source, sourceHash, reason } = await getRagV2SourceHash(env, orgId, {
+    source_table: sourceTable,
+    source_id: sourceId,
+  });
+  if (!source || !sourceHash) {
+    if (source && reason === 'source_text_too_short') {
+      await markRagV2SourceSkipped(env, orgId, source, reason, profiles[0]);
+    }
+    return {
+      status: reason === 'source_not_found' ? 'missing' : 'skipped',
+      source_table: sourceTable,
+      source_id: sourceId,
+      source_family: source?.sourceFamily,
+      source_created_at: source?.sourceCreatedAt,
+      reason,
+    };
+  }
+
+  const idempotencyKey = [
+    orgId,
+    sourceTable,
+    sourceId,
+    sourceHash,
+    profiles.join('+'),
+    RAG_V2_CHUNK_VERSION,
+  ].join(':');
+  const result = await enqueueWork(env, orgId, RAG_V2_WORK_QUEUE_DOMAIN, {
+    source_table: sourceTable,
+    source_id: sourceId,
+    profiles,
+  } satisfies RagV2ReindexPayload, {
+    upstream: 'bge',
+    idempotency_key: idempotencyKey,
+    max_attempts: options.maxAttempts ?? 5,
+    priority: options.priority ?? (source.sourceFamily === 'slack' ? 30 : 10),
+  });
+
+  return {
+    status: result.inserted ? 'enqueued' : 'already_queued',
+    source_table: sourceTable,
+    source_id: sourceId,
+    source_family: source.sourceFamily,
+    source_created_at: source.sourceCreatedAt,
+    source_hash: sourceHash,
+    work_queue_id: result.id,
+    idempotency_key: idempotencyKey,
+  };
+}
+
+function ragV2CompletionPredicate(alias: string, vectorCountColumn: string): string {
+  return `${alias}.backfill_status = 'completed'
+    AND ${alias}.chunk_count > 0
+    AND ${alias}.lexical_count >= ${alias}.chunk_count
+    AND ${alias}.${vectorCountColumn} >= ${alias}.chunk_count`;
+}
+
+async function markRagV2SourceSkipped(
+  env: Env,
+  orgId: string,
+  source: RagV2Source,
+  reason: string,
+  profileId: EmbeddingProfileId = DEFAULT_RAG_V2_EMBEDDING_PROFILE
+): Promise<void> {
+  const sourceHash = await sha256Short(source.text || `${source.sourceTable}:${source.sourceId}:skipped`, 32);
+  await env.D1.prepare(
+    `INSERT INTO rag_source_index_state
+       (org_id, source_table, source_id, source_hash, selected_embedding_profile,
+        chunk_count, vectorized_bge_count, vectorized_qwen3_count, vectorized_minilm_count,
+        lexical_count, backfill_status, last_error, started_at, completed_at)
+     VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 'skipped', ?,
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+     ON CONFLICT(org_id, source_table, source_id) DO UPDATE SET
+       source_hash = excluded.source_hash,
+       selected_embedding_profile = excluded.selected_embedding_profile,
+       chunk_count = 0,
+       vectorized_bge_count = 0,
+       vectorized_qwen3_count = 0,
+       vectorized_minilm_count = 0,
+       lexical_count = 0,
+       backfill_status = 'skipped',
+       last_error = excluded.last_error,
+       completed_at = excluded.completed_at,
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(
+    orgId,
+    source.sourceTable,
+    source.sourceId,
+    sourceHash,
+    profileId,
+    reason
+  ).run();
+}
+
+async function getRagV2QueueCounts(
+  env: Env,
+  orgId: string
+): Promise<Record<string, number>> {
+  const rows = await env.D1.prepare(
+    `SELECT status, COUNT(*) AS count
+       FROM work_queue
+      WHERE org_id = ? AND domain = ?
+      GROUP BY status`
+  ).bind(orgId, RAG_V2_WORK_QUEUE_DOMAIN).all<{ status: string; count: number }>();
+  const counts: Record<string, number> = {};
+  for (const row of rows.results || []) counts[row.status] = Number(row.count || 0);
+  return counts;
+}
+
+async function getRagV2FreshnessForSpec(
+  env: Env,
+  orgId: string,
+  spec: RagV2SourceSpec,
+  profileId: EmbeddingProfileId,
+  queueCounts: Record<string, number>
+): Promise<RagV2FreshnessRow> {
+  const vectorCountColumn = vectorCountColumnForProfile(profileId);
+  const complete = ragV2CompletionPredicate('s', vectorCountColumn);
+  const row = await env.D1.prepare(
+    `WITH src AS (${spec.sourceSql})
+     SELECT
+       COUNT(*) AS total_sources,
+       SUM(CASE WHEN ${complete} THEN 1 ELSE 0 END) AS indexed_sources,
+       SUM(CASE WHEN s.source_id IS NULL THEN 1 ELSE 0 END) AS missing_sources,
+       SUM(CASE WHEN s.backfill_status = 'skipped' THEN 1 ELSE 0 END) AS skipped_sources,
+       SUM(CASE WHEN s.source_id IS NOT NULL AND s.backfill_status != 'skipped' AND NOT (${complete}) THEN 1 ELSE 0 END) AS incomplete_sources,
+       MAX(src.source_created_at) AS latest_source_at,
+       MAX(CASE WHEN ${complete} THEN src.source_created_at ELSE NULL END) AS latest_indexed_source_at
+      FROM src
+      LEFT JOIN rag_source_index_state s
+        ON s.org_id = ?
+       AND s.source_table = ?
+       AND s.source_id = src.id`
+  ).bind(orgId, orgId, spec.sourceTable).first<{
+    total_sources: number | null;
+    indexed_sources: number | null;
+    missing_sources: number | null;
+    incomplete_sources: number | null;
+    skipped_sources: number | null;
+    latest_source_at: string | null;
+    latest_indexed_source_at: string | null;
+  }>();
+
+  const latestSource = row?.latest_source_at || null;
+  const latestIndexed = row?.latest_indexed_source_at || null;
+  const sourceMs = latestSource ? Date.parse(latestSource) : NaN;
+  const indexedMs = latestIndexed ? Date.parse(latestIndexed) : NaN;
+  const freshnessLagMs = Number.isFinite(sourceMs)
+    ? Number.isFinite(indexedMs) ? Math.max(0, sourceMs - indexedMs) : null
+    : null;
+
+  return {
+    source_family: spec.sourceFamily,
+    source_table: spec.sourceTable,
+    total_sources: Number(row?.total_sources || 0),
+    indexed_sources: Number(row?.indexed_sources || 0),
+    missing_sources: Number(row?.missing_sources || 0),
+    incomplete_sources: Number(row?.incomplete_sources || 0),
+    skipped_sources: Number(row?.skipped_sources || 0),
+    latest_source_at: latestSource,
+    latest_indexed_source_at: latestIndexed,
+    freshness_lag_ms: freshnessLagMs,
+    queue_pending: queueCounts.pending || 0,
+    queue_in_progress: queueCounts.in_progress || 0,
+    queue_failed: queueCounts.failed || 0,
+    queue_dead_letter: queueCounts.dead_letter || 0,
+  };
+}
+
+export async function getRagV2FreshnessSummary(
+  env: Env,
+  orgId: string,
+  options: {
+    profile?: EmbeddingProfileId;
+    sourceTables?: RagV2SourceTable[];
+    sourceFamilies?: string[];
+  } = {}
+): Promise<RagV2FreshnessRow[]> {
+  const profileId = options.profile || (await getRagV2RuntimeConfig(env, orgId)).embeddingProfile;
+  const queueCounts = await getRagV2QueueCounts(env, orgId).catch(() => ({}));
+  const specs = specsForRagV2Coverage(options);
+  const rows: RagV2FreshnessRow[] = [];
+  for (const spec of specs) {
+    rows.push(await getRagV2FreshnessForSpec(env, orgId, spec, profileId, queueCounts));
+  }
+  return rows;
+}
+
+export async function getRagV2SourceFreshness(
+  env: Env,
+  orgId: string,
+  sourceFamily: string,
+  options: { profile?: EmbeddingProfileId; sourceTable?: RagV2SourceTable } = {}
+): Promise<RagV2FreshnessRow | null> {
+  const rows = await getRagV2FreshnessSummary(env, orgId, {
+    profile: options.profile,
+    sourceFamilies: [sourceFamily],
+    sourceTables: options.sourceTable ? [options.sourceTable] : undefined,
+  });
+  return rows[0] || null;
+}
+
+export async function scanAndRepairRagV2Coverage(
+  env: Env,
+  orgId: string,
+  options: {
+    sourceTables?: RagV2SourceTable[];
+    sourceFamilies?: string[];
+    profiles?: EmbeddingProfileId[];
+    limitPerSpec?: number;
+    priority?: number;
+  } = {}
+): Promise<RagV2CoverageRepairResult> {
+  const profiles = options.profiles?.length
+    ? options.profiles
+    : [(await getRagV2RuntimeConfig(env, orgId)).embeddingProfile];
+  const profile = profiles[0];
+  const vectorCountColumn = vectorCountColumnForProfile(profile);
+  const specs = specsForRagV2Coverage(options);
+  const limit = Math.max(1, Math.min(options.limitPerSpec ?? 50, 250));
+  const errors: string[] = [];
+  let scanned = 0;
+  let candidates = 0;
+  let enqueued = 0;
+  let alreadyQueued = 0;
+  let skipped = 0;
+  let missing = 0;
+
+  for (const spec of specs) {
+    const complete = ragV2CompletionPredicate('s', vectorCountColumn);
+    const rows = await env.D1.prepare(
+      `WITH src AS (${spec.sourceSql})
+       SELECT src.id
+         FROM src
+         LEFT JOIN rag_source_index_state s
+           ON s.org_id = ?
+          AND s.source_table = ?
+          AND s.source_id = src.id
+        WHERE s.source_id IS NULL
+           OR (s.backfill_status != 'skipped' AND NOT (${complete}))
+        ORDER BY src.source_created_at DESC
+        LIMIT ?`
+    ).bind(orgId, orgId, spec.sourceTable, limit).all<{ id: string }>();
+
+    scanned += limit;
+    candidates += rows.results.length;
+    for (const row of rows.results) {
+      try {
+        const result = await enqueueRagV2SourceReindex(env, orgId, spec.sourceTable, row.id, {
+          profiles,
+          priority: options.priority ?? (spec.sourceFamily === 'slack' ? 30 : 10),
+          maxAttempts: 6,
+        });
+        if (result.status === 'enqueued') enqueued++;
+        else if (result.status === 'already_queued') alreadyQueued++;
+        else if (result.status === 'missing') missing++;
+        else skipped++;
+      } catch (e) {
+        errors.push(`${spec.sourceTable}:${row.id}:${e instanceof Error ? e.message : String(e)}`.slice(0, 500));
+      }
+    }
+  }
+
+  const freshness = await getRagV2FreshnessSummary(env, orgId, {
+    profile,
+    sourceTables: options.sourceTables,
+    sourceFamilies: options.sourceFamilies,
+  }).catch((e) => {
+    errors.push(`freshness:${e instanceof Error ? e.message : String(e)}`.slice(0, 500));
+    return [] as RagV2FreshnessRow[];
+  });
+
+  return {
+    scanned,
+    candidates,
+    enqueued,
+    already_queued: alreadyQueued,
+    skipped,
+    missing,
+    errors,
+    freshness,
   };
 }
 
@@ -740,6 +1230,7 @@ function upsertRagChunkRecordStatement(env: Env, record: RagChunkRecord): D1Prep
        created_at_epoch = excluded.created_at_epoch,
        chunk_config_version = excluded.chunk_config_version,
        lexical_doc_id = excluded.lexical_doc_id,
+       opensearch_status = excluded.opensearch_status,
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
   ).bind(
     record.id,
@@ -825,6 +1316,27 @@ async function markVectorStatuses(
           WHERE id = ?`
       ).bind(update.vectorId, update.status, update.error || null, update.chunkId);
     });
+    await env.D1.batch(statements);
+  }
+}
+
+async function markLexicalStatuses(
+  env: Env,
+  chunkIds: string[],
+  status: 'synced' | 'failed' | 'skipped',
+  error?: string
+): Promise<void> {
+  for (let i = 0; i < chunkIds.length; i += 100) {
+    const statements = chunkIds.slice(i, i + 100).map(chunkId =>
+      env.D1.prepare(
+        `UPDATE rag_chunks_v2
+            SET opensearch_status = ?,
+                last_error = CASE WHEN ? IS NOT NULL THEN ? ELSE last_error END,
+                indexed_at = CASE WHEN ? = 'synced' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE indexed_at END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`
+      ).bind(status, error || null, error || null, status, chunkId)
+    );
     await env.D1.batch(statements);
   }
 }
@@ -982,8 +1494,12 @@ export async function reindexRagV2Item(
   const source = await loadRagV2Source(payload, orgId, env);
   const profiles = payload.profiles?.length ? payload.profiles : [DEFAULT_RAG_V2_EMBEDDING_PROFILE];
   const isRangeJob = isRagV2RangePayload(payload);
-  if (!source || !source.text || source.text.trim().length < 10) {
+  if (!source) {
     return { status: 'missing', chunks: 0, profiles, lexical: 'skipped', errors: [] };
+  }
+  if (!source.text || source.text.trim().length < 10) {
+    await markRagV2SourceSkipped(env, orgId, source, 'source_text_too_short', profiles[0]);
+    return { status: 'skipped', chunks: 0, profiles, lexical: 'skipped', errors: [] };
   }
 
   const sourceHash = await sha256Short(source.text, 32);
@@ -1109,7 +1625,7 @@ export async function reindexRagV2Item(
       vectorize_status_qwen3: 'pending',
       vectorize_status_minilm: 'pending',
       lexical_doc_id: chunkId,
-      opensearch_status: 'skipped',
+      opensearch_status: 'pending',
       last_error: null,
     };
     recordsForSearch.push({ ...record, body: chunk.text });
@@ -1196,6 +1712,12 @@ export async function reindexRagV2Item(
     lexical = 'failed';
     errors.push(e instanceof Error ? e.message : String(e));
   }
+  await markLexicalStatuses(
+    env,
+    recordsForSearch.map(record => record.id),
+    lexical === 'synced' ? 'synced' : lexical === 'failed' ? 'failed' : 'skipped',
+    lexical === 'failed' ? errors.slice(-3).join('\n') || 'lexical_sync_failed' : undefined
+  );
 
   const counts = await readRagV2SourceSyncCounts(env, orgId, source);
   const sourceComplete =
@@ -1234,7 +1756,7 @@ export async function reindexRagV2Item(
 }
 
 export async function getRagV2Status(env: Env, orgId: string): Promise<Record<string, unknown>> {
-  const [sources, chunks, queue] = await Promise.all([
+  const [sources, chunks, queue, freshness] = await Promise.all([
     env.D1.prepare(
       `SELECT source_table, backfill_status, COUNT(*) AS count,
               SUM(chunk_count) AS chunks,
@@ -1265,11 +1787,13 @@ export async function getRagV2Status(env: Env, orgId: string): Promise<Record<st
         WHERE org_id = ? AND domain = ?
         GROUP BY status`
     ).bind(orgId, RAG_V2_WORK_QUEUE_DOMAIN).all(),
+    getRagV2FreshnessSummary(env, orgId).catch(() => []),
   ]);
   return {
     sources: sources.results,
     chunks,
     queue: queue.results,
+    freshness,
     lexical_engine: 'd1_fts5',
     profiles: Object.values(RAG_V2_EMBEDDING_PROFILES).map(p => ({
       id: p.id,

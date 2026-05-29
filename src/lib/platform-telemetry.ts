@@ -6,6 +6,7 @@ import {
   filterOutlookIncidentsForUserReports,
   getOutlookAppOnlyHealthSnapshot,
 } from './outlook-app-only-health';
+import { getRagV2FreshnessSummary } from './rag-v2';
 
 export type PlatformTelemetryTopic =
   | 'auto'
@@ -676,6 +677,7 @@ async function inspectDataCoverage(ctx: AuthContext, env: Env): Promise<any> {
     eventsEmbedded,
     connectedUsers,
     outlookHealth,
+    ragV2Freshness,
   ] = await Promise.all([
     env.D1.prepare(`SELECT COUNT(*) AS n FROM conversations WHERE org_id = ?`).bind(ctx.orgId).first<{ n: number }>(),
     env.D1.prepare(`SELECT COUNT(DISTINCT entity_id) AS n FROM vector_entity_index WHERE org_id = ? AND source_table = 'conversations'`).bind(ctx.orgId).first<{ n: number }>(),
@@ -709,6 +711,7 @@ async function inspectDataCoverage(ctx: AuthContext, env: Env): Promise<any> {
           AND deleted_at IS NULL`
     ).bind(ctx.orgId).first<{ total: number; outlook_connected: number }>(),
     getOutlookAppOnlyHealthSnapshot(ctx.orgId, env),
+    getRagV2FreshnessSummary(env, ctx.orgId).catch(() => []),
   ]);
 
   const convTotal = asNumber(conversationsTotal?.n);
@@ -735,6 +738,7 @@ async function inspectDataCoverage(ctx: AuthContext, env: Env): Promise<any> {
       status: outlookHealth.status,
       summary: outlookHealth.summary,
     },
+    rag_v2_freshness: ragV2Freshness,
   };
 }
 

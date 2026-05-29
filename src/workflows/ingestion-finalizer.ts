@@ -168,6 +168,123 @@ export class IngestionFinalizerWorkflow extends WorkflowEntrypoint<Env, Finalize
         }
       );
 
+      // Keep MARTy's active RAG v2 index fresh. The legacy embed gap
+      // detector above repairs vector_entity_index, but RAG v2 has its own
+      // source/chunk state and work_queue domain. Without this enqueue path,
+      // newly ingested Slack/email/doc/event rows can be present in D1 while
+      // remaining invisible to the primary v2 retrieval path.
+      await trackedStep(
+        this.env,
+        step,
+        sync_job_id,
+        'detect-rag-v2-gaps',
+        { timeout: '180 seconds', retries: { limit: 1, delay: '5 seconds' } },
+        async () => {
+          try {
+            const startedAt = await this.env.D1.prepare(
+              `SELECT started_at FROM sync_jobs WHERE id = ?`
+            ).bind(sync_job_id).first<{ started_at: string }>();
+            if (!startedAt?.started_at) return;
+
+            const [convos, events, docs] = await Promise.all([
+              this.env.D1.prepare(
+                `SELECT id FROM conversations
+                  WHERE org_id = ?
+                    AND created_at >= ?
+                    AND (body_r2_key IS NOT NULL OR length(COALESCE(body_preview, '')) >= 10)
+                  ORDER BY created_at DESC
+                  LIMIT 500`
+              ).bind(org_id, startedAt.started_at).all<{ id: string }>(),
+              this.env.D1.prepare(
+                `SELECT id FROM events
+                  WHERE org_id = ?
+                    AND created_at >= ?
+                    AND deleted_at IS NULL
+                    AND (transcript_r2_key IS NOT NULL OR length(COALESCE(summary, '')) >= 10)
+                  ORDER BY created_at DESC
+                  LIMIT 250`
+              ).bind(org_id, startedAt.started_at).all<{ id: string }>(),
+              this.env.D1.prepare(
+                `SELECT id FROM documents
+                  WHERE org_id = ?
+                    AND created_at >= ?
+                    AND deleted_at IS NULL
+                    AND processing_status = 'completed'
+                    AND COALESCE(json_extract(custom_fields, '$.marty_lab_generated'), 0) != 1
+                    AND (r2_key IS NOT NULL OR length(COALESCE(extracted_text_preview, '')) >= 10)
+                  ORDER BY created_at DESC
+                  LIMIT 250`
+              ).bind(org_id, startedAt.started_at).all<{ id: string }>(),
+            ]);
+
+            const { enqueueRagV2SourceReindex } = await import('../lib/rag-v2');
+            const counters = {
+              candidates: convos.results.length + events.results.length + docs.results.length,
+              enqueued: 0,
+              already_queued: 0,
+              skipped: 0,
+              missing: 0,
+              errors: 0,
+            };
+            const enqueueOne = async (
+              sourceTable: 'conversations' | 'events' | 'documents',
+              id: string
+            ) => {
+              try {
+                const result = await enqueueRagV2SourceReindex(this.env, org_id, sourceTable, id, {
+                  priority: sourceTable === 'conversations' ? 30 : 10,
+                  maxAttempts: 6,
+                });
+                if (result.status === 'enqueued') counters.enqueued++;
+                else if (result.status === 'already_queued') counters.already_queued++;
+                else if (result.status === 'missing') counters.missing++;
+                else counters.skipped++;
+              } catch (e) {
+                counters.errors++;
+                console.error(
+                  `[IngestionFinalizerWorkflow] detect-rag-v2-gaps enqueue failed table=${sourceTable} id=${id}:`,
+                  errMessage(e)
+                );
+              }
+            };
+
+            for (const row of convos.results) await enqueueOne('conversations', row.id);
+            for (const row of events.results) await enqueueOne('events', row.id);
+            for (const row of docs.results) await enqueueOne('documents', row.id);
+
+            if (counters.candidates === 0) {
+              console.log('[IngestionFinalizerWorkflow] detect-rag-v2-gaps: no fresh RAG v2 candidates');
+            } else {
+              console.log(
+                `[IngestionFinalizerWorkflow] detect-rag-v2-gaps: candidates=${counters.candidates} enqueued=${counters.enqueued} already=${counters.already_queued} skipped=${counters.skipped} missing=${counters.missing} errors=${counters.errors}`
+              );
+            }
+
+            await this.env.D1.prepare(
+              `UPDATE sync_jobs SET metadata = json_set(
+                  COALESCE(metadata, '{}'),
+                  '$.rag_v2_candidates_total', ?,
+                  '$.rag_v2_enqueued', ?,
+                  '$.rag_v2_already_queued', ?,
+                  '$.rag_v2_skipped', ?,
+                  '$.rag_v2_missing', ?,
+                  '$.rag_v2_enqueue_errors', ?
+                ) WHERE id = ?`
+            ).bind(
+              counters.candidates,
+              counters.enqueued,
+              counters.already_queued,
+              counters.skipped,
+              counters.missing,
+              counters.errors,
+              sync_job_id
+            ).run();
+          } catch (e) {
+            console.error('[IngestionFinalizerWorkflow] detect-rag-v2-gaps failed:', errMessage(e));
+          }
+        }
+      );
+
       // Phase 0a-4 (2026-05-04): the four heavy org-wide bulk calcs
       // (relationship status, owners, comms patterns, associations) were
       // removed from this finalizer and migrated to daily-cron.

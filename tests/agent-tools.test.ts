@@ -37,4 +37,28 @@ describe('agent tool source contracts', () => {
     expect(sql).toContain('conversation_search_fts');
     expect(sql).toContain('MATCH');
   });
+
+  it('activates Slack freshness fallback when RAG v2 is behind the relational source', () => {
+    expect(__agentToolsTestHooks.shouldCheckSlackFreshness({
+      query: 'most recent messages',
+      source_types: ['slack'],
+    })).toBe(true);
+    expect(__agentToolsTestHooks.queryAsksForRecent('what is the latest Slack message?')).toBe(true);
+    expect(__agentToolsTestHooks.shouldUseSlackFreshnessFallback({
+      source_family: 'slack',
+      source_table: 'conversations',
+      total_sources: 319,
+      indexed_sources: 187,
+      missing_sources: 132,
+      incomplete_sources: 0,
+      skipped_sources: 0,
+      latest_source_at: '2026-05-29T18:06:06.959Z',
+      latest_indexed_source_at: '2026-05-14T16:02:24.817Z',
+      freshness_lag_ms: 1_315_422_142,
+      queue_pending: 0,
+      queue_in_progress: 0,
+      queue_failed: 0,
+      queue_dead_letter: 0,
+    })).toBe(true);
+  });
 });
