@@ -843,9 +843,9 @@ async function inspectPipelineHealth(ctx: AuthContext, input: PlatformTelemetryI
               SUM(CASE WHEN last_news_fetched_at >= ? THEN 1 ELSE 0 END) AS attempted_last_window,
               SUM(CASE WHEN last_news_fetched_at IS NULL OR last_news_fetched_at < ? THEN 1 ELSE 0 END) AS due_or_stale,
               MAX(last_news_fetched_at) AS latest_news_attempt_at,
-              (SELECT COUNT(*) FROM news_articles WHERE org_id = ?) AS total_articles,
-              (SELECT COUNT(*) FROM news_articles WHERE org_id = ? AND created_at >= ?) AS articles_created_last_window,
-              (SELECT MAX(created_at) FROM news_articles WHERE org_id = ?) AS latest_article_ingested_at
+              (SELECT COUNT(*) FROM news_articles WHERE org_id = ? AND quality_status = 'usable') AS total_articles,
+              (SELECT COUNT(*) FROM news_articles WHERE org_id = ? AND quality_status = 'usable' AND created_at >= ?) AS articles_created_last_window,
+              (SELECT MAX(created_at) FROM news_articles WHERE org_id = ? AND quality_status = 'usable') AS latest_article_ingested_at
          FROM companies
         WHERE org_id = ?
           AND deleted_at IS NULL
@@ -855,7 +855,7 @@ async function inspectPipelineHealth(ctx: AuthContext, input: PlatformTelemetryI
     env.D1.prepare(
       `SELECT id, company_id, title, source_name, published_at, relevance_tag, relevance_score, created_at
          FROM news_articles
-        WHERE org_id = ?
+        WHERE org_id = ? AND quality_status = 'usable'
         ORDER BY created_at DESC
         LIMIT ?`
     ).bind(ctx.orgId, Math.min(limit, 8)).all<any>(),

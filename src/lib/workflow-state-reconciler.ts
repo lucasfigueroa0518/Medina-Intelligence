@@ -99,8 +99,8 @@ interface ReconcileCounts {
  *  before they're reconcilable. */
 const WORKFLOW_TYPE_TO_CF_NAME: Record<string, string> = {
   ingestion: 'ingestion-workflow',
+  enrichment: 'enrichment-workflow',
   // Add as instanceId capture is instrumented in each workflow:
-  // enrichment: 'enrichment-workflow',
   // 'ingestion-chunk': 'ingestion-chunk-workflow',
   // ...
 };

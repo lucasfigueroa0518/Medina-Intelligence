@@ -10,6 +10,7 @@ import {
 import { getOrgSettings, chunkArray } from '../lib/helpers';
 import { hashShort } from '../lib/helpers';
 import { scoreArticle } from '../lib/news-scoring';
+import { assessNewsQuality } from '../lib/news-quality';
 
 interface NewsArticle {
   title: string;
@@ -288,6 +289,7 @@ async function fetchOneCompany(
   const start = Date.now();
   const items: ClassifiableItem[] = [];
   const seenTitles = new Set<string>();
+  const seenUrls = new Set<string>();
 
   try {
     if (!(await checkGeminiRateLimit(env, orgId, 'low'))) {
@@ -325,19 +327,45 @@ async function fetchOneCompany(
             relevance_tag: tag,
             published_at: article.date,
           });
+          const quality = assessNewsQuality({
+            sourceUrl: article.url || null,
+            publishedAt: article.date,
+          });
+          if (quality.normalizedUrl) {
+            if (seenUrls.has(quality.normalizedUrl)) continue;
+            seenUrls.add(quality.normalizedUrl);
+          }
+
+          if (quality.status === 'usable' && quality.normalizedUrl) {
+            const existing = await env.D1.prepare(
+              `SELECT id FROM news_articles
+                WHERE org_id = ? AND source_url_normalized = ? AND quality_status = 'usable'
+                LIMIT 1`
+            ).bind(orgId, quality.normalizedUrl).first<{ id: string }>();
+            if (existing?.id) continue;
+          }
 
           const articleId = hashShort(article.title + article.date + company.id);
-          await env.D1.prepare(
+          const inserted = await env.D1.prepare(
             `INSERT OR IGNORE INTO news_articles
                (id, org_id, company_id, title, source_url, source_name, published_at,
-                summary, relevance_tag, relevance_score, sector, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+                summary, relevance_tag, relevance_score, sector, source_url_normalized,
+                quality_status, quality_reason, quarantined_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     CASE WHEN ? != 'usable' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END,
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
           ).bind(
             articleId, orgId, company.id,
             article.title, article.url || null, article.source,
             article.date, article.summary,
-            tag, relevanceScore, company.sector
+            tag, relevanceScore, company.sector,
+            quality.normalizedUrl,
+            quality.status,
+            quality.reason,
+            quality.status
           ).run();
+
+          if (quality.status !== 'usable' || !inserted.meta?.changes) continue;
 
           items.push({
             type: 'news',

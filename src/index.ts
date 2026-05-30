@@ -25,6 +25,7 @@ import * as Sync from './handlers/sync';
 import * as AuditLog from './handlers/audit-log';
 import * as Admin from './handlers/admin';
 import * as Cleanup from './handlers/cleanup';
+import * as D1Maintenance from './handlers/d1-maintenance';
 import { sweepApprovalQueue } from './handlers/sweep-approval-queue';
 import * as Imports from './handlers/imports';
 import * as IntelligentImport from './handlers/intelligent-import';
@@ -707,6 +708,14 @@ async function routeAuthenticated(
       const { handleCleanupTranscriptAcl } = await import('./handlers/cleanup-transcript-acl');
       return handleCleanupTranscriptAcl(ctx, env);
     }
+    if (path === '/api/admin/d1-maintenance/preview' && method === 'POST')
+      return D1Maintenance.preview(request, ctx, env);
+    if (path === '/api/admin/d1-maintenance/run' && method === 'POST')
+      return D1Maintenance.run(request, ctx, env);
+    if (path === '/api/admin/d1-maintenance/runs' && method === 'GET')
+      return D1Maintenance.getRun(request, null, ctx, env);
+    m = path.match(/^\/api\/admin\/d1-maintenance\/runs\/([^/]+)$/);
+    if (m && method === 'GET') return D1Maintenance.getRun(request, m[1], ctx, env);
     if (path === '/api/admin/recompute-primary-entity-ids' && method === 'POST')
       return Admin.recomputePrimaryEntityIds(request, ctx, env);
     if (path === '/api/admin/reembed-transcripts' && method === 'POST')
@@ -1237,6 +1246,31 @@ export async function handleScheduled(
           idempotencyKey: `work_queue_tick:${minuteStart}`,
           initialMetadata: { cron, minute_start: minuteStart },
         });
+        const tick = new Date(scheduledAt);
+        if (tick.getUTCHours() === 2 && tick.getUTCMinutes() === 25) {
+          const { runScheduledD1Maintenance } = await import('./lib/d1-maintenance');
+          await withTaskRun(env, 'system', 'd1_maintenance', async (taskRun) => {
+            const result = await runScheduledD1Maintenance(env);
+            const numericStepTotal = Object.values(result.steps).reduce<number>((sum, step) => {
+              const stepValues = Object.values(step as Record<string, unknown>);
+              return sum + stepValues.reduce<number>((inner, value) => inner + (typeof value === 'number' ? value : 0), 0);
+            }, 0);
+            taskRun.report({
+              items_processed: numericStepTotal,
+              items_failed: result.status === 'failed' ? 1 : 0,
+              metadata: {
+                run_id: result.run_id,
+                r2_prefix: result.r2_prefix,
+                status: result.status,
+                steps: result.steps,
+              },
+            });
+            return result;
+          }, {
+            idempotencyKey: `d1_maintenance:${tick.toISOString().slice(0, 10)}`,
+            initialMetadata: { cron, scheduled_date: tick.toISOString().slice(0, 10) },
+          });
+        }
       } catch (e) {
         console.error('work-queue tick failed:', e);
       }

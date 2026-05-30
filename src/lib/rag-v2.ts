@@ -252,6 +252,7 @@ const RAG_V2_SOURCE_SPECS: RagV2SourceSpec[] = [
       SELECT id, COALESCE(published_at, created_at) AS source_created_at
         FROM news_articles
        WHERE org_id = ?
+         AND quality_status = 'usable'
          AND length(COALESCE(summary, '')) >= 10
     `,
     sourceWhere: "src.source_table = 'news_articles' AND src.source_family = 'news'",
@@ -518,7 +519,7 @@ async function loadRagV2Source(payload: RagV2ReindexPayload, orgId: string, env:
     const row = await env.D1.prepare(
       `SELECT id, company_id, title, source_name, published_at, summary, relevance_tag, sector
          FROM news_articles
-        WHERE id = ? AND org_id = ?`
+        WHERE id = ? AND org_id = ? AND quality_status = 'usable'`
     ).bind(payload.source_id, orgId).first<any>();
     if (!row) return null;
     return {

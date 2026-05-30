@@ -43,6 +43,7 @@ export async function recalculateCompanyNewsScore(
   const articles = await env.D1.prepare(
     `SELECT relevance_tag, published_at FROM news_articles
      WHERE company_id = ? AND org_id = ?
+       AND quality_status = 'usable'
      ORDER BY published_at DESC LIMIT 50`
   ).bind(companyId, orgId).all<ScoringInput>();
 

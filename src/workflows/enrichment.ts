@@ -52,6 +52,7 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
     let org_id: string | undefined;
     let jobCreated = false;
     let syncJobId: string | null = null;
+    const cfInstanceId = event.instanceId;
 
     try {
       // Defensive payload unpack — if the runtime hands us no payload we want
@@ -81,10 +82,10 @@ export class EnrichmentWorkflow extends WorkflowEntrypoint<Env, EnrichmentParams
         ).bind(org_id!).run();
 
         const inserted = await this.env.D1.prepare(
-          `INSERT INTO sync_jobs (org_id, workflow_type, status, started_at, timeout_at)
-           VALUES (?, 'enrichment', 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 minutes'))
+          `INSERT INTO sync_jobs (org_id, workflow_type, status, started_at, timeout_at, cf_instance_id)
+           VALUES (?, 'enrichment', 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 minutes'), ?)
            RETURNING id`
-        ).bind(org_id!).first<{ id: string }>();
+        ).bind(org_id!, cfInstanceId || null).first<{ id: string }>();
         return inserted?.id ?? null;
       });
 

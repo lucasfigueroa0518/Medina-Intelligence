@@ -448,7 +448,8 @@ async function hydrateSources(
     lookups.push(
       env.D1.prepare(
         `SELECT id, title, source_name, source_url, published_at, company_id
-         FROM news_articles WHERE org_id = ? AND id IN (${ph})`
+         FROM news_articles
+         WHERE org_id = ? AND quality_status = 'usable' AND id IN (${ph})`
       )
         .bind(orgId, ...ids)
         .all<{

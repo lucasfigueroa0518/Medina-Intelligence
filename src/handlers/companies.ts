@@ -406,6 +406,7 @@ export async function getCompany(
             relevance_tag, relevance_score
      FROM news_articles
      WHERE company_id = ? AND org_id = ?
+       AND quality_status = 'usable'
      ORDER BY CASE WHEN relevance_tag = 'direct_mention' THEN 0 ELSE 1 END,
               published_at DESC
      LIMIT 10`
@@ -505,6 +506,7 @@ export async function getCompanyNews(
             relevance_tag, relevance_score
      FROM news_articles
      WHERE company_id = ? AND org_id = ?
+       AND quality_status = 'usable'
      ORDER BY CASE WHEN relevance_tag = 'direct_mention' THEN 0 ELSE 1 END,
               published_at DESC
      LIMIT 30`

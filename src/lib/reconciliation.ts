@@ -1,6 +1,7 @@
 // TRD §7.4 — Event reconciliation (Outlook upsert, Firefly matching, standalone promotion, orphan flagging)
 import type { Env } from '../types/env';
 import { safelyUpsertEventTimelineItemsForContacts } from './contact-detail-read-model';
+import { upsertEventAttendee } from './event-attendees';
 
 export interface OutlookEventLike {
   id: string;
@@ -60,21 +61,16 @@ export async function upsertOutlookEvent(
       'SELECT id FROM users WHERE email = ? AND org_id = ?'
     ).bind(att.emailAddress.address, orgId).first<{ id: string }>();
 
-    const attendeeInsert = await env.D1.prepare(
-      `INSERT OR IGNORE INTO event_attendees (event_id, contact_id, user_id, email, display_name, role, is_internal)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        eventRow.id,
-        contact?.id || null,
-        user?.id || null,
-        att.emailAddress.address,
-        att.emailAddress.name || null,
-        isOrganizer ? 'organizer' : att.type === 'optional' ? 'optional' : 'attendee',
-        user ? 1 : 0
-      )
-      .run();
-    if (attendeeInsert.meta?.changes && contact?.id) {
+    const attendeeWrite = await upsertEventAttendee(env, {
+      eventId: eventRow.id,
+      contactId: contact?.id || null,
+      userId: user?.id || null,
+      email: att.emailAddress.address,
+      displayName: att.emailAddress.name || null,
+      role: isOrganizer ? 'organizer' : att.type === 'optional' ? 'optional' : 'attendee',
+      isInternal: !!user,
+    });
+    if (attendeeWrite.inserted && contact?.id) {
       await safelyUpsertEventTimelineItemsForContacts(
         env,
         orgId,

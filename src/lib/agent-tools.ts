@@ -1833,6 +1833,7 @@ export async function getCompanyDetail(
       `SELECT id, title, source, published_at, summary, relevance_tag, relevance_score
        FROM news_articles
        WHERE company_id = ?
+         AND quality_status = 'usable'
        ORDER BY CASE WHEN relevance_tag = 'direct_mention' THEN 0 ELSE 1 END,
                 published_at DESC
        LIMIT ?`

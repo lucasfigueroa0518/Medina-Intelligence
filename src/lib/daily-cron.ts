@@ -173,7 +173,7 @@ export async function scheduleReEnrichment(orgId: string, env: Env): Promise<voi
        LEFT JOIN (
          SELECT company_id, COUNT(*) AS recent_news
          FROM news_articles
-         WHERE org_id = ? AND published_at > ?
+         WHERE org_id = ? AND published_at > ? AND quality_status = 'usable'
          GROUP BY company_id
        ) n ON n.company_id = c.id
        LEFT JOIN (
@@ -265,7 +265,7 @@ export async function reconcileVectorIndex(orgId: string, env: Env): Promise<voi
          UNION ALL SELECT 1 FROM conversations WHERE id = vei.entity_id AND vei.source_table = 'conversations'
          UNION ALL SELECT 1 FROM documents WHERE id = vei.entity_id AND vei.source_table = 'documents' AND deleted_at IS NULL
          UNION ALL SELECT 1 FROM deals WHERE id = vei.entity_id AND vei.source_table = 'deals' AND deleted_at IS NULL
-         UNION ALL SELECT 1 FROM news_articles WHERE id = vei.entity_id AND vei.source_table = 'news_articles'
+         UNION ALL SELECT 1 FROM news_articles WHERE id = vei.entity_id AND vei.source_table = 'news_articles' AND quality_status = 'usable'
        ) LIMIT 500`
   ).bind(orgId).all<{ vector_id: string }>();
 
@@ -417,6 +417,7 @@ export async function extractFactsFromRecentNews(orgId: string, env: Env): Promi
        FROM news_articles
        WHERE org_id = ? AND company_id IS NOT NULL
          AND facts_extracted_at IS NULL
+         AND quality_status = 'usable'
          AND summary IS NOT NULL AND LENGTH(summary) > 60
        ORDER BY published_at DESC
        LIMIT 25`

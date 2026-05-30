@@ -779,6 +779,7 @@ export async function triggerCompanyEnrichment(
     const recentNews = await env.D1.prepare(
       `SELECT title, summary, relevance_tag, published_at FROM news_articles
        WHERE company_id = ? AND org_id = ?
+         AND quality_status = 'usable'
        ORDER BY CASE WHEN relevance_tag = 'direct_mention' THEN 0 ELSE 1 END,
                 published_at DESC
        LIMIT 5`

@@ -142,7 +142,7 @@ async function listRagV2SourceIds(
     contacts: `SELECT id FROM contacts WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL AND length(coalesce(bio_summary,'')) > 20 ORDER BY updated_at DESC LIMIT ?`,
     companies: `SELECT id FROM companies WHERE org_id = ? AND deleted_at IS NULL AND merged_into IS NULL AND length(coalesce(description,'')) > 20 ORDER BY updated_at DESC LIMIT ?`,
     deals: `SELECT id FROM deals WHERE org_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT ?`,
-    news_articles: `SELECT id FROM news_articles WHERE org_id = ? AND length(coalesce(summary,'')) > 20 ORDER BY published_at DESC LIMIT ?`,
+    news_articles: `SELECT id FROM news_articles WHERE org_id = ? AND quality_status = 'usable' AND length(coalesce(summary,'')) > 20 ORDER BY published_at DESC LIMIT ?`,
   };
   const rows = await env.D1.prepare(sqlByTable[sourceTable]).bind(orgId, limit).all<{ id: string }>();
   return rows.results.map(r => r.id);
