@@ -38,6 +38,7 @@ export interface ProcessClassifiedStats {
   deal_signals_staged: number;
   prospect_signals_recorded: number;
   prospects_upserted: number;
+  prospect_classifications_pending: number;
   errors: Array<{ phase: string; error: string }>;
 }
 
@@ -54,6 +55,7 @@ function emptyStats(): ProcessClassifiedStats {
     deal_signals_staged: 0,
     prospect_signals_recorded: 0,
     prospects_upserted: 0,
+    prospect_classifications_pending: 0,
     errors: [],
   };
 }
@@ -181,6 +183,7 @@ export async function processClassifiedItems(
     });
     stats.prospect_signals_recorded = prospectStats.signals_recorded;
     stats.prospects_upserted = prospectStats.prospects_upserted;
+    stats.prospect_classifications_pending = prospectStats.classifications_pending;
     for (const err of prospectStats.errors) {
       stats.errors.push({ phase: 'detect-prospects', error: `${err.item_id}: ${err.error}` });
     }
@@ -205,6 +208,7 @@ export async function processClassifiedItems(
           itemsScanned: items.length,
           signalsRecorded: prospectStats.signals_recorded,
           prospectsUpserted: prospectStats.prospects_upserted,
+          classificationsPending: prospectStats.classifications_pending,
           status: prospectStats.errors.length > 0 ? 'partial' : 'completed',
           error: prospectStats.errors[0]?.error || null,
         });
@@ -233,6 +237,7 @@ export async function persistClassifiedStats(
     stats.attachments_attempted > 0 ||
     stats.deal_signals_staged > 0 ||
     stats.prospect_signals_recorded > 0 ||
+    stats.prospect_classifications_pending > 0 ||
     stats.embed_failures > 0 ||
     stats.errors.length > 0;
   if (!hasAny) return;
@@ -252,14 +257,15 @@ export async function persistClassifiedStats(
             '$.attachments_failed',    COALESCE(json_extract(metadata, '$.attachments_failed'),    0) + ?,
             '$.deal_signals_staged',   COALESCE(json_extract(metadata, '$.deal_signals_staged'),   0) + ?,
             '$.prospect_signals_recorded', COALESCE(json_extract(metadata, '$.prospect_signals_recorded'), 0) + ?,
-            '$.prospects_upserted',    COALESCE(json_extract(metadata, '$.prospects_upserted'),    0) + ?
+            '$.prospects_upserted',    COALESCE(json_extract(metadata, '$.prospects_upserted'),    0) + ?,
+            '$.prospect_classifications_pending', COALESCE(json_extract(metadata, '$.prospect_classifications_pending'), 0) + ?
           )
         WHERE id = ?`
     ).bind(
       stats.items_total, stats.items_staged, stats.items_embedded, stats.embed_failures,
       stats.attachments_attempted, stats.attachments_processed, stats.attachments_skipped, stats.attachments_failed,
       stats.deal_signals_staged,
-      stats.prospect_signals_recorded, stats.prospects_upserted,
+      stats.prospect_signals_recorded, stats.prospects_upserted, stats.prospect_classifications_pending,
       syncJobId
     ).run();
 

@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS prospects (
   last_seen_at TEXT,
   last_signal_at TEXT,
   intro_source TEXT,
-  signal_strength_score INTEGER NOT NULL DEFAULT 0,
+  signal_strength INTEGER NOT NULL DEFAULT 0,
   signal_strength_reasons TEXT NOT NULL DEFAULT '[]',
   enrichment_priority TEXT NOT NULL DEFAULT 'lazy'
     CHECK(enrichment_priority IN ('eager','lazy')),
@@ -105,7 +105,10 @@ CREATE INDEX IF NOT EXISTS idx_prospects_org_seen
 CREATE INDEX IF NOT EXISTS idx_prospects_org_sector
   ON prospects(org_id, sector_key, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_prospects_strength
-  ON prospects(org_id, signal_strength_score DESC, last_seen_at DESC);
+  ON prospects(org_id, signal_strength DESC, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prospects_deal
+  ON prospects(org_id, deal_id)
+  WHERE deal_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_prospects_duplicate
   ON prospects(org_id, possible_duplicate_of)
   WHERE possible_duplicate_of IS NOT NULL;
@@ -134,6 +137,13 @@ CREATE TABLE IF NOT EXISTS prospect_signals (
   confidence REAL NOT NULL DEFAULT 0,
   confidence_tier TEXT NOT NULL DEFAULT 'medium'
     CHECK(confidence_tier IN ('high','medium','low')),
+  classification_status TEXT NOT NULL DEFAULT 'classified'
+    CHECK(classification_status IN ('pending','classified','failed')),
+  resolution_status TEXT NOT NULL DEFAULT 'resolved'
+    CHECK(resolution_status IN ('pending','resolved','dropped')),
+  error_message TEXT,
+  classification_attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempted_at TEXT,
   sector_key TEXT NOT NULL DEFAULT 'uncategorized'
     REFERENCES prospect_sectors(key),
   sector_confidence REAL NOT NULL DEFAULT 0,
@@ -157,6 +167,9 @@ CREATE INDEX IF NOT EXISTS idx_prospect_signals_source
   ON prospect_signals(org_id, source_type, source_id);
 CREATE INDEX IF NOT EXISTS idx_prospect_signals_type
   ON prospect_signals(org_id, mention_type, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prospect_signals_pending
+  ON prospect_signals(org_id, classification_status, updated_at)
+  WHERE classification_status != 'classified' OR resolution_status = 'pending';
 
 CREATE TABLE IF NOT EXISTS prospect_classification_history (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -225,6 +238,7 @@ CREATE TABLE IF NOT EXISTS prospect_backfill_coverage (
   items_scanned INTEGER NOT NULL DEFAULT 0,
   signals_recorded INTEGER NOT NULL DEFAULT 0,
   prospects_upserted INTEGER NOT NULL DEFAULT 0,
+  classifications_pending INTEGER NOT NULL DEFAULT 0,
   started_at TEXT,
   completed_at TEXT,
   error_message TEXT,

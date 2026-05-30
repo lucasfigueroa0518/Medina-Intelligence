@@ -157,8 +157,16 @@ export interface ClaudeCallResult {
   model: string;
 }
 
+export type ClaudeSystemPrompt =
+  | string
+  | Array<{
+      type: 'text';
+      text: string;
+      cache_control?: { type: 'ephemeral' };
+    }>;
+
 export async function callClaudeWithUsage(
-  params: { system: string; user: string; max_tokens: number; orgId?: string; model?: string },
+  params: { system: ClaudeSystemPrompt; user: string; max_tokens: number; orgId?: string; model?: string },
   priority: 'high' | 'low',
   env: Env
 ): Promise<ClaudeCallResult> {
@@ -202,7 +210,7 @@ export async function callClaudeWithUsage(
 }
 
 export async function callClaude(
-  params: { system: string; user: string; max_tokens: number; orgId?: string; model?: string },
+  params: { system: ClaudeSystemPrompt; user: string; max_tokens: number; orgId?: string; model?: string },
   priority: 'high' | 'low',
   env: Env
 ): Promise<string> {

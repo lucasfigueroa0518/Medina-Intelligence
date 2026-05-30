@@ -1411,7 +1411,7 @@ export async function searchProspects(
     `SELECT p.id, p.canonical_name, p.domain, p.status, p.visibility,
             p.sector_key, ps.label AS sector_label, p.sector_confidence,
             p.signal_count, p.evidence_count, p.first_seen_at, p.last_seen_at,
-            p.last_signal_at, p.signal_strength_score, p.signal_strength_reasons,
+            p.last_signal_at, p.signal_strength, p.signal_strength_reasons,
             p.enrichment_priority, p.enrichment_status, p.confidence,
             p.provisional, p.direction_uncertain, p.possible_duplicate_of,
             p.possible_company_id, p.possible_deal_id,
@@ -1421,7 +1421,7 @@ export async function searchProspects(
        LEFT JOIN companies c ON c.id = p.possible_company_id
        LEFT JOIN deals d ON d.id = p.possible_deal_id
       WHERE ${where.join(' AND ')}
-      ORDER BY p.last_seen_at DESC NULLS LAST, p.signal_strength_score DESC, p.canonical_name ASC
+      ORDER BY p.last_seen_at DESC NULLS LAST, p.signal_strength DESC, p.canonical_name ASC
       LIMIT ?`
   ).bind(...binds, limit).all<any>();
 
@@ -1500,20 +1500,21 @@ export async function queryDealFlow(
     ).bind(...binds).all<any>(),
     env.D1.prepare(
       `SELECT p.id, p.canonical_name, p.sector_key, COALESCE(ps.label, p.sector_key) AS sector_label,
-              p.last_seen_at, p.signal_count, p.signal_strength_score, p.enrichment_priority
+              p.last_seen_at, p.signal_count, p.signal_strength, p.enrichment_priority
          FROM prospects p
          LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
         WHERE ${whereSql}
-        ORDER BY p.last_seen_at DESC NULLS LAST, p.signal_strength_score DESC
+        ORDER BY p.last_seen_at DESC NULLS LAST, p.signal_strength DESC
         LIMIT ?`
     ).bind(...binds, limit).all<any>(),
     env.D1.prepare(
-      `SELECT source_family, MIN(window_start) AS earliest_window_start,
-              MAX(window_end) AS latest_window_end,
-              SUM(items_scanned) AS items_scanned,
-              SUM(signals_recorded) AS signals_recorded,
-              MAX(completed_at) AS latest_completed_at
-         FROM prospect_backfill_coverage
+	      `SELECT source_family, MIN(window_start) AS earliest_window_start,
+	              MAX(window_end) AS latest_window_end,
+	              SUM(items_scanned) AS items_scanned,
+	              SUM(signals_recorded) AS signals_recorded,
+	              SUM(classifications_pending) AS classifications_pending,
+	              MAX(completed_at) AS latest_completed_at
+	         FROM prospect_backfill_coverage
         WHERE org_id = ?
         GROUP BY source_family`
     ).bind(ctx.orgId).all<any>(),
@@ -1656,7 +1657,7 @@ export async function getProspectEvidence(
   if (!input.prospect_id) return { error: 'PROSPECT_ID_REQUIRED', message: 'Provide prospect_id.' };
   const prospect = await env.D1.prepare(
     `SELECT p.id, p.canonical_name, p.status, p.sector_key, COALESCE(ps.label, p.sector_key) AS sector_label,
-            p.signal_count, p.signal_strength_score, p.signal_strength_reasons, p.enrichment_priority
+            p.signal_count, p.signal_strength, p.signal_strength_reasons, p.enrichment_priority
        FROM prospects p
        LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
       WHERE p.id = ? AND p.org_id = ? AND p.deleted_at IS NULL`

@@ -59,6 +59,7 @@ interface PredictionRecord {
   sector_confidence: number;
   reasoning: string | null;
   usage: { input_tokens: number; output_tokens: number; total_tokens: number };
+  cost_usd: number | null;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -237,6 +238,10 @@ function summarize(
       ? (usage.input_tokens / 1_000_000) * args.inputUsdPerMillion +
         (usage.output_tokens / 1_000_000) * args.outputUsdPerMillion
       : null;
+  const estimatedCostPerItemUsd =
+    estimatedCostUsd != null && predictions.length > 0
+      ? estimatedCostUsd / predictions.length
+      : null;
 
   const failingItems = predictions
     .filter(p =>
@@ -283,6 +288,7 @@ function summarize(
       ...usage,
       per_item_avg_tokens: predictions.length > 0 ? usage.total_tokens / predictions.length : null,
       estimated_cost_usd: estimatedCostUsd,
+      estimated_cost_per_item_usd: estimatedCostPerItemUsd,
     },
     failing_items: failingItems,
     predictions,
@@ -339,6 +345,11 @@ async function main(): Promise<void> {
       }, env);
       const inputTokens = decision.usage?.input_tokens || 0;
       const outputTokens = decision.usage?.output_tokens || 0;
+      const costUsd =
+        args.inputUsdPerMillion != null && args.outputUsdPerMillion != null
+          ? (inputTokens / 1_000_000) * args.inputUsdPerMillion +
+            (outputTokens / 1_000_000) * args.outputUsdPerMillion
+          : null;
       predictions.push({
         item_id: record.item_id,
         source_type: record.source_type,
@@ -356,6 +367,7 @@ async function main(): Promise<void> {
         sector_confidence: decision.sectorConfidence,
         reasoning: decision.reasoning,
         usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
+        cost_usd: costUsd,
       });
     }
 

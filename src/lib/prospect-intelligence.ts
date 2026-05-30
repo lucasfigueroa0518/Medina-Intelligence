@@ -1,6 +1,6 @@
 import type { Env } from '../types/env';
 import type { ClassifiedItem } from '../types/interfaces';
-import { callClaudeWithUsage } from './claude';
+import { callClaudeWithUsage, type ClaudeSystemPrompt } from './claude';
 import { emailDomain, getConfiguredInternalDomains, isInternalEmailDomain } from './internal-domains';
 
 export const PROSPECT_CLASSIFIER_VERSION = 'prospect-v1-llm-req-cl-2026-05-30';
@@ -55,6 +55,7 @@ export interface ProspectDetectionStats {
   mentions_seen: number;
   signals_recorded: number;
   prospects_upserted: number;
+  classifications_pending: number;
   skipped_known_deal: number;
   skipped_intro_source: number;
   skipped_news: number;
@@ -153,6 +154,7 @@ function emptyStats(items: number): ProspectDetectionStats {
     mentions_seen: 0,
     signals_recorded: 0,
     prospects_upserted: 0,
+    classifications_pending: 0,
     skipped_known_deal: 0,
     skipped_intro_source: 0,
     skipped_news: 0,
@@ -725,13 +727,13 @@ function classifierInputForRuntime(
   };
 }
 
-function buildProspectClassifierPrompt(input: ProspectClassifierInput): { system: string; user: string } {
+function buildProspectClassifierPrompt(input: ProspectClassifierInput): { system: string; systemForApi: ClaudeSystemPrompt; user: string } {
   const knownDeals = entityListForPrompt(input.knownContext.knownDeals);
   const knownDealmakers = entityListForPrompt(input.knownContext.knownDealmakers);
   const prefilterHints = JSON.stringify(input.prefilterHints);
   const sectorHints = JSON.stringify(input.sectorHints);
 
-  const system = `You classify one company-mention extracted from a single source item (an email, Slack
+  const staticSystem = `You classify one company-mention extracted from a single source item (an email, Slack
 message, meeting-transcript chunk, or document) for Medina Ventures, a venture capital
 firm. You output strict JSON and nothing else.
 
@@ -770,12 +772,6 @@ unclear, "uncategorized":
   ${PROSPECT_SECTOR_LABELS}
 Also output sector_confidence in [0,1].
 
-KNOWN deals / portfolio (names + domains): ${knownDeals}
-KNOWN dealmakers / intro sources (names + domains): ${knownDealmakers}
-
-Hints (heuristic pre-filter and sector hints -- WEAK signals, not ground truth; override
-them when the content disagrees): ${prefilterHints} ${sectorHints}
-
 Provisional examples until the gold-set dev split exists:
 Auguria with intro + deck -> {"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.9,"confidence":0.95,"reasoning":"Introduced as an investment opportunity with a deck."}
 Qunnect pitched to Mastercard -> {"mention_type":"known_deal","direction":"outbound","sector_key":"quantum","sector_confidence":0.9,"confidence":0.95,"reasoning":"Known portfolio/deal company being pitched outbound."}
@@ -788,13 +784,25 @@ Output ONLY this JSON object, no prose, no code fences:
 {"mention_type":"...","direction":"...","sector_key":"...","sector_confidence":0.0,"confidence":0.0,"reasoning":"one short sentence"}
 confidence is your overall confidence in the mention_type + direction call, in [0,1].`;
 
+  const dynamicSystem = `KNOWN deals / portfolio (names + domains): ${knownDeals}
+KNOWN dealmakers / intro sources (names + domains): ${knownDealmakers}
+
+Hints (heuristic pre-filter and sector hints -- WEAK signals, not ground truth; override
+them when the content disagrees): ${prefilterHints} ${sectorHints}`;
+
+  const system = `${staticSystem}\n\n${dynamicSystem}`;
+  const systemForApi: ClaudeSystemPrompt = [
+    { type: 'text', text: staticSystem, cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: dynamicSystem },
+  ];
+
   const user = `SOURCE_TYPE: ${input.sourceType}
 FROM / CONTEXT: ${input.senderAndContext}
 MENTION (the company in question): ${input.companyName}
 EXCERPT:
 ${input.rawExcerpt}`;
 
-  return { system, user };
+  return { system, systemForApi, user };
 }
 
 function parseProspectClassifierResponse(
@@ -825,7 +833,7 @@ export async function callProspectClassifier(
   const model = prospectClassifierModel(env);
   const prompt = buildProspectClassifierPrompt(input);
   const result = await callClaudeWithUsage(
-    { system: prompt.system, user: prompt.user, max_tokens: 500, orgId: input.orgId, model },
+    { system: prompt.systemForApi, user: prompt.user, max_tokens: 500, orgId: input.orgId, model },
     'low',
     env
   );
@@ -986,15 +994,21 @@ async function upsertSignal(args: {
   ingestionMode: 'live' | 'backfill';
 }, env: Env): Promise<{ insertedOrUpdated: boolean }> {
   const before = await env.D1.prepare(
-    `SELECT id, mention_type, direction, sector_key, confidence, classifier_version, prospect_id
+    `SELECT id, mention_type, direction, sector_key, confidence, classifier_version, prospect_id,
+            classification_status, resolution_status, classification_attempts, error_message
        FROM prospect_signals
       WHERE org_id = ? AND source_type = ? AND source_id = ? AND mention_ordinal = ?
       LIMIT 1`
   ).bind(args.orgId, args.sourceType, args.sourceId, args.mention.mentionOrdinal).first<{
     id: string; mention_type: string; direction: string; sector_key: string; confidence: number; classifier_version: string; prospect_id: string | null;
+    classification_status: string; resolution_status: string; classification_attempts: number; error_message: string | null;
   }>();
 
   const signalId = before?.id || crypto.randomUUID();
+  const resolutionStatus = args.cls.provisional || args.cls.directionUncertain || args.cls.sectorKey === 'uncategorized'
+    ? 'pending'
+    : 'resolved';
+  const attempts = Number(before?.classification_attempts || 0) + 1;
   const newClassification = {
     mention_type: args.cls.mentionType,
     direction: args.cls.direction,
@@ -1002,6 +1016,8 @@ async function upsertSignal(args: {
     confidence: args.cls.confidence,
     classifier_version: PROSPECT_CLASSIFIER_VERSION,
     prospect_id: args.prospectId,
+    classification_status: 'classified',
+    resolution_status: resolutionStatus,
   };
 
   await env.D1.prepare(
@@ -1010,6 +1026,7 @@ async function upsertSignal(args: {
        span_start, span_end, raw_mention_text, normalized_mention, source_title,
        occurred_at, direction, direction_source, direction_uncertain,
        mention_type, classifier_version, confidence, confidence_tier,
+       classification_status, resolution_status, error_message, classification_attempts, last_attempted_at,
        sector_key, sector_confidence, signal_kind, dealmaker_id, dealmaker_name,
        has_deck, has_meeting, ingestion_mode, metadata_json, created_at, updated_at
      ) VALUES (
@@ -1017,6 +1034,7 @@ async function upsertSignal(args: {
        ?, ?, ?, ?, ?,
        ?, ?, ?, ?,
        ?, ?, ?, ?,
+       ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'),
        ?, ?, ?, ?, ?,
        ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
      )
@@ -1035,6 +1053,11 @@ async function upsertSignal(args: {
        classifier_version = excluded.classifier_version,
        confidence = excluded.confidence,
        confidence_tier = excluded.confidence_tier,
+       classification_status = excluded.classification_status,
+       resolution_status = excluded.resolution_status,
+       error_message = excluded.error_message,
+       classification_attempts = excluded.classification_attempts,
+       last_attempted_at = excluded.last_attempted_at,
        sector_key = excluded.sector_key,
        sector_confidence = excluded.sector_confidence,
        signal_kind = excluded.signal_kind,
@@ -1065,6 +1088,10 @@ async function upsertSignal(args: {
     PROSPECT_CLASSIFIER_VERSION,
     args.cls.confidence,
     args.cls.confidenceTier,
+    'classified',
+    resolutionStatus,
+    null,
+    attempts,
     args.cls.sectorKey,
     args.cls.sectorConfidence,
     args.cls.signalKind,
@@ -1082,7 +1109,9 @@ async function upsertSignal(args: {
     before.sector_key !== args.cls.sectorKey ||
     Number(before.confidence) !== args.cls.confidence ||
     before.classifier_version !== PROSPECT_CLASSIFIER_VERSION ||
-    before.prospect_id !== args.prospectId
+    before.prospect_id !== args.prospectId ||
+    before.classification_status !== 'classified' ||
+    before.resolution_status !== resolutionStatus
   )) {
     await env.D1.prepare(
       `INSERT INTO prospect_classification_history
@@ -1099,6 +1128,87 @@ async function upsertSignal(args: {
   }
 
   return { insertedOrUpdated: true };
+}
+
+async function upsertFailedSignal(args: {
+  orgId: string;
+  sourceType: SourceType;
+  sourceId: string;
+  sourceTitle: string | null;
+  occurredAt: string;
+  mention: MentionCandidate;
+  ingestionMode: 'live' | 'backfill';
+  error: unknown;
+}, env: Env): Promise<void> {
+  const message = (args.error instanceof Error ? args.error.message : String(args.error || 'unknown'))
+    .slice(0, 1000);
+  const before = await env.D1.prepare(
+    `SELECT id, classification_attempts
+       FROM prospect_signals
+      WHERE org_id = ? AND source_type = ? AND source_id = ? AND mention_ordinal = ?
+      LIMIT 1`
+  ).bind(args.orgId, args.sourceType, args.sourceId, args.mention.mentionOrdinal).first<{
+    id: string; classification_attempts: number;
+  }>();
+  const attempts = Number(before?.classification_attempts || 0) + 1;
+
+  await env.D1.prepare(
+    `INSERT INTO prospect_signals (
+       id, org_id, prospect_id, source_type, source_id, mention_ordinal,
+       span_start, span_end, raw_mention_text, normalized_mention, source_title,
+       occurred_at, direction, direction_source, direction_uncertain,
+       mention_type, classifier_version, confidence, confidence_tier,
+       classification_status, resolution_status, error_message, classification_attempts, last_attempted_at,
+       sector_key, sector_confidence, signal_kind, has_deck, has_meeting,
+       ingestion_mode, metadata_json, created_at, updated_at
+     ) VALUES (
+       ?, ?, NULL, ?, ?, ?,
+       ?, ?, ?, ?, ?,
+       ?, 'inbound', 'llm', 0,
+       'noise', ?, 0, 'low',
+       'failed', 'pending', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+       'uncategorized', 0, 'unknown', 0, 0,
+       ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     )
+     ON CONFLICT(org_id, source_type, source_id, mention_ordinal) DO UPDATE SET
+       span_start = excluded.span_start,
+       span_end = excluded.span_end,
+       raw_mention_text = excluded.raw_mention_text,
+       normalized_mention = excluded.normalized_mention,
+       source_title = excluded.source_title,
+       occurred_at = excluded.occurred_at,
+       classifier_version = excluded.classifier_version,
+       classification_status = excluded.classification_status,
+       resolution_status = excluded.resolution_status,
+       error_message = excluded.error_message,
+       classification_attempts = excluded.classification_attempts,
+       last_attempted_at = excluded.last_attempted_at,
+       ingestion_mode = excluded.ingestion_mode,
+       metadata_json = json_patch(COALESCE(prospect_signals.metadata_json, '{}'), excluded.metadata_json),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(
+    before?.id || crypto.randomUUID(),
+    args.orgId,
+    args.sourceType,
+    args.sourceId,
+    args.mention.mentionOrdinal,
+    args.mention.spanStart,
+    args.mention.spanEnd,
+    args.mention.raw,
+    args.mention.normalizedName,
+    args.sourceTitle,
+    args.occurredAt,
+    PROSPECT_CLASSIFIER_VERSION,
+    message,
+    attempts,
+    args.ingestionMode,
+    JSON.stringify({
+      classifier: 'llm_req_cl',
+      classifier_error: message,
+      retriable: true,
+      req: 'REQ-AR-3',
+    })
+  ).run();
 }
 
 export function computeSignalStrength(input: {
@@ -1152,7 +1262,7 @@ async function refreshProspectAggregate(prospectId: string, orgId: string, env: 
             first_seen_at = ?,
             last_seen_at = ?,
             last_signal_at = ?,
-            signal_strength_score = ?,
+            signal_strength = ?,
             signal_strength_reasons = ?,
             enrichment_priority = ?,
             confidence = MAX(confidence, ?),
@@ -1207,14 +1317,32 @@ export async function detectAndRecordProspectSignals(
     if (!sourceType) continue;
     try {
       const fallbackName = await companyNameFor(item.companyId, orgId, env);
-      const mentions = extractMentionCandidatesFromText(`${item.subject || ''}\n${item.bodyText || ''}`, fallbackName);
-      stats.mentions_seen += mentions.length;
-      for (const mention of mentions) {
-        const existing = await lookupExistingContext(mention, item, orgId, env);
-        const cls = await classifyMention(item, mention, existing, knownContext, orgId, env);
-        const occurredAt = item.sentAt || new Date().toISOString();
-        let prospectId: string | null = null;
-        let dealmaker: { id: string | null; name: string | null } = { id: null, name: null };
+	      const mentions = extractMentionCandidatesFromText(`${item.subject || ''}\n${item.bodyText || ''}`, fallbackName);
+	      stats.mentions_seen += mentions.length;
+	      for (const mention of mentions) {
+	        const occurredAt = item.sentAt || new Date().toISOString();
+	        const existing = await lookupExistingContext(mention, item, orgId, env);
+	        let cls: Classification;
+	        try {
+	          cls = await classifyMention(item, mention, existing, knownContext, orgId, env);
+	        } catch (e) {
+	          await upsertFailedSignal({
+	            orgId,
+	            sourceType,
+	            sourceId: item.entityId,
+	            sourceTitle: item.subject || null,
+	            occurredAt,
+	            mention,
+	            ingestionMode,
+	            error: e,
+	          }, env);
+	          stats.signals_recorded++;
+	          stats.classifications_pending++;
+	          stats.errors.push({ item_id: item.entityId, error: e instanceof Error ? e.message : String(e) });
+	          continue;
+	        }
+	        let prospectId: string | null = null;
+	        let dealmaker: { id: string | null; name: string | null } = { id: null, name: null };
 
         if (cls.mentionType === 'inbound_prospect') {
           if (cls.hasWarmIntro) {
@@ -1269,34 +1397,36 @@ export async function recordProspectBackfillCoverage(
     sourceFamily: string;
     windowStart: string;
     windowEnd: string;
-    itemsScanned: number;
-    signalsRecorded: number;
-    prospectsUpserted: number;
-    status: 'completed' | 'partial' | 'failed';
-    error?: string | null;
-  }
+	    itemsScanned: number;
+	    signalsRecorded: number;
+	    prospectsUpserted: number;
+	    classificationsPending?: number;
+	    status: 'completed' | 'partial' | 'failed';
+	    error?: string | null;
+	  }
 ): Promise<void> {
   await env.D1.prepare(
-    `INSERT INTO prospect_backfill_coverage (
-       id, org_id, run_id, source_family, window_start, window_end,
-       status, items_scanned, signals_recorded, prospects_upserted,
-       started_at, completed_at, error_message, created_at, updated_at
-     ) VALUES (
-       ?, ?, ?, ?, ?, ?,
-       ?, ?, ?, ?,
-       strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?,
-       strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     )
+	    `INSERT INTO prospect_backfill_coverage (
+	       id, org_id, run_id, source_family, window_start, window_end,
+	       status, items_scanned, signals_recorded, prospects_upserted, classifications_pending,
+	       started_at, completed_at, error_message, created_at, updated_at
+	     ) VALUES (
+	       ?, ?, ?, ?, ?, ?,
+	       ?, ?, ?, ?, ?,
+	       strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?,
+	       strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	     )
      ON CONFLICT(org_id, source_family, window_start, window_end) DO UPDATE SET
        run_id = COALESCE(excluded.run_id, prospect_backfill_coverage.run_id),
        status = CASE
          WHEN prospect_backfill_coverage.status = 'completed' THEN prospect_backfill_coverage.status
          ELSE excluded.status
        END,
-       items_scanned = MAX(prospect_backfill_coverage.items_scanned, excluded.items_scanned),
-       signals_recorded = MAX(prospect_backfill_coverage.signals_recorded, excluded.signals_recorded),
-       prospects_upserted = MAX(prospect_backfill_coverage.prospects_upserted, excluded.prospects_upserted),
-       completed_at = excluded.completed_at,
+	       items_scanned = MAX(prospect_backfill_coverage.items_scanned, excluded.items_scanned),
+	       signals_recorded = MAX(prospect_backfill_coverage.signals_recorded, excluded.signals_recorded),
+	       prospects_upserted = MAX(prospect_backfill_coverage.prospects_upserted, excluded.prospects_upserted),
+	       classifications_pending = excluded.classifications_pending,
+	       completed_at = excluded.completed_at,
        error_message = excluded.error_message,
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
   ).bind(
@@ -1307,12 +1437,13 @@ export async function recordProspectBackfillCoverage(
     input.windowStart,
     input.windowEnd,
     input.status,
-    input.itemsScanned,
-    input.signalsRecorded,
-    input.prospectsUpserted,
-    input.error || null
-  ).run();
-}
+	    input.itemsScanned,
+	    input.signalsRecorded,
+	    input.prospectsUpserted,
+	    input.classificationsPending || 0,
+	    input.error || null
+	  ).run();
+	}
 
 export async function runProspectReconciliation(orgId: string, env: Env): Promise<{ scanned: number; converted: number; duplicate_links: number }> {
   const rows = await env.D1.prepare(
