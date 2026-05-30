@@ -45,6 +45,7 @@ class FakeD1 {
   prospects: any[] = [];
   prospectSignals: any[] = [];
   classificationHistory: any[] = [];
+  classifierSamples: any[] = [];
   coverage: any[] = [];
 
   prepare(sql: string): FakeStatement {
@@ -153,6 +154,32 @@ class FakeD1 {
         previous_classification_json: binds[4],
         new_classification_json: binds[5],
       });
+      return;
+    }
+
+    if (/INSERT INTO prospect_classifier_samples/i.test(sql)) {
+      const existing = this.classifierSamples.find(row =>
+        row.org_id === binds[1] &&
+        row.source_type === binds[3] &&
+        row.source_id === binds[4] &&
+        row.mention_ordinal === binds[5]
+      );
+      const row = existing || {};
+      Object.assign(row, {
+        id: binds[0],
+        org_id: binds[1],
+        prospect_signal_id: binds[2],
+        source_type: binds[3],
+        source_id: binds[4],
+        mention_ordinal: binds[5],
+        sample_reason: binds[6],
+        confidence_tier: binds[7],
+        predicted_mention_type: binds[8],
+        predicted_direction: binds[9],
+        predicted_sector_key: binds[10],
+        label_status: 'unlabeled',
+      });
+      if (!existing) this.classifierSamples.push(row);
       return;
     }
 
@@ -299,7 +326,7 @@ describe('prospect intelligence deterministic signals', () => {
       sentAt: '2026-05-01T00:00:00.000Z',
     };
     const [mention] = extractMentionCandidatesFromText(item.bodyText);
-    const existing = { companyId: null, dealId: null, relationshipStates: [], isInternal: false, matchStrength: 'none' as const };
+    const existing = { companyId: null, dealId: null, companyDomain: null, relationshipStates: [], isInternal: false, matchStrength: 'none' as const };
     const prefilter = buildClassifierPrefilter(item, mention, existing, {} as any);
     const input = classifierInputForRuntime(item, mention, existing, prefilter, {
       knownDeals: [{ name: 'Qunnect', domain: 'qunnect.io' }],
@@ -375,6 +402,51 @@ describe('prospect intelligence deterministic signals', () => {
     expect(candidate.canonicalName).toBe('Auguria');
   });
 
+  it('parses curated dealflow lists beyond the generic extractor cap and preserves per-company fields', () => {
+    const { parseDealflowList } = __prospectIntelligenceTestHooks;
+    const lines = Array.from({ length: 15 }, (_, index) =>
+      `- ArmyCo${index + 1} - Seed - $${index + 1}M - website armyco${index + 1}.com - POC founder${index + 1}@armyco${index + 1}.com - Problem: rugged sensors - Approach: autonomy stack`
+    );
+
+    const candidates = parseDealflowList(`ArmyFUZE cohort shortlist\n${lines.join('\n')}`);
+
+    expect(candidates).toHaveLength(15);
+    expect(candidates[0]).toMatchObject({
+      canonicalName: 'ArmyCo1',
+      mentionOrdinal: 1,
+      isListEntry: true,
+      listFields: {
+        stage: 'Seed',
+        amount: '$1M',
+        website: 'founder1@armyco1.com'.split('@')[1],
+      },
+    });
+    expect(candidates[14].mentionOrdinal).toBe(15);
+  });
+
+  it('prefilter drops obvious non-dealflow sources before an LLM call', async () => {
+    callClaudeWithUsageMock.mockReset();
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-ramp',
+      source: 'email',
+      subject: 'Ramp receipt',
+      bodyText: 'Ramp bill and payment receipt for May.',
+      bodyPreview: 'Ramp bill',
+      fromEmail: 'receipts@ramp.com',
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(stats.prefilter_dropped).toBe(1);
+    expect(stats.signals_recorded).toBe(0);
+    expect(callClaudeWithUsageMock).not.toHaveBeenCalled();
+  });
+
   it('marks the static classifier context for Anthropic prompt caching', () => {
     const { buildClassifierPrefilter, buildProspectClassifierPrompt, classifierInputForRuntime } = __prospectIntelligenceTestHooks;
     const item: any = {
@@ -384,7 +456,7 @@ describe('prospect intelligence deterministic signals', () => {
       fromEmail: 'alice@example.com',
     };
     const [mention] = extractMentionCandidatesFromText(item.bodyText);
-    const existing = { companyId: null, dealId: null, relationshipStates: [], isInternal: false, matchStrength: 'none' as const };
+    const existing = { companyId: null, dealId: null, companyDomain: null, relationshipStates: [], isInternal: false, matchStrength: 'none' as const };
     const prefilter = buildClassifierPrefilter(item, mention, existing, {} as any);
     const prompt = buildProspectClassifierPrompt(classifierInputForRuntime(item, mention, existing, prefilter, {
       knownDeals: [],
@@ -470,6 +542,77 @@ describe('prospect intelligence deterministic signals', () => {
     expect(db.classificationHistory).toHaveLength(1);
   });
 
+  it('commits medium-confidence classifications as final metadata and samples them for monitoring', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValueOnce({
+      text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.8,"confidence":0.7,"reasoning":"Potential investment context."}',
+      usage: { input_tokens: 90, output_tokens: 20 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-medium',
+      source: 'email',
+      subject: 'Intro to Auguria',
+      bodyText: 'Warm intro to Auguria for a security platform.',
+      bodyPreview: 'Warm intro to Auguria',
+      fromEmail: 'alice@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
+    expect(stats.classifications_pending).toBe(0);
+    expect(stats.production_samples_recorded).toBe(1);
+    expect(db.prospects[0]).toMatchObject({ status: 'active', provisional: 0 });
+    expect(db.prospectSignals[0]).toMatchObject({
+      confidence_tier: 'medium',
+      resolution_status: 'resolved',
+    });
+    expect(db.classifierSamples[0]).toMatchObject({
+      source_id: 'conv-medium',
+      sample_reason: 'medium_confidence',
+      label_status: 'unlabeled',
+    });
+  });
+
+  it('downgrades LLM direction conflicts to provisional direction_uncertain metadata', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValueOnce({
+      text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.8,"confidence":0.95,"reasoning":"Looks like an intro."}',
+      usage: { input_tokens: 90, output_tokens: 20 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-direction',
+      source: 'email',
+      subject: 'Intro to Auguria',
+      bodyText: 'Auguria founder@auguria.com would be a good customer intro.',
+      bodyPreview: 'Auguria customer intro',
+      fromEmail: 'lucas@medinavc.com',
+      toEmails: ['founder@auguria.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(db.prospects[0]).toMatchObject({ status: 'provisional', provisional: 1, direction_uncertain: 1 });
+    expect(db.prospectSignals[0]).toMatchObject({
+      confidence: 0.54,
+      confidence_tier: 'low',
+      direction_uncertain: 1,
+      resolution_status: 'pending',
+    });
+    expect(db.classifierSamples[0].sample_reason).toBe('direction_uncertain');
+  });
+
   it('keeps migration 0114 aligned with the reconciled prospect contract', () => {
     const sql = readFileSync('migrations/0114_prospect_intelligence.sql', 'utf8');
 
@@ -480,6 +623,7 @@ describe('prospect intelligence deterministic signals', () => {
     expect(sql).toContain('classification_status TEXT NOT NULL DEFAULT');
     expect(sql).toContain('resolution_status TEXT NOT NULL DEFAULT');
     expect(sql).toContain('classifications_pending INTEGER NOT NULL DEFAULT 0');
+    expect(sql).toContain('prospect_classifier_samples');
     expect(sql).not.toMatch(/thesis_score|thesis_band|review_queue/i);
     expect(sql).not.toMatch(/ALTER TABLE\s+deals[\s\S]*prospect_id/i);
   });

@@ -202,6 +202,33 @@ CREATE TABLE IF NOT EXISTS prospect_soft_links (
 CREATE INDEX IF NOT EXISTS idx_prospect_soft_links_prospect
   ON prospect_soft_links(prospect_id, link_type);
 
+CREATE TABLE IF NOT EXISTS prospect_classifier_samples (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  prospect_signal_id TEXT REFERENCES prospect_signals(id) ON DELETE SET NULL,
+  source_type TEXT NOT NULL CHECK(source_type IN ('conversation','event','document')),
+  source_id TEXT NOT NULL,
+  mention_ordinal INTEGER NOT NULL,
+  sample_reason TEXT NOT NULL,
+  confidence_tier TEXT NOT NULL CHECK(confidence_tier IN ('high','medium','low')),
+  predicted_mention_type TEXT NOT NULL,
+  predicted_direction TEXT NOT NULL,
+  predicted_sector_key TEXT NOT NULL,
+  label_status TEXT NOT NULL DEFAULT 'unlabeled'
+    CHECK(label_status IN ('unlabeled','labeled','adjudicated')),
+  gold_mention_type TEXT,
+  gold_direction TEXT,
+  gold_sector_key TEXT,
+  sampled_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  labeled_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(org_id, source_type, source_id, mention_ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prospect_classifier_samples_status
+  ON prospect_classifier_samples(org_id, label_status, sampled_at DESC);
+
 CREATE TABLE IF NOT EXISTS prospect_backfill_runs (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,

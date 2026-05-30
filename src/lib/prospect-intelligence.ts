@@ -5,6 +5,7 @@ import { emailDomain, getConfiguredInternalDomains, isInternalEmailDomain } from
 
 export const PROSPECT_CLASSIFIER_VERSION = 'prospect-v1-llm-req-cl-2026-05-30';
 const PROSPECT_CLASSIFIER_DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+const DEFAULT_PROSPECT_PRODUCTION_SAMPLE_RATE = 0.02;
 
 export const PROSPECT_SECTOR_TAXONOMY = [
   { key: 'ai_data', label: 'AI / Data' },
@@ -56,6 +57,8 @@ export interface ProspectDetectionStats {
   signals_recorded: number;
   prospects_upserted: number;
   classifications_pending: number;
+  prefilter_dropped: number;
+  production_samples_recorded: number;
   skipped_known_deal: number;
   skipped_intro_source: number;
   skipped_news: number;
@@ -74,14 +77,16 @@ interface MentionCandidate {
   lineText: string;
   isListEntry: boolean;
   products: string[];
+  listFields?: ParsedDealflowListFields;
 }
 
 interface ExistingContext {
   companyId: string | null;
   dealId: string | null;
+  companyDomain: string | null;
   relationshipStates: string[];
   isInternal: boolean;
-  matchStrength: 'none' | 'name' | 'company_id';
+  matchStrength: 'none' | 'name' | 'domain' | 'company_id';
 }
 
 interface Classification {
@@ -100,6 +105,8 @@ interface Classification {
   possibleCompanyId: string | null;
   possibleDealId: string | null;
   provisional: boolean;
+  sampledForProduction: boolean;
+  samplingReason: string | null;
   metadata: Record<string, unknown>;
 }
 
@@ -148,6 +155,15 @@ export interface ProspectClassifierInput {
   orgId: string;
 }
 
+export interface ParsedDealflowListFields {
+  stage?: string | null;
+  amount?: string | null;
+  website?: string | null;
+  poc?: string | null;
+  problem?: string | null;
+  approach?: string | null;
+}
+
 function emptyStats(items: number): ProspectDetectionStats {
   return {
     items_scanned: items,
@@ -155,6 +171,8 @@ function emptyStats(items: number): ProspectDetectionStats {
     signals_recorded: 0,
     prospects_upserted: 0,
     classifications_pending: 0,
+    prefilter_dropped: 0,
+    production_samples_recorded: 0,
     skipped_known_deal: 0,
     skipped_intro_source: 0,
     skipped_news: 0,
@@ -190,6 +208,7 @@ function canonicalizeMention(raw: string): { canonicalName: string; products: st
     .replace(/^[\-*•\d.)\s]+/, '')
     .replace(/\s+/g, ' ')
     .replace(/[,:;]+$/g, '')
+    .replace(/\s+\b(?:for|to|from|with|and|the)\b$/i, '')
     .trim();
   const parts = cleaned.split(/\s+\/\s+/).map(p => p.trim()).filter(Boolean);
   if (parts.length > 1) {
@@ -257,12 +276,17 @@ function isNewsletterLike(item: ClassifiedItem): boolean {
   return item.type === 'news';
 }
 
-function inferDirection(item: ClassifiedItem, env: Env): DeterministicDirection {
+function inferDirection(item: ClassifiedItem, env: Env, companyDomain?: string | null): DeterministicDirection {
   if (item.direction) return item.direction;
   if (item.type === 'news') return 'news';
   const internalDomains = getConfiguredInternalDomains(env);
   const fromInternal = isInternalEmailDomain(item.fromEmail, internalDomains);
+  const fromDomain = emailDomain(item.fromEmail);
   const recipients = [...(item.toEmails || []), ...(item.ccEmails || [])].filter(Boolean);
+  const recipientDomains = recipients.map(email => emailDomain(email)).filter(Boolean) as string[];
+  const normalizedCompanyDomain = companyDomain?.trim().toLowerCase() || null;
+  if (normalizedCompanyDomain && fromDomain === normalizedCompanyDomain) return 'inbound';
+  if (normalizedCompanyDomain && fromInternal && recipientDomains.includes(normalizedCompanyDomain)) return 'outbound';
   if (fromInternal && recipients.length > 0 && recipients.every(email => isInternalEmailDomain(email, internalDomains))) return 'internal';
   if (fromInternal) return 'outbound';
   if (item.type === 'slack_message') return 'internal';
@@ -306,7 +330,9 @@ function confidenceTierFor(confidence: number): ConfidenceTier {
   return confidence >= 0.82 ? 'high' : confidence >= 0.55 ? 'medium' : 'low';
 }
 
-function prospectClassifierModel(env: Env): string {
+function prospectClassifierModel(env: Env, input?: ProspectClassifierInput): string {
+  const isListEntry = Boolean((input?.prefilterHints as any)?.mention?.parse_dealflow_list);
+  if (isListEntry && env.PROSPECT_LIST_CLASSIFIER_MODEL) return env.PROSPECT_LIST_CLASSIFIER_MODEL;
   return env.PROSPECT_CLASSIFIER_MODEL || env.MARTY_LAB_HAIKU_MODEL || PROSPECT_CLASSIFIER_DEFAULT_MODEL;
 }
 
@@ -343,12 +369,44 @@ function parseUnitConfidence(value: unknown, field: string): number {
   return n;
 }
 
-export function extractMentionCandidatesFromText(text: string, fallbackName?: string | null): MentionCandidate[] {
+function productionSampleRate(env: Env): number {
+  const n = Number(env.PROSPECT_PRODUCTION_SAMPLE_RATE);
+  if (!Number.isFinite(n)) return DEFAULT_PROSPECT_PRODUCTION_SAMPLE_RATE;
+  return clamp(n, 0, 1);
+}
+
+function stableSampleBucket(key: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 0xffffffff;
+}
+
+function productionSamplingDecision(args: {
+  orgId: string;
+  item: ClassifiedItem;
+  mention: MentionCandidate;
+  confidenceTier: ConfidenceTier;
+  directionUncertain: boolean;
+  env: Env;
+}): { sampled: boolean; reason: string | null } {
+  if (args.directionUncertain) return { sampled: true, reason: 'direction_uncertain' };
+  if (args.confidenceTier === 'medium') return { sampled: true, reason: 'medium_confidence' };
+  if (args.confidenceTier === 'low') return { sampled: true, reason: 'low_confidence' };
+  const key = `${args.orgId}:${args.item.entityType}:${args.item.entityId}:${args.mention.mentionOrdinal}:${PROSPECT_CLASSIFIER_VERSION}`;
+  return stableSampleBucket(key) < productionSampleRate(args.env)
+    ? { sampled: true, reason: 'random_live_sample' }
+    : { sampled: false, reason: null };
+}
+
+export function extractMentionCandidatesFromText(text: string, fallbackName?: string | null, maxCandidates = 12): MentionCandidate[] {
   const candidates: MentionCandidate[] = [];
   const seen = new Set<string>();
   let ordinal = 1;
 
-  function push(raw: string, lineText: string, lineOffset: number | null, isListEntry: boolean): void {
+  function push(raw: string, lineText: string, lineOffset: number | null, isListEntry: boolean, listFields?: ParsedDealflowListFields): void {
     const { canonicalName, products } = canonicalizeMention(raw);
     if (isGenericCandidate(canonicalName)) return;
     const normalizedName = normalizeProspectName(canonicalName);
@@ -366,6 +424,7 @@ export function extractMentionCandidatesFromText(text: string, fallbackName?: st
       lineText: lineText.slice(0, 500),
       isListEntry,
       products,
+      listFields,
     });
   }
 
@@ -390,7 +449,7 @@ export function extractMentionCandidatesFromText(text: string, fallbackName?: st
     const intro = trimmed.match(/\b(?:intro(?:ducing)?|meet)\s+(?:to\s+|for\s+)?([A-Z][A-Za-z0-9&.'’/-]+(?:\s+[A-Z][A-Za-z0-9&.'’/-]+){0,4})\b/i);
     if (intro) push(intro[1], line, offset, isListEntry);
 
-    if (candidates.length >= 12) break;
+    if (candidates.length >= maxCandidates) break;
     offset += line.length + 1;
   }
 
@@ -398,6 +457,83 @@ export function extractMentionCandidatesFromText(text: string, fallbackName?: st
     push(fallbackName, fallbackName, null, false);
   }
 
+  return candidates;
+}
+
+function isDealflowListText(text: string): boolean {
+  const listLines = text
+    .split(/\n+/)
+    .filter(line => /^\s*(?:[-*•]|\d+[.)])\s+/.test(line) && /[A-Z][A-Za-z0-9&.'’/-]+/.test(line));
+  if (listLines.length >= 3) return true;
+  return /\b(armyfuze|cohort|batch|portfolio day|demo day|dealflow list|companies below|shortlist)\b/i.test(text) && listLines.length >= 2;
+}
+
+function fieldAfter(label: string, line: string): string | null {
+  const match = line.match(new RegExp(`\\b(?:${label})\\s*[:=-]\\s*([^|;]+)`, 'i'));
+  return match ? normalizeWhitespace(match[1]).slice(0, 160) : null;
+}
+
+function parseListFields(line: string): ParsedDealflowListFields {
+  const amount = line.match(/\$[0-9][0-9.,]*(?:\s?(?:k|m|mm|million|b))?/i)?.[0] || null;
+  const website = domainInText(line);
+  const poc = emailInText(line) || fieldAfter('poc|contact|founder', line);
+  const stage = line.match(/\b(pre[-\s]?seed|seed|series\s+[abc]|growth|pilot|pre[-\s]?revenue)\b/i)?.[0] || null;
+  return {
+    stage,
+    amount,
+    website,
+    poc,
+    problem: fieldAfter('problem', line),
+    approach: fieldAfter('approach|solution', line),
+  };
+}
+
+export function parseDealflowList(text: string, fallbackName?: string | null): MentionCandidate[] {
+  if (!isDealflowListText(text)) {
+    return extractMentionCandidatesFromText(text, fallbackName);
+  }
+  const candidates: MentionCandidate[] = [];
+  const seen = new Set<string>();
+  let ordinal = 1;
+  let offset = 0;
+  for (const line of text.split(/\n+/)) {
+    const trimmed = line.trim();
+    const isListEntry = /^\s*(?:[-*•]|\d+[.)])\s+/.test(line);
+    if (!isListEntry) {
+      offset += line.length + 1;
+      continue;
+    }
+    const name = trimmed.match(/^(?:[-*•]|\d+[.)])\s*([A-Z][A-Za-z0-9&.'’/-]+(?:\s+[A-Z][A-Za-z0-9&.'’/-]+){0,4})(?:\s*(?:[-—–:|,]|\s\/\s|\(|$))/)?.[1];
+    if (!name) {
+      offset += line.length + 1;
+      continue;
+    }
+    const { canonicalName, products } = canonicalizeMention(name);
+    const normalizedName = normalizeProspectName(canonicalName);
+    if (!normalizedName || seen.has(normalizedName) || isGenericCandidate(canonicalName)) {
+      offset += line.length + 1;
+      continue;
+    }
+    seen.add(normalizedName);
+    const localIndex = line.indexOf(name);
+    const spanStart = localIndex < 0 ? null : offset + localIndex;
+    candidates.push({
+      raw: name,
+      canonicalName,
+      normalizedName,
+      mentionOrdinal: ordinal++,
+      spanStart,
+      spanEnd: spanStart == null ? null : spanStart + name.length,
+      lineText: line.slice(0, 500),
+      isListEntry: true,
+      products,
+      listFields: parseListFields(line),
+    });
+    offset += line.length + 1;
+  }
+  if (candidates.length === 0 && fallbackName) {
+    return extractMentionCandidatesFromText(text, fallbackName);
+  }
   return candidates;
 }
 
@@ -416,6 +552,7 @@ async function lookupExistingContext(
   env: Env
 ): Promise<ExistingContext> {
   const candidates: Array<{ id: string; name: string; domain: string | null; is_internal_entity: number | null }> = [];
+  const mentionDomain = domainFromMention(item, mention);
 
   if (item.companyId) {
     const direct = await env.D1.prepare(
@@ -424,6 +561,16 @@ async function lookupExistingContext(
         WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
     ).bind(item.companyId, orgId).first<{ id: string; name: string; domain: string | null; is_internal_entity: number | null }>();
     if (direct) candidates.push(direct);
+  }
+
+  if (mentionDomain) {
+    const byDomain = await env.D1.prepare(
+      `SELECT id, name, domain, is_internal_entity
+         FROM companies
+        WHERE org_id = ? AND deleted_at IS NULL AND lower(domain) = lower(?)
+        LIMIT 1`
+    ).bind(orgId, mentionDomain).first<{ id: string; name: string; domain: string | null; is_internal_entity: number | null }>();
+    if (byDomain) candidates.push(byDomain);
   }
 
   const token = mention.canonicalName.split(/\s+/)[0]?.toLowerCase();
@@ -438,8 +585,13 @@ async function lookupExistingContext(
   }
 
   const deduped = new Map(candidates.map(c => [c.id, c]));
-  const match = Array.from(deduped.values()).find(c => normalizeProspectName(c.name) === mention.normalizedName);
-  if (!match) return { companyId: null, dealId: null, relationshipStates: [], isInternal: false, matchStrength: 'none' };
+  const allCandidates = Array.from(deduped.values());
+  const domainMatch = mentionDomain
+    ? allCandidates.find(c => c.domain && c.domain.toLowerCase() === mentionDomain)
+    : null;
+  const nameMatch = allCandidates.find(c => normalizeProspectName(c.name) === mention.normalizedName);
+  const match = domainMatch || nameMatch;
+  if (!match) return { companyId: null, dealId: null, companyDomain: mentionDomain, relationshipStates: [], isInternal: false, matchStrength: 'none' };
 
   const relationships = await env.D1.prepare(
     `SELECT relationship_state
@@ -457,9 +609,10 @@ async function lookupExistingContext(
   return {
     companyId: match.id,
     dealId: deal?.id || null,
+    companyDomain: match.domain || mentionDomain || null,
     relationshipStates: relationships.results.map(r => r.relationship_state),
     isInternal: match.is_internal_entity === 1,
-    matchStrength: item.companyId === match.id ? 'company_id' : 'name',
+    matchStrength: item.companyId === match.id ? 'company_id' : domainMatch ? 'domain' : 'name',
   };
 }
 
@@ -526,6 +679,10 @@ function domainInText(text: string): string | null {
   if (email) return emailDomain(email);
   const match = text.match(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b/i);
   return match ? match[1].toLowerCase() : null;
+}
+
+function domainFromMention(item: ClassifiedItem, mention: MentionCandidate): string | null {
+  return domainInText(`${mention.lineText}\n${item.bodyPreview || ''}\n${item.bodyText || ''}`);
 }
 
 async function upsertDealmakerIdentity(
@@ -618,7 +775,7 @@ function buildClassifierPrefilter(
   existing: ExistingContext,
   env: Env
 ): ClassifierPrefilter {
-  const deterministicDirection = inferDirection(item, env);
+  const deterministicDirection = inferDirection(item, env, existing.companyDomain || domainFromMention(item, mention));
   const newsletter = isNewsletterLike(item);
   const hasDeck = hasDeckSignal(item);
   const hasMeeting = hasMeetingSignal(item);
@@ -651,6 +808,41 @@ function buildClassifierPrefilter(
   };
 }
 
+function sourcePrefilter(item: ClassifiedItem, env: Env): { shouldScan: boolean; reasons: string[] } {
+  const from = `${item.fromEmail || ''} ${item.fromName || ''}`.toLowerCase();
+  const subject = (item.subject || '').toLowerCase();
+  const body = `${item.bodyPreview || ''}\n${item.bodyText || ''}\n${item.text || ''}`.toLowerCase();
+  const haystack = `${from}\n${subject}\n${body}`;
+  const allowSignals = [
+    /\b(intro|introduc|deal\s?flow|pitch deck|deck attached|cim|teaser|data room|raising|fundraise|series [abc]|seed round|demo day|armyfuze)\b/,
+    /#dealflow-pipeline/i,
+  ];
+  if (allowSignals.some(re => re.test(haystack))) {
+    return { shouldScan: true, reasons: ['dealflow_allow_signal'] };
+  }
+  if (hasDeckSignal(item) || isDealflowListText(`${item.subject || ''}\n${item.bodyText || ''}\n${item.text || ''}`)) {
+    return { shouldScan: true, reasons: ['deck_or_list_allow_signal'] };
+  }
+  const dropChecks: Array<[RegExp, string]> = [
+    [/\b(invoice|receipt|bill|billing|payment due|statement)\b/, 'billing_or_invoice'],
+    [/\b(fund admin|capital call|tax document|k-1|schedule k|trustserve|ramp)\b/, 'fund_admin_or_expense'],
+    [/\b(counsel|legal notice|engagement letter|gtlaw\.com)\b/, 'legal_or_counsel'],
+    [/\b(website visit|visitors?|analytics|utm_|page views?|services@)\b/, 'web_analytics_summary'],
+    [/\b(4th grade|school trip|birthday|dinner reservation|personal)\b/, 'personal_or_family'],
+  ];
+  const matched = dropChecks.find(([re]) => re.test(haystack));
+  if (matched) return { shouldScan: false, reasons: [matched[1]] };
+
+  const internalDomains = getConfiguredInternalDomains(env);
+  if (item.type === 'slack_message' && !/#dealflow-pipeline/i.test(`${item.subject || ''}\n${item.bodyText || ''}`)) {
+    return { shouldScan: true, reasons: ['slack_internal_pass_to_classifier'] };
+  }
+  if (item.fromEmail && isInternalEmailDomain(item.fromEmail, internalDomains) && /\b(customer|bd|sales|partnership)\b/.test(haystack)) {
+    return { shouldScan: true, reasons: ['outbound_bd_pass_to_classifier'] };
+  }
+  return { shouldScan: true, reasons: [] };
+}
+
 function sourceTypeForPrompt(item: ClassifiedItem): string {
   if (item.type === 'email') return 'email';
   if (item.type === 'slack_message') return 'Slack';
@@ -669,6 +861,7 @@ function senderAndContextForPrompt(item: ClassifiedItem, existing: ExistingConte
     existing.relationshipStates.length ? `matched firm relationship states: ${existing.relationshipStates.join(', ')}` : '',
     existing.dealId ? `matched existing deal id: ${existing.dealId}` : '',
     existing.companyId ? `matched company id: ${existing.companyId}` : '',
+    existing.companyDomain ? `matched company domain: ${existing.companyDomain}` : '',
   ].filter(Boolean);
   return compactClassifierText(parts.join(' | '), 900);
 }
@@ -715,10 +908,13 @@ function classifierInputForRuntime(
         normalized_name: mention.normalizedName,
         is_list_entry: mention.isListEntry,
         products: mention.products,
+        parse_dealflow_list: Boolean(mention.listFields),
+        list_fields: mention.listFields || null,
       },
       crm_context: {
         matched_company_id: existing.companyId,
         matched_open_deal_id: existing.dealId,
+        matched_company_domain: existing.companyDomain,
         relationship_states: existing.relationshipStates,
         matched_internal_company: existing.isInternal,
         match_strength: existing.matchStrength,
@@ -830,7 +1026,7 @@ export async function callProspectClassifier(
   if (input.prefilterHints.should_classify === false) {
     throw new Error('PREFILTER_REJECTED_CLASSIFIER_CALL');
   }
-  const model = prospectClassifierModel(env);
+  const model = prospectClassifierModel(env, input);
   const prompt = buildProspectClassifierPrompt(input);
   const result = await callClaudeWithUsage(
     { system: prompt.systemForApi, user: prompt.user, max_tokens: 500, orgId: input.orgId, model },
@@ -855,10 +1051,22 @@ async function classifyMention(
   const directionUncertain =
     prefilter.deterministicDirection !== 'unknown' &&
     prefilter.deterministicDirection !== llm.direction;
+  const effectiveConfidence = directionUncertain
+    ? Math.min(llm.confidence, 0.54)
+    : llm.confidence;
+  const confidenceTier = confidenceTierFor(effectiveConfidence);
+  const sampling = productionSamplingDecision({
+    orgId,
+    item,
+    mention,
+    confidenceTier,
+    directionUncertain,
+    env,
+  });
 
   let possibleCompanyId: string | null = null;
   let possibleDealId: string | null = null;
-  let provisional = llm.confidence < 0.82 || directionUncertain;
+  let provisional = confidenceTier === 'low' || directionUncertain;
 
   if (llm.mentionType === 'inbound_prospect') {
     possibleCompanyId = existing.companyId;
@@ -870,8 +1078,8 @@ async function classifyMention(
     direction: llm.direction,
     directionUncertain,
     mentionType: llm.mentionType,
-    confidence: llm.confidence,
-    confidenceTier: confidenceTierFor(llm.confidence),
+    confidence: effectiveConfidence,
+    confidenceTier,
     sectorKey: llm.sectorKey,
     sectorConfidence: llm.sectorConfidence,
     signalKind: prefilter.signalKind,
@@ -882,18 +1090,30 @@ async function classifyMention(
     possibleCompanyId,
     possibleDealId,
     provisional,
+    sampledForProduction: sampling.sampled,
+    samplingReason: sampling.reason,
     metadata: {
       classifier: 'llm_req_cl',
       classifier_model: llm.model,
       llm_reasoning: llm.reasoning,
+      llm_confidence: llm.confidence,
+      effective_confidence: effectiveConfidence,
       llm_usage: llm.usage || null,
       prefilter,
       products: mention.products,
+      list_fields: mention.listFields || null,
       from_domain: emailDomain(item.fromEmail),
       source_direction: item.direction || null,
       deterministic_direction: prefilter.deterministicDirection,
       deterministic_direction_disagreed: directionUncertain,
       deterministic_portfolio_hint: portfolio,
+      confidence_tier_routing: {
+        req: 'REQ-VAL-5',
+        tier: confidenceTier,
+        provisional,
+        production_sampled: sampling.sampled,
+        sampling_reason: sampling.reason,
+      },
     },
   };
 }
@@ -901,6 +1121,7 @@ async function classifyMention(
 function prospectSourceType(item: ClassifiedItem): SourceType | null {
   if (item.entityType === 'event') return 'event';
   if (item.entityType === 'conversation') return 'conversation';
+  if ((item as any).entityType === 'document') return 'document';
   return null;
 }
 
@@ -992,7 +1213,7 @@ async function upsertSignal(args: {
   dealmakerId: string | null;
   dealmakerName: string | null;
   ingestionMode: 'live' | 'backfill';
-}, env: Env): Promise<{ insertedOrUpdated: boolean }> {
+}, env: Env): Promise<{ signalId: string }> {
   const before = await env.D1.prepare(
     `SELECT id, mention_type, direction, sector_key, confidence, classifier_version, prospect_id,
             classification_status, resolution_status, classification_attempts, error_message
@@ -1127,7 +1348,50 @@ async function upsertSignal(args: {
     ).run();
   }
 
-  return { insertedOrUpdated: true };
+  return { signalId };
+}
+
+async function recordProductionSample(args: {
+  orgId: string;
+  signalId: string;
+  sourceType: SourceType;
+  sourceId: string;
+  mention: MentionCandidate;
+  cls: Classification;
+}, env: Env): Promise<boolean> {
+  if (!args.cls.sampledForProduction || !args.cls.samplingReason) return false;
+  await env.D1.prepare(
+    `INSERT INTO prospect_classifier_samples (
+       id, org_id, prospect_signal_id, source_type, source_id, mention_ordinal,
+       sample_reason, confidence_tier, predicted_mention_type, predicted_direction,
+       predicted_sector_key, label_status, created_at, updated_at
+     ) VALUES (
+       ?, ?, ?, ?, ?, ?,
+       ?, ?, ?, ?,
+       ?, 'unlabeled', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     )
+     ON CONFLICT(org_id, source_type, source_id, mention_ordinal) DO UPDATE SET
+       prospect_signal_id = excluded.prospect_signal_id,
+       sample_reason = excluded.sample_reason,
+       confidence_tier = excluded.confidence_tier,
+       predicted_mention_type = excluded.predicted_mention_type,
+       predicted_direction = excluded.predicted_direction,
+       predicted_sector_key = excluded.predicted_sector_key,
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(
+    crypto.randomUUID(),
+    args.orgId,
+    args.signalId,
+    args.sourceType,
+    args.sourceId,
+    args.mention.mentionOrdinal,
+    args.cls.samplingReason,
+    args.cls.confidenceTier,
+    args.cls.mentionType,
+    args.cls.direction,
+    args.cls.sectorKey
+  ).run();
+  return true;
 }
 
 async function upsertFailedSignal(args: {
@@ -1316,8 +1580,13 @@ export async function detectAndRecordProspectSignals(
     const sourceType = prospectSourceType(item);
     if (!sourceType) continue;
     try {
+      const sourceGate = sourcePrefilter(item, env);
+      if (!sourceGate.shouldScan) {
+        stats.prefilter_dropped++;
+        continue;
+      }
       const fallbackName = await companyNameFor(item.companyId, orgId, env);
-	      const mentions = extractMentionCandidatesFromText(`${item.subject || ''}\n${item.bodyText || ''}`, fallbackName);
+	      const mentions = parseDealflowList(`${item.subject || ''}\n${item.bodyText || ''}\n${item.text || ''}`, fallbackName);
 	      stats.mentions_seen += mentions.length;
 	      for (const mention of mentions) {
 	        const occurredAt = item.sentAt || new Date().toISOString();
@@ -1364,7 +1633,7 @@ export async function detectAndRecordProspectSignals(
           stats.skipped_web_analytics++;
         }
 
-        await upsertSignal({
+        const signalResult = await upsertSignal({
           orgId,
           prospectId,
           sourceType,
@@ -1378,6 +1647,18 @@ export async function detectAndRecordProspectSignals(
           ingestionMode,
         }, env);
         stats.signals_recorded++;
+        const sampled = await recordProductionSample({
+          orgId,
+          signalId: signalResult.signalId,
+          sourceType,
+          sourceId: item.entityId,
+          mention,
+          cls,
+        }, env).catch(e => {
+          stats.errors.push({ item_id: item.entityId, error: `production_sample_failed:${e instanceof Error ? e.message : String(e)}` });
+          return false;
+        });
+        if (sampled) stats.production_samples_recorded++;
 
         if (prospectId) await refreshProspectAggregate(prospectId, orgId, env);
       }
@@ -1512,6 +1793,9 @@ export async function runProspectReconciliation(orgId: string, env: Env): Promis
 export const __prospectIntelligenceTestHooks = {
   normalizeProspectName,
   extractMentionCandidatesFromText,
+  parseDealflowList,
+  sourcePrefilter,
+  productionSamplingDecision,
   computeSignalStrength,
   sectorHintForText,
   buildClassifierPrefilter,
