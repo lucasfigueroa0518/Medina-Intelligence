@@ -22,7 +22,7 @@ import { SESSION_TITLE_PROMPT } from '../prompts/session-title';
 import { estimateTokens, truncateToTokens } from '../lib/tokens';
 import { emitAudit } from '../lib/audit';
 import {
-  searchContacts, searchCompanies, searchDeals, searchProspects, queryDealFlow, getProspectEvidence, searchConversations,
+  searchContacts, searchCompanies, searchDeals, searchProspects, queryDealFlow, getProspectEvidence, getProspectDigest, runProspectCleanupPassTool, searchConversations,
   searchEvents, recall, sweepConversations,
   getFirmRelationshipSnapshotTool, setFirmCompanyRelationshipTool,
   getContactDetail, getCompanyDetail, getDealDetail,
@@ -347,6 +347,26 @@ const AGENT_TOOLS: ToolDefinition[] = [
         limit: { type: 'number', description: 'Max evidence rows. Default 20; max follows mode limits.' },
       },
       required: ['prospect_id'],
+    },
+  },
+  {
+    name: 'get_prospect_digest',
+    description: 'Build a recent high-signal prospect digest with dedup-aware counts, unresolved classifier/reconciler qualifiers, and ACL-safe metadata. Use before proactive MARTy summaries of deal flow.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        days_back: { type: 'number', description: 'Lookback window. Default 14 days.' },
+        sector: { type: 'string', description: 'Optional exact sector key/label such as fintech, cybersecurity, ai_data, aerospace_defense, or uncategorized.' },
+        limit: { type: 'number', description: 'Max prospects to include. Default follows current mode.' },
+      },
+    },
+  },
+  {
+    name: 'run_prospect_cleanup_pass',
+    description: 'Admin-only deterministic prospect cleanup: resolves eligible provisional/uncertain states, marks exact-domain deal conversions, and records duplicate soft links. Does not use a review queue.',
+    input_schema: {
+      type: 'object',
+      properties: {},
     },
   },
   {
@@ -875,6 +895,8 @@ async function executeTool(
     case 'query_deal_flow': return queryDealFlow(ctx, toolInput || {}, env);
     case 'search_prospects': return searchProspects(ctx, toolInput || {}, env, toolContext);
     case 'get_prospect_evidence': return getProspectEvidence(ctx, toolInput || {}, env, toolContext);
+    case 'get_prospect_digest': return getProspectDigest(ctx, toolInput || {}, env, toolContext);
+    case 'run_prospect_cleanup_pass': return runProspectCleanupPassTool(ctx, toolInput || {}, env);
     case 'search_conversations': return searchConversations(ctx, toolInput, env, toolContext);
     case 'search_events': return searchEvents(ctx, toolInput, env, toolContext);
     case 'sweep_conversations': return sweepConversations(ctx, toolInput, env, toolContext);
