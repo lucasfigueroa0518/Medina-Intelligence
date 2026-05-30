@@ -19,6 +19,7 @@ import {
   applyProspectEnrichmentCandidate,
   recordProspectBackfillCoverage,
   reverseProspectMerge,
+  runProspectBackfillWindow,
   runProspectEnrichmentCycle,
 } from '../src/lib/prospect-intelligence';
 
@@ -49,6 +50,9 @@ class FakeD1 {
   companies: any[] = [];
   deals: any[] = [];
   relationships: any[] = [];
+  sourceConversations: any[] = [];
+  sourceEvents: any[] = [];
+  sourceDocuments: any[] = [];
   prospects: any[] = [];
   prospectSignals: any[] = [];
   softLinks: any[] = [];
@@ -57,6 +61,7 @@ class FakeD1 {
   mergeAudit: any[] = [];
   entityFieldState: any[] = [];
   coverage: any[] = [];
+  backfillRuns: any[] = [];
 
   prepare(sql: string): FakeStatement {
     return new FakeStatement(this, sql);
@@ -106,10 +111,57 @@ class FakeD1 {
         .slice(0, Number(limit))
         .map(row => ({ ...row }));
     }
+    if (/FROM conversations/i.test(sql)) {
+      const [orgId, start, end, limit] = binds;
+      return this.sourceConversations
+        .filter(row => row.org_id === orgId && row.sent_at >= start && row.sent_at < end)
+        .sort((a, b) => String(b.sent_at).localeCompare(String(a.sent_at)))
+        .slice(0, Number(limit));
+    }
+    if (/FROM events/i.test(sql)) {
+      const [orgId, start, end, limit] = binds;
+      return this.sourceEvents
+        .filter(row => row.org_id === orgId && !row.deleted_at && row.start_time >= start && row.start_time < end)
+        .sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)))
+        .slice(0, Number(limit));
+    }
+    if (/FROM documents/i.test(sql)) {
+      const [orgId, start, end, limit] = binds;
+      return this.sourceDocuments
+        .filter(row => row.org_id === orgId && !row.deleted_at && row.created_at >= start && row.created_at < end)
+        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+        .slice(0, Number(limit));
+    }
+    if (/FROM prospects/i.test(sql) && /ORDER BY updated_at ASC/i.test(sql)) {
+      const [orgId] = binds;
+      return this.prospects
+        .filter(row => row.org_id === orgId && !row.deleted_at && ['active', 'provisional'].includes(row.status))
+        .slice(0, 100);
+    }
     return [];
   }
 
   first(sql: string, binds: unknown[]): any | null {
+    if (/COUNT\(\*\) AS n/i.test(sql) && /FROM prospect_signals/i.test(sql)) {
+      const [orgId] = binds;
+      return {
+        n: this.prospectSignals.filter(row =>
+          row.org_id === orgId &&
+          (row.classification_status !== 'classified' || row.resolution_status === 'pending')
+        ).length,
+      };
+    }
+    if (/SUM\(CASE WHEN classification_status/i.test(sql)) {
+      const [orgId, prospectId] = binds;
+      const rows = this.prospectSignals.filter(row => row.org_id === orgId && row.prospect_id === prospectId);
+      return {
+        pending_classifications: rows.filter(row => row.classification_status !== 'classified').length,
+        pending_resolution: rows.filter(row => row.resolution_status === 'pending').length,
+        direction_uncertain: rows.filter(row => row.direction_uncertain === 1).length,
+        uncategorized: rows.filter(row => row.sector_key === 'uncategorized').length,
+        avg_confidence: rows.length ? rows.reduce((sum, row) => sum + Number(row.confidence || 0), 0) / rows.length : null,
+      };
+    }
     if (/FROM companies/i.test(sql) && /WHERE id = \?/i.test(sql)) {
       const [id, orgId] = binds;
       const row = this.companies.find(entry => entry.id === id && entry.org_id === orgId && !entry.deleted_at);
@@ -403,6 +455,34 @@ class FakeD1 {
         classifications_pending: binds[10],
         error_message: binds[11],
       });
+      return;
+    }
+
+    if (/INSERT INTO prospect_backfill_runs/i.test(sql)) {
+      this.backfillRuns.push({
+        id: binds[0],
+        org_id: binds[1],
+        window_start: binds[2],
+        window_end: binds[3],
+        cursor: binds[4],
+        status: 'in_progress',
+        source_families: binds[5],
+        measured_cost_per_item: binds[6],
+      });
+      return;
+    }
+
+    if (/UPDATE prospect_backfill_runs/i.test(sql)) {
+      const [cursor, itemsFound, itemsProcessed, signalsRecorded, estimatedCost, runId, orgId] = binds;
+      const row = this.backfillRuns.find(entry => entry.id === runId && entry.org_id === orgId);
+      if (row) {
+        row.status = 'completed';
+        row.cursor = cursor;
+        row.items_found = itemsFound;
+        row.items_processed = itemsProcessed;
+        row.signals_recorded = signalsRecorded;
+        row.estimated_total_cost = estimatedCost;
+      }
     }
   }
 
@@ -1055,6 +1135,83 @@ describe('prospect intelligence deterministic signals', () => {
     expect(result.scanned).toBe(2);
     expect(fetched[0]).toBe('https://high.example');
     expect(fetched[1]).toBe('https://low.example');
+  });
+
+  it('runs a tiny local windowed backfill with coverage and idempotent signal keys', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValue({
+      text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.9,"confidence":0.95,"reasoning":"Investment intro."}',
+      usage: { input_tokens: 90, output_tokens: 20 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    db.sourceConversations.push(
+      {
+        id: 'hist-conv-1',
+        org_id: 'org-1',
+        source: 'outlook',
+        subject: 'Funding update',
+        body_preview: 'Auguria is raising a seed round for security data.',
+        sent_at: '2026-04-10T12:00:00.000Z',
+        from_email: 'alice@example.com',
+        to_emails: '["lucas@medinavc.com"]',
+        cc_emails: '[]',
+        direction: null,
+        visibility: 'private',
+        participant_user_ids: '[]',
+      },
+      {
+        id: 'hist-conv-2',
+        org_id: 'org-1',
+        source: 'outlook',
+        subject: 'Deck follow-up',
+        body_preview: 'Meet Auguria for the follow-up deck.',
+        sent_at: '2026-04-11T12:00:00.000Z',
+        from_email: 'alice@example.com',
+        to_emails: '["lucas@medinavc.com"]',
+        cc_emails: '[]',
+        direction: null,
+        visibility: 'private',
+        participant_user_ids: '[]',
+      },
+    );
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+
+    const first = await runProspectBackfillWindow('org-1', env, {
+      windowStart: '2026-04-01T00:00:00.000Z',
+      windowEnd: '2026-05-01T00:00:00.000Z',
+      sourceFamilies: ['conversation'],
+      batchLimit: 10,
+      measuredCostPerItemUsd: 0.001,
+    });
+    const second = await runProspectBackfillWindow('org-1', env, {
+      windowStart: '2026-04-01T00:00:00.000Z',
+      windowEnd: '2026-05-01T00:00:00.000Z',
+      sourceFamilies: ['conversation'],
+      batchLimit: 10,
+      measuredCostPerItemUsd: 0.001,
+    });
+
+    expect(first.items_found).toBe(2);
+    expect(first.items_processed).toBe(2);
+    expect(first.signals_recorded).toBe(2);
+    expect(first.reconciliation.scanned).toBeGreaterThanOrEqual(1);
+    expect(db.coverage[0]).toMatchObject({
+      source_family: 'conversation',
+      status: 'completed',
+      items_scanned: 2,
+      signals_recorded: 2,
+      classifications_pending: 0,
+    });
+    expect(db.backfillRuns[0]).toMatchObject({
+      status: 'completed',
+      items_found: 2,
+      estimated_total_cost: 0.002,
+    });
+    expect(second.items_found).toBe(2);
+    expect(db.prospectSignals).toHaveLength(2);
+    expect(new Set(db.prospectSignals.map(row => `${row.source_type}:${row.source_id}:${row.mention_ordinal}`)).size).toBe(2);
+    expect(db.prospectSignals.every(row => row.ingestion_mode === 'backfill')).toBe(true);
   });
 
   it('keeps migration 0114 aligned with the reconciled prospect contract', () => {

@@ -177,6 +177,30 @@ export interface ProspectEnrichmentCandidate {
 
 const PROSPECT_ENRICHMENT_FIELDS = new Set(['website', 'domain', 'description', 'hq_location', 'founders_json']);
 
+type ProspectBackfillSourceFamily = 'conversation' | 'event' | 'document';
+
+export interface ProspectBackfillWindowInput {
+  windowStart: string;
+  windowEnd: string;
+  sourceFamilies?: ProspectBackfillSourceFamily[];
+  batchLimit?: number;
+  measuredCostPerItemUsd?: number | null;
+  runId?: string | null;
+}
+
+export interface ProspectBackfillWindowResult {
+  run_id: string;
+  window_start: string;
+  window_end: string;
+  items_found: number;
+  items_processed: number;
+  signals_recorded: number;
+  prospects_upserted: number;
+  classifications_pending: number;
+  source_families: string[];
+  reconciliation: Awaited<ReturnType<typeof runProspectReconciliation>>;
+}
+
 function emptyStats(items: number): ProspectDetectionStats {
   return {
     items_scanned: items,
@@ -1957,6 +1981,246 @@ export async function recordProspectBackfillCoverage(
 	    input.error || null
 	  ).run();
 	}
+
+function parseEmailList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter(v => typeof v === 'string');
+  const text = String(value || '').trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed.filter(v => typeof v === 'string');
+  } catch {}
+  return text.split(/[;,]/).map(part => part.trim()).filter(Boolean);
+}
+
+function estimateProspectBackfillCost(items: number, measuredCostPerItemUsd?: number | null): number | null {
+  if (measuredCostPerItemUsd == null || !Number.isFinite(measuredCostPerItemUsd)) return null;
+  return items * measuredCostPerItemUsd;
+}
+
+async function createProspectBackfillRun(
+  orgId: string,
+  env: Env,
+  input: ProspectBackfillWindowInput,
+  sourceFamilies: ProspectBackfillSourceFamily[]
+): Promise<string> {
+  if (input.runId) return input.runId;
+  const runId = crypto.randomUUID();
+  await env.D1.prepare(
+    `INSERT INTO prospect_backfill_runs (
+       id, org_id, window_start, window_end, cursor, status, source_families,
+       measured_cost_per_item, estimated_total_cost, started_at, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, NULL,
+       strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+  ).bind(
+    runId,
+    orgId,
+    input.windowStart,
+    input.windowEnd,
+    input.windowEnd,
+    JSON.stringify(sourceFamilies),
+    input.measuredCostPerItemUsd ?? null
+  ).run();
+  return runId;
+}
+
+async function loadBackfillItemsForFamily(
+  orgId: string,
+  env: Env,
+  family: ProspectBackfillSourceFamily,
+  windowStart: string,
+  windowEnd: string,
+  limit: number
+): Promise<ClassifiedItem[]> {
+  if (family === 'conversation') {
+    const rows = await env.D1.prepare(
+      `SELECT id, source, subject, body_preview, sent_at, from_email, to_emails, cc_emails,
+              direction, visibility, participant_user_ids
+         FROM conversations
+        WHERE org_id = ? AND sent_at >= ? AND sent_at < ?
+        ORDER BY sent_at DESC
+        LIMIT ?`
+    ).bind(orgId, windowStart, windowEnd, limit).all<any>();
+    return (rows.results || []).map(row => ({
+      type: row.source === 'slack' ? 'slack_message' : 'email',
+      source: row.source === 'slack' ? 'slack' : 'outlook',
+      externalId: row.id,
+      subject: row.subject || '',
+      bodyText: row.body_preview || '',
+      bodyPreview: row.body_preview || '',
+      fromEmail: row.from_email || '',
+      toEmails: parseEmailList(row.to_emails),
+      ccEmails: parseEmailList(row.cc_emails),
+      sentAt: row.sent_at,
+      direction: row.direction || undefined,
+      orgId,
+      visibility: row.visibility || 'private',
+      entityType: 'conversation',
+      entityId: row.id,
+      contactIds: [],
+      participantUserIds: parseEmailList(row.participant_user_ids),
+      metadata: {
+        org_id: orgId,
+        visibility: row.visibility || 'private',
+        document_type: row.source === 'slack' ? 'slack' : 'email',
+        source_table: 'conversations',
+        source_id: row.id,
+        r2_key: '',
+        created_at: row.sent_at,
+        primary_entity_id: row.id,
+      },
+      text: row.body_preview || '',
+    } as ClassifiedItem));
+  }
+  if (family === 'event') {
+    const rows = await env.D1.prepare(
+      `SELECT id, title, description, summary, start_time, source
+         FROM events
+        WHERE org_id = ? AND deleted_at IS NULL AND start_time >= ? AND start_time < ?
+        ORDER BY start_time DESC
+        LIMIT ?`
+    ).bind(orgId, windowStart, windowEnd, limit).all<any>();
+    return (rows.results || []).map(row => ({
+      type: 'calendar_event',
+      source: 'outlook',
+      externalId: row.id,
+      subject: row.title || '',
+      bodyText: row.summary || row.description || '',
+      bodyPreview: row.summary || row.description || '',
+      fromEmail: '',
+      toEmails: [],
+      ccEmails: [],
+      sentAt: row.start_time,
+      orgId,
+      visibility: 'private',
+      entityType: 'event',
+      entityId: row.id,
+      contactIds: [],
+      metadata: {
+        org_id: orgId,
+        visibility: 'private',
+        document_type: 'meeting',
+        source_table: 'events',
+        source_id: row.id,
+        r2_key: '',
+        created_at: row.start_time,
+        primary_entity_id: row.id,
+      },
+      text: row.summary || row.description || '',
+    } as ClassifiedItem));
+  }
+  const rows = await env.D1.prepare(
+    `SELECT id, title, extracted_text_preview, document_type, source, visibility,
+            participant_user_ids, created_at
+       FROM documents
+      WHERE org_id = ? AND deleted_at IS NULL AND created_at >= ? AND created_at < ?
+      ORDER BY created_at DESC
+      LIMIT ?`
+  ).bind(orgId, windowStart, windowEnd, limit).all<any>();
+  return (rows.results || []).map(row => ({
+    type: 'email',
+    source: 'outlook',
+    externalId: row.id,
+    subject: row.title || '',
+    bodyText: row.extracted_text_preview || '',
+    bodyPreview: row.extracted_text_preview || '',
+    fromEmail: '',
+    toEmails: [],
+    ccEmails: [],
+    sentAt: row.created_at,
+    orgId,
+    visibility: row.visibility || 'private',
+    entityType: 'document',
+    entityId: row.id,
+    contactIds: [],
+    participantUserIds: parseEmailList(row.participant_user_ids),
+    metadata: {
+      org_id: orgId,
+      visibility: row.visibility || 'private',
+      document_type: row.document_type || row.source || 'document',
+      source_table: 'documents',
+      source_id: row.id,
+      r2_key: '',
+      created_at: row.created_at,
+      primary_entity_id: row.id,
+    },
+    text: row.extracted_text_preview || '',
+  } as any));
+}
+
+export async function runProspectBackfillWindow(
+  orgId: string,
+  env: Env,
+  input: ProspectBackfillWindowInput
+): Promise<ProspectBackfillWindowResult> {
+  const sourceFamilies: ProspectBackfillSourceFamily[] = input.sourceFamilies && input.sourceFamilies.length > 0
+    ? input.sourceFamilies
+    : ['conversation', 'event', 'document'];
+  const limit = Math.min(Math.max(Number(input.batchLimit || 100), 1), 500);
+  const runId = await createProspectBackfillRun(orgId, env, input, sourceFamilies);
+  let itemsFound = 0;
+  let itemsProcessed = 0;
+  let signalsRecorded = 0;
+  let prospectsUpserted = 0;
+  let classificationsPending = 0;
+
+  for (const family of sourceFamilies) {
+    const items = await loadBackfillItemsForFamily(orgId, env, family, input.windowStart, input.windowEnd, limit);
+    itemsFound += items.length;
+    const stats = await detectAndRecordProspectSignals(items, orgId, env, { ingestionMode: 'backfill' });
+    itemsProcessed += stats.items_scanned;
+    signalsRecorded += stats.signals_recorded;
+    prospectsUpserted += stats.prospects_upserted;
+    classificationsPending += stats.classifications_pending;
+    await recordProspectBackfillCoverage(orgId, env, {
+      runId,
+      sourceFamily: family,
+      windowStart: input.windowStart,
+      windowEnd: input.windowEnd,
+      itemsScanned: stats.items_scanned,
+      signalsRecorded: stats.signals_recorded,
+      prospectsUpserted: stats.prospects_upserted,
+      classificationsPending: stats.classifications_pending,
+      status: stats.errors.length > 0 ? 'partial' : 'completed',
+      error: stats.errors[0]?.error || null,
+    });
+  }
+
+  const reconciliation = await runProspectReconciliation(orgId, env);
+  await env.D1.prepare(
+    `UPDATE prospect_backfill_runs
+        SET status = 'completed',
+            cursor = ?,
+            items_found = ?,
+            items_processed = ?,
+            signals_recorded = ?,
+            estimated_total_cost = ?,
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    input.windowStart,
+    itemsFound,
+    itemsProcessed,
+    signalsRecorded,
+    estimateProspectBackfillCost(itemsFound, input.measuredCostPerItemUsd),
+    runId,
+    orgId
+  ).run();
+
+  return {
+    run_id: runId,
+    window_start: input.windowStart,
+    window_end: input.windowEnd,
+    items_found: itemsFound,
+    items_processed: itemsProcessed,
+    signals_recorded: signalsRecorded,
+    prospects_upserted: prospectsUpserted,
+    classifications_pending: classificationsPending,
+    source_families: sourceFamilies,
+    reconciliation,
+  };
+}
 
 export async function runProspectReconciliation(orgId: string, env: Env): Promise<{ scanned: number; converted: number; duplicate_links: number; resolved_soft_states: number; pending_classifications: number }> {
   const rows = await env.D1.prepare(
