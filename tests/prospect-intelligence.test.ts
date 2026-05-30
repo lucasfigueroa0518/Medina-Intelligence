@@ -1214,6 +1214,111 @@ describe('prospect intelligence deterministic signals', () => {
     expect(db.prospectSignals.every(row => row.ingestion_mode === 'backfill')).toBe(true);
   });
 
+  it('runs the Phase 6 north-star fixtures end to end without duplicate prospects', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockImplementation(async (request: any) => {
+      const company = String(request.user || '').match(/MENTION \(the company in question\): ([^\n]+)/)?.[1] || '';
+      const sectors: Record<string, string> = {
+        MAX: 'ai_data',
+        Auguria: 'cybersecurity',
+        Sativa: 'materials_manufacturing',
+        'Portal Aircraft': 'aerospace_defense',
+      };
+      return {
+        text: JSON.stringify({
+          mention_type: 'inbound_prospect',
+          direction: 'inbound',
+          sector_key: sectors[company] || 'uncategorized',
+          sector_confidence: 0.9,
+          confidence: 0.94,
+          reasoning: `${company} is presented as an investment opportunity in the fixture.`,
+        }),
+        usage: { input_tokens: 110, output_tokens: 24 },
+        model: 'claude-haiku-4-5-20251001',
+      };
+    });
+
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const fixtures: any[] = [
+      {
+        type: 'document',
+        entityType: 'document',
+        entityId: 'fixture-max-evidence-report',
+        subject: 'MAX evidence report',
+        bodyText: 'MAX is raising a seed round for an AI data workflow platform. Deck attached and diligence call scheduled.',
+        bodyPreview: 'MAX is raising a seed round',
+        fromEmail: 'alice@example.com',
+        sentAt: '2026-05-21T12:00:00.000Z',
+        attachments: [{ id: 'max-deck', name: 'MAX Deck.pdf', size: 1024, contentType: 'application/pdf' }],
+      },
+      {
+        type: 'email',
+        entityType: 'conversation',
+        entityId: 'fixture-auguria-thread',
+        source: 'email',
+        subject: 'Intro to Auguria',
+        bodyText: 'Warm intro to Auguria; deck attached for their security data platform and we should meet next week.',
+        bodyPreview: 'Warm intro to Auguria',
+        fromEmail: 'investor@example.com',
+        toEmails: ['lucas@medinavc.com'],
+        sentAt: '2026-05-22T12:00:00.000Z',
+        attachments: [{ id: 'auguria-deck', name: 'Auguria Pitch Deck.pdf', size: 2048, contentType: 'application/pdf' }],
+      },
+      {
+        type: 'document',
+        entityType: 'document',
+        entityId: 'fixture-armyfuze-list',
+        subject: 'ArmyFUZE cohort shortlist',
+        bodyText: [
+          'ArmyFUZE cohort shortlist',
+          '- Sativa - Seed - $1M - website sativa.example - Problem: hempcrete materials for deployable structures - Approach: manufacturing process',
+          '- Portal Aircraft - Seed - $2M - website portalaircraft.example - Problem: defense aviation logistics - Approach: autonomous aircraft',
+        ].join('\n'),
+        bodyPreview: 'ArmyFUZE cohort shortlist',
+        fromEmail: 'program@example.mil',
+        sentAt: '2026-05-23T12:00:00.000Z',
+      },
+    ];
+
+    const first = await detectAndRecordProspectSignals(fixtures, 'org-1', env, { ingestionMode: 'backfill' });
+    await recordProspectBackfillCoverage('org-1', env, {
+      sourceFamily: 'phase6_fixtures',
+      windowStart: '2026-05-21T00:00:00.000Z',
+      windowEnd: '2026-05-24T00:00:00.000Z',
+      itemsScanned: fixtures.length,
+      signalsRecorded: first.signals_recorded,
+      prospectsUpserted: first.prospects_upserted,
+      classificationsPending: first.classifications_pending,
+      status: first.classifications_pending === 0 ? 'completed' : 'partial',
+    });
+    const second = await detectAndRecordProspectSignals(fixtures, 'org-1', env, { ingestionMode: 'backfill' });
+
+    expect(first.items_scanned).toBe(3);
+    expect(first.signals_recorded).toBe(4);
+    expect(first.prospects_upserted).toBe(4);
+    expect(first.classifications_pending).toBe(0);
+    expect(db.coverage[0]).toMatchObject({
+      source_family: 'phase6_fixtures',
+      items_scanned: 3,
+      signals_recorded: 4,
+      prospects_upserted: 4,
+      classifications_pending: 0,
+      status: 'completed',
+    });
+    expect(db.prospects.map(row => row.canonical_name).sort()).toEqual([
+      'Auguria',
+      'MAX',
+      'Portal Aircraft',
+      'Sativa',
+    ]);
+    expect(db.prospectSignals).toHaveLength(4);
+    expect(new Set(db.prospectSignals.map(row => `${row.source_type}:${row.source_id}:${row.mention_ordinal}`)).size).toBe(4);
+    expect(second.signals_recorded).toBe(4);
+    expect(db.prospects).toHaveLength(4);
+    expect(db.prospectSignals).toHaveLength(4);
+  });
+
   it('keeps migration 0114 aligned with the reconciled prospect contract', () => {
     const sql = readFileSync('migrations/0114_prospect_intelligence.sql', 'utf8');
 
