@@ -7,7 +7,7 @@ describe('prospect gold-set candidate extractor contract', () => {
     const gitignore = readFileSync('.gitignore', 'utf8');
 
     expect(script).toContain('sourcePrefilter');
-    expect(script).toContain('parseDealflowList');
+    expect(script).toContain('extractOrganizationMentionsFromSource');
     expect(script).toContain("gold_mention_type: ''");
     expect(script).toContain("gold_direction: ''");
     expect(script).toContain("gold_sector_key: ''");
@@ -15,7 +15,6 @@ describe('prospect gold-set candidate extractor contract', () => {
     expect(script).toContain('gold-candidates.test.jsonl');
     expect(script).toContain('CLASS_FLOORS');
     expect(script).not.toContain('callProspectClassifier');
-    expect(script).not.toContain('callClaude');
     expect(gitignore).toContain('.prospect-gold-set/');
   });
 });

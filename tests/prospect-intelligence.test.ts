@@ -672,6 +672,51 @@ describe('prospect intelligence deterministic signals', () => {
     expect(candidate.canonicalName).toBe('Auguria');
   });
 
+  it('uses the shared organization extractor without email scaffolding or fund people', async () => {
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-org-extract',
+      source: 'email',
+      subject: 'Fwd: Intro thread',
+      bodyText: [
+        'Sent: Wednesday, May 27, 2026 9:14 AM',
+        'On Thu, Tony wrote:',
+        'Hi Tony,',
+        'Auguria is raising a seed round for its security data platform.',
+        'NeuralSeek is evaluating a partnership with Qunnect.',
+        'Greenberg Traurig is counsel on the matter.',
+        'Lucas',
+        'Medina Ventures',
+      ].join('\n'),
+      bodyPreview: 'Auguria is raising',
+      fromEmail: 'alice@example.com',
+      toEmails: ['tony@medinavc.com'],
+      sentAt: '2026-05-27T09:14:00.000Z',
+    };
+
+    const mentions = await __prospectIntelligenceTestHooks.extractOrganizationMentionsFromSource(item, 'org-1', env, {
+      forceLlm: true,
+      llmExtractor: async () => [
+        { name: 'Auguria', raw: 'Auguria' },
+        { name: 'NeuralSeek', raw: 'NeuralSeek' },
+        { name: 'Qunnect', raw: 'Qunnect' },
+        { name: 'Greenberg Traurig', raw: 'Greenberg Traurig' },
+        { name: 'Sent', raw: 'Sent' },
+        { name: 'Tony', raw: 'Tony' },
+        { name: 'Medina Ventures', raw: 'Medina Ventures' },
+      ],
+    });
+    const names = mentions.map(mention => mention.canonicalName);
+
+    expect(names).toEqual(expect.arrayContaining(['Auguria', 'NeuralSeek', 'Qunnect', 'Greenberg Traurig']));
+    expect(names).not.toEqual(expect.arrayContaining(['Sent', 'Fwd', 'On Thu', 'Tony', 'Lucas', 'Medina Ventures']));
+    expect(mentions.every(mention => typeof mention.spanStart === 'number')).toBe(true);
+    expect(mentions.map(mention => mention.mentionOrdinal)).toEqual([1, 2, 3, 4]);
+  });
+
   it('parses curated dealflow lists beyond the generic extractor cap and preserves per-company fields', () => {
     const { parseDealflowList } = __prospectIntelligenceTestHooks;
     const lines = Array.from({ length: 15 }, (_, index) =>
@@ -851,11 +896,17 @@ describe('prospect intelligence deterministic signals', () => {
 
   it('downgrades LLM direction conflicts to provisional direction_uncertain metadata', async () => {
     callClaudeWithUsageMock.mockReset();
-    callClaudeWithUsageMock.mockResolvedValueOnce({
-      text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.8,"confidence":0.95,"reasoning":"Looks like an intro."}',
-      usage: { input_tokens: 90, output_tokens: 20 },
-      model: 'claude-haiku-4-5-20251001',
-    });
+    callClaudeWithUsageMock
+      .mockResolvedValueOnce({
+        text: '{"organizations":[{"name":"Auguria","raw":"Auguria"}]}',
+        usage: { input_tokens: 60, output_tokens: 12 },
+        model: 'claude-haiku-4-5-20251001',
+      })
+      .mockResolvedValueOnce({
+        text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.8,"confidence":0.95,"reasoning":"Looks like an intro."}',
+        usage: { input_tokens: 90, output_tokens: 20 },
+        model: 'claude-haiku-4-5-20251001',
+      });
     const db = new FakeD1();
     const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
     const item: any = {

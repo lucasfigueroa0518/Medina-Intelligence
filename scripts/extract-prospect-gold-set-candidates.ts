@@ -6,7 +6,7 @@ import process from 'node:process';
 import { getPlatformProxy } from 'wrangler';
 
 import type { Env } from '../src/types/env';
-import { __prospectIntelligenceTestHooks } from '../src/lib/prospect-intelligence';
+import { __prospectIntelligenceTestHooks, extractOrganizationMentionsFromSource } from '../src/lib/prospect-intelligence';
 
 type Split = 'dev' | 'test';
 type Stratum = 'stratified_random' | 'known_positive' | 'hard_case';
@@ -335,14 +335,29 @@ async function loadSources(env: Env, args: Args): Promise<SourceCandidate[]> {
   });
 }
 
-function extractRecords(sources: SourceCandidate[], env: Env, targetTotal: number): GoldCandidateRecord[] {
+async function extractRecords(sources: SourceCandidate[], env: Env, orgId: string, targetTotal: number): Promise<GoldCandidateRecord[]> {
   const records: GoldCandidateRecord[] = [];
   const seenMentions = new Set<string>();
   for (const source of sources) {
     if (!sourcePrefilterAllows(source, env)) continue;
-    const mentions = __prospectIntelligenceTestHooks.parseDealflowList(
-      `${source.sourceTitle || ''}\n${source.bodyText}`
-    );
+    const mentions = await extractOrganizationMentionsFromSource({
+      type: source.sourceChannel === 'email' ? 'email' : source.sourceChannel === 'slack' ? 'slack_message' : source.sourceChannel === 'meeting' ? 'calendar_event' : 'news',
+      entityType: source.sourceType,
+      entityId: source.sourceId,
+      contactIds: [],
+      subject: source.sourceTitle || undefined,
+      bodyText: source.bodyText,
+      bodyPreview: source.bodyPreview || undefined,
+      fromEmail: source.fromEmail || undefined,
+      toEmails: source.toEmails,
+      ccEmails: source.ccEmails,
+      direction: source.direction || undefined,
+      sentAt: source.occurredAt,
+      orgId,
+      visibility: 'org_wide',
+      metadata: {} as any,
+      text: source.bodyText,
+    } as any, orgId, env, { forceLlm: true, maxLlmOrganizations: 30 });
     for (const mention of mentions) {
       const deterministicKey = `${source.sourceType}:${source.sourceId}:${mention.mentionOrdinal}`;
       const dedupeKey = `${mention.normalizedName}:${compactText(mention.lineText, 220).toLowerCase()}`;
@@ -390,7 +405,7 @@ async function main(): Promise<void> {
   const env = proxy.env as unknown as Env;
   try {
     const sources = await loadSources(env, args);
-    const records = extractRecords(sources, env, args.targetTotal);
+    const records = await extractRecords(sources, env, args.orgId, args.targetTotal);
     const dev = records.filter(record => record.split === 'dev');
     const test = records.filter(record => record.split === 'test');
     await mkdir(args.outputDir, { recursive: true });

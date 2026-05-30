@@ -67,7 +67,7 @@ export interface ProspectDetectionStats {
   errors: Array<{ item_id: string; error: string }>;
 }
 
-interface MentionCandidate {
+export interface MentionCandidate {
   raw: string;
   canonicalName: string;
   normalizedName: string;
@@ -163,6 +163,29 @@ export interface ParsedDealflowListFields {
   poc?: string | null;
   problem?: string | null;
   approach?: string | null;
+}
+
+export interface ProspectOrgExtractionLlmInput {
+  cleanedText: string;
+  sourceContext: string;
+  orgId: string;
+}
+
+export interface ProspectOrgExtractionLlmOutput {
+  name: string;
+  raw?: string | null;
+  context?: string | null;
+}
+
+export type ProspectOrgExtractionLlm = (input: ProspectOrgExtractionLlmInput) => Promise<ProspectOrgExtractionLlmOutput[]>;
+
+export interface ProspectOrganizationExtractionOptions {
+  fallbackName?: string | null;
+  knownContext?: ProspectClassifierKnownContext;
+  allowLlm?: boolean;
+  forceLlm?: boolean;
+  maxLlmOrganizations?: number;
+  llmExtractor?: ProspectOrgExtractionLlm;
 }
 
 export interface ProspectEnrichmentCandidate {
@@ -261,7 +284,167 @@ function isGenericCandidate(name: string): boolean {
     'hi', 'hello', 'thanks', 'thankyou', 'best', 'regards', 'forwarded',
     'subject', 'from', 'to', 'cc', 'date', 'team', 'fund', 'company',
     'meeting', 'call', 'deck', 'memo', 'newsletter', 'update',
+    'sent', 'fwd', 'fw', 're', 'on', 'thu', 'thursday', 'wednesday',
+    'monday', 'tuesday', 'friday', 'saturday', 'sunday', 'jan', 'january',
+    'feb', 'february', 'mar', 'march', 'apr', 'april', 'may', 'jun',
+    'june', 'jul', 'july', 'aug', 'august', 'sep', 'sept', 'september',
+    'oct', 'october', 'nov', 'november', 'dec', 'december', 'lucas',
+    'tony', 'anthony', 'alicia', 'michael', 'mike', 'john', 'david',
+    'andrew', 'alex', 'sam', 'chris', 'leonardo', 'medina',
+    'medinaventures', 'medinavc', 'mediavc', 'claudeopus', 'googlemeet',
+    'japaneseendowment', 'britishcolumbia', 'gables',
   ]).has(normalized);
+}
+
+function isOwnFundEntity(name: string): boolean {
+  const normalized = normalizeProspectName(name);
+  if (!normalized) return true;
+  if (/^(lucas|tony|anthony|alicia|medina|medinaventures|medinavc|mediavc)$/.test(normalized)) return true;
+  return /\bmedina\s+(ventures|vc|capital)\b/i.test(name);
+}
+
+function looksLikePersonName(name: string): boolean {
+  const clean = normalizeWhitespace(name).replace(/[,.]+$/g, '');
+  const tokens = clean.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 3) return false;
+  if (/\b(inc|llc|ltd|corp|capital|ventures|partners|group|labs|systems|technologies|university|foundation|bank|cpa|management|club|committee)\b/i.test(clean)) return false;
+  const firstNames = new Set([
+    'lucas', 'tony', 'anthony', 'alicia', 'michael', 'mike', 'john', 'david',
+    'andrew', 'alex', 'sam', 'chris', 'leonardo', 'daniel', 'james', 'robert',
+    'william', 'jennifer', 'sarah', 'laura', 'maria',
+    'josh', 'victor', 'steve',
+  ]);
+  return firstNames.has(tokens[0].toLowerCase()) && tokens.every(token => /^[A-Z][a-zA-Z.'-]+$/.test(token));
+}
+
+function lineExcerptAt(text: string, start: number, end: number): string {
+  const before = text.lastIndexOf('\n', Math.max(0, start - 1));
+  const after = text.indexOf('\n', end);
+  return text.slice(before < 0 ? 0 : before + 1, after < 0 ? text.length : after).slice(0, 500);
+}
+
+function stripEmailScaffoldingLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  if (/^(?:from|sent|to|cc|bcc|date|subject)\s*:/i.test(trimmed)) return true;
+  if (/^(?:fwd?|re)\s*:/i.test(trimmed)) return true;
+  if (/^[-_]{2,}\s*(?:original|forwarded)\s+message\s*[-_]{2,}$/i.test(trimmed)) return true;
+  if (/^on\s+(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*[, ]/i.test(trimmed)) return true;
+  if (/^on\s+.+\s+wrote:$/i.test(trimmed)) return true;
+  if (/^(?:hi|hello|hey|dear)\s+[A-Z][A-Za-z.'-]{1,30}[,!.\s]*$/i.test(trimmed)) return true;
+  if (/^(?:best|thanks|thank you|regards|sincerely|cheers|warmly)[,!.\s]*$/i.test(trimmed)) return true;
+  if (/^(?:get outlook for ios|sent from my iphone|sent from my ipad)$/i.test(trimmed)) return true;
+  if (/^\d{1,2}\/\d{1,2}\/\d{2,4}(?:,\s*\d{1,2}:\d{2}\s*(?:am|pm)?)?$/i.test(trimmed)) return true;
+  return false;
+}
+
+export function cleanProspectSourceText(rawText: string): { cleanedText: string } {
+  const lines = String(rawText || '').replace(/\r\n?/g, '\n').split('\n');
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (/^>\s?/.test(line)) continue;
+    if (stripEmailScaffoldingLine(line)) continue;
+    const trimmed = line.trim();
+    if (/^(?:lucas|tony|anthony|alicia)\b(?:\s+[A-Z][A-Za-z.'-]+)?\s*$/i.test(trimmed)) continue;
+    if (/\bmedina\s+(?:ventures|vc|capital)\b/i.test(trimmed) && trimmed.length < 80) continue;
+    kept.push(line);
+  }
+  return { cleanedText: kept.join('\n').replace(/\n{3,}/g, '\n\n').trim() };
+}
+
+function domainLabelToCompany(domain: string): string {
+  let first = domain.toLowerCase().replace(/^www\./, '').split('.')[0] || '';
+  first = first.replace(/(?:inc|llc|ltd|corp|cpa|management)$/i, '');
+  return first
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map(part => part ? part[0].toUpperCase() + part.slice(1) : part)
+    .join(' ');
+}
+
+function shouldIgnoreDomain(domain: string, env?: Env): boolean {
+  const normalized = domain.toLowerCase().replace(/^www\./, '');
+  const first = normalized.split('.')[0];
+  if (/medina|mediavc/.test(normalized)) return true;
+  const common = new Set([
+    'gmail.com', 'google.com', 'outlook.com', 'office.com', 'office365.com',
+    'microsoft.com', 'icloud.com', 'yahoo.com', 'hotmail.com', 'aol.com',
+    'zoom.us', 'linkedin.com', 'x.com', 'twitter.com', 'facebook.com',
+    'instagram.com', 'youtube.com', 'substack.com', 'mailchimp.com',
+    'sendgrid.net', 'hubspot.com', 'salesforce.com', 'dropbox.com',
+    'box.com', 'docusign.net', 'calendly.com',
+  ]);
+  if (common.has(normalized)) return true;
+  if (first.length < 3) return true;
+  return env ? isInternalEmailDomain(`noreply@${normalized}`, getConfiguredInternalDomains(env)) : false;
+}
+
+function findCaseInsensitive(text: string, needle: string, fromIndex = 0): number {
+  if (!needle.trim()) return -1;
+  return text.toLowerCase().indexOf(needle.toLowerCase(), fromIndex);
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> {
+  const text = raw.trim();
+  if (text.startsWith('{') && text.endsWith('}')) return JSON.parse(text) as Record<string, unknown>;
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start >= 0 && end > start) return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+  throw new Error('INVALID_ORG_EXTRACTION_JSON');
+}
+
+function parseOrgExtractionResponse(raw: string): ProspectOrgExtractionLlmOutput[] {
+  const parsed = parseJsonObject(raw);
+  const rows = Array.isArray(parsed.organizations) ? parsed.organizations : [];
+  const out: ProspectOrgExtractionLlmOutput[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const entry = row as Record<string, unknown>;
+    const name = typeof entry.name === 'string' ? normalizeWhitespace(entry.name) : '';
+    if (!name) continue;
+    out.push({
+      name,
+      raw: typeof entry.raw === 'string' ? normalizeWhitespace(entry.raw) : null,
+      context: typeof entry.context === 'string' ? normalizeWhitespace(entry.context).slice(0, 300) : null,
+    });
+  }
+  return out;
+}
+
+function orgExtractionModel(env: Env): string {
+  return env.PROSPECT_ORG_EXTRACTOR_MODEL || env.PROSPECT_CLASSIFIER_MODEL || env.MARTY_LAB_HAIKU_MODEL || PROSPECT_CLASSIFIER_DEFAULT_MODEL;
+}
+
+function buildOrgExtractionPrompt(input: ProspectOrgExtractionLlmInput): { system: ClaudeSystemPrompt; user: string } {
+  const staticSystem = `Extract organization names from one cleaned source item for a venture-fund prospect-intelligence pipeline.
+Return strict JSON only. Include real organizations of any role: startups, known deals, customers,
+vendors, law firms, accelerators, government channels, investors, and companies in news.
+Do not include people, greetings, dates, email headers, quoted-reply scaffolding, personal names,
+Medina Ventures / Medina VC, or generic words. Do not classify the mention_type, direction, or sector.
+Only include names whose exact text appears in the source so the caller can anchor a deterministic span.
+Output: {"organizations":[{"name":"Organization Name","raw":"exact source span","context":"short local context"}]}`;
+  const system: ClaudeSystemPrompt = [
+    { type: 'text', text: staticSystem, cache_control: { type: 'ephemeral' } },
+  ];
+  const user = `SOURCE CONTEXT:
+${input.sourceContext}
+
+CLEANED SOURCE:
+${input.cleanedText.slice(0, 7000)}`;
+  return { system, user };
+}
+
+async function defaultLlmExtractOrganizations(
+  input: ProspectOrgExtractionLlmInput,
+  env: Env
+): Promise<ProspectOrgExtractionLlmOutput[]> {
+  const prompt = buildOrgExtractionPrompt(input);
+  const result = await callClaudeWithUsage(
+    { system: prompt.system, user: prompt.user, max_tokens: 900, orgId: input.orgId, model: orgExtractionModel(env) },
+    'low',
+    env
+  );
+  return parseOrgExtractionResponse(result.text);
 }
 
 function sectorHintForText(text: string): { key: SectorKey; confidence: number } {
@@ -441,60 +624,64 @@ function productionSamplingDecision(args: {
 export function extractMentionCandidatesFromText(text: string, fallbackName?: string | null, maxCandidates = 12): MentionCandidate[] {
   const candidates: MentionCandidate[] = [];
   const seen = new Set<string>();
-  let ordinal = 1;
+  const { cleanedText } = cleanProspectSourceText(text);
 
-  function push(raw: string, lineText: string, lineOffset: number | null, isListEntry: boolean, listFields?: ParsedDealflowListFields): void {
-    const { canonicalName, products } = canonicalizeMention(raw);
+  function push(raw: string, canonicalRaw: string, spanStart: number | null, isListEntry: boolean, listFields?: ParsedDealflowListFields): void {
+    const { canonicalName, products } = canonicalizeMention(canonicalRaw);
     if (isGenericCandidate(canonicalName)) return;
+    if (isOwnFundEntity(canonicalName)) return;
+    if (looksLikePersonName(canonicalName)) return;
     const normalizedName = normalizeProspectName(canonicalName);
     if (!normalizedName || seen.has(normalizedName)) return;
     seen.add(normalizedName);
-    const localIndex = lineText.indexOf(raw);
-    const spanStart = lineOffset == null || localIndex < 0 ? null : lineOffset + localIndex;
+    const end = spanStart == null ? null : spanStart + raw.length;
     candidates.push({
       raw,
       canonicalName,
       normalizedName,
-      mentionOrdinal: ordinal++,
+      mentionOrdinal: 0,
       spanStart,
-      spanEnd: spanStart == null ? null : spanStart + raw.length,
-      lineText: lineText.slice(0, 500),
+      spanEnd: end,
+      lineText: spanStart == null ? canonicalName : lineExcerptAt(cleanedText, spanStart, end || spanStart),
       isListEntry,
       products,
       listFields,
     });
   }
 
-  const lines = text.split(/\n+/);
-  let offset = 0;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.length < 3) {
-      offset += line.length + 1;
-      continue;
-    }
-    const isListEntry = /^\s*(?:[-*•]|\d+[.)])\s+/.test(line);
-    const slashName = trimmed.match(/^(?:[-*•]|\d+[.)])?\s*([A-Z][A-Za-z0-9&.'’-]+(?:\s+[A-Z][A-Za-z0-9&.'’-]+){0,3}(?:\s*\/\s*[A-Z][A-Za-z0-9&.'’-]+(?:\s+[A-Z][A-Za-z0-9&.'’-]+){0,3})+)(?:\s*(?:[-—–:|,]|\(|$))/);
-    if (slashName) push(slashName[1], line, offset, isListEntry);
-
-    const leading = trimmed.match(/^(?:[-*•]|\d+[.)])?\s*([A-Z][A-Za-z0-9&.'’/-]+(?:\s+[A-Z][A-Za-z0-9&.'’/-]+){0,4})(?:\s*(?:[-—–:|,]|\s\/\s|\()\s*)/);
-    if (leading) push(leading[1], line, offset, isListEntry);
-
-    const raising = trimmed.match(/\b([A-Z][A-Za-z0-9&.'’/-]+(?:\s+[A-Z][A-Za-z0-9&.'’/-]+){0,4})\s+(?:is|are|has|have)\s+(?:raising|building|launching|looking|seeking)\b/);
-    if (raising) push(raising[1], line, offset, isListEntry);
-
-    const intro = trimmed.match(/\b(?:intro(?:ducing)?|meet)\s+(?:to\s+|for\s+)?([A-Z][A-Za-z0-9&.'’/-]+(?:\s+[A-Z][A-Za-z0-9&.'’/-]+){0,4})\b/i);
-    if (intro) push(intro[1], line, offset, isListEntry);
-
+  for (const match of cleanedText.matchAll(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|gov|mil|edu|health|tech|dev|finance|xyz))\b/gi)) {
+    const domain = match[1].toLowerCase();
+    if (shouldIgnoreDomain(domain)) continue;
+    const raw = match[0];
+    push(raw, domainLabelToCompany(domain), match.index ?? null, false);
     if (candidates.length >= maxCandidates) break;
-    offset += line.length + 1;
   }
 
-  if (candidates.length === 0 && fallbackName) {
+  const highSignalPatterns = [
+    /^(?:[-*•]|\d+[.)])?[ \t]*([A-Z][A-Za-z0-9&.'’-]+(?:[ \t]+[A-Z][A-Za-z0-9&.'’-]+){0,3}(?:[ \t]*\/[ \t]*[A-Z][A-Za-z0-9&.'’-]+(?:[ \t]+[A-Z][A-Za-z0-9&.'’-]+){0,3})+)(?:[ \t]*(?:[-—–:|,]|\(|$))/gm,
+    /\b(?:intro(?:ducing)?|meet|warm intro to|introduction to)[ \t]+(?:to[ \t]+|for[ \t]+)?([A-Z][A-Za-z0-9&.'’/-]+(?:[ \t]+[A-Z][A-Za-z0-9&.'’/-]+){0,4})\b/gi,
+    /\b([A-Z][A-Za-z0-9&.'’/-]+(?:[ \t]+[A-Z][A-Za-z0-9&.'’/-]+){0,4})[ \t]+(?:is|are|has|have)[ \t]+(?:raising|building|launching|looking|seeking|developing)\b/g,
+    /\b(?:deck|memo|diligence|investment|demo|pilot)[ \t]+(?:for|from|with)[ \t]+([A-Z][A-Za-z0-9&.'’/-]+(?:[ \t]+[A-Z][A-Za-z0-9&.'’/-]+){0,4})\b/gi,
+  ];
+  for (const pattern of highSignalPatterns) {
+    for (const match of cleanedText.matchAll(pattern)) {
+      const raw = normalizeWhitespace(match[1] || '');
+      if (!raw) continue;
+      if (!/^[A-Z0-9]/.test(raw)) continue;
+      const start = findCaseInsensitive(cleanedText, raw, match.index || 0);
+      push(raw, raw, start < 0 ? null : start, false);
+      if (candidates.length >= maxCandidates) break;
+    }
+    if (candidates.length >= maxCandidates) break;
+  }
+
+  if (candidates.length === 0 && fallbackName && !isOwnFundEntity(fallbackName)) {
     push(fallbackName, fallbackName, null, false);
   }
 
-  return candidates;
+  return candidates
+    .sort((a, b) => (a.spanStart ?? Number.MAX_SAFE_INTEGER) - (b.spanStart ?? Number.MAX_SAFE_INTEGER))
+    .map((candidate, index) => ({ ...candidate, mentionOrdinal: index + 1 }));
 }
 
 function isDealflowListText(text: string): boolean {
@@ -547,7 +734,7 @@ export function parseDealflowList(text: string, fallbackName?: string | null): M
     }
     const { canonicalName, products } = canonicalizeMention(name);
     const normalizedName = normalizeProspectName(canonicalName);
-    if (!normalizedName || seen.has(normalizedName) || isGenericCandidate(canonicalName)) {
+    if (!normalizedName || seen.has(normalizedName) || isGenericCandidate(canonicalName) || isOwnFundEntity(canonicalName) || looksLikePersonName(canonicalName)) {
       offset += line.length + 1;
       continue;
     }
@@ -572,6 +759,167 @@ export function parseDealflowList(text: string, fallbackName?: string | null): M
     return extractMentionCandidatesFromText(text, fallbackName);
   }
   return candidates;
+}
+
+function mentionFromAnchoredRaw(
+  cleanedText: string,
+  raw: string,
+  canonicalRaw: string,
+  spanStart: number | null,
+  isListEntry: boolean,
+  listFields?: ParsedDealflowListFields
+): MentionCandidate | null {
+  const { canonicalName, products } = canonicalizeMention(canonicalRaw);
+  if (isGenericCandidate(canonicalName) || isOwnFundEntity(canonicalName)) return null;
+  if (looksLikePersonName(canonicalName)) return null;
+  const normalizedName = normalizeProspectName(canonicalName);
+  if (!normalizedName) return null;
+  const spanEnd = spanStart == null ? null : spanStart + raw.length;
+  return {
+    raw,
+    canonicalName,
+    normalizedName,
+    mentionOrdinal: 0,
+    spanStart,
+    spanEnd,
+    lineText: spanStart == null ? canonicalName : lineExcerptAt(cleanedText, spanStart, spanEnd || spanStart),
+    isListEntry,
+    products,
+    listFields,
+  };
+}
+
+function sourceTextForOrgExtraction(item: ClassifiedItem): string {
+  return [
+    item.subject || '',
+    item.bodyText || '',
+    item.text || '',
+  ].filter(Boolean).join('\n');
+}
+
+function sourceContextForOrgExtraction(item: ClassifiedItem): string {
+  const parts = [
+    `source_type: ${sourceTypeForPrompt(item)}`,
+    item.fromName || item.fromEmail ? `from: ${normalizeWhitespace(`${item.fromName || ''} ${item.fromEmail || ''}`)}` : '',
+    item.subject ? `subject: ${item.subject}` : '',
+    item.toEmails?.length ? `to: ${item.toEmails.slice(0, 8).join(', ')}` : '',
+    item.ccEmails?.length ? `cc: ${item.ccEmails.slice(0, 8).join(', ')}` : '',
+    item.direction ? `source direction field: ${item.direction}` : '',
+  ].filter(Boolean);
+  return compactClassifierText(parts.join(' | '), 900);
+}
+
+function shouldRunOrgExtractionLlm(cleanedText: string, deterministicMentionCount: number): boolean {
+  const compact = normalizeWhitespace(cleanedText);
+  if (compact.length < 40) return false;
+  if (!/[A-Z][A-Za-z0-9&.'’-]{2,}/.test(cleanedText)) return false;
+  if (/^(?:sent|from|to|cc|subject|date|fwd|re)\b/i.test(compact)) return false;
+  if (deterministicMentionCount > 0 && !/\b(?:also|with|from|including|includes|customer|vendor|partner|law firm|counsel|accelerator|cohort|portfolio|introduced by|via)\b/i.test(compact)) {
+    return false;
+  }
+  return true;
+}
+
+function anchorLlmOrganization(cleanedText: string, org: ProspectOrgExtractionLlmOutput): { raw: string; canonicalRaw: string; spanStart: number } | null {
+  const candidates = [
+    typeof org.raw === 'string' ? normalizeWhitespace(org.raw) : '',
+    normalizeWhitespace(org.name),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    const start = findCaseInsensitive(cleanedText, candidate);
+    if (start >= 0) return { raw: cleanedText.slice(start, start + candidate.length), canonicalRaw: org.name, spanStart: start };
+  }
+  return null;
+}
+
+function addMentionCandidate(target: Map<string, MentionCandidate>, candidate: MentionCandidate | null): void {
+  if (!candidate) return;
+  const existing = target.get(candidate.normalizedName);
+  if (!existing) {
+    target.set(candidate.normalizedName, candidate);
+    return;
+  }
+  const existingStart = existing.spanStart ?? Number.MAX_SAFE_INTEGER;
+  const nextStart = candidate.spanStart ?? Number.MAX_SAFE_INTEGER;
+  if (nextStart < existingStart) target.set(candidate.normalizedName, candidate);
+}
+
+function renumberMentionCandidates(candidates: MentionCandidate[]): MentionCandidate[] {
+  return candidates
+    .sort((a, b) => (a.spanStart ?? Number.MAX_SAFE_INTEGER) - (b.spanStart ?? Number.MAX_SAFE_INTEGER))
+    .map((candidate, index) => ({ ...candidate, mentionOrdinal: index + 1 }));
+}
+
+function addKnownContextMentions(
+  mentions: Map<string, MentionCandidate>,
+  cleanedText: string,
+  knownContext: ProspectClassifierKnownContext | undefined,
+  env: Env
+): void {
+  if (!knownContext) return;
+  for (const entity of knownContext.knownDeals) {
+    const name = normalizeWhitespace(entity.name || '');
+    if (name) {
+      const start = findCaseInsensitive(cleanedText, name);
+      if (start >= 0) addMentionCandidate(mentions, mentionFromAnchoredRaw(cleanedText, cleanedText.slice(start, start + name.length), name, start, false));
+    }
+    const domain = String(entity.domain || '').trim().toLowerCase().replace(/^www\./, '');
+    if (domain && !shouldIgnoreDomain(domain, env)) {
+      const start = findCaseInsensitive(cleanedText, domain);
+      if (start >= 0) addMentionCandidate(mentions, mentionFromAnchoredRaw(cleanedText, cleanedText.slice(start, start + domain.length), name || domainLabelToCompany(domain), start, false));
+    }
+  }
+  for (const entity of knownContext.knownDealmakers) {
+    const domain = String(entity.domain || '').trim().toLowerCase().replace(/^www\./, '');
+    if (!domain || shouldIgnoreDomain(domain, env)) continue;
+    const start = findCaseInsensitive(cleanedText, domain);
+    if (start >= 0) addMentionCandidate(mentions, mentionFromAnchoredRaw(cleanedText, cleanedText.slice(start, start + domain.length), domainLabelToCompany(domain), start, false));
+  }
+}
+
+export async function extractOrganizationMentionsFromSource(
+  item: ClassifiedItem,
+  orgId: string,
+  env: Env,
+  options: ProspectOrganizationExtractionOptions = {}
+): Promise<MentionCandidate[]> {
+  const rawText = sourceTextForOrgExtraction(item);
+  const { cleanedText } = cleanProspectSourceText(rawText);
+  if (!cleanedText) return [];
+
+  const mentions = new Map<string, MentionCandidate>();
+  if (isDealflowListText(cleanedText)) {
+    for (const mention of parseDealflowList(cleanedText, options.fallbackName)) {
+      addMentionCandidate(mentions, { ...mention, mentionOrdinal: 0 });
+    }
+  }
+  for (const mention of extractMentionCandidatesFromText(cleanedText, options.fallbackName, 24)) {
+    addMentionCandidate(mentions, { ...mention, mentionOrdinal: 0 });
+  }
+  addKnownContextMentions(mentions, cleanedText, options.knownContext, env);
+
+  if (options.allowLlm !== false && (options.forceLlm || shouldRunOrgExtractionLlm(cleanedText, mentions.size))) {
+    const llmExtract = options.llmExtractor || ((input: ProspectOrgExtractionLlmInput) => defaultLlmExtractOrganizations(input, env));
+    const llmRows = await llmExtract({
+      cleanedText,
+      sourceContext: sourceContextForOrgExtraction(item),
+      orgId,
+    });
+    for (const org of llmRows.slice(0, options.maxLlmOrganizations || 24)) {
+      if (isOwnFundEntity(org.name)) continue;
+      const anchored = anchorLlmOrganization(cleanedText, org);
+      if (!anchored) continue;
+      addMentionCandidate(mentions, mentionFromAnchoredRaw(
+        cleanedText,
+        anchored.raw,
+        anchored.canonicalRaw,
+        anchored.spanStart,
+        false
+      ));
+    }
+  }
+
+  return renumberMentionCandidates([...mentions.values()]);
 }
 
 async function companyNameFor(id: string | undefined, orgId: string, env: Env): Promise<string | null> {
@@ -1841,7 +2189,7 @@ export async function detectAndRecordProspectSignals(
         continue;
       }
       const fallbackName = await companyNameFor(item.companyId, orgId, env);
-	      const mentions = parseDealflowList(`${item.subject || ''}\n${item.bodyText || ''}\n${item.text || ''}`, fallbackName);
+	      const mentions = await extractOrganizationMentionsFromSource(item, orgId, env, { fallbackName, knownContext });
 	      stats.mentions_seen += mentions.length;
 	      for (const mention of mentions) {
 	        const occurredAt = item.sentAt || new Date().toISOString();
@@ -2466,7 +2814,9 @@ export async function reverseProspectMerge(
 
 export const __prospectIntelligenceTestHooks = {
   normalizeProspectName,
+  cleanProspectSourceText,
   extractMentionCandidatesFromText,
+  extractOrganizationMentionsFromSource,
   parseDealflowList,
   sourcePrefilter,
   productionSamplingDecision,
