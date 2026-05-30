@@ -61,6 +61,17 @@ import {
   buildMartyMaxModePrompt,
 } from '../lib/marty-runtime';
 import { buildMaxSetTool, compactMaxSetResultForContext, detectMaxSetIntent } from '../lib/max-set-builder';
+import {
+  buildMaxExecutionPlan,
+  cancelMaxModeJobs,
+  classifyMaxRequest,
+  createQueuedMaxModeJob,
+  enqueueMaxModeJob,
+  repairStaleMaxModeJobs,
+  updateMaxModeJobProgress,
+  type MaxExecutionPlan,
+  type MaxTaskShape,
+} from '../lib/max-orchestrator';
 import { TurnSourceRegistry } from '../lib/turn-source-registry';
 import { planDeterministicSourceRouting } from '../lib/source-router';
 import { inspectPlatformTelemetryTool } from '../lib/platform-telemetry';
@@ -981,6 +992,13 @@ async function markStaleRunningAgentTurns(
   const cutoffExpr = `strftime('%Y-%m-%dT%H:%M:%fZ','now','-${STALE_AGENT_TURN_MINUTES} minutes')`;
   const staleMessage = `This MARTy response stopped before completion. I marked it as stale so the session can be used again. Please retry the request.`;
   const sessionFilter = sessionId ? 'AND m.session_id = ?' : '';
+  const activeDurableMaxPredicate = `NOT EXISTS (
+         SELECT 1
+         FROM max_mode_jobs j
+         WHERE j.assistant_message_id = m.id
+           AND j.status IN ('queued','running','cancelling')
+           AND COALESCE(j.heartbeat_at, j.updated_at, j.created_at) >= ${cutoffExpr}
+       )`;
   const accessPredicate = `EXISTS (
          SELECT 1
          FROM agent_sessions s
@@ -996,6 +1014,7 @@ async function markStaleRunningAgentTurns(
      WHERE m.role = 'assistant'
        AND json_extract(m.metadata, '$.status') = 'running'
        AND m.created_at < ${cutoffExpr}
+       AND ${activeDurableMaxPredicate}
        AND ${accessPredicate}
        ${sessionFilter}
      LIMIT 50`
@@ -1021,9 +1040,12 @@ async function markStaleRunningAgentTurns(
      WHERE m.role = 'assistant'
        AND json_extract(m.metadata, '$.status') = 'running'
        AND m.created_at < ${cutoffExpr}
+       AND ${activeDurableMaxPredicate}
        AND ${accessPredicate}
        ${sessionFilter}`
   ).bind(...bindValues).run().catch(() => {});
+
+  await repairStaleMaxModeJobs(env, ctx, sessionId, STALE_AGENT_TURN_MINUTES).catch(() => 0);
 
   for (const row of staleSessionRows.results) {
     if (row.session_id) {
@@ -1878,6 +1900,147 @@ async function persistImmediateAgentResult(
   await touchAgentSessionActivity(env, session.id);
 }
 
+function durableMaxAcceptedText(plan: MaxExecutionPlan): string {
+  const families = plan.source_families.join(', ');
+  if (plan.task_shape === 'set_builder') {
+    return `MAX accepted. I’m building the set in the background across ${families} and will attach the export here when it is ready.`;
+  }
+  if (plan.artifact.required) {
+    return `MAX accepted. I’m running a durable ${plan.task_shape.replace(/_/g, ' ')} across ${families} and will attach the report here when it is ready.`;
+  }
+  return `MAX accepted. I’m running the durable sweep across ${families} and will update this answer when it completes.`;
+}
+
+async function persistDurableMaxAccepted(
+  env: Env,
+  session: AgentSession,
+  assistantMessageId: string,
+  requestId: string,
+  runId: string,
+  runtimeFingerprint: any,
+  plan: MaxExecutionPlan,
+  jobId: string,
+  workQueueId?: string | null
+): Promise<void> {
+  const now = new Date().toISOString();
+  const tool = plan.task_shape === 'set_builder' ? 'build_max_set' : 'max_evidence_report';
+  const input = plan.task_shape === 'set_builder'
+    ? plan.max_set_input
+    : { query: plan.search_query, plan };
+  const metadata = {
+    status: 'running',
+    request_id: requestId,
+    run_id: runId,
+    runtime_fingerprint: runtimeFingerprint,
+    deep_dive: true,
+    durable: true,
+    max_job: {
+      id: jobId,
+      status: 'queued',
+      task_shape: plan.task_shape,
+      source_families: plan.source_families,
+      work_queue_id: workQueueId || null,
+    },
+    tool_calls: [{
+      id: `${tool}:${jobId}`,
+      tool,
+      input,
+      status: 'executing',
+      collapsed: true,
+      activeRunId: jobId,
+      updated_at: now,
+      runs: [{
+        id: jobId,
+        input,
+        status: 'executing',
+      }],
+    }],
+  };
+  await env.D1.prepare(
+    `UPDATE agent_messages
+        SET content = ?,
+            metadata = ?
+      WHERE id = ? AND session_id = ?`
+  ).bind(
+    durableMaxAcceptedText(plan),
+    JSON.stringify(metadata),
+    assistantMessageId,
+    session.id
+  ).run();
+  await touchAgentSessionActivity(env, session.id);
+}
+
+function createDurableMaxAcceptedResponse(args: {
+  env: Env;
+  session: AgentSession;
+  requestId: string;
+  runId: string;
+  jobId: string;
+  plan: MaxExecutionPlan;
+  runtimeFingerprint: any;
+  turnAttachments: UploadSummary[];
+  sessionAttachments: Awaited<ReturnType<typeof assembleSessionAttachments>>;
+}): Response {
+  const {
+    session,
+    requestId,
+    runId,
+    jobId,
+    plan,
+    runtimeFingerprint,
+    turnAttachments,
+    sessionAttachments,
+  } = args;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encodeSseEvent({ type: 'session', session_id: session.id }));
+      controller.enqueue(encodeSseEvent({ type: 'request', request_id: requestId }));
+      controller.enqueue(encodeSseEvent({ type: 'run', run_id: runId, request_id: requestId, session_id: session.id, durable: true }));
+      controller.enqueue(encodeSseEvent({ type: 'runtime', runtime_fingerprint: runtimeFingerprint }));
+      controller.enqueue(encodeSseEvent({ type: 'sources', sources: [] }));
+      controller.enqueue(encodeSseEvent({
+        type: 'attachments',
+        turn_attachments: turnAttachments,
+        session_attachments: sessionAttachments.summaries,
+        bytes_used: sessionAttachments.bytesUsed,
+        bytes_total: sessionAttachments.bytesTotal,
+      }));
+      controller.enqueue(encodeSseEvent({
+        type: 'max_step',
+        durable: true,
+        job_id: jobId,
+        run_id: runId,
+        request_id: requestId,
+        session_id: session.id,
+        task_shape: plan.task_shape,
+        step: 'planned',
+        status: 'queued',
+        source_families: plan.source_families,
+        message: durableMaxAcceptedText(plan),
+      }));
+      controller.enqueue(encodeSseEvent({
+        type: 'tool_call',
+        tool: plan.task_shape === 'set_builder' ? 'build_max_set' : 'max_evidence_report',
+        input: plan.task_shape === 'set_builder' ? plan.max_set_input : { query: plan.search_query, plan },
+        status: 'executing',
+        durable: true,
+        job_id: jobId,
+      }));
+      controller.enqueue(encodeSseEvent({ text: durableMaxAcceptedText(plan) }));
+      controller.enqueue(encodeSseDone());
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
+  });
+}
+
 function createStreamingMaxSetResponse(args: {
   ctx: AuthContext;
   env: Env;
@@ -2359,6 +2522,7 @@ export async function cancelAgentRequest(
     ? await cancelRequest(requestId, env)
     : { local: false };
   await markAgentRunCancelRequested(env, ctx, { runId, requestId, sessionId }).catch(() => 0);
+  const cancelledMaxJobs = await cancelMaxModeJobs(env, ctx, { runId, requestId, sessionId }).catch(() => 0);
   const cancelledRows = await markAgentTurnCancelled(env, ctx, {
     requestId,
     sessionId,
@@ -2367,8 +2531,8 @@ export async function cancelAgentRequest(
   }).catch(() => 0);
   // Audit the cancel for debugging — keeps a trace in case Lucas reports
   // "I clicked stop and nothing happened."
-  console.log(`[agent:cancel] request=${requestId || 'n/a'} run=${runId || 'n/a'} session=${sessionId || 'n/a'} user=${ctx.userId} local=${result.local} rows=${cancelledRows}`);
-  return jsonResponse({ ok: true, local: result.local, cancelled_rows: cancelledRows });
+  console.log(`[agent:cancel] request=${requestId || 'n/a'} run=${runId || 'n/a'} session=${sessionId || 'n/a'} user=${ctx.userId} local=${result.local} rows=${cancelledRows} max_jobs=${cancelledMaxJobs}`);
+  return jsonResponse({ ok: true, local: result.local, cancelled_rows: cancelledRows, cancelled_max_jobs: cancelledMaxJobs });
 }
 
 export async function getAgentRunEvents(
@@ -2524,18 +2688,29 @@ export async function queryAgent(
     }
   }
   const maxSetIntent = deepDive ? detectMaxSetIntent(query, { currentUserEmail: ctx.email }) : { shouldBuild: false, reason: null, input: null };
+  const maxClassification = deepDive
+    ? classifyMaxRequest(query, maxSetIntent)
+    : { task_shape: 'mixed' as const, should_run_durably: false, reason: 'not_max_mode' };
 
   const runningTurn = await getRunningAssistantTurn(session.id, env);
   if (runningTurn) {
     const interruptMatches = interruptRunning
       && (!interruptRequestId || runningTurn.request_id === interruptRequestId);
-    if (interruptMatches) {
-      if (runningTurn.request_id) {
-        await cancelRequest(runningTurn.request_id, env).catch(() => ({ local: false }));
-      }
-      await markAgentTurnCancelled(env, ctx, {
-        assistantMessageId: runningTurn.id,
-        sessionId: session.id,
+      if (interruptMatches) {
+        if (runningTurn.request_id) {
+          await cancelRequest(runningTurn.request_id, env).catch(() => ({ local: false }));
+        }
+        await markAgentRunCancelRequested(env, ctx, {
+          requestId: runningTurn.request_id,
+          sessionId: session.id,
+        }).catch(() => 0);
+        await cancelMaxModeJobs(env, ctx, {
+          requestId: runningTurn.request_id,
+          sessionId: session.id,
+        }, 'Stopped because the user sent a new prompt.').catch(() => 0);
+        await markAgentTurnCancelled(env, ctx, {
+          assistantMessageId: runningTurn.id,
+          sessionId: session.id,
         reason: 'Stopped because the user sent a new prompt.',
         kind: 'interrupt',
       }).catch(() => 0);
@@ -2599,6 +2774,14 @@ export async function queryAgent(
         if (activeTurn.request_id) {
           await cancelRequest(activeTurn.request_id, env).catch(() => ({ local: false }));
         }
+        await markAgentRunCancelRequested(env, ctx, {
+          requestId: activeTurn.request_id,
+          sessionId: session.id,
+        }).catch(() => 0);
+        await cancelMaxModeJobs(env, ctx, {
+          requestId: activeTurn.request_id,
+          sessionId: session.id,
+        }, 'Stopped because the user sent a new prompt.').catch(() => 0);
         await markAgentTurnCancelled(env, ctx, {
           assistantMessageId: activeTurn.id,
           sessionId: session.id,
@@ -2674,25 +2857,70 @@ export async function queryAgent(
     await persistAssistantToolCallsMetadata(env, assistantMessageId, session.id, durableToolCalls);
   };
 
-  if (maxSetIntent.shouldBuild && maxSetIntent.input) {
+  if (deepDive && maxClassification.should_run_durably) {
+    const plan = buildMaxExecutionPlan(query, maxClassification.task_shape, maxSetIntent);
+    const maxJobId = await createQueuedMaxModeJob(env, ctx, {
+      sessionId: session.id,
+      assistantMessageId,
+      requestId,
+      agentRunId,
+      query,
+      plan,
+      maxSetInput: maxSetIntent.input,
+    });
+    const enqueueResult = await enqueueMaxModeJob(env, ctx, {
+      job_id: maxJobId,
+      org_id: ctx.orgId,
+      user_id: ctx.userId,
+      session_id: session.id,
+      assistant_message_id: assistantMessageId,
+      request_id: requestId,
+      agent_run_id: agentRunId,
+      query,
+      plan,
+      max_set_input: maxSetIntent.input,
+      runtime_fingerprint: runtimeFingerprint,
+    });
     if (ddKey) {
       const ddCount = parseInt(await env.KV.get(ddKey) || '0');
       await env.KV.put(ddKey, String(ddCount + 1), { expirationTtl: 7200 }).catch(() => {});
     }
-    return createStreamingMaxSetResponse({
-      ctx,
+    await persistRunEventSafe(env, agentRunId, ctx, session.id, 'planned', {
+      type: 'max_step',
+      durable: true,
+      job_id: maxJobId,
+      run_id: agentRunId,
+      request_id: requestId,
+      session_id: session.id,
+      task_shape: plan.task_shape,
+      step: 'planned',
+      status: 'queued',
+      source_families: plan.source_families,
+      work_queue_id: enqueueResult.workQueueId || null,
+      reason: maxClassification.reason,
+    });
+    await persistDurableMaxAccepted(
       env,
       session,
-      query,
-      input: maxSetIntent.input,
+      assistantMessageId,
+      requestId,
+      agentRunId,
+      runtimeFingerprint,
+      plan,
+      maxJobId,
+      enqueueResult.workQueueId || null
+    );
+    unregisterRequest(requestId);
+    return createDurableMaxAcceptedResponse({
+      env,
+      session,
       requestId,
       runId: agentRunId,
-      assistantMessageId,
+      jobId: maxJobId,
+      plan,
       runtimeFingerprint,
       turnAttachments,
       sessionAttachments,
-      turnIndex,
-      signal: cancelController.signal,
     });
   }
 

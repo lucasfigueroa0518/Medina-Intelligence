@@ -1771,6 +1771,10 @@ export async function streamAgentQuery(
   const decoder = new TextDecoder();
   let buffer = '';
   let receivedContent = false;
+  let sawRunId: string | null = null;
+  let sawRequestId: string | null = opts?.clientRequestId || opts?.interruptRequestId || null;
+  let sawSessionId: string | null = sessionId;
+  let sawDurableRun = false;
 
   try {
     while (true) {
@@ -1789,11 +1793,17 @@ export async function streamAgentQuery(
         try {
           const evt = JSON.parse(json);
           if (evt.type === 'session') {
+            sawSessionId = evt.session_id || sawSessionId;
             onToolEvent?.({ type: 'session', session_id: evt.session_id });
           } else if (evt.type === 'request') {
             // Cancellation handle — first event the server emits per turn.
+            sawRequestId = evt.request_id || sawRequestId;
             onToolEvent?.({ type: 'request', request_id: evt.request_id });
           } else if (evt.type === 'run') {
+            sawRunId = evt.run_id || sawRunId;
+            sawRequestId = evt.request_id || sawRequestId;
+            sawSessionId = evt.session_id || sawSessionId;
+            sawDurableRun = sawDurableRun || !!evt.durable;
             onToolEvent?.(evt);
           } else if (evt.type === 'sources') {
             onToolEvent?.({ type: 'sources', sources: evt.sources });
@@ -1806,6 +1816,10 @@ export async function streamAgentQuery(
           } else if (evt.type === 'model_error') {
             onToolEvent?.(evt);
           } else if (evt.type === 'max_step') {
+            sawDurableRun = sawDurableRun || !!evt.durable;
+            sawRunId = evt.run_id || sawRunId;
+            sawRequestId = evt.request_id || sawRequestId;
+            sawSessionId = evt.session_id || sawSessionId;
             onToolEvent?.(evt);
           } else if (evt.text) {
             receivedContent = true;
@@ -1824,13 +1838,29 @@ export async function streamAgentQuery(
       onError('Cancelled', { code: 'CLIENT_ABORT', retryable: false, sessionId, requestId: opts?.clientRequestId || opts?.interruptRequestId || null });
       return;
     }
-    onError(`Stream interrupted: ${(e as Error).message || 'connection lost'}`, { code: 'STREAM_INTERRUPTED', sessionId });
+    if (sawDurableRun || sawRunId) {
+      onError('MAX is still running. Reconnecting to progress events...', {
+        code: 'STREAM_INTERRUPTED_RUNNING',
+        retryable: false,
+        sessionId: sawSessionId,
+        requestId: sawRequestId,
+      });
+    } else {
+      onError(`Stream interrupted: ${(e as Error).message || 'connection lost'}`, { code: 'STREAM_INTERRUPTED', sessionId });
+    }
     return;
   }
 
   // Stream ended without [DONE] — premature close
   if (receivedContent) {
     onDone();
+  } else if (sawDurableRun || sawRunId) {
+    onError('MAX is still running. Reconnecting to progress events...', {
+      code: 'STREAM_INTERRUPTED_RUNNING',
+      retryable: false,
+      sessionId: sawSessionId,
+      requestId: sawRequestId,
+    });
   } else {
     onError('Connection lost — no response received. The request may have timed out.');
   }

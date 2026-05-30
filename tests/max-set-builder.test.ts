@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { __maxSetTestHooks, detectMaxSetIntent } from '../src/lib/max-set-builder';
+import { buildMaxExecutionPlan, classifyMaxRequest } from '../src/lib/max-orchestrator';
 
 describe('MAX set builder contracts', () => {
   it('parses email recipients from strings and JSON-shaped Outlook fields', () => {
@@ -137,5 +138,55 @@ describe('MAX set builder contracts', () => {
     );
     expect(exhaustive.shouldBuild).toBe(true);
     expect(exhaustive.input?.task_type).toBe('entity_theme_set');
+  });
+
+  it('routes exhaustive rosters to durable set-builder jobs', () => {
+    const intent = detectMaxSetIntent(
+      'List every startup we have ever talked to that is involved in quantum'
+    );
+    const classified = classifyMaxRequest(
+      'List every startup we have ever talked to that is involved in quantum',
+      intent
+    );
+    const plan = buildMaxExecutionPlan(
+      'List every startup we have ever talked to that is involved in quantum',
+      classified.task_shape,
+      intent
+    );
+
+    expect(classified).toMatchObject({
+      task_shape: 'set_builder',
+      should_run_durably: true,
+      reason: 'max_set_builder',
+    });
+    expect(plan.source_families).toContain('conversations');
+    expect(plan.artifact.required).toBe(true);
+    expect(plan.max_set_input?.task_type).toBe('entity_theme_set');
+  });
+
+  it('routes long report and sample-corpus prompts to durable evidence execution', () => {
+    const prompt = [
+      'Pull 25 emails, 3-5 Slack messages, and 5-10 meetings where people are sending us startup opportunities.',
+      'Compile a report as a doc with raw data for emails and Slack, but only transcript chunks for meetings.',
+    ].join(' ');
+    const classified = classifyMaxRequest(prompt, { shouldBuild: false, input: null });
+    const plan = buildMaxExecutionPlan(prompt, classified.task_shape, { shouldBuild: false, input: null });
+
+    expect(classified.task_shape).toBe('sample_corpus');
+    expect(classified.should_run_durably).toBe(true);
+    expect(plan.source_families).toEqual(expect.arrayContaining(['email', 'slack', 'meetings']));
+    expect(plan.requested_counts).toMatchObject({ emails: 25, slack: 5, meetings: 10 });
+    expect(plan.privacy_policy.meeting_transcripts).toBe('chunks_only');
+    expect(plan.artifact).toMatchObject({ required: true, kind: 'docx' });
+  });
+
+  it('routes broad count questions to durable count aggregation', () => {
+    const classified = classifyMaxRequest(
+      'How many emails and Slack messages mention startup opportunities this year?',
+      { shouldBuild: false, input: null }
+    );
+
+    expect(classified.task_shape).toBe('count_aggregation');
+    expect(classified.should_run_durably).toBe(true);
   });
 });

@@ -231,6 +231,9 @@ interface Message {
   attachments?: ChatUploadSummary[];
   documentCards?: MartyDocumentCard[];
   deckJobs?: DeckJobView[];
+  runId?: string | null;
+  durable?: boolean;
+  maxJob?: any;
 }
 
 interface RunningMartyStream {
@@ -241,6 +244,7 @@ interface RunningMartyStream {
   assistantMessageId: string;
   abortController?: AbortController | null;
   clientRequestId?: string;
+  durable?: boolean;
 }
 
 type MartyMode = 'fast' | 'max';
@@ -539,6 +543,7 @@ const TOOL_ICONS: Record<string, typeof Search> = {
   create_company: FileText, update_company: FileText,
   create_deal: FileText, update_deal: FileText,
   create_document_artifact: FileText, create_deck_artifact: FileText, edit_document_artifact: FileText,
+  build_max_set: Search, max_evidence_report: FileText,
   add_note: FileText, add_deal_action_item: FileText, apply_tag: FileText,
   delete_entity: AlertCircle,
 };
@@ -552,6 +557,8 @@ function toolActionLabel(name: string): string {
   if (name === 'create_deck_artifact') return 'Creating deck';
   if (name === 'create_document_artifact') return 'Creating document';
   if (name === 'edit_document_artifact') return 'Editing document';
+  if (name === 'build_max_set') return 'Building MAX set';
+  if (name === 'max_evidence_report') return 'Building MAX report';
   if (name.startsWith('search')) return 'Searching';
   if (name.startsWith('get')) return 'Loading';
   if (name === 'web_search') return 'Searching the web';
@@ -1001,6 +1008,9 @@ function hydrateAgentMessage(m: any): Message {
     documentCards,
     toolCalls,
     deckJobs,
+    runId: typeof meta.run_id === 'string' ? meta.run_id : undefined,
+    durable: !!meta.durable || !!meta.max_job,
+    maxJob: meta.max_job,
     cancelled: !!meta.cancelled || meta.status === 'cancelled',
     streaming: running,
     pendingRequestId: running && typeof meta.request_id === 'string' ? meta.request_id : undefined,
@@ -1653,6 +1663,8 @@ export default function GodModePage() {
           requestId: run.requestId,
           runId: run.runId || null,
           lastSeq: run.lastSeq || 0,
+          assistantMessageId: run.assistantMessageId,
+          durable: !!run.durable,
         }));
         localStorage.setItem(MARTY_PENDING_RUNS_STORAGE_KEY, JSON.stringify(pendingRuns));
         localStorage.setItem(MARTY_PENDING_STORAGE_KEY, JSON.stringify(pendingRuns[0]));
@@ -2354,6 +2366,8 @@ export default function GodModePage() {
           registerRunningStream({
             sessionId: activeSessionId,
             requestId: stillRunning.pendingRequestId,
+            runId: stillRunning.runId || null,
+            durable: !!stillRunning.durable,
             assistantMessageId: stillRunning.id,
           });
           if (activeSessionIdRef.current === activeSessionId) setIsThinking(true);
@@ -2394,6 +2408,112 @@ export default function GodModePage() {
       window.clearInterval(timer);
     };
   }, [activeSessionId, clearRunningStream, demoMode, mergeSessionsFromServer, messages, registerRunningStream, removeSessionFromSidebar]);
+
+  const runningSessionKey = runningSessionIds.join('|');
+
+  React.useEffect(() => {
+    if (demoMode || runningSessionIds.length === 0) return;
+    let stopped = false;
+    let timer: number | null = null;
+
+    const applyMaxProgress = (run: RunningMartyStream, payload: any, seq?: number) => {
+      const currentRun = runningStreamsRef.current[run.sessionId] || run;
+      registerRunningStream({
+        ...currentRun,
+        lastSeq: Math.max(currentRun.lastSeq || 0, seq || 0),
+        durable: currentRun.durable || !!payload?.durable,
+        abortController: currentRun.abortController && !payload?.durable ? currentRun.abortController : null,
+      });
+      if (payload?.type !== 'max_step') return;
+      updateSessionDraft(run.sessionId, m => m.map(msg => {
+        if (msg.id !== currentRun.assistantMessageId) return msg;
+        const status = payload.status === 'completed' || payload.step === 'completed'
+          ? 'done'
+          : payload.status === 'failed' || payload.step === 'failed'
+            ? 'error'
+            : payload.status === 'cancelled' || payload.step === 'cancelled'
+              ? 'cancelled'
+              : 'executing';
+        const toolEvent = {
+          type: status === 'executing' ? 'tool_call' : 'tool_result',
+          tool: payload.task_shape === 'set_builder' ? 'build_max_set' : 'max_evidence_report',
+          status,
+          input: { task_shape: payload.task_shape, source_families: payload.source_families },
+          result: {
+            message: payload.message,
+            step: payload.step,
+            coverage: payload.coverage,
+            document_cards: payload.document_cards,
+          },
+        };
+        return {
+          ...msg,
+          content: normalizeMartySentenceSpacing(msg.content || payload.message || 'MAX is still running.'),
+          streaming: status === 'executing',
+          pendingRequestId: status === 'executing' ? (payload.request_id || currentRun.requestId) : undefined,
+          runId: payload.run_id || msg.runId,
+          durable: true,
+          toolCalls: upsertToolEvent(msg.toolCalls || [], toolEvent),
+          documentCards: payload.document_cards ? mergeDocumentCards(msg.documentCards, payload.document_cards) : msg.documentCards,
+          error: status === 'error' ? true : msg.error,
+          cancelled: status === 'cancelled' ? true : msg.cancelled,
+        };
+      }));
+    };
+
+    const refreshTerminalRun = async (run: RunningMartyStream) => {
+      try {
+        const d = await api.getSessionMessages(run.sessionId);
+        if (stopped) return;
+        applyServerMessages(d.messages, run.sessionId);
+        if (d.session) upsertSessionInSidebar(d.session);
+        const nextMessages = hydrateAgentMessages(d.messages);
+        if (!getRunningAssistantMessage(nextMessages)) {
+          clearRunningStream(run.sessionId);
+          if (activeSessionIdRef.current === run.sessionId) setIsThinking(false);
+          api.listSessions().then(d2 => mergeSessionsFromServer(d2.sessions)).catch(() => {});
+        }
+      } catch {
+        // Keep the local durable card; the normal session polling path can recover later.
+      }
+    };
+
+    const poll = async () => {
+      const runs = Object.values(runningStreamsRef.current)
+        .filter(run => run.runId && (run.durable || !run.abortController));
+      for (const run of runs) {
+        if (stopped || !run.runId) return;
+        try {
+          const snapshot = await api.getAgentRunEvents(run.runId, run.lastSeq || 0, 20000);
+          if (stopped) return;
+          const latestSeq = Number(snapshot.latest_seq || run.lastSeq || 0);
+          if (latestSeq > (run.lastSeq || 0)) {
+            const current = runningStreamsRef.current[run.sessionId] || run;
+            registerRunningStream({ ...current, lastSeq: latestSeq, durable: current.durable || snapshot.events.some(evt => !!evt.payload?.durable) });
+          }
+          for (const evt of snapshot.events || []) {
+            applyMaxProgress(run, evt.payload, evt.seq);
+          }
+          const terminalRun = ['completed', 'error', 'stale_error', 'cancelled'].includes(String(snapshot.run?.status || ''));
+          const terminalEvent = (snapshot.events || []).some(evt =>
+            ['completed', 'failed', 'cancelled'].includes(String(evt.payload?.step || evt.event_type || ''))
+          );
+          if (terminalRun || terminalEvent) {
+            await refreshTerminalRun(run);
+          }
+        } catch {
+          // Event polling is recovery infrastructure; a miss should not turn into a visible failure.
+        }
+      }
+      if (!stopped) timer = window.setTimeout(poll, 2500);
+    };
+
+    poll();
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [applyServerMessages, clearRunningStream, demoMode, mergeSessionsFromServer, registerRunningStream, runningSessionIds.length, runningSessionKey, upsertSessionInSidebar]);
 
   // Fix 1: Auto-scroll only when user hasn't scrolled up
   React.useEffect(() => {
@@ -2706,6 +2826,22 @@ export default function GodModePage() {
           locallyCancelledRequestIdsRef.current.delete(clientRequestId);
           locallyCancelledRequestIdsRef.current.delete(actualRequestId);
           cancelledLocallyRef.current = false;
+          if (activeRun?.durable) {
+            if (activeSessionIdRef.current === finalSessionId) setIsThinking(false);
+            registerRunningStream({ ...activeRun, abortController: null, durable: true });
+            updateSessionDraft(requestSessionId!, m => m.map(msg => {
+              if (msg.id !== assistantMsgId) return msg;
+              return {
+                ...msg,
+                content: normalizeMartySentenceSpacing(msg.content || 'MAX is still running. I will update this message when the durable job completes.'),
+                streaming: true,
+                pendingRequestId: actualRequestId,
+                runId: activeRun.runId || msg.runId,
+                durable: true,
+              };
+            }));
+            return;
+          }
           clearRunningStream(finalSessionId, clientRequestId);
           if (activeSessionIdRef.current === finalSessionId) setIsThinking(false);
           updateSessionDraft(requestSessionId!, m => m.map(msg => {
@@ -2759,6 +2895,28 @@ export default function GodModePage() {
             ));
             if (pendingSessionIdRef.current === finalSessionId) pendingSessionIdRef.current = null;
             if (liveSessionIdRef.current === finalSessionId) liveSessionIdRef.current = null;
+            return;
+          }
+          if (opts.code === 'STREAM_INTERRUPTED_RUNNING') {
+            const durableRun = activeRun || runningStreamsRef.current[finalSessionId];
+            if (durableRun) {
+              registerRunningStream({ ...durableRun, abortController: null, durable: true });
+            }
+            if (activeSessionIdRef.current === finalSessionId) setIsThinking(false);
+            updateSessionDraft(requestSessionId!, m => m.map(msg =>
+              msg.id === assistantMsgId
+                ? {
+                    ...msg,
+                    content: normalizeMartySentenceSpacing(msg.content || 'MAX is still running. I will reconnect to progress events and update this message when the durable job completes.'),
+                    streaming: true,
+                    pendingRequestId: actualRequestId,
+                    runId: durableRun?.runId || msg.runId,
+                    durable: true,
+                    error: false,
+                    retryable: false,
+                  }
+                : msg
+            ));
             return;
           }
           const staleSession = opts.code === 'SESSION_NOT_FOUND' || err.includes('SESSION_NOT_FOUND') || err.includes('no longer exists');
@@ -2856,6 +3014,7 @@ export default function GodModePage() {
               assistantMessageId: assistantMsgId,
               abortController,
               clientRequestId,
+              durable: runningStreamsRef.current[event.session_id]?.durable,
             });
             return;
           }
@@ -2872,6 +3031,7 @@ export default function GodModePage() {
               assistantMessageId: assistantMsgId,
               abortController,
               clientRequestId,
+              durable: runningStreamsRef.current[requestSessionId!]?.durable,
             });
             return;
           }
@@ -2883,7 +3043,57 @@ export default function GodModePage() {
               assistantMessageId: assistantMsgId,
               abortController,
               clientRequestId,
+              durable: !!event.durable || runningStreamsRef.current[requestSessionId!]?.durable,
             });
+            return;
+          }
+          if (event.type === 'max_step') {
+            const sessionForRun = event.session_id || requestSessionId!;
+            const currentRun = runningStreamsRef.current[sessionForRun];
+            registerRunningStream({
+              sessionId: sessionForRun,
+              requestId: event.request_id || currentRun?.requestId || clientRequestId,
+              runId: event.run_id || currentRun?.runId || null,
+              lastSeq: typeof event.seq === 'number' ? event.seq : currentRun?.lastSeq || 0,
+              assistantMessageId: currentRun?.assistantMessageId || assistantMsgId,
+              abortController: event.durable ? null : abortController,
+              clientRequestId,
+              durable: !!event.durable || currentRun?.durable,
+            });
+            updateSessionDraft(sessionForRun, m => m.map(msg => {
+              if (msg.id !== (currentRun?.assistantMessageId || assistantMsgId)) return msg;
+              const status = event.status === 'completed' || event.step === 'completed'
+                ? 'done'
+                : event.status === 'failed' || event.step === 'failed'
+                  ? 'error'
+                  : event.status === 'cancelled' || event.step === 'cancelled'
+                    ? 'cancelled'
+                    : 'executing';
+              const toolEvent = {
+                type: status === 'executing' ? 'tool_call' : 'tool_result',
+                tool: event.task_shape === 'set_builder' ? 'build_max_set' : 'max_evidence_report',
+                status,
+                input: { task_shape: event.task_shape, source_families: event.source_families },
+                result: {
+                  message: event.message,
+                  step: event.step,
+                  coverage: event.coverage,
+                  document_cards: event.document_cards,
+                },
+              };
+              return {
+                ...msg,
+                content: normalizeMartySentenceSpacing(msg.content || event.message || 'MAX is still running.'),
+                streaming: status === 'executing',
+                pendingRequestId: status === 'executing' ? (event.request_id || currentRun?.requestId || clientRequestId) : undefined,
+                runId: event.run_id || msg.runId,
+                durable: true,
+                toolCalls: upsertToolEvent(msg.toolCalls || [], toolEvent),
+                documentCards: event.document_cards ? mergeDocumentCards(msg.documentCards, event.document_cards) : msg.documentCards,
+                error: status === 'error' ? true : msg.error,
+                cancelled: status === 'cancelled' ? true : msg.cancelled,
+              };
+            }));
             return;
           }
           if (event.type === 'sources') {

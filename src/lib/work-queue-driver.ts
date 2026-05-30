@@ -172,6 +172,7 @@ import { contactEnrichmentHandler } from './work-queue-handlers/contact-enrichme
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 import { deckRenderHandler } from './work-queue-handlers/deck-render';
 import { slackChannelBackfillHandler } from './work-queue-handlers/slack-channel-backfill';
+import { maxModeJobHandler } from './work-queue-handlers/max-mode-job';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -204,6 +205,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   dealReplayEvidenceHandler,
   intelligentImportHandler,
   contactEnrichmentHandler,
+  maxModeJobHandler,
   // MARTy Sandbox handlers are intentionally not registered while the
   // sandbox is disabled; queued sandbox rows must not consume model credits.
   ragReindexV2Handler,
