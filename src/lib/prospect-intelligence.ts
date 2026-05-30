@@ -104,6 +104,7 @@ interface Classification {
   dealmakerName: string | null;
   possibleCompanyId: string | null;
   possibleDealId: string | null;
+  linkedDealId: string | null;
   provisional: boolean;
   sampledForProduction: boolean;
   samplingReason: string | null;
@@ -1066,18 +1067,29 @@ async function classifyMention(
 
   let possibleCompanyId: string | null = null;
   let possibleDealId: string | null = null;
+  let linkedDealId: string | null = null;
+  let mentionType = llm.mentionType;
   let provisional = confidenceTier === 'low' || directionUncertain;
+  const exactDealDomainMatch = Boolean(existing.dealId && existing.matchStrength === 'domain');
 
-  if (llm.mentionType === 'inbound_prospect') {
+  if (exactDealDomainMatch && (llm.mentionType === 'inbound_prospect' || llm.mentionType === 'known_deal')) {
+    mentionType = 'known_deal';
+    linkedDealId = existing.dealId;
+    provisional = false;
+  } else if (llm.mentionType === 'known_deal' && existing.dealId && existing.matchStrength !== 'name') {
+    linkedDealId = existing.dealId;
+  }
+
+  if (mentionType === 'inbound_prospect') {
     possibleCompanyId = existing.companyId;
-    possibleDealId = existing.dealId && existing.matchStrength !== 'company_id' ? existing.dealId : null;
+    possibleDealId = existing.dealId && existing.matchStrength === 'name' ? existing.dealId : null;
     if (possibleDealId) provisional = true;
   }
 
   return {
     direction: llm.direction,
     directionUncertain,
-    mentionType: llm.mentionType,
+    mentionType,
     confidence: effectiveConfidence,
     confidenceTier,
     sectorKey: llm.sectorKey,
@@ -1089,6 +1101,7 @@ async function classifyMention(
     dealmakerName: prefilter.hasWarmIntro ? normalizeWhitespace(item.fromName || item.fromEmail || '') : null,
     possibleCompanyId,
     possibleDealId,
+    linkedDealId,
     provisional,
     sampledForProduction: sampling.sampled,
     samplingReason: sampling.reason,
@@ -1107,6 +1120,13 @@ async function classifyMention(
       deterministic_direction: prefilter.deterministicDirection,
       deterministic_direction_disagreed: directionUncertain,
       deterministic_portfolio_hint: portfolio,
+      firewall: {
+        req: 'REQ-ID-5',
+        exact_deal_domain_match: exactDealDomainMatch,
+        linked_deal_id: linkedDealId,
+        weak_deal_match_held_as_soft_link: Boolean(possibleDealId),
+        original_llm_mention_type: llm.mentionType,
+      },
       confidence_tier_routing: {
         req: 'REQ-VAL-5',
         tier: confidenceTier,
@@ -1204,6 +1224,7 @@ async function upsertProspect(
 async function upsertSignal(args: {
   orgId: string;
   prospectId: string | null;
+  dealId: string | null;
   sourceType: SourceType;
   sourceId: string;
   sourceTitle: string | null;
@@ -1215,13 +1236,13 @@ async function upsertSignal(args: {
   ingestionMode: 'live' | 'backfill';
 }, env: Env): Promise<{ signalId: string }> {
   const before = await env.D1.prepare(
-    `SELECT id, mention_type, direction, sector_key, confidence, classifier_version, prospect_id,
+    `SELECT id, mention_type, direction, sector_key, confidence, classifier_version, prospect_id, deal_id,
             classification_status, resolution_status, classification_attempts, error_message
        FROM prospect_signals
       WHERE org_id = ? AND source_type = ? AND source_id = ? AND mention_ordinal = ?
       LIMIT 1`
   ).bind(args.orgId, args.sourceType, args.sourceId, args.mention.mentionOrdinal).first<{
-    id: string; mention_type: string; direction: string; sector_key: string; confidence: number; classifier_version: string; prospect_id: string | null;
+    id: string; mention_type: string; direction: string; sector_key: string; confidence: number; classifier_version: string; prospect_id: string | null; deal_id: string | null;
     classification_status: string; resolution_status: string; classification_attempts: number; error_message: string | null;
   }>();
 
@@ -1237,13 +1258,14 @@ async function upsertSignal(args: {
     confidence: args.cls.confidence,
     classifier_version: PROSPECT_CLASSIFIER_VERSION,
     prospect_id: args.prospectId,
+    deal_id: args.dealId,
     classification_status: 'classified',
     resolution_status: resolutionStatus,
   };
 
   await env.D1.prepare(
     `INSERT INTO prospect_signals (
-       id, org_id, prospect_id, source_type, source_id, mention_ordinal,
+       id, org_id, prospect_id, deal_id, source_type, source_id, mention_ordinal,
        span_start, span_end, raw_mention_text, normalized_mention, source_title,
        occurred_at, direction, direction_source, direction_uncertain,
        mention_type, classifier_version, confidence, confidence_tier,
@@ -1251,7 +1273,7 @@ async function upsertSignal(args: {
        sector_key, sector_confidence, signal_kind, dealmaker_id, dealmaker_name,
        has_deck, has_meeting, ingestion_mode, metadata_json, created_at, updated_at
      ) VALUES (
-       ?, ?, ?, ?, ?, ?,
+       ?, ?, ?, ?, ?, ?, ?,
        ?, ?, ?, ?, ?,
        ?, ?, ?, ?,
        ?, ?, ?, ?,
@@ -1261,6 +1283,7 @@ async function upsertSignal(args: {
      )
      ON CONFLICT(org_id, source_type, source_id, mention_ordinal) DO UPDATE SET
        prospect_id = excluded.prospect_id,
+       deal_id = excluded.deal_id,
        span_start = excluded.span_start,
        span_end = excluded.span_end,
        raw_mention_text = excluded.raw_mention_text,
@@ -1293,6 +1316,7 @@ async function upsertSignal(args: {
     signalId,
     args.orgId,
     args.prospectId,
+    args.dealId,
     args.sourceType,
     args.sourceId,
     args.mention.mentionOrdinal,
@@ -1331,6 +1355,7 @@ async function upsertSignal(args: {
     Number(before.confidence) !== args.cls.confidence ||
     before.classifier_version !== PROSPECT_CLASSIFIER_VERSION ||
     before.prospect_id !== args.prospectId ||
+    before.deal_id !== args.dealId ||
     before.classification_status !== 'classified' ||
     before.resolution_status !== resolutionStatus
   )) {
@@ -1636,6 +1661,7 @@ export async function detectAndRecordProspectSignals(
         const signalResult = await upsertSignal({
           orgId,
           prospectId,
+          dealId: cls.linkedDealId,
           sourceType,
           sourceId: item.entityId,
           sourceTitle: item.subject || null,
@@ -1726,7 +1752,7 @@ export async function recordProspectBackfillCoverage(
 	  ).run();
 	}
 
-export async function runProspectReconciliation(orgId: string, env: Env): Promise<{ scanned: number; converted: number; duplicate_links: number }> {
+export async function runProspectReconciliation(orgId: string, env: Env): Promise<{ scanned: number; converted: number; duplicate_links: number; resolved_soft_states: number; pending_classifications: number }> {
   const rows = await env.D1.prepare(
     `SELECT id, canonical_name, normalized_name, domain, possible_deal_id, possible_duplicate_of
        FROM prospects
@@ -1740,6 +1766,7 @@ export async function runProspectReconciliation(orgId: string, env: Env): Promis
 
   let converted = 0;
   let duplicateLinks = 0;
+  let resolvedSoftStates = 0;
   for (const p of rows.results) {
     if (p.domain) {
       const deal = await env.D1.prepare(
@@ -1785,9 +1812,186 @@ export async function runProspectReconciliation(orgId: string, env: Env): Promis
       ).bind(crypto.randomUUID(), orgId, p.id, dup.id).run();
       duplicateLinks++;
     }
+
+    const unresolved = await env.D1.prepare(
+      `SELECT
+          SUM(CASE WHEN classification_status != 'classified' THEN 1 ELSE 0 END) AS pending_classifications,
+          SUM(CASE WHEN resolution_status = 'pending' THEN 1 ELSE 0 END) AS pending_resolution,
+          SUM(CASE WHEN direction_uncertain = 1 THEN 1 ELSE 0 END) AS direction_uncertain,
+          SUM(CASE WHEN sector_key = 'uncategorized' THEN 1 ELSE 0 END) AS uncategorized,
+          AVG(confidence) AS avg_confidence
+         FROM prospect_signals
+        WHERE org_id = ? AND prospect_id = ?`
+    ).bind(orgId, p.id).first<{
+      pending_classifications: number | null; pending_resolution: number | null; direction_uncertain: number | null; uncategorized: number | null; avg_confidence: number | null;
+    }>();
+    const canResolve =
+      Number(unresolved?.pending_classifications || 0) === 0 &&
+      Number(unresolved?.direction_uncertain || 0) === 0 &&
+      Number(unresolved?.uncategorized || 0) === 0 &&
+      Number(unresolved?.avg_confidence || 0) >= 0.82;
+    if (canResolve) {
+      await env.D1.prepare(
+        `UPDATE prospects
+            SET status = CASE WHEN status = 'provisional' THEN 'active' ELSE status END,
+                provisional = 0,
+                direction_uncertain = 0,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND org_id = ?
+            AND (status = 'provisional' OR provisional = 1 OR direction_uncertain = 1)`
+      ).bind(p.id, orgId).run();
+      await env.D1.prepare(
+        `UPDATE prospect_signals
+            SET resolution_status = 'resolved',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE org_id = ? AND prospect_id = ?
+            AND classification_status = 'classified'
+            AND direction_uncertain = 0
+            AND sector_key != 'uncategorized'`
+      ).bind(orgId, p.id).run();
+      resolvedSoftStates++;
+    }
   }
 
-  return { scanned: rows.results.length, converted, duplicate_links: duplicateLinks };
+  const pending = await env.D1.prepare(
+    `SELECT COUNT(*) AS n
+       FROM prospect_signals
+      WHERE org_id = ?
+        AND (classification_status != 'classified' OR resolution_status = 'pending')`
+  ).bind(orgId).first<{ n: number }>();
+
+  return {
+    scanned: rows.results.length,
+    converted,
+    duplicate_links: duplicateLinks,
+    resolved_soft_states: resolvedSoftStates,
+    pending_classifications: pending?.n || 0,
+  };
+}
+
+export async function mergeProspects(
+  orgId: string,
+  winnerProspectId: string,
+  loserProspectId: string,
+  env: Env,
+  options: { method: string; score: number; alternatives?: unknown[] }
+): Promise<{ audit_id: string; moved_signals: number }> {
+  if (winnerProspectId === loserProspectId) throw new Error('PROSPECT_MERGE_SELF');
+  const [winner, loser, signals] = await Promise.all([
+    env.D1.prepare(`SELECT * FROM prospects WHERE id = ? AND org_id = ? AND deleted_at IS NULL`).bind(winnerProspectId, orgId).first<any>(),
+    env.D1.prepare(`SELECT * FROM prospects WHERE id = ? AND org_id = ? AND deleted_at IS NULL`).bind(loserProspectId, orgId).first<any>(),
+    env.D1.prepare(`SELECT id FROM prospect_signals WHERE org_id = ? AND prospect_id = ?`).bind(orgId, loserProspectId).all<{ id: string }>(),
+  ]);
+  if (!winner || !loser) throw new Error('PROSPECT_MERGE_NOT_FOUND');
+
+  const signalIds = (signals.results || []).map(row => row.id);
+  await env.D1.prepare(
+    `UPDATE prospect_signals
+        SET prospect_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE org_id = ? AND prospect_id = ?`
+  ).bind(winnerProspectId, orgId, loserProspectId).run();
+  await env.D1.prepare(
+    `UPDATE prospects
+        SET status = 'merged',
+            possible_duplicate_of = ?,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(winnerProspectId, loserProspectId, orgId).run();
+  await env.D1.prepare(
+    `INSERT OR IGNORE INTO prospect_soft_links
+       (id, org_id, prospect_id, link_type, target_type, target_id, score, evidence_json, created_at, updated_at)
+     VALUES (?, ?, ?, 'possible_duplicate', 'prospect', ?, ?, ?,
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+  ).bind(
+    crypto.randomUUID(),
+    orgId,
+    loserProspectId,
+    winnerProspectId,
+    options.score,
+    JSON.stringify({ method: options.method, req: 'REQ-ID-7' })
+  ).run();
+  await refreshProspectAggregate(winnerProspectId, orgId, env).catch(() => undefined);
+
+  const auditId = crypto.randomUUID();
+  await env.D1.prepare(
+    `INSERT INTO prospect_merge_audit (
+       id, org_id, action, winner_prospect_id, loser_prospect_id, method, score,
+       moved_signal_ids, alternatives_json, previous_loser_status,
+       previous_winner_snapshot, previous_loser_snapshot, created_at
+     ) VALUES (?, ?, 'merge', ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+  ).bind(
+    auditId,
+    orgId,
+    winnerProspectId,
+    loserProspectId,
+    options.method,
+    options.score,
+    JSON.stringify(signalIds),
+    JSON.stringify(options.alternatives || []),
+    loser.status || null,
+    JSON.stringify(winner),
+    JSON.stringify(loser)
+  ).run();
+
+  return { audit_id: auditId, moved_signals: signalIds.length };
+}
+
+export async function reverseProspectMerge(
+  orgId: string,
+  auditId: string,
+  env: Env
+): Promise<{ audit_id: string; restored_signals: number }> {
+  const audit = await env.D1.prepare(
+    `SELECT winner_prospect_id, loser_prospect_id, moved_signal_ids, previous_loser_status, score, method
+       FROM prospect_merge_audit
+      WHERE id = ? AND org_id = ? AND action = 'merge'
+      LIMIT 1`
+  ).bind(auditId, orgId).first<{
+    winner_prospect_id: string; loser_prospect_id: string; moved_signal_ids: string; previous_loser_status: string | null; score: number; method: string;
+  }>();
+  if (!audit) throw new Error('PROSPECT_MERGE_AUDIT_NOT_FOUND');
+  let signalIds: string[] = [];
+  try {
+    const parsed = JSON.parse(audit.moved_signal_ids || '[]');
+    if (Array.isArray(parsed)) signalIds = parsed.filter(id => typeof id === 'string');
+  } catch {}
+  if (signalIds.length > 0) {
+    const ph = signalIds.map(() => '?').join(',');
+    await env.D1.prepare(
+      `UPDATE prospect_signals
+          SET prospect_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE org_id = ? AND id IN (${ph})`
+    ).bind(audit.loser_prospect_id, orgId, ...signalIds).run();
+  }
+  await env.D1.prepare(
+    `UPDATE prospects
+        SET status = COALESCE(?, 'active'),
+            possible_duplicate_of = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(audit.previous_loser_status, audit.loser_prospect_id, orgId).run();
+  await Promise.all([
+    refreshProspectAggregate(audit.winner_prospect_id, orgId, env).catch(() => undefined),
+    refreshProspectAggregate(audit.loser_prospect_id, orgId, env).catch(() => undefined),
+  ]);
+
+  const reverseAuditId = crypto.randomUUID();
+  await env.D1.prepare(
+    `INSERT INTO prospect_merge_audit (
+       id, org_id, action, winner_prospect_id, loser_prospect_id, method, score,
+       moved_signal_ids, alternatives_json, previous_loser_status, created_at
+     ) VALUES (?, ?, 'unmerge', ?, ?, ?, ?, ?, '[]', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+  ).bind(
+    reverseAuditId,
+    orgId,
+    audit.winner_prospect_id,
+    audit.loser_prospect_id,
+    `reverse:${audit.method}`,
+    audit.score,
+    JSON.stringify(signalIds),
+    audit.previous_loser_status
+  ).run();
+  return { audit_id: reverseAuditId, restored_signals: signalIds.length };
 }
 
 export const __prospectIntelligenceTestHooks = {

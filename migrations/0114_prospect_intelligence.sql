@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS prospect_signals (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   prospect_id TEXT REFERENCES prospects(id) ON DELETE SET NULL,
+  deal_id TEXT REFERENCES deals(id) ON DELETE SET NULL,
   source_type TEXT NOT NULL CHECK(source_type IN ('conversation','event','document')),
   source_id TEXT NOT NULL,
   mention_ordinal INTEGER NOT NULL,
@@ -163,6 +164,9 @@ CREATE TABLE IF NOT EXISTS prospect_signals (
 
 CREATE INDEX IF NOT EXISTS idx_prospect_signals_prospect
   ON prospect_signals(prospect_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prospect_signals_deal
+  ON prospect_signals(org_id, deal_id, occurred_at DESC)
+  WHERE deal_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_prospect_signals_source
   ON prospect_signals(org_id, source_type, source_id);
 CREATE INDEX IF NOT EXISTS idx_prospect_signals_type
@@ -201,6 +205,25 @@ CREATE TABLE IF NOT EXISTS prospect_soft_links (
 
 CREATE INDEX IF NOT EXISTS idx_prospect_soft_links_prospect
   ON prospect_soft_links(prospect_id, link_type);
+
+CREATE TABLE IF NOT EXISTS prospect_merge_audit (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  action TEXT NOT NULL CHECK(action IN ('merge','unmerge')),
+  winner_prospect_id TEXT NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+  loser_prospect_id TEXT NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+  method TEXT NOT NULL,
+  score REAL NOT NULL DEFAULT 0,
+  moved_signal_ids TEXT NOT NULL DEFAULT '[]',
+  alternatives_json TEXT NOT NULL DEFAULT '[]',
+  previous_loser_status TEXT,
+  previous_winner_snapshot TEXT,
+  previous_loser_snapshot TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_prospect_merge_audit_org
+  ON prospect_merge_audit(org_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS prospect_classifier_samples (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),

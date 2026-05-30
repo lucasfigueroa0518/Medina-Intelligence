@@ -14,8 +14,10 @@ import {
   computeSignalStrength,
   detectAndRecordProspectSignals,
   extractMentionCandidatesFromText,
+  mergeProspects,
   normalizeProspectName,
   recordProspectBackfillCoverage,
+  reverseProspectMerge,
 } from '../src/lib/prospect-intelligence';
 
 class FakeStatement {
@@ -42,10 +44,15 @@ class FakeStatement {
 }
 
 class FakeD1 {
+  companies: any[] = [];
+  deals: any[] = [];
+  relationships: any[] = [];
   prospects: any[] = [];
   prospectSignals: any[] = [];
+  softLinks: any[] = [];
   classificationHistory: any[] = [];
   classifierSamples: any[] = [];
+  mergeAudit: any[] = [];
   coverage: any[] = [];
 
   prepare(sql: string): FakeStatement {
@@ -57,18 +64,65 @@ class FakeD1 {
   }
 
   all(sql: string, binds: unknown[]): any[] {
-    if (/FROM companies c/i.test(sql) || /FROM dealmakers/i.test(sql)) return [];
-    if (/FROM companies\s+WHERE/i.test(sql)) return [];
+    if (/FROM dealmakers/i.test(sql)) return [];
+    if (/FROM companies c/i.test(sql)) {
+      return this.companies
+        .filter(company => company.org_id === binds[0] && this.deals.some(deal => deal.org_id === company.org_id && deal.company_id === company.id && deal.stage !== 'closed' && !deal.deleted_at))
+        .map(company => ({ name: company.name, domain: company.domain || null }));
+    }
+    if (/FROM companies\s+WHERE/i.test(sql)) {
+      const [orgId, pattern] = binds;
+      const token = String(pattern || '').replace(/%/g, '').toLowerCase();
+      return this.companies.filter(company =>
+        company.org_id === orgId &&
+        !company.deleted_at &&
+        String(company.name || '').toLowerCase().includes(token)
+      );
+    }
+    if (/FROM firm_company_relationships/i.test(sql)) {
+      const [orgId, companyId] = binds;
+      return this.relationships.filter(row => row.org_id === orgId && row.company_id === companyId && !row.ended_at);
+    }
     if (/FROM prospect_signals/i.test(sql) && /SELECT signal_kind/i.test(sql)) {
       const [prospectId, orgId] = binds;
       return this.prospectSignals
         .filter(row => row.prospect_id === prospectId && row.org_id === orgId && row.mention_type === 'inbound_prospect')
         .sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
     }
+    if (/SELECT id FROM prospect_signals/i.test(sql)) {
+      const [orgId, prospectId] = binds;
+      return this.prospectSignals
+        .filter(row => row.org_id === orgId && row.prospect_id === prospectId)
+        .map(row => ({ id: row.id }));
+    }
     return [];
   }
 
   first(sql: string, binds: unknown[]): any | null {
+    if (/FROM companies/i.test(sql) && /WHERE id = \?/i.test(sql)) {
+      const [id, orgId] = binds;
+      const row = this.companies.find(entry => entry.id === id && entry.org_id === orgId && !entry.deleted_at);
+      return row ? { ...row } : null;
+    }
+    if (/FROM companies/i.test(sql) && /lower\(domain\) = lower\(\?\)/i.test(sql)) {
+      const [orgId, domain] = binds;
+      const row = this.companies.find(entry =>
+        entry.org_id === orgId &&
+        !entry.deleted_at &&
+        String(entry.domain || '').toLowerCase() === String(domain || '').toLowerCase()
+      );
+      return row ? { ...row } : null;
+    }
+    if (/FROM deals/i.test(sql) && /company_id = \?/i.test(sql)) {
+      const [orgId, companyId] = binds;
+      const row = this.deals.find(entry =>
+        entry.org_id === orgId &&
+        entry.company_id === companyId &&
+        !entry.deleted_at &&
+        entry.stage !== 'closed'
+      );
+      return row ? { ...row } : null;
+    }
     if (/FROM prospect_signals/i.test(sql)) {
       const [orgId, sourceType, sourceId, mentionOrdinal] = binds;
       const row = this.prospectSignals.find(entry =>
@@ -82,6 +136,16 @@ class FakeD1 {
     if (/SELECT id FROM prospects/i.test(sql)) {
       const [orgId, normalizedName] = binds;
       const row = this.prospects.find(entry => entry.org_id === orgId && entry.normalized_name === normalizedName && !entry.deleted_at);
+      return row ? { ...row } : null;
+    }
+    if (/SELECT \* FROM prospects/i.test(sql)) {
+      const [id, orgId] = binds;
+      const row = this.prospects.find(entry => entry.id === id && entry.org_id === orgId && !entry.deleted_at);
+      return row ? { ...row } : null;
+    }
+    if (/FROM prospect_merge_audit/i.test(sql)) {
+      const [id, orgId] = binds;
+      const row = this.mergeAudit.find(entry => entry.id === id && entry.org_id === orgId && entry.action === 'merge');
       return row ? { ...row } : null;
     }
     return null;
@@ -145,6 +209,19 @@ class FakeD1 {
       return;
     }
 
+    if (/INSERT(?: OR IGNORE)? INTO prospect_soft_links/i.test(sql)) {
+      this.softLinks.push({
+        id: binds[0],
+        org_id: binds[1],
+        prospect_id: binds[2],
+        link_type: /possible_duplicate/.test(sql) ? 'possible_duplicate' : binds[3],
+        target_type: /'prospect'/.test(sql) ? 'prospect' : binds[4],
+        target_id: /'prospect'/.test(sql) ? binds[3] : binds[5],
+        score: /'prospect'/.test(sql) ? binds[4] : binds[6],
+      });
+      return;
+    }
+
     if (/INSERT INTO prospect_classification_history/i.test(sql)) {
       this.classificationHistory.push({
         id: binds[0],
@@ -199,6 +276,56 @@ class FakeD1 {
       return;
     }
 
+    if (/UPDATE prospect_signals/i.test(sql) && /SET prospect_id/i.test(sql)) {
+      if (/id IN/i.test(sql)) {
+        const [prospectId, orgId, ...signalIds] = binds;
+        for (const row of this.prospectSignals) {
+          if (row.org_id === orgId && signalIds.includes(row.id)) row.prospect_id = prospectId;
+        }
+        return;
+      }
+      const [winnerId, orgId, loserId] = binds;
+      for (const row of this.prospectSignals) {
+        if (row.org_id === orgId && row.prospect_id === loserId) row.prospect_id = winnerId;
+      }
+      return;
+    }
+
+    if (/UPDATE prospects/i.test(sql) && /status = 'merged'/i.test(sql)) {
+      const [winnerId, loserId, orgId] = binds;
+      const row = this.prospects.find(entry => entry.id === loserId && entry.org_id === orgId);
+      if (row) {
+        row.status = 'merged';
+        row.possible_duplicate_of = winnerId;
+      }
+      return;
+    }
+
+    if (/UPDATE prospects/i.test(sql) && /possible_duplicate_of = NULL/i.test(sql)) {
+      const [status, loserId, orgId] = binds;
+      const row = this.prospects.find(entry => entry.id === loserId && entry.org_id === orgId);
+      if (row) {
+        row.status = status || 'active';
+        row.possible_duplicate_of = null;
+      }
+      return;
+    }
+
+    if (/INSERT INTO prospect_merge_audit/i.test(sql)) {
+      this.mergeAudit.push({
+        id: binds[0],
+        org_id: binds[1],
+        action: /'unmerge'/.test(sql) ? 'unmerge' : 'merge',
+        winner_prospect_id: binds[2],
+        loser_prospect_id: binds[3],
+        method: binds[4],
+        score: binds[5],
+        moved_signal_ids: binds[6],
+        previous_loser_status: binds[8] || null,
+      });
+      return;
+    }
+
     if (/INSERT INTO prospect_backfill_coverage/i.test(sql)) {
       this.coverage.push({
         id: binds[0],
@@ -218,41 +345,42 @@ class FakeD1 {
   }
 
   private upsertSuccessfulSignal(binds: unknown[]): void {
-    const existing = this.storedSignalFor(binds[1], binds[3], binds[4], binds[5]);
+    const existing = this.storedSignalFor(binds[1], binds[4], binds[5], binds[6]);
     const row = existing || {};
     Object.assign(row, {
       id: binds[0],
       org_id: binds[1],
       prospect_id: binds[2],
-      source_type: binds[3],
-      source_id: binds[4],
-      mention_ordinal: binds[5],
-      span_start: binds[6],
-      span_end: binds[7],
-      raw_mention_text: binds[8],
-      normalized_mention: binds[9],
-      source_title: binds[10],
-      occurred_at: binds[11],
-      direction: binds[12],
-      direction_source: binds[13],
-      direction_uncertain: binds[14],
-      mention_type: binds[15],
-      classifier_version: binds[16],
-      confidence: binds[17],
-      confidence_tier: binds[18],
-      classification_status: binds[19],
-      resolution_status: binds[20],
-      error_message: binds[21],
-      classification_attempts: binds[22],
-      sector_key: binds[23],
-      sector_confidence: binds[24],
-      signal_kind: binds[25],
-      dealmaker_id: binds[26],
-      dealmaker_name: binds[27],
-      has_deck: binds[28],
-      has_meeting: binds[29],
-      ingestion_mode: binds[30],
-      metadata_json: binds[31],
+      deal_id: binds[3],
+      source_type: binds[4],
+      source_id: binds[5],
+      mention_ordinal: binds[6],
+      span_start: binds[7],
+      span_end: binds[8],
+      raw_mention_text: binds[9],
+      normalized_mention: binds[10],
+      source_title: binds[11],
+      occurred_at: binds[12],
+      direction: binds[13],
+      direction_source: binds[14],
+      direction_uncertain: binds[15],
+      mention_type: binds[16],
+      classifier_version: binds[17],
+      confidence: binds[18],
+      confidence_tier: binds[19],
+      classification_status: binds[20],
+      resolution_status: binds[21],
+      error_message: binds[22],
+      classification_attempts: binds[23],
+      sector_key: binds[24],
+      sector_confidence: binds[25],
+      signal_kind: binds[26],
+      dealmaker_id: binds[27],
+      dealmaker_name: binds[28],
+      has_deck: binds[29],
+      has_meeting: binds[30],
+      ingestion_mode: binds[31],
+      metadata_json: binds[32],
     });
     if (!existing) this.prospectSignals.push(row);
   }
@@ -613,10 +741,131 @@ describe('prospect intelligence deterministic signals', () => {
     expect(db.classifierSamples[0].sample_reason).toBe('direction_uncertain');
   });
 
+  it('firewalls exact-domain existing deals as known_deal signals without creating prospects', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValueOnce({
+      text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"quantum","sector_confidence":0.9,"confidence":0.95,"reasoning":"Investment context."}',
+      usage: { input_tokens: 90, output_tokens: 20 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    db.companies.push({ id: 'company-qunnect', org_id: 'org-1', name: 'Qunnect', domain: 'qunnect.io' });
+    db.deals.push({ id: 'deal-qunnect', org_id: 'org-1', company_id: 'company-qunnect', stage: 'talking' });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-qunnect',
+      source: 'email',
+      subject: 'Intro to Qunnect',
+      bodyText: 'Qunnect founder@qunnect.io is raising and attached a deck.',
+      bodyPreview: 'Qunnect founder@qunnect.io',
+      fromEmail: 'alice@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+      attachments: [{ id: 'a1', name: 'Qunnect Deck.pdf', size: 100, contentType: 'application/pdf' }],
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(stats.skipped_known_deal).toBe(1);
+    expect(stats.prospects_upserted).toBe(0);
+    expect(db.prospects).toHaveLength(0);
+    expect(db.prospectSignals[0]).toMatchObject({
+      mention_type: 'known_deal',
+      deal_id: 'deal-qunnect',
+      prospect_id: null,
+      resolution_status: 'resolved',
+    });
+  });
+
+  it('holds weak name-only deal matches as separate prospects with soft deal links', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValueOnce({
+      text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"aerospace_defense","sector_confidence":0.8,"confidence":0.9,"reasoning":"Investment intro."}',
+      usage: { input_tokens: 90, output_tokens: 20 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    db.companies.push({ id: 'company-portal', org_id: 'org-1', name: 'Portal Aircraft', domain: null });
+    db.deals.push({ id: 'deal-portal', org_id: 'org-1', company_id: 'company-portal', stage: 'talking' });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-portal',
+      source: 'email',
+      subject: 'Intro to Portal Aircraft',
+      bodyText: 'Portal Aircraft is raising a seed round for defense aviation.',
+      bodyPreview: 'Portal Aircraft is raising',
+      fromEmail: 'alice@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(stats.prospects_upserted).toBe(1);
+    expect(db.prospects[0]).toMatchObject({
+      canonical_name: 'Portal Aircraft',
+      status: 'provisional',
+      possible_deal_id: 'deal-portal',
+    });
+    expect(db.prospectSignals[0]).toMatchObject({
+      mention_type: 'inbound_prospect',
+      deal_id: null,
+      prospect_id: db.prospects[0].id,
+    });
+    expect(db.softLinks.some(link =>
+      link.link_type === 'possible_deal_attach' &&
+      link.target_type === 'deal' &&
+      link.target_id === 'deal-portal'
+    )).toBe(true);
+  });
+
+  it('records reversible audited prospect merges', async () => {
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    db.prospects.push(
+      { id: 'prospect-winner', org_id: 'org-1', canonical_name: 'NeuralSeek', normalized_name: 'neuralseek', status: 'active', deleted_at: null },
+      { id: 'prospect-loser', org_id: 'org-1', canonical_name: 'Neural Seek', normalized_name: 'neuralseek', status: 'provisional', deleted_at: null },
+    );
+    db.prospectSignals.push({
+      id: 'signal-loser',
+      org_id: 'org-1',
+      prospect_id: 'prospect-loser',
+      mention_type: 'inbound_prospect',
+      signal_kind: 'intro',
+      has_deck: 0,
+      has_meeting: 0,
+      confidence: 0.9,
+      occurred_at: '2026-05-01T00:00:00.000Z',
+    });
+
+    const merge = await mergeProspects('org-1', 'prospect-winner', 'prospect-loser', env, {
+      method: 'deterministic_normalized_name',
+      score: 1,
+    });
+
+    expect(merge.moved_signals).toBe(1);
+    expect(db.prospectSignals[0].prospect_id).toBe('prospect-winner');
+    expect(db.prospects[1]).toMatchObject({ status: 'merged', possible_duplicate_of: 'prospect-winner' });
+    expect(db.mergeAudit[0]).toMatchObject({ action: 'merge', loser_prospect_id: 'prospect-loser' });
+
+    const reversed = await reverseProspectMerge('org-1', merge.audit_id, env);
+
+    expect(reversed.restored_signals).toBe(1);
+    expect(db.prospectSignals[0].prospect_id).toBe('prospect-loser');
+    expect(db.prospects[1]).toMatchObject({ status: 'provisional', possible_duplicate_of: null });
+    expect(db.mergeAudit[1]).toMatchObject({ action: 'unmerge', loser_prospect_id: 'prospect-loser' });
+  });
+
   it('keeps migration 0114 aligned with the reconciled prospect contract', () => {
     const sql = readFileSync('migrations/0114_prospect_intelligence.sql', 'utf8');
 
     expect(sql).toContain('deal_id TEXT REFERENCES deals(id) ON DELETE SET NULL');
+    expect(sql).toContain('idx_prospect_signals_deal');
+    expect(sql).toContain('prospect_merge_audit');
     expect(sql).toContain('idx_prospects_deal');
     expect(sql).toContain('ON prospects(org_id, deal_id)');
     expect(sql).toContain('signal_strength INTEGER NOT NULL DEFAULT 0');
