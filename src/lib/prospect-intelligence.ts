@@ -2189,32 +2189,32 @@ export async function detectAndRecordProspectSignals(
         continue;
       }
       const fallbackName = await companyNameFor(item.companyId, orgId, env);
-	      const mentions = await extractOrganizationMentionsFromSource(item, orgId, env, { fallbackName, knownContext });
-	      stats.mentions_seen += mentions.length;
-	      for (const mention of mentions) {
-	        const occurredAt = item.sentAt || new Date().toISOString();
-	        const existing = await lookupExistingContext(mention, item, orgId, env);
-	        let cls: Classification;
-	        try {
-	          cls = await classifyMention(item, mention, existing, knownContext, orgId, env);
-	        } catch (e) {
-	          await upsertFailedSignal({
-	            orgId,
-	            sourceType,
-	            sourceId: item.entityId,
-	            sourceTitle: item.subject || null,
-	            occurredAt,
-	            mention,
-	            ingestionMode,
-	            error: e,
-	          }, env);
-	          stats.signals_recorded++;
-	          stats.classifications_pending++;
-	          stats.errors.push({ item_id: item.entityId, error: e instanceof Error ? e.message : String(e) });
-	          continue;
-	        }
-	        let prospectId: string | null = null;
-	        let dealmaker: { id: string | null; name: string | null } = { id: null, name: null };
+      const mentions = await extractOrganizationMentionsFromSource(item, orgId, env, { fallbackName, knownContext });
+      stats.mentions_seen += mentions.length;
+      for (const mention of mentions) {
+        const occurredAt = item.sentAt || new Date().toISOString();
+        const existing = await lookupExistingContext(mention, item, orgId, env);
+        let cls: Classification;
+        try {
+          cls = await classifyMention(item, mention, existing, knownContext, orgId, env);
+        } catch (e) {
+          await upsertFailedSignal({
+            orgId,
+            sourceType,
+            sourceId: item.entityId,
+            sourceTitle: item.subject || null,
+            occurredAt,
+            mention,
+            ingestionMode,
+            error: e,
+          }, env);
+          stats.signals_recorded++;
+          stats.classifications_pending++;
+          stats.errors.push({ item_id: item.entityId, error: e instanceof Error ? e.message : String(e) });
+          continue;
+        }
+        let prospectId: string | null = null;
+        let dealmaker: { id: string | null; name: string | null } = { id: null, name: null };
 
         if (cls.mentionType === 'inbound_prospect') {
           if (cls.hasWarmIntro) {
