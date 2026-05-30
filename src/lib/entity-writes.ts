@@ -103,6 +103,7 @@ const DEAL_WRITABLE = new Set([
 const PROSPECT_WRITABLE = new Set([
   'canonical_name', 'domain', 'status', 'visibility',
   'sector_key', 'sector_confidence',
+  'website', 'description', 'hq_location', 'founders_json',
   'enrichment_priority', 'enrichment_status',
   'possible_duplicate_of', 'possible_company_id', 'possible_deal_id',
   'metadata_json', 'custom_fields',

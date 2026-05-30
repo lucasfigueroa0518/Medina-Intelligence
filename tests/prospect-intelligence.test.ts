@@ -16,8 +16,10 @@ import {
   extractMentionCandidatesFromText,
   mergeProspects,
   normalizeProspectName,
+  applyProspectEnrichmentCandidate,
   recordProspectBackfillCoverage,
   reverseProspectMerge,
+  runProspectEnrichmentCycle,
 } from '../src/lib/prospect-intelligence';
 
 class FakeStatement {
@@ -53,6 +55,7 @@ class FakeD1 {
   classificationHistory: any[] = [];
   classifierSamples: any[] = [];
   mergeAudit: any[] = [];
+  entityFieldState: any[] = [];
   coverage: any[] = [];
 
   prepare(sql: string): FakeStatement {
@@ -94,6 +97,14 @@ class FakeD1 {
       return this.prospectSignals
         .filter(row => row.org_id === orgId && row.prospect_id === prospectId)
         .map(row => ({ id: row.id }));
+    }
+    if (/FROM prospects/i.test(sql) && /ORDER BY signal_strength DESC/i.test(sql)) {
+      const [orgId, limit] = binds;
+      return this.prospects
+        .filter(row => row.org_id === orgId && !row.deleted_at && ['active', 'provisional'].includes(row.status) && ['not_started', 'candidate', 'failed'].includes(row.enrichment_status || 'not_started'))
+        .sort((a, b) => Number(b.signal_strength || 0) - Number(a.signal_strength || 0))
+        .slice(0, Number(limit))
+        .map(row => ({ ...row }));
     }
     return [];
   }
@@ -142,6 +153,17 @@ class FakeD1 {
       const [id, orgId] = binds;
       const row = this.prospects.find(entry => entry.id === id && entry.org_id === orgId && !entry.deleted_at);
       return row ? { ...row } : null;
+    }
+    if (/FROM prospects/i.test(sql) && /canonical_name/i.test(sql) && /WHERE id = \?/i.test(sql)) {
+      const [id, orgId] = binds;
+      const row = this.prospects.find(entry => entry.id === id && entry.org_id === orgId && !entry.deleted_at);
+      return row ? { ...row } : null;
+    }
+    if (/SELECT\s+\w+\s+AS value FROM prospects/i.test(sql)) {
+      const [id, orgId] = binds;
+      const field = sql.match(/SELECT\s+(\w+)\s+AS value FROM prospects/i)?.[1] || '';
+      const row = this.prospects.find(entry => entry.id === id && entry.org_id === orgId && !entry.deleted_at);
+      return row ? { value: row[field] ?? null } : null;
     }
     if (/FROM prospect_merge_audit/i.test(sql)) {
       const [id, orgId] = binds;
@@ -273,6 +295,46 @@ class FakeD1 {
         prospect.enrichment_priority = binds[7];
         prospect.confidence = binds[8];
       }
+      return;
+    }
+
+    if (/UPDATE prospects/i.test(sql) && /enrichment_status = 'enriched'/i.test(sql)) {
+      const field = sql.match(/SET\s+(\w+)\s+= \?/i)?.[1] || '';
+      const [value, prospectId, orgId] = binds;
+      const row = this.prospects.find(entry => entry.id === prospectId && entry.org_id === orgId);
+      if (row && field) {
+        row[field] = value;
+        row.enrichment_status = 'enriched';
+      }
+      return;
+    }
+
+    if (/INSERT INTO entity_field_state/i.test(sql)) {
+      const apply = /current_value = excluded.current_value/i.test(sql);
+      if (apply) {
+        const [entityId, fieldName, currentValue, sources] = binds;
+        const existing = this.entityFieldState.find(row => row.entity_type === 'prospect' && row.entity_id === entityId && row.field_name === fieldName);
+        const row = existing || { entity_type: 'prospect', entity_id: entityId, field_name: fieldName };
+        Object.assign(row, {
+          current_value: currentValue,
+          current_value_sources: sources,
+          pending_proposals: '{}',
+        });
+        if (!existing) this.entityFieldState.push(row);
+      } else {
+        const [entityId, fieldName, proposalValue, sourceKey] = binds;
+        const existing = this.entityFieldState.find(row => row.entity_type === 'prospect' && row.entity_id === entityId && row.field_name === fieldName);
+        const row = existing || { entity_type: 'prospect', entity_id: entityId, field_name: fieldName, current_value: null, current_value_sources: '[]' };
+        row.pending_proposals = JSON.stringify({ [String(proposalValue)]: [String(sourceKey)] });
+        if (!existing) this.entityFieldState.push(row);
+      }
+      return;
+    }
+
+    if (/UPDATE prospects/i.test(sql) && /enrichment_status = CASE/i.test(sql)) {
+      const [prospectId, orgId] = binds;
+      const row = this.prospects.find(entry => entry.id === prospectId && entry.org_id === orgId);
+      if (row && (!row.enrichment_status || row.enrichment_status === 'not_started')) row.enrichment_status = 'candidate';
       return;
     }
 
@@ -860,6 +922,141 @@ describe('prospect intelligence deterministic signals', () => {
     expect(db.mergeAudit[1]).toMatchObject({ action: 'unmerge', loser_prospect_id: 'prospect-loser' });
   });
 
+  it('applies corroborated own-domain enrichment through entity_field_state without overwriting filled fields', async () => {
+    const db = new FakeD1();
+    db.prospects.push({
+      id: 'prospect-auguria',
+      org_id: 'org-1',
+      canonical_name: 'Auguria',
+      normalized_name: 'auguria',
+      domain: 'auguria.io',
+      website: null,
+      description: 'Deck-sourced description',
+      status: 'active',
+      enrichment_status: 'not_started',
+      deleted_at: null,
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+
+    const result = await applyProspectEnrichmentCandidate('org-1', {
+      prospectId: 'prospect-auguria',
+      canonicalName: 'Auguria',
+      domain: 'auguria.io',
+      sourceKind: 'own_domain',
+      sourceUrl: 'https://auguria.io',
+      fields: {
+        website: 'https://auguria.io',
+        description: 'Website description should not overwrite.',
+      },
+    }, env);
+
+    expect(result.applied).toEqual(['website']);
+    expect(result.discarded).toContain('description');
+    expect(db.prospects[0]).toMatchObject({
+      website: 'https://auguria.io',
+      description: 'Deck-sourced description',
+      enrichment_status: 'enriched',
+    });
+    expect(db.entityFieldState[0]).toMatchObject({
+      entity_type: 'prospect',
+      entity_id: 'prospect-auguria',
+      field_name: 'website',
+      current_value: 'https://auguria.io',
+    });
+  });
+
+  it('holds uncorroborated third-party enrichment candidates and discards wrong-company facts', async () => {
+    const db = new FakeD1();
+    db.prospects.push({
+      id: 'prospect-portal',
+      org_id: 'org-1',
+      canonical_name: 'Portal Aircraft',
+      normalized_name: 'portalaircraft',
+      domain: 'portalaircraft.com',
+      description: null,
+      status: 'active',
+      enrichment_status: 'not_started',
+      deleted_at: null,
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+
+    const wrongCompany = await applyProspectEnrichmentCandidate('org-1', {
+      prospectId: 'prospect-portal',
+      canonicalName: 'Portal Software',
+      domain: 'portalsoftware.com',
+      sourceKind: 'duckduckgo',
+      sourceUrl: 'https://portalsoftware.com/about',
+      fields: { description: 'Wrong company.' },
+    }, env);
+    const held = await applyProspectEnrichmentCandidate('org-1', {
+      prospectId: 'prospect-portal',
+      canonicalName: 'Portal Aircraft',
+      domain: 'portalaircraft.com',
+      sourceKind: 'duckduckgo',
+      sourceUrl: 'https://search.example/portal',
+      fields: { description: 'Aerospace autonomy company.' },
+      corroboratingSourceCount: 1,
+    }, env);
+
+    expect(wrongCompany.discarded).toEqual(['description']);
+    expect(held.held).toEqual(['description']);
+    expect(db.prospects[0].description).toBeNull();
+    expect(db.prospects[0].enrichment_status).toBe('candidate');
+    expect(db.entityFieldState[0]).toMatchObject({
+      entity_type: 'prospect',
+      field_name: 'description',
+      current_value: null,
+    });
+    expect(JSON.parse(db.entityFieldState[0].pending_proposals)).toHaveProperty('Aerospace autonomy company.');
+  });
+
+  it('runs prospect enrichment in deterministic signal_strength priority order', async () => {
+    const db = new FakeD1();
+    db.prospects.push(
+      {
+        id: 'prospect-low',
+        org_id: 'org-1',
+        canonical_name: 'LowSignal',
+        normalized_name: 'lowsignal',
+        domain: 'low.example',
+        website: null,
+        description: null,
+        signal_strength: 10,
+        status: 'active',
+        enrichment_status: 'not_started',
+        deleted_at: null,
+      },
+      {
+        id: 'prospect-high',
+        org_id: 'org-1',
+        canonical_name: 'HighSignal',
+        normalized_name: 'highsignal',
+        domain: 'high.example',
+        website: null,
+        description: null,
+        signal_strength: 90,
+        status: 'active',
+        enrichment_status: 'not_started',
+        deleted_at: null,
+      },
+    );
+    const fetched: string[] = [];
+    const fetcher = vi.fn(async (url: string) => {
+      fetched.push(url);
+      return {
+        ok: true,
+        text: async () => '<html><head><title>HighSignal</title><meta name="description" content="Signal description"></head></html>',
+      } as any;
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+
+    const result = await runProspectEnrichmentCycle('org-1', env, { limit: 2, fetcher: fetcher as any });
+
+    expect(result.scanned).toBe(2);
+    expect(fetched[0]).toBe('https://high.example');
+    expect(fetched[1]).toBe('https://low.example');
+  });
+
   it('keeps migration 0114 aligned with the reconciled prospect contract', () => {
     const sql = readFileSync('migrations/0114_prospect_intelligence.sql', 'utf8');
 
@@ -869,6 +1066,8 @@ describe('prospect intelligence deterministic signals', () => {
     expect(sql).toContain('idx_prospects_deal');
     expect(sql).toContain('ON prospects(org_id, deal_id)');
     expect(sql).toContain('signal_strength INTEGER NOT NULL DEFAULT 0');
+    expect(sql).toContain('description TEXT');
+    expect(sql).toContain('founders_json TEXT NOT NULL DEFAULT');
     expect(sql).toContain('classification_status TEXT NOT NULL DEFAULT');
     expect(sql).toContain('resolution_status TEXT NOT NULL DEFAULT');
     expect(sql).toContain('classifications_pending INTEGER NOT NULL DEFAULT 0');

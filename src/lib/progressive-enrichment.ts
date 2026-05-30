@@ -21,7 +21,7 @@ interface FieldUpdate {
 export type SourceType =
   | 'email_signature' | 'meeting_transcript' | 'slack'
   | 'enrichment' | 'llm_extraction' | 'display_name'
-  | 'web_enrichment_company' | 'news_article';
+  | 'web_enrichment_company' | 'web_enrichment_prospect' | 'news_article';
 
 /** @deprecated Wave 6: corroboration is the only quality signal. The
  *  policy distinction (always_queue vs auto_if_confident) is a no-op
@@ -47,6 +47,7 @@ const COMPANY_FIELDS = new Set([
 const PROSPECT_FIELDS = new Set([
   'canonical_name', 'domain', 'status', 'visibility',
   'sector_key', 'sector_confidence',
+  'website', 'description', 'hq_location', 'founders_json',
   'enrichment_priority', 'enrichment_status',
   'possible_duplicate_of', 'possible_company_id', 'possible_deal_id',
   'metadata_json', 'custom_fields',
@@ -141,7 +142,7 @@ function normalizeForComparison(field: string, value: string): string {
  */
 export async function proposeEntityUpdate(
   orgId: string,
-  entityType: 'contact' | 'company',
+  entityType: 'contact' | 'company' | 'prospect',
   entityId: string,
   field: string,
   proposedValue: string,
@@ -187,7 +188,9 @@ export async function proposeEntityUpdate(
 
   // Update Vectorize index when the entity's actual value changed.
   if (result.disposition === 'apply' && result.applyMode === 'fill_empty') {
-    try { await updateEntityInIndex(orgId, entityType, entityId, env); } catch {}
+    if (entityType !== 'prospect') {
+      try { await updateEntityInIndex(orgId, entityType, entityId, env); } catch {}
+    }
     return 'auto_applied';
   }
   if (result.disposition === 'queue') return 'proposed';
@@ -196,7 +199,7 @@ export async function proposeEntityUpdate(
 
 export async function proposeMultipleUpdates(
   orgId: string,
-  entityType: 'contact' | 'company',
+  entityType: 'contact' | 'company' | 'prospect',
   entityId: string,
   updates: FieldUpdate[],
   env: Env,

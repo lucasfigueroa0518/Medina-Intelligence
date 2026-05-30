@@ -72,6 +72,10 @@ CREATE TABLE IF NOT EXISTS prospects (
   sector_key TEXT NOT NULL DEFAULT 'uncategorized'
     REFERENCES prospect_sectors(key),
   sector_confidence REAL NOT NULL DEFAULT 0,
+  website TEXT,
+  description TEXT,
+  hq_location TEXT,
+  founders_json TEXT NOT NULL DEFAULT '[]',
   signal_count INTEGER NOT NULL DEFAULT 0,
   evidence_count INTEGER NOT NULL DEFAULT 0,
   first_seen_at TEXT,

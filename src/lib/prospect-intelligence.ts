@@ -165,6 +165,18 @@ export interface ParsedDealflowListFields {
   approach?: string | null;
 }
 
+export interface ProspectEnrichmentCandidate {
+  prospectId: string;
+  canonicalName: string;
+  domain?: string | null;
+  sourceKind: 'own_domain' | 'google_news' | 'duckduckgo';
+  sourceUrl: string;
+  fields: Partial<Record<'website' | 'domain' | 'description' | 'hq_location' | 'founders_json', string>>;
+  corroboratingSourceCount?: number;
+}
+
+const PROSPECT_ENRICHMENT_FIELDS = new Set(['website', 'domain', 'description', 'hq_location', 'founders_json']);
+
 function emptyStats(items: number): ProspectDetectionStats {
   return {
     items_scanned: items,
@@ -1574,6 +1586,200 @@ async function refreshProspectAggregate(prospectId: string, orgId: string, env: 
   ).run();
 }
 
+function sameCompanyForEnrichment(prospect: { canonical_name: string; domain: string | null }, candidate: ProspectEnrichmentCandidate): boolean {
+  const prospectDomain = prospect.domain?.trim().toLowerCase() || null;
+  const candidateDomain = candidate.domain?.trim().toLowerCase() || domainInText(candidate.sourceUrl);
+  if (prospectDomain && candidateDomain && prospectDomain === candidateDomain) return true;
+  if (candidate.sourceKind === 'own_domain' && prospectDomain && candidate.sourceUrl.toLowerCase().includes(prospectDomain)) return true;
+  return normalizeProspectName(candidate.canonicalName) === normalizeProspectName(prospect.canonical_name);
+}
+
+function enrichmentCandidateIsCorroborated(candidate: ProspectEnrichmentCandidate): boolean {
+  return candidate.sourceKind === 'own_domain' || Number(candidate.corroboratingSourceCount || 0) >= 2;
+}
+
+async function currentProspectFieldValue(
+  orgId: string,
+  prospectId: string,
+  field: string,
+  env: Env
+): Promise<string | null> {
+  if (!PROSPECT_ENRICHMENT_FIELDS.has(field)) return null;
+  const row = await env.D1.prepare(
+    `SELECT ${field} AS value FROM prospects WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(prospectId, orgId).first<{ value: string | null }>();
+  const value = row?.value == null ? null : String(row.value).trim();
+  return value || null;
+}
+
+async function writeProspectFieldState(args: {
+  orgId: string;
+  prospectId: string;
+  field: string;
+  value: string;
+  source: string;
+  sourceUrl: string;
+  applyToEntity: boolean;
+}, env: Env): Promise<'applied' | 'held' | 'skipped'> {
+  if (!PROSPECT_ENRICHMENT_FIELDS.has(args.field)) return 'skipped';
+  const value = normalizeWhitespace(args.value);
+  if (!value) return 'skipped';
+
+  if (args.applyToEntity) {
+    await env.D1.prepare(
+      `UPDATE prospects
+          SET ${args.field} = ?,
+              enrichment_status = 'enriched',
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(value, args.prospectId, args.orgId).run();
+    await env.D1.prepare(
+      `INSERT INTO entity_field_state
+         (entity_type, entity_id, field_name, current_value, current_value_sources, pending_proposals, rejected_values)
+       VALUES ('prospect', ?, ?, ?, ?, '{}', '{}')
+       ON CONFLICT(entity_type, entity_id, field_name) DO UPDATE SET
+         current_value = excluded.current_value,
+         current_value_sources = excluded.current_value_sources,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+    ).bind(
+      args.prospectId,
+      args.field,
+      value,
+      JSON.stringify([{ source: args.source, source_url: args.sourceUrl, authority: 'web_enrichment', req: 'REQ-EN-4' }])
+    ).run();
+    return 'applied';
+  }
+
+  await env.D1.prepare(
+    `INSERT INTO entity_field_state
+       (entity_type, entity_id, field_name, current_value, current_value_sources, pending_proposals, rejected_values)
+     VALUES ('prospect', ?, ?, NULL, '[]', json_object(?, json_array(?)), '{}')
+     ON CONFLICT(entity_type, entity_id, field_name) DO UPDATE SET
+       pending_proposals = json_patch(COALESCE(entity_field_state.pending_proposals, '{}'), json_object(?, json_array(?))),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(
+    args.prospectId,
+    args.field,
+    value,
+    `${args.source}:${args.sourceUrl}`,
+    value,
+    `${args.source}:${args.sourceUrl}`
+  ).run();
+  await env.D1.prepare(
+    `UPDATE prospects
+        SET enrichment_status = CASE WHEN enrichment_status = 'not_started' THEN 'candidate' ELSE enrichment_status END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(args.prospectId, args.orgId).run();
+  return 'held';
+}
+
+export async function applyProspectEnrichmentCandidate(
+  orgId: string,
+  candidate: ProspectEnrichmentCandidate,
+  env: Env
+): Promise<{ applied: string[]; held: string[]; discarded: string[] }> {
+  const prospect = await env.D1.prepare(
+    `SELECT id, canonical_name, domain, website, description, hq_location, founders_json
+       FROM prospects
+      WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(candidate.prospectId, orgId).first<any>();
+  if (!prospect) throw new Error('PROSPECT_NOT_FOUND');
+
+  const sameCompany = sameCompanyForEnrichment(prospect, candidate);
+  const corroborated = enrichmentCandidateIsCorroborated(candidate);
+  const result = { applied: [] as string[], held: [] as string[], discarded: [] as string[] };
+  for (const [field, rawValue] of Object.entries(candidate.fields)) {
+    if (!rawValue || !PROSPECT_ENRICHMENT_FIELDS.has(field)) continue;
+    if (!sameCompany) {
+      result.discarded.push(field);
+      continue;
+    }
+    const current = await currentProspectFieldValue(orgId, candidate.prospectId, field, env);
+    if (current) {
+      result.discarded.push(field);
+      continue;
+    }
+    const disposition = await writeProspectFieldState({
+      orgId,
+      prospectId: candidate.prospectId,
+      field,
+      value: rawValue,
+      source: `web_enrichment:${candidate.sourceKind}`,
+      sourceUrl: candidate.sourceUrl,
+      applyToEntity: corroborated,
+    }, env);
+    if (disposition === 'applied') result.applied.push(field);
+    else if (disposition === 'held') result.held.push(field);
+    else result.discarded.push(field);
+  }
+  return result;
+}
+
+function extractMetaContent(html: string, name: string): string | null {
+  const re = new RegExp(`<meta[^>]+(?:name|property)=["']${name}["'][^>]+content=["']([^"']+)["'][^>]*>`, 'i');
+  return re.exec(html)?.[1]?.replace(/&amp;/g, '&') || null;
+}
+
+function titleFromHtml(html: string): string | null {
+  return html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() || null;
+}
+
+export async function runProspectEnrichmentCycle(
+  orgId: string,
+  env: Env,
+  options: { limit?: number; fetcher?: typeof fetch } = {}
+): Promise<{ scanned: number; applied: number; held: number; discarded: number }> {
+  const limit = Math.min(Math.max(Number(options.limit || 10), 1), 50);
+  const prospects = await env.D1.prepare(
+    `SELECT id, canonical_name, domain, signal_strength, enrichment_status
+       FROM prospects
+      WHERE org_id = ? AND deleted_at IS NULL
+        AND status IN ('active','provisional')
+        AND enrichment_status IN ('not_started','candidate','failed')
+      ORDER BY signal_strength DESC, last_seen_at DESC
+      LIMIT ?`
+  ).bind(orgId, limit).all<{ id: string; canonical_name: string; domain: string | null; signal_strength: number; enrichment_status: string }>();
+
+  let applied = 0;
+  let held = 0;
+  let discarded = 0;
+  const fetcher = options.fetcher || fetch;
+  for (const prospect of prospects.results || []) {
+    if (!prospect.domain) continue;
+    const url = `https://${prospect.domain}`;
+    try {
+      const response = await fetcher(url, { cf: { cacheTtl: 3600 } } as any);
+      if (!response.ok) throw new Error(`HTTP_${response.status}`);
+      const html = await response.text();
+      const description = extractMetaContent(html, 'description') || extractMetaContent(html, 'og:description') || titleFromHtml(html);
+      const candidate = await applyProspectEnrichmentCandidate(orgId, {
+        prospectId: prospect.id,
+        canonicalName: prospect.canonical_name,
+        domain: prospect.domain,
+        sourceKind: 'own_domain',
+        sourceUrl: url,
+        fields: {
+          website: url,
+          description: description || undefined,
+        },
+      }, env);
+      applied += candidate.applied.length;
+      held += candidate.held.length;
+      discarded += candidate.discarded.length;
+    } catch (e) {
+      await env.D1.prepare(
+        `UPDATE prospects
+            SET enrichment_status = 'failed',
+                metadata_json = json_patch(COALESCE(metadata_json, '{}'), json_object('enrichment_error', ?)),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND org_id = ?`
+      ).bind(e instanceof Error ? e.message : String(e), prospect.id, orgId).run();
+    }
+  }
+  return { scanned: prospects.results.length, applied, held, discarded };
+}
+
 async function recordSoftLinks(prospectId: string, orgId: string, cls: Classification, env: Env): Promise<void> {
   const links: Array<{ linkType: 'possible_company_match' | 'possible_deal_attach'; targetType: 'company' | 'deal'; targetId: string }> = [];
   if (cls.possibleCompanyId) links.push({ linkType: 'possible_company_match', targetType: 'company', targetId: cls.possibleCompanyId });
@@ -2000,6 +2206,8 @@ export const __prospectIntelligenceTestHooks = {
   parseDealflowList,
   sourcePrefilter,
   productionSamplingDecision,
+  sameCompanyForEnrichment,
+  enrichmentCandidateIsCorroborated,
   computeSignalStrength,
   sectorHintForText,
   buildClassifierPrefilter,
