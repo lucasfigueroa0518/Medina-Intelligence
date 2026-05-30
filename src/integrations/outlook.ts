@@ -752,7 +752,7 @@ export async function runHistoricalBackfill(
       try {
         const stats = await processClassifiedItems(
           classified,
-          { orgId, syncJobId },
+          { orgId, syncJobId, ingestionMode: 'backfill' },
           env
         );
         // Accumulate this page's counters into the sync_jobs metadata. Each

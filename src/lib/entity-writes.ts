@@ -37,7 +37,7 @@ import {
 import { safelyRebuildContactDetailReadModelForContact } from './contact-detail-read-model';
 import { loadConversationVisibilityMap } from './email-derived-visibility';
 
-export type EntityType = 'contact' | 'company' | 'deal';
+export type EntityType = 'contact' | 'company' | 'deal' | 'prospect';
 
 export interface WriteContext {
   orgId: string;
@@ -100,6 +100,14 @@ const DEAL_WRITABLE = new Set([
   'instrument_type', 'actual_close_date', 'lead_source', 'thesis_fit',
 ]);
 
+const PROSPECT_WRITABLE = new Set([
+  'canonical_name', 'domain', 'status', 'visibility',
+  'sector_key', 'sector_confidence',
+  'enrichment_priority', 'enrichment_status',
+  'possible_duplicate_of', 'possible_company_id', 'possible_deal_id',
+  'metadata_json', 'custom_fields',
+]);
+
 // Deal fields whose changes are tracked in source_metadata for the
 // per-field provenance trail. Mirrors the existing updateDeal handler.
 const DEAL_PROVENANCE_FIELDS = [
@@ -110,7 +118,8 @@ const DEAL_PROVENANCE_FIELDS = [
 function tableForEntity(t: EntityType): string {
   if (t === 'contact') return 'contacts';
   if (t === 'company') return 'companies';
-  return 'deals';
+  if (t === 'deal') return 'deals';
+  return 'prospects';
 }
 
 // ── Phase 3: agent_writes audit hook ────────────────────────────────
@@ -172,7 +181,8 @@ async function logAgentWrite(
 function writableSetFor(t: EntityType): Set<string> {
   if (t === 'contact') return CONTACT_WRITABLE;
   if (t === 'company') return COMPANY_WRITABLE;
-  return DEAL_WRITABLE;
+  if (t === 'deal') return DEAL_WRITABLE;
+  return PROSPECT_WRITABLE;
 }
 
 // ── Lock check (the core safety primitive) ──────────────────────────
@@ -277,6 +287,7 @@ interface UpdateEntityOptions {
 
 const CONTACT_PRIVATE_DERIVED_FIELDS = new Set(['bio_summary', 'custom_fields']);
 const DEAL_PRIVATE_DERIVED_FIELDS = new Set(['notes', 'custom_fields']);
+const EMPTY_PRIVATE_DERIVED_FIELDS = new Set<string>();
 
 async function isMartyPrivateDerivedWriteAllowed(
   field: string,
@@ -297,7 +308,7 @@ async function isMartyPrivateDerivedWriteAllowed(
 }
 
 async function updateEntityFieldsCommon(
-  entityType: 'contact' | 'company',
+  entityType: 'contact' | 'company' | 'prospect',
   entityId: string,
   fields: Record<string, unknown>,
   ctx: WriteContext,
@@ -311,7 +322,7 @@ async function updateEntityFieldsCommon(
       applied: {},
       rejected: [],
       error: {
-        code: entityType === 'contact' ? 'CONTACT_NOT_FOUND' : 'COMPANY_NOT_FOUND',
+        code: `${entityType.toUpperCase()}_NOT_FOUND`,
         status: 404,
         message: `${entityType} not found in your org`,
       },
@@ -330,7 +341,10 @@ async function updateEntityFieldsCommon(
       }
       continue;
     }
-    if (!(await isMartyPrivateDerivedWriteAllowed(field, CONTACT_PRIVATE_DERIVED_FIELDS, ctx, env, opts))) {
+    const privateDerivedFields = entityType === 'contact'
+      ? CONTACT_PRIVATE_DERIVED_FIELDS
+      : EMPTY_PRIVATE_DERIVED_FIELDS;
+    if (!(await isMartyPrivateDerivedWriteAllowed(field, privateDerivedFields, ctx, env, opts))) {
       if (!opts.silentLockSkip) {
         rejected.push({
           field_name: field,
@@ -438,7 +452,7 @@ async function updateEntityFieldsCommon(
   if (entityType === 'contact') {
     await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, entityId);
     await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, entityId, 'contact_updated');
-  } else {
+  } else if (entityType === 'company') {
     await safelyRebuildContactSearchIndexForCompany(
       env,
       ctx.orgId,
@@ -462,6 +476,10 @@ export const updateContactFields = (
 export const updateCompanyFields = (
   id: string, fields: Record<string, unknown>, ctx: WriteContext, env: Env, opts?: UpdateEntityOptions
 ) => updateEntityFieldsCommon('company', id, fields, ctx, env, opts);
+
+export const updateProspectFields = (
+  id: string, fields: Record<string, unknown>, ctx: WriteContext, env: Env, opts?: UpdateEntityOptions
+) => updateEntityFieldsCommon('prospect', id, fields, ctx, env, opts);
 
 // ── Deal updates: same shape + per-field provenance + stage transition ──
 //

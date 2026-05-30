@@ -97,7 +97,7 @@ export async function handleBackfillSlackChannelHistory(
   let stats: Awaited<ReturnType<typeof processClassifiedItems>> | null = null;
   if (messages.length > 0) {
     const classified = await classifyAndDeduplicate(messages, ctx.orgId, env);
-    stats = await processClassifiedItems(classified, { orgId: ctx.orgId, syncJobId }, env);
+    stats = await processClassifiedItems(classified, { orgId: ctx.orgId, syncJobId, ingestionMode: 'backfill' }, env);
   }
 
   // Close the sync_jobs row.

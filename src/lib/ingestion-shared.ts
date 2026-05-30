@@ -23,6 +23,7 @@ export interface ProcessClassifiedContext {
   orgId: string;
   /** Used for stage-and-commit's audit trail. Inline-backfill passes a synthetic key (`backfill-${userId}`). */
   syncJobId: string;
+  ingestionMode?: 'live' | 'backfill';
 }
 
 export interface ProcessClassifiedStats {
@@ -35,6 +36,8 @@ export interface ProcessClassifiedStats {
   attachments_skipped: number;
   attachments_failed: number;
   deal_signals_staged: number;
+  prospect_signals_recorded: number;
+  prospects_upserted: number;
   errors: Array<{ phase: string; error: string }>;
 }
 
@@ -49,6 +52,8 @@ function emptyStats(): ProcessClassifiedStats {
     attachments_skipped: 0,
     attachments_failed: 0,
     deal_signals_staged: 0,
+    prospect_signals_recorded: 0,
+    prospects_upserted: 0,
     errors: [],
   };
 }
@@ -61,6 +66,7 @@ function emptyStats(): ProcessClassifiedStats {
  *   2. chunk-and-embed   — split + embed each item's text, write vector rows
  *   3. process-attachments — Graph fetch + persist email attachments as docs
  *   4. detect-deals      — LLM-screen for deal-signal candidates, stage them
+ *   5. detect-prospects  — deterministic prospect mentions/signals, no holds
  *
  * Per-item failures within a phase are caught + counted in stats, not
  * rethrown — a single bad item can't take down the rest of the batch. The
@@ -162,6 +168,52 @@ export async function processClassifiedItems(
     stats.errors.push({ phase: 'detect-deals', error: e?.message || String(e) });
   }
 
+  // Phase 5 — detect prospects. This path deliberately records uncertainty as
+  // recoverable entity metadata.
+  try {
+    const {
+      detectAndRecordProspectSignals,
+      recordProspectBackfillCoverage,
+    } = await import('./prospect-intelligence');
+    const ingestionMode = ctx.ingestionMode || (ctx.syncJobId.includes('backfill') ? 'backfill' : 'live');
+    const prospectStats = await detectAndRecordProspectSignals(classified, ctx.orgId, env, {
+      ingestionMode,
+    });
+    stats.prospect_signals_recorded = prospectStats.signals_recorded;
+    stats.prospects_upserted = prospectStats.prospects_upserted;
+    for (const err of prospectStats.errors) {
+      stats.errors.push({ phase: 'detect-prospects', error: `${err.item_id}: ${err.error}` });
+    }
+    if (ingestionMode === 'backfill') {
+      const bySource = new Map<string, ClassifiedItem[]>();
+      for (const item of classified) {
+        const key = item.source || item.type || 'unknown';
+        const bucket = bySource.get(key) || [];
+        bucket.push(item);
+        bySource.set(key, bucket);
+      }
+      for (const [sourceFamily, items] of bySource) {
+        const dates = items
+          .map(item => item.sentAt)
+          .filter((value): value is string => typeof value === 'string' && value.length > 0)
+          .sort();
+        if (dates.length === 0) continue;
+        await recordProspectBackfillCoverage(ctx.orgId, env, {
+          sourceFamily,
+          windowStart: dates[0],
+          windowEnd: dates[dates.length - 1],
+          itemsScanned: items.length,
+          signalsRecorded: prospectStats.signals_recorded,
+          prospectsUpserted: prospectStats.prospects_upserted,
+          status: prospectStats.errors.length > 0 ? 'partial' : 'completed',
+          error: prospectStats.errors[0]?.error || null,
+        });
+      }
+    }
+  } catch (e: any) {
+    stats.errors.push({ phase: 'detect-prospects', error: e?.message || String(e) });
+  }
+
   return stats;
 }
 
@@ -180,6 +232,7 @@ export async function persistClassifiedStats(
     stats.items_total > 0 ||
     stats.attachments_attempted > 0 ||
     stats.deal_signals_staged > 0 ||
+    stats.prospect_signals_recorded > 0 ||
     stats.embed_failures > 0 ||
     stats.errors.length > 0;
   if (!hasAny) return;
@@ -197,13 +250,16 @@ export async function persistClassifiedStats(
             '$.attachments_processed', COALESCE(json_extract(metadata, '$.attachments_processed'), 0) + ?,
             '$.attachments_skipped',   COALESCE(json_extract(metadata, '$.attachments_skipped'),   0) + ?,
             '$.attachments_failed',    COALESCE(json_extract(metadata, '$.attachments_failed'),    0) + ?,
-            '$.deal_signals_staged',   COALESCE(json_extract(metadata, '$.deal_signals_staged'),   0) + ?
+            '$.deal_signals_staged',   COALESCE(json_extract(metadata, '$.deal_signals_staged'),   0) + ?,
+            '$.prospect_signals_recorded', COALESCE(json_extract(metadata, '$.prospect_signals_recorded'), 0) + ?,
+            '$.prospects_upserted',    COALESCE(json_extract(metadata, '$.prospects_upserted'),    0) + ?
           )
         WHERE id = ?`
     ).bind(
       stats.items_total, stats.items_staged, stats.items_embedded, stats.embed_failures,
       stats.attachments_attempted, stats.attachments_processed, stats.attachments_skipped, stats.attachments_failed,
       stats.deal_signals_staged,
+      stats.prospect_signals_recorded, stats.prospects_upserted,
       syncJobId
     ).run();
 

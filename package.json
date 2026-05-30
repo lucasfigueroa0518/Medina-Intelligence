@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:agent": "vitest run tests/agent-runtime.test.ts tests/agent-tools.test.ts tests/citations.test.ts tests/claude.test.ts tests/firm-relationship-state.test.ts",
-    "test:max": "vitest run tests/max-set-builder.test.ts"
+    "test:max": "vitest run tests/max-set-builder.test.ts",
+    "prospect:spike": "tsx scripts/prospect-classifier-spike.ts"
   },
   "dependencies": {
     "@e965/xlsx": "^0.20.3",
@@ -37,6 +38,7 @@
     "@cloudflare/workers-types": "^4.20240924.0",
     "@types/node": "^20.14.0",
     "concurrently": "^9.0.1",
+    "tsx": "^4.22.3",
     "typescript": "^5.6.0",
     "vitest": "^4.1.6",
     "wrangler": "^4.85.0"

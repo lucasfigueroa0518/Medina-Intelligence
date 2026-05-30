@@ -19,6 +19,7 @@ import { embedDocumentItem as embedDocumentItemForRepair } from './document-embe
 import { repairContactSearchIndexDrift } from './contact-search';
 import { repairContactDetailReadModelDrift } from './contact-detail-read-model';
 import { CLAUDE_HAIKU_MODEL } from './model-policy';
+import { runProspectReconciliation } from './prospect-intelligence';
 
 // Mirrors the visibility logic in classification.ts:233 — emails are always
 // 'private' regardless of source-side hint, transcripts/manual notes are
@@ -63,6 +64,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await promoteToStandalone(orgId, env); } catch (e) { console.error('Standalone promotion:', e); }
   try { await flagStaleOrphanedEvents(orgId, env); } catch (e) { console.error('Orphan flagging:', e); }
   try { await recalculateAllAssociations(orgId, env); } catch (e) { console.error('Association recalc:', e); }
+  try { await runProspectReconciliation(orgId, env); } catch (e) { console.error('Prospect reconciliation:', e); }
   // Phase 0a-4 (2026-05-04): three org-wide bulk calcs migrated from
   // ingestion-finalizer to daily-cron after Terminal 5 confirmed the
   // finalizer was hitting the 1000-subreq cap consistently. Each is

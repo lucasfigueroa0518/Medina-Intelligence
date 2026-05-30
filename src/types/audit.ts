@@ -8,6 +8,7 @@ export type AuditAction =
 
 export type AuditEntityType =
   | 'contact' | 'company' | 'deal' | 'event' | 'conversation'
+  | 'prospect'
   | 'document' | 'task' | 'tag' | 'campaign' | 'user'
   | 'sync_job' | 'integration' | 'import_job';
 
@@ -34,6 +35,7 @@ const VALID_ACTIONS: ReadonlySet<string> = new Set([
 
 const VALID_ENTITY_TYPES: ReadonlySet<string> = new Set([
   'contact', 'company', 'deal', 'event', 'conversation',
+  'prospect',
   'document', 'task', 'tag', 'campaign', 'user',
   'sync_job', 'integration', 'import_job',
 ]);

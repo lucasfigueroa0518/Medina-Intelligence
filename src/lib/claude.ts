@@ -151,17 +151,24 @@ function buildGatewayHeaders(env: Env): Record<string, string> {
   return headers;
 }
 
-export async function callClaude(
+export interface ClaudeCallResult {
+  text: string;
+  usage: { input_tokens: number; output_tokens: number };
+  model: string;
+}
+
+export async function callClaudeWithUsage(
   params: { system: string; user: string; max_tokens: number; orgId?: string; model?: string },
   priority: 'high' | 'low',
   env: Env
-): Promise<string> {
+): Promise<ClaudeCallResult> {
   const orgId = params.orgId || 'system';
   const model = params.model || resolveDefaultClaudeModel();
   const budgetSource = budgetUpstreamForClaudeModel(model);
   if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
     throw new Error('CLAUDE_RATE_LIMITED');
   }
+  const model = params.model || CLAUDE_MODEL;
 
   const response = await fetch(buildGatewayUrl(env), {
     method: 'POST',
@@ -191,7 +198,16 @@ export async function callClaude(
   const data = (await response.json()) as ClaudeResponse;
   const textBlock = data.content.find(b => b.type === 'text');
   if (!textBlock) throw new Error('Claude returned no text content');
-  return textBlock.text!;
+  return { text: textBlock.text!, usage: data.usage, model };
+}
+
+export async function callClaude(
+  params: { system: string; user: string; max_tokens: number; orgId?: string; model?: string },
+  priority: 'high' | 'low',
+  env: Env
+): Promise<string> {
+  const result = await callClaudeWithUsage(params, priority, env);
+  return result.text;
 }
 
 export interface ToolDefinition {
