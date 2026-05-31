@@ -268,11 +268,13 @@ export function normalizeProspectName(value: string | null | undefined): string 
 
 function canonicalizeMention(raw: string): { canonicalName: string; products: string[] } {
   let cleaned = normalizeWhitespace(raw)
-    .replace(/^[\-*•\d.)\s]+/, '')
+    .replace(/^\s*(?:[-*•]\s*|\d+[.)]\s*)/, '')
+    .replace(/^(?:hi|hello|hey|dear)\s+[A-Z][A-Za-z.'-]{1,30}[,!.\s]*$/i, '')
+    .replace(/^(?:hi|hello|hey|dear)\s+[A-Z][A-Za-z.'-]{1,30}[,!\s]+/i, '')
     .replace(/^(?:about|regarding|subject|re|fw|fwd)\s*[:\-]?\s+/i, '')
     .replace(/\s+/g, ' ')
     .replace(/[,:;]+$/g, '')
-    .replace(/\s+\b(?:for|to|from|with|and|the)\b$/i, '')
+    .replace(/\s+\b(?:for|to|from|with|and|the|at)\b$/i, '')
     .trim();
   cleaned = collapseRepeatedAdjacentName(cleaned);
   const parts = cleaned.split(/\s+\/\s+/).map(p => p.trim()).filter(Boolean);
@@ -295,6 +297,10 @@ function collapseRepeatedAdjacentName(name: string): string {
 function isGenericCandidate(name: string): boolean {
   const clean = normalizeWhitespace(name);
   if (/^(?:i['’]?m|i\s+am|we|they|it|there|please|sorry|no worries|sounds great|great|thanks)\b/i.test(clean)) return true;
+  if (/^(?:hi|hello|hey|dear)\s+[A-Z][A-Za-z.'-]{1,30}[,!.\s]*$/i.test(clean)) return true;
+  if (/^(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b/i.test(clean)) return true;
+  if (/^(?:quantum|cyber|ai|ml|data|security|healthcare|fintech|aerospace|defense)$/i.test(clean)) return true;
+  if (/\b(?:employee search endpoint|search endpoint|prospector spreadsheets?|spreadsheet|spreadsheets|presentation|verification code|calendar artifact)\b/i.test(clean)) return true;
   if (/\b(?:google meet|meet\.google\.com|join by phone|meeting link|calendar invite)\b/i.test(clean)) return true;
   if (/^(?:join with|join by|joining info|meeting link|video call|conference call|docreq)\b/i.test(clean)) return true;
   if (/^(?:about|regarding|subject|re|fw|fwd)\s*[:\-]?\s*$/i.test(clean)) return true;
@@ -303,16 +309,19 @@ function isGenericCandidate(name: string): boolean {
   return new Set([
     'hi', 'hello', 'thanks', 'thankyou', 'best', 'regards', 'forwarded',
     'subject', 'from', 'to', 'cc', 'date', 'team', 'fund', 'company',
-    'meeting', 'call', 'deck', 'memo', 'newsletter', 'update',
+    'meeting', 'call', 'deck', 'memo', 'newsletter', 'update', 'claude',
     'sent', 'fwd', 'fw', 're', 'on', 'thu', 'thursday', 'wednesday',
     'monday', 'tuesday', 'friday', 'saturday', 'sunday', 'jan', 'january',
     'feb', 'february', 'mar', 'march', 'apr', 'april', 'may', 'jun',
     'june', 'jul', 'july', 'aug', 'august', 'sep', 'sept', 'september',
     'oct', 'october', 'nov', 'november', 'dec', 'december', 'lucas',
     'tony', 'anthony', 'alicia', 'michael', 'mike', 'john', 'david',
-    'andrew', 'alex', 'sam', 'chris', 'leonardo', 'medina',
+    'andrew', 'alex', 'sam', 'chris', 'leonardo', 'craig', 'manny', 'raul',
+    'chuck', 'medina',
     'medinaventures', 'medinavc', 'mediavc', 'claudeopus', 'googlemeet',
-    'meetinglink', 'joinwithgooglemeet', 'joinby', 'docreq',
+    'meetinglink', 'joinwithgooglemeet', 'joinby', 'docreq', 'hitony',
+    'employeeendpoint', 'employeesearchendpoint', 'prospectorspreadsheets',
+    'cyberpresentation', 'thursdayafter', 'hco',
     'japaneseendowment', 'britishcolumbia', 'gables', 'neural',
   ]).has(normalized);
 }
@@ -333,7 +342,7 @@ function looksLikePersonName(name: string): boolean {
     'lucas', 'tony', 'anthony', 'alicia', 'michael', 'mike', 'john', 'david',
     'andrew', 'alex', 'sam', 'chris', 'leonardo', 'daniel', 'james', 'robert',
     'william', 'jennifer', 'sarah', 'laura', 'maria',
-    'josh', 'victor', 'steve',
+    'josh', 'victor', 'steve', 'craig', 'chuck', 'manny', 'raul',
   ]);
   return firstNames.has(tokens[0].toLowerCase()) && tokens.every(token => /^[A-Z][a-zA-Z.'-]+$/.test(token));
 }
@@ -1471,7 +1480,9 @@ mention_type -- choose exactly one, using this decision order (first match wins)
   3. noise         -- vendor, fund admin, legal, internal ops, personal, OR a company
                      that is a commercial/customer/BD target rather than an investment
                      target.
-     web_analytics -- a website-traffic or analytics record (a noise subtype).
+     web_analytics -- only an explicit website-visit / traffic analytics source row
+                      (a noise subtype); ordinary emails, auth notices, vendor/admin
+                      messages, and portfolio/customer threads remain noise.
   4. The named entity is a company in an investment context:
        known_deal       -- the named entity itself exactly matches the KNOWN list below
                            (even if pitched outbound/internal). Do not infer known_deal from
@@ -1499,6 +1510,10 @@ Sativa hempcrete in an ArmyFUZE list -> {"mention_type":"inbound_prospect","dire
 Lead investor named in a funding announcement -> {"mention_type":"news","direction":"news","sector_key":"uncategorized","sector_confidence":0.3,"confidence":0.88,"reasoning":"Named as reported round context, not actively introducing deal flow to the fund."}
 Calendar platform or meeting-link text in an intro invite -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.92,"reasoning":"Calendar/link scaffolding, not a company mention."}
 Portfolio company mentioned as context in an admin/legal thread -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.85,"reasoning":"Administrative context, not an investment or outbound portfolio pitch signal."}
+Investor, design partner, or report author named inside an active deal/co-investment thread -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.3,"confidence":0.9,"reasoning":"Background entity inside a deal thread, not public reporting and not the investment target."}
+Market comparable or portfolio competitor named in a portfolio/company commentary email -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.3,"confidence":0.88,"reasoning":"Contextual background in an ordinary business thread, not newsletter or press reporting."}
+Verification-code, login, billing, or admin email from a vendor -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.95,"reasoning":"Operational artifact; not website traffic analytics and not deal flow."}
+Explicit website-visitor analytics row saying Company X visited medinavc.com -> {"mention_type":"web_analytics","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.9,"reasoning":"Literal traffic analytics source row."}
 
 Output ONLY this JSON object, no prose, no code fences:
 {"mention_type":"...","direction":"...","sector_key":"...","sector_confidence":0.0,"confidence":0.0,"reasoning":"one short sentence"}
@@ -1553,7 +1568,7 @@ export async function callProspectClassifier(
   const model = prospectClassifierModel(env, input);
   const prompt = buildProspectClassifierPrompt(input);
   const result = await callClaudeWithUsage(
-    { system: prompt.systemForApi, user: prompt.user, max_tokens: 500, orgId: input.orgId, model, assistantPrefill: '{' },
+    { system: prompt.systemForApi, user: prompt.user, max_tokens: 500, orgId: input.orgId, model, assistantPrefill: '{', temperature: 0 },
     'low',
     env
   );

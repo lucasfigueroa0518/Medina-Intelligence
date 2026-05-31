@@ -576,6 +576,12 @@ describe('prospect intelligence deterministic signals', () => {
     expect(candidate.products).toEqual(['FortiLayer AI', 'FortiLayer OT']);
   });
 
+  it('does not strip leading digits from company names anchored by domains', () => {
+    const [candidate] = extractMentionCandidatesFromText('Please coordinate with 8k-capital.com on closing items.');
+    expect(candidate.canonicalName).toBe('8k Capital');
+    expect(candidate.normalizedName).toBe('8kcapital');
+  });
+
   it('suppresses meeting scaffolding and canonicalizes repeated adjacent names before classification', async () => {
     const { extractOrganizationMentionsFromSource } = __prospectIntelligenceTestHooks;
     const item: any = {
@@ -590,6 +596,7 @@ describe('prospect intelligence deterministic signals', () => {
         'Warm intro to Auguria and NeuralSeek for the diligence call.',
         'Qunnect Qunnect appears in the copied calendar title.',
         'Greenberg Traurig will handle counsel questions.',
+        'Quantum Machines is a separate real organization in the same thread.',
       ].join('\n'),
       fromEmail: 'alice@example.com',
     };
@@ -604,14 +611,24 @@ describe('prospect intelligence deterministic signals', () => {
         { name: 'NeuralSeek', raw: 'NeuralSeek', context: null },
         { name: 'Qunnect Qunnect', raw: 'Qunnect Qunnect', context: null },
         { name: 'Greenberg Traurig', raw: 'Greenberg Traurig', context: null },
+        { name: 'Craig Abod', raw: 'Craig Abod', context: null },
+        { name: 'Manny', raw: 'Manny', context: null },
+        { name: 'Hi Tony', raw: 'Hi Tony', context: null },
+        { name: 'Thursday after', raw: 'Thursday after', context: null },
+        { name: 'Employee Search Endpoint', raw: 'Employee Search Endpoint', context: null },
+        { name: 'Prospector Spreadsheets', raw: 'Prospector Spreadsheets', context: null },
+        { name: 'Cyber Presentation', raw: 'Cyber Presentation', context: null },
+        { name: 'Quantum', raw: 'Quantum', context: null },
+        { name: 'Quantum Machines', raw: 'Quantum Machines', context: null },
       ],
     });
 
     const names = mentions.map(mention => mention.canonicalName);
-    expect(names).toEqual(expect.arrayContaining(['Auguria', 'NeuralSeek', 'Qunnect', 'Greenberg Traurig']));
+    expect(names).toEqual(expect.arrayContaining(['Auguria', 'NeuralSeek', 'Qunnect', 'Greenberg Traurig', 'Quantum Machines']));
     expect(names).not.toContain('Join with Google Meet');
     expect(names).not.toContain('Meeting link meet.google.com/cya-yrux-nbm Join by phone');
     expect(names).not.toContain('DocReq');
+    expect(names).not.toEqual(expect.arrayContaining(['Craig Abod', 'Manny', 'Hi Tony', 'Thursday after', 'Employee Search Endpoint', 'Prospector Spreadsheets', 'Cyber Presentation', 'Quantum']));
     expect(mentions.find(mention => mention.canonicalName === 'Qunnect')?.raw).toBe('Qunnect Qunnect');
   });
 
@@ -652,6 +669,9 @@ describe('prospect intelligence deterministic signals', () => {
     expect(prompt.system).toContain('Incidental background references in ordinary email threads');
     expect(prompt.system).toContain('financing/news/background sentence is not automatically an intro_source');
     expect(prompt.system).toContain('nearby companies; classify only the MENTION named in the user prompt');
+    expect(prompt.system).toContain('Background entity inside a deal thread');
+    expect(prompt.system).toContain('Operational artifact; not website traffic analytics');
+    expect(prompt.system).toContain('Literal traffic analytics source row');
     expect(prompt.user).toContain('SOURCE_TYPE: email');
     expect(prompt.user).toContain('MENTION (the company in question): Auguria');
   });

@@ -173,6 +173,7 @@ export async function callClaudeWithUsage(
     orgId?: string;
     model?: string;
     assistantPrefill?: string;
+    temperature?: number;
   },
   priority: 'high' | 'low',
   env: Env
@@ -191,6 +192,7 @@ export async function callClaudeWithUsage(
     body: JSON.stringify({
       model,
       max_tokens: params.max_tokens,
+      ...(params.temperature != null ? { temperature: params.temperature } : {}),
       system: params.system,
       messages: params.assistantPrefill
         ? [
@@ -223,7 +225,7 @@ export async function callClaudeWithUsage(
 }
 
 export async function callClaude(
-  params: { system: ClaudeSystemPrompt; user: string; max_tokens: number; orgId?: string; model?: string },
+  params: { system: ClaudeSystemPrompt; user: string; max_tokens: number; orgId?: string; model?: string; temperature?: number },
   priority: 'high' | 'low',
   env: Env
 ): Promise<string> {

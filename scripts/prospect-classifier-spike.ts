@@ -56,20 +56,23 @@ interface SpikeClassifierDecision {
   reasoning: string | null;
   model: string;
   usage?: { input_tokens: number; output_tokens: number; total_tokens?: number };
+  rawResponse?: string;
 }
 
 class SpikeClassifierError extends Error {
   usage?: { input_tokens: number; output_tokens: number; total_tokens?: number };
   model?: string;
+  rawResponse?: string;
 
   constructor(
     message: string,
-    options?: { usage?: { input_tokens: number; output_tokens: number; total_tokens?: number }; model?: string }
+    options?: { usage?: { input_tokens: number; output_tokens: number; total_tokens?: number }; model?: string; rawResponse?: string }
   ) {
     super(message);
     this.name = 'SpikeClassifierError';
     this.usage = options?.usage;
     this.model = options?.model;
+    this.rawResponse = options?.rawResponse;
   }
 }
 
@@ -101,6 +104,7 @@ export interface PredictionRecord {
   sector_confidence: number;
   reasoning: string | null;
   classifier_error?: string | null;
+  raw_model_output?: string | null;
   usage: { input_tokens: number; output_tokens: number; total_tokens: number };
   cost_usd: number | null;
 }
@@ -307,6 +311,7 @@ async function callDirectAnthropicClassifier(input: ProspectClassifierInput, env
     body: JSON.stringify({
       model,
       max_tokens: 500,
+      temperature: 0,
       system: prompt.systemForApi,
       messages: [
         { role: 'user', content: prompt.user },
@@ -321,10 +326,10 @@ async function callDirectAnthropicClassifier(input: ProspectClassifierInput, env
   const data = await response.json() as any;
   const text = `{${data.content?.find((block: any) => block.type === 'text')?.text || ''}`;
   try {
-    return __prospectIntelligenceTestHooks.parseProspectClassifierResponse(text, model, data.usage);
+    return { ...__prospectIntelligenceTestHooks.parseProspectClassifierResponse(text, model, data.usage), rawResponse: text };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new SpikeClassifierError(message, { usage: data.usage, model });
+    throw new SpikeClassifierError(message, { usage: data.usage, model, rawResponse: text });
   }
 }
 
@@ -565,11 +570,16 @@ async function main(): Promise<void> {
       let decision: SpikeClassifierDecision | null = null;
       let classifierError: string | null = null;
       let errorUsage: SpikeClassifierDecision['usage'] | null = null;
+      let rawModelOutput: string | null = null;
       try {
         decision = await callClassifierForSpike(classifierInput, env);
+        rawModelOutput = decision.rawResponse || null;
       } catch (error) {
         classifierError = error instanceof Error ? error.message : String(error);
-        if (error instanceof SpikeClassifierError) errorUsage = error.usage || null;
+        if (error instanceof SpikeClassifierError) {
+          errorUsage = error.usage || null;
+          rawModelOutput = error.rawResponse || null;
+        }
       }
       const inputTokens = decision?.usage?.input_tokens ?? errorUsage?.input_tokens ?? 0;
       const outputTokens = decision?.usage?.output_tokens ?? errorUsage?.output_tokens ?? 0;
@@ -600,6 +610,7 @@ async function main(): Promise<void> {
         sector_confidence: decision?.sectorConfidence || 0,
         reasoning: decision?.reasoning || null,
         classifier_error: classifierError,
+        raw_model_output: rawModelOutput,
         usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
         cost_usd: costUsd,
       });
