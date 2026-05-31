@@ -54,6 +54,10 @@ interface GoldCandidateRecord {
   normalized_company_name: string;
   raw_span: string;
   raw_excerpt: string;
+  source_subject: string;
+  source_sender: string;
+  occurred_at: string;
+  context_char_count: number;
   sender_and_context: string;
   stratum: Stratum;
   stratum_reason: string;
@@ -364,6 +368,7 @@ async function extractRecords(sources: SourceCandidate[], env: Env, orgId: strin
       if (seenMentions.has(dedupeKey)) continue;
       seenMentions.add(dedupeKey);
       const itemId = `gs_${stableHash(deterministicKey).slice(0, 12)}`;
+      const contextText = mention.contextText || mention.lineText;
       records.push({
         item_id: itemId,
         deterministic_key: deterministicKey,
@@ -376,7 +381,11 @@ async function extractRecords(sources: SourceCandidate[], env: Env, orgId: strin
         company_name: mention.canonicalName,
         normalized_company_name: mention.normalizedName,
         raw_span: mention.raw,
-        raw_excerpt: compactText(mention.lineText, 500),
+        raw_excerpt: compactText(contextText, 4000),
+        source_subject: source.sourceTitle || '',
+        source_sender: source.fromEmail || '',
+        occurred_at: source.occurredAt,
+        context_char_count: contextText.length,
         sender_and_context: source.senderAndContext,
         stratum: source.stratum,
         stratum_reason: source.stratumReason,
@@ -399,6 +408,45 @@ function jsonl(records: GoldCandidateRecord[]): string {
   return records.map(record => JSON.stringify(record)).join('\n') + (records.length ? '\n' : '');
 }
 
+function csv(value: unknown): string {
+  const text = value == null ? '' : String(value);
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function humanLabelingCsv(records: GoldCandidateRecord[]): string {
+  const header = [
+    'source_type', 'source_id', 'mention_ordinal', 'deterministic_key',
+    'company_as_mentioned', 'raw_span', 'surrounding_context',
+    'source_subject', 'source_sender', 'occurred_at', 'context_char_count',
+    'sender_and_context', 'stratum', 'split',
+    'mention_type', 'direction', 'sector_key', 'notes',
+  ];
+  const rows = [header.map(csv).join(',')];
+  for (const record of records) {
+    rows.push([
+      record.deterministic_source_type,
+      record.source_id,
+      record.mention_ordinal,
+      record.deterministic_key,
+      record.company_name,
+      record.raw_span,
+      record.raw_excerpt,
+      record.source_subject,
+      record.source_sender,
+      record.occurred_at,
+      record.context_char_count,
+      record.sender_and_context,
+      record.stratum,
+      record.split,
+      '',
+      '',
+      '',
+      '',
+    ].map(csv).join(','));
+  }
+  return `${rows.join('\n')}\n`;
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const proxy = await getPlatformProxy({ configPath: args.configPath });
@@ -412,6 +460,7 @@ async function main(): Promise<void> {
     await writeFile(join(args.outputDir, 'gold-candidates.dev.jsonl'), jsonl(dev), 'utf8');
     await writeFile(join(args.outputDir, 'gold-candidates.test.jsonl'), jsonl(test), 'utf8');
     await writeFile(join(args.outputDir, 'gold-candidates.all.jsonl'), jsonl(records), 'utf8');
+    await writeFile(join(args.outputDir, 'gold-candidates.human-labeling.csv'), humanLabelingCsv(records), 'utf8');
     const manifest = {
       generated_at: new Date().toISOString(),
       org_id: args.orgId,

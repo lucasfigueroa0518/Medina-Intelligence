@@ -27,7 +27,7 @@ import {
   ensureContactSearchIndexReady,
 } from './contact-search';
 import { safelyMaintainContactReadModels } from './contact-maintenance';
-import { runProspectReconciliation } from './prospect-intelligence';
+import { cleanProspectSourceText, prospectContextWindow, runProspectReconciliation } from './prospect-intelligence';
 
 export interface AgentToolContext {
   deepDive?: boolean;
@@ -1355,10 +1355,39 @@ function parseJsonArray(value: unknown): unknown[] {
   }
 }
 
-function cleanEvidenceText(value: unknown, max = 500): string | null {
+function cleanEvidenceText(value: unknown, max = 4000): string | null {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   if (!text) return null;
   return text.length > max ? `${text.slice(0, max).trim()}...` : text;
+}
+
+async function readEvidenceR2Text(env: Env, key?: string | null, max = 12000): Promise<string | null> {
+  const normalizedKey = String(key || '').trim();
+  if (!normalizedKey || !env.R2?.get) return null;
+  try {
+    const object = await env.R2.get(normalizedKey);
+    if (!object) return null;
+    const text = await object.text();
+    return text ? text.slice(0, max) : null;
+  } catch {
+    return null;
+  }
+}
+
+function mentionCenteredEvidenceSnippet(sourceText: unknown, rawMention: unknown): string | null {
+  const original = String(sourceText || '');
+  if (!original.trim()) return null;
+  const cleaned = cleanProspectSourceText(original).cleanedText || original;
+  const mention = String(rawMention || '').trim();
+  const haystack = cleaned.toLowerCase();
+  const needle = mention.toLowerCase();
+  const start = needle ? haystack.indexOf(needle) : -1;
+  const excerpt = prospectContextWindow(
+    cleaned,
+    start >= 0 ? start : null,
+    start >= 0 ? start + mention.length : null
+  );
+  return cleanEvidenceText(excerpt);
 }
 
 function prospectStatusFilter(inputStatus: unknown): string[] {
@@ -1780,7 +1809,7 @@ async function hydrateProspectEvidenceRow(
   if (signal.source_type === 'conversation') {
     const row = await env.D1.prepare(
       `SELECT c.id, c.source, c.subject, c.from_email, c.sent_at, c.body_preview,
-              c.participant_user_ids, c.is_campaign_email,
+              c.body_r2_key, c.participant_user_ids, c.is_campaign_email,
               sc.is_private AS slack_is_private
          FROM conversations c
          LEFT JOIN slack_channels sc
@@ -1795,13 +1824,16 @@ async function hydrateProspectEvidenceRow(
     ).bind(signal.source_id, ctx.orgId).first<any>();
     if (!row) return { ...base, placeholder: 'Source conversation not found or no longer available.' };
     const canRead = canReadConversationContent(row, ctx.userId, ctx.userRole, sharingFlags);
+    const sourceText = canRead
+      ? await readEvidenceR2Text(env, row.body_r2_key) || row.body_preview
+      : null;
     return {
       ...base,
       source_title: row.subject || base.source_title,
       occurred_at: row.sent_at || base.occurred_at,
       source_subtype: row.source,
       can_read_content: canRead,
-      snippet: canRead ? cleanEvidenceText(row.body_preview) : null,
+      snippet: canRead ? mentionCenteredEvidenceSnippet(sourceText, signal.raw_mention_text) : null,
       placeholder: canRead ? null : 'Private conversation evidence hidden for this viewer.',
     };
   }
@@ -1815,6 +1847,9 @@ async function hydrateProspectEvidenceRow(
     ).bind(signal.source_id, ctx.orgId).first<any>();
     if (!row) return { ...base, placeholder: 'Source event not found or no longer available.' };
     const canRead = await canReadEventEvidence(ctx, signal.source_id, env);
+    const sourceText = canRead
+      ? await readEvidenceR2Text(env, row.transcript_r2_key) || row.summary || row.description
+      : null;
     return {
       ...base,
       source_title: row.title || base.source_title,
@@ -1822,7 +1857,7 @@ async function hydrateProspectEvidenceRow(
       source_subtype: row.event_type,
       has_transcript: !!row.transcript_r2_key,
       can_read_content: canRead,
-      snippet: canRead ? cleanEvidenceText(row.summary || row.description) : null,
+      snippet: canRead ? mentionCenteredEvidenceSnippet(sourceText, signal.raw_mention_text) : null,
       placeholder: canRead ? null : 'Private meeting evidence hidden for this viewer.',
     };
   }
@@ -1843,7 +1878,7 @@ async function hydrateProspectEvidenceRow(
       occurred_at: row.created_at || base.occurred_at,
       source_subtype: row.document_type || row.source,
       can_read_content: canRead,
-      snippet: canRead ? cleanEvidenceText(row.extracted_text_preview) : null,
+      snippet: canRead ? mentionCenteredEvidenceSnippet(row.extracted_text_preview, signal.raw_mention_text) : null,
       placeholder: canRead ? null : 'Private document evidence hidden for this viewer.',
     };
   }

@@ -103,6 +103,7 @@ class ProspectAgentFakeD1 {
   signals: any[] = [];
   coverage: any[] = [];
   conversations: any[] = [];
+  r2Objects = new Map<string, string>();
   users: any[] = [];
 
   prepare(sql: string): ProspectAgentStatement {
@@ -275,7 +276,15 @@ class ProspectAgentFakeD1 {
 }
 
 function prospectAgentEnv(db: ProspectAgentFakeD1): any {
-  return { D1: db };
+  return {
+    D1: db,
+    R2: {
+      get: async (key: string) => {
+        const text = db.r2Objects.get(key);
+        return text == null ? null : { text: async () => text };
+      },
+    },
+  };
 }
 
 describe('prospect MARTy tools', () => {
@@ -402,10 +411,20 @@ describe('prospect MARTy tools', () => {
       from_email: 'alice@example.com',
       sent_at: '2026-05-29T00:00:00.000Z',
       body_preview: 'Private deck and founder notes.',
+      body_r2_key: 'conv-private-body',
       participant_user_ids: '["user-owner"]',
       is_campaign_email: 0,
       slack_is_private: null,
     });
+    db.r2Objects.set(
+      'conv-private-body',
+      [
+        'Alice shared the thread after the first intro call and included notes from the founder.',
+        'The context before the mention says this is a seed financing discussion with a deck attached.',
+        'Auguria is building a security data product for threat teams and asked Medina Ventures to review the round.',
+        'The follow-up asks for next steps, diligence questions, and a meeting with the technical cofounder.',
+      ].join(' ')
+    );
 
     const redacted = await getProspectEvidence(ctx, { prospect_id: 'prospect-auguria' }, prospectAgentEnv(db));
     const ownerVisible = await getProspectEvidence(
@@ -422,7 +441,9 @@ describe('prospect MARTy tools', () => {
       snippet: null,
     });
     expect(ownerVisible.restricted_evidence_count).toBe(0);
-    expect(ownerVisible.evidence[0].snippet).toContain('Private deck');
+    expect(ownerVisible.evidence[0].snippet).toContain('seed financing discussion');
+    expect(ownerVisible.evidence[0].snippet).toContain('technical cofounder');
+    expect(ownerVisible.evidence[0].snippet.length).toBeGreaterThan('Private deck and founder notes.'.length);
   });
 
   it('builds a confidence-qualified prospect digest and keeps cleanup admin-only', async () => {

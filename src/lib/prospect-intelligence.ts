@@ -6,6 +6,8 @@ import { emailDomain, getConfiguredInternalDomains, isInternalEmailDomain } from
 export const PROSPECT_CLASSIFIER_VERSION = 'prospect-v1-llm-req-cl-2026-05-30';
 const PROSPECT_CLASSIFIER_DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
 const DEFAULT_PROSPECT_PRODUCTION_SAMPLE_RATE = 0.02;
+export const PROSPECT_CONTEXT_WINDOW_CHARS = 4000;
+const PROSPECT_SOURCE_TEXT_MAX_CHARS = 12000;
 
 export const PROSPECT_SECTOR_TAXONOMY = [
   { key: 'ai_data', label: 'AI / Data' },
@@ -75,6 +77,7 @@ export interface MentionCandidate {
   spanStart: number | null;
   spanEnd: number | null;
   lineText: string;
+  contextText: string;
   isListEntry: boolean;
   products: string[];
   listFields?: ParsedDealflowListFields;
@@ -266,6 +269,7 @@ export function normalizeProspectName(value: string | null | undefined): string 
 function canonicalizeMention(raw: string): { canonicalName: string; products: string[] } {
   const cleaned = normalizeWhitespace(raw)
     .replace(/^[\-*•\d.)\s]+/, '')
+    .replace(/^(?:about|regarding|subject|re|fw|fwd)\s*[:\-]?\s+/i, '')
     .replace(/\s+/g, ' ')
     .replace(/[,:;]+$/g, '')
     .replace(/\s+\b(?:for|to|from|with|and|the)\b$/i, '')
@@ -278,6 +282,9 @@ function canonicalizeMention(raw: string): { canonicalName: string; products: st
 }
 
 function isGenericCandidate(name: string): boolean {
+  const clean = normalizeWhitespace(name);
+  if (/^(?:i['’]?m|i\s+am|we|they|it|there|please|sorry|no worries|sounds great|great|thanks)\b/i.test(clean)) return true;
+  if (/^(?:about|regarding|subject|re|fw|fwd)\s*[:\-]?\s*$/i.test(clean)) return true;
   const normalized = normalizeProspectName(name);
   if (!normalized || normalized.length < 3) return true;
   return new Set([
@@ -292,7 +299,7 @@ function isGenericCandidate(name: string): boolean {
     'tony', 'anthony', 'alicia', 'michael', 'mike', 'john', 'david',
     'andrew', 'alex', 'sam', 'chris', 'leonardo', 'medina',
     'medinaventures', 'medinavc', 'mediavc', 'claudeopus', 'googlemeet',
-    'japaneseendowment', 'britishcolumbia', 'gables',
+    'japaneseendowment', 'britishcolumbia', 'gables', 'neural',
   ]).has(normalized);
 }
 
@@ -323,6 +330,38 @@ function lineExcerptAt(text: string, start: number, end: number): string {
   return text.slice(before < 0 ? 0 : before + 1, after < 0 ? text.length : after).slice(0, 500);
 }
 
+export function prospectContextWindow(
+  text: string,
+  spanStart?: number | null,
+  spanEnd?: number | null,
+  targetChars = PROSPECT_CONTEXT_WINDOW_CHARS
+): string {
+  const source = String(text || '').replace(/\r\n?/g, '\n').trim();
+  if (!source) return '';
+  const limit = Math.max(200, Math.floor(targetChars || PROSPECT_CONTEXT_WINDOW_CHARS));
+  if (source.length <= limit) return source;
+
+  const start = typeof spanStart === 'number' && Number.isFinite(spanStart)
+    ? Math.max(0, Math.min(source.length, Math.floor(spanStart)))
+    : null;
+  const end = typeof spanEnd === 'number' && Number.isFinite(spanEnd)
+    ? Math.max(start ?? 0, Math.min(source.length, Math.floor(spanEnd)))
+    : start;
+
+  if (start == null || end == null) {
+    const prefix = source.slice(0, limit).trim();
+    return `${prefix}...`;
+  }
+
+  const center = Math.floor((start + end) / 2);
+  let windowStart = Math.max(0, center - Math.floor(limit / 2));
+  let windowEnd = Math.min(source.length, windowStart + limit);
+  windowStart = Math.max(0, windowEnd - limit);
+
+  const excerpt = source.slice(windowStart, windowEnd).trim();
+  return `${windowStart > 0 ? '...' : ''}${excerpt}${windowEnd < source.length ? '...' : ''}`;
+}
+
 function stripEmailScaffoldingLine(line: string): boolean {
   const trimmed = line.trim();
   if (!trimmed) return true;
@@ -339,7 +378,16 @@ function stripEmailScaffoldingLine(line: string): boolean {
 }
 
 export function cleanProspectSourceText(rawText: string): { cleanedText: string } {
-  const lines = String(rawText || '').replace(/\r\n?/g, '\n').split('\n');
+  const normalizedText = String(rawText || '')
+    .replace(/&nbsp;|&#160;|&#65279;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/\s+(Begin forwarded message:)/gi, '\n$1')
+    .replace(/\s+((?:From|Sent|To|Cc|Bcc|Date|Subject):)/gi, '\n$1')
+    .replace(/\s+(On\s+(?:mon|tue|wed|thu|fri|sat|sun)[^.\n]{0,200}\s+wrote:?)/gi, '\n$1');
+  const lines = normalizedText.replace(/\r\n?/g, '\n').split('\n');
   const kept: string[] = [];
   for (const line of lines) {
     if (/^>\s?/.test(line)) continue;
@@ -375,6 +423,7 @@ function shouldIgnoreDomain(domain: string, env?: Env): boolean {
     'box.com', 'docusign.net', 'calendly.com',
   ]);
   if (common.has(normalized)) return true;
+  if (['zoom', 'zoomcrc', 'googlemeet', 'teams', 'webex'].includes(first)) return true;
   if (first.length < 3) return true;
   return env ? isInternalEmailDomain(`noreply@${normalized}`, getConfiguredInternalDomains(env)) : false;
 }
@@ -514,7 +563,7 @@ function inferDirection(item: ClassifiedItem, env: Env, companyDomain?: string |
 }
 
 function signalKindFor(item: ClassifiedItem, mention: MentionCandidate, hasDeck: boolean, hasMeeting: boolean): SignalKind {
-  const haystack = `${item.subject || ''}\n${mention.lineText}\n${item.bodyPreview || ''}`.toLowerCase();
+  const haystack = `${item.subject || ''}\n${mention.contextText || mention.lineText}\n${item.bodyPreview || ''}`.toLowerCase();
   if (hasDeck) return 'deck';
   if (hasMeeting) return item.type === 'calendar_event' ? 'meeting' : 'call';
   if (isWarmIntroSignal(item, mention)) return 'intro';
@@ -524,7 +573,7 @@ function signalKindFor(item: ClassifiedItem, mention: MentionCandidate, hasDeck:
 }
 
 function isWarmIntroSignal(item: ClassifiedItem, mention: MentionCandidate): boolean {
-  const haystack = `${item.subject || ''}\n${mention.lineText}\n${item.bodyPreview || ''}`.toLowerCase();
+  const haystack = `${item.subject || ''}\n${mention.contextText || mention.lineText}\n${item.bodyPreview || ''}`.toLowerCase();
   return /\b(intro|introducing|introduction|warm intro|meet\s+\w+)/.test(haystack);
 }
 
@@ -635,6 +684,7 @@ export function extractMentionCandidatesFromText(text: string, fallbackName?: st
     if (!normalizedName || seen.has(normalizedName)) return;
     seen.add(normalizedName);
     const end = spanStart == null ? null : spanStart + raw.length;
+    const contextText = prospectContextWindow(cleanedText, spanStart, end);
     candidates.push({
       raw,
       canonicalName,
@@ -643,6 +693,7 @@ export function extractMentionCandidatesFromText(text: string, fallbackName?: st
       spanStart,
       spanEnd: end,
       lineText: spanStart == null ? canonicalName : lineExcerptAt(cleanedText, spanStart, end || spanStart),
+      contextText,
       isListEntry,
       products,
       listFields,
@@ -741,14 +792,16 @@ export function parseDealflowList(text: string, fallbackName?: string | null): M
     seen.add(normalizedName);
     const localIndex = line.indexOf(name);
     const spanStart = localIndex < 0 ? null : offset + localIndex;
+    const spanEnd = spanStart == null ? null : spanStart + name.length;
     candidates.push({
       raw: name,
       canonicalName,
       normalizedName,
       mentionOrdinal: ordinal++,
       spanStart,
-      spanEnd: spanStart == null ? null : spanStart + name.length,
+      spanEnd,
       lineText: line.slice(0, 500),
+      contextText: prospectContextWindow(text, spanStart, spanEnd),
       isListEntry: true,
       products,
       listFields: parseListFields(line),
@@ -783,6 +836,7 @@ function mentionFromAnchoredRaw(
     spanStart,
     spanEnd,
     lineText: spanStart == null ? canonicalName : lineExcerptAt(cleanedText, spanStart, spanEnd || spanStart),
+    contextText: prospectContextWindow(cleanedText, spanStart, spanEnd),
     isListEntry,
     products,
     listFields,
@@ -1067,7 +1121,7 @@ function domainInText(text: string): string | null {
 }
 
 function domainFromMention(item: ClassifiedItem, mention: MentionCandidate): string | null {
-  return domainInText(`${mention.lineText}\n${item.bodyPreview || ''}\n${item.bodyText || ''}`);
+  return domainInText(`${mention.contextText || mention.lineText}\n${item.bodyPreview || ''}\n${item.bodyText || ''}`);
 }
 
 async function upsertDealmakerIdentity(
@@ -1166,7 +1220,7 @@ function buildClassifierPrefilter(
   const hasMeeting = hasMeetingSignal(item);
   const hasWarmIntro = isWarmIntroSignal(item, mention);
   const signalKind = signalKindFor(item, mention, hasDeck, hasMeeting);
-  const sectorHint = sectorHintForText(`${mention.canonicalName}\n${mention.lineText}\n${item.subject || ''}\n${item.bodyPreview || ''}`);
+  const sectorHint = sectorHintForText(`${mention.canonicalName}\n${mention.contextText || mention.lineText}\n${item.subject || ''}\n${item.bodyPreview || ''}`);
   const confidenceHint = confidenceFor(signalKind, deterministicDirection, newsletter);
   const reasons: string[] = [];
   if (newsletter) reasons.push('newsletter_like_source');
@@ -1252,11 +1306,21 @@ function senderAndContextForPrompt(item: ClassifiedItem, existing: ExistingConte
 }
 
 function rawExcerptForPrompt(item: ClassifiedItem, mention: MentionCandidate): string {
+  const sourceContext = mention.contextText || mention.lineText || item.bodyText || item.text || '';
+  const promptAnchor = findCaseInsensitive(sourceContext, mention.raw) >= 0
+    ? findCaseInsensitive(sourceContext, mention.raw)
+    : findCaseInsensitive(sourceContext, mention.canonicalName);
+  const mentionContext = promptAnchor >= 0
+    ? prospectContextWindow(sourceContext, promptAnchor, promptAnchor + (mention.raw || mention.canonicalName).length, 3000)
+    : sourceContext;
+  const preview = item.bodyPreview && !mentionContext.includes(item.bodyPreview)
+    ? `Preview: ${item.bodyPreview}`
+    : '';
   const excerpt = [
     item.subject ? `Subject: ${item.subject}` : '',
     mention.lineText ? `Mention line: ${mention.lineText}` : '',
-    item.bodyPreview ? `Preview: ${item.bodyPreview}` : '',
-    item.bodyText || item.text || '',
+    mentionContext ? `Mention context:\n${mentionContext}` : '',
+    preview,
   ].filter(Boolean).join('\n');
   return compactClassifierText(excerpt, 3500);
 }
@@ -2372,6 +2436,19 @@ async function createProspectBackfillRun(
   return runId;
 }
 
+async function readProspectSourceR2Text(env: Env, key?: string | null, maxChars = PROSPECT_SOURCE_TEXT_MAX_CHARS): Promise<string | null> {
+  const normalizedKey = String(key || '').trim();
+  if (!normalizedKey || !env.R2?.get) return null;
+  try {
+    const object = await env.R2.get(normalizedKey);
+    if (!object) return null;
+    const text = await object.text();
+    return text ? text.slice(0, maxChars) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function loadBackfillItemsForFamily(
   orgId: string,
   env: Env,
@@ -2383,79 +2460,86 @@ async function loadBackfillItemsForFamily(
   if (family === 'conversation') {
     const rows = await env.D1.prepare(
       `SELECT id, source, subject, body_preview, sent_at, from_email, to_emails, cc_emails,
-              direction, visibility, participant_user_ids
+              direction, visibility, participant_user_ids, body_r2_key
          FROM conversations
         WHERE org_id = ? AND sent_at >= ? AND sent_at < ?
         ORDER BY sent_at DESC
         LIMIT ?`
     ).bind(orgId, windowStart, windowEnd, limit).all<any>();
-    return (rows.results || []).map(row => ({
-      type: row.source === 'slack' ? 'slack_message' : 'email',
-      source: row.source === 'slack' ? 'slack' : 'outlook',
-      externalId: row.id,
-      subject: row.subject || '',
-      bodyText: row.body_preview || '',
-      bodyPreview: row.body_preview || '',
-      fromEmail: row.from_email || '',
-      toEmails: parseEmailList(row.to_emails),
-      ccEmails: parseEmailList(row.cc_emails),
-      sentAt: row.sent_at,
-      direction: row.direction || undefined,
-      orgId,
-      visibility: row.visibility || 'private',
-      entityType: 'conversation',
-      entityId: row.id,
-      contactIds: [],
-      participantUserIds: parseEmailList(row.participant_user_ids),
-      metadata: {
-        org_id: orgId,
+    return Promise.all((rows.results || []).map(async row => {
+      const bodyText = await readProspectSourceR2Text(env, row.body_r2_key) || row.body_preview || '';
+      return {
+        type: row.source === 'slack' ? 'slack_message' : 'email',
+        source: row.source === 'slack' ? 'slack' : 'outlook',
+        externalId: row.id,
+        subject: row.subject || '',
+        bodyText,
+        bodyPreview: row.body_preview || bodyText.slice(0, 500),
+        fromEmail: row.from_email || '',
+        toEmails: parseEmailList(row.to_emails),
+        ccEmails: parseEmailList(row.cc_emails),
+        sentAt: row.sent_at,
+        direction: row.direction || undefined,
+        orgId,
         visibility: row.visibility || 'private',
-        document_type: row.source === 'slack' ? 'slack' : 'email',
-        source_table: 'conversations',
-        source_id: row.id,
-        r2_key: '',
-        created_at: row.sent_at,
-        primary_entity_id: row.id,
-      },
-      text: row.body_preview || '',
-    } as ClassifiedItem));
+        entityType: 'conversation',
+        entityId: row.id,
+        contactIds: [],
+        participantUserIds: parseEmailList(row.participant_user_ids),
+        metadata: {
+          org_id: orgId,
+          visibility: row.visibility || 'private',
+          document_type: row.source === 'slack' ? 'slack' : 'email',
+          source_table: 'conversations',
+          source_id: row.id,
+          r2_key: row.body_r2_key || '',
+          created_at: row.sent_at,
+          primary_entity_id: row.id,
+        },
+        text: bodyText,
+      } as ClassifiedItem;
+    }));
   }
   if (family === 'event') {
     const rows = await env.D1.prepare(
-      `SELECT id, title, description, summary, start_time, source
+      `SELECT id, title, description, summary, start_time, source, transcript_r2_key
          FROM events
         WHERE org_id = ? AND deleted_at IS NULL AND start_time >= ? AND start_time < ?
         ORDER BY start_time DESC
         LIMIT ?`
     ).bind(orgId, windowStart, windowEnd, limit).all<any>();
-    return (rows.results || []).map(row => ({
-      type: 'calendar_event',
-      source: 'outlook',
-      externalId: row.id,
-      subject: row.title || '',
-      bodyText: row.summary || row.description || '',
-      bodyPreview: row.summary || row.description || '',
-      fromEmail: '',
-      toEmails: [],
-      ccEmails: [],
-      sentAt: row.start_time,
-      orgId,
-      visibility: 'private',
-      entityType: 'event',
-      entityId: row.id,
-      contactIds: [],
-      metadata: {
-        org_id: orgId,
+    return Promise.all((rows.results || []).map(async row => {
+      const fallbackText = row.summary || row.description || '';
+      const bodyText = await readProspectSourceR2Text(env, row.transcript_r2_key) || fallbackText;
+      return {
+        type: 'calendar_event',
+        source: 'outlook',
+        externalId: row.id,
+        subject: row.title || '',
+        bodyText,
+        bodyPreview: fallbackText || bodyText.slice(0, 500),
+        fromEmail: '',
+        toEmails: [],
+        ccEmails: [],
+        sentAt: row.start_time,
+        orgId,
         visibility: 'private',
-        document_type: 'meeting',
-        source_table: 'events',
-        source_id: row.id,
-        r2_key: '',
-        created_at: row.start_time,
-        primary_entity_id: row.id,
-      },
-      text: row.summary || row.description || '',
-    } as ClassifiedItem));
+        entityType: 'event',
+        entityId: row.id,
+        contactIds: [],
+        metadata: {
+          org_id: orgId,
+          visibility: 'private',
+          document_type: 'meeting',
+          source_table: 'events',
+          source_id: row.id,
+          r2_key: row.transcript_r2_key || '',
+          created_at: row.start_time,
+          primary_entity_id: row.id,
+        },
+        text: bodyText,
+      } as ClassifiedItem;
+    }));
   }
   const rows = await env.D1.prepare(
     `SELECT id, title, extracted_text_preview, document_type, source, visibility,
@@ -2815,6 +2899,7 @@ export async function reverseProspectMerge(
 export const __prospectIntelligenceTestHooks = {
   normalizeProspectName,
   cleanProspectSourceText,
+  prospectContextWindow,
   extractMentionCandidatesFromText,
   extractOrganizationMentionsFromSource,
   parseDealflowList,

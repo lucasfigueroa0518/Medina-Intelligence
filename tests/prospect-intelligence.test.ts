@@ -612,6 +612,53 @@ describe('prospect intelligence deterministic signals', () => {
     expect(prompt.user).toContain('MENTION (the company in question): Auguria');
   });
 
+  it('builds broad mention-centered context without changing deterministic ordinals', () => {
+    const text = [
+      'DIU sent this as an introduction channel after ArmyFUZE demo day.',
+      'Auguria is raising a seed round for its security data platform.',
+      'The follow-up asks Medina to review the deck and schedule diligence with the founder.',
+    ].join('\n');
+
+    const [mention] = extractMentionCandidatesFromText(text);
+
+    expect(mention.canonicalName).toBe('Auguria');
+    expect(mention.mentionOrdinal).toBe(1);
+    expect(mention.lineText).toContain('Auguria is raising');
+    expect(mention.contextText).toContain('DIU sent this as an introduction channel');
+    expect(mention.contextText).toContain('schedule diligence with the founder');
+    expect(mention.contextText.length).toBeGreaterThan(mention.lineText.length);
+  });
+
+  it('feeds the classifier nearby pre/post source context instead of only the mention line', () => {
+    const { buildClassifierPrefilter, classifierInputForRuntime } = __prospectIntelligenceTestHooks;
+    const filler = Array.from({ length: 70 }, (_, index) => `Archive note ${index}: routine portfolio update with no new deal signal.`).join('\n');
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      subject: 'Forwarded ArmyFUZE follow-up',
+      bodyText: [
+        filler,
+        'DIU sent this as an introduction channel after ArmyFUZE demo day.',
+        'Auguria is raising a seed round for its security data platform.',
+        'The follow-up asks Medina to review the deck and schedule diligence with the founder.',
+      ].join('\n'),
+      bodyPreview: 'Archive note 0',
+      fromEmail: 'partner@diu.mil',
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+    const [mention] = extractMentionCandidatesFromText(item.bodyText);
+    const existing = { companyId: null, dealId: null, companyDomain: null, relationshipStates: [], isInternal: false, matchStrength: 'none' as const };
+    const prefilter = buildClassifierPrefilter(item, mention, existing, {} as any);
+    const input = classifierInputForRuntime(item, mention, existing, prefilter, {
+      knownDeals: [],
+      knownDealmakers: [{ name: 'DIU', domain: 'diu.mil' }],
+    }, 'org-1');
+
+    expect(input.rawExcerpt).toContain('Mention context:');
+    expect(input.rawExcerpt).toContain('DIU sent this as an introduction channel');
+    expect(input.rawExcerpt).toContain('schedule diligence with the founder');
+  });
+
   it('parses only the gold-kit LLM JSON contract and rejects fenced output', () => {
     const { parseProspectClassifierResponse, parseMentionType, parseDirection, parseSectorKey } = __prospectIntelligenceTestHooks;
 
@@ -685,8 +732,11 @@ describe('prospect intelligence deterministic signals', () => {
         'Sent: Wednesday, May 27, 2026 9:14 AM',
         'On Thu, Tony wrote:',
         'Hi Tony,',
+        'I’m sorry if I missed the earlier calendar invite.',
+        'About Auguria',
         'Auguria is raising a seed round for its security data platform.',
         'NeuralSeek is evaluating a partnership with Qunnect.',
+        '#neuralseek We should sync on where we are with neural before asking more diligence questions.',
         'Greenberg Traurig is counsel on the matter.',
         'Lucas',
         'Medina Ventures',
@@ -704,6 +754,9 @@ describe('prospect intelligence deterministic signals', () => {
         { name: 'NeuralSeek', raw: 'NeuralSeek' },
         { name: 'Qunnect', raw: 'Qunnect' },
         { name: 'Greenberg Traurig', raw: 'Greenberg Traurig' },
+        { name: 'About Auguria', raw: 'About Auguria' },
+        { name: 'I’m sorry if', raw: 'I’m sorry if' },
+        { name: 'Neural', raw: 'neural' },
         { name: 'Sent', raw: 'Sent' },
         { name: 'Tony', raw: 'Tony' },
         { name: 'Medina Ventures', raw: 'Medina Ventures' },
@@ -712,7 +765,7 @@ describe('prospect intelligence deterministic signals', () => {
     const names = mentions.map(mention => mention.canonicalName);
 
     expect(names).toEqual(expect.arrayContaining(['Auguria', 'NeuralSeek', 'Qunnect', 'Greenberg Traurig']));
-    expect(names).not.toEqual(expect.arrayContaining(['Sent', 'Fwd', 'On Thu', 'Tony', 'Lucas', 'Medina Ventures']));
+    expect(names).not.toEqual(expect.arrayContaining(['Sent', 'Fwd', 'On Thu', 'Tony', 'Lucas', 'Medina Ventures', 'About Auguria', 'I’m sorry if', 'Neural']));
     expect(mentions.every(mention => typeof mention.spanStart === 'number')).toBe(true);
     expect(mentions.map(mention => mention.mentionOrdinal)).toEqual([1, 2, 3, 4]);
   });
