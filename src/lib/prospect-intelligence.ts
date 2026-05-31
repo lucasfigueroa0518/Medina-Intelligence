@@ -433,17 +433,64 @@ function findCaseInsensitive(text: string, needle: string, fromIndex = 0): numbe
   return text.toLowerCase().indexOf(needle.toLowerCase(), fromIndex);
 }
 
-function parseJsonObject(raw: string): Record<string, unknown> {
-  const text = raw.trim();
-  if (text.startsWith('{') && text.endsWith('}')) return JSON.parse(text) as Record<string, unknown>;
+function stripJsonCodeFence(raw: string): string {
+  let text = raw.trim();
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+  return text;
+}
+
+function matchingJsonObjectEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function parseJsonObject(raw: string, errorCode = 'INVALID_JSON_OBJECT'): Record<string, unknown> {
+  const text = stripJsonCodeFence(raw);
+  if (text.startsWith('{') && text.endsWith('}')) {
+    try {
+      return JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      // Fall through to matching-object extraction for responses with prose after the object.
+    }
+  }
   const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start >= 0 && end > start) return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
-  throw new Error('INVALID_ORG_EXTRACTION_JSON');
+  const end = start >= 0 ? matchingJsonObjectEnd(text, start) : -1;
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`${errorCode}: ${message}`);
+    }
+  }
+  throw new Error(errorCode);
 }
 
 function parseOrgExtractionResponse(raw: string): ProspectOrgExtractionLlmOutput[] {
-  const parsed = parseJsonObject(raw);
+  const parsed = parseJsonObject(raw, 'INVALID_ORG_EXTRACTION_JSON');
   const rows = Array.isArray(parsed.organizations) ? parsed.organizations : [];
   const out: ProspectOrgExtractionLlmOutput[] = [];
   for (const row of rows) {
@@ -1455,7 +1502,7 @@ function parseProspectClassifierResponse(
   model: string,
   usage?: { input_tokens: number; output_tokens: number }
 ): LlmClassifierDecision {
-  const parsed = JSON.parse(raw.trim()) as Record<string, unknown>;
+  const parsed = parseJsonObject(raw, 'INVALID_PROSPECT_CLASSIFIER_JSON');
   return {
     mentionType: parseMentionType(parsed.mention_type),
     direction: parseDirection(parsed.direction),
@@ -1478,7 +1525,7 @@ export async function callProspectClassifier(
   const model = prospectClassifierModel(env, input);
   const prompt = buildProspectClassifierPrompt(input);
   const result = await callClaudeWithUsage(
-    { system: prompt.systemForApi, user: prompt.user, max_tokens: 500, orgId: input.orgId, model },
+    { system: prompt.systemForApi, user: prompt.user, max_tokens: 500, orgId: input.orgId, model, assistantPrefill: '{' },
     'low',
     env
   );

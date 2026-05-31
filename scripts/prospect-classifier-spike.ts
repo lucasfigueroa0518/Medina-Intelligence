@@ -308,7 +308,10 @@ async function callDirectAnthropicClassifier(input: ProspectClassifierInput, env
       model,
       max_tokens: 500,
       system: prompt.systemForApi,
-      messages: [{ role: 'user', content: prompt.user }],
+      messages: [
+        { role: 'user', content: prompt.user },
+        { role: 'assistant', content: '{' },
+      ],
     }),
   });
   if (!response.ok) {
@@ -316,7 +319,7 @@ async function callDirectAnthropicClassifier(input: ProspectClassifierInput, env
     throw new Error(`DIRECT_ANTHROPIC_CLASSIFIER_FAILED ${response.status}: ${text.slice(0, 500)}`);
   }
   const data = await response.json() as any;
-  const text = data.content?.find((block: any) => block.type === 'text')?.text || '';
+  const text = `{${data.content?.find((block: any) => block.type === 'text')?.text || ''}`;
   try {
     return __prospectIntelligenceTestHooks.parseProspectClassifierResponse(text, model, data.usage);
   } catch (error) {

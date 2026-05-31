@@ -166,7 +166,14 @@ export type ClaudeSystemPrompt =
     }>;
 
 export async function callClaudeWithUsage(
-  params: { system: ClaudeSystemPrompt; user: string; max_tokens: number; orgId?: string; model?: string },
+  params: {
+    system: ClaudeSystemPrompt;
+    user: string;
+    max_tokens: number;
+    orgId?: string;
+    model?: string;
+    assistantPrefill?: string;
+  },
   priority: 'high' | 'low',
   env: Env
 ): Promise<ClaudeCallResult> {
@@ -185,7 +192,12 @@ export async function callClaudeWithUsage(
       model,
       max_tokens: params.max_tokens,
       system: params.system,
-      messages: [{ role: 'user', content: params.user }],
+      messages: params.assistantPrefill
+        ? [
+            { role: 'user', content: params.user },
+            { role: 'assistant', content: params.assistantPrefill },
+          ]
+        : [{ role: 'user', content: params.user }],
     }),
   });
 
@@ -206,7 +218,8 @@ export async function callClaudeWithUsage(
   const data = (await response.json()) as ClaudeResponse;
   const textBlock = data.content.find(b => b.type === 'text');
   if (!textBlock) throw new Error('Claude returned no text content');
-  return { text: textBlock.text!, usage: data.usage, model };
+  const text = params.assistantPrefill ? `${params.assistantPrefill}${textBlock.text!}` : textBlock.text!;
+  return { text, usage: data.usage, model };
 }
 
 export async function callClaude(

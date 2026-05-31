@@ -659,7 +659,7 @@ describe('prospect intelligence deterministic signals', () => {
     expect(input.rawExcerpt).toContain('schedule diligence with the founder');
   });
 
-  it('parses only the gold-kit LLM JSON contract and rejects fenced output', () => {
+  it('parses the gold-kit LLM JSON contract from raw, fenced, and prose-wrapped output', () => {
     const { parseProspectClassifierResponse, parseMentionType, parseDirection, parseSectorKey } = __prospectIntelligenceTestHooks;
 
     const parsed = parseProspectClassifierResponse(
@@ -675,10 +675,20 @@ describe('prospect intelligence deterministic signals', () => {
     expect(parseSectorKey('aerospace defense')).toBe('aerospace_defense');
     expect(() => parseMentionType('news_only')).toThrow(/INVALID_LLM_MENTION_TYPE/);
     expect(() => parseDirection('unknown')).toThrow(/INVALID_LLM_DIRECTION/);
-    expect(() => parseProspectClassifierResponse(
+
+    const fenced = parseProspectClassifierResponse(
       '```json\n{"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.8,"reasoning":"Admin."}\n```',
       'claude-haiku-4-5-20251001'
-    )).toThrow();
+    );
+    expect(fenced.mentionType).toBe('noise');
+    expect(fenced.direction).toBe('internal');
+
+    const proseWrapped = parseProspectClassifierResponse(
+      'Here is the JSON:\n{"mention_type":"known_deal","direction":"outbound","sector_key":"quantum","sector_confidence":0.7,"confidence":0.88,"reasoning":"Existing deal."}\nDone.',
+      'claude-haiku-4-5-20251001'
+    );
+    expect(proseWrapped.mentionType).toBe('known_deal');
+    expect(proseWrapped.direction).toBe('outbound');
   });
 
   it('ranks meeting/deck/warm-intro signals above single cold or list mentions', () => {
