@@ -267,13 +267,14 @@ export function normalizeProspectName(value: string | null | undefined): string 
 }
 
 function canonicalizeMention(raw: string): { canonicalName: string; products: string[] } {
-  const cleaned = normalizeWhitespace(raw)
+  let cleaned = normalizeWhitespace(raw)
     .replace(/^[\-*•\d.)\s]+/, '')
     .replace(/^(?:about|regarding|subject|re|fw|fwd)\s*[:\-]?\s+/i, '')
     .replace(/\s+/g, ' ')
     .replace(/[,:;]+$/g, '')
     .replace(/\s+\b(?:for|to|from|with|and|the)\b$/i, '')
     .trim();
+  cleaned = collapseRepeatedAdjacentName(cleaned);
   const parts = cleaned.split(/\s+\/\s+/).map(p => p.trim()).filter(Boolean);
   if (parts.length > 1) {
     return { canonicalName: parts[0], products: parts.slice(1) };
@@ -281,9 +282,21 @@ function canonicalizeMention(raw: string): { canonicalName: string; products: st
   return { canonicalName: cleaned, products: [] };
 }
 
+function collapseRepeatedAdjacentName(name: string): string {
+  const tokens = normalizeWhitespace(name).split(/\s+/).filter(Boolean);
+  if (tokens.length < 2 || tokens.length % 2 !== 0) return name;
+  const mid = tokens.length / 2;
+  const left = normalizeProspectName(tokens.slice(0, mid).join(' '));
+  const right = normalizeProspectName(tokens.slice(mid).join(' '));
+  if (left && left === right) return tokens.slice(0, mid).join(' ');
+  return name;
+}
+
 function isGenericCandidate(name: string): boolean {
   const clean = normalizeWhitespace(name);
   if (/^(?:i['’]?m|i\s+am|we|they|it|there|please|sorry|no worries|sounds great|great|thanks)\b/i.test(clean)) return true;
+  if (/\b(?:google meet|meet\.google\.com|join by phone|meeting link|calendar invite)\b/i.test(clean)) return true;
+  if (/^(?:join with|join by|joining info|meeting link|video call|conference call|docreq)\b/i.test(clean)) return true;
   if (/^(?:about|regarding|subject|re|fw|fwd)\s*[:\-]?\s*$/i.test(clean)) return true;
   const normalized = normalizeProspectName(name);
   if (!normalized || normalized.length < 3) return true;
@@ -299,6 +312,7 @@ function isGenericCandidate(name: string): boolean {
     'tony', 'anthony', 'alicia', 'michael', 'mike', 'john', 'david',
     'andrew', 'alex', 'sam', 'chris', 'leonardo', 'medina',
     'medinaventures', 'medinavc', 'mediavc', 'claudeopus', 'googlemeet',
+    'meetinglink', 'joinwithgooglemeet', 'joinby', 'docreq',
     'japaneseendowment', 'britishcolumbia', 'gables', 'neural',
   ]).has(normalized);
 }
@@ -516,7 +530,8 @@ function buildOrgExtractionPrompt(input: ProspectOrgExtractionLlmInput): { syste
 Return strict JSON only. Include real organizations of any role: startups, known deals, customers,
 vendors, law firms, accelerators, government channels, investors, and companies in news.
 Do not include people, greetings, dates, email headers, quoted-reply scaffolding, personal names,
-Medina Ventures / Medina VC, or generic words. Do not classify the mention_type, direction, or sector.
+calendar or meeting-link scaffolding, DocReq/doc-request labels, Medina Ventures / Medina VC, or
+generic words. Do not classify the mention_type, direction, or sector.
 Only include names whose exact text appears in the source so the caller can anchor a deterministic span.
 Output: {"organizations":[{"name":"Organization Name","raw":"exact source span","context":"short local context"}]}`;
   const system: ClaudeSystemPrompt = [
@@ -1441,16 +1456,26 @@ for being off-thesis. Sector is captured separately.
 Classify on three axes.
 
 mention_type -- choose exactly one, using this decision order (first match wins):
+  VALID VALUES ONLY: inbound_prospect, known_deal, intro_source, news, noise,
+                     web_analytics. Never output outbound, internal, outbound_prospect,
+                     or any other value as mention_type; outbound/internal are directions.
   1. news          -- company named only informationally (newsletter, press, market
-                     commentary); no one is proposing the fund engage it.
+                     commentary, or public reporting); no one is proposing the fund engage it.
+                     Incidental background references in ordinary email threads, calendar
+                     invites, legal/admin notes, meeting notes, or portfolio/customer threads
+                     are noise, not news.
   2. intro_source  -- the person, firm, accelerator, or government channel making an
-                     introduction or sending deal flow (NOT the company introduced).
+                     introduction or sending deal flow to the fund (NOT the company introduced).
+                     A VC, investor, advisor, vendor, publication, or agency merely named in a
+                     financing/news/background sentence is not automatically an intro_source.
   3. noise         -- vendor, fund admin, legal, internal ops, personal, OR a company
                      that is a commercial/customer/BD target rather than an investment
                      target.
      web_analytics -- a website-traffic or analytics record (a noise subtype).
   4. The named entity is a company in an investment context:
-       known_deal       -- it is in the KNOWN list below (even if pitched outbound).
+       known_deal       -- the named entity itself exactly matches the KNOWN list below
+                           (even if pitched outbound/internal). Do not infer known_deal from
+                           nearby companies; classify only the MENTION named in the user prompt.
        inbound_prospect -- otherwise (regardless of thesis fit).
 
 direction -- choose exactly one:
@@ -1464,13 +1489,16 @@ unclear, "uncategorized":
   ${PROSPECT_SECTOR_LABELS}
 Also output sector_confidence in [0,1].
 
-Provisional examples until the gold-set dev split exists:
+Rubric examples (sanitized; apply as rules, not source facts):
 Auguria with intro + deck -> {"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.9,"confidence":0.95,"reasoning":"Introduced as an investment opportunity with a deck."}
 Qunnect pitched to Mastercard -> {"mention_type":"known_deal","direction":"outbound","sector_key":"quantum","sector_confidence":0.9,"confidence":0.95,"reasoning":"Known portfolio/deal company being pitched outbound."}
 Mastercard in the Qunnect customer thread -> {"mention_type":"noise","direction":"outbound","sector_key":"fintech","sector_confidence":0.75,"confidence":0.9,"reasoning":"Commercial customer target, not an investment prospect."}
 Anthropic in an NVCA fundraise newsletter -> {"mention_type":"news","direction":"news","sector_key":"ai_data","sector_confidence":0.85,"confidence":0.92,"reasoning":"Informational fundraise news only."}
 DIU sending ArmyFUZE deal flow -> {"mention_type":"intro_source","direction":"inbound","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.9,"reasoning":"Government channel forwarding deal flow."}
 Sativa hempcrete in an ArmyFUZE list -> {"mention_type":"inbound_prospect","direction":"inbound","sector_key":"materials_manufacturing","sector_confidence":0.85,"confidence":0.9,"reasoning":"Off-thesis but presented as an investment opportunity."}
+Lead investor named in a funding announcement -> {"mention_type":"news","direction":"news","sector_key":"uncategorized","sector_confidence":0.3,"confidence":0.88,"reasoning":"Named as reported round context, not actively introducing deal flow to the fund."}
+Calendar platform or meeting-link text in an intro invite -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.92,"reasoning":"Calendar/link scaffolding, not a company mention."}
+Portfolio company mentioned as context in an admin/legal thread -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.85,"reasoning":"Administrative context, not an investment or outbound portfolio pitch signal."}
 
 Output ONLY this JSON object, no prose, no code fences:
 {"mention_type":"...","direction":"...","sector_key":"...","sector_confidence":0.0,"confidence":0.0,"reasoning":"one short sentence"}

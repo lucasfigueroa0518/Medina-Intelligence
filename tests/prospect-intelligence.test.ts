@@ -11,6 +11,7 @@ vi.mock('../src/lib/claude', () => ({
 
 import {
   __prospectIntelligenceTestHooks,
+  callProspectClassifier,
   computeSignalStrength,
   detectAndRecordProspectSignals,
   extractMentionCandidatesFromText,
@@ -575,6 +576,45 @@ describe('prospect intelligence deterministic signals', () => {
     expect(candidate.products).toEqual(['FortiLayer AI', 'FortiLayer OT']);
   });
 
+  it('suppresses meeting scaffolding and canonicalizes repeated adjacent names before classification', async () => {
+    const { extractOrganizationMentionsFromSource } = __prospectIntelligenceTestHooks;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-scaffold',
+      subject: 'Intro to Auguria',
+      bodyText: [
+        'Join with Google Meet: meet.google.com/cya-yrux-nbm',
+        'Meeting link meet.google.com/cya-yrux-nbm Join by phone.',
+        'DocReq: please upload diligence files.',
+        'Warm intro to Auguria and NeuralSeek for the diligence call.',
+        'Qunnect Qunnect appears in the copied calendar title.',
+        'Greenberg Traurig will handle counsel questions.',
+      ].join('\n'),
+      fromEmail: 'alice@example.com',
+    };
+
+    const mentions = await extractOrganizationMentionsFromSource(item, 'org-1', { INTERNAL_DOMAINS: 'medinavc.com' } as any, {
+      forceLlm: true,
+      llmExtractor: async () => [
+        { name: 'Join with Google Meet', raw: 'Join with Google Meet', context: null },
+        { name: 'Meeting link meet.google.com/cya-yrux-nbm Join by phone', raw: 'Meeting link meet.google.com/cya-yrux-nbm Join by phone', context: null },
+        { name: 'DocReq', raw: 'DocReq', context: null },
+        { name: 'Auguria', raw: 'Auguria', context: null },
+        { name: 'NeuralSeek', raw: 'NeuralSeek', context: null },
+        { name: 'Qunnect Qunnect', raw: 'Qunnect Qunnect', context: null },
+        { name: 'Greenberg Traurig', raw: 'Greenberg Traurig', context: null },
+      ],
+    });
+
+    const names = mentions.map(mention => mention.canonicalName);
+    expect(names).toEqual(expect.arrayContaining(['Auguria', 'NeuralSeek', 'Qunnect', 'Greenberg Traurig']));
+    expect(names).not.toContain('Join with Google Meet');
+    expect(names).not.toContain('Meeting link meet.google.com/cya-yrux-nbm Join by phone');
+    expect(names).not.toContain('DocReq');
+    expect(mentions.find(mention => mention.canonicalName === 'Qunnect')?.raw).toBe('Qunnect Qunnect');
+  });
+
   it('keeps keyword sectoring as a prefilter hint only', () => {
     const { sectorHintForText } = __prospectIntelligenceTestHooks;
 
@@ -608,8 +648,47 @@ describe('prospect intelligence deterministic signals', () => {
     expect(prompt.system).toContain('KNOWN deals / portfolio (names + domains): Qunnect <qunnect.io>');
     expect(prompt.system).toContain('ai_data, cybersecurity, quantum');
     expect(prompt.system).toContain('"mention_type":"..."');
+    expect(prompt.system).toContain('Never output outbound, internal, outbound_prospect');
+    expect(prompt.system).toContain('Incidental background references in ordinary email threads');
+    expect(prompt.system).toContain('financing/news/background sentence is not automatically an intro_source');
+    expect(prompt.system).toContain('nearby companies; classify only the MENTION named in the user prompt');
     expect(prompt.user).toContain('SOURCE_TYPE: email');
     expect(prompt.user).toContain('MENTION (the company in question): Auguria');
+  });
+
+  it('keeps mocked classifier flow on valid taxonomy boundaries for common hard cases', async () => {
+    callClaudeWithUsageMock.mockReset();
+    const outputs = [
+      { mention_type: 'noise', direction: 'outbound', sector_key: 'fintech', sector_confidence: 0.7, confidence: 0.9, reasoning: 'Customer target, not deal flow.' },
+      { mention_type: 'news', direction: 'news', sector_key: 'uncategorized', sector_confidence: 0.3, confidence: 0.88, reasoning: 'Reported round context only.' },
+      { mention_type: 'known_deal', direction: 'outbound', sector_key: 'quantum', sector_confidence: 0.9, confidence: 0.95, reasoning: 'Exact known deal match.' },
+      { mention_type: 'intro_source', direction: 'inbound', sector_key: 'uncategorized', sector_confidence: 0.2, confidence: 0.9, reasoning: 'Active channel forwarding deal flow.' },
+    ];
+    callClaudeWithUsageMock.mockImplementation(async () => ({
+      text: JSON.stringify(outputs.shift()),
+      usage: { input_tokens: 80, output_tokens: 20 },
+      model: 'claude-haiku-4-5-20251001',
+    }));
+
+    const baseInput = {
+      sourceType: 'email',
+      senderAndContext: 'from partner@example.com',
+      prefilterHints: { should_classify: true, reasons: [], deterministic_direction: 'unknown' },
+      sectorHints: { key: 'uncategorized', confidence: 0.2 },
+      knownContext: { knownDeals: [{ name: 'Qunnect', domain: 'qunnect.io' }], knownDealmakers: [{ name: 'DIU', domain: 'diu.mil' }] },
+      orgId: 'org-1',
+    } as any;
+
+    const customer = await callProspectClassifier({ ...baseInput, companyName: 'Mastercard', rawExcerpt: 'Qunnect is being pitched to Mastercard as a customer.' }, {} as any);
+    const investorNews = await callProspectClassifier({ ...baseInput, companyName: 'Quantonation', rawExcerpt: 'Quantonation was named as an investor in a reported round.' }, {} as any);
+    const knownDeal = await callProspectClassifier({ ...baseInput, companyName: 'Qunnect', rawExcerpt: 'Portfolio company Qunnect is being pitched outbound.' }, {} as any);
+    const introSource = await callProspectClassifier({ ...baseInput, companyName: 'DIU', rawExcerpt: 'DIU is forwarding ArmyFUZE deal flow to the fund.' }, {} as any);
+
+    expect(customer).toMatchObject({ mentionType: 'noise', direction: 'outbound' });
+    expect(investorNews).toMatchObject({ mentionType: 'news', direction: 'news' });
+    expect(knownDeal).toMatchObject({ mentionType: 'known_deal', direction: 'outbound' });
+    expect(introSource).toMatchObject({ mentionType: 'intro_source', direction: 'inbound' });
+    expect(callClaudeWithUsageMock.mock.calls.every(([request]) => request.assistantPrefill === '{')).toBe(true);
   });
 
   it('builds broad mention-centered context without changing deterministic ordinals', () => {
