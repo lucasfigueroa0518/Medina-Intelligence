@@ -13,6 +13,7 @@ import {
   PROSPECT_MENTION_TYPES,
   PROSPECT_SECTOR_TAXONOMY,
   type ProspectClassifierKnownContext,
+  type ProspectClassifierInput,
 } from '../src/lib/prospect-intelligence';
 
 type Split = 'dev' | 'test' | 'all';
@@ -46,6 +47,34 @@ interface Args {
   outputUsdPerMillion?: number;
 }
 
+interface SpikeClassifierDecision {
+  mentionType: string;
+  direction: string;
+  sectorKey: string;
+  sectorConfidence: number;
+  confidence: number;
+  reasoning: string | null;
+  model: string;
+  usage?: { input_tokens: number; output_tokens: number; total_tokens?: number };
+}
+
+class SpikeClassifierError extends Error {
+  usage?: { input_tokens: number; output_tokens: number; total_tokens?: number };
+  model?: string;
+
+  constructor(
+    message: string,
+    options?: { usage?: { input_tokens: number; output_tokens: number; total_tokens?: number }; model?: string }
+  ) {
+    super(message);
+    this.name = 'SpikeClassifierError';
+    this.usage = options?.usage;
+    this.model = options?.model;
+  }
+}
+
+let forceDirectAnthropic = process.env.PROSPECT_SPIKE_DIRECT_ANTHROPIC === '1';
+
 type LabelColumn = 'mention_type' | 'direction' | 'sector_key';
 type LabelExclusionReason = 'blank' | 'adjudicate';
 
@@ -71,6 +100,7 @@ export interface PredictionRecord {
   confidence: number;
   sector_confidence: number;
   reasoning: string | null;
+  classifier_error?: string | null;
   usage: { input_tokens: number; output_tokens: number; total_tokens: number };
   cost_usd: number | null;
 }
@@ -258,6 +288,59 @@ function prefilterHintsFor(record: GoldRecord, sectorHint: { key: string; confid
   };
 }
 
+function spikeClassifierModel(env: Env): string {
+  return env.PROSPECT_CLASSIFIER_MODEL || env.MARTY_LAB_HAIKU_MODEL || 'claude-haiku-4-5-20251001';
+}
+
+async function callDirectAnthropicClassifier(input: ProspectClassifierInput, env: Env): Promise<SpikeClassifierDecision> {
+  const apiKey = (env as any).ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY missing for direct spike classifier fallback');
+  const prompt = __prospectIntelligenceTestHooks.buildProspectClassifierPrompt(input);
+  const model = spikeClassifierModel(env);
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 500,
+      system: prompt.systemForApi,
+      messages: [{ role: 'user', content: prompt.user }],
+    }),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`DIRECT_ANTHROPIC_CLASSIFIER_FAILED ${response.status}: ${text.slice(0, 500)}`);
+  }
+  const data = await response.json() as any;
+  const text = data.content?.find((block: any) => block.type === 'text')?.text || '';
+  try {
+    return __prospectIntelligenceTestHooks.parseProspectClassifierResponse(text, model, data.usage);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new SpikeClassifierError(message, { usage: data.usage, model });
+  }
+}
+
+async function callClassifierForSpike(input: ProspectClassifierInput, env: Env): Promise<SpikeClassifierDecision> {
+  if (forceDirectAnthropic) {
+    return callDirectAnthropicClassifier(input, env);
+  }
+  try {
+    return await callProspectClassifier(input, env);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/Claude API error 401|Unauthorized|AiGatewayError/i.test(message)) {
+      forceDirectAnthropic = true;
+      return callDirectAnthropicClassifier(input, env);
+    }
+    throw error;
+  }
+}
+
 function incrementMatrix(matrix: Record<string, Record<string, number>>, gold: string, predicted: string): void {
   matrix[gold] ||= {};
   matrix[gold][predicted] = (matrix[gold][predicted] || 0) + 1;
@@ -364,6 +447,7 @@ export function summarize(
     estimatedCostUsd != null && predictions.length > 0
       ? estimatedCostUsd / predictions.length
       : null;
+  const classifierErrorCount = predictions.filter(p => p.classifier_error).length;
 
   const failingItems = predictions
     .filter(p =>
@@ -382,6 +466,7 @@ export function summarize(
       predicted_sector_key: p.predicted_sector_key,
       confidence: p.confidence,
       reasoning: p.reasoning,
+      classifier_error: p.classifier_error || null,
     }));
 
   return {
@@ -389,6 +474,7 @@ export function summarize(
     note: 'Only valid for a frozen human-labeled split. Do not run backfill unless verdict is GO on the held-out test split.',
     split: args.split,
     item_count: predictions.length,
+    classifier_error_count: classifierErrorCount,
     scoring_coverage: {
       mention_type: coverageFor(predictions, 'mention_type'),
       direction: coverageFor(predictions, 'direction'),
@@ -463,7 +549,7 @@ async function main(): Promise<void> {
       const sectorHint = __prospectIntelligenceTestHooks.sectorHintForText(
         `${record.company_name}\n${record.raw_excerpt}`
       );
-      const decision = await callProspectClassifier({
+      const classifierInput: ProspectClassifierInput = {
         sourceType: record.source_type,
         senderAndContext: record.sender_and_context,
         companyName: record.company_name,
@@ -472,9 +558,18 @@ async function main(): Promise<void> {
         sectorHints: sectorHint,
         knownContext,
         orgId: args.orgId,
-      }, env);
-      const inputTokens = decision.usage?.input_tokens || 0;
-      const outputTokens = decision.usage?.output_tokens || 0;
+      };
+      let decision: SpikeClassifierDecision | null = null;
+      let classifierError: string | null = null;
+      let errorUsage: SpikeClassifierDecision['usage'] | null = null;
+      try {
+        decision = await callClassifierForSpike(classifierInput, env);
+      } catch (error) {
+        classifierError = error instanceof Error ? error.message : String(error);
+        if (error instanceof SpikeClassifierError) errorUsage = error.usage || null;
+      }
+      const inputTokens = decision?.usage?.input_tokens ?? errorUsage?.input_tokens ?? 0;
+      const outputTokens = decision?.usage?.output_tokens ?? errorUsage?.output_tokens ?? 0;
       const costUsd =
         args.inputUsdPerMillion != null && args.outputUsdPerMillion != null
           ? (inputTokens / 1_000_000) * args.inputUsdPerMillion +
@@ -495,12 +590,13 @@ async function main(): Promise<void> {
           direction: goldDirection.excluded_reason,
           sector_key: goldSectorKey.excluded_reason,
         },
-        predicted_mention_type: decision.mentionType,
-        predicted_direction: decision.direction,
-        predicted_sector_key: decision.sectorKey,
-        confidence: decision.confidence,
-        sector_confidence: decision.sectorConfidence,
-        reasoning: decision.reasoning,
+        predicted_mention_type: decision?.mentionType || 'classifier_error',
+        predicted_direction: decision?.direction || 'classifier_error',
+        predicted_sector_key: decision?.sectorKey || 'classifier_error',
+        confidence: decision?.confidence || 0,
+        sector_confidence: decision?.sectorConfidence || 0,
+        reasoning: decision?.reasoning || null,
+        classifier_error: classifierError,
         usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
         cost_usd: costUsd,
       });
