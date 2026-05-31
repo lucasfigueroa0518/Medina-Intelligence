@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from 'node:fs/promises';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 import { getPlatformProxy } from 'wrangler';
 
 import type { Env } from '../src/types/env';
@@ -24,9 +25,12 @@ interface GoldRecord {
   company_name: string;
   raw_excerpt: string;
   sender_and_context: string;
-  gold_mention_type: string;
+  gold_mention_type?: string | null;
   gold_direction?: string | null;
   gold_sector_key?: string | null;
+  mention_type?: string | null;
+  direction?: string | null;
+  sector_key?: string | null;
   split: 'dev' | 'test';
   notes?: string;
 }
@@ -42,16 +46,25 @@ interface Args {
   outputUsdPerMillion?: number;
 }
 
-interface PredictionRecord {
+type LabelColumn = 'mention_type' | 'direction' | 'sector_key';
+type LabelExclusionReason = 'blank' | 'adjudicate';
+
+interface LabelStatus {
+  value: string | null;
+  excluded_reason: LabelExclusionReason | null;
+}
+
+export interface PredictionRecord {
   item_id: string;
   source_type: string;
   source_id: string;
   mention_ordinal: number;
   company_name: string;
   split: string;
-  gold_mention_type: string;
+  gold_mention_type: string | null;
   gold_direction: string | null;
   gold_sector_key: string | null;
+  gold_label_exclusions: Record<LabelColumn, LabelExclusionReason | null>;
   predicted_mention_type: string;
   predicted_direction: string;
   predicted_sector_key: string;
@@ -81,7 +94,7 @@ function parseArgs(argv: string[]): Args {
   const orgId = args.get('org-id');
   if (!goldSetPath || !orgId) {
     throw new Error(
-      'Usage: npm run prospect:spike -- --gold-set /secure/path/gold.jsonl --org-id <org_id> [--split test] [--known-context /secure/path/context.json]'
+      'Usage: npm run prospect:spike -- --gold-set /secure/path/gold.jsonl-or.csv --org-id <org_id> [--split test] [--known-context /secure/path/context.json]'
     );
   }
   const splitRaw = args.get('split') || 'test';
@@ -123,9 +136,95 @@ function parseJsonl(raw: string): GoldRecord[] {
     });
 }
 
-function normalizedGoldLabel(value: unknown): string | null {
+function parseCsv(raw: string): GoldRecord[] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let quoted = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (quoted) {
+      if (ch === '"' && raw[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (ch === '"') {
+        quoted = false;
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+    if (ch === '"') quoted = true;
+    else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\n') {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
+    } else if (ch !== '\r') {
+      field += ch;
+    }
+  }
+  if (field || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+
+  const [header, ...body] = rows.filter(r => r.some(cell => cell.trim()));
+  if (!header) return [];
+  const keyFor = (name: string): number => header.indexOf(name);
+  const valueAt = (record: string[], ...names: string[]): string => {
+    for (const name of names) {
+      const index = keyFor(name);
+      if (index >= 0) return record[index] || '';
+    }
+    return '';
+  };
+
+  return body.map((record, index) => {
+    const sourceType = valueAt(record, 'source_type');
+    const sourceId = valueAt(record, 'source_id');
+    const mentionOrdinal = Number(valueAt(record, 'mention_ordinal') || index + 1);
+    const deterministicKey = valueAt(record, 'deterministic_key') || `${sourceType}:${sourceId}:${mentionOrdinal}`;
+    const senderContext = valueAt(record, 'sender_and_context') || [
+      valueAt(record, 'source_sender') ? `from ${valueAt(record, 'source_sender')}` : '',
+      valueAt(record, 'source_subject') ? `subject ${valueAt(record, 'source_subject')}` : '',
+      valueAt(record, 'occurred_at') ? `occurred ${valueAt(record, 'occurred_at')}` : '',
+    ].filter(Boolean).join('; ');
+
+    return {
+      item_id: valueAt(record, 'item_id') || deterministicKey,
+      source_type: sourceType,
+      source_id: sourceId,
+      mention_ordinal: mentionOrdinal,
+      company_name: valueAt(record, 'company_name', 'company_as_mentioned'),
+      raw_excerpt: valueAt(record, 'raw_excerpt', 'surrounding_context'),
+      sender_and_context: senderContext,
+      gold_mention_type: valueAt(record, 'gold_mention_type', 'mention_type'),
+      gold_direction: valueAt(record, 'gold_direction', 'direction'),
+      gold_sector_key: valueAt(record, 'gold_sector_key', 'sector_key'),
+      split: (valueAt(record, 'split') || 'test') as 'dev' | 'test',
+      notes: valueAt(record, 'notes'),
+    };
+  });
+}
+
+export function parseGoldRecords(raw: string, path = ''): GoldRecord[] {
+  return /\.csv$/i.test(path) ? parseCsv(raw) : parseJsonl(raw);
+}
+
+export function normalizedGoldLabel(value: unknown): LabelStatus {
   const text = String(value || '').trim();
-  return text && text !== '-' ? text : null;
+  if (!text || text === '-') return { value: null, excluded_reason: 'blank' };
+  if (/\badjudicate\b/i.test(text)) return { value: null, excluded_reason: 'adjudicate' };
+  return { value: text, excluded_reason: null };
+}
+
+function goldLabelInput(record: GoldRecord, goldKey: 'gold_mention_type' | 'gold_direction' | 'gold_sector_key', humanKey: 'mention_type' | 'direction' | 'sector_key'): unknown {
+  const goldValue = record[goldKey];
+  return String(goldValue ?? '').trim() ? goldValue : record[humanKey];
 }
 
 function prefilterHintsFor(record: GoldRecord, sectorHint: { key: string; confidence: number }): Record<string, unknown> {
@@ -172,7 +271,27 @@ function metricPass(value: number | null, threshold: number): boolean {
   return typeof value === 'number' && value >= threshold;
 }
 
-function summarize(
+function coverageFor(predictions: PredictionRecord[], column: LabelColumn): Record<string, unknown> {
+  const field = column === 'mention_type'
+    ? 'gold_mention_type'
+    : column === 'direction'
+    ? 'gold_direction'
+    : 'gold_sector_key';
+  const excludedByReason: Record<LabelExclusionReason, number> = { blank: 0, adjudicate: 0 };
+  for (const prediction of predictions) {
+    const reason = prediction.gold_label_exclusions[column];
+    if (reason) excludedByReason[reason]++;
+  }
+  const scored = predictions.filter(prediction => prediction[field] != null).length;
+  const excluded = predictions.length - scored;
+  return {
+    scored_rows: scored,
+    excluded_rows: excluded,
+    excluded_by_reason: excludedByReason,
+  };
+}
+
+export function summarize(
   predictions: PredictionRecord[],
   args: Args
 ): Record<string, unknown> {
@@ -180,11 +299,14 @@ function summarize(
   const directionMatrix: Record<string, Record<string, number>> = {};
   const sectorMatrix: Record<string, Record<string, number>> = {};
   const perClass: Record<string, { precision: number | null; recall: number | null; tp: number; predicted: number; gold: number }> = {};
+  const mentionScored = predictions.filter(p => p.gold_mention_type);
+  const directionScored = predictions.filter(p => p.gold_direction);
+  const sectorScored = predictions.filter(p => p.gold_sector_key);
 
   for (const type of PROSPECT_MENTION_TYPES) {
-    const tp = predictions.filter(p => p.gold_mention_type === type && p.predicted_mention_type === type).length;
-    const predicted = predictions.filter(p => p.predicted_mention_type === type).length;
-    const gold = predictions.filter(p => p.gold_mention_type === type).length;
+    const tp = mentionScored.filter(p => p.gold_mention_type === type && p.predicted_mention_type === type).length;
+    const predicted = mentionScored.filter(p => p.predicted_mention_type === type).length;
+    const gold = mentionScored.filter(p => p.gold_mention_type === type).length;
     perClass[type] = { precision: ratio(tp, predicted), recall: ratio(tp, gold), tp, predicted, gold };
   }
 
@@ -195,22 +317,22 @@ function summarize(
   let sectorCorrect = 0;
   let sectorTotal = 0;
 
-  for (const p of predictions) {
-    incrementMatrix(mentionMatrix, p.gold_mention_type, p.predicted_mention_type);
-    if (p.gold_direction) {
-      incrementMatrix(directionMatrix, p.gold_direction, p.predicted_direction);
-      directionTotal++;
-      if (p.gold_direction === p.predicted_direction) directionCorrect++;
-      if (p.gold_mention_type === 'inbound_prospect') {
-        inboundDirectionTotal++;
-        if (p.gold_direction === p.predicted_direction) inboundDirectionCorrect++;
-      }
+  for (const p of mentionScored) {
+    incrementMatrix(mentionMatrix, p.gold_mention_type as string, p.predicted_mention_type);
+  }
+  for (const p of directionScored) {
+    incrementMatrix(directionMatrix, p.gold_direction as string, p.predicted_direction);
+    directionTotal++;
+    if (p.gold_direction === p.predicted_direction) directionCorrect++;
+    if (p.gold_mention_type === 'inbound_prospect') {
+      inboundDirectionTotal++;
+      if (p.gold_direction === p.predicted_direction) inboundDirectionCorrect++;
     }
-    if (p.gold_sector_key) {
-      incrementMatrix(sectorMatrix, p.gold_sector_key, p.predicted_sector_key);
-      sectorTotal++;
-      if (p.gold_sector_key === p.predicted_sector_key) sectorCorrect++;
-    }
+  }
+  for (const p of sectorScored) {
+    incrementMatrix(sectorMatrix, p.gold_sector_key as string, p.predicted_sector_key);
+    sectorTotal++;
+    if (p.gold_sector_key === p.predicted_sector_key) sectorCorrect++;
   }
 
   const directionAccuracy = ratio(directionCorrect, directionTotal);
@@ -245,7 +367,7 @@ function summarize(
 
   const failingItems = predictions
     .filter(p =>
-      p.gold_mention_type !== p.predicted_mention_type ||
+      (!!p.gold_mention_type && p.gold_mention_type !== p.predicted_mention_type) ||
       (!!p.gold_direction && p.gold_direction !== p.predicted_direction) ||
       (!!p.gold_sector_key && p.gold_sector_key !== p.predicted_sector_key)
     )
@@ -267,6 +389,14 @@ function summarize(
     note: 'Only valid for a frozen human-labeled split. Do not run backfill unless verdict is GO on the held-out test split.',
     split: args.split,
     item_count: predictions.length,
+    scoring_coverage: {
+      mention_type: coverageFor(predictions, 'mention_type'),
+      direction: coverageFor(predictions, 'direction'),
+      sector_key: {
+        ...coverageFor(predictions, 'sector_key'),
+        note: 'Blank sector_key is expected and excluded for news, intro_source, noise, and web_analytics rows.',
+      },
+    },
     thresholds: {
       inbound_prospect_precision: 0.95,
       inbound_prospect_recall: 0.9,
@@ -312,22 +442,22 @@ async function main(): Promise<void> {
   const env = proxy.env as unknown as Env;
   try {
     const knownContext = await loadKnownContext(args, env);
-    const allRecords = parseJsonl(await readFile(args.goldSetPath, 'utf8'));
+    const allRecords = parseGoldRecords(await readFile(args.goldSetPath, 'utf8'), args.goldSetPath);
     const records = allRecords.filter(record => args.split === 'all' || record.split === args.split);
     if (records.length === 0) throw new Error(`NO_GOLD_RECORDS_FOR_SPLIT:${args.split}`);
 
     const predictions: PredictionRecord[] = [];
     for (const record of records) {
-      const goldMentionType = normalizedGoldLabel(record.gold_mention_type);
-      if (!goldMentionType || !PROSPECT_MENTION_TYPES.includes(goldMentionType as any)) {
+      const goldMentionType = normalizedGoldLabel(goldLabelInput(record, 'gold_mention_type', 'mention_type'));
+      if (goldMentionType.value && !PROSPECT_MENTION_TYPES.includes(goldMentionType.value as any)) {
         throw new Error(`INVALID_GOLD_MENTION_TYPE item_id=${record.item_id}`);
       }
-      const goldDirection = normalizedGoldLabel(record.gold_direction);
-      if (goldDirection && !PROSPECT_DIRECTIONS.includes(goldDirection as any)) {
+      const goldDirection = normalizedGoldLabel(goldLabelInput(record, 'gold_direction', 'direction'));
+      if (goldDirection.value && !PROSPECT_DIRECTIONS.includes(goldDirection.value as any)) {
         throw new Error(`INVALID_GOLD_DIRECTION item_id=${record.item_id}`);
       }
-      const goldSectorKey = normalizedGoldLabel(record.gold_sector_key);
-      if (goldSectorKey && !PROSPECT_SECTOR_TAXONOMY.some(sector => sector.key === goldSectorKey)) {
+      const goldSectorKey = normalizedGoldLabel(goldLabelInput(record, 'gold_sector_key', 'sector_key'));
+      if (goldSectorKey.value && !PROSPECT_SECTOR_TAXONOMY.some(sector => sector.key === goldSectorKey.value)) {
         throw new Error(`INVALID_GOLD_SECTOR_KEY item_id=${record.item_id}`);
       }
       const sectorHint = __prospectIntelligenceTestHooks.sectorHintForText(
@@ -357,9 +487,14 @@ async function main(): Promise<void> {
         mention_ordinal: record.mention_ordinal,
         company_name: record.company_name,
         split: record.split,
-        gold_mention_type: goldMentionType,
-        gold_direction: goldDirection,
-        gold_sector_key: goldSectorKey,
+        gold_mention_type: goldMentionType.value,
+        gold_direction: goldDirection.value,
+        gold_sector_key: goldSectorKey.value,
+        gold_label_exclusions: {
+          mention_type: goldMentionType.excluded_reason,
+          direction: goldDirection.excluded_reason,
+          sector_key: goldSectorKey.excluded_reason,
+        },
         predicted_mention_type: decision.mentionType,
         predicted_direction: decision.direction,
         predicted_sector_key: decision.sectorKey,
@@ -381,7 +516,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(error => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(error => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
