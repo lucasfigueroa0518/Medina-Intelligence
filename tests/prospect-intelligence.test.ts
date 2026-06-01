@@ -664,25 +664,74 @@ describe('prospect intelligence deterministic signals', () => {
     expect(prompt.system).toContain('Thesis fit does NOT determine prospect status');
     expect(prompt.system).toContain('KNOWN deals / portfolio (names + domains): Qunnect <qunnect.io>');
     expect(prompt.system).toContain('ai_data, cybersecurity, quantum');
-    expect(prompt.system).toContain('"mention_type":"..."');
-    expect(prompt.system).toContain('Never output outbound, internal, outbound_prospect');
-    expect(prompt.system).toContain('Incidental background references in ordinary email threads');
-    expect(prompt.system).toContain('financing/news/background sentence is not automatically an intro_source');
-    expect(prompt.system).toContain('nearby companies; classify only the MENTION named in the user prompt');
-    expect(prompt.system).toContain('Background entity inside a deal thread');
-    expect(prompt.system).toContain('Operational artifact; not website traffic analytics');
-    expect(prompt.system).toContain('Literal traffic analytics source row');
+    expect(prompt.system).toContain('"prospect_action":"..."');
+    expect(prompt.system).toContain('This is the only model-facing action bucket');
+    expect(prompt.system).toContain('record_context');
+    expect(prompt.system).toContain('If in doubt between relationship vs meeting');
+    expect(prompt.system).toContain('Never put a nearby company here');
     expect(prompt.user).toContain('SOURCE_TYPE: email');
     expect(prompt.user).toContain('MENTION (the company in question): Auguria');
+  });
+
+  it('deterministically vetoes obvious non-investable create-prospect mentions', () => {
+    const { prospectCreateVetoForMention } = __prospectIntelligenceTestHooks;
+    const blocked = [
+      ['Join with Google Meet', 'Calendar invite with Join with Google Meet details.'],
+      ['Meeting link meet.google.com/cya-yrux-nbm Join by phone', 'Calendar meeting link text.'],
+      ['Vimeo', 'Video link for WavePoint Solutions hosted on Vimeo.'],
+      ['US Army', 'US Army is a customer and deployment context for WavePoint.'],
+      ['Gillette Stadium', 'Gillette Stadium is a customer deployment location.'],
+      ['Finalis Securities LLC', 'Finalis Securities LLC is the exclusive financial advisor for WavePoint.'],
+      ['Sheehanfinance', 'sheehanfinance.com is the advisor domain facilitating the raise.'],
+      ['Cedar Pine', 'Cedar Pine is just relationship context; WavePoint Solutions is the actual company being pitched.'],
+    ];
+
+    for (const [companyName, rawExcerpt] of blocked) {
+      expect(prospectCreateVetoForMention({
+        prospectAction: 'create_prospect',
+        companyName,
+        rawMention: companyName,
+        rawExcerpt,
+        senderAndContext: 'from advisor@example.com',
+        llmReasoning: `${companyName} is mentioned around the investment opportunity.`,
+      })).toMatchObject({ applied: true });
+    }
+  });
+
+  it('does not veto valid investment-target create-prospect mentions', () => {
+    const { prospectCreateVetoForMention } = __prospectIntelligenceTestHooks;
+    const valid = [
+      ['Auguria', 'Warm intro to Auguria; deck attached for their security data product.'],
+      ['RHEON Labs', 'RHEON Labs is raising with a deck and call request from an advisor.'],
+      ['Rheonlabs', 'Rheonlabs is an EIS funding opportunity with allocation available.'],
+      ['WavePoint Solutions', 'WavePoint Solutions is conducting a $10M raise with customer traction.'],
+      ['WavePoint Solutions', 'WavePoint Solutions is the actual company being pitched.'],
+      ['Wavepointsolution', 'Wavepointsolution is the company being pitched as an investment opportunity.'],
+      ['Nova Finance', 'Nova Finance is raising with support from an exclusive financial advisor.'],
+      ['Qusecure', 'Qusecure is introduced as a quantum security investment opportunity.'],
+      ['Vulcan', 'Vulcan is being sent as a prospect for review.'],
+      ['Rendair', 'Rendair is a company being presented for investment consideration.'],
+    ];
+
+    for (const [companyName, rawExcerpt] of valid) {
+      expect(prospectCreateVetoForMention({
+        prospectAction: 'create_prospect',
+        companyName,
+        rawMention: companyName,
+        rawExcerpt,
+        senderAndContext: 'from external dealmaker',
+        llmReasoning: `${companyName} is the company being pitched as an investment opportunity.`,
+      })).toMatchObject({ applied: false });
+    }
   });
 
   it('keeps mocked classifier flow on valid taxonomy boundaries for common hard cases', async () => {
     callClaudeWithUsageMock.mockReset();
     const outputs = [
-      { mention_type: 'noise', direction: 'outbound', sector_key: 'fintech', sector_confidence: 0.7, confidence: 0.9, reasoning: 'Customer target, not deal flow.' },
-      { mention_type: 'news', direction: 'news', sector_key: 'uncategorized', sector_confidence: 0.3, confidence: 0.88, reasoning: 'Reported round context only.' },
-      { mention_type: 'known_deal', direction: 'outbound', sector_key: 'quantum', sector_confidence: 0.9, confidence: 0.95, reasoning: 'Exact known deal match.' },
-      { mention_type: 'intro_source', direction: 'inbound', sector_key: 'uncategorized', sector_confidence: 0.2, confidence: 0.9, reasoning: 'Active channel forwarding deal flow.' },
+      { prospect_action: 'record_context', prospect_company_name: null, direction: 'outbound', sector_key: 'fintech', sector_confidence: 0.7, confidence: 0.9, reasoning: 'Customer target, useful context but not a prospect.' },
+      { prospect_action: 'ignore', prospect_company_name: null, direction: 'news', sector_key: 'uncategorized', sector_confidence: 0.3, confidence: 0.88, reasoning: 'Reported round context only.' },
+      { prospect_action: 'attach_existing_deal', prospect_company_name: null, direction: 'outbound', sector_key: 'quantum', sector_confidence: 0.9, confidence: 0.95, reasoning: 'Exact known deal match.' },
+      { prospect_action: 'record_context', prospect_company_name: null, direction: 'inbound', sector_key: 'uncategorized', sector_confidence: 0.2, confidence: 0.9, reasoning: 'Active channel forwarding deal flow.' },
     ];
     callClaudeWithUsageMock.mockImplementation(async () => ({
       text: JSON.stringify(outputs.shift()),
@@ -704,10 +753,10 @@ describe('prospect intelligence deterministic signals', () => {
     const knownDeal = await callProspectClassifier({ ...baseInput, companyName: 'Qunnect', rawExcerpt: 'Portfolio company Qunnect is being pitched outbound.' }, {} as any);
     const introSource = await callProspectClassifier({ ...baseInput, companyName: 'DIU', rawExcerpt: 'DIU is forwarding ArmyFUZE deal flow to the fund.' }, {} as any);
 
-    expect(customer).toMatchObject({ mentionType: 'noise', direction: 'outbound' });
-    expect(investorNews).toMatchObject({ mentionType: 'news', direction: 'news' });
+    expect(customer).toMatchObject({ mentionType: 'noise', prospectAction: 'record_context', direction: 'outbound' });
+    expect(investorNews).toMatchObject({ mentionType: 'noise', prospectAction: 'ignore', direction: 'news' });
     expect(knownDeal).toMatchObject({ mentionType: 'known_deal', direction: 'outbound' });
-    expect(introSource).toMatchObject({ mentionType: 'intro_source', direction: 'inbound' });
+    expect(introSource).toMatchObject({ mentionType: 'noise', prospectAction: 'record_context', direction: 'inbound' });
     expect(callClaudeWithUsageMock.mock.calls.every(([request]) => request.assistantPrefill === '{')).toBe(true);
   });
 
@@ -759,31 +808,37 @@ describe('prospect intelligence deterministic signals', () => {
   });
 
   it('parses the gold-kit LLM JSON contract from raw, fenced, and prose-wrapped output', () => {
-    const { parseProspectClassifierResponse, parseMentionType, parseDirection, parseSectorKey } = __prospectIntelligenceTestHooks;
+    const { parseProspectClassifierResponse, parseMentionType, parseDirection, parseSectorKey, parseProspectAction } = __prospectIntelligenceTestHooks;
 
     const parsed = parseProspectClassifierResponse(
-      '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.9,"confidence":0.95,"reasoning":"Deck attached."}',
+      '{"prospect_action":"create_prospect","prospect_company_name":"Auguria","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.9,"confidence":0.95,"reasoning":"Deck attached."}',
       'claude-haiku-4-5-20251001'
     );
 
     expect(parsed.mentionType).toBe('inbound_prospect');
+    expect(parsed.prospectAction).toBe('create_prospect');
+    expect(parsed.prospectCompanyName).toBe('Auguria');
     expect(parsed.direction).toBe('inbound');
     expect(parsed.sectorKey).toBe('cybersecurity');
     expect(parseMentionType('news')).toBe('news');
+    expect(parseProspectAction('record_context', 'noise')).toBe('record_context');
+    expect(parseProspectAction('', 'intro_source')).toBe('record_context');
     expect(parseDirection('news')).toBe('news');
     expect(parseSectorKey('aerospace defense')).toBe('aerospace_defense');
     expect(() => parseMentionType('news_only')).toThrow(/INVALID_LLM_MENTION_TYPE/);
     expect(() => parseDirection('unknown')).toThrow(/INVALID_LLM_DIRECTION/);
+    expect(() => parseProspectAction('needs_review', 'noise')).toThrow(/INVALID_LLM_PROSPECT_ACTION/);
 
     const fenced = parseProspectClassifierResponse(
-      '```json\n{"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.8,"reasoning":"Admin."}\n```',
+      '```json\n{"prospect_action":"ignore","prospect_company_name":null,"direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.8,"reasoning":"Admin."}\n```',
       'claude-haiku-4-5-20251001'
     );
     expect(fenced.mentionType).toBe('noise');
+    expect(fenced.prospectAction).toBe('ignore');
     expect(fenced.direction).toBe('internal');
 
     const proseWrapped = parseProspectClassifierResponse(
-      'Here is the JSON:\n{"mention_type":"known_deal","direction":"outbound","sector_key":"quantum","sector_confidence":0.7,"confidence":0.88,"reasoning":"Existing deal."}\nDone.',
+      'Here is the JSON:\n{"prospect_action":"attach_existing_deal","prospect_company_name":null,"direction":"outbound","sector_key":"quantum","sector_confidence":0.7,"confidence":0.88,"reasoning":"Existing deal."}\nDone.',
       'claude-haiku-4-5-20251001'
     );
     expect(proseWrapped.mentionType).toBe('known_deal');
@@ -1053,6 +1108,115 @@ describe('prospect intelligence deterministic signals', () => {
       source_id: 'conv-medium',
       sample_reason: 'medium_confidence',
       label_status: 'unlabeled',
+    });
+  });
+
+  it('records signal-only inbound-looking relationship context without creating a prospect', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock
+      .mockResolvedValueOnce({
+        text: '{"organizations":[{"name":"MRAI Global","raw":"MRAI Global"}]}',
+        usage: { input_tokens: 60, output_tokens: 12 },
+        model: 'claude-haiku-4-5-20251001',
+      })
+      .mockResolvedValueOnce({
+        text: '{"prospect_action":"record_context","prospect_company_name":null,"direction":"inbound","sector_key":"uncategorized","sector_confidence":0.25,"confidence":0.86,"reasoning":"Useful relationship signal, but the named entity is not clearly the investment target."}',
+        usage: { input_tokens: 90, output_tokens: 30 },
+        model: 'claude-haiku-4-5-20251001',
+      })
+      .mockResolvedValue({
+        text: '{"prospect_action":"record_context","prospect_company_name":null,"direction":"inbound","sector_key":"uncategorized","sector_confidence":0.25,"confidence":0.86,"reasoning":"Useful relationship signal, but the named entity is not clearly the investment target."}',
+        usage: { input_tokens: 90, output_tokens: 30 },
+        model: 'claude-haiku-4-5-20251001',
+      });
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-signal-only',
+      source: 'email',
+      subject: 'Follow-up with MRAI Global',
+      bodyText: 'Warm intro to MRAI Global as a relationship check-in; no company deck, round, or diligence ask yet.',
+      bodyPreview: 'Warm intro to MRAI Global',
+      fromEmail: 'alice@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(stats.signals_recorded).toBeGreaterThanOrEqual(1);
+    expect(stats.prospects_upserted).toBe(0);
+    expect(db.prospects).toHaveLength(0);
+    expect(db.prospectSignals.every(signal => signal.prospect_id == null)).toBe(true);
+    const signal = db.prospectSignals.find(row => {
+      const metadata = JSON.parse(row.metadata_json || '{}');
+      return metadata.prospect_action === 'record_context';
+    });
+    expect(signal).toBeTruthy();
+    expect(signal).toMatchObject({
+      mention_type: 'noise',
+      prospect_id: null,
+    });
+    expect(JSON.parse(signal!.metadata_json)).toMatchObject({
+      prospect_action: 'record_context',
+      should_create_prospect: false,
+      context_signal: true,
+    });
+  });
+
+  it('hard-vetoes LLM create_prospect outputs for obvious service-provider mentions', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock
+      .mockResolvedValueOnce({
+        text: '{"organizations":[{"name":"Finalis Securities LLC","raw":"Finalis Securities LLC"}]}',
+        usage: { input_tokens: 60, output_tokens: 12 },
+        model: 'claude-haiku-4-5-20251001',
+      })
+      .mockResolvedValueOnce({
+        text: '{"prospect_action":"create_prospect","prospect_company_name":"Finalis Securities LLC","direction":"inbound","sector_key":"fintech","sector_confidence":0.65,"confidence":0.92,"reasoning":"WavePoint is being actively pitched by Finalis Securities LLC as an investment opportunity."}',
+        usage: { input_tokens: 90, output_tokens: 30 },
+        model: 'claude-haiku-4-5-20251001',
+      })
+      .mockResolvedValue({
+        text: '{"prospect_action":"create_prospect","prospect_company_name":"Finalis Securities LLC","direction":"inbound","sector_key":"fintech","sector_confidence":0.65,"confidence":0.92,"reasoning":"WavePoint is being actively pitched by Finalis Securities LLC as an investment opportunity."}',
+        usage: { input_tokens: 90, output_tokens: 30 },
+        model: 'claude-haiku-4-5-20251001',
+      });
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-service-provider-veto',
+      source: 'email',
+      subject: 'WavePoint $10M raise',
+      bodyText: 'Finalis Securities LLC is the exclusive financial advisor conducting a $10M raise for WavePoint Solutions.',
+      bodyPreview: 'Finalis Securities LLC is the exclusive financial advisor',
+      fromEmail: 'advisor@finalis.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(stats.prospects_upserted).toBe(0);
+    expect(db.prospects).toHaveLength(0);
+    expect(db.prospectSignals.length).toBeGreaterThanOrEqual(1);
+    const signal = db.prospectSignals.find(row => row.raw_mention_text === 'Finalis Securities LLC');
+    expect(signal).toMatchObject({
+      mention_type: 'noise',
+      prospect_id: null,
+      confidence_tier: 'high',
+      resolution_status: 'resolved',
+    });
+    expect(JSON.parse(signal!.metadata_json)).toMatchObject({
+      prospect_action: 'ignore',
+      should_create_prospect: false,
+      create_prospect_veto_applied: true,
+      create_prospect_veto_reason: 'service_provider_or_intermediary',
+      original_llm_prospect_action: 'create_prospect',
     });
   });
 

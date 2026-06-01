@@ -49,6 +49,7 @@ interface Args {
 
 interface SpikeClassifierDecision {
   mentionType: string;
+  prospectAction: string;
   direction: string;
   sectorKey: string;
   sectorConfidence: number;
@@ -98,6 +99,7 @@ export interface PredictionRecord {
   gold_sector_key: string | null;
   gold_label_exclusions: Record<LabelColumn, LabelExclusionReason | null>;
   predicted_mention_type: string;
+  predicted_prospect_action: string;
   predicted_direction: string;
   predicted_sector_key: string;
   confidence: number;
@@ -279,7 +281,7 @@ function prefilterHintsFor(record: GoldRecord, sectorHint: { key: string; confid
     signal_kind_hint: reasons.includes('deck_signal')
       ? 'deck'
       : reasons.includes('meeting_or_call_signal')
-      ? 'call'
+      ? 'meeting'
       : reasons.includes('warm_intro_language')
       ? 'intro'
       : reasons.includes('list_entry_shape')
@@ -468,6 +470,7 @@ export function summarize(
       company_name: p.company_name,
       gold_mention_type: p.gold_mention_type,
       predicted_mention_type: p.predicted_mention_type,
+      predicted_prospect_action: p.predicted_prospect_action,
       gold_direction: p.gold_direction,
       predicted_direction: p.predicted_direction,
       gold_sector_key: p.gold_sector_key,
@@ -604,6 +607,7 @@ async function main(): Promise<void> {
           sector_key: goldSectorKey.excluded_reason,
         },
         predicted_mention_type: decision?.mentionType || 'classifier_error',
+        predicted_prospect_action: decision?.prospectAction || 'classifier_error',
         predicted_direction: decision?.direction || 'classifier_error',
         predicted_sector_key: decision?.sectorKey || 'classifier_error',
         confidence: decision?.confidence || 0,

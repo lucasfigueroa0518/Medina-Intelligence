@@ -3,7 +3,7 @@ import type { ClassifiedItem } from '../types/interfaces';
 import { callClaudeWithUsage, type ClaudeSystemPrompt } from './claude';
 import { emailDomain, getConfiguredInternalDomains, isInternalEmailDomain } from './internal-domains';
 
-export const PROSPECT_CLASSIFIER_VERSION = 'prospect-v1-llm-req-cl-2026-05-30';
+export const PROSPECT_CLASSIFIER_VERSION = 'prospect-v1-llm-req-cl-veto-2026-06-01';
 const PROSPECT_CLASSIFIER_DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
 const DEFAULT_PROSPECT_PRODUCTION_SAMPLE_RATE = 0.02;
 export const PROSPECT_CONTEXT_WINDOW_CHARS = 4000;
@@ -42,6 +42,14 @@ export const PROSPECT_MENTION_TYPES = [
 ] as const;
 const PROSPECT_MENTION_TYPE_SET = new Set<string>(PROSPECT_MENTION_TYPES);
 
+export const PROSPECT_ACTIONS = [
+  'create_prospect',
+  'attach_existing_deal',
+  'record_context',
+  'ignore',
+] as const;
+const PROSPECT_ACTION_SET = new Set<string>(PROSPECT_ACTIONS);
+
 export const PROSPECT_DIRECTIONS = ['inbound', 'outbound', 'internal', 'news'] as const;
 const PROSPECT_DIRECTION_SET = new Set<string>(PROSPECT_DIRECTIONS);
 
@@ -49,8 +57,9 @@ type SourceType = 'conversation' | 'event' | 'document';
 type Direction = typeof PROSPECT_DIRECTIONS[number];
 type DeterministicDirection = Direction | 'unknown';
 type MentionType = typeof PROSPECT_MENTION_TYPES[number];
+type ProspectAction = typeof PROSPECT_ACTIONS[number];
 type SectorKey = typeof PROSPECT_SECTOR_TAXONOMY[number]['key'];
-type SignalKind = 'intro' | 'raise' | 'deck' | 'meeting' | 'call' | 'list_entry' | 'cold_mention' | 'unknown';
+type SignalKind = 'intro' | 'raise' | 'deck' | 'meeting' | 'list_entry' | 'cold_mention' | 'unknown';
 type ConfidenceTier = 'high' | 'medium' | 'low';
 
 export interface ProspectDetectionStats {
@@ -96,6 +105,9 @@ interface Classification {
   direction: Direction;
   directionUncertain: boolean;
   mentionType: MentionType;
+  prospectAction: ProspectAction;
+  shouldCreateProspect: boolean;
+  prospectCompanyName: string | null;
   confidence: number;
   confidenceTier: ConfidenceTier;
   sectorKey: SectorKey;
@@ -133,9 +145,26 @@ interface LlmClassifierDecision {
   sectorKey: SectorKey;
   sectorConfidence: number;
   confidence: number;
+  prospectAction: ProspectAction;
+  prospectCompanyName: string | null;
   reasoning: string | null;
   model: string;
   usage?: { input_tokens: number; output_tokens: number };
+}
+
+interface ProspectCreateVetoInput {
+  prospectAction: string;
+  companyName: string;
+  rawMention?: string | null;
+  rawExcerpt?: string | null;
+  senderAndContext?: string | null;
+  llmReasoning?: string | null;
+}
+
+interface ProspectCreateVetoDecision {
+  applied: boolean;
+  reason: string | null;
+  confidence: number | null;
 }
 
 export interface ProspectClassifierKnownEntity {
@@ -157,6 +186,13 @@ export interface ProspectClassifierInput {
   sectorHints: { key: SectorKey; confidence: number };
   knownContext: ProspectClassifierKnownContext;
   orgId: string;
+  policyLens?: ProspectClassifierPolicyLens | null;
+}
+
+export interface ProspectClassifierPolicyLens {
+  id: string;
+  name: string;
+  instructions: string;
 }
 
 export interface ParsedDealflowListFields {
@@ -251,6 +287,10 @@ function clamp(n: number, min: number, max: number): number {
 
 function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 export function normalizeProspectName(value: string | null | undefined): string {
@@ -636,7 +676,7 @@ function inferDirection(item: ClassifiedItem, env: Env, companyDomain?: string |
 function signalKindFor(item: ClassifiedItem, mention: MentionCandidate, hasDeck: boolean, hasMeeting: boolean): SignalKind {
   const haystack = `${item.subject || ''}\n${mention.contextText || mention.lineText}\n${item.bodyPreview || ''}`.toLowerCase();
   if (hasDeck) return 'deck';
-  if (hasMeeting) return item.type === 'calendar_event' ? 'meeting' : 'call';
+  if (hasMeeting) return 'meeting';
   if (isWarmIntroSignal(item, mention)) return 'intro';
   if (/\b(raise|raising|round|seed|series [abc]|allocation|term sheet)\b/.test(haystack)) return 'raise';
   if (mention.isListEntry) return 'list_entry';
@@ -651,7 +691,7 @@ function isWarmIntroSignal(item: ClassifiedItem, mention: MentionCandidate): boo
 function confidenceFor(kind: SignalKind, direction: DeterministicDirection, newsletter: boolean): { confidence: number; tier: ConfidenceTier; provisional: boolean } {
   if (newsletter) return { confidence: 0.25, tier: 'low', provisional: true };
   let confidence = 0.62;
-  if (kind === 'meeting' || kind === 'call') confidence += 0.18;
+  if (kind === 'meeting') confidence += 0.18;
   if (kind === 'deck') confidence += 0.16;
   if (kind === 'intro') confidence += 0.14;
   if (kind === 'raise') confidence += 0.1;
@@ -691,6 +731,210 @@ function parseMentionType(value: unknown): MentionType {
   const v = String(value || '').trim().toLowerCase();
   if (PROSPECT_MENTION_TYPE_SET.has(v)) return v as MentionType;
   throw new Error(`INVALID_LLM_MENTION_TYPE:${v || 'empty'}`);
+}
+
+function parseNullableClassifierString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const text = normalizeWhitespace(value);
+  if (!text || /^null$/i.test(text)) return null;
+  return text.slice(0, 180);
+}
+
+function actionFromLegacyFields(mentionType: MentionType, legacySignalDisposition: unknown): ProspectAction {
+  const disposition = String(legacySignalDisposition || '').trim().toLowerCase();
+  if (disposition === 'create_prospect') return 'create_prospect';
+  if (disposition === 'attach_known_deal' || disposition === 'attach_existing_deal') return 'attach_existing_deal';
+  if (disposition === 'relationship_signal' || disposition === 'meeting_signal') return 'record_context';
+  if (disposition === 'admin_noise' || disposition === 'news_only' || disposition === 'web_analytics') return 'ignore';
+  if (mentionType === 'inbound_prospect') return 'create_prospect';
+  if (mentionType === 'known_deal') return 'attach_existing_deal';
+  if (mentionType === 'intro_source') return 'record_context';
+  return 'ignore';
+}
+
+function parseProspectAction(value: unknown, mentionType: MentionType, legacySignalDisposition?: unknown): ProspectAction {
+  const v = String(value || '').trim().toLowerCase();
+  if (!v) return actionFromLegacyFields(mentionType, legacySignalDisposition);
+  if (PROSPECT_ACTION_SET.has(v)) return v as ProspectAction;
+  throw new Error(`INVALID_LLM_PROSPECT_ACTION:${v}`);
+}
+
+function mentionTypeForAction(action: ProspectAction): MentionType {
+  if (action === 'create_prospect') return 'inbound_prospect';
+  if (action === 'attach_existing_deal') return 'known_deal';
+  return 'noise';
+}
+
+const VETO_LINK_OR_ADMIN_NAMES = new Set([
+  'googlemeet',
+  'meetinglink',
+  'joinwithgooglemeet',
+  'joinby',
+  'joinbyphone',
+  'videocall',
+  'conferencecall',
+  'calendarinvite',
+]);
+
+const VETO_TOOL_OR_LINK_HOSTS = new Set([
+  'vimeo',
+  'docsend',
+  'google',
+  'microsoft',
+  'microsoftteams',
+  'teams',
+  'zoom',
+  'slack',
+  'calendly',
+  'docusign',
+  'dropbox',
+  'box',
+]);
+
+const VETO_GOVERNMENT_OR_BUYER_ENTITIES = new Set([
+  'army',
+  'usarmy',
+  'unitedstatesarmy',
+  'dod',
+  'departmentofdefense',
+  'southcom',
+  'ussouthcom',
+  'navy',
+  'usnavy',
+  'airforce',
+  'usairforce',
+  'spaceforce',
+  'marines',
+  'usmarines',
+]);
+
+const VETO_SERVICE_PROVIDER_NAMES = new Set([
+  'finalis',
+  'finalissecurities',
+  'sheehanfinance',
+  'woodyravine',
+  'orrick',
+  'greenbergtraurig',
+  'gtlaw',
+  'goodkindandflorio',
+  'goodkindflorio',
+]);
+
+const VETO_SINGLE_PERSON_NAMES = new Set([
+  'apollo',
+  'patrick',
+  'lloyd',
+  'craig',
+  'manny',
+  'raul',
+  'chuck',
+]);
+
+function hasDifferentActualTarget(context: string, currentNormalizedName: string): boolean {
+  if (!currentNormalizedName) return false;
+  const targetPatterns = [
+    /\b(?:actual|real)\s+(?:investment\s+)?(?:prospect|target|company(?:\s+being\s+pitched)?)\s+(?:is|was|appears to be|seems to be|:)\s+([A-Za-z0-9&.'’ -]{2,80})/i,
+    /\b([A-Za-z0-9&.'’ -]{2,80})\s+(?:is|was|appears to be|seems to be)\s+(?:the\s+)?(?:actual|real)\s+(?:investment\s+)?(?:prospect|target|company(?:\s+being\s+pitched)?)/i,
+  ];
+  for (const pattern of targetPatterns) {
+    const match = context.match(pattern);
+    if (!match?.[1]) continue;
+    const target = normalizeWhitespace(match[1])
+      .replace(/[.;:,].*$/g, '')
+      .replace(/\s+\b(?:not|rather|instead|while|but|because|with|for|as|and|that|which)\b.*$/i, '')
+      .trim();
+    const targetNormalized = normalizeProspectName(target);
+    if (
+      targetNormalized &&
+      targetNormalized !== currentNormalizedName &&
+      !targetNormalized.includes(currentNormalizedName) &&
+      !currentNormalizedName.includes(targetNormalized)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasCurrentCompanyServiceProviderRole(context: string, company: string): boolean {
+  const compactCompany = normalizeWhitespace(company);
+  if (!compactCompany) return false;
+  const companyPattern = escapeRegExp(compactCompany).replace(/\\ /g, '\\s+');
+  return new RegExp(
+    `\\b${companyPattern}\\b\\s+(?:is|was|serves\\s+as|served\\s+as|acting\\s+as|acted\\s+as)\\s+(?:the\\s+)?(?:exclusive\\s+)?(?:financial\\s+advisor|broker[-\\s]?dealer|placement\\s+agent|legal\\s+counsel|law\\s+firm)\\b`,
+    'i'
+  ).test(context);
+}
+
+function prospectCreateVetoForMention(input: ProspectCreateVetoInput): ProspectCreateVetoDecision {
+  if (input.prospectAction !== 'create_prospect') {
+    return { applied: false, reason: null, confidence: null };
+  }
+
+  const company = normalizeWhitespace(input.companyName || input.rawMention || '');
+  const rawMention = normalizeWhitespace(input.rawMention || company);
+  const normalized = normalizeProspectName(company);
+  const nameHaystack = `${company}\n${rawMention}`.toLowerCase();
+  const contextText = [
+    input.senderAndContext || '',
+    input.rawExcerpt || '',
+    input.llmReasoning || '',
+  ].join('\n');
+  const contextHaystack = contextText.toLowerCase();
+
+  const veto = (reason: string): ProspectCreateVetoDecision => ({
+    applied: true,
+    reason,
+    confidence: 0.97,
+  });
+
+  if (
+    VETO_LINK_OR_ADMIN_NAMES.has(normalized) ||
+    /\b(?:google meet|meet\.google\.com|join with google meet|meeting link|join by phone|dial[-\s]?in|video call|calendar invite)\b/i.test(nameHaystack)
+  ) {
+    return veto('admin_link_or_calendar_scaffolding');
+  }
+
+  if (
+    VETO_TOOL_OR_LINK_HOSTS.has(normalized) ||
+    /\b(?:vimeo|docsend|zoom|calendly|docusign|dropbox|google drive|microsoft teams|slack)\.com\b/i.test(nameHaystack)
+  ) {
+    return veto('tool_vendor_or_link_host');
+  }
+
+  if (
+    /\b(?:stadium|arena|hotel|airport|conference center|convention center|restaurant|resort|auditorium|theat(?:er|re)|club)\b/i.test(company)
+  ) {
+    return veto('venue_or_physical_location');
+  }
+
+  if (VETO_GOVERNMENT_OR_BUYER_ENTITIES.has(normalized)) {
+    return veto('government_customer_or_buyer_entity');
+  }
+
+  if (
+    VETO_SERVICE_PROVIDER_NAMES.has(normalized) ||
+    /\b(?:securities|broker[-\s]?dealer|financial advisor|exclusive financial advisor|placement agent|law firm|legal counsel|attorneys?|cpa|fund admin|capital markets)\b/i.test(company) ||
+    hasCurrentCompanyServiceProviderRole(contextText, company) ||
+    (/\b(?:exclusive financial advisor|broker[-\s]?dealer|placement agent|legal counsel|law firm)\b/i.test(contextHaystack) &&
+      /\b(?:securities|advisor|advisory|law|legal|llp|p\.a\.)\b/i.test(company))
+  ) {
+    return veto('service_provider_or_intermediary');
+  }
+
+  if (looksLikePersonName(company) || VETO_SINGLE_PERSON_NAMES.has(normalized)) {
+    return veto('person_or_relationship_participant');
+  }
+
+  if (
+    /\b(?:merely|just|only)\s+(?:a\s+)?(?:video|link|host|venue|customer|deployment|source|advisor|broker|law|legal|meeting)\b/i.test(contextHaystack) ||
+    /\b(?:not\s+(?:the|an)\s+(?:investment\s+)?(?:target|prospect)|not itself (?:an? )?investment prospect)\b/i.test(contextHaystack) ||
+    hasDifferentActualTarget(contextText, normalized)
+  ) {
+    return veto('nearby_company_hallucination_or_non_target_role');
+  }
+
+  return { applied: false, reason: null, confidence: null };
 }
 
 function parseSectorKey(value: unknown): SectorKey {
@@ -1462,32 +1706,28 @@ CRITICAL: Thesis fit does NOT determine prospect status. A company that is off-t
 presented to the fund as an investment opportunity. Never downgrade or drop a prospect
 for being off-thesis. Sector is captured separately.
 
-Classify on three axes.
+Choose exactly one prospect_action. This is the only model-facing action bucket:
 
-mention_type -- choose exactly one, using this decision order (first match wins):
-  VALID VALUES ONLY: inbound_prospect, known_deal, intro_source, news, noise,
-                     web_analytics. Never output outbound, internal, outbound_prospect,
-                     or any other value as mention_type; outbound/internal are directions.
-  1. news          -- company named only informationally (newsletter, press, market
-                     commentary, or public reporting); no one is proposing the fund engage it.
-                     Incidental background references in ordinary email threads, calendar
-                     invites, legal/admin notes, meeting notes, or portfolio/customer threads
-                     are noise, not news.
-  2. intro_source  -- the person, firm, accelerator, or government channel making an
-                     introduction or sending deal flow to the fund (NOT the company introduced).
-                     A VC, investor, advisor, vendor, publication, or agency merely named in a
-                     financing/news/background sentence is not automatically an intro_source.
-  3. noise         -- vendor, fund admin, legal, internal ops, personal, OR a company
-                     that is a commercial/customer/BD target rather than an investment
-                     target.
-     web_analytics -- only an explicit website-visit / traffic analytics source row
-                      (a noise subtype); ordinary emails, auth notices, vendor/admin
-                      messages, and portfolio/customer threads remain noise.
-  4. The named entity is a company in an investment context:
-       known_deal       -- the named entity itself exactly matches the KNOWN list below
-                           (even if pitched outbound/internal). Do not infer known_deal from
-                           nearby companies; classify only the MENTION named in the user prompt.
-       inbound_prospect -- otherwise (regardless of thesis fit).
+  create_prospect       -- MENTION is the startup/company being newly presented to the
+                           fund as an investment opportunity and should become a canonical
+                           prospect counted in deal-flow aggregates.
+  attach_existing_deal  -- MENTION is an existing deal/portfolio company. Do not create a
+                           prospect; deterministic firewall logic will attach if safe.
+  record_context        -- MENTION is useful dealflow context but is not itself the company
+                           to count: intro source, accelerator/channel, investor/advisor,
+                           customer/partner, relationship org, meeting participant, or a
+                           weak signal worth retaining without creating a prospect.
+  ignore                -- admin/vendor/legal/billing/personal noise, public news only,
+                           website analytics, auth notices, calendar/link scaffolding, or
+                           ordinary background with no useful dealflow value.
+
+Never encode the reason as a separate category. If in doubt between relationship vs meeting
+vs intro vs customer context, choose record_context. If in doubt between news/web analytics/
+admin/vendor noise, choose ignore.
+
+prospect_company_name -- the canonical prospect company name when prospect_action is
+create_prospect; otherwise null. Never put a nearby company here unless the MENTION itself
+is that company.
 
 direction -- choose exactly one:
   inbound   -- an external party is presenting a company to the fund.
@@ -1501,29 +1741,31 @@ unclear, "uncategorized":
 Also output sector_confidence in [0,1].
 
 Rubric examples (sanitized; apply as rules, not source facts):
-Auguria with intro + deck -> {"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.9,"confidence":0.95,"reasoning":"Introduced as an investment opportunity with a deck."}
-Qunnect pitched to Mastercard -> {"mention_type":"known_deal","direction":"outbound","sector_key":"quantum","sector_confidence":0.9,"confidence":0.95,"reasoning":"Known portfolio/deal company being pitched outbound."}
-Mastercard in the Qunnect customer thread -> {"mention_type":"noise","direction":"outbound","sector_key":"fintech","sector_confidence":0.75,"confidence":0.9,"reasoning":"Commercial customer target, not an investment prospect."}
-Anthropic in an NVCA fundraise newsletter -> {"mention_type":"news","direction":"news","sector_key":"ai_data","sector_confidence":0.85,"confidence":0.92,"reasoning":"Informational fundraise news only."}
-DIU sending ArmyFUZE deal flow -> {"mention_type":"intro_source","direction":"inbound","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.9,"reasoning":"Government channel forwarding deal flow."}
-Sativa hempcrete in an ArmyFUZE list -> {"mention_type":"inbound_prospect","direction":"inbound","sector_key":"materials_manufacturing","sector_confidence":0.85,"confidence":0.9,"reasoning":"Off-thesis but presented as an investment opportunity."}
-Lead investor named in a funding announcement -> {"mention_type":"news","direction":"news","sector_key":"uncategorized","sector_confidence":0.3,"confidence":0.88,"reasoning":"Named as reported round context, not actively introducing deal flow to the fund."}
-Calendar platform or meeting-link text in an intro invite -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.92,"reasoning":"Calendar/link scaffolding, not a company mention."}
-Portfolio company mentioned as context in an admin/legal thread -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.85,"reasoning":"Administrative context, not an investment or outbound portfolio pitch signal."}
-Investor, design partner, or report author named inside an active deal/co-investment thread -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.3,"confidence":0.9,"reasoning":"Background entity inside a deal thread, not public reporting and not the investment target."}
-Market comparable or portfolio competitor named in a portfolio/company commentary email -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.3,"confidence":0.88,"reasoning":"Contextual background in an ordinary business thread, not newsletter or press reporting."}
-Verification-code, login, billing, or admin email from a vendor -> {"mention_type":"noise","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.95,"reasoning":"Operational artifact; not website traffic analytics and not deal flow."}
-Explicit website-visitor analytics row saying Company X visited medinavc.com -> {"mention_type":"web_analytics","direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.9,"reasoning":"Literal traffic analytics source row."}
+Auguria with intro + deck -> {"prospect_action":"create_prospect","prospect_company_name":"Auguria","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.9,"confidence":0.95,"reasoning":"Introduced as an investment opportunity with a deck."}
+Qunnect pitched to Mastercard -> {"prospect_action":"attach_existing_deal","prospect_company_name":null,"direction":"outbound","sector_key":"quantum","sector_confidence":0.9,"confidence":0.95,"reasoning":"Known portfolio/deal company being pitched outbound."}
+Mastercard in the Qunnect customer thread -> {"prospect_action":"record_context","prospect_company_name":null,"direction":"outbound","sector_key":"fintech","sector_confidence":0.75,"confidence":0.9,"reasoning":"Commercial customer target, useful context but not an investment prospect."}
+DIU sending ArmyFUZE deal flow -> {"prospect_action":"record_context","prospect_company_name":null,"direction":"inbound","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.9,"reasoning":"Government channel forwarding deal flow."}
+Sativa hempcrete in an ArmyFUZE list -> {"prospect_action":"create_prospect","prospect_company_name":"Sativa","direction":"inbound","sector_key":"materials_manufacturing","sector_confidence":0.85,"confidence":0.9,"reasoning":"Off-thesis but presented as an investment opportunity."}
+MRAI Global in scheduling/follow-up context with no investment ask -> {"prospect_action":"record_context","prospect_company_name":null,"direction":"internal","sector_key":"uncategorized","sector_confidence":0.25,"confidence":0.82,"reasoning":"Useful meeting evidence but not enough to create a prospect."}
+Apollo Lee named as a person or relationship participant -> {"prospect_action":"record_context","prospect_company_name":null,"direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.88,"reasoning":"Relationship context, not a prospect company mention."}
+Cedar Pine named around another company's commercial relationship -> {"prospect_action":"record_context","prospect_company_name":null,"direction":"internal","sector_key":"uncategorized","sector_confidence":0.3,"confidence":0.86,"reasoning":"Useful relationship context but not the investment target."}
+Anthropic in an NVCA fundraise newsletter -> {"prospect_action":"ignore","prospect_company_name":null,"direction":"news","sector_key":"ai_data","sector_confidence":0.85,"confidence":0.92,"reasoning":"Informational fundraise news only."}
+Verification-code, login, billing, or admin email from a vendor -> {"prospect_action":"ignore","prospect_company_name":null,"direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.95,"reasoning":"Operational artifact, not deal flow."}
+Explicit website-visitor analytics row saying Company X visited medinavc.com -> {"prospect_action":"ignore","prospect_company_name":null,"direction":"internal","sector_key":"uncategorized","sector_confidence":0.2,"confidence":0.9,"reasoning":"Website traffic analytics is not a prospect signal."}
 
 Output ONLY this JSON object, no prose, no code fences:
-{"mention_type":"...","direction":"...","sector_key":"...","sector_confidence":0.0,"confidence":0.0,"reasoning":"one short sentence"}
-confidence is your overall confidence in the mention_type + direction call, in [0,1].`;
+{"prospect_action":"...","prospect_company_name":null,"direction":"...","sector_key":"...","sector_confidence":0.0,"confidence":0.0,"reasoning":"one short sentence"}
+confidence is your overall confidence in the prospect_action + direction call, in [0,1].`;
+
+  const policyLens = input.policyLens
+    ? `\n\nPOLICY LENS FOR THIS QUARANTINED EVALUATION RUN:\n${input.policyLens.name} (${input.policyLens.id})\n${input.policyLens.instructions}\nUse this lens only to resolve borderline cases inside the schema. Do not violate the hard rules above.`
+    : '';
 
   const dynamicSystem = `KNOWN deals / portfolio (names + domains): ${knownDeals}
 KNOWN dealmakers / intro sources (names + domains): ${knownDealmakers}
 
 Hints (heuristic pre-filter and sector hints -- WEAK signals, not ground truth; override
-them when the content disagrees): ${prefilterHints} ${sectorHints}`;
+them when the content disagrees): ${prefilterHints} ${sectorHints}${policyLens}`;
 
   const system = `${staticSystem}\n\n${dynamicSystem}`;
   const systemForApi: ClaudeSystemPrompt = [
@@ -1546,12 +1788,16 @@ function parseProspectClassifierResponse(
   usage?: { input_tokens: number; output_tokens: number }
 ): LlmClassifierDecision {
   const parsed = parseJsonObject(raw, 'INVALID_PROSPECT_CLASSIFIER_JSON');
+  const legacyMentionType = parsed.mention_type ? parseMentionType(parsed.mention_type) : 'noise';
+  const prospectAction = parseProspectAction(parsed.prospect_action, legacyMentionType, parsed.signal_disposition);
   return {
-    mentionType: parseMentionType(parsed.mention_type),
+    mentionType: mentionTypeForAction(prospectAction),
     direction: parseDirection(parsed.direction),
     sectorKey: parseSectorKey(parsed.sector_key),
     sectorConfidence: parseUnitConfidence(parsed.sector_confidence, 'sector_confidence'),
     confidence: parseUnitConfidence(parsed.confidence, 'confidence'),
+    prospectAction,
+    prospectCompanyName: parseNullableClassifierString(parsed.prospect_company_name),
     reasoning: typeof parsed.reasoning === 'string' ? parsed.reasoning.slice(0, 500) : null,
     model,
     usage,
@@ -1568,7 +1814,7 @@ export async function callProspectClassifier(
   const model = prospectClassifierModel(env, input);
   const prompt = buildProspectClassifierPrompt(input);
   const result = await callClaudeWithUsage(
-    { system: prompt.systemForApi, user: prompt.user, max_tokens: 500, orgId: input.orgId, model, assistantPrefill: '{', temperature: 0 },
+    { system: prompt.systemForApi, user: prompt.user, max_tokens: 700, orgId: input.orgId, model, assistantPrefill: '{', temperature: 0 },
     'low',
     env
   );
@@ -1586,14 +1832,63 @@ async function classifyMention(
   const prefilter = buildClassifierPrefilter(item, mention, existing, env);
   const classifierInput = classifierInputForRuntime(item, mention, existing, prefilter, knownContext, orgId);
   const llm = await callProspectClassifier(classifierInput, env);
+  const createProspectVeto = prospectCreateVetoForMention({
+    prospectAction: llm.prospectAction,
+    companyName: mention.canonicalName,
+    rawMention: mention.raw,
+    rawExcerpt: classifierInput.rawExcerpt,
+    senderAndContext: classifierInput.senderAndContext,
+    llmReasoning: llm.reasoning,
+  });
   const portfolio = existing.relationshipStates.includes('current_portfolio') || existing.relationshipStates.includes('exited');
-  const directionUncertain =
+  let directionUncertain =
     prefilter.deterministicDirection !== 'unknown' &&
     prefilter.deterministicDirection !== llm.direction;
-  const effectiveConfidence = directionUncertain
+  let effectiveConfidence = directionUncertain
     ? Math.min(llm.confidence, 0.54)
     : llm.confidence;
-  const confidenceTier = confidenceTierFor(effectiveConfidence);
+
+  let possibleCompanyId: string | null = null;
+  let possibleDealId: string | null = null;
+  let linkedDealId: string | null = null;
+  let mentionType = llm.mentionType;
+  let prospectAction = llm.prospectAction;
+  let shouldCreateProspect = prospectAction === 'create_prospect';
+  let confidenceTier = confidenceTierFor(effectiveConfidence);
+  let provisional = confidenceTier === 'low' || directionUncertain;
+  let createProspectVetoApplied = false;
+  let createProspectVetoReason: string | null = null;
+  const exactDealDomainMatch = Boolean(existing.dealId && existing.matchStrength === 'domain');
+
+  if (exactDealDomainMatch && (prospectAction === 'create_prospect' || prospectAction === 'attach_existing_deal')) {
+    mentionType = 'known_deal';
+    prospectAction = 'attach_existing_deal';
+    shouldCreateProspect = false;
+    linkedDealId = existing.dealId;
+    provisional = false;
+  } else if (prospectAction === 'attach_existing_deal' && existing.dealId && existing.matchStrength !== 'name') {
+    mentionType = 'known_deal';
+    linkedDealId = existing.dealId;
+  } else if (prospectAction === 'attach_existing_deal') {
+    mentionType = 'noise';
+    prospectAction = 'record_context';
+  }
+
+  if (prospectAction === 'create_prospect' && createProspectVeto.applied) {
+    mentionType = 'noise';
+    prospectAction = 'ignore';
+    shouldCreateProspect = false;
+    possibleCompanyId = null;
+    possibleDealId = null;
+    linkedDealId = null;
+    provisional = false;
+    directionUncertain = false;
+    effectiveConfidence = createProspectVeto.confidence || 0.97;
+    createProspectVetoApplied = true;
+    createProspectVetoReason = createProspectVeto.reason;
+  }
+
+  confidenceTier = confidenceTierFor(effectiveConfidence);
   const sampling = productionSamplingDecision({
     orgId,
     item,
@@ -1603,22 +1898,7 @@ async function classifyMention(
     env,
   });
 
-  let possibleCompanyId: string | null = null;
-  let possibleDealId: string | null = null;
-  let linkedDealId: string | null = null;
-  let mentionType = llm.mentionType;
-  let provisional = confidenceTier === 'low' || directionUncertain;
-  const exactDealDomainMatch = Boolean(existing.dealId && existing.matchStrength === 'domain');
-
-  if (exactDealDomainMatch && (llm.mentionType === 'inbound_prospect' || llm.mentionType === 'known_deal')) {
-    mentionType = 'known_deal';
-    linkedDealId = existing.dealId;
-    provisional = false;
-  } else if (llm.mentionType === 'known_deal' && existing.dealId && existing.matchStrength !== 'name') {
-    linkedDealId = existing.dealId;
-  }
-
-  if (mentionType === 'inbound_prospect') {
+  if (shouldCreateProspect) {
     possibleCompanyId = existing.companyId;
     possibleDealId = existing.dealId && existing.matchStrength === 'name' ? existing.dealId : null;
     if (possibleDealId) provisional = true;
@@ -1628,6 +1908,9 @@ async function classifyMention(
     direction: llm.direction,
     directionUncertain,
     mentionType,
+    prospectAction,
+    shouldCreateProspect,
+    prospectCompanyName: shouldCreateProspect ? (llm.prospectCompanyName || mention.canonicalName) : null,
     confidence: effectiveConfidence,
     confidenceTier,
     sectorKey: llm.sectorKey,
@@ -1650,6 +1933,14 @@ async function classifyMention(
       llm_confidence: llm.confidence,
       effective_confidence: effectiveConfidence,
       llm_usage: llm.usage || null,
+      create_prospect_veto_applied: createProspectVetoApplied,
+      create_prospect_veto_reason: createProspectVetoReason,
+      original_llm_prospect_action: llm.prospectAction,
+      original_llm_reasoning: llm.reasoning,
+      prospect_action: prospectAction,
+      should_create_prospect: shouldCreateProspect,
+      prospect_company_name: shouldCreateProspect ? (llm.prospectCompanyName || mention.canonicalName) : null,
+      context_signal: prospectAction === 'record_context',
       prefilter,
       products: mention.products,
       list_fields: mention.listFields || null,
@@ -1663,7 +1954,8 @@ async function classifyMention(
         exact_deal_domain_match: exactDealDomainMatch,
         linked_deal_id: linkedDealId,
         weak_deal_match_held_as_soft_link: Boolean(possibleDealId),
-        original_llm_mention_type: llm.mentionType,
+        original_llm_prospect_action: llm.prospectAction,
+        derived_mention_type: mentionType,
       },
       confidence_tier_routing: {
         req: 'REQ-VAL-5',
@@ -1749,7 +2041,11 @@ async function upsertProspect(
     cls.directionUncertain ? 1 : 0,
     cls.possibleCompanyId,
     cls.possibleDealId,
-    JSON.stringify({ products: mention.products })
+    JSON.stringify({
+      products: mention.products,
+      prospect_action: cls.prospectAction,
+      prospect_company_name: cls.prospectCompanyName,
+    })
   ).run();
 
   const row = await env.D1.prepare(
@@ -2075,7 +2371,7 @@ async function refreshProspectAggregate(prospectId: string, orgId: string, env: 
   if (signals.length === 0) return;
   const strength = computeSignalStrength({
     signalCount: signals.length,
-    hasMeeting: signals.some(s => s.has_meeting === 1 || s.signal_kind === 'meeting' || s.signal_kind === 'call'),
+    hasMeeting: signals.some(s => s.has_meeting === 1 || s.signal_kind === 'meeting'),
     hasDeck: signals.some(s => s.has_deck === 1 || s.signal_kind === 'deck'),
     hasWarmIntro: signals.some(s => !!s.dealmaker_id || s.signal_kind === 'intro'),
     hasOnlyListEntries: signals.every(s => s.signal_kind === 'list_entry'),
@@ -2370,7 +2666,7 @@ export async function detectAndRecordProspectSignals(
         let prospectId: string | null = null;
         let dealmaker: { id: string | null; name: string | null } = { id: null, name: null };
 
-        if (cls.mentionType === 'inbound_prospect') {
+        if (cls.shouldCreateProspect) {
           if (cls.hasWarmIntro) {
             dealmaker = await upsertSenderDealmaker(item, orgId, occurredAt, env);
           }
@@ -3002,8 +3298,10 @@ export const __prospectIntelligenceTestHooks = {
   buildClassifierPrefilter,
   buildProspectClassifierPrompt,
   classifierInputForRuntime,
+  prospectCreateVetoForMention,
   parseProspectClassifierResponse,
   parseDirection,
   parseMentionType,
+  parseProspectAction,
   parseSectorKey,
 };

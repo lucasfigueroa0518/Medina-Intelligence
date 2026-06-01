@@ -18,7 +18,8 @@
     "test": "vitest run",
     "test:agent": "vitest run tests/agent-runtime.test.ts tests/agent-tools.test.ts tests/citations.test.ts tests/claude.test.ts tests/firm-relationship-state.test.ts",
     "test:max": "vitest run tests/max-set-builder.test.ts",
-    "prospect:spike": "tsx scripts/prospect-classifier-spike.ts"
+    "prospect:spike": "tsx scripts/prospect-classifier-spike.ts",
+    "prospect:universes": "tsx scripts/prospect-classifier-universe-spike.ts"
   },
   "dependencies": {
     "@e965/xlsx": "^0.20.3",
