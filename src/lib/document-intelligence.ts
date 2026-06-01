@@ -12,6 +12,7 @@ import { classifyByFilename } from './document-filename-classifier';
 import { enqueueDocumentEmbeddingRepair } from './document-embedding';
 import { isVerifiedContactCompanyAffiliation } from './contact-company-affiliation';
 import { safelyMaintainContactReadModels } from './contact-maintenance';
+import { CLAUDE_HAIKU_MODEL, resolveQualityExceptionClaudeModel } from './model-policy';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types
@@ -228,7 +229,7 @@ export async function classifyDocument(
 
   try {
     const response = await callClaude(
-      { system: CLASSIFIER_SYSTEM, user: userPrompt, max_tokens: 100, orgId, model: 'claude-haiku-4-5-20251001' },
+      { system: CLASSIFIER_SYSTEM, user: userPrompt, max_tokens: 100, orgId, model: CLAUDE_HAIKU_MODEL },
       'low',
       env
     );
@@ -807,7 +808,7 @@ export async function extractEntities(
   }
 
   const system = BASE_EXTRACTION_SYSTEM + (CATEGORY_HINTS[category] || '');
-  const model = isTabular ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-6';
+  const model = resolveQualityExceptionClaudeModel(env, 'document_extraction');
   const maxChars = isTabular ? 30000 : 20000;
   const truncated = text.length > maxChars ? text.slice(0, maxChars) + '\n[... truncated]' : text;
 
@@ -866,7 +867,7 @@ async function extractTabularChunked(
   for (let i = 0; i < chunks.length; i++) {
     try {
       const response = await callClaude(
-        { system, user: chunks[i], max_tokens: 4000, orgId, model: 'claude-haiku-4-5-20251001' },
+        { system, user: chunks[i], max_tokens: 4000, orgId, model: resolveQualityExceptionClaudeModel(env, 'document_extraction') },
         'high',
         env
       );

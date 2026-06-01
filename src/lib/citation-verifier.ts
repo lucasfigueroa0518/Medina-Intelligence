@@ -20,9 +20,10 @@
 import type { Env } from '../types/env';
 import type { CitationSource } from './citations';
 import { callClaude } from './claude';
+import { CLAUDE_HAIKU_MODEL } from './model-policy';
 
 const SAMPLE_RATE = 0.20;
-const JUDGE_MODEL = 'claude-haiku-4-5-20251001';
+const JUDGE_MODEL = CLAUDE_HAIKU_MODEL;
 const CLAIM_WINDOW_CHARS = 250;
 const MAX_CLAIMS_PER_MESSAGE = 8; // bound CF subrequest fan-out per the standing 10-step cap
 

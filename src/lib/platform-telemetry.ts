@@ -766,8 +766,8 @@ async function inspectPipelineHealth(ctx: AuthContext, input: PlatformTelemetryI
     recentNewsArticles,
     contactEnrichmentQueue,
     geminiBudgets,
+    anthropicBudgets,
     geminiEnrichmentCooldown,
-    geminiNewsCooldown,
     geminiLinkedinCooldown,
   ] = await Promise.all([
     getOrgSettings(ctx.orgId, env),
@@ -879,8 +879,16 @@ async function inspectPipelineHealth(ctx: AuthContext, input: PlatformTelemetryI
           AND upstream IN ('gemini', 'gemini_web_search')
         ORDER BY upstream ASC, bucket_window ASC, user_id ASC`
     ).bind(ctx.orgId).all<any>(),
+    env.D1.prepare(
+      `SELECT org_id, user_id, upstream, bucket_window, bucket_start, used, cap,
+              last_429_at, consecutive_429s, circuit_open_until,
+              cap_lowered_at, cap_lowered_count, updated_at
+         FROM upstream_budget_ledger
+        WHERE org_id = ?
+          AND upstream IN ('anthropic_haiku', 'anthropic_sonnet', 'anthropic_opus', 'claude')
+        ORDER BY upstream ASC, bucket_window ASC, user_id ASC`
+    ).bind(ctx.orgId).all<any>(),
     safeKvGet(env, `rate_limit:gemini_enrichment:${ctx.orgId}`, 'json'),
-    safeKvGet(env, `rate_limit:gemini_news:${ctx.orgId}`, 'json'),
     safeKvGet(env, `rate_limit:gemini_linkedin:${ctx.orgId}`, 'json'),
   ]);
 
@@ -978,13 +986,16 @@ async function inspectPipelineHealth(ctx: AuthContext, input: PlatformTelemetryI
         recent_articles: recentNewsArticles.results || [],
       },
       gemini: {
-        metric_definition: 'Gemini usage is durably visible through upstream_budget_ledger current budget windows plus source-specific KV cooldowns. Exact historical per-call logs are not stored; use enrichment/news run metadata as proxy workload evidence.',
+        metric_definition: 'Gemini usage is durably visible through upstream_budget_ledger current budget windows plus source-specific KV cooldowns. Current Gemini use is limited to contact enrichment, LinkedIn discovery, and company enrichment.',
         current_budget_windows: (geminiBudgets.results || []).map(summarizeBudgetRow),
         source_cooldowns: {
           gemini_enrichment: geminiEnrichmentCooldown || null,
-          gemini_news: geminiNewsCooldown || null,
           gemini_linkedin: geminiLinkedinCooldown || null,
         },
+      },
+      anthropic: {
+        metric_definition: 'Anthropic usage is split by model tier so Haiku, Sonnet, Opus, and legacy Claude fallback buckets are visible separately.',
+        current_budget_windows: (anthropicBudgets.results || []).map(summarizeBudgetRow),
       },
     },
     recent_sync_jobs: (syncRuns.results || []).map(summarizeSyncJob),

@@ -1,16 +1,11 @@
-// TRD §6.5 — Industry-wide news intelligence via Gemini web search (grounded).
+// TRD §6.5 — Industry-wide news intelligence via lightweight RSS/DDG search.
 import type { Env } from '../types/env';
 import type { ClassifiableItem } from '../types/interfaces';
-import { callGemini } from '../lib/gemini';
-import {
-  checkGeminiRateLimit,
-  checkEnrichmentRateLimit,
-  recordEnrichmentRateLimit,
-} from '../lib/rate-limit';
 import { getOrgSettings, chunkArray } from '../lib/helpers';
 import { hashShort } from '../lib/helpers';
 import { scoreArticle } from '../lib/news-scoring';
 import { assessNewsQuality } from '../lib/news-quality';
+import { lightweightWebSearchSources } from '../lib/agent-web-search';
 
 interface NewsArticle {
   title: string;
@@ -84,53 +79,25 @@ async function runSearchQuery(
   const cached = await env.KV.get<NewsArticle[]>(cacheKey, 'json');
   if (cached) return cached;
 
-  const newsPrompt = `Use Google Search to find recent news about: ${searchQuery.query}
-
-Find 3-5 relevant articles from the past 30 days. For each article include:
-- title
-- source (publication name)
-- date (ISO 8601)
-- url (article URL)
-- summary (2 sentences on key points)
-
-Focus on: funding announcements, partnerships, product launches, leadership changes, acquisitions, regulatory developments, market analysis. Ignore purely promotional press releases.
-
-Return ONLY a JSON array:
-[{"title": "...", "source": "...", "date": "...", "url": "...", "summary": "..."}]
-
-If no recent news found, return: []`;
-
-  const { text } = await callGemini(
-    {
-      system:
-        'You are a financial news researcher. Use Google Search grounding to find real, recent articles. Return only a valid JSON array. No preamble, no markdown, no code fences.',
-      user: newsPrompt,
-      max_tokens: 2000,
-      orgId,
-    },
-    'low',
-    env
-  );
-
-  try {
-    const cleaned = text
-      .trim()
-      .replace(/```json\s*/g, '')
-      .replace(/```/g, '')
-      .trim();
-    const match = cleaned.match(/\[[\s\S]*\]/);
-    const articles: NewsArticle[] = JSON.parse(match ? match[0] : cleaned);
-    if (!Array.isArray(articles)) return [];
-    const result = articles.map(a => ({
-      ...a,
-      url: a.url && !a.url.includes('vertexaisearch.cloud.google.com') ? a.url : undefined,
+  const sources = await lightweightWebSearchSources(searchQuery.query, 5);
+  const result = sources.map(source => {
+    let host = '';
+    try {
+      host = new URL(source.uri).hostname.replace(/^www\./, '');
+    } catch {
+      host = source.provider || 'web';
+    }
+    return {
+      title: source.title,
+      source: source.publisher || host,
+      date: source.published_at || '',
+      summary: source.snippet || '',
+      url: source.uri,
       relevance_tag: searchQuery.tag,
-    }));
-    await env.KV.put(cacheKey, JSON.stringify(result), { expirationTtl: 21600 });
-    return result;
-  } catch {
-    return [];
-  }
+    };
+  });
+  await env.KV.put(cacheKey, JSON.stringify(result), { expirationTtl: 21600 });
+  return result;
 }
 
 export interface NewsFetchTelemetry {
@@ -153,9 +120,9 @@ interface CompanyRow {
   description: string | null;
 }
 
-// Audit 2026-04-28: the prior implementation queried up to 20 companies and
-// fired ~5 Gemini calls per company SERIALLY. With 187 active companies and
-// each call taking 2–5s, the step routinely blew past 300s. The new design:
+// Audit 2026-04-28: the historical implementation queried up to 20 companies
+// and fired multiple model-grounded searches per company. The lightweight
+// design keeps the same workload controls while using RSS/DDG fetches:
 //
 //   1. Staleness filter on companies.last_news_fetched_at — only fetch
 //      companies untouched in the last 24h. Hourly cron + ~25/run covers the
@@ -171,17 +138,8 @@ interface CompanyRow {
 const MAX_PER_RUN = 25;
 const PER_COMPANY_BUDGET_MS = 25_000;
 
-// Phase 3.2.1 (2026-05-04): chunked dispatch to slip below Google
-// Gemini's per-second burst protection. Phase 3.2 surfaced that
-// firing 25 callGemini in parallel produced ~24× HTTP 429 in a
-// ~5-second window — the ledger circuit breaker tripped 8 times in
-// one hour and Gemini's cap drifted from 500 → 89 (~83% reduction)
-// over two hours of chronic pressure (Terminal 5 forensic 2026-05-04).
-// Chunking 5-wide with a 1.5s inter-batch sleep keeps the effective
-// per-second rate at ~5 calls/sec in worst-case synchronization
-// (5 companies × 1 query each in a tight burst), well below Google's
-// observed tolerance. fetchOneCompany's internal sequential query
-// loop continues unchanged inside each batch.
+// Keep company-level search chunked and paced so RSS/DDG fetches do not
+// synchronize into a noisy burst.
 const NEWS_CHUNK_SIZE = 5;
 const NEWS_INTER_BATCH_DELAY_MS = 1500;
 
@@ -223,15 +181,10 @@ export async function fetchNewsForActiveCompanies(
     return { items: [], telemetry: { ...zero, step_duration_ms: Date.now() - stepStart } };
   }
 
-  // Phase 3.2.1: chunked dispatch with inter-batch pacing. Replaces the
-  // prior 25-wide Promise.allSettled which triggered Google's per-second
-  // burst protection and drove chronic Gemini cap drift (see comment
-  // above). Per batch: NEWS_CHUNK_SIZE companies fire concurrently;
-  // sleep NEWS_INTER_BATCH_DELAY_MS between batches; aggregate results
-  // identically to before. fetchOneCompany semantics unchanged — one
-  // slow / failing company in a batch doesn't poison the batch
-  // (Promise.allSettled), and a slow batch doesn't poison subsequent
-  // batches (each batch awaits its own settle).
+  // Chunked dispatch with inter-batch pacing keeps the cheap search path
+  // friendly to RSS/DDG endpoints. One slow / failing company in a batch
+  // cannot poison the batch, and a slow batch cannot poison subsequent
+  // batches.
   const chunks = chunkArray(companies.results, NEWS_CHUNK_SIZE);
   const items: ClassifiableItem[] = [];
   let succeeded = 0;
@@ -250,15 +203,14 @@ export async function fetchNewsForActiveCompanies(
         failed++;
       }
     }
-    // Pace between batches to slip past Google's per-second burst
-    // protection. Skip after the last batch — no work follows.
+    // Pace between batches. Skip after the last batch — no work follows.
     if (batchIdx < chunks.length - 1) {
       await new Promise(resolve => setTimeout(resolve, NEWS_INTER_BATCH_DELAY_MS));
     }
   }
 
   // Stamp every attempted company — successes AND failures. Without this, a
-  // company whose Gemini calls always fail would re-enter the staleness pool
+  // company whose searches always fail would re-enter the staleness pool
   // every run forever.
   const attemptedIds = companies.results.map(c => c.id);
   if (attemptedIds.length > 0) {
@@ -292,14 +244,6 @@ async function fetchOneCompany(
   const seenUrls = new Set<string>();
 
   try {
-    if (!(await checkGeminiRateLimit(env, orgId, 'low'))) {
-      await recordEnrichmentRateLimit('gemini_news', orgId, env);
-      return { ok: false, items };
-    }
-    if (!(await checkEnrichmentRateLimit('gemini_news', orgId, env))) {
-      return { ok: false, items };
-    }
-
     const techFocus = company.description ? company.description.substring(0, 100) : null;
     const queries = buildSearchQueries(company.name, company.sector, techFocus);
 
@@ -312,8 +256,6 @@ async function fetchOneCompany(
         );
         break;
       }
-      if (!(await checkGeminiRateLimit(env, orgId, 'low'))) break;
-
       try {
         const articles = await runSearchQuery(searchQuery, orgId, env);
 

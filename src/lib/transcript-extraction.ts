@@ -1,5 +1,6 @@
 import type { Env } from '../types/env';
 import { callClaude } from './claude';
+import { resolveQualityExceptionClaudeModel } from './model-policy';
 import { truncateToTokens } from './tokens';
 import { hashShort } from './helpers';
 import {
@@ -109,6 +110,7 @@ ${truncateToTokens(transcriptText, 6000)}`;
       user: userPrompt,
       max_tokens: 3000,
       orgId,
+      model: resolveQualityExceptionClaudeModel(env, 'transcript_extraction'),
     },
     'low',
     env
@@ -142,6 +144,7 @@ ${truncateToTokens(transcriptText, 5000)}`;
       user: userPrompt,
       max_tokens: 1500,
       orgId,
+      model: resolveQualityExceptionClaudeModel(env, 'transcript_extraction'),
     },
     'low',
     env

@@ -1,4 +1,6 @@
-export const MAX_MODE_MODEL = 'claude-opus-4-7';
+import { CLAUDE_OPUS_MODEL } from './model-policy';
+
+export const MAX_MODE_MODEL = CLAUDE_OPUS_MODEL;
 
 export const MAX_MODE_LIMITS = {
   recallDefault: 75,

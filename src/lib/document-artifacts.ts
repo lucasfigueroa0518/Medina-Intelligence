@@ -10,6 +10,7 @@ import { callClaude } from './claude';
 import { truncateToTokens } from './tokens';
 import { enqueueWork } from './work-queue';
 import { webSearch } from './agent-web-search';
+import { resolveQualityExceptionClaudeModel } from './model-policy';
 import {
   MEDINA_DECK_ENGINE_VERSION,
   buildMedinaDeckStudio,
@@ -1333,7 +1334,13 @@ ${JSON.stringify(content || {}, null, 2).slice(0, 18000)}
 
 Source document context:
 ${sourceContext || '(none)'}`;
-  const raw = await callClaude({ system, user, max_tokens: 7000, orgId: ctx.orgId }, 'low', env).catch(() => '');
+  const raw = await callClaude({
+    system,
+    user,
+    max_tokens: 7000,
+    orgId: ctx.orgId,
+    model: resolveQualityExceptionClaudeModel(env, 'artifact_planning'),
+  }, 'low', env).catch(() => '');
   const parsed = parseJsonObject(raw);
   return parsed || defaultArtifactContent(kind, title, content);
 }
@@ -1375,7 +1382,13 @@ ${JSON.stringify(content || {}, null, 2).slice(0, 18000)}
 
 Source document context:
 ${sourceContext || '(none)'}`;
-  const raw = await callClaude({ system, user, max_tokens: 7000, orgId: ctx.orgId }, 'low', env).catch(() => '');
+  const raw = await callClaude({
+    system,
+    user,
+    max_tokens: 7000,
+    orgId: ctx.orgId,
+    model: resolveQualityExceptionClaudeModel(env, 'artifact_planning'),
+  }, 'low', env).catch(() => '');
   return parseJsonObject(raw) || defaultArtifactContent(kind, title, content);
 }
 
@@ -1409,7 +1422,13 @@ ${JSON.stringify(content || {}, null, 2).slice(0, 18000)}
 
 Source document context:
 ${sourceContext || '(none)'}`;
-  const raw = await callClaude({ system, user, max_tokens: 7000, orgId: ctx.orgId }, 'high', env).catch(() => '');
+  const raw = await callClaude({
+    system,
+    user,
+    max_tokens: 7000,
+    orgId: ctx.orgId,
+    model: resolveQualityExceptionClaudeModel(env, 'artifact_planning'),
+  }, 'high', env).catch(() => '');
   const planned = parseJsonObject(raw);
   if (!planned || asArray(planned?.slides).length < 4) return content;
   return planned;
@@ -2454,7 +2473,13 @@ ${qa.slideFindings.map(f => `- ${f.severity}: ${f.slideId}: ${f.issue} -> ${f.re
 
 Current deck JSON:
 ${JSON.stringify(content || {}, null, 2).slice(0, 16000)}`;
-  const raw = await callClaude({ system, user, max_tokens: 4500, orgId: ctx.orgId }, 'low', env).catch(() => '');
+  const raw = await callClaude({
+    system,
+    user,
+    max_tokens: 4500,
+    orgId: ctx.orgId,
+    model: resolveQualityExceptionClaudeModel(env, 'artifact_planning'),
+  }, 'low', env).catch(() => '');
   const patch = parseJsonObject(raw);
   if (!patch || !Array.isArray(patch.slides)) return null;
 
@@ -5898,7 +5923,13 @@ Instructions: ${String(input.instructions || '').slice(0, 4000)}
 SOURCE DOCUMENT (${sourceDoc.title || sourceDoc.file_name}):
 ${sourceForModel}`;
 
-  let structured = parseJsonObject(await callClaude({ system, user, max_tokens: 3500, orgId: ctx.orgId }, 'low', env));
+  let structured = parseJsonObject(await callClaude({
+    system,
+    user,
+    max_tokens: 3500,
+    orgId: ctx.orgId,
+    model: resolveQualityExceptionClaudeModel(env, 'artifact_planning'),
+  }, 'low', env));
   if (!structured) {
     structured = {
       sections: [{

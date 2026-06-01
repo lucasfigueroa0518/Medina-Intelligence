@@ -54,7 +54,8 @@ import {
   markAgentRunCancelRequested,
   updateAgentRunStatus,
 } from '../lib/agent-runs';
-import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from '../lib/max-mode';
+import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from '../lib/max-mode';
+import { CLAUDE_HAIKU_MODEL, resolveMartyMaxModel, resolveMartyNormalModel } from '../lib/model-policy';
 import {
   buildLiveMartyRuntimeFingerprint,
   buildMartyBaseSystemPrompt,
@@ -3200,7 +3201,9 @@ export async function queryAgent(
       {
         system: systemPrompt,
         messages,
-        model: deepDive ? (env.MARTY_MAX_MODEL || MAX_MODE_MODEL) : undefined,
+        model: deepDive ? resolveMartyMaxModel(env) : resolveMartyNormalModel(env),
+        orgId: ctx.orgId,
+        priority: 'high',
         max_tokens: deepDive ? MAX_MODE_LIMITS.outputTokens : NORMAL_MODE_LIMITS.outputTokens,
         fallbackMaxTokens: deepDive ? MAX_MODE_LIMITS.fallbackOutputTokens : undefined,
         maxIterations: deepDive ? MAX_MODE_LIMITS.toolIterations : NORMAL_MODE_LIMITS.toolIterations,
@@ -3477,7 +3480,7 @@ export async function queryAgent(
       if (turnIndex === 0 && !session.title) {
         try {
           const title = await callClaude(
-            { system: SESSION_TITLE_PROMPT, user: query, max_tokens: 20, orgId: ctx.orgId, model: 'claude-haiku-4-5-20251001' },
+            { system: SESSION_TITLE_PROMPT, user: query, max_tokens: 20, orgId: ctx.orgId, model: CLAUDE_HAIKU_MODEL },
             'low',
             env
           );

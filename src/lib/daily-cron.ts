@@ -18,6 +18,7 @@ import { enqueueDueContactEnrichment } from './contact-enrichment-queue';
 import { embedDocumentItem as embedDocumentItemForRepair } from './document-embedding';
 import { repairContactSearchIndexDrift } from './contact-search';
 import { repairContactDetailReadModelDrift } from './contact-detail-read-model';
+import { CLAUDE_HAIKU_MODEL } from './model-policy';
 
 // Mirrors the visibility logic in classification.ts:233 — emails are always
 // 'private' regardless of source-side hint, transcripts/manual notes are
@@ -491,7 +492,7 @@ Summary: ${article.summary?.slice(0, 2500) || ''}`;
   let raw: string;
   try {
     raw = await callClaude(
-      { system, user, max_tokens: 500, orgId, model: 'claude-haiku-4-5-20251001' },
+      { system, user, max_tokens: 500, orgId, model: CLAUDE_HAIKU_MODEL },
       'low',
       env
     );

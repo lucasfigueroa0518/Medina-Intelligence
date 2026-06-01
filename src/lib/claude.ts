@@ -2,6 +2,11 @@ import type { Env } from '../types/env';
 import { checkClaudeRateLimit } from './rate-limit';
 import { recordBudgetSuccess, recordRateLimit } from './upstream-budget';
 import { NORMAL_MODE_LIMITS } from './max-mode';
+import {
+  budgetUpstreamForClaudeModel,
+  CLAUDE_HAIKU_MODEL,
+  resolveDefaultClaudeModel,
+} from './model-policy';
 
 interface ClaudeResponse {
   content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
@@ -10,7 +15,7 @@ interface ClaudeResponse {
 }
 
 const ANTHROPIC_VERSION = '2023-06-01';
-export const CLAUDE_MODEL = 'claude-sonnet-4-6';
+export const CLAUDE_MODEL = CLAUDE_HAIKU_MODEL;
 const MODEL_TOOL_RESULT_JSON_LIMIT = 80_000;
 const MODEL_TOOL_RESULT_ARRAY_LIMIT = 40;
 const MODEL_TOOL_RESULT_STRING_LIMIT = 2_400;
@@ -152,7 +157,9 @@ export async function callClaude(
   env: Env
 ): Promise<string> {
   const orgId = params.orgId || 'system';
-  if (!(await checkClaudeRateLimit(env, orgId, priority))) {
+  const model = params.model || resolveDefaultClaudeModel();
+  const budgetSource = budgetUpstreamForClaudeModel(model);
+  if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
     throw new Error('CLAUDE_RATE_LIMITED');
   }
 
@@ -160,7 +167,7 @@ export async function callClaude(
     method: 'POST',
     headers: buildGatewayHeaders(env),
     body: JSON.stringify({
-      model: params.model || CLAUDE_MODEL,
+      model,
       max_tokens: params.max_tokens,
       system: params.system,
       messages: [{ role: 'user', content: params.user }],
@@ -174,12 +181,12 @@ export async function callClaude(
       // 3 consecutive 429s → cap drops 10%, circuit opens 30 min.
       // Pre-3.3 the KV-backed limiter could only observe its own
       // counter; the ledger gives us upstream-driven evidence.
-      await recordRateLimit(env, orgId, null, 'claude', 'minute');
+      await recordRateLimit(env, orgId, null, budgetSource, 'minute');
       throw new Error('CLAUDE_RATE_LIMITED');
     }
     throw new Error(`Claude API error ${response.status}: ${errorBody}`);
   }
-  await recordBudgetSuccess(env, orgId, null, 'claude', 'minute');
+  await recordBudgetSuccess(env, orgId, null, budgetSource, 'minute');
 
   const data = (await response.json()) as ClaudeResponse;
   const textBlock = data.content.find(b => b.type === 'text');
@@ -234,6 +241,8 @@ export async function callClaudeStreaming(
     messages: Array<{ role: 'user' | 'assistant'; content: any }>;
     max_tokens: number;
     model?: string;
+    orgId?: string;
+    priority?: 'high' | 'low';
     fallbackMaxTokens?: number;
     maxIterations?: number;
     tools?: ToolDefinition[];
@@ -259,6 +268,10 @@ export async function callClaudeStreaming(
     let iterations = 0;
     const maxIterations = params.maxIterations ?? NORMAL_MODE_LIMITS.toolIterations;
     let activeMaxTokens = params.max_tokens;
+    const orgId = params.orgId || 'system';
+    const priority = params.priority || 'high';
+    const model = params.model || resolveDefaultClaudeModel();
+    const budgetSource = budgetUpstreamForClaudeModel(model);
     let usedMaxTokenFallback = false;
     let usedProviderContextFallback = false;
     if (params.preludeEvents?.length) {
@@ -279,7 +292,7 @@ export async function callClaudeStreaming(
       console.log(`[claude-stream] iteration ${iterations}/${maxIterations}, messages: ${messages.length}`);
 
       const buildBody = (maxTokens: number): any => ({
-        model: params.model || CLAUDE_MODEL,
+        model,
         max_tokens: maxTokens,
         stream: true,
         system: params.system,
@@ -290,6 +303,18 @@ export async function callClaudeStreaming(
 
       let response: Response;
       try {
+        if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
+          await emit({
+            type: 'model_error',
+            provider: 'claude',
+            status: 429,
+            retryable: true,
+          });
+          await emit({
+            text: '\n\nMARTy hit a model budget limit. Retry is safe.',
+          });
+          break;
+        }
         response = await fetch(buildGatewayUrl(env), {
           method: 'POST',
           headers: buildGatewayHeaders(env),
@@ -309,6 +334,9 @@ export async function callClaudeStreaming(
       let finalErrorBody: string | null = null;
       if (!response.ok) {
         finalErrorBody = await response.text();
+        if (response.status === 429) {
+          await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+        }
         if (
           params.fallbackMaxTokens &&
           !usedMaxTokenFallback &&
@@ -325,6 +353,18 @@ export async function callClaudeStreaming(
           const fallbackBody = buildBody(activeMaxTokens);
           if (params.tools?.length) fallbackBody.tools = params.tools;
           try {
+            if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
+              await emit({
+                type: 'model_error',
+                provider: 'claude',
+                status: 429,
+                retryable: true,
+              });
+              await emit({
+                text: '\n\nMARTy hit a model budget limit. Retry is safe.',
+              });
+              break;
+            }
             response = await fetch(buildGatewayUrl(env), {
               method: 'POST',
               headers: buildGatewayHeaders(env),
@@ -333,6 +373,9 @@ export async function callClaudeStreaming(
             });
             if (!response.ok) {
               finalErrorBody = await response.text();
+              if (response.status === 429) {
+                await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+              }
             } else {
               finalErrorBody = null;
             }
@@ -372,6 +415,7 @@ export async function callClaudeStreaming(
         });
         break;
       }
+      await recordBudgetSuccess(env, orgId, null, budgetSource, 'minute');
       if (!response.body) break;
 
       const decoder = new TextDecoder();

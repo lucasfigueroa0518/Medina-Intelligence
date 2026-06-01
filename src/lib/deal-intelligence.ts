@@ -29,12 +29,13 @@ import { callClaude } from './claude';
 import { canReadConversationContent, getSharingFlags, parseParticipantUserIds } from './helpers';
 import { readableConversationFingerprint } from './email-derived-visibility';
 import { cleanIntelligenceBrief } from './intelligence-briefing';
+import { CLAUDE_HAIKU_MODEL } from './model-policy';
 
 // Tunables. Stored as constants so behavior is auditable.
 export const STALENESS_WINDOW_MS = 60 * 60 * 1000;            // 1h per locked freshness contract
 const MAX_CONVERSATIONS_FOR_PROMPT = 30;                       // recent-first; older fall back to summarization
 const MAX_BODY_PREVIEW_CHARS = 1500;                           // per-conversation cap; assembles to ~30 × 1500 ≈ 45kB ≤ ~10k tokens
-const COMPUTE_MODEL = 'claude-haiku-4-5-20251001';             // locked: Haiku 4.5, NOT Sonnet/Opus
+const COMPUTE_MODEL = CLAUDE_HAIKU_MODEL;                      // locked: Haiku 4.5, NOT Sonnet/Opus
 const HOURLY_BATCH_LIMIT = 50;                                  // rows refreshed per hourly cron tick
 
 export type Sentiment = 'positive' | 'neutral' | 'negative' | null;

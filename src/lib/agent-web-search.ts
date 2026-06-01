@@ -1,20 +1,21 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
-import { callGemini } from './gemini';
 
-interface WebSearchSource {
+export interface WebSearchSource {
   title: string;
   uri: string;
   snippet?: string;
+  publisher?: string;
+  published_at?: string;
   provider?: 'duckduckgo' | 'google_news';
 }
 
-function clampResultLimit(numResults?: number): number {
+export function clampResultLimit(numResults?: number): number {
   if (!Number.isFinite(numResults)) return 5;
   return Math.max(1, Math.min(10, Math.floor(numResults || 5)));
 }
 
-function decodeHtml(value: string): string {
+export function decodeHtml(value: string): string {
   return value
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
@@ -27,12 +28,13 @@ function decodeHtml(value: string): string {
     .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(parseInt(code, 16)));
 }
 
-function stripHtml(value: string): string {
+export function stripHtml(value: string): string {
   return decodeHtml(value)
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
+    .replace(/\s+([.,;:!?])/g, '$1')
     .trim();
 }
 
@@ -65,7 +67,7 @@ async function fetchSearchText(url: string, accept: string): Promise<string> {
   return await res.text();
 }
 
-async function searchDuckDuckGo(query: string, limit: number): Promise<WebSearchSource[]> {
+export async function searchDuckDuckGo(query: string, limit: number): Promise<WebSearchSource[]> {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
   const html = await fetchSearchText(url, 'text/html,application/xhtml+xml');
   const blocks = html.match(/<div class="result[\s\S]*?(?=<div class="result|<\/body>)/gi) || [];
@@ -95,7 +97,7 @@ async function searchDuckDuckGo(query: string, limit: number): Promise<WebSearch
   return hits;
 }
 
-async function searchGoogleNewsRss(query: string, limit: number): Promise<WebSearchSource[]> {
+export async function searchGoogleNewsRss(query: string, limit: number): Promise<WebSearchSource[]> {
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
   const xml = await fetchSearchText(url, 'application/rss+xml,application/xml,text/xml');
   const itemBlocks = xml.match(/<item>[\s\S]*?<\/item>/gi) || [];
@@ -105,8 +107,10 @@ async function searchGoogleNewsRss(query: string, limit: number): Promise<WebSea
     const title = stripHtml((item.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i)
       || item.match(/<title>([\s\S]*?)<\/title>/i))?.[1] || '');
     const uri = stripHtml((item.match(/<link>([\s\S]*?)<\/link>/i)?.[1] || '').trim());
-    const source = stripHtml((item.match(/<source[^>]*>([\s\S]*?)<\/source>/i)?.[1] || '').trim());
+    const sourceMatch = item.match(/<source[^>]*>([\s\S]*?)<\/source>/i);
+    const source = stripHtml((sourceMatch?.[1] || '').trim());
     const pubDate = stripHtml((item.match(/<pubDate>([\s\S]*?)<\/pubDate>/i)?.[1] || '').trim());
+    const parsedPubDate = pubDate ? new Date(pubDate) : null;
 
     if (!title || !uri) continue;
 
@@ -114,6 +118,8 @@ async function searchGoogleNewsRss(query: string, limit: number): Promise<WebSea
       title,
       uri,
       snippet: [source, pubDate].filter(Boolean).join(' · ') || undefined,
+      publisher: source || undefined,
+      published_at: parsedPubDate && !Number.isNaN(parsedPubDate.getTime()) ? parsedPubDate.toISOString() : undefined,
       provider: 'google_news',
     });
 
@@ -138,27 +144,31 @@ function dedupeSources(sources: WebSearchSource[], limit: number): WebSearchSour
   return deduped;
 }
 
-export async function fallbackWebSearch(query: string, numResults?: number): Promise<any> {
+export async function lightweightWebSearchSources(query: string, numResults?: number): Promise<WebSearchSource[]> {
   const limit = clampResultLimit(numResults);
   const settled = await Promise.allSettled([
     searchGoogleNewsRss(query, limit),
     searchDuckDuckGo(query, limit),
   ]);
 
-  const sources = dedupeSources(
+  return dedupeSources(
     settled.flatMap((result) => result.status === 'fulfilled' ? result.value : []),
     limit
   );
+}
+
+export async function fallbackWebSearch(query: string, numResults?: number): Promise<any> {
+  const sources = await lightweightWebSearchSources(query, numResults);
 
   if (!sources.length) {
     return {
-      error: 'MARTy could not reach live web search right now after trying the primary and fallback search providers. Internal CRM retrieval still works; try live web again in a few minutes.',
+      error: 'MARTy could not reach RSS/DDG web search right now. Internal CRM retrieval still works; try live web again in a few minutes.',
       query,
     };
   }
 
   const summary = [
-    'Fallback web/news search results:',
+    'RSS/DDG web/news search results:',
     '',
     ...sources.map((source, index) => {
       const detail = source.snippet ? ` — ${source.snippet}` : '';
@@ -168,50 +178,26 @@ export async function fallbackWebSearch(query: string, numResults?: number): Pro
 
   return {
     summary,
-    sources: sources.map(({ title, uri }) => ({ title, uri })),
+    sources: sources.map(({ title, uri, snippet, publisher, published_at, provider }) => ({
+      title,
+      uri,
+      snippet,
+      publisher,
+      published_at,
+      provider,
+    })),
     query,
-    search_mode: 'fallback',
+    search_mode: 'rss_ddg',
   };
 }
 
 export async function webSearch(
   query: string,
   numResults: number | undefined,
-  ctx: AuthContext,
-  env: Env
+  _ctx: AuthContext,
+  _env: Env
 ): Promise<any> {
-  try {
-    const result = await callGemini(
-      {
-        system: 'You are a research assistant. Search the web for the given query and provide a comprehensive summary of the top results. Include key facts, dates, and sources. Be concise and factual.',
-        user: query,
-        max_tokens: 2000,
-        orgId: ctx.orgId,
-        userId: ctx.userId,
-        budgetSource: 'gemini_web_search',
-        grounding: true,
-        temperature: 0.3,
-      },
-      'low',
-      env
-    );
-
-    return {
-      summary: result.text,
-      sources: result.sources.slice(0, clampResultLimit(numResults)),
-      query,
-    };
-  } catch (e: any) {
-    if (e.message?.includes('GEMINI_RATE_LIMITED')) {
-      return fallbackWebSearch(query, numResults);
-    }
-    if (e.message?.includes('GEMINI_CONFIG_ERROR')) {
-      return fallbackWebSearch(query, numResults);
-    }
-    const fallback = await fallbackWebSearch(query, numResults);
-    if (!fallback.error) return fallback;
-    return { error: `MARTy web search failed: ${e.message}`, query };
-  }
+  return fallbackWebSearch(query, numResults);
 }
 
 export async function readUrl(url: string): Promise<any> {

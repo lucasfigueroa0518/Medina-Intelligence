@@ -11,9 +11,9 @@ interface ClaudeRateState {
 // upstream_budget_ledger. Caller signature unchanged so all 26+ existing
 // call sites keep working without edits. Same migration shape as Graph
 // (3.1) and Gemini (3.2):
-//   • The ledger replaces the KV counter for the rate-limit-window
-//     accounting. The cap is sourced from DEFAULT_CAPS.claude.minute
-//     (= 60, matching the existing CLAUDE_MAX_RPM env-var default).
+//   • The ledger replaces the KV counter for rate-limit-window accounting.
+//     Anthropic calls now pass a model-specific upstream bucket when known
+//     (Haiku/Sonnet/Opus), with `claude` kept as the legacy fallback bucket.
 //   • Priority is preserved via cap-math at the call site: 'high' uses
 //     full cap, 'low' uses cap minus a 1/3 reserve — same semantics as
 //     the prior KV implementation.
@@ -26,22 +26,21 @@ interface ClaudeRateState {
 //     breaker closes that gap.
 //   • The previous KV keys (`claude_rate:<orgId>`) are abandoned. TTL
 //     was 120s so they expire naturally within ~2 min after deploy.
-//   • Note: callClaudeStreaming intentionally NOT routed through this
-//     wrapper today (pre-existing gap, not a Phase 3.3 regression).
-//     Future phase can fold streaming through the same ledger.
+//   • Streaming and non-streaming Claude calls both route through this helper.
 export async function checkClaudeRateLimit(
   env: Env,
   orgId: string,
-  priority: 'high' | 'low'
+  priority: 'high' | 'low',
+  upstream: Extract<Upstream, 'anthropic_haiku' | 'anthropic_sonnet' | 'anthropic_opus' | 'claude'> = 'claude'
 ): Promise<boolean> {
-  const result = await checkBudget(env, orgId, null, 'claude', 'minute');
+  const result = await checkBudget(env, orgId, null, upstream, 'minute');
   if (result.decision === 'circuit_open') return false;
   const reserve = Math.floor(result.cap / 3);
   const effectiveCap = priority === 'high' ? result.cap : result.cap - reserve;
   if (result.used >= effectiveCap) return false;
   // Reserve budget now, but do not reset upstream 429 state until the
   // Claude wrapper observes a real 2xx response.
-  await reserveBudget(env, orgId, null, 'claude', 'minute');
+  await reserveBudget(env, orgId, null, upstream, 'minute');
   return true;
 }
 

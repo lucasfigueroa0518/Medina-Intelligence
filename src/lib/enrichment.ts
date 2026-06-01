@@ -29,6 +29,7 @@ import { cleanIntelligenceBrief } from './intelligence-briefing';
 import { proposeEntityUpdate, proposeMultipleUpdates } from './progressive-enrichment';
 import { jaroWinkler } from './dedup';
 import { isVerifiedContactCompanyAffiliation } from './contact-company-affiliation';
+import { CLAUDE_HAIKU_MODEL } from './model-policy';
 
 // Returns true if two company names plausibly refer to the same entity:
 // exact match, high Jaro-Winkler similarity (catches typos/spellings), or
@@ -998,7 +999,7 @@ Rules:
   let raw: string;
   try {
     raw = await callClaude(
-      { system, user, max_tokens: 200, orgId, model: 'claude-haiku-4-5-20251001' },
+      { system, user, max_tokens: 200, orgId, model: CLAUDE_HAIKU_MODEL },
       'low',
       env
     );
@@ -1121,7 +1122,7 @@ Rules:
   let raw: string;
   try {
     raw = await callClaude(
-      { system, user, max_tokens: 800, orgId, model: 'claude-haiku-4-5-20251001' },
+      { system, user, max_tokens: 800, orgId, model: CLAUDE_HAIKU_MODEL },
       'low',
       env
     );

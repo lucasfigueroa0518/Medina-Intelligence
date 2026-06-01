@@ -42,6 +42,7 @@ export interface Env {
   MARTY_LAB_OPUS_MODEL?: string;
   MARTY_LAB_HAIKU_MODEL?: string;
   MARTY_LAB_CODE_PATCH_MODEL?: string;
+  MARTY_NORMAL_MODEL?: string;
   MARTY_MAX_MODEL?: string;
   MARTY_RUNTIME_GIT_SHA?: string;
   // Premium deck rendering is orchestrated by the Worker but executed by a

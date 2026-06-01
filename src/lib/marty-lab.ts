@@ -12,6 +12,7 @@ import {
   productionRuntimeMatches,
   type MartyRuntimeFingerprint,
 } from './marty-runtime';
+import { CLAUDE_HAIKU_MODEL, CLAUDE_OPUS_MODEL } from './model-policy';
 
 export type MartyLabRunStatus = 'queued' | 'configured' | 'running' | 'completed' | 'cancelled' | 'failed';
 export type MartyLabExperimentStatus = 'queued' | 'running' | 'graded' | 'blocked' | 'failed' | 'cancelled';
@@ -78,10 +79,10 @@ function martyLabApprovalRuleSummary(): string {
   return `Approval is baseline-relative and evidence-weighted: each experiment runs exactly ${MARTY_LAB_VALIDATION_CONVERSATIONS} validation conversations, then decides from the available evidence; automatic acceptance needs at least ${MARTY_LAB_MIN_DECISION_VALID_SAMPLES}/${MARTY_LAB_VALIDATION_CONVERSATIONS} clean paired grades, strong target-behavior improvement, positive net average/median deltas, no hard privacy/security or target-validity blocker, and human review for meaningful non-target regressions. Small unrelated losses are surfaced as context instead of automatically rejecting a strong fix.`;
 }
 
-const MARTY_LAB_DEFAULT_OPUS_MODEL = 'claude-opus-4-7';
+const MARTY_LAB_DEFAULT_OPUS_MODEL = CLAUDE_OPUS_MODEL;
 const MARTY_LAB_FALLBACK_OPUS_MODEL = 'claude-opus-4-6';
-const MARTY_LAB_DEFAULT_CODE_PATCH_MODEL = 'claude-opus-4-7';
-const MARTY_LAB_DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
+const MARTY_LAB_DEFAULT_CODE_PATCH_MODEL = CLAUDE_OPUS_MODEL;
+const MARTY_LAB_DEFAULT_HAIKU_MODEL = CLAUDE_HAIKU_MODEL;
 
 type MartyLabModelRole =
   | 'hypothesis'

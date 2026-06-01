@@ -1,8 +1,8 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
-import { CLAUDE_MODEL } from './claude';
-import { MAX_MODE_LIMITS, MAX_MODE_MODEL, NORMAL_MODE_LIMITS } from './max-mode';
+import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
+import { resolveMartyMaxModel, resolveMartyNormalModel } from './model-policy';
 
 export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-19-platform-aware-v1';
 export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-19-live-platform-aware-v1';
@@ -154,8 +154,8 @@ function productionRuntimeComponents(env: Env, deepDive: boolean): Record<string
       max_mode_addendum_version: 'max-set-builder-v2-forced',
     },
     claude: {
-      normal_model: CLAUDE_MODEL,
-      max_model: env.MARTY_MAX_MODEL || MAX_MODE_MODEL,
+      normal_model: resolveMartyNormalModel(env),
+      max_model: resolveMartyMaxModel(env),
       active_mode: deepDive ? 'max' : 'normal',
     },
     limits: {
