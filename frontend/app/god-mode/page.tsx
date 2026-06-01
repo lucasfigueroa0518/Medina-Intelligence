@@ -38,7 +38,7 @@ const THINKING_VERBS = [
   "Sharpening the brief", "Assembling the picture", "Locking in the signal",
   "Shining Manny's shoes", "Helping Raul pick his outfit", "Ordering lunch for Tony",
   "Helping Alvaro with Due Diligence", "Building firewalls for Adam",
-  "Is Tony a Vegan?", "Reposting Raul's Instagram Posts",
+  "Is Tony a Vegan?",
 ];
 
 function useThinkingVerb(active: boolean) {
