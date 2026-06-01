@@ -28,6 +28,8 @@ interface Args {
   remoteReadProof: boolean;
   classify: boolean;
   allowMissingSources: boolean;
+  allowEmptyDecisions: boolean;
+  highSignal: boolean;
   outputDir: string;
 }
 
@@ -48,6 +50,7 @@ export interface ProspectPipelineCanarySummary {
   write_proof_status: 'platform_proxy_read_only_adapter' | 'remote_d1_read_only_proved';
   write_proof_statement: string;
   dry_run_counter_labels: Record<string, string>;
+  high_signal: boolean;
   org_id: string;
   source_type: CanarySourceType;
   lookback_hours: number;
@@ -117,6 +120,8 @@ function parseArgs(argv: string[]): Args {
     remoteReadProof: raw.get('remote-read-proof') === 'true',
     classify: raw.get('classify') === 'true',
     allowMissingSources: raw.get('allow-missing-sources') === 'true',
+    allowEmptyDecisions: raw.get('allow-empty-decisions') === 'true',
+    highSignal: raw.get('high-signal') === 'true',
     outputDir: raw.get('output-dir') || join(homedir(), 'Downloads', `prospect-pipeline-canary-${today}`),
   };
 }
@@ -246,6 +251,33 @@ const CANARY_DRY_RUN_COUNTER_LABELS = {
   record_context_skipped: 'would_record_context',
   ignored_or_noise_skipped: 'would_ignore_or_skip_noise',
 };
+const HIGH_SIGNAL_TERMS = [
+  'intro',
+  'introduc',
+  'deck',
+  'pitch',
+  'raise',
+  'raising',
+  'round',
+  'seed',
+  'series ',
+  'diligence',
+  'founder',
+  'term sheet',
+  'nda',
+  'opportunity',
+  'investment',
+  'allocation',
+  'data room',
+  'model',
+  'Qunnect',
+  'Classiq',
+];
+
+function highSignalPredicateSql(columns: string[]): string {
+  const haystack = columns.map(column => `lower(COALESCE(${column}, ''))`).join(" || ' ' || ");
+  return `(${HIGH_SIGNAL_TERMS.map(term => `${haystack} LIKE ${sqlString(`%${term.toLowerCase()}%`)}`).join(' OR ')})`;
+}
 
 function emptyCoverage(): SourceCoverageSummary {
   return {
@@ -256,7 +288,7 @@ function emptyCoverage(): SourceCoverageSummary {
   };
 }
 
-function conversationSelectSql(orgId: string, lookbackHours: number, limit: number): string {
+function conversationSelectSql(orgId: string, lookbackHours: number, limit: number, highSignal = false): string {
   return `SELECT 'conversation' AS source_type,
             id AS source_id,
             subject AS title,
@@ -266,11 +298,12 @@ function conversationSelectSql(orgId: string, lookbackHours: number, limit: numb
       WHERE org_id = ${sqlString(orgId)}
         AND sent_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', '-${lookbackHours} hours')
         AND sent_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        ${highSignal ? `AND ${highSignalPredicateSql(['subject', 'body_preview', 'source'])}` : ''}
       ORDER BY sent_at DESC, id ASC
       LIMIT ${limit}`;
 }
 
-function eventSelectSql(orgId: string, lookbackHours: number, limit: number): string {
+function eventSelectSql(orgId: string, lookbackHours: number, limit: number, highSignal = false): string {
   return `SELECT 'event' AS source_type,
             id AS source_id,
             title,
@@ -281,11 +314,12 @@ function eventSelectSql(orgId: string, lookbackHours: number, limit: number): st
         AND deleted_at IS NULL
         AND start_time >= strftime('%Y-%m-%dT%H:%M:%fZ','now', '-${lookbackHours} hours')
         AND start_time <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        ${highSignal ? `AND ${highSignalPredicateSql(['title', 'description', 'summary', 'source'])}` : ''}
       ORDER BY start_time DESC, id ASC
       LIMIT ${limit}`;
 }
 
-function documentSelectSql(orgId: string, lookbackHours: number, limit: number): string {
+function documentSelectSql(orgId: string, lookbackHours: number, limit: number, highSignal = false): string {
   return `SELECT 'document' AS source_type,
             id AS source_id,
             COALESCE(title, file_name) AS title,
@@ -296,11 +330,12 @@ function documentSelectSql(orgId: string, lookbackHours: number, limit: number):
         AND deleted_at IS NULL
         AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', '-${lookbackHours} hours')
         AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        ${highSignal ? `AND ${highSignalPredicateSql(['title', 'file_name', 'extracted_text_preview', 'document_type'])}` : ''}
       ORDER BY created_at DESC, id ASC
       LIMIT ${limit}`;
 }
 
-async function selectConversations(env: Env, orgId: string, lookbackHours: number, limit: number): Promise<CanarySourceRow[]> {
+async function selectConversations(env: Env, orgId: string, lookbackHours: number, limit: number, highSignal = false): Promise<CanarySourceRow[]> {
   const rows = await env.D1.prepare(
     `SELECT 'conversation' AS source_type,
             id AS source_id,
@@ -311,13 +346,14 @@ async function selectConversations(env: Env, orgId: string, lookbackHours: numbe
       WHERE org_id = ?
         AND sent_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)
         AND sent_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        ${highSignal ? `AND ${highSignalPredicateSql(['subject', 'body_preview', 'source'])}` : ''}
       ORDER BY sent_at DESC, id ASC
       LIMIT ?`
   ).bind(orgId, `-${lookbackHours} hours`, limit).all<CanarySourceRow>();
   return rows.results || [];
 }
 
-async function selectEvents(env: Env, orgId: string, lookbackHours: number, limit: number): Promise<CanarySourceRow[]> {
+async function selectEvents(env: Env, orgId: string, lookbackHours: number, limit: number, highSignal = false): Promise<CanarySourceRow[]> {
   const rows = await env.D1.prepare(
     `SELECT 'event' AS source_type,
             id AS source_id,
@@ -329,13 +365,14 @@ async function selectEvents(env: Env, orgId: string, lookbackHours: number, limi
         AND deleted_at IS NULL
         AND start_time >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)
         AND start_time <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        ${highSignal ? `AND ${highSignalPredicateSql(['title', 'description', 'summary', 'source'])}` : ''}
       ORDER BY start_time DESC, id ASC
       LIMIT ?`
   ).bind(orgId, `-${lookbackHours} hours`, limit).all<CanarySourceRow>();
   return rows.results || [];
 }
 
-async function selectDocuments(env: Env, orgId: string, lookbackHours: number, limit: number): Promise<CanarySourceRow[]> {
+async function selectDocuments(env: Env, orgId: string, lookbackHours: number, limit: number, highSignal = false): Promise<CanarySourceRow[]> {
   const rows = await env.D1.prepare(
     `SELECT 'document' AS source_type,
             id AS source_id,
@@ -347,6 +384,7 @@ async function selectDocuments(env: Env, orgId: string, lookbackHours: number, l
         AND deleted_at IS NULL
         AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)
         AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        ${highSignal ? `AND ${highSignalPredicateSql(['title', 'file_name', 'extracted_text_preview', 'document_type'])}` : ''}
       ORDER BY created_at DESC, id ASC
       LIMIT ?`
   ).bind(orgId, `-${lookbackHours} hours`, limit).all<CanarySourceRow>();
@@ -355,17 +393,17 @@ async function selectDocuments(env: Env, orgId: string, lookbackHours: number, l
 
 export async function buildProspectPipelineCanarySummary(
   env: Env,
-  args: Pick<Args, 'orgId' | 'sourceType' | 'lookbackHours' | 'limit'>
+  args: Pick<Args, 'orgId' | 'sourceType' | 'lookbackHours' | 'limit'> & { highSignal?: boolean }
 ): Promise<ProspectPipelineCanarySummary> {
   const selectors: Array<Promise<CanarySourceRow[]>> = [];
   if (args.sourceType === 'all' || args.sourceType === 'conversation') {
-    selectors.push(selectConversations(env, args.orgId, args.lookbackHours, args.limit));
+    selectors.push(selectConversations(env, args.orgId, args.lookbackHours, args.limit, args.highSignal === true));
   }
   if (args.sourceType === 'all' || args.sourceType === 'event') {
-    selectors.push(selectEvents(env, args.orgId, args.lookbackHours, args.limit));
+    selectors.push(selectEvents(env, args.orgId, args.lookbackHours, args.limit, args.highSignal === true));
   }
   if (args.sourceType === 'all' || args.sourceType === 'document') {
-    selectors.push(selectDocuments(env, args.orgId, args.lookbackHours, args.limit));
+    selectors.push(selectDocuments(env, args.orgId, args.lookbackHours, args.limit, args.highSignal === true));
   }
   const sources = (await Promise.all(selectors))
     .flat()
@@ -384,6 +422,7 @@ export async function buildProspectPipelineCanarySummary(
     write_proof_status: 'platform_proxy_read_only_adapter',
     write_proof_statement: CANARY_WRITE_PROOF_STATEMENT,
     dry_run_counter_labels: CANARY_DRY_RUN_COUNTER_LABELS,
+    high_signal: args.highSignal === true,
     org_id: args.orgId,
     source_type: args.sourceType,
     lookback_hours: args.lookbackHours,
@@ -410,6 +449,7 @@ export function buildProspectPipelineRemoteCanarySummary(input: {
   sourceType: CanarySourceType;
   lookbackHours: number;
   limit: number;
+  highSignal?: boolean;
   sources: CanarySourceRow[];
   remoteMeta: RemoteMeta;
 }): ProspectPipelineCanarySummary {
@@ -430,6 +470,7 @@ export function buildProspectPipelineRemoteCanarySummary(input: {
     write_proof_status: 'remote_d1_read_only_proved',
     write_proof_statement: CANARY_WRITE_PROOF_STATEMENT,
     dry_run_counter_labels: CANARY_DRY_RUN_COUNTER_LABELS,
+    high_signal: input.highSignal === true,
     org_id: input.orgId,
     source_type: input.sourceType,
     lookback_hours: input.lookbackHours,
@@ -451,21 +492,21 @@ export function buildProspectPipelineRemoteCanarySummary(input: {
   };
 }
 
-function buildRemoteCommands(args: Pick<Args, 'orgId' | 'sourceType' | 'lookbackHours' | 'limit'>): string[] {
+function buildRemoteCommands(args: Pick<Args, 'orgId' | 'sourceType' | 'lookbackHours' | 'limit'> & { highSignal?: boolean }): string[] {
   const commands: string[] = [];
   if (args.sourceType === 'all' || args.sourceType === 'conversation') {
-    commands.push(conversationSelectSql(args.orgId, args.lookbackHours, args.limit));
+    commands.push(conversationSelectSql(args.orgId, args.lookbackHours, args.limit, args.highSignal === true));
   }
   if (args.sourceType === 'all' || args.sourceType === 'event') {
-    commands.push(eventSelectSql(args.orgId, args.lookbackHours, args.limit));
+    commands.push(eventSelectSql(args.orgId, args.lookbackHours, args.limit, args.highSignal === true));
   }
   if (args.sourceType === 'all' || args.sourceType === 'document') {
-    commands.push(documentSelectSql(args.orgId, args.lookbackHours, args.limit));
+    commands.push(documentSelectSql(args.orgId, args.lookbackHours, args.limit, args.highSignal === true));
   }
   return commands;
 }
 
-export function buildProspectPipelineRemoteReadCommands(args: Pick<Args, 'orgId' | 'sourceType' | 'lookbackHours' | 'limit'>): string[] {
+export function buildProspectPipelineRemoteReadCommands(args: Pick<Args, 'orgId' | 'sourceType' | 'lookbackHours' | 'limit'> & { highSignal?: boolean }): string[] {
   return buildRemoteCommands(args);
 }
 
@@ -479,14 +520,16 @@ async function buildRemoteReadProofSummary(args: Args): Promise<ProspectPipeline
     sourceType: args.sourceType,
     lookbackHours: args.lookbackHours,
     limit: args.limit,
+    highSignal: args.highSignal,
     sources,
     remoteMeta,
   });
 }
 
 export function assertCanaryClassificationComplete(
-  summary: Pick<ProspectPipelineCanarySummary, 'source_coverage' | 'classification_status' | 'hydration_status'>,
-  allowMissingSources: boolean
+  summary: Pick<ProspectPipelineCanarySummary, 'source_coverage' | 'classification_status' | 'hydration_status' | 'classifier' | 'high_signal'>,
+  allowMissingSources: boolean,
+  allowEmptyDecisions = false
 ): void {
   const coverage = summary.source_coverage;
   const missing = coverage?.missing_sources.length || 0;
@@ -495,6 +538,9 @@ export function assertCanaryClassificationComplete(
   }
   if (!allowMissingSources && coverage && coverage.total_sources > 0 && coverage.hydratable_sources === 0) {
     throw new Error(`CANARY_CLASSIFICATION_INCOMPLETE classification_status=${summary.classification_status} hydratable_sources=0`);
+  }
+  if (summary.high_signal && !allowEmptyDecisions && coverage && coverage.hydratable_sources > 0 && (summary.classifier?.decisions.length || 0) === 0) {
+    throw new Error('CANARY_HIGH_SIGNAL_EMPTY_DECISIONS');
   }
 }
 
@@ -527,7 +573,7 @@ function updateCanaryClassificationStatuses(summary: ProspectPipelineCanarySumma
 export async function classifyCanarySources(
   env: Env,
   summary: ProspectPipelineCanarySummary,
-  options: { allowMissingSources?: boolean; allowPartialSchema?: boolean } = {}
+  options: { allowMissingSources?: boolean; allowPartialSchema?: boolean; allowEmptyDecisions?: boolean } = {}
 ): Promise<{ classifier: ProspectDryRunResult | null; sourceCoverage: SourceCoverageSummary }> {
   const readOnlyEnv = readOnlyCanaryEnv(env);
   const coverage = emptyCoverage();
@@ -558,7 +604,7 @@ export async function classifyCanarySources(
   summary.classifier = classifier;
   summary.source_coverage = coverage;
   updateCanaryClassificationStatuses(summary);
-  assertCanaryClassificationComplete(summary, options.allowMissingSources === true);
+  assertCanaryClassificationComplete(summary, options.allowMissingSources === true, options.allowEmptyDecisions === true);
   return { classifier, sourceCoverage: coverage };
 }
 
@@ -585,6 +631,7 @@ function renderCanaryReport(summary: ProspectPipelineCanarySummary): string {
     `- Hydration status: ${summary.hydration_status}`,
     `- Classification status: ${summary.classification_status}`,
     `- Write proof status: ${summary.write_proof_status}`,
+    `- High-signal mode: ${summary.high_signal}`,
     `- Org: ${summary.org_id}`,
     `- Source type: ${summary.source_type}`,
     `- Lookback hours: ${summary.lookback_hours}`,
@@ -660,6 +707,7 @@ async function main(): Promise<void> {
         : proxy.env as unknown as Env;
       await classifyCanarySources(canaryEnv, summary, {
         allowMissingSources: args.allowMissingSources,
+        allowEmptyDecisions: args.allowEmptyDecisions,
         allowPartialSchema: !args.remoteReadProof,
       });
       if (remoteMeta) {

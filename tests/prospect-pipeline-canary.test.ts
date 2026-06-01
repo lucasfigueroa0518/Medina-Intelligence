@@ -69,7 +69,7 @@ describe('prospect pipeline canary dry run', () => {
   it('builds deterministic queue payloads without declaring any writes', async () => {
     const summary = await buildProspectPipelineCanarySummary(
       { D1: new CanaryFakeD1() } as any,
-      { orgId: 'org-1', sourceType: 'all', lookbackHours: 24, limit: 5 }
+      { orgId: 'org-1', sourceType: 'all', lookbackHours: 24, limit: 5, highSignal: true }
     );
 
     expect(summary).toMatchObject({
@@ -83,6 +83,7 @@ describe('prospect pipeline canary dry run', () => {
       changed_db: false,
       remote_d1_meta: null,
       org_id: 'org-1',
+      high_signal: true,
     });
     expect(summary.sources.map(row => row.source_id)).toEqual(['event-1', 'conv-1', 'doc-1']);
     expect(summary.queue_payloads).toEqual([
@@ -117,6 +118,27 @@ describe('prospect pipeline canary dry run', () => {
     expect(commands.join('\n')).toMatch(/sent_at <= strftime/);
     expect(commands.join('\n')).toMatch(/start_time <= strftime/);
     expect(commands.join('\n')).toMatch(/created_at <= strftime/);
+  });
+
+  it('adds high-signal filters while keeping remote SELECTs read-only and bounded', () => {
+    const commands = buildProspectPipelineRemoteReadCommands({
+      orgId: 'org-1',
+      sourceType: 'all',
+      lookbackHours: 720,
+      limit: 10,
+      highSignal: true,
+    });
+    const sql = commands.join('\n');
+
+    expect(commands).toHaveLength(3);
+    expect(commands.every(command => /^\s*SELECT\b/i.test(command))).toBe(true);
+    expect(sql).not.toMatch(/\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b/i);
+    expect(sql).toContain("LIKE '%deck%'");
+    expect(sql).toContain("LIKE '%diligence%'");
+    expect(sql).toContain("LIKE '%term sheet%'");
+    expect(sql).toMatch(/sent_at <= strftime/);
+    expect(sql).toMatch(/start_time <= strftime/);
+    expect(sql).toMatch(/created_at <= strftime/);
   });
 
   it('includes Cloudflare D1 read metadata in the remote proof summary', () => {
@@ -211,5 +233,61 @@ describe('prospect pipeline canary dry run', () => {
 
     expect(() => assertCanaryClassificationComplete(summary, false)).toThrow(/CANARY_CLASSIFICATION_INCOMPLETE/);
     expect(() => assertCanaryClassificationComplete(summary, true)).not.toThrow();
+  });
+
+  it('fails high-signal classification proof with hydratable sources but no decisions unless explicitly allowed', () => {
+    const summary = buildProspectPipelineRemoteCanarySummary({
+      orgId: 'org-1',
+      sourceType: 'conversation',
+      lookbackHours: 24,
+      limit: 5,
+      highSignal: true,
+      sources: [{
+        source_type: 'conversation',
+        source_id: 'conv-1',
+        title: 'Intro to Auguria',
+        occurred_at: '2026-06-01T10:00:00.000Z',
+        source_label: 'outlook',
+      }],
+      remoteMeta: {
+        rows_read: 1,
+        rows_written: 0,
+        changed_db: false,
+        query_count: 1,
+      },
+    });
+    summary.source_coverage = {
+      total_sources: 1,
+      hydratable_sources: 1,
+      by_source_type: { conversation: 1, event: 0, document: 0 },
+      missing_sources: [],
+    };
+    summary.hydration_status = 'hydrated';
+    summary.classification_status = 'classified';
+    summary.classifier = {
+      decisions: [],
+      decision_counts: {
+        create_prospect: 0,
+        attach_existing_deal: 0,
+        record_context: 0,
+        ignore: 0,
+        classifier_error: 0,
+      },
+      duplicates: [],
+      stats: {
+        items_scanned: 1,
+        mentions_seen: 0,
+        signals_recorded: 0,
+        prospects_upserted: 0,
+        known_deals_attached: 0,
+        record_context_skipped: 0,
+        ignored_or_noise_skipped: 0,
+        classifications_pending: 0,
+        errors: [],
+      },
+    } as any;
+
+    expect(() => assertCanaryClassificationComplete(summary, false)).toThrow(/CANARY_HIGH_SIGNAL_EMPTY_DECISIONS/);
+    expect(() => assertCanaryClassificationComplete(summary, false, true)).not.toThrow();
   });
 });

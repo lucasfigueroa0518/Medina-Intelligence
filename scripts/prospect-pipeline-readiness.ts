@@ -25,6 +25,9 @@ export interface ProspectPipelineReadinessSources {
   workQueueDriver: string;
   prospectDetectHandler: string;
   prospectPipelineCanary: string;
+  prospectLiveCanary: string;
+  prospectBackfillWindow: string;
+  prospectPipelineHealth: string;
   prospectIntelligence: string;
   materializeKnownDeals: string;
   migrationReadinessCheck: string;
@@ -43,6 +46,9 @@ const DEFAULT_FILES = {
   workQueueDriver: 'src/lib/work-queue-driver.ts',
   prospectDetectHandler: 'src/lib/work-queue-handlers/prospect-detect.ts',
   prospectPipelineCanary: 'scripts/prospect-pipeline-canary.ts',
+  prospectLiveCanary: 'scripts/prospect-live-canary.ts',
+  prospectBackfillWindow: 'scripts/prospect-backfill-window.ts',
+  prospectPipelineHealth: 'scripts/prospect-pipeline-health.ts',
   prospectIntelligence: 'src/lib/prospect-intelligence.ts',
   materializeKnownDeals: 'scripts/prospect-materialize-known-deals.ts',
   migrationReadinessCheck: 'scripts/prospect-migration-readiness-check.ts',
@@ -137,6 +143,21 @@ export function evaluateProspectPipelineReadiness(input: {
       'package.json exposes npm run prospect:pipeline-canary'
     ),
     check(
+      'package.live_canary_script',
+      packageJson.scripts?.['prospect:live-canary'] === 'tsx scripts/prospect-live-canary.ts',
+      'package.json exposes npm run prospect:live-canary'
+    ),
+    check(
+      'package.backfill_window_script',
+      packageJson.scripts?.['prospect:backfill-window'] === 'tsx scripts/prospect-backfill-window.ts',
+      'package.json exposes npm run prospect:backfill-window'
+    ),
+    check(
+      'package.pipeline_health_script',
+      packageJson.scripts?.['prospect:pipeline-health'] === 'tsx scripts/prospect-pipeline-health.ts',
+      'package.json exposes npm run prospect:pipeline-health'
+    ),
+    check(
       'package.migration_readiness_script',
       packageJson.scripts?.['prospect:migration-readiness'] === 'tsx scripts/prospect-migration-readiness-check.ts',
       'package.json exposes npm run prospect:migration-readiness'
@@ -203,6 +224,41 @@ export function evaluateProspectPipelineReadiness(input: {
         /rows_written/.test(sources.prospectPipelineCanary) &&
         /changed_db/.test(sources.prospectPipelineCanary),
       'prospect pipeline canary can use wrangler D1 remote SELECTs and aborts unless rows_written=0 and changed_db=false'
+    ),
+    check(
+      'canary.high_signal_mode_available',
+      /highSignalPredicateSql/.test(sources.prospectPipelineCanary) &&
+        /HIGH_SIGNAL_TERMS/.test(sources.prospectPipelineCanary) &&
+        /CANARY_HIGH_SIGNAL_EMPTY_DECISIONS/.test(sources.prospectPipelineCanary) &&
+        /allow-empty-decisions/.test(sources.prospectPipelineCanary),
+      'prospect pipeline canary can target high-signal source rows and fails closed on empty classified decisions unless explicitly allowed'
+    ),
+    check(
+      'live_canary.explicit_go_required',
+      /PROSPECT_LIVE_CANARY_GO/.test(sources.prospectLiveCanary) &&
+        /PROSPECT_LIVE_CANARY_REQUIRES_EXPLICIT_GO/.test(sources.prospectLiveCanary) &&
+        /enqueueProspectDetectSource/.test(sources.prospectLiveCanary) &&
+        /INVALID_LIMIT_MAX_10/.test(sources.prospectLiveCanary),
+      'live prospect canary refuses production enqueue without exact Lucas GO token and caps source count'
+    ),
+    check(
+      'backfill_window.explicit_go_required',
+      /PROSPECT_BACKFILL_GO/.test(sources.prospectBackfillWindow) &&
+        /PROSPECT_BACKFILL_REQUIRES_EXPLICIT_GO/.test(sources.prospectBackfillWindow) &&
+        /PROSPECT_BACKFILL_WINDOW_TOO_LARGE/.test(sources.prospectBackfillWindow) &&
+        /PROSPECT_BACKFILL_BATCH_TOO_LARGE/.test(sources.prospectBackfillWindow) &&
+        /runProspectBackfillWindow/.test(sources.prospectBackfillWindow),
+      'backfill window wrapper previews by default and refuses writes or broad windows without explicit GO'
+    ),
+    check(
+      'pipeline_health.read_only_monitor',
+      /read_only:\s*true/.test(sources.prospectPipelineHealth) &&
+        /PIPELINE_HEALTH_READ_ONLY_VIOLATION/.test(sources.prospectPipelineHealth) &&
+        /work_queue/.test(sources.prospectPipelineHealth) &&
+        /upstream_budget_ledger/.test(sources.prospectPipelineHealth) &&
+        /prospect_signals/.test(sources.prospectPipelineHealth) &&
+        /prospects/.test(sources.prospectPipelineHealth),
+      'pipeline health monitor is SELECT-only and reports queue, budget, prospect, and signal health'
     ),
     check(
       'classifier.runtime_hooks_available',
