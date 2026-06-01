@@ -151,6 +151,60 @@ function buildGatewayHeaders(env: Env): Record<string, string> {
   return headers;
 }
 
+function buildAnthropicRequestBody(
+  params: {
+    system: ClaudeSystemPrompt;
+    user: string;
+    max_tokens: number;
+    model?: string;
+    assistantPrefill?: string;
+    temperature?: number;
+  },
+  model: string
+): Record<string, unknown> {
+  return {
+    model,
+    max_tokens: params.max_tokens,
+    ...(params.temperature != null ? { temperature: params.temperature } : {}),
+    system: params.system,
+    messages: params.assistantPrefill
+      ? [
+          { role: 'user', content: params.user },
+          { role: 'assistant', content: params.assistantPrefill },
+        ]
+      : [{ role: 'user', content: params.user }],
+  };
+}
+
+function hasAiGatewayBinding(env: Env): boolean {
+  return typeof (env as any).AI?.gateway === 'function';
+}
+
+async function fetchClaudeViaGateway(
+  env: Env,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const gatewayToken = (env as any).CLOUDFLARE_AI_GATEWAY_TOKEN as string | undefined;
+  if (!gatewayToken?.trim() && hasAiGatewayBinding(env)) {
+    return (env as any).AI.gateway(env.CLOUDFLARE_AI_GATEWAY_SLUG).run({
+      provider: 'anthropic',
+      endpoint: 'v1/messages',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': env.ANTHROPIC_API_KEY,
+        'anthropic-version': ANTHROPIC_VERSION,
+      },
+      query: body,
+    });
+  }
+
+  return fetch(buildGatewayUrl(env), {
+    method: 'POST',
+    headers: buildGatewayHeaders(env),
+    body: JSON.stringify(body),
+  });
+}
+
 export interface ClaudeCallResult {
   text: string;
   usage: { input_tokens: number; output_tokens: number };
@@ -184,24 +238,9 @@ export async function callClaudeWithUsage(
   if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
     throw new Error('CLAUDE_RATE_LIMITED');
   }
-  const model = params.model || CLAUDE_MODEL;
+  const body = buildAnthropicRequestBody(params, model);
 
-  const response = await fetch(buildGatewayUrl(env), {
-    method: 'POST',
-    headers: buildGatewayHeaders(env),
-    body: JSON.stringify({
-      model,
-      max_tokens: params.max_tokens,
-      ...(params.temperature != null ? { temperature: params.temperature } : {}),
-      system: params.system,
-      messages: params.assistantPrefill
-        ? [
-            { role: 'user', content: params.user },
-            { role: 'assistant', content: params.assistantPrefill },
-          ]
-        : [{ role: 'user', content: params.user }],
-    }),
-  });
+  const response = await fetchClaudeViaGateway(env, body);
 
   if (!response.ok) {
     const errorBody = await response.text();

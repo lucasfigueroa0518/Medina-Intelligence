@@ -164,9 +164,12 @@ async function withHeartbeat<T>(
 // ─── Registry ───────────────────────────────────────────────────────
 
 import { embedRetryHandler } from './work-queue-handlers/embed-retry';
+import { attachmentBackfillHandler } from './work-queue-handlers/attachment-backfill';
 import { calendarRefreshHandler } from './work-queue-handlers/calendar-refresh';
 import { fireflyWindowHandler } from './work-queue-handlers/firefly-window';
 import { dealReplayEvidenceHandler } from './work-queue-handlers/deal-replay-evidence';
+import { dealEvidenceDetectHandler } from './work-queue-handlers/deal-evidence-detect';
+import { prospectDetectHandler } from './work-queue-handlers/prospect-detect';
 import { intelligentImportHandler } from './work-queue-handlers/intelligent-import';
 import { contactEnrichmentHandler } from './work-queue-handlers/contact-enrichment';
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
@@ -200,9 +203,12 @@ import { maxModeJobHandler } from './work-queue-handlers/max-mode-job';
  */
 export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   embedRetryHandler,
+  attachmentBackfillHandler,
   calendarRefreshHandler,
   fireflyWindowHandler,
   dealReplayEvidenceHandler,
+  dealEvidenceDetectHandler,
+  prospectDetectHandler,
   intelligentImportHandler,
   contactEnrichmentHandler,
   maxModeJobHandler,
@@ -219,11 +225,13 @@ export interface ProcessTickResult {
   swept: number;            // rows reclaimed from stale claims
   deck_reconciled?: number; // active deck jobs terminalized from queue truth
   open_circuits: string[];  // upstreams skipped this tick
+  sample_errors: Array<{ domain: string; work_queue_id: string | null; error: string }>;
   per_domain: Array<{
     domain: string;
     claimed: number;
     completed: number;
     failed: number;
+    errors?: Array<{ work_queue_id: string | null; error: string }>;
   }>;
 }
 
@@ -311,6 +319,7 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
   const result: ProcessTickResult = {
     swept: 0,
     open_circuits: [],
+    sample_errors: [],
     per_domain: [],
   };
 
@@ -356,7 +365,13 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
   // budget — each handler runs to completion before the next claims.
   // Domains needing concurrency can implement it INSIDE handler.process.
   for (const handler of WORK_QUEUE_HANDLERS) {
-    const stats = { domain: handler.domain, claimed: 0, completed: 0, failed: 0 };
+    const stats: ProcessTickResult['per_domain'][number] = {
+      domain: handler.domain,
+      claimed: 0,
+      completed: 0,
+      failed: 0,
+      errors: [],
+    };
     let claimed: WorkQueueRow[] = [];
     try {
       let claimLimit = Math.min(handler.batchSize, 10);
@@ -382,7 +397,10 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
       );
       stats.claimed = claimed.length;
     } catch (e) {
-      console.error(`[work-queue] claim failed for ${handler.domain}:`, e instanceof Error ? e.message : e);
+      const message = e instanceof Error ? e.message : String(e);
+      console.error(`[work-queue] claim failed for ${handler.domain}:`, message);
+      stats.errors?.push({ work_queue_id: null, error: message });
+      result.sample_errors.push({ domain: handler.domain, work_queue_id: null, error: message });
       result.per_domain.push(stats);
       continue;
     }
@@ -391,13 +409,28 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
       try {
         const itemResult = await processClaimedWorkItem(env, handler, item);
         if (itemResult.completed) stats.completed++;
-        if (itemResult.failed) stats.failed++;
-      } catch {
+        if (itemResult.failed) {
+          stats.failed++;
+          if (itemResult.error) {
+            const entry = { work_queue_id: item.id, error: itemResult.error.slice(0, 500) };
+            if ((stats.errors?.length || 0) < 5) stats.errors?.push(entry);
+            if (result.sample_errors.length < 10) {
+              result.sample_errors.push({ domain: handler.domain, ...entry });
+            }
+          }
+        }
+      } catch (e) {
         // Failure in failWork itself — processClaimedWorkItem already
         // logged the full chain. The row stays in_progress but the
         // watchdog's stale-lock sweep will reclaim it next tick once
         // locked_until elapses.
         stats.failed++;
+        const message = e instanceof Error ? e.message : String(e);
+        const entry = { work_queue_id: item.id, error: message.slice(0, 500) };
+        if ((stats.errors?.length || 0) < 5) stats.errors?.push(entry);
+        if (result.sample_errors.length < 10) {
+          result.sample_errors.push({ domain: handler.domain, ...entry });
+        }
       }
     }
     result.per_domain.push(stats);

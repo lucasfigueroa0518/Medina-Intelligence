@@ -1032,6 +1032,21 @@ export async function handleScheduled(
           try { await enqueueBackfillDocuments(org.id, env); }
           catch (e) { console.error(`hourly self-heal: enqueueBackfillDocuments failed for ${org.id}:`, e); }
         })());
+        // Hourly deal evidence coverage for completed deal documents. The
+        // ingestion path already detects conversations/events inline; this
+        // covers deal_pitch/deal_terms/deal_financials/deal_diligence docs
+        // that completed after attachment/upload processing.
+        ctxExec.waitUntil((async () => {
+          const { enqueueDealEvidenceDocumentDetection } = await import('./lib/daily-cron');
+          try {
+            const result = await enqueueDealEvidenceDocumentDetection(org.id, env);
+            if (result.enqueued > 0) {
+              console.warn(`[deal-evidence] org=${org.id} document_candidates=${result.candidates} enqueued=${result.enqueued}`);
+            }
+          } catch (e) {
+            console.error(`hourly self-heal: enqueueDealEvidenceDocumentDetection failed for ${org.id}:`, e);
+          }
+        })());
         // Hourly RAG v2 source coverage self-heal. This is the primary
         // retrieval index Marty uses for v2 orgs; legacy vector coverage can
         // be healthy while rag_source_index_state is stale. The scanner is
@@ -1231,19 +1246,44 @@ export async function handleScheduled(
           const result = await processWorkQueueTick(env);
           const completed = result.per_domain.reduce((sum, d) => sum + d.completed, 0);
           const failed = result.per_domain.reduce((sum, d) => sum + d.failed, 0);
+          const topFailingDomain = result.per_domain
+            .filter(d => d.failed > 0)
+            .sort((a, b) => b.failed - a.failed)[0] || null;
+          const sampleError = result.sample_errors[0] || null;
           taskRun.report({
             items_processed: completed,
             items_failed: failed,
             items_skipped: result.swept,
+            last_error: sampleError
+              ? `${sampleError.domain}${sampleError.work_queue_id ? `:${sampleError.work_queue_id}` : ''}: ${sampleError.error}`
+              : undefined,
             metadata: {
               swept: result.swept,
               open_circuits: result.open_circuits,
+              top_failing_domain: topFailingDomain?.domain || null,
+              sample_error: sampleError,
+              sample_errors: result.sample_errors,
               per_domain: result.per_domain,
             },
           });
           return result;
         }, {
           idempotencyKey: `work_queue_tick:${minuteStart}`,
+          initialMetadata: { cron, minute_start: minuteStart },
+        });
+        await withTaskRun(env, 'system', 'sync_job_stale_reconcile', async (taskRun) => {
+          const { reconcileStaleOperationalSyncJobs } = await import('./lib/sync-job-lifecycle');
+          const result = await reconcileStaleOperationalSyncJobs(env, { maxAgeMinutes: 10, limit: 50 });
+          taskRun.report({
+            items_processed: result.reconciled,
+            metadata: {
+              reconciled: result.reconciled,
+              sampled_ids: result.sampled_ids,
+            },
+          });
+          return result;
+        }, {
+          idempotencyKey: `sync_job_stale_reconcile:${minuteStart}`,
           initialMetadata: { cron, minute_start: minuteStart },
         });
         const tick = new Date(scheduledAt);

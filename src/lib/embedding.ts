@@ -118,6 +118,15 @@ export function prefixChunk(text: string, meta: ChunkMetadata): string {
 // 4 concurrent BGE calls per Worker invocation as a defensive ceiling.
 let inFlightEmbeds = 0;
 const MAX_IN_FLIGHT_PER_ISOLATE = 4;
+export const EXPECTED_VECTORIZE_DIMENSIONS = 768;
+export const VECTORIZE_ID_MAX_BYTES = 64;
+export const VECTORIZE_PAYLOAD_QUARANTINE_ERROR = 'VECTORIZE_PAYLOAD_QUARANTINED';
+
+export interface VectorizeUpsertPayload {
+  id: string;
+  values: number[];
+  metadata: Record<string, string | number | boolean>;
+}
 
 async function withInFlightCap<T>(fn: () => Promise<T>): Promise<T> {
   while (inFlightEmbeds >= MAX_IN_FLIGHT_PER_ISOLATE) {
@@ -327,9 +336,15 @@ export function buildVectorId(
 }
 
 function compactText(value: unknown, max: number): string | undefined {
-  const text = String(value || '').trim();
+  const text = sanitizeVectorizeTextPreview(String(value || '')).trim();
   if (!text) return undefined;
   return text.length > max ? text.slice(0, max) : text;
+}
+
+export function sanitizeVectorizeTextPreview(value: string): string {
+  return value
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ');
 }
 
 function addCompactMetadata(
@@ -383,6 +398,63 @@ export function compactVectorizeMetadata(
   return out;
 }
 
+export function isDeterministicVectorizePayloadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return (
+    message.includes(VECTORIZE_PAYLOAD_QUARANTINE_ERROR) ||
+    message.includes('40023') ||
+    /failed to parse upsert vectors request/i.test(message) ||
+    /VECTOR_UPSERT_ERROR/i.test(message)
+  );
+}
+
+export function validateVectorizePayload(
+  payload: VectorizeUpsertPayload,
+  expectedDimensions = EXPECTED_VECTORIZE_DIMENSIONS
+): void {
+  const fail = (reason: string): never => {
+    throw new Error(`${VECTORIZE_PAYLOAD_QUARANTINE_ERROR}: ${reason}`);
+  };
+
+  if (!payload.id || typeof payload.id !== 'string') fail('missing vector id');
+  const idBytes = new TextEncoder().encode(payload.id).length;
+  if (idBytes > VECTORIZE_ID_MAX_BYTES) {
+    fail(`vector id exceeds ${VECTORIZE_ID_MAX_BYTES} bytes (${idBytes})`);
+  }
+
+  if (!Array.isArray(payload.values)) fail('values must be an array');
+  if (payload.values.length !== expectedDimensions) {
+    fail(`expected ${expectedDimensions} dimensions, got ${payload.values.length}`);
+  }
+  for (let i = 0; i < payload.values.length; i++) {
+    const value = payload.values[i];
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      fail(`non-finite vector value at index ${i}`);
+    }
+  }
+
+  if (!payload.metadata || typeof payload.metadata !== 'object' || Array.isArray(payload.metadata)) {
+    fail('metadata must be an object');
+  }
+  for (const [key, value] of Object.entries(payload.metadata)) {
+    if (!key || typeof key !== 'string') fail('metadata key must be a non-empty string');
+    if (typeof value === 'string') {
+      try {
+        JSON.stringify(value);
+      } catch {
+        fail(`metadata string is not JSON-safe for key ${key}`);
+      }
+      continue;
+    }
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) fail(`metadata number is non-finite for key ${key}`);
+      continue;
+    }
+    if (typeof value === 'boolean') continue;
+    fail(`metadata value for key ${key} must be string, number, or boolean`);
+  }
+}
+
 export async function chunkEmbedAndPersist(
   text: string,
   meta: ChunkMetadata,
@@ -400,20 +472,32 @@ export async function chunkEmbedAndPersist(
     totalChunks,
     prefixedChunk.substring(0, 200)
   );
+  const vectorPayload: VectorizeUpsertPayload = {
+    id: vectorId,
+    values,
+    metadata,
+  };
+  validateVectorizePayload(vectorPayload);
 
-  await Promise.all([
-    env.VECTORIZE.upsert([
-      {
-        id: vectorId,
-        values,
-        metadata,
-      },
-    ]),
-    // Retrying wrapper — bursty chunk writes (e.g., 15 chunks for a transcript
-    // re-embed) can hit KV's per-namespace write throttle and 429. Audit
-    // 2026-04-29 saw 3/5 transcripts fail on KV PUT 429 during reembed.
-    kvPutWithRetry(env, `chunk:${vectorId}`, prefixedChunk),
-  ]);
+  try {
+    await Promise.all([
+      env.VECTORIZE.upsert([vectorPayload]),
+      // Retrying wrapper — bursty chunk writes (e.g., 15 chunks for a transcript
+      // re-embed) can hit KV's per-namespace write throttle and 429. Audit
+      // 2026-04-29 saw 3/5 transcripts fail on KV PUT 429 during reembed.
+      kvPutWithRetry(env, `chunk:${vectorId}`, prefixedChunk),
+    ]);
+  } catch (e) {
+    if (isDeterministicVectorizePayloadError(e)) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `${VECTORIZE_PAYLOAD_QUARANTINE_ERROR}: source_table=${meta.source_table} ` +
+        `source_id=${meta.source_id} vector_id=${vectorId} chunk_index=${chunkIndex}/${totalChunks} ` +
+        `dimensions=${values.length}: ${message}`
+      );
+    }
+    throw e;
+  }
 
   return {
     vectorId,

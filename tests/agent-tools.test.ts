@@ -149,9 +149,10 @@ class ProspectAgentFakeD1 {
     if (/FROM prospect_signals s\s+JOIN prospects p/i.test(sql)) {
       const [orgId] = binds;
       const grouped = new Map<string, { source_type: string; signal_count: number; prospectIds: Set<string> }>();
-      for (const signal of this.signals.filter(row => row.org_id === orgId && row.mention_type === 'inbound_prospect')) {
+      const eligibleProspectIds = new Set(this.filteredProspects(orgId, sql).map(row => row.id));
+      for (const signal of this.signals.filter(row => row.org_id === orgId && ['inbound_prospect', 'known_deal'].includes(row.mention_type))) {
         const prospect = this.prospects.find(row => row.id === signal.prospect_id && row.org_id === orgId);
-        if (!prospect) continue;
+        if (!prospect || !eligibleProspectIds.has(prospect.id)) continue;
         const current = grouped.get(signal.source_type) || { source_type: signal.source_type, signal_count: 0, prospectIds: new Set<string>() };
         current.signal_count++;
         current.prospectIds.add(String(prospect.possible_duplicate_of || prospect.id));
@@ -165,7 +166,7 @@ class ProspectAgentFakeD1 {
     }
 
     if (/FROM prospects p/i.test(sql) && /GROUP BY p\.sector_key/i.test(sql)) {
-      const prospects = this.filteredProspects(binds[0]);
+      const prospects = this.filteredProspects(binds[0], sql);
       const grouped = new Map<string, Set<string>>();
       for (const prospect of prospects) {
         const key = prospect.sector_key || 'uncategorized';
@@ -181,7 +182,7 @@ class ProspectAgentFakeD1 {
     }
 
     if (/FROM prospects p/i.test(sql) && /GROUP BY p\.enrichment_priority/i.test(sql)) {
-      const prospects = this.filteredProspects(binds[0]);
+      const prospects = this.filteredProspects(binds[0], sql);
       const grouped = new Map<string, Set<string>>();
       for (const prospect of prospects) {
         const key = prospect.enrichment_priority || 'lazy';
@@ -206,7 +207,7 @@ class ProspectAgentFakeD1 {
     if (/FROM prospects p/i.test(sql) && /ORDER BY p\.signal_strength DESC/i.test(sql)) {
       const [orgId] = binds;
       const limit = Number(binds[binds.length - 1] || 20);
-      return this.filteredProspects(orgId)
+      return this.filteredProspects(orgId, sql)
         .sort((a, b) => Number(b.signal_strength || 0) - Number(a.signal_strength || 0))
         .slice(0, limit)
         .map(row => ({ ...row, sector_label: row.sector_key }));
@@ -215,7 +216,7 @@ class ProspectAgentFakeD1 {
     if (/FROM prospects p/i.test(sql) && /ORDER BY p\.last_seen_at DESC/i.test(sql)) {
       const [orgId] = binds;
       const limit = Number(binds[binds.length - 1] || 20);
-      return this.filteredProspects(orgId)
+      return this.filteredProspects(orgId, sql)
         .sort((a, b) => String(b.last_seen_at || '').localeCompare(String(a.last_seen_at || '')))
         .slice(0, limit)
         .map(row => ({ ...row, sector_label: row.sector_key }));
@@ -226,7 +227,7 @@ class ProspectAgentFakeD1 {
 
   first(sql: string, binds: unknown[]): any | null {
     if (/COUNT\(DISTINCT COALESCE\(p\.possible_duplicate_of, p\.id\)\) AS total/i.test(sql)) {
-      const ids = new Set(this.filteredProspects(binds[0]).map(row => String(row.possible_duplicate_of || row.id)));
+      const ids = new Set(this.filteredProspects(binds[0], sql).map(row => String(row.possible_duplicate_of || row.id)));
       return { total: ids.size };
     }
 
@@ -266,11 +267,13 @@ class ProspectAgentFakeD1 {
 
   run(_sql: string, _binds: unknown[]): void {}
 
-  private filteredProspects(orgId: unknown): any[] {
+  private filteredProspects(orgId: unknown, sql = ''): any[] {
     return this.prospects.filter(row =>
       row.org_id === orgId &&
       !row.deleted_at &&
-      ['active', 'provisional'].includes(row.status)
+      ['active', 'provisional', 'converted'].includes(row.status) &&
+      (!/p\.provisional = 0/i.test(sql) || row.provisional === 0) &&
+      (!/p\.direction_uncertain = 0/i.test(sql) || row.direction_uncertain === 0)
     );
   }
 }
@@ -336,15 +339,32 @@ describe('prospect MARTy tools', () => {
         possible_duplicate_of: null,
         signal_strength_reasons: '[]',
       },
+      {
+        id: 'prospect-qunnect',
+        org_id: 'org-1',
+        canonical_name: 'Qunnect',
+        sector_key: 'quantum',
+        status: 'converted',
+        last_seen_at: '2026-05-29T00:00:00.000Z',
+        signal_strength: 85,
+        enrichment_priority: 'eager',
+        confidence: 1,
+        provisional: 0,
+        direction_uncertain: 0,
+        possible_duplicate_of: null,
+        signal_strength_reasons: '["known_deal_backlink"]',
+      },
     );
     db.signals.push(
       { id: 'sig-1', org_id: 'org-1', prospect_id: 'prospect-auguria', source_type: 'conversation', mention_type: 'inbound_prospect', classification_status: 'classified', resolution_status: 'resolved' },
       { id: 'sig-2', org_id: 'org-1', prospect_id: 'prospect-auguria-dup', source_type: 'document', mention_type: 'inbound_prospect', classification_status: 'classified', resolution_status: 'pending' },
       { id: 'sig-3', org_id: 'org-1', prospect_id: 'prospect-sativa', source_type: 'document', mention_type: 'inbound_prospect', classification_status: 'failed', resolution_status: 'pending' },
+      { id: 'sig-4', org_id: 'org-1', prospect_id: 'prospect-qunnect', source_type: 'conversation', mention_type: 'known_deal', classification_status: 'classified', resolution_status: 'resolved' },
     );
     db.coverage.push({ org_id: 'org-1', source_family: 'document', window_start: '2026-05-01', window_end: '2026-05-30', status: 'partial', items_scanned: 3, signals_recorded: 2, classifications_pending: 1 });
 
     const memberResult = await queryDealFlow(ctx, { days_back: 30 }, prospectAgentEnv(db));
+    const inclusiveResult = await queryDealFlow(ctx, { days_back: 30, include_provisional: true }, prospectAgentEnv(db));
     const otherUserResult = await queryDealFlow(
       { ...ctx, userId: 'user-2', email: 'user-2@medinavc.com' },
       { days_back: 30 },
@@ -352,10 +372,13 @@ describe('prospect MARTy tools', () => {
     );
 
     expect(memberResult.total_prospects).toBe(2);
+    expect(inclusiveResult.total_prospects).toBe(3);
     expect(otherUserResult.total_prospects).toBe(memberResult.total_prospects);
     expect(memberResult.by_source).toEqual(expect.arrayContaining([
-      expect.objectContaining({ source_type: 'conversation', prospect_count: 1 }),
-      expect.objectContaining({ source_type: 'document', prospect_count: 2 }),
+      expect.objectContaining({ source_type: 'conversation', prospect_count: 2 }),
+    ]));
+    expect(memberResult.by_source).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ source_type: 'document' }),
     ]));
     expect(memberResult.qualifiers.unresolved).toMatchObject({
       provisional_prospects: 2,
@@ -366,6 +389,12 @@ describe('prospect MARTy tools', () => {
       pending_resolutions: 2,
     });
     expect(memberResult.qualifiers.source_content_acl).toMatch(/identical across users/i);
+  });
+
+  it('defaults prospect status filters to high-integrity pipeline records but preserves explicit status choices', () => {
+    expect(__agentToolsTestHooks.prospectStatusFilter(undefined)).toEqual(['active', 'converted']);
+    expect(__agentToolsTestHooks.prospectStatusFilter('converted')).toEqual(['converted']);
+    expect(__agentToolsTestHooks.prospectStatusFilter(['active', 'converted'])).toEqual(['active', 'converted']);
   });
 
   it('redacts prospect evidence snippets per source ACL while keeping evidence counts honest', async () => {

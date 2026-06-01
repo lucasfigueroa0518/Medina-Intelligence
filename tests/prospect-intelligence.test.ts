@@ -14,6 +14,7 @@ import {
   callProspectClassifier,
   computeSignalStrength,
   detectAndRecordProspectSignals,
+  ensureProspectForDeal,
   extractMentionCandidatesFromText,
   mergeProspects,
   normalizeProspectName,
@@ -97,6 +98,17 @@ class FakeD1 {
       return this.prospectSignals
         .filter(row => row.prospect_id === prospectId && row.org_id === orgId && row.mention_type === 'inbound_prospect')
         .sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
+    }
+    if (/SELECT id, deal_id\s+FROM prospects/i.test(sql)) {
+      const [orgId] = binds;
+      return this.prospects
+        .filter(row =>
+          row.org_id === orgId &&
+          !row.deleted_at &&
+          row.deal_id &&
+          ['active', 'provisional', 'converted'].includes(row.status)
+        )
+        .map(row => ({ id: row.id, deal_id: row.deal_id }));
     }
     if (/SELECT id FROM prospect_signals/i.test(sql)) {
       const [orgId, prospectId] = binds;
@@ -187,6 +199,32 @@ class FakeD1 {
       );
       return row ? { ...row } : null;
     }
+    if (/FROM deals d\s+JOIN companies c/i.test(sql)) {
+      const [orgId, dealId] = binds;
+      const deal = this.deals.find(entry =>
+        entry.org_id === orgId &&
+        entry.id === dealId &&
+        !entry.deleted_at &&
+        entry.stage !== 'closed'
+      );
+      if (!deal) return null;
+      const company = this.companies.find(entry =>
+        entry.id === deal.company_id &&
+        entry.org_id === orgId &&
+        !entry.deleted_at
+      );
+      if (!company) return null;
+      return {
+        deal_id: deal.id,
+        company_id: deal.company_id,
+        created_at: deal.created_at || null,
+        updated_at: deal.updated_at || null,
+        company_name: company.name,
+        company_domain: company.domain || null,
+        company_website: company.website || null,
+        company_sector: company.sector || null,
+      };
+    }
     if (/FROM prospect_signals/i.test(sql)) {
       const [orgId, sourceType, sourceId, mentionOrdinal] = binds;
       const row = this.prospectSignals.find(entry =>
@@ -197,7 +235,12 @@ class FakeD1 {
       );
       return row ? { ...row } : null;
     }
-    if (/SELECT id FROM prospects/i.test(sql)) {
+    if (/SELECT id\s+FROM prospects/i.test(sql) && /deal_id = \?/i.test(sql)) {
+      const [orgId, dealId] = binds;
+      const row = this.prospects.find(entry => entry.org_id === orgId && entry.deal_id === dealId && !entry.deleted_at);
+      return row ? { id: row.id } : null;
+    }
+    if (/SELECT id\s+FROM prospects/i.test(sql)) {
       const [orgId, normalizedName] = binds;
       const row = this.prospects.find(entry => entry.org_id === orgId && entry.normalized_name === normalizedName && !entry.deleted_at);
       return row ? { ...row } : null;
@@ -236,6 +279,88 @@ class FakeD1 {
   }
 
   run(sql: string, binds: unknown[]): void {
+    if (/UPDATE prospects/i.test(sql) && /status = 'converted'/i.test(sql) && /metadata_json = json_patch/i.test(sql)) {
+      const prospectId = binds[13];
+      const orgId = binds[14];
+      const row = this.prospects.find(entry => entry.id === prospectId && entry.org_id === orgId);
+      if (row) {
+        const previousSignalStrength = Number(row.signal_strength || 0);
+        row.canonical_name = String(binds[0]).length > String(row.canonical_name || '').length ? binds[0] : row.canonical_name;
+        row.domain = row.domain || binds[2];
+        row.company_id = row.company_id || binds[3];
+        row.status = 'converted';
+        if (row.sector_key === 'uncategorized' || Number(row.sector_confidence || 0) < Number(binds[4] || 0)) {
+          row.sector_key = binds[5];
+        }
+        row.sector_confidence = Math.max(Number(row.sector_confidence || 0), Number(binds[6] || 0));
+        row.last_seen_at = binds[7];
+        row.last_signal_at = binds[9];
+        row.signal_strength = Math.max(previousSignalStrength, 85);
+        row.signal_strength_reasons = previousSignalStrength < 85 ? binds[11] : row.signal_strength_reasons;
+        row.enrichment_priority = 'eager';
+        row.confidence = Math.max(Number(row.confidence || 0), 1);
+        row.provisional = 0;
+        row.direction_uncertain = 0;
+        row.possible_deal_id = null;
+        row.metadata_json = binds[12];
+      }
+      return;
+    }
+
+    if (/INSERT INTO prospects/i.test(sql) && /company_id, deal_id/i.test(sql)) {
+      const normalizedName = binds[3];
+      const existing = this.prospects.find(row => row.org_id === binds[1] && row.normalized_name === normalizedName);
+      if (existing) {
+        const previousSignalStrength = Number(existing.signal_strength || 0);
+        existing.canonical_name = String(binds[2]).length > String(existing.canonical_name || '').length ? binds[2] : existing.canonical_name;
+        existing.domain = existing.domain || binds[4];
+        existing.company_id = existing.company_id || binds[5];
+        existing.deal_id = existing.deal_id || binds[6];
+        existing.status = 'converted';
+        if (existing.sector_key === 'uncategorized' || Number(existing.sector_confidence || 0) < Number(binds[8] || 0)) {
+          existing.sector_key = binds[7];
+        }
+        existing.sector_confidence = Math.max(Number(existing.sector_confidence || 0), Number(binds[8] || 0));
+        existing.last_seen_at = binds[10];
+        existing.last_signal_at = binds[11];
+        existing.signal_strength = Math.max(previousSignalStrength, 85);
+        existing.signal_strength_reasons = previousSignalStrength < 85 ? binds[12] : existing.signal_strength_reasons;
+        existing.enrichment_priority = 'eager';
+        existing.confidence = Math.max(Number(existing.confidence || 0), 1);
+        existing.provisional = 0;
+        existing.direction_uncertain = 0;
+        existing.possible_deal_id = null;
+        existing.metadata_json = binds[13];
+        return;
+      }
+      this.prospects.push({
+        id: binds[0],
+        org_id: binds[1],
+        canonical_name: binds[2],
+        normalized_name: normalizedName,
+        domain: binds[4],
+        company_id: binds[5],
+        deal_id: binds[6],
+        status: 'converted',
+        visibility: 'firm',
+        sector_key: binds[7],
+        sector_confidence: binds[8],
+        first_seen_at: binds[9],
+        last_seen_at: binds[10],
+        last_signal_at: binds[11],
+        signal_count: 0,
+        evidence_count: 0,
+        signal_strength: 85,
+        signal_strength_reasons: binds[12],
+        enrichment_priority: 'eager',
+        confidence: 1,
+        provisional: 0,
+        direction_uncertain: 0,
+        metadata_json: binds[13],
+      });
+      return;
+    }
+
     if (/INSERT INTO prospects/i.test(sql)) {
       const normalizedName = binds[3];
       const existing = this.prospects.find(row => row.org_id === binds[1] && row.normalized_name === normalizedName);
@@ -576,6 +701,25 @@ describe('prospect intelligence deterministic signals', () => {
     expect(candidate.products).toEqual(['FortiLayer AI', 'FortiLayer OT']);
   });
 
+  it('generalizes attachment filename suffix canonicalization without stripping domain TLDs', () => {
+    const { canonicalizeMention } = __prospectIntelligenceTestHooks;
+    for (const suffix of ['zip', 'pdf', 'ppt', 'pptx', 'doc', 'docx', 'xls', 'xlsx', 'csv']) {
+      expect(canonicalizeMention(`Fidux.${suffix}`).canonicalName).toBe('Fidux');
+    }
+
+    for (const domainLikeName of ['Auguria.ai', 'Qunnect.io', 'Rendair.co', 'Vulcan.com', 'Nodi.dev', 'FortiLayer.tech']) {
+      expect(canonicalizeMention(domainLikeName).canonicalName).toBe(domainLikeName);
+    }
+  });
+
+  it('strips safe document-heading prefixes from real company names', () => {
+    const { canonicalizeMention } = __prospectIntelligenceTestHooks;
+
+    expect(canonicalizeMention('Company Overview Chain Reaction').canonicalName).toBe('Chain Reaction');
+    expect(canonicalizeMention('Executive Summary Qunnect').canonicalName).toBe('Qunnect');
+    expect(canonicalizeMention('Investment Memo Zero Third').canonicalName).toBe('Zero Third');
+  });
+
   it('does not strip leading digits from company names anchored by domains', () => {
     const [candidate] = extractMentionCandidatesFromText('Please coordinate with 8k-capital.com on closing items.');
     expect(candidate.canonicalName).toBe('8k Capital');
@@ -632,6 +776,85 @@ describe('prospect intelligence deterministic signals', () => {
     expect(mentions.find(mention => mention.canonicalName === 'Qunnect')?.raw).toBe('Qunnect Qunnect');
   });
 
+  it('suppresses headings, markup artifacts, and generic fragments from LLM org extraction', async () => {
+    const { extractOrganizationMentionsFromSource } = __prospectIntelligenceTestHooks;
+    const item: any = {
+      type: 'email',
+      entityType: 'document',
+      entityId: 'doc-outline',
+      subject: 'Zero Third analysis',
+      bodyText: [
+        'Company Overview Chain Reaction',
+        'What They Do',
+        'Why Now',
+        'Schema schema.org body-container column-per',
+        'Go-to market notes',
+        'Chain Reaction builds privacy infrastructure.',
+      ].join('\n'),
+      fromEmail: 'analyst@medinavc.com',
+    };
+
+    const mentions = await extractOrganizationMentionsFromSource(item, 'org-1', { INTERNAL_DOMAINS: 'medinavc.com' } as any, {
+      forceLlm: true,
+      llmExtractor: async () => [
+        { name: 'Company Overview Chain Reaction', raw: 'Company Overview Chain Reaction', context: null },
+        { name: 'What They Do', raw: 'What They Do', context: null },
+        { name: 'Why Now', raw: 'Why Now', context: null },
+        { name: 'Schema', raw: 'Schema', context: null },
+        { name: 'Go-to', raw: 'Go-to', context: null },
+        { name: 'Chain Reaction', raw: 'Chain Reaction', context: null },
+      ],
+    });
+
+    const names = mentions.map(mention => mention.canonicalName);
+    expect(names).toEqual(expect.arrayContaining(['Chain Reaction']));
+    expect(names).not.toEqual(expect.arrayContaining(['Company Overview Chain Reaction', 'What They Do', 'Why Now', 'Schema', 'Go-to']));
+  });
+
+  it('filters person and participant bundles while preserving real connector-company names', async () => {
+    const { extractOrganizationMentionsFromSource } = __prospectIntelligenceTestHooks;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-participants',
+      subject: 'Participant and company extraction',
+      bodyText: [
+        'Participants: Tony/Melissa; Melissa + Tony; Wes Cowan/Tony Jimenez; Tony Jimenez & Wes Cowan; Yesha / Khizroev; William Real of Civic Construction.',
+        'Companies: Johnson & Johnson, Procter & Gamble, Booz Allen Hamilton, Vector Capital, RHEON Labs, Mully AI.',
+      ].join('\n'),
+      fromEmail: 'external@example.com',
+    };
+
+    const mentions = await extractOrganizationMentionsFromSource(item, 'org-1', { INTERNAL_DOMAINS: 'medinavc.com' } as any, {
+      forceLlm: true,
+      llmExtractor: async () => [
+        { name: 'Tony/Melissa', raw: 'Tony/Melissa', context: null },
+        { name: 'Melissa + Tony', raw: 'Melissa + Tony', context: null },
+        { name: 'Wes Cowan/Tony Jimenez', raw: 'Wes Cowan/Tony Jimenez', context: null },
+        { name: 'Tony Jimenez & Wes Cowan', raw: 'Tony Jimenez & Wes Cowan', context: null },
+        { name: 'Yesha / Khizroev', raw: 'Yesha / Khizroev', context: null },
+        { name: 'William Real of Civic Construction', raw: 'William Real of Civic Construction', context: null },
+        { name: 'Johnson & Johnson', raw: 'Johnson & Johnson', context: null },
+        { name: 'Procter & Gamble', raw: 'Procter & Gamble', context: null },
+        { name: 'Booz Allen Hamilton', raw: 'Booz Allen Hamilton', context: null },
+        { name: 'Vector Capital', raw: 'Vector Capital', context: null },
+        { name: 'RHEON Labs', raw: 'RHEON Labs', context: null },
+        { name: 'Mully AI', raw: 'Mully AI', context: null },
+      ],
+    });
+
+    const names = mentions.map(mention => mention.canonicalName);
+    expect(names).toEqual(expect.arrayContaining(['Johnson & Johnson', 'Procter & Gamble', 'Booz Allen Hamilton', 'Vector Capital', 'RHEON Labs', 'Mully AI']));
+    expect(names).not.toEqual(expect.arrayContaining([
+      'Tony/Melissa',
+      'Melissa + Tony',
+      'Wes Cowan/Tony Jimenez',
+      'Tony Jimenez & Wes Cowan',
+      'Yesha / Khizroev',
+      'William Real of Civic Construction',
+    ]));
+  });
+
   it('keeps keyword sectoring as a prefilter hint only', () => {
     const { sectorHintForText } = __prospectIntelligenceTestHooks;
 
@@ -639,6 +862,90 @@ describe('prospect intelligence deterministic signals', () => {
     expect(sectorHintForText('ArmyFUZE rugged hardware for Army field teams').key).toBe('aerospace_defense');
     expect(sectorHintForText('Sativa hempcrete materials for construction').key).toBe('materials_manufacturing');
     expect(sectorHintForText('A single uncategorized cold mention').key).toBe('uncategorized');
+  });
+
+  it('materializes an open deal as one converted linked prospect idempotently', async () => {
+    const db = new FakeD1();
+    db.companies.push({
+      id: 'company-qunnect',
+      org_id: 'org-1',
+      name: 'Qunnect',
+      domain: 'qunnect.io',
+      sector: 'quantum',
+    });
+    db.deals.push({
+      id: 'deal-qunnect',
+      org_id: 'org-1',
+      company_id: 'company-qunnect',
+      stage: 'talking',
+      created_at: '2026-05-01T00:00:00.000Z',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+
+    const first = await ensureProspectForDeal('org-1', 'deal-qunnect', env);
+    const second = await ensureProspectForDeal('org-1', 'deal-qunnect', env);
+
+    expect(first.action).toBe('created');
+    expect(second).toMatchObject({ action: 'already_linked', prospectId: first.prospectId });
+    expect(db.prospects).toHaveLength(1);
+    expect(db.prospects[0]).toMatchObject({
+      canonical_name: 'Qunnect',
+      normalized_name: 'qunnect',
+      domain: 'qunnect.io',
+      company_id: 'company-qunnect',
+      deal_id: 'deal-qunnect',
+      status: 'converted',
+      visibility: 'firm',
+      sector_key: 'quantum',
+      signal_strength: 85,
+      enrichment_priority: 'eager',
+      confidence: 1,
+      provisional: 0,
+      direction_uncertain: 0,
+    });
+    expect(JSON.parse(db.prospects[0].metadata_json)).toMatchObject({
+      source: 'known_deal_backlink',
+      deal_id: 'deal-qunnect',
+      company_id: 'company-qunnect',
+    });
+  });
+
+  it('links an existing prospect to an open deal instead of creating a duplicate', async () => {
+    const db = new FakeD1();
+    db.companies.push({ id: 'company-auguria', org_id: 'org-1', name: 'Auguria', domain: 'auguria.io', sector: 'cybersecurity' });
+    db.deals.push({ id: 'deal-auguria', org_id: 'org-1', company_id: 'company-auguria', stage: 'talking' });
+    db.prospects.push({
+      id: 'prospect-auguria',
+      org_id: 'org-1',
+      canonical_name: 'Auguria',
+      normalized_name: 'auguria',
+      status: 'active',
+      sector_key: 'uncategorized',
+      sector_confidence: 0,
+      signal_strength: 30,
+      signal_strength_reasons: '[]',
+      confidence: 0.75,
+      provisional: 1,
+      direction_uncertain: 1,
+      metadata_json: '{}',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+
+    const result = await ensureProspectForDeal('org-1', 'deal-auguria', env);
+
+    expect(result).toMatchObject({ action: 'updated', prospectId: 'prospect-auguria' });
+    expect(db.prospects).toHaveLength(1);
+    expect(db.prospects[0]).toMatchObject({
+      id: 'prospect-auguria',
+      deal_id: 'deal-auguria',
+      company_id: 'company-auguria',
+      status: 'converted',
+      sector_key: 'cybersecurity',
+      signal_strength: 85,
+      provisional: 0,
+      direction_uncertain: 0,
+      possible_deal_id: null,
+    });
   });
 
   it('builds an LLM classifier prompt where the model decides mention type, direction, and sector', () => {
@@ -669,13 +976,23 @@ describe('prospect intelligence deterministic signals', () => {
     expect(prompt.system).toContain('record_context');
     expect(prompt.system).toContain('If in doubt between relationship vs meeting');
     expect(prompt.system).toContain('Never put a nearby company here');
+    expect(prompt.system).toContain('False-positive traps to avoid');
+    expect(prompt.system).toContain('participant bundle');
+    expect(prompt.system).toContain('Generated meeting summaries');
     expect(prompt.user).toContain('SOURCE_TYPE: email');
     expect(prompt.user).toContain('MENTION (the company in question): Auguria');
   });
 
   it('deterministically vetoes obvious non-investable create-prospect mentions', () => {
     const { prospectCreateVetoForMention } = __prospectIntelligenceTestHooks;
-    const blocked = [
+    const blocked: Array<{
+      company: string;
+      action?: 'create_prospect' | 'attach_existing_deal';
+      excerpt: string;
+      reasoning: string;
+      prospectCompanyName?: string;
+      senderAndContext?: string;
+    }> = [
       ['Join with Google Meet', 'Calendar invite with Join with Google Meet details.'],
       ['Meeting link meet.google.com/cya-yrux-nbm Join by phone', 'Calendar meeting link text.'],
       ['Vimeo', 'Video link for WavePoint Solutions hosted on Vimeo.'],
@@ -683,7 +1000,16 @@ describe('prospect intelligence deterministic signals', () => {
       ['Gillette Stadium', 'Gillette Stadium is a customer deployment location.'],
       ['Finalis Securities LLC', 'Finalis Securities LLC is the exclusive financial advisor for WavePoint.'],
       ['Sheehanfinance', 'sheehanfinance.com is the advisor domain facilitating the raise.'],
+      ['CJW Quantum', 'CJW Quantum Consulting LLC is a consulting firm advising the conversation.'],
+      ['eMerge Americas', 'eMerge Americas is a sourcing/channel partner around the deal.'],
+      ['Tony’s Florida Quantum', 'Tony’s Florida Quantum note is a generated meeting-summary title, not a company.'],
       ['Cedar Pine', 'Cedar Pine is just relationship context; WavePoint Solutions is the actual company being pitched.'],
+      ['Front Porch', 'Front Porch is a hybrid venture vehicle investing in funds.'],
+      ['What They Do', 'What They Do is a document section heading in the company memo.'],
+      ['Schema', 'Schema appears to be schema.org markup in the email HTML.'],
+      ['Tony/Melissa', 'Tony/Melissa are meeting participants, not the company being pitched.'],
+      ['Digitalera Group', 'OnID was introduced by Digitalera Group as the intro source.'],
+      ['8k Capital', '8k Capital is mentioned as a meeting participant at the fundraising meeting.'],
     ];
 
     for (const [companyName, rawExcerpt] of blocked) {
@@ -711,6 +1037,10 @@ describe('prospect intelligence deterministic signals', () => {
       ['Qusecure', 'Qusecure is introduced as a quantum security investment opportunity.'],
       ['Vulcan', 'Vulcan is being sent as a prospect for review.'],
       ['Rendair', 'Rendair is a company being presented for investment consideration.'],
+      ['Classiq', 'Intro to Classiq founders for an investment opportunity; Classiq introduced their quantum software platform and deck.'],
+      ['Universal Quantum', 'Lazard is presenting Universal Quantum as an investment opportunity with a deck.'],
+      ['Johnson & Johnson', 'Johnson & Johnson is being evaluated as a strategic investment opportunity.'],
+      ['Vector Capital', 'Vector Capital is being presented as the investment target with a deck.'],
     ];
 
     for (const [companyName, rawExcerpt] of valid) {
@@ -883,6 +1213,176 @@ describe('prospect intelligence deterministic signals', () => {
     expect(candidate.canonicalName).toBe('Auguria');
   });
 
+  it('extracts likely target companies from high-signal subjects and about blocks', () => {
+    const names = extractMentionCandidatesFromText([
+      'Overkast update and demo video',
+      'HI Tony, we now have a demo video to share.',
+      'Platform turning energy rebates into instant revenue for contractors backed by Fifth Wall and Keyframe',
+      '--- About Sealed Sealed helps contractors monetize rebates.',
+      'Company Name artlabs Company URL https://artlabs.ai Founder(s) Ben Smith Short Description AI art tooling',
+      'Re: Intro Bea (Suma Wealth) / Medina Ventures',
+    ].join('\n')).map(candidate => candidate.canonicalName);
+
+    expect(names).toEqual(expect.arrayContaining(['Overkast', 'Sealed', 'Artlabs', 'Suma Wealth']));
+    expect(names).not.toContain('April. We');
+  });
+
+  it('vetoes wrong target-role entities while preserving the actual pitched company', () => {
+    const { prospectValuableActionVetoForMention } = __prospectIntelligenceTestHooks;
+    const blocked = [
+      {
+        company: 'Ligo Partners',
+        excerpt: 'About Sealed Sealed helps contractors monetize rebates.',
+        reasoning: 'Sealed is being introduced as an investment opportunity by Ligo Partners with traction metrics.',
+      },
+      {
+        company: 'Fifth Wall',
+        excerpt: 'Platform backed by Fifth Wall and Keyframe. About Sealed Sealed helps contractors.',
+        reasoning: 'Fifth Wall is an investor/backer context; Sealed is the company being pitched.',
+      },
+      {
+        company: 'Lazard',
+        excerpt: 'Universal Quantum has executed a co-lead agreement and is raising.',
+        reasoning: 'Universal Quantum is being presented as an investment opportunity by Lazard.',
+      },
+      {
+        company: 'Ascendo Venture Capital',
+        excerpt: 'Re: Intro Bea (Suma Wealth) / Medina Ventures. Suma Wealth is raising a priced seed.',
+        reasoning: 'SUMA Wealth is being actively pitched by Ascendo VC as an investment opportunity.',
+      },
+      {
+        company: 'JP Morgan Chase',
+        action: 'attach_existing_deal',
+        excerpt: 'Qunnect established development initiatives with design partners including JP Morgan Chase.',
+        reasoning: 'JP Morgan Chase is mentioned as a design partner of Qunnect, not the deal company.',
+      },
+      {
+        company: 'KSDT',
+        action: 'attach_existing_deal',
+        excerpt: 'Meeting Summary: Medina Ventures x KSDT. KSDT is the accounting and advisory firm reviewing another company.',
+        reasoning: 'KSDT is an advisory participant, not the deal company.',
+      },
+      {
+        company: 'BLD Holdings',
+        excerpt: 'Re: Medina LP Reference Intro. BLD Holdings is a prospective LP conversation.',
+        reasoning: 'BLD Holdings is being introduced as a prospective LP for the fund.',
+      },
+      {
+        company: 'Quantonation',
+        excerpt: 'Quantonation shared memQ as the investment opportunity.',
+        reasoning: 'memQ is the actual company being pitched; Quantonation is the investor/source context.',
+        prospectCompanyName: 'memQ',
+      },
+      {
+        company: 'Helix Earth',
+        excerpt: 'NVCA SmartBrief digest reported Helix Earth fundraise news.',
+        reasoning: 'Helix Earth appears in informational fundraise news only.',
+      },
+      {
+        company: 'Foundationallm',
+        excerpt: 'Re: Fwd: Meeting SubQ <> Medina & eMerge. Great meeting you and excited to learn more about SubQ.',
+        senderAndContext: 'from ZoinerTejada@foundationaLLM.ai; subject Re: Fwd: Meeting SubQ <> Medina & eMerge',
+        reasoning: 'FoundationaLLM is reaching out, but SubQ is the company being discussed.',
+      },
+      {
+        company: 'Kriptos',
+        excerpt: 'Weekly meeting recap from 4Degrees network. Here are people you met with that you may want to add to 4Degrees.',
+        senderAndContext: 'from mail@4degrees.ai; subject Weekly meeting recap',
+        reasoning: 'Meeting recap shows Medina met with the CEO of Kriptos.',
+      },
+    ];
+
+    for (const row of blocked) {
+      expect(prospectValuableActionVetoForMention({
+        prospectAction: row.action || 'create_prospect',
+        companyName: row.company,
+        rawMention: row.company,
+        rawExcerpt: row.excerpt,
+        senderAndContext: row.senderAndContext || 'from external@example.com',
+        prospectCompanyName: row.prospectCompanyName,
+        llmReasoning: row.reasoning,
+      })).toMatchObject({ applied: true });
+    }
+
+    expect(prospectValuableActionVetoForMention({
+      prospectAction: 'create_prospect',
+      companyName: 'Sealed',
+      rawMention: 'Sealed',
+      rawExcerpt: 'About Sealed Sealed helps contractors monetize rebates and is raising growth capital.',
+      senderAndContext: 'from alec@ligopartners.com',
+      llmReasoning: 'Sealed is the company being pitched as an investment opportunity.',
+    })).toMatchObject({ applied: false });
+
+    expect(prospectValuableActionVetoForMention({
+      prospectAction: 'create_prospect',
+      companyName: 'Minette.ai',
+      rawMention: 'Minette.ai',
+      rawExcerpt: 'Minette.ai is a founder reply sharing what they are building and asking for time with Medina.',
+      senderAndContext: 'from founder@minette.ai; subject Re: Intro Minette.ai <> Medina',
+      llmReasoning: 'Minette.ai is being introduced to Medina Ventures as an investment opportunity.',
+    })).toMatchObject({ applied: false });
+
+    expect(prospectValuableActionVetoForMention({
+      prospectAction: 'create_prospect',
+      companyName: 'Somewearlabs',
+      rawMention: 'Somewearlabs',
+      rawExcerpt: 'Somewear Labs is a Seattle-based space-tech company introduced to Medina by a warm intro.',
+      senderAndContext: 'from james@somewearlabs.com; subject Re: An introduction for Tony and James',
+      llmReasoning: 'Somewear Labs is being introduced to Medina Ventures as an investment opportunity.',
+    })).toMatchObject({ applied: false });
+
+    expect(prospectValuableActionVetoForMention({
+      prospectAction: 'create_prospect',
+      companyName: 'Somewear Labs',
+      rawMention: 'Somewear Labs',
+      rawExcerpt: 'Somewear Labs is a Seattle-based space-tech company introduced to Medina by a warm intro.',
+      senderAndContext: 'from james@somewearlabs.com; subject Re: An introduction for Tony and James',
+      llmReasoning: 'Somewear Labs is being introduced to Medina Ventures as an investment opportunity.',
+    })).toMatchObject({ applied: false });
+
+    expect(prospectValuableActionVetoForMention({
+      prospectAction: 'attach_existing_deal',
+      companyName: 'Alvaro Gonzalez-Rico',
+      rawMention: 'Alvaro Gonzalez-Rico',
+      rawExcerpt: 'Meeting summary includes Alvaro Gonzalez-Rico as an internal participant while the team discusses a known deal.',
+      senderAndContext: 'from meeting-summary@firefly',
+      llmReasoning: 'The surrounding meeting discusses a known deal, but Alvaro Gonzalez-Rico is a person/participant.',
+    })).toMatchObject({ applied: true, reason: 'person_or_participant_bundle' });
+
+    for (const companyName of ['Mergeit', 'Spookstock', 'TerraMarc']) {
+      expect(prospectValuableActionVetoForMention({
+        prospectAction: 'attach_existing_deal',
+        companyName,
+        rawMention: companyName,
+        rawExcerpt: `${companyName} appears in an internal generated meeting summary as stale portfolio context with no current deal evidence.`,
+        senderAndContext: 'from meeting-summary@firefly',
+        llmReasoning: `${companyName} is only an existing portfolio/company context mention, not a current deal signal.`,
+      })).toMatchObject({
+        applied: true,
+        reason: 'weak_known_deal_context_without_target_signal',
+        nonValuableAction: 'record_context',
+      });
+    }
+
+    expect(prospectValuableActionVetoForMention({
+      prospectAction: 'attach_existing_deal',
+      companyName: 'NeuralSeek',
+      rawMention: 'NeuralSeek',
+      rawExcerpt: 'NeuralSeek is the known deal company being pitched outbound to Mastercard as a potential customer.',
+      senderAndContext: 'from lucas@medinavc.com',
+      llmReasoning: 'Known portfolio/deal company being pitched outbound.',
+    })).toMatchObject({ applied: false });
+
+    expect(prospectValuableActionVetoForMention({
+      prospectAction: 'attach_existing_deal',
+      companyName: 'Tech D',
+      rawMention: 'Tech D',
+      rawExcerpt: 'Tech D is a known operating entity inside the NeuralSeek deal structure.',
+      senderAndContext: 'from meeting-summary@firefly',
+      llmReasoning: 'Tech D is a known operating entity within the existing portfolio investment structure.',
+    })).toMatchObject({ applied: false });
+  });
+
   it('uses the shared organization extractor without email scaffolding or fund people', async () => {
     const db = new FakeD1();
     const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
@@ -977,6 +1477,56 @@ describe('prospect intelligence deterministic signals', () => {
     expect(stats.prefilter_dropped).toBe(1);
     expect(stats.signals_recorded).toBe(0);
     expect(callClaudeWithUsageMock).not.toHaveBeenCalled();
+  });
+
+  it('records prospect signals from document source items with the same durable keying', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValueOnce({
+      text: '{"prospect_action":"create_prospect","prospect_company_name":"Artlabs","direction":"inbound","sector_key":"ai_data","sector_confidence":0.8,"confidence":0.94,"reasoning":"The document is a company profile and pitch for Artlabs."}',
+      usage: { input_tokens: 100, output_tokens: 24 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'document',
+      source: 'outlook',
+      externalId: 'doc-1',
+      subject: 'Artlabs investment memo',
+      bodyText: 'Company Name Artlabs Company URL https://artlabs.ai Founder(s) Ben Smith Short Description AI art infrastructure. Artlabs is raising a seed round and attached a pitch deck.',
+      bodyPreview: 'Artlabs is raising a seed round.',
+      sentAt: '2026-05-01T00:00:00.000Z',
+      orgId: 'org-1',
+      visibility: 'private',
+      entityType: 'document',
+      entityId: 'doc-1',
+      contactIds: [],
+      participantUserIds: [],
+      metadata: {
+        org_id: 'org-1',
+        visibility: 'private',
+        document_type: 'pitch_deck',
+        source_table: 'documents',
+        source_id: 'doc-1',
+        r2_key: 'org-1/document/doc-1.pdf',
+        created_at: '2026-05-01T00:00:00.000Z',
+        primary_entity_id: 'doc-1',
+      },
+      text: 'Company Name Artlabs Company URL https://artlabs.ai Founder(s) Ben Smith Short Description AI art infrastructure. Artlabs is raising a seed round and attached a pitch deck.',
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env, { ingestionMode: 'live' });
+
+    expect(stats.signals_recorded).toBe(1);
+    expect(stats.prospects_upserted).toBe(1);
+    expect(db.prospectSignals[0]).toMatchObject({
+      source_type: 'document',
+      source_id: 'doc-1',
+      mention_ordinal: 1,
+      mention_type: 'inbound_prospect',
+      ingestion_mode: 'live',
+      prospect_id: db.prospects[0].id,
+    });
   });
 
   it('marks the static classifier context for Anthropic prompt caching', () => {
@@ -1294,6 +1844,60 @@ describe('prospect intelligence deterministic signals', () => {
       mention_type: 'known_deal',
       deal_id: 'deal-qunnect',
       prospect_id: null,
+      resolution_status: 'resolved',
+    });
+  });
+
+  it('attaches known_deal signals to an already materialized deal-backed prospect', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValueOnce({
+      text: '{"prospect_action":"attach_existing_deal","prospect_company_name":null,"direction":"inbound","sector_key":"quantum","sector_confidence":0.9,"confidence":0.95,"reasoning":"Known deal context."}',
+      usage: { input_tokens: 90, output_tokens: 20 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    db.companies.push({ id: 'company-qunnect', org_id: 'org-1', name: 'Qunnect', domain: 'qunnect.io' });
+    db.deals.push({ id: 'deal-qunnect', org_id: 'org-1', company_id: 'company-qunnect', stage: 'talking' });
+    db.prospects.push({
+      id: 'prospect-qunnect',
+      org_id: 'org-1',
+      canonical_name: 'Qunnect',
+      normalized_name: 'qunnect',
+      deal_id: 'deal-qunnect',
+      status: 'converted',
+      sector_key: 'quantum',
+      sector_confidence: 0.9,
+      signal_strength: 85,
+      signal_strength_reasons: '["known_deal_backlink"]',
+      confidence: 1,
+      provisional: 0,
+      direction_uncertain: 0,
+      metadata_json: '{}',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-qunnect-existing',
+      source: 'email',
+      subject: 'Intro to Qunnect',
+      bodyText: 'Qunnect founder@qunnect.io is raising and attached a deck.',
+      bodyPreview: 'Qunnect founder@qunnect.io',
+      fromEmail: 'alice@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+      attachments: [{ id: 'a1', name: 'Qunnect Deck.pdf', size: 100, contentType: 'application/pdf' }],
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(stats.skipped_known_deal).toBe(1);
+    expect(stats.prospects_upserted).toBe(0);
+    expect(db.prospects).toHaveLength(1);
+    expect(db.prospectSignals[0]).toMatchObject({
+      mention_type: 'known_deal',
+      deal_id: 'deal-qunnect',
+      prospect_id: 'prospect-qunnect',
       resolution_status: 'resolved',
     });
   });
@@ -1713,5 +2317,13 @@ describe('prospect intelligence deterministic signals', () => {
     expect(sql).toContain('prospect_classifier_samples');
     expect(sql).not.toMatch(/thesis_score|thesis_band|review_queue/i);
     expect(sql).not.toMatch(/ALTER TABLE\s+deals[\s\S]*prospect_id/i);
+  });
+
+  it('keeps migration 0116 aligned with the known-deal backlink contract', () => {
+    const sql = readFileSync('migrations/0116_prospect_deal_backlinks.sql', 'utf8');
+
+    expect(sql).toContain('CREATE UNIQUE INDEX IF NOT EXISTS uniq_prospects_org_deal_active');
+    expect(sql).toContain('ON prospects(org_id, deal_id)');
+    expect(sql).toContain('WHERE deleted_at IS NULL AND deal_id IS NOT NULL');
   });
 });

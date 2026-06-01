@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import process from 'node:process';
@@ -26,6 +26,9 @@ interface Args {
   configPath: string;
   maxTextChars: number;
   allowLlmExtraction: boolean;
+  forceLlmExtraction: boolean;
+  appendExisting: boolean;
+  topUpStratum?: Stratum;
 }
 
 interface RemoteMeta {
@@ -119,6 +122,9 @@ function parseArgs(argv: string[]): Args {
     configPath: args.get('config') || 'wrangler.toml',
     maxTextChars: Number.isFinite(maxTextChars) ? maxTextChars : 6000,
     allowLlmExtraction: args.get('allow-llm-extraction') === 'true',
+    forceLlmExtraction: args.get('force-llm-extraction') === 'true',
+    appendExisting: args.get('append-existing') === 'true',
+    topUpStratum: args.get('top-up-stratum') as Stratum | undefined,
   };
 }
 
@@ -190,6 +196,17 @@ async function loadExistingSourceIds(path: string): Promise<Set<string>> {
   const text = await readFile(path, 'utf8');
   const rows = parseGoldRecords(text, path);
   return new Set(rows.map(row => `${row.source_type}:${row.source_id}`));
+}
+
+async function loadExistingPositiveRecords(path: string): Promise<OutputRecord[]> {
+  if (!existsSync(path)) return [];
+  const text = await readFile(path, 'utf8');
+  return text
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => JSON.parse(line) as OutputRecord)
+    .filter(record => record.source_type && record.source_id && record.deterministic_key);
 }
 
 function sourceKey(row: SourceCandidate): string {
@@ -344,6 +361,7 @@ async function loadKnownEntities(args: Args, meta: RemoteMeta): Promise<KnownEnt
 
 async function loadSources(args: Args, meta: RemoteMeta, known: KnownEntity[]): Promise<SourceCandidate[]> {
   const sources: SourceCandidate[] = [];
+  const inboundLimit = args.topUpStratum === 'enriched_inbound' ? 1200 : 180;
   const inboundTerms = ['introducing', 'introduction', 'connect you with', 'warm intro', 'deck', 'pitch', 'raising', 'fundraise', 'diligence', 'demo'];
   const hardNegativeTerms = ['invoice', 'billing', 'docusign', 'greenberg', 'ramp', 'mastercard', 'investor', 'led by', 'newsletter', 'press', 'salesforce', 'verification', 'reseller', 'customer', 'partner'];
   const introTerms = ['introducing', 'introduction from', 'forwarding', 'deal flow', 'armyfuze', 'diu', 'accelerator', 'cohort'];
@@ -366,7 +384,7 @@ async function loadSources(args: Args, meta: RemoteMeta, known: KnownEntity[]): 
     args,
     meta,
     `source != 'slack' AND lower(COALESCE(from_email, '')) NOT LIKE '%medinavc.com%' AND ${likeAny(['subject', 'body_preview'], inboundTerms)}`,
-    180,
+    inboundLimit,
     'enriched_inbound',
     'inbound_prospect'
   ));
@@ -391,7 +409,8 @@ async function loadSources(args: Args, meta: RemoteMeta, known: KnownEntity[]): 
     seen.add(key);
     if (!source.bodyText.trim() && !source.sourceTitle.trim()) return false;
     const tk = targetKey(source);
-    const ceiling = Math.max(((TARGETS as any)[tk] || 24) * 4, 60);
+    const multiplier = args.topUpStratum && source.stratum === args.topUpStratum ? 20 : 4;
+    const ceiling = Math.max(((TARGETS as any)[tk] || 24) * multiplier, 60);
     if ((perTargetSeen[tk] || 0) >= ceiling) return false;
     perTargetSeen[tk] = (perTargetSeen[tk] || 0) + 1;
     return true;
@@ -442,13 +461,25 @@ async function extractMentionsForText(args: Args, env: Env, known: KnownEntity[]
     knownContext: { knownDeals: known, knownDealmakers: [] },
     maxLlmOrganizations: 12,
     allowLlm,
+    forceLlm: args.forceLlmExtraction && allowLlm,
   });
 }
 
-async function extractRecords(args: Args, env: Env, known: KnownEntity[], sources: SourceCandidate[], existingSources: Set<string>): Promise<OutputRecord[]> {
+async function extractRecords(
+  args: Args,
+  env: Env,
+  known: KnownEntity[],
+  sources: SourceCandidate[],
+  existingSources: Set<string>,
+  existingRecords: OutputRecord[]
+): Promise<OutputRecord[]> {
   const counts: Record<string, number> = {};
   const records: OutputRecord[] = [];
-  const seen = new Set<string>();
+  for (const record of existingRecords) {
+    counts[targetKey(record as unknown as SourceCandidate)] = (counts[targetKey(record as unknown as SourceCandidate)] || 0) + 1;
+  }
+  const seen = new Set<string>(existingRecords.map(record => `${record.deterministic_key}:${normalize(record.company_as_mentioned)}`));
+  const targetStrata = args.topUpStratum ? new Set<Stratum>([args.topUpStratum]) : null;
   const sorted = [...sources].sort((a, b) => {
     const ta = targetKey(a);
     const tb = targetKey(b);
@@ -457,6 +488,7 @@ async function extractRecords(args: Args, env: Env, known: KnownEntity[], source
   });
 
   for (const source of sorted) {
+    if (targetStrata && !targetStrata.has(source.stratum)) continue;
     const tk = targetKey(source);
     if ((counts[tk] || 0) >= (TARGETS as any)[tk]) continue;
     if (existingSources.has(sourceKey(source))) continue;
@@ -489,6 +521,7 @@ async function extractRecords(args: Args, env: Env, known: KnownEntity[], source
       const deterministicKey = `${source.sourceType}:${source.sourceId}:${mention.mentionOrdinal}:${mention.spanStart ?? 'na'}:${mention.spanEnd ?? 'na'}`;
       const dedupeKey = `${deterministicKey}:${mention.normalizedName}`;
       if (seen.has(dedupeKey)) continue;
+      if (existingRecords.some(record => record.deterministic_key === deterministicKey)) continue;
       seen.add(dedupeKey);
       const context = mention.contextText || mention.lineText || source.bodyText;
       records.push({
@@ -572,37 +605,47 @@ function countBy<T extends string>(records: OutputRecord[], get: (record: Output
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const remoteMeta: RemoteMeta = { rows_read: 0, rows_written: 0, changed_db: false };
-  const existingSources = await loadExistingSourceIds(args.existingGoldSetPath);
+  const csvPath = join(args.outputDir, 'positive-enriched-test.human-labeling.csv');
+  const jsonlPath = join(args.outputDir, 'positive-enriched-test.candidates.jsonl');
+  const manifestPath = join(args.outputDir, 'positive-enriched-test.manifest.json');
+  const existingGoldSources = await loadExistingSourceIds(args.existingGoldSetPath);
+  const existingPositiveRecords = args.appendExisting ? await loadExistingPositiveRecords(jsonlPath) : [];
+  const existingSources = new Set<string>([
+    ...existingGoldSources,
+    ...existingPositiveRecords.map(record => `${record.source_type}:${record.source_id}`),
+  ]);
   const known = await loadKnownEntities(args, remoteMeta);
   const sources = await loadSources(args, remoteMeta, known);
-  process.stderr.write(`sampled ${sources.length} source candidates; existing source exclusions=${existingSources.size}; allow_llm=${args.allowLlmExtraction}\n`);
+  process.stderr.write(`sampled ${sources.length} source candidates; existing source exclusions=${existingSources.size}; existing_positive_rows=${existingPositiveRecords.length}; allow_llm=${args.allowLlmExtraction}; force_llm=${args.forceLlmExtraction}; top_up=${args.topUpStratum || 'all'}\n`);
   const proxy = args.allowLlmExtraction ? await getPlatformProxy({ configPath: args.configPath }) : null;
   const env = proxy ? proxy.env as unknown as Env : {} as Env;
   try {
-    const records = await extractRecords(args, env, known, sources, existingSources);
+    const records = await extractRecords(args, env, known, sources, existingSources, existingPositiveRecords);
+    const allRecords = args.appendExisting ? [...existingPositiveRecords, ...records] : records;
     await mkdir(args.outputDir, { recursive: true });
-    const csvPath = join(args.outputDir, 'positive-enriched-test.human-labeling.csv');
-    const jsonlPath = join(args.outputDir, 'positive-enriched-test.candidates.jsonl');
-    const manifestPath = join(args.outputDir, 'positive-enriched-test.manifest.json');
-    await writeFile(csvPath, humanLabelingCsv(records), 'utf8');
-    await writeFile(jsonlPath, records.map(record => JSON.stringify(record)).join('\n') + (records.length ? '\n' : ''), 'utf8');
+    await writeFile(csvPath, humanLabelingCsv(allRecords), 'utf8');
+    await writeFile(jsonlPath, allRecords.map(record => JSON.stringify(record)).join('\n') + (allRecords.length ? '\n' : ''), 'utf8');
     const manifest = {
       generated_at: new Date().toISOString(),
       org_id: args.orgId,
-      rows: records.length,
+      rows: allRecords.length,
       csv_path: csvPath,
       jsonl_path: jsonlPath,
       split: 'test',
-      existing_gold_set_deduped_sources: existingSources.size,
+      existing_gold_set_deduped_sources: existingGoldSources.size,
+      existing_positive_rows_before_append: existingPositiveRecords.length,
+      new_rows_appended: records.length,
       source_candidates_read: sources.length,
       org_extractor_llm_used_after_deterministic_preview_gate: args.allowLlmExtraction,
+      org_extractor_llm_forced: args.forceLlmExtraction,
+      top_up_stratum: args.topUpStratum || null,
       remote_d1_meta: remoteMeta,
       remote_source_tables_rows_written: remoteMeta.rows_written || 0,
       remote_source_tables_changed_db: Boolean(remoteMeta.changed_db),
       target_counts: TARGETS,
-      stratum_counts: countBy(records, record => record.stratum),
-      expected_class_counts: countBy(records, record => record.expected_class),
-      representative_n_for_future_recall_gate: records.filter(record => record.stratum === 'representative').length,
+      stratum_counts: countBy(allRecords, record => record.stratum),
+      expected_class_counts: countBy(allRecords, record => record.expected_class),
+      representative_n_for_future_recall_gate: allRecords.filter(record => record.stratum === 'representative').length,
       classifier_used: false,
       label_columns_blank: true,
       notes: [

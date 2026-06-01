@@ -524,6 +524,12 @@ export async function createDeal(
   } catch (e) {
     console.error(`[deals] auto-link contacts failed for new deal ${id}:`, e);
   }
+  try {
+    const { ensureProspectForDeal } = await import('../lib/prospect-intelligence');
+    await ensureProspectForDeal(ctx.orgId, id, env);
+  } catch (e) {
+    console.error(`[deals] known-deal prospect backlink failed for new deal ${id}:`, e);
+  }
   const created = await env.D1.prepare('SELECT * FROM deals WHERE id = ?').bind(id).first();
   return jsonResponse({ deal: created }, 201);
 }

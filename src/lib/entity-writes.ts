@@ -625,6 +625,19 @@ export async function updateDealFields(
 
   await invalidateRagCache(ctx.orgId, env);
 
+  const nextStage = 'stage' in passingFields ? String(passingFields.stage || '') : String((after as any)?.stage || '');
+  const shouldRefreshKnownDealBacklink =
+    'company_id' in passingFields ||
+    (stageChanged && nextStage !== 'closed' && nextStage !== 'closed_won' && nextStage !== 'closed_lost');
+  if (shouldRefreshKnownDealBacklink) {
+    try {
+      const { ensureProspectForDeal } = await import('./prospect-intelligence');
+      await ensureProspectForDeal(ctx.orgId, dealId, env);
+    } catch (e) {
+      console.error(`[entity-writes] known-deal prospect backlink refresh failed for ${dealId}:`, e);
+    }
+  }
+
   return {
     ok: true,
     applied: passingFields,
@@ -1034,6 +1047,12 @@ export async function createDealRecord(
     await embedDeal(id, ctx.orgId, env);
   } catch (e) {
     console.error(`[entity-writes] embedDeal failed for ${id}:`, e);
+  }
+  try {
+    const { ensureProspectForDeal } = await import('./prospect-intelligence');
+    await ensureProspectForDeal(ctx.orgId, id, env);
+  } catch (e) {
+    console.error(`[entity-writes] known-deal prospect backlink failed for ${id}:`, e);
   }
 
   return { ok: true, id };

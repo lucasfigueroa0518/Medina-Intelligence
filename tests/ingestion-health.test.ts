@@ -172,4 +172,28 @@ describe('ingestion health', () => {
     expect(incidentInsert?.binds).toContain('critical');
     expect(incidentInsert?.binds).toContain(1);
   });
+
+  it('does not auto-requeue deterministic Vectorize payload quarantines', async () => {
+    const d1 = makeD1Mock({
+      deadLetters: [{
+        id: 'wq-vector',
+        org_id: 'org-1',
+        domain: 'embed_retry',
+        payload: JSON.stringify({ entity_id: 'doc-1', source_table: 'documents' }),
+        last_error: 'vectorize_payload_quarantined: VECTOR_UPSERT_ERROR (code = 40023): failed to parse upsert vectors request',
+        created_at: '2026-05-23T00:00:00.000Z',
+      }],
+    });
+
+    const result = await scanAndRepairIngestion('org-1', makeEnv(d1));
+
+    expect(result.dead_letters_requeued).toBe(0);
+    expect(d1.runs.some((r: any) =>
+      r.sql.includes('UPDATE work_queue') &&
+      r.sql.includes("status = 'pending'")
+    )).toBe(false);
+    const incidentInsert = d1.runs.find((r: any) => r.sql.includes('INSERT INTO ingestion_incidents'));
+    expect(incidentInsert?.binds).toContain('vectorize_payload_quarantined');
+    expect(incidentInsert?.binds).toContain('embedding');
+  });
 });

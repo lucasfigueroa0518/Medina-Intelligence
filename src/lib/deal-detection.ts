@@ -70,6 +70,14 @@ export interface DealDetectionResult {
   confidence?: number | null;
 }
 
+export interface DealDetectionBatchStats {
+  deal_signals_staged: number;
+  deal_candidates_seen: number;
+  deal_candidates_scanned: number;
+  deal_candidates_deferred: number;
+  deal_skip_reasons: Record<string, number>;
+}
+
 function normalizeCompanyName(name: string | null | undefined): string {
   return (name || '')
     .toLowerCase()
@@ -99,6 +107,55 @@ function looksLikeDealCandidate(item: ClassifiedItem): boolean {
   if (item.type !== 'email' && item.type !== 'calendar_event' && item.type !== 'slack_message') return false;
   const haystack = `${item.subject || ''}\n${item.bodyText || ''}\n${item.bodyPreview || ''}`.toLowerCase();
   return looksLikeDealText(haystack);
+}
+
+function emptyBatchStats(): DealDetectionBatchStats {
+  return {
+    deal_signals_staged: 0,
+    deal_candidates_seen: 0,
+    deal_candidates_scanned: 0,
+    deal_candidates_deferred: 0,
+    deal_skip_reasons: {},
+  };
+}
+
+function incrementReason(stats: DealDetectionBatchStats, reason: string, count = 1): void {
+  const key = reason || 'unknown';
+  stats.deal_skip_reasons[key] = (stats.deal_skip_reasons[key] || 0) + count;
+}
+
+function sourceTypeForClassifiedItem(item: ClassifiedItem): 'conversation' | 'event' {
+  return item.type === 'calendar_event' ? 'event' : 'conversation';
+}
+
+async function enqueueDeferredDealCandidate(
+  orgId: string,
+  item: ClassifiedItem,
+  env: Env,
+  origin: string
+): Promise<boolean> {
+  if (!item.companyId) return false;
+  const sourceType = sourceTypeForClassifiedItem(item);
+  const { enqueueWork } = await import('./work-queue');
+  const result = await enqueueWork(
+    env,
+    orgId,
+    'deal_evidence_detect',
+    {
+      source_type: sourceType,
+      source_id: item.entityId,
+      company_id: item.companyId,
+      origin,
+      detected_at: new Date().toISOString(),
+    },
+    {
+      upstream: 'claude',
+      idempotency_key: `${orgId}:${sourceType}:${item.entityId}:${item.companyId}:deal_evidence_detect:v1`,
+      priority: 15,
+      max_attempts: 5,
+    }
+  );
+  return result.inserted || Boolean(result.id);
 }
 
 export async function detectDealSignalForSource(
@@ -202,8 +259,19 @@ export async function detectAndStageDealSignals(
   orgId: string,
   env: Env
 ): Promise<number> {
+  const stats = await detectAndStageDealSignalsDetailed(items, orgId, env);
+  return stats.deal_signals_staged;
+}
+
+export async function detectAndStageDealSignalsDetailed(
+  items: ClassifiedItem[],
+  orgId: string,
+  env: Env
+): Promise<DealDetectionBatchStats> {
+  const stats = emptyBatchStats();
   let candidates = items.filter(looksLikeDealCandidate);
-  if (candidates.length === 0) return 0;
+  stats.deal_candidates_seen = candidates.length;
+  if (candidates.length === 0) return stats;
 
   // Wave 1: drop candidates whose target company is an internal Medina-side
   // entity. Otherwise the LLM keeps generating create_deal proposals for
@@ -222,21 +290,34 @@ export async function detectAndStageDealSignals(
       const skipped = before - candidates.length;
       if (skipped > 0) {
         console.log(`[deal-detect] skipped ${skipped} candidates targeting internal entities`);
+        incrementReason(stats, 'internal_company', skipped);
       }
     }
   }
-  if (candidates.length === 0) return 0;
+  if (candidates.length === 0) return stats;
 
   // Cap LLM calls per ingestion cycle so a noisy batch can't eat the budget.
   const MAX_LLM_CALLS = 20;
   const budget = candidates.slice(0, MAX_LLM_CALLS);
-
-  let staged = 0;
+  const overflow = candidates.slice(MAX_LLM_CALLS);
+  if (overflow.length > 0) {
+    stats.deal_candidates_deferred = overflow.length;
+    incrementReason(stats, 'llm_budget_overflow_deferred', overflow.length);
+    for (const item of overflow) {
+      try {
+        await enqueueDeferredDealCandidate(orgId, item, env, 'llm_budget_overflow');
+      } catch (e) {
+        console.error('[deal-detect] failed to enqueue overflow candidate:', e);
+        incrementReason(stats, 'overflow_enqueue_failed');
+      }
+    }
+  }
 
   for (const item of budget) {
-    const sourceType = item.type === 'calendar_event' ? 'event' : 'conversation';
+    const sourceType = sourceTypeForClassifiedItem(item);
     let result: DealDetectionResult;
     try {
+      stats.deal_candidates_scanned++;
       result = await detectDealSignalForSource({
         orgId,
         companyId: item.companyId!,
@@ -252,17 +333,20 @@ export async function detectAndStageDealSignals(
       }, env);
     } catch (e) {
       console.error('[deal-detect] claude call failed:', e);
+      incrementReason(stats, 'llm_error');
       continue;
     }
 
     if (result.recorded) {
-      staged++;
+      stats.deal_signals_staged++;
       console.log(
         `[deal-detect] recorded evidence company=${result.companyName || item.companyId} source=${sourceType}:${item.entityId} ` +
         `confidence=${result.confidence ?? 'unknown'} promotion=${result.reason}${result.dealId ? ` deal=${result.dealId}` : ''}`
       );
+    } else {
+      incrementReason(stats, result.reason);
     }
   }
 
-  return staged;
+  return stats;
 }

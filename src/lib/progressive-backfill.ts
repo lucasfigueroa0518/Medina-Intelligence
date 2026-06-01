@@ -18,7 +18,7 @@ export interface ProgressiveBackfillJob {
   user_id: string;
   window_size_days: number;
   total_windows: number;
-  status: 'active' | 'completed' | 'cancelled';
+  status: 'active' | 'completed' | 'cancelled' | 'failed';
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -37,6 +37,67 @@ export interface ProgressiveBackfillWindow {
   started_at: string | null;
   completed_at: string | null;
   last_error: string | null;
+}
+
+async function markProgressiveBackfillFailed(
+  env: Env,
+  opts: {
+    orgId: string;
+    userId: string;
+    parentId: string;
+    windowId: string;
+    windowIndex: number;
+    message: string;
+    startDate?: string | null;
+    endDate?: string | null;
+    cause?: unknown;
+  }
+): Promise<void> {
+  const message = opts.message.slice(0, 500);
+  await env.KV.delete(`backfill_progress:${opts.userId}`).catch(() => undefined);
+  await env.D1.prepare(
+    `UPDATE progressive_backfill_windows
+        SET status = 'failed',
+            last_error = ?,
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(message, opts.windowId).run();
+  await env.D1.prepare(
+    `UPDATE progressive_backfill_jobs
+        SET status = 'failed',
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND status = 'active'`
+  ).bind(opts.parentId).run();
+
+  try {
+    const { reportIngestionFailure } = await import('./ingestion-health');
+    await reportIngestionFailure(env, {
+      orgId: opts.orgId,
+      source: 'outlook_email',
+      scopeType: 'progressive_backfill_window',
+      scopeId: opts.windowId,
+      code: 'progressive_backfill_terminal_graph_error',
+      title: 'Progressive backfill window failed terminally',
+      message,
+      severity: 'warning',
+      humanActionRequired: false,
+      metadata: {
+        parent_id: opts.parentId,
+        user_id: opts.userId,
+        window_id: opts.windowId,
+        window_index: opts.windowIndex,
+        start_date: opts.startDate,
+        end_date: opts.endDate,
+        cause: opts.cause instanceof Error ? opts.cause.message : opts.cause ? String(opts.cause).slice(0, 500) : null,
+      },
+    });
+  } catch (e) {
+    console.error(
+      `[progressive-backfill] terminal failure incident report failed for ${opts.windowId}:`,
+      e instanceof Error ? e.message : e
+    );
+  }
 }
 
 /**
@@ -251,6 +312,23 @@ export async function driveProgressiveBackfill(
   ).bind(parent.id).first<ProgressiveBackfillWindow>();
 
   if (!win) {
+    const failed = await env.D1.prepare(
+      `SELECT COUNT(*) AS count
+         FROM progressive_backfill_windows
+        WHERE parent_id = ? AND status = 'failed'`
+    ).bind(parent.id).first<{ count: number }>();
+    if ((failed?.count || 0) > 0) {
+      await env.KV.delete(`backfill_progress:${userId}`).catch(() => undefined);
+      await env.D1.prepare(
+        `UPDATE progressive_backfill_jobs
+            SET status = 'failed',
+                completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND status = 'active'`
+      ).bind(parent.id).run();
+      return { advanced: false, status: 'failed', note: 'parent failed due to failed child window' };
+    }
+
     // All windows done — finalize parent.
     await env.D1.prepare(
       `UPDATE progressive_backfill_jobs
@@ -282,11 +360,33 @@ export async function driveProgressiveBackfill(
     });
   } catch (e: any) {
     const msg = String(e?.message || e).slice(0, 500);
-    await env.D1.prepare(
-      `UPDATE progressive_backfill_windows
-          SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ?`
-    ).bind(msg, win.id).run();
+    await markProgressiveBackfillFailed(env, {
+      orgId,
+      userId,
+      parentId: parent.id,
+      windowId: win.id,
+      windowIndex: win.window_index,
+      startDate: win.start_date,
+      endDate: win.end_date,
+      message: msg,
+      cause: e,
+    });
+    return { advanced: true, window_index: win.window_index, status: 'failed', note: msg };
+  }
+
+  if (result.status === 'failed') {
+    const msg = String(result.error || 'progressive backfill failed').slice(0, 500);
+    await markProgressiveBackfillFailed(env, {
+      orgId,
+      userId,
+      parentId: parent.id,
+      windowId: win.id,
+      windowIndex: win.window_index,
+      startDate: win.start_date,
+      endDate: win.end_date,
+      message: msg,
+      cause: result.error || result.status,
+    });
     return { advanced: true, window_index: win.window_index, status: 'failed', note: msg };
   }
 

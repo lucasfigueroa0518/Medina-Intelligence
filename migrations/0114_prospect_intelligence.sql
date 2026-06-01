@@ -153,7 +153,7 @@ CREATE TABLE IF NOT EXISTS prospect_signals (
     REFERENCES prospect_sectors(key),
   sector_confidence REAL NOT NULL DEFAULT 0,
   signal_kind TEXT NOT NULL DEFAULT 'unknown'
-    CHECK(signal_kind IN ('intro','raise','deck','meeting','call','list_entry','cold_mention','unknown')),
+    CHECK(signal_kind IN ('intro','raise','deck','meeting','list_entry','cold_mention','unknown')),
   dealmaker_id TEXT REFERENCES dealmakers(id) ON DELETE SET NULL,
   dealmaker_name TEXT,
   has_deck INTEGER NOT NULL DEFAULT 0 CHECK(has_deck IN (0,1)),
@@ -307,6 +307,8 @@ CREATE INDEX IF NOT EXISTS idx_prospect_backfill_coverage_org_family
 -- Extend entity_field_state to support prospects. SQLite cannot relax a CHECK
 -- in place, so preserve all current rows and rebuild with the widened enum.
 PRAGMA foreign_keys = OFF;
+
+DROP TABLE IF EXISTS entity_field_state_new;
 
 CREATE TABLE IF NOT EXISTS entity_field_state_new (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),

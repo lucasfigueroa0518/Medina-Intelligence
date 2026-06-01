@@ -36,6 +36,8 @@ import type { WorkQueueHandler } from '../work-queue-driver';
 import { recordUsage, recordRateLimit } from '../upstream-budget';
 import { embedDocumentItem, embedSingleItem } from '../daily-cron';
 import { enqueueDocumentEmbeddingRepair } from '../document-embedding';
+import { isDeterministicVectorizePayloadError } from '../embedding';
+import { deadLetterWork } from '../work-queue';
 
 interface EmbedRetryPayload {
   entity_id: string;
@@ -51,6 +53,29 @@ const TRANSIENT_RATE_LIMIT_PATTERNS = [
   '429',
   'rate_limit',
 ];
+
+async function markVectorizePayloadQuarantined(
+  env: Env,
+  itemId: string,
+  orgId: string,
+  payload: EmbedRetryPayload,
+  error: string
+): Promise<void> {
+  if (payload.source_table !== 'documents') return;
+  await env.D1.prepare(
+    `UPDATE documents
+        SET custom_fields = json_set(
+              CASE WHEN custom_fields IS NOT NULL AND json_valid(custom_fields)
+                   THEN custom_fields ELSE '{}' END,
+              '$.embedding_quarantined_at', strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              '$.embedding_quarantine_code', 'vectorize_payload_quarantined',
+              '$.embedding_quarantine_work_queue_id', ?,
+              '$.embedding_quarantine_reason', ?
+            ),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(itemId, error.slice(0, 500), payload.entity_id, orgId).run();
+}
 
 export const embedRetryHandler: WorkQueueHandler = {
   domain: 'embed_retry',
@@ -121,6 +146,13 @@ export const embedRetryHandler: WorkQueueHandler = {
       await recordUsage(env, item.org_id, null, 'bge', 'per_second');
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
+      if (isDeterministicVectorizePayloadError(e)) {
+        const quarantineMessage = `vectorize_payload_quarantined: entity=${source_table}:${entity_id} ${errMsg}`.slice(0, 900);
+        await markVectorizePayloadQuarantined(env, item.id, item.org_id, payload, quarantineMessage);
+        await deadLetterWork(env, item.id, quarantineMessage);
+        return;
+      }
+
       // Rate-limit detection — same shape patterns as the prior drain.
       // Trips the bge ledger's 429 counter; on 3 consecutive 429s the
       // circuit opens for 30min and Phase 5's claimNextBatch will skip

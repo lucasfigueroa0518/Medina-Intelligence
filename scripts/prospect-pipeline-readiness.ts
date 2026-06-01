@@ -1,0 +1,253 @@
+#!/usr/bin/env node
+import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import process from 'node:process';
+import {
+  evaluateProspectClassifierGate,
+  type ProspectClassifierGateResult,
+} from './prospect-classifier-gate';
+
+export type ProspectPipelineReadinessStatus = 'pass' | 'warn' | 'fail';
+
+export interface ProspectPipelineReadinessCheck {
+  name: string;
+  status: ProspectPipelineReadinessStatus;
+  detail: string;
+}
+
+export interface ProspectPipelineReadinessResult {
+  passed: boolean;
+  checks: ProspectPipelineReadinessCheck[];
+}
+
+export interface ProspectPipelineReadinessSources {
+  packageJson: string;
+  workQueueDriver: string;
+  prospectDetectHandler: string;
+  prospectPipelineCanary: string;
+  prospectIntelligence: string;
+  materializeKnownDeals: string;
+  migrationReadinessCheck: string;
+  migration0114: string;
+  migration0115: string;
+  migration0116: string;
+}
+
+interface Args {
+  summaryPath: string | null;
+  manifestPath: string | null;
+}
+
+const DEFAULT_FILES = {
+  packageJson: 'package.json',
+  workQueueDriver: 'src/lib/work-queue-driver.ts',
+  prospectDetectHandler: 'src/lib/work-queue-handlers/prospect-detect.ts',
+  prospectPipelineCanary: 'scripts/prospect-pipeline-canary.ts',
+  prospectIntelligence: 'src/lib/prospect-intelligence.ts',
+  materializeKnownDeals: 'scripts/prospect-materialize-known-deals.ts',
+  migrationReadinessCheck: 'scripts/prospect-migration-readiness-check.ts',
+  migration0114: 'migrations/0114_prospect_intelligence.sql',
+  migration0115: 'migrations/0115_ingestion_evidence_hardening.sql',
+  migration0116: 'migrations/0116_prospect_deal_backlinks.sql',
+} as const;
+
+function parseArgs(argv: string[]): Args {
+  const raw = new Map<string, string>();
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (!token.startsWith('--')) continue;
+    const key = token.slice(2);
+    const next = argv[i + 1];
+    if (!next || next.startsWith('--')) raw.set(key, 'true');
+    else {
+      raw.set(key, next);
+      i += 1;
+    }
+  }
+  return {
+    summaryPath: raw.get('summary') || raw.get('replay-benchmark-summary') || null,
+    manifestPath: raw.get('manifest') || null,
+  };
+}
+
+async function readJson(path: string): Promise<Record<string, unknown>> {
+  return JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+}
+
+async function readDefaultSources(): Promise<ProspectPipelineReadinessSources> {
+  const entries = await Promise.all(
+    Object.entries(DEFAULT_FILES).map(async ([key, path]) => [key, await readFile(path, 'utf8')] as const)
+  );
+  return Object.fromEntries(entries) as unknown as ProspectPipelineReadinessSources;
+}
+
+function check(
+  name: string,
+  passed: boolean,
+  detail: string,
+  statusOnFail: ProspectPipelineReadinessStatus = 'fail'
+): ProspectPipelineReadinessCheck {
+  return { name, status: passed ? 'pass' : statusOnFail, detail };
+}
+
+function gateChecksToReadiness(gate: ProspectClassifierGateResult): ProspectPipelineReadinessCheck[] {
+  return gate.checks.map(entry => ({
+    name: `classifier_gate.${entry.name}`,
+    status: entry.passed ? 'pass' : 'fail',
+    detail: `actual=${String(entry.actual)} expected=${entry.expected}`,
+  }));
+}
+
+export function evaluateProspectPipelineReadiness(input: {
+  sources: ProspectPipelineReadinessSources;
+  summary?: Record<string, unknown> | null;
+  manifest?: Record<string, unknown> | null;
+}): ProspectPipelineReadinessResult {
+  const checks: ProspectPipelineReadinessCheck[] = [];
+  const sources = input.sources;
+  const packageJson = JSON.parse(sources.packageJson) as { scripts?: Record<string, string> };
+
+  if (input.summary) {
+    checks.push(...gateChecksToReadiness(evaluateProspectClassifierGate({
+      summary: input.summary,
+      manifest: input.manifest || null,
+    })));
+  } else {
+    checks.push({
+      name: 'classifier_gate.available',
+      status: 'warn',
+      detail: 'No replay summary supplied. Run with --summary and --manifest before GO.',
+    });
+  }
+
+  checks.push(
+    check(
+      'package.pipeline_readiness_script',
+      packageJson.scripts?.['prospect:pipeline-readiness'] === 'tsx scripts/prospect-pipeline-readiness.ts',
+      'package.json exposes npm run prospect:pipeline-readiness'
+    ),
+    check(
+      'package.classifier_gate_script',
+      packageJson.scripts?.['prospect:classifier-gate'] === 'tsx scripts/prospect-classifier-gate.ts',
+      'package.json exposes npm run prospect:classifier-gate'
+    ),
+    check(
+      'package.pipeline_canary_script',
+      packageJson.scripts?.['prospect:pipeline-canary'] === 'tsx scripts/prospect-pipeline-canary.ts',
+      'package.json exposes npm run prospect:pipeline-canary'
+    ),
+    check(
+      'package.migration_readiness_script',
+      packageJson.scripts?.['prospect:migration-readiness'] === 'tsx scripts/prospect-migration-readiness-check.ts',
+      'package.json exposes npm run prospect:migration-readiness'
+    ),
+    check(
+      'work_queue.prospect_detect_registered',
+      /prospectDetectHandler/.test(sources.workQueueDriver) &&
+        /work-queue-handlers\/prospect-detect/.test(sources.workQueueDriver),
+      'prospect_detect is registered in the shared work queue driver'
+    ),
+    check(
+      'work_queue.prospect_detect_retry_safety',
+      /deadLetterWork/.test(sources.prospectDetectHandler) &&
+        /deferWork/.test(sources.prospectDetectHandler) &&
+        /CLAUDE_RATE_LIMITED\|429/.test(sources.prospectDetectHandler),
+      'prospect_detect dead-letters malformed/missing rows and defers Claude/rate-limit failures'
+    ),
+    check(
+      'work_queue.prospect_detect_idempotency',
+      /idempotency_key/.test(sources.prospectDetectHandler) &&
+        /:prospect_detect:v1/.test(sources.prospectDetectHandler),
+      'manual/canary prospect enqueue path uses stable idempotency keys'
+    ),
+    check(
+      'canary.dry_run_only',
+      /rows_written:\s*0/.test(sources.prospectPipelineCanary) &&
+        /changed_db:\s*false/.test(sources.prospectPipelineCanary) &&
+        !/enqueueProspectDetectSource/.test(sources.prospectPipelineCanary),
+      'prospect pipeline canary reads source rows and emits payloads without enqueuing or writing'
+    ),
+    check(
+      'canary.remote_read_proof_available',
+      /wrangler_d1_remote_select/.test(sources.prospectPipelineCanary) &&
+        /REMOTE_D1_READ_ONLY_VIOLATION/.test(sources.prospectPipelineCanary) &&
+        /rows_written/.test(sources.prospectPipelineCanary) &&
+        /changed_db/.test(sources.prospectPipelineCanary),
+      'prospect pipeline canary can use wrangler D1 remote SELECTs and aborts unless rows_written=0 and changed_db=false'
+    ),
+    check(
+      'classifier.runtime_hooks_available',
+      /detectAndRecordProspectSignals/.test(sources.prospectIntelligence) &&
+        /prospectSourceType/.test(sources.prospectIntelligence),
+      'classifier exposes the shared source-to-signal runtime used by live and queued paths'
+    ),
+    check(
+      'known_deal_materialization.explicit_go_required',
+      /APPLY_REQUIRES_EXPLICIT_GO/.test(sources.materializeKnownDeals) &&
+        /confirmProductionWrite/.test(sources.materializeKnownDeals),
+      'known-deal materialization cannot apply from CLI without explicit production-write confirmation'
+    ),
+    check(
+      'migration.readiness_script_available',
+      /runProspectMigrationReadinessCheck/.test(sources.migrationReadinessCheck) &&
+        /mkdtempSync/.test(sources.migrationReadinessCheck) &&
+        /EXPECTED_INDEXES/.test(sources.migrationReadinessCheck),
+      'migration readiness proof runs against throwaway SQLite databases and checks indexes/constraints'
+    ),
+    check(
+      'migration.0114_prospect_tables',
+      /CREATE TABLE IF NOT EXISTS prospects/.test(sources.migration0114) &&
+        /CREATE TABLE IF NOT EXISTS prospect_signals/.test(sources.migration0114) &&
+        /CREATE TABLE IF NOT EXISTS prospect_backfill_coverage/.test(sources.migration0114) &&
+        /CREATE TABLE IF NOT EXISTS prospect_classifier_samples/.test(sources.migration0114),
+      'prospect intelligence migration includes prospects, signals, coverage, and classifier audit tables'
+    ),
+    check(
+      'migration.0114_rebuild_guard',
+      /DROP TABLE IF EXISTS entity_field_state_new/.test(sources.migration0114),
+      'prospect migration clears stale entity_field_state_new rebuild table before recreating it'
+    ),
+    check(
+      'migration.0115_rebuild_guard',
+      /DROP TABLE IF EXISTS progressive_backfill_jobs_new/.test(sources.migration0115) &&
+        /CREATE INDEX IF NOT EXISTS idx_pbj_org_status/.test(sources.migration0115),
+      'ingestion hardening rebuild migration clears stale temp table and recreates indexes idempotently'
+    ),
+    check(
+      'migration.0116_known_deal_backlink_index',
+      /CREATE UNIQUE INDEX IF NOT EXISTS uniq_prospects_org_deal_active/.test(sources.migration0116) &&
+        /ON prospects\(org_id, deal_id\)/.test(sources.migration0116),
+      'known-deal prospect backlinks enforce one live prospect per deal'
+    )
+  );
+
+  checks.push({
+    name: 'production_rollout.go_gate',
+    status: 'warn',
+    detail: 'Readiness check is read-only. Migration apply, materialization apply, backfills, deploys, and live production enablement still require Lucas GO.',
+  });
+
+  return {
+    passed: checks.every(entry => entry.status !== 'fail'),
+    checks,
+  };
+}
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+  const [sources, summary, manifest] = await Promise.all([
+    readDefaultSources(),
+    args.summaryPath ? readJson(args.summaryPath) : Promise.resolve(null),
+    args.manifestPath ? readJson(args.manifestPath) : Promise.resolve(null),
+  ]);
+  const result = evaluateProspectPipelineReadiness({ sources, summary, manifest });
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (!result.passed) process.exitCode = 1;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(error => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

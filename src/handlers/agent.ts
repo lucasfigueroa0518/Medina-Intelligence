@@ -312,7 +312,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
       properties: {
         days_back: { type: 'number', description: 'Lookback window. Default 180 days.' },
         sector: { type: 'string', description: 'Optional exact sector key/label such as fintech, cybersecurity, ai_data, aerospace_defense, or materials_manufacturing.' },
-        include_provisional: { type: 'boolean', description: 'Include provisional prospects. Default true.' },
+        include_provisional: { type: 'boolean', description: 'Include provisional and direction-uncertain prospects. Default false; the default view is high-integrity active/converted deal flow.' },
         limit: { type: 'number', description: 'Max recent prospects to include. Default 20, max 100.' },
       },
     },
@@ -330,7 +330,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
             { type: 'string' },
             { type: 'array', items: { type: 'string' } },
           ],
-          description: 'Status filter. Defaults to active and provisional.',
+          description: 'Status filter. Defaults to high-integrity active and converted prospects. Pass provisional explicitly to inspect lower-confidence records.',
         },
         enrichment_priority: { type: 'string', enum: ['eager', 'lazy'], description: 'Filter by signal-strength enrichment priority.' },
         limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },

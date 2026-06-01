@@ -1395,7 +1395,7 @@ function prospectStatusFilter(inputStatus: unknown): string[] {
     return inputStatus.map(s => String(s)).filter(Boolean);
   }
   const status = String(inputStatus || '').trim();
-  return status ? [status] : ['active', 'provisional'];
+  return status ? [status] : ['active', 'converted'];
 }
 
 function canonicalProspectIdSql(alias = 'p'): string {
@@ -1434,7 +1434,7 @@ async function prospectAnswerQualifiers(
   const prospectWhere: string[] = [
     'p.org_id = ?',
     'p.deleted_at IS NULL',
-    "p.status IN ('active','provisional')",
+    "p.status IN ('active','provisional','converted')",
   ];
   const prospectBinds: unknown[] = [ctx.orgId];
   const signalWhere: string[] = ['s.org_id = ?'];
@@ -1514,6 +1514,10 @@ export async function searchProspects(
     where.push(`p.status IN (${statuses.map(() => '?').join(',')})`);
     binds.push(...statuses);
   }
+  if (input.status == null) {
+    where.push('p.provisional = 0');
+    where.push('p.direction_uncertain = 0');
+  }
 
   const keyword = cleanTerm(input.keyword);
   if (keyword) {
@@ -1581,7 +1585,7 @@ export async function queryDealFlow(
   },
   env: Env
 ): Promise<any> {
-  const where: string[] = ['p.org_id = ?', 'p.deleted_at IS NULL', "p.status IN ('active','provisional')"];
+  const where: string[] = ['p.org_id = ?', 'p.deleted_at IS NULL', "p.status IN ('active','provisional','converted')"];
   const binds: unknown[] = [ctx.orgId];
   const daysBack = typeof input.days_back === 'number' && Number.isFinite(input.days_back)
     ? Math.min(Math.max(Math.floor(input.days_back), 1), 3650)
@@ -1589,8 +1593,10 @@ export async function queryDealFlow(
   where.push("p.last_seen_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)");
   binds.push(`-${daysBack} days`);
 
-  if (input.include_provisional === false) {
+  const includeProvisional = input.include_provisional === true;
+  if (!includeProvisional) {
     where.push('p.provisional = 0');
+    where.push('p.direction_uncertain = 0');
   }
 
   const sector = normalizeSectorKey(input.sector);
@@ -1625,7 +1631,7 @@ export async function queryDealFlow(
          JOIN prospects p ON p.id = s.prospect_id
          LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
         WHERE ${whereSql.replace(/\bp\./g, 'p.')}
-          AND s.mention_type = 'inbound_prospect'
+          AND s.mention_type IN ('inbound_prospect','known_deal')
         GROUP BY s.source_type
         ORDER BY signal_count DESC`
     ).bind(...binds).all<any>(),
@@ -1667,7 +1673,7 @@ export async function queryDealFlow(
     })),
     qualifiers: {
       days_back: daysBack,
-      include_provisional: input.include_provisional !== false,
+      include_provisional: includeProvisional,
       sector_filter: sector || null,
       sort: 'recency_then_signal_strength',
       dedup: 'COUNT(DISTINCT COALESCE(possible_duplicate_of, id))',
@@ -1696,7 +1702,9 @@ export async function getProspectDigest(
   const where: string[] = [
     'p.org_id = ?',
     'p.deleted_at IS NULL',
-    "p.status IN ('active','provisional')",
+    "p.status IN ('active','provisional','converted')",
+    'p.provisional = 0',
+    'p.direction_uncertain = 0',
     "p.last_seen_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)",
   ];
   const binds: unknown[] = [ctx.orgId, `-${daysBack} days`];
@@ -3401,6 +3409,7 @@ export const __agentToolsTestHooks = {
   cleanEventText,
   conversationLookbackDays,
   conversationSearchCteSql,
+  prospectStatusFilter,
   shouldCheckSlackFreshness,
   shouldUseSlackFreshnessFallback,
   shouldUseDeterministicSlackRecentFallback,

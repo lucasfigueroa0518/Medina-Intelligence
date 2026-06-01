@@ -36,6 +36,10 @@ export interface ProcessClassifiedStats {
   attachments_skipped: number;
   attachments_failed: number;
   deal_signals_staged: number;
+  deal_candidates_seen: number;
+  deal_candidates_scanned: number;
+  deal_candidates_deferred: number;
+  deal_skip_reasons: Record<string, number>;
   prospect_signals_recorded: number;
   prospects_upserted: number;
   prospect_classifications_pending: number;
@@ -53,6 +57,10 @@ function emptyStats(): ProcessClassifiedStats {
     attachments_skipped: 0,
     attachments_failed: 0,
     deal_signals_staged: 0,
+    deal_candidates_seen: 0,
+    deal_candidates_scanned: 0,
+    deal_candidates_deferred: 0,
+    deal_skip_reasons: {},
     prospect_signals_recorded: 0,
     prospects_upserted: 0,
     prospect_classifications_pending: 0,
@@ -162,10 +170,17 @@ export async function processClassifiedItems(
   }
 
   // Phase 4 — detect deals. Also missing from inline-backfill before Wave 2.
-  // detectAndStageDealSignals self-caps at 20 LLM calls per batch.
+  // detectAndStageDealSignalsDetailed scans the first 20 candidates inline and
+  // enqueues overflow to deal_evidence_detect so budget caps are visible and
+  // recoverable instead of silently dropping deal-looking sources.
   try {
-    const { detectAndStageDealSignals } = await import('./deal-detection');
-    stats.deal_signals_staged = await detectAndStageDealSignals(classified, ctx.orgId, env);
+    const { detectAndStageDealSignalsDetailed } = await import('./deal-detection');
+    const dealStats = await detectAndStageDealSignalsDetailed(classified, ctx.orgId, env);
+    stats.deal_signals_staged = dealStats.deal_signals_staged;
+    stats.deal_candidates_seen = dealStats.deal_candidates_seen;
+    stats.deal_candidates_scanned = dealStats.deal_candidates_scanned;
+    stats.deal_candidates_deferred = dealStats.deal_candidates_deferred;
+    stats.deal_skip_reasons = dealStats.deal_skip_reasons;
   } catch (e: any) {
     stats.errors.push({ phase: 'detect-deals', error: e?.message || String(e) });
   }
@@ -236,6 +251,8 @@ export async function persistClassifiedStats(
     stats.items_total > 0 ||
     stats.attachments_attempted > 0 ||
     stats.deal_signals_staged > 0 ||
+    stats.deal_candidates_seen > 0 ||
+    stats.deal_candidates_deferred > 0 ||
     stats.prospect_signals_recorded > 0 ||
     stats.prospect_classifications_pending > 0 ||
     stats.embed_failures > 0 ||
@@ -256,6 +273,9 @@ export async function persistClassifiedStats(
             '$.attachments_skipped',   COALESCE(json_extract(metadata, '$.attachments_skipped'),   0) + ?,
             '$.attachments_failed',    COALESCE(json_extract(metadata, '$.attachments_failed'),    0) + ?,
             '$.deal_signals_staged',   COALESCE(json_extract(metadata, '$.deal_signals_staged'),   0) + ?,
+            '$.deal_candidates_seen',   COALESCE(json_extract(metadata, '$.deal_candidates_seen'),   0) + ?,
+            '$.deal_candidates_scanned', COALESCE(json_extract(metadata, '$.deal_candidates_scanned'), 0) + ?,
+            '$.deal_candidates_deferred', COALESCE(json_extract(metadata, '$.deal_candidates_deferred'), 0) + ?,
             '$.prospect_signals_recorded', COALESCE(json_extract(metadata, '$.prospect_signals_recorded'), 0) + ?,
             '$.prospects_upserted',    COALESCE(json_extract(metadata, '$.prospects_upserted'),    0) + ?,
             '$.prospect_classifications_pending', COALESCE(json_extract(metadata, '$.prospect_classifications_pending'), 0) + ?
@@ -264,10 +284,22 @@ export async function persistClassifiedStats(
     ).bind(
       stats.items_total, stats.items_staged, stats.items_embedded, stats.embed_failures,
       stats.attachments_attempted, stats.attachments_processed, stats.attachments_skipped, stats.attachments_failed,
-      stats.deal_signals_staged,
+      stats.deal_signals_staged, stats.deal_candidates_seen, stats.deal_candidates_scanned, stats.deal_candidates_deferred,
       stats.prospect_signals_recorded, stats.prospects_upserted, stats.prospect_classifications_pending,
       syncJobId
     ).run();
+
+    if (Object.keys(stats.deal_skip_reasons || {}).length > 0) {
+      await env.D1.prepare(
+        `UPDATE sync_jobs
+            SET metadata = json_set(
+              COALESCE(metadata, '{}'),
+              '$.deal_skip_reasons',
+              json(?)
+            )
+          WHERE id = ?`
+      ).bind(JSON.stringify(stats.deal_skip_reasons), syncJobId).run();
+    }
 
     // Persist error context for debugging. Latest-wins (no accumulation
     // across calls) — for the dangling-row diagnostic the first page's

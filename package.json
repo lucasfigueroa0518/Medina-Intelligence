@@ -19,7 +19,13 @@
     "test:agent": "vitest run tests/agent-runtime.test.ts tests/agent-tools.test.ts tests/citations.test.ts tests/claude.test.ts tests/firm-relationship-state.test.ts",
     "test:max": "vitest run tests/max-set-builder.test.ts",
     "prospect:spike": "tsx scripts/prospect-classifier-spike.ts",
-    "prospect:universes": "tsx scripts/prospect-classifier-universe-spike.ts"
+    "prospect:universes": "tsx scripts/prospect-classifier-universe-spike.ts",
+    "prospect:classifier-gate": "tsx scripts/prospect-classifier-gate.ts",
+    "prospect:pipeline-readiness": "tsx scripts/prospect-pipeline-readiness.ts",
+    "prospect:pipeline-canary": "tsx scripts/prospect-pipeline-canary.ts",
+    "prospect:migration-readiness": "tsx scripts/prospect-migration-readiness-check.ts",
+    "prospect:large-experiment": "tsx scripts/prospect-large-classifier-experiment.ts",
+    "prospect:materialize-known-deals": "tsx scripts/prospect-materialize-known-deals.ts"
   },
   "dependencies": {
     "@e965/xlsx": "^0.20.3",
