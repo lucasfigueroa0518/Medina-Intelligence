@@ -4072,7 +4072,7 @@ async function loadBackfillItemsForFamily(
   if (family === 'conversation') {
     const rows = await env.D1.prepare(
       `SELECT id, source, subject, body_preview, sent_at, from_email, to_emails, cc_emails,
-              direction, visibility, participant_user_ids, body_r2_key
+              direction, 'private' AS visibility, participant_user_ids, body_r2_key
          FROM conversations
         WHERE org_id = ? AND sent_at >= ? AND sent_at < ?
         ORDER BY sent_at DESC

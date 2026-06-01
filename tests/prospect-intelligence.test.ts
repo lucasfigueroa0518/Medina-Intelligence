@@ -127,6 +127,10 @@ class FakeD1 {
         .map(row => ({ ...row }));
     }
     if (/FROM conversations/i.test(sql)) {
+      if (/body_r2_key/i.test(sql)) {
+        expect(sql).toContain("'private' AS visibility");
+        expect(sql).not.toMatch(/direction,\s*visibility\b/i);
+      }
       const [orgId, start, end, limit] = binds;
       return this.sourceConversations
         .filter(row => row.org_id === orgId && row.sent_at >= start && row.sent_at < end)
