@@ -228,6 +228,7 @@ export async function callClaudeWithUsage(
     model?: string;
     assistantPrefill?: string;
     temperature?: number;
+    dryRunNoBudgetWrites?: boolean;
   },
   priority: 'high' | 'low',
   env: Env
@@ -235,7 +236,8 @@ export async function callClaudeWithUsage(
   const orgId = params.orgId || 'system';
   const model = params.model || resolveDefaultClaudeModel();
   const budgetSource = budgetUpstreamForClaudeModel(model);
-  if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
+  const dryRunNoBudgetWrites = params.dryRunNoBudgetWrites === true;
+  if (!dryRunNoBudgetWrites && !(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
     throw new Error('CLAUDE_RATE_LIMITED');
   }
   const body = buildAnthropicRequestBody(params, model);
@@ -249,12 +251,16 @@ export async function callClaudeWithUsage(
       // 3 consecutive 429s → cap drops 10%, circuit opens 30 min.
       // Pre-3.3 the KV-backed limiter could only observe its own
       // counter; the ledger gives us upstream-driven evidence.
-      await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+      if (!dryRunNoBudgetWrites) {
+        await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+      }
       throw new Error('CLAUDE_RATE_LIMITED');
     }
     throw new Error(`Claude API error ${response.status}: ${errorBody}`);
   }
-  await recordBudgetSuccess(env, orgId, null, budgetSource, 'minute');
+  if (!dryRunNoBudgetWrites) {
+    await recordBudgetSuccess(env, orgId, null, budgetSource, 'minute');
+  }
 
   const data = (await response.json()) as ClaudeResponse;
   const textBlock = data.content.find(b => b.type === 'text');

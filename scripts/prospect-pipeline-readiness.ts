@@ -161,6 +161,22 @@ export function evaluateProspectPipelineReadiness(input: {
       'manual/canary prospect enqueue path uses stable idempotency keys'
     ),
     check(
+      'work_queue.prospect_detect_telemetry',
+      /prospect_detect_processed/.test(sources.prospectDetectHandler) &&
+        /known_deals_attached/.test(sources.prospectDetectHandler) &&
+        /record_context_skipped/.test(sources.prospectDetectHandler) &&
+        /ignored_or_noise_skipped/.test(sources.prospectDetectHandler) &&
+        /deferred_rate_limited/.test(sources.prospectDetectHandler),
+      'prospect_detect emits structured source-level telemetry for created, attached, skipped, deferred, and errored signals'
+    ),
+    check(
+      'work_queue.prospect_detect_budget_guard',
+      /upstream_budget_ledger/.test(sources.prospectDetectHandler) &&
+        /prospectClassifierBudgetUpstreams/.test(sources.prospectDetectHandler) &&
+        /classifier circuit open/.test(sources.prospectDetectHandler),
+      'prospect_detect checks the shared upstream budget ledger before classifier work'
+    ),
+    check(
       'canary.dry_run_only',
       /rows_written:\s*0/.test(sources.prospectPipelineCanary) &&
         /changed_db:\s*false/.test(sources.prospectPipelineCanary) &&
@@ -168,8 +184,21 @@ export function evaluateProspectPipelineReadiness(input: {
       'prospect pipeline canary reads source rows and emits payloads without enqueuing or writing'
     ),
     check(
+      'canary.classify_only_available',
+      /classifyProspectSignalsDryRun/.test(sources.prospectPipelineCanary) &&
+        /CANARY_READ_ONLY_SQL_VIOLATION/.test(sources.prospectPipelineCanary) &&
+        /CANARY_CLASSIFICATION_INCOMPLETE/.test(sources.prospectPipelineCanary) &&
+        /hydration_status/.test(sources.prospectPipelineCanary) &&
+        /classification_status/.test(sources.prospectPipelineCanary) &&
+        /dry_run_counter_labels/.test(sources.prospectPipelineCanary) &&
+        /canary-decisions\.jsonl/.test(sources.prospectPipelineCanary) &&
+        /No queue rows, prospects, prospect signals/.test(sources.prospectPipelineCanary),
+      'prospect pipeline canary can classify recent sources through a read-only dry-run path and write audit artifacts'
+    ),
+    check(
       'canary.remote_read_proof_available',
       /wrangler_d1_remote_select/.test(sources.prospectPipelineCanary) &&
+        /remoteReadOnlyCanaryEnv/.test(sources.prospectPipelineCanary) &&
         /REMOTE_D1_READ_ONLY_VIOLATION/.test(sources.prospectPipelineCanary) &&
         /rows_written/.test(sources.prospectPipelineCanary) &&
         /changed_db/.test(sources.prospectPipelineCanary),

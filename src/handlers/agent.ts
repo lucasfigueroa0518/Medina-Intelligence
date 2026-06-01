@@ -306,20 +306,21 @@ const AGENT_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'query_deal_flow',
-    description: 'Exact aggregate prospect/deal-flow counts from the prospect intelligence tables. Use for "how many prospects", sector counts such as fintech, recent flow, source coverage, and high-signal vs lazy enrichment rollups. Counts are firm-visible and do not depend on source-content ACL.',
+    description: 'Exact aggregate prospect/deal-flow counts from the prospect intelligence tables. Defaults to reliable high-integrity active/converted prospects, including known-deal-backed prospects linked by prospect intelligence. Use for "how many prospects", sector counts such as fintech, recent flow, source coverage, and high-signal vs lazy enrichment rollups. Counts are firm-visible and do not depend on source-content ACL.',
     input_schema: {
       type: 'object',
       properties: {
         days_back: { type: 'number', description: 'Lookback window. Default 180 days.' },
         sector: { type: 'string', description: 'Optional exact sector key/label such as fintech, cybersecurity, ai_data, aerospace_defense, or materials_manufacturing.' },
         include_provisional: { type: 'boolean', description: 'Include provisional and direction-uncertain prospects. Default false; the default view is high-integrity active/converted deal flow.' },
+        include_context: { type: 'boolean', description: 'Include weak record_context-style signal counts as a separate context_signals section. Default false; context signals never mix into the main prospect count.' },
         limit: { type: 'number', description: 'Max recent prospects to include. Default 20, max 100.' },
       },
     },
   },
   {
     name: 'search_prospects',
-    description: 'Search derived prospect identities. Default sort is recency first, then deterministic signal strength. Use sector to slice "show me fintech".',
+    description: 'Search derived prospect identities. Default view is reliable active/converted prospects only; provisional, direction-uncertain, or weak context-only records require explicit filters. Default sort is recency first, then deterministic signal strength. Use sector to slice "show me fintech".',
     input_schema: {
       type: 'object',
       properties: {
@@ -351,12 +352,13 @@ const AGENT_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'get_prospect_digest',
-    description: 'Build a recent high-signal prospect digest with dedup-aware counts, unresolved classifier/reconciler qualifiers, and ACL-safe metadata. Use before proactive MARTy summaries of deal flow.',
+    description: 'Build a recent high-signal prospect digest from reliable active/converted prospects, with dedup-aware counts, unresolved classifier/reconciler qualifiers, and ACL-safe metadata. Weak context signals are hidden unless include_context is explicitly true. Use before proactive MARTy summaries of deal flow.',
     input_schema: {
       type: 'object',
       properties: {
         days_back: { type: 'number', description: 'Lookback window. Default 14 days.' },
         sector: { type: 'string', description: 'Optional exact sector key/label such as fintech, cybersecurity, ai_data, aerospace_defense, or uncategorized.' },
+        include_context: { type: 'boolean', description: 'Include weak record_context-style signal counts as a separate context_signals section. Default false.' },
         limit: { type: 'number', description: 'Max prospects to include. Default follows current mode.' },
       },
     },

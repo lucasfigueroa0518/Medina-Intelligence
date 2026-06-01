@@ -1494,6 +1494,44 @@ async function prospectAnswerQualifiers(
   };
 }
 
+async function prospectContextSignalSummary(
+  ctx: AuthContext,
+  env: Env,
+  options: { daysBack?: number; sector?: string | null } = {}
+): Promise<Array<{ mention_type: string; source_type: string; signal_count: number; source_count: number }>> {
+  const where: string[] = [
+    's.org_id = ?',
+    `(
+      json_extract(s.metadata_json, '$.prospect_action') = 'record_context'
+      OR (
+        json_extract(s.metadata_json, '$.prospect_action') IS NULL
+        AND s.mention_type IN ('intro_source','news','noise','web_analytics')
+      )
+    )`,
+    "COALESCE(json_extract(s.metadata_json, '$.prospect_action'), '') != 'ignore'",
+  ];
+  const binds: unknown[] = [ctx.orgId];
+  if (options.daysBack && Number.isFinite(options.daysBack)) {
+    const lookback = `-${Math.min(Math.max(Math.floor(options.daysBack), 1), 3650)} days`;
+    where.push("s.occurred_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)");
+    binds.push(lookback);
+  }
+  if (options.sector) {
+    where.push('lower(s.sector_key) = ?');
+    binds.push(options.sector);
+  }
+  const rows = await env.D1.prepare(
+    `SELECT s.mention_type, s.source_type,
+            COUNT(*) AS signal_count,
+            COUNT(DISTINCT s.source_id) AS source_count
+       FROM prospect_signals s
+      WHERE ${where.join(' AND ')}
+      GROUP BY s.mention_type, s.source_type
+      ORDER BY signal_count DESC, s.mention_type ASC, s.source_type ASC`
+  ).bind(...binds).all<any>();
+  return rows.results || [];
+}
+
 export async function searchProspects(
   ctx: AuthContext,
   input: {
@@ -1581,6 +1619,7 @@ export async function queryDealFlow(
     days_back?: number;
     sector?: string;
     include_provisional?: boolean;
+    include_context?: boolean;
     limit?: number;
   },
   env: Env
@@ -1594,6 +1633,7 @@ export async function queryDealFlow(
   binds.push(`-${daysBack} days`);
 
   const includeProvisional = input.include_provisional === true;
+  const includeContext = input.include_context === true;
   if (!includeProvisional) {
     where.push('p.provisional = 0');
     where.push('p.direction_uncertain = 0');
@@ -1607,7 +1647,7 @@ export async function queryDealFlow(
 
   const whereSql = where.join(' AND ');
   const limit = Math.min(Math.max(Number(input.limit || 20), 1), 100);
-  const [totalRow, bySector, byPriority, bySource, recent, coverage, qualifiers] = await Promise.all([
+  const [totalRow, bySector, byPriority, bySource, recent, coverage, qualifiers, contextSignals] = await Promise.all([
     env.D1.prepare(`SELECT COUNT(DISTINCT ${canonicalProspectIdSql('p')}) AS total FROM prospects p LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key WHERE ${whereSql}`).bind(...binds).first<{ total: number }>(),
     env.D1.prepare(
       `SELECT p.sector_key, COALESCE(ps.label, p.sector_key) AS sector_label, COUNT(DISTINCT ${canonicalProspectIdSql('p')}) AS total
@@ -1657,6 +1697,7 @@ export async function queryDealFlow(
         GROUP BY source_family`
     ).bind(ctx.orgId).all<any>(),
     prospectAnswerQualifiers(ctx, env, { daysBack, sector }),
+    includeContext ? prospectContextSignalSummary(ctx, env, { daysBack, sector }) : Promise.resolve(null),
   ]);
 
   return {
@@ -1664,6 +1705,7 @@ export async function queryDealFlow(
     by_sector: bySector.results || [],
     by_enrichment_priority: byPriority.results || [],
     by_source: bySource.results || [],
+    context_signals: includeContext ? (contextSignals || []) : null,
     recent_prospects: (recent.results || []).map(row => ({
       ...row,
       canonical_prospect_id: row.possible_duplicate_of || row.id,
@@ -1674,6 +1716,7 @@ export async function queryDealFlow(
     qualifiers: {
       days_back: daysBack,
       include_provisional: includeProvisional,
+      include_context: includeContext,
       sector_filter: sector || null,
       sort: 'recency_then_signal_strength',
       dedup: 'COUNT(DISTINCT COALESCE(possible_duplicate_of, id))',
@@ -1690,6 +1733,7 @@ export async function getProspectDigest(
   input: {
     days_back?: number;
     sector?: string;
+    include_context?: boolean;
     limit?: number;
   },
   env: Env,
@@ -1726,7 +1770,12 @@ export async function getProspectDigest(
         ORDER BY p.signal_strength DESC, p.last_seen_at DESC NULLS LAST
         LIMIT ?`
     ).bind(...binds, limit).all<any>(),
-    queryDealFlow(ctx, { days_back: daysBack, sector: sector || undefined, limit: 5 }, env),
+    queryDealFlow(ctx, {
+      days_back: daysBack,
+      sector: sector || undefined,
+      include_context: input.include_context === true,
+      limit: 5,
+    }, env),
     prospectAnswerQualifiers(ctx, env, { daysBack, sector }),
   ]);
 
@@ -1747,6 +1796,7 @@ export async function getProspectDigest(
       by_sector: flow.by_sector,
       by_enrichment_priority: flow.by_enrichment_priority,
     },
+    context_signals: flow.context_signals,
     prospects,
     qualifiers,
     marty_guidance: 'When unresolved counts are non-zero, qualify summaries with pending/provisional/direction-uncertain state rather than presenting the digest as exhaustive truth.',

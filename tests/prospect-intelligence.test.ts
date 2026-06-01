@@ -12,10 +12,12 @@ vi.mock('../src/lib/claude', () => ({
 import {
   __prospectIntelligenceTestHooks,
   callProspectClassifier,
+  classifyProspectSignalsDryRun,
   computeSignalStrength,
   detectAndRecordProspectSignals,
   ensureProspectForDeal,
   extractMentionCandidatesFromText,
+  loadProspectClassifierKnownContext,
   mergeProspects,
   normalizeProspectName,
   applyProspectEnrichmentCandidate,
@@ -1088,6 +1090,7 @@ describe('prospect intelligence deterministic signals', () => {
     expect(knownDeal).toMatchObject({ mentionType: 'known_deal', direction: 'outbound' });
     expect(introSource).toMatchObject({ mentionType: 'noise', prospectAction: 'record_context', direction: 'inbound' });
     expect(callClaudeWithUsageMock.mock.calls.every(([request]) => request.assistantPrefill === '{')).toBe(true);
+    expect(callClaudeWithUsageMock.mock.calls.every(([request]) => request.dryRunNoBudgetWrites !== true)).toBe(true);
   });
 
   it('builds broad mention-centered context without changing deterministic ordinals', () => {
@@ -1526,6 +1529,105 @@ describe('prospect intelligence deterministic signals', () => {
       mention_type: 'inbound_prospect',
       ingestion_mode: 'live',
       prospect_id: db.prospects[0].id,
+    });
+  });
+
+  it('classifies prospect signals in dry-run mode without writing prospects or signals', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValueOnce({
+      text: '{"prospect_action":"create_prospect","prospect_company_name":"Artlabs","direction":"inbound","sector_key":"ai_data","sector_confidence":0.8,"confidence":0.94,"reasoning":"The document is a company profile and pitch for Artlabs."}',
+      usage: { input_tokens: 100, output_tokens: 24 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    const readOnlyD1 = {
+      prepare(sql: string) {
+        if (/^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/i.test(sql)) {
+          throw new Error(`unexpected write: ${sql}`);
+        }
+        return db.prepare(sql);
+      },
+    };
+    const env = { D1: readOnlyD1, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'document',
+      source: 'outlook',
+      externalId: 'doc-dry',
+      subject: 'Artlabs investment memo',
+      bodyText: 'Company Name Artlabs Company URL https://artlabs.ai Founder(s) Ben Smith Short Description AI art infrastructure. Artlabs is raising a seed round and attached a pitch deck.',
+      bodyPreview: 'Artlabs is raising a seed round.',
+      sentAt: '2026-05-01T00:00:00.000Z',
+      orgId: 'org-1',
+      visibility: 'private',
+      entityType: 'document',
+      entityId: 'doc-dry',
+      contactIds: [],
+      participantUserIds: [],
+      metadata: {
+        org_id: 'org-1',
+        visibility: 'private',
+        document_type: 'pitch_deck',
+        source_table: 'documents',
+        source_id: 'doc-dry',
+        r2_key: 'org-1/document/doc-dry.pdf',
+        created_at: '2026-05-01T00:00:00.000Z',
+        primary_entity_id: 'doc-dry',
+      },
+      text: 'Company Name Artlabs Company URL https://artlabs.ai Founder(s) Ben Smith Short Description AI art infrastructure. Artlabs is raising a seed round and attached a pitch deck.',
+    };
+
+    const result = await classifyProspectSignalsDryRun([item], 'org-1', env);
+
+    expect(result).toMatchObject({
+      dry_run: true,
+      rows_written: 0,
+      changed_db: false,
+      decision_counts: {
+        create_prospect: 1,
+        attach_existing_deal: 0,
+        record_context: 0,
+        ignore: 0,
+        classifier_error: 0,
+      },
+    });
+    expect(result.decisions[0]).toMatchObject({
+      source_type: 'document',
+      source_id: 'doc-dry',
+      company_name: 'Artlabs',
+      prospect_action: 'create_prospect',
+      duplicate_key: 'document:doc-dry:1:artlabs',
+    });
+    expect(callClaudeWithUsageMock.mock.calls[0][0]).toMatchObject({ dryRunNoBudgetWrites: true });
+    expect(db.prospects).toHaveLength(0);
+    expect(db.prospectSignals).toHaveLength(0);
+  });
+
+  it('only tolerates missing classifier context tables in explicit partial-schema dry runs', async () => {
+    const env = {
+      D1: {
+        prepare(sql: string) {
+          return {
+            bind() {
+              return this;
+            },
+            async all() {
+              if (/firm_company_relationships/i.test(sql)) {
+                throw new Error('D1_ERROR: no such table: firm_company_relationships');
+              }
+              if (/FROM dealmakers/i.test(sql)) {
+                throw new Error('D1_ERROR: no such table: dealmakers');
+              }
+              return { results: [] };
+            },
+          };
+        },
+      },
+    } as any;
+
+    await expect(loadProspectClassifierKnownContext('org-1', env)).rejects.toThrow(/firm_company_relationships/);
+    await expect(loadProspectClassifierKnownContext('org-1', env, { allowPartialSchema: true })).resolves.toEqual({
+      knownDeals: [],
+      knownDealmakers: [],
     });
   });
 

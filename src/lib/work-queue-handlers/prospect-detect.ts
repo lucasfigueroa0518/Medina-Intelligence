@@ -1,6 +1,10 @@
 import type { Env } from '../../types/env';
 import type { ChunkMetadata, ClassifiedItem } from '../../types/interfaces';
-import { detectAndRecordProspectSignals } from '../prospect-intelligence';
+import {
+  detectAndRecordProspectSignals,
+  prospectClassifierBudgetUpstreams,
+  type ProspectDetectionStats,
+} from '../prospect-intelligence';
 import { deadLetterWork, deferWork, enqueueWork } from '../work-queue';
 import type { WorkQueueHandler } from '../work-queue-driver';
 
@@ -23,10 +27,21 @@ export interface EnqueueProspectDetectInput {
   priority?: number;
 }
 
-interface ProspectSourceBundle {
+export interface ProspectSourceBundle {
   item: ClassifiedItem;
   sourceType: ProspectDetectSourceType;
   sourceId: string;
+}
+
+type ProspectDetectOutcome = 'completed' | 'deferred' | 'dead_letter' | 'failed';
+
+interface ProspectDetectTelemetryInput {
+  itemId: string;
+  orgId: string;
+  payload?: ProspectDetectPayload | null;
+  stats?: ProspectDetectionStats | null;
+  outcome: ProspectDetectOutcome;
+  error?: string | null;
 }
 
 function parsePayload(payload: string): ProspectDetectPayload {
@@ -47,6 +62,61 @@ function parsePayload(payload: string): ProspectDetectPayload {
     detected_at: parsed.detected_at,
     ingestion_mode: parsed.ingestion_mode || 'live',
   };
+}
+
+function zeroTelemetryStats(): Pick<
+  ProspectDetectionStats,
+  | 'items_scanned'
+  | 'mentions_seen'
+  | 'signals_recorded'
+  | 'prospects_upserted'
+  | 'known_deals_attached'
+  | 'record_context_skipped'
+  | 'ignored_or_noise_skipped'
+  | 'classifications_pending'
+> {
+  return {
+    items_scanned: 0,
+    mentions_seen: 0,
+    signals_recorded: 0,
+    prospects_upserted: 0,
+    known_deals_attached: 0,
+    record_context_skipped: 0,
+    ignored_or_noise_skipped: 0,
+    classifications_pending: 0,
+  };
+}
+
+function emitProspectDetectTelemetry(input: ProspectDetectTelemetryInput): void {
+  const stats = input.stats || zeroTelemetryStats();
+  const payload = input.payload || null;
+  const errored = input.error ? 1 : (input.stats?.errors.length || 0);
+  const entry = {
+    event: 'prospect_detect_processed',
+    work_queue_id: input.itemId,
+    org_id: input.orgId,
+    source_type: payload?.source_type || null,
+    source_id: payload?.source_id || null,
+    origin: payload?.origin || null,
+    ingestion_mode: payload?.ingestion_mode || null,
+    sources_scanned: Number(stats.items_scanned || 0),
+    mentions_seen: Number(stats.mentions_seen || 0),
+    signals_recorded: Number(stats.signals_recorded || 0),
+    prospects_created_or_updated: Number(stats.prospects_upserted || 0),
+    known_deals_attached: Number(stats.known_deals_attached || 0),
+    record_context_skipped: Number(stats.record_context_skipped || 0),
+    ignored_or_noise_skipped: Number(stats.ignored_or_noise_skipped || 0),
+    classification_pending: Number(stats.classifications_pending || 0),
+    errored,
+    deferred_rate_limited: input.outcome === 'deferred' ? 1 : 0,
+    outcome: input.outcome,
+    error: input.error || input.stats?.errors[0]?.error || null,
+  };
+  try {
+    console.log(JSON.stringify(entry));
+  } catch {
+    console.log('[prospect_detect_processed]', entry);
+  }
 }
 
 function normalizeDirection(value: string | null | undefined): 'inbound' | 'outbound' | 'internal' | undefined {
@@ -96,9 +166,9 @@ function parseJsonStringArray(value: string | null | undefined): string[] {
 
 async function loadConversation(env: Env, orgId: string, sourceId: string): Promise<ProspectSourceBundle | null> {
   const row = await env.D1.prepare(
-    `SELECT id, subject, body_preview, body_r2_key, source, sent_at,
-            from_email, fc.full_name AS from_name, to_emails, cc_emails,
-            direction, participant_user_ids
+    `SELECT c.id, c.subject, c.body_preview, c.body_r2_key, c.source, c.sent_at,
+            c.from_email, fc.full_name AS from_name, c.to_emails, c.cc_emails,
+            c.direction, c.participant_user_ids
        FROM conversations c
        LEFT JOIN contacts fc ON fc.id = c.from_contact_id AND fc.org_id = c.org_id
       WHERE c.id = ? AND c.org_id = ?`
@@ -308,7 +378,7 @@ async function loadDocument(env: Env, orgId: string, sourceId: string): Promise<
   };
 }
 
-async function loadSource(env: Env, orgId: string, payload: ProspectDetectPayload): Promise<ProspectSourceBundle | null> {
+export async function loadProspectDetectSource(env: Env, orgId: string, payload: ProspectDetectPayload): Promise<ProspectSourceBundle | null> {
   if (payload.source_type === 'conversation') return loadConversation(env, orgId, payload.source_id);
   if (payload.source_type === 'event') return loadEvent(env, orgId, payload.source_id);
   return loadDocument(env, orgId, payload.source_id);
@@ -317,6 +387,22 @@ async function loadSource(env: Env, orgId: string, payload: ProspectDetectPayloa
 function isDeferrableClassifierError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error || '');
   return /CLAUDE_RATE_LIMITED|429|rate.?limit|timeout|overloaded|529/i.test(message);
+}
+
+async function prospectClassifierCircuitOpen(env: Env, orgId: string): Promise<string | null> {
+  const upstreams = prospectClassifierBudgetUpstreams(env);
+  const placeholders = upstreams.map(() => '?').join(',');
+  const row = await env.D1.prepare(
+    `SELECT upstream
+       FROM upstream_budget_ledger
+      WHERE org_id = ?
+        AND upstream IN (${placeholders})
+        AND circuit_open_until IS NOT NULL
+        AND circuit_open_until > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      ORDER BY circuit_open_until DESC
+      LIMIT 1`
+  ).bind(orgId, ...upstreams).first<{ upstream: string }>();
+  return row?.upstream || null;
 }
 
 export async function enqueueProspectDetectSource(
@@ -354,18 +440,53 @@ export const prospectDetectHandler: WorkQueueHandler = {
     try {
       payload = parsePayload(item.payload);
     } catch (e) {
-      await deadLetterWork(env, item.id, `malformed prospect_detect payload: ${e instanceof Error ? e.message : String(e)}`);
+      const error = `malformed prospect_detect payload: ${e instanceof Error ? e.message : String(e)}`;
+      await deadLetterWork(env, item.id, error);
+      emitProspectDetectTelemetry({
+        itemId: item.id,
+        orgId: item.org_id,
+        payload: null,
+        outcome: 'dead_letter',
+        error,
+      });
       return;
     }
 
-    const source = await loadSource(env, item.org_id, payload);
+    const source = await loadProspectDetectSource(env, item.org_id, payload);
     if (!source) {
-      await deadLetterWork(env, item.id, `prospect_detect source not found: ${payload.source_type}:${payload.source_id}`);
+      const error = `prospect_detect source not found: ${payload.source_type}:${payload.source_id}`;
+      await deadLetterWork(env, item.id, error);
+      emitProspectDetectTelemetry({
+        itemId: item.id,
+        orgId: item.org_id,
+        payload,
+        outcome: 'dead_letter',
+        error,
+      });
       return;
     }
 
+    let stats: ProspectDetectionStats | null = null;
     try {
-      const stats = await detectAndRecordProspectSignals([source.item], item.org_id, env, {
+      const openCircuit = await prospectClassifierCircuitOpen(env, item.org_id);
+      if (openCircuit) {
+        await deferWork(
+          env,
+          item.id,
+          new Date(Date.now() + 90_000).toISOString(),
+          item.payload
+        );
+        emitProspectDetectTelemetry({
+          itemId: item.id,
+          orgId: item.org_id,
+          payload,
+          outcome: 'deferred',
+          error: `classifier circuit open: ${openCircuit}`,
+        });
+        return;
+      }
+
+      stats = await detectAndRecordProspectSignals([source.item], item.org_id, env, {
         ingestionMode: payload.ingestion_mode || 'live',
       });
       const deferrable = stats.errors.find(error => isDeferrableClassifierError(error.error));
@@ -376,12 +497,28 @@ export const prospectDetectHandler: WorkQueueHandler = {
           new Date(Date.now() + 90_000).toISOString(),
           item.payload
         );
+        emitProspectDetectTelemetry({
+          itemId: item.id,
+          orgId: item.org_id,
+          payload,
+          stats,
+          outcome: 'deferred',
+          error: deferrable.error,
+        });
         return;
       }
       if (stats.errors.length > 0) {
         throw new Error(`prospect_detect_failed:${stats.errors[0].item_id}:${stats.errors[0].error}`);
       }
+      emitProspectDetectTelemetry({
+        itemId: item.id,
+        orgId: item.org_id,
+        payload,
+        stats,
+        outcome: 'completed',
+      });
     } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
       if (isDeferrableClassifierError(e)) {
         await deferWork(
           env,
@@ -389,8 +526,24 @@ export const prospectDetectHandler: WorkQueueHandler = {
           new Date(Date.now() + 90_000).toISOString(),
           item.payload
         );
+        emitProspectDetectTelemetry({
+          itemId: item.id,
+          orgId: item.org_id,
+          payload,
+          stats,
+          outcome: 'deferred',
+          error,
+        });
         return;
       }
+      emitProspectDetectTelemetry({
+        itemId: item.id,
+        orgId: item.org_id,
+        payload,
+        stats,
+        outcome: 'failed',
+        error,
+      });
       throw e;
     }
   },

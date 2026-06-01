@@ -6,6 +6,7 @@ import {
   queryDealFlow,
   runProspectCleanupPassTool,
   searchConversations,
+  searchProspects,
 } from '../src/lib/agent-tools';
 import type { AuthContext } from '../src/types/interfaces';
 
@@ -162,6 +163,41 @@ class ProspectAgentFakeD1 {
         source_type: row.source_type,
         signal_count: row.signal_count,
         prospect_count: row.prospectIds.size,
+      }));
+    }
+
+    if (/FROM prospect_signals s/i.test(sql) && /GROUP BY s\.mention_type, s\.source_type/i.test(sql)) {
+      const [orgId] = binds;
+      const contextTypes = new Set(['intro_source', 'news', 'noise', 'web_analytics']);
+      const grouped = new Map<string, { mention_type: string; source_type: string; signal_count: number; sourceIds: Set<string> }>();
+      for (const signal of this.signals.filter(row => {
+        if (row.org_id !== orgId) return false;
+        let action: string | null = null;
+        try {
+          action = JSON.parse(row.metadata_json || '{}').prospect_action || null;
+        } catch {
+          action = null;
+        }
+        if (action === 'ignore') return false;
+        if (action === 'record_context') return true;
+        return action == null && contextTypes.has(row.mention_type);
+      })) {
+        const key = `${signal.mention_type}:${signal.source_type}`;
+        const current = grouped.get(key) || {
+          mention_type: signal.mention_type,
+          source_type: signal.source_type,
+          signal_count: 0,
+          sourceIds: new Set<string>(),
+        };
+        current.signal_count++;
+        current.sourceIds.add(String(signal.source_id || signal.id));
+        grouped.set(key, current);
+      }
+      return [...grouped.values()].map(row => ({
+        mention_type: row.mention_type,
+        source_type: row.source_type,
+        signal_count: row.signal_count,
+        source_count: row.sourceIds.size,
       }));
     }
 
@@ -360,11 +396,14 @@ describe('prospect MARTy tools', () => {
       { id: 'sig-2', org_id: 'org-1', prospect_id: 'prospect-auguria-dup', source_type: 'document', mention_type: 'inbound_prospect', classification_status: 'classified', resolution_status: 'pending' },
       { id: 'sig-3', org_id: 'org-1', prospect_id: 'prospect-sativa', source_type: 'document', mention_type: 'inbound_prospect', classification_status: 'failed', resolution_status: 'pending' },
       { id: 'sig-4', org_id: 'org-1', prospect_id: 'prospect-qunnect', source_type: 'conversation', mention_type: 'known_deal', classification_status: 'classified', resolution_status: 'resolved' },
+      { id: 'sig-context', org_id: 'org-1', prospect_id: null, source_type: 'event', source_id: 'event-context', mention_type: 'intro_source', classification_status: 'classified', resolution_status: 'resolved', metadata_json: '{"prospect_action":"record_context"}' },
+      { id: 'sig-ignore', org_id: 'org-1', prospect_id: null, source_type: 'event', source_id: 'event-ignore', mention_type: 'noise', classification_status: 'classified', resolution_status: 'resolved', metadata_json: '{"prospect_action":"ignore"}' },
     );
     db.coverage.push({ org_id: 'org-1', source_family: 'document', window_start: '2026-05-01', window_end: '2026-05-30', status: 'partial', items_scanned: 3, signals_recorded: 2, classifications_pending: 1 });
 
     const memberResult = await queryDealFlow(ctx, { days_back: 30 }, prospectAgentEnv(db));
     const inclusiveResult = await queryDealFlow(ctx, { days_back: 30, include_provisional: true }, prospectAgentEnv(db));
+    const contextResult = await queryDealFlow(ctx, { days_back: 30, include_context: true }, prospectAgentEnv(db));
     const otherUserResult = await queryDealFlow(
       { ...ctx, userId: 'user-2', email: 'user-2@medinavc.com' },
       { days_back: 30 },
@@ -373,6 +412,11 @@ describe('prospect MARTy tools', () => {
 
     expect(memberResult.total_prospects).toBe(2);
     expect(inclusiveResult.total_prospects).toBe(3);
+    expect(memberResult.context_signals).toBeNull();
+    expect(contextResult.total_prospects).toBe(2);
+    expect(contextResult.context_signals).toEqual([
+      expect.objectContaining({ mention_type: 'intro_source', source_type: 'event', signal_count: 1, source_count: 1 }),
+    ]);
     expect(otherUserResult.total_prospects).toBe(memberResult.total_prospects);
     expect(memberResult.by_source).toEqual(expect.arrayContaining([
       expect.objectContaining({ source_type: 'conversation', prospect_count: 2 }),
@@ -395,6 +439,64 @@ describe('prospect MARTy tools', () => {
     expect(__agentToolsTestHooks.prospectStatusFilter(undefined)).toEqual(['active', 'converted']);
     expect(__agentToolsTestHooks.prospectStatusFilter('converted')).toEqual(['converted']);
     expect(__agentToolsTestHooks.prospectStatusFilter(['active', 'converted'])).toEqual(['active', 'converted']);
+  });
+
+  it('searches reliable prospects by default and only includes provisional records with explicit status filters', async () => {
+    const db = new ProspectAgentFakeD1();
+    db.prospects.push(
+      {
+        id: 'prospect-reliable',
+        org_id: 'org-1',
+        canonical_name: 'ReliableCo',
+        sector_key: 'cybersecurity',
+        status: 'active',
+        last_seen_at: '2026-05-30T00:00:00.000Z',
+        signal_strength: 80,
+        enrichment_priority: 'eager',
+        confidence: 0.9,
+        provisional: 0,
+        direction_uncertain: 0,
+        possible_duplicate_of: null,
+        signal_strength_reasons: '[]',
+      },
+      {
+        id: 'prospect-provisional',
+        org_id: 'org-1',
+        canonical_name: 'MaybeCo',
+        sector_key: 'ai_data',
+        status: 'active',
+        last_seen_at: '2026-05-31T00:00:00.000Z',
+        signal_strength: 90,
+        enrichment_priority: 'lazy',
+        confidence: 0.5,
+        provisional: 1,
+        direction_uncertain: 1,
+        possible_duplicate_of: null,
+        signal_strength_reasons: '[]',
+      },
+      {
+        id: 'prospect-known-deal',
+        org_id: 'org-1',
+        canonical_name: 'KnownDealCo',
+        sector_key: 'quantum',
+        status: 'converted',
+        last_seen_at: '2026-05-29T00:00:00.000Z',
+        signal_strength: 95,
+        enrichment_priority: 'eager',
+        confidence: 1,
+        provisional: 0,
+        direction_uncertain: 0,
+        possible_duplicate_of: null,
+        possible_deal_id: 'deal-1',
+        signal_strength_reasons: '["known_deal_backlink"]',
+      },
+    );
+
+    const defaultResult = await searchProspects(ctx, {}, prospectAgentEnv(db));
+    const explicitResult = await searchProspects(ctx, { status: 'active' }, prospectAgentEnv(db));
+
+    expect(defaultResult.prospects.map((row: any) => row.id)).toEqual(['prospect-reliable', 'prospect-known-deal']);
+    expect(explicitResult.prospects.map((row: any) => row.id)).toContain('prospect-provisional');
   });
 
   it('redacts prospect evidence snippets per source ACL while keeping evidence counts honest', async () => {

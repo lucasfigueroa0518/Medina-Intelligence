@@ -2,7 +2,7 @@ import type { Env } from '../types/env';
 import type { ClassifiedItem } from '../types/interfaces';
 import { callClaudeWithUsage, type ClaudeSystemPrompt } from './claude';
 import { emailDomain, getConfiguredInternalDomains, isInternalEmailDomain } from './internal-domains';
-import { CLAUDE_HAIKU_MODEL } from './model-policy';
+import { budgetUpstreamForClaudeModel, CLAUDE_HAIKU_MODEL } from './model-policy';
 
 export const PROSPECT_CLASSIFIER_VERSION = 'prospect-v1-llm-req-cl-veto-calibrated-2026-06-01';
 const PROSPECT_CLASSIFIER_DEFAULT_MODEL = CLAUDE_HAIKU_MODEL;
@@ -54,7 +54,7 @@ const PROSPECT_ACTION_SET = new Set<string>(PROSPECT_ACTIONS);
 export const PROSPECT_DIRECTIONS = ['inbound', 'outbound', 'internal', 'news'] as const;
 const PROSPECT_DIRECTION_SET = new Set<string>(PROSPECT_DIRECTIONS);
 
-type SourceType = 'conversation' | 'event' | 'document';
+export type SourceType = 'conversation' | 'event' | 'document';
 type Direction = typeof PROSPECT_DIRECTIONS[number];
 type DeterministicDirection = Direction | 'unknown';
 type MentionType = typeof PROSPECT_MENTION_TYPES[number];
@@ -71,6 +71,9 @@ export interface ProspectDetectionStats {
   classifications_pending: number;
   prefilter_dropped: number;
   production_samples_recorded: number;
+  known_deals_attached: number;
+  record_context_skipped: number;
+  ignored_or_noise_skipped: number;
   skipped_known_deal: number;
   skipped_intro_source: number;
   skipped_news: number;
@@ -235,6 +238,7 @@ export interface ProspectOrganizationExtractionOptions {
   forceLlm?: boolean;
   maxLlmOrganizations?: number;
   llmExtractor?: ProspectOrgExtractionLlm;
+  dryRunNoBudgetWrites?: boolean;
 }
 
 export interface ProspectEnrichmentCandidate {
@@ -280,6 +284,53 @@ export interface ProspectBackfillWindowResult {
   reconciliation: Awaited<ReturnType<typeof runProspectReconciliation>>;
 }
 
+export interface ProspectDryRunDecision {
+  item_id: string;
+  source_type: SourceType;
+  source_id: string;
+  source_title: string | null;
+  occurred_at: string;
+  mention_ordinal: number;
+  company_name: string;
+  normalized_company_name: string;
+  duplicate_key: string;
+  prospect_action: ProspectAction | 'classifier_error';
+  mention_type: MentionType | 'classifier_error';
+  direction: Direction | null;
+  confidence: number | null;
+  sector_key: SectorKey | null;
+  prospect_company_name: string | null;
+  should_create_prospect: boolean;
+  linked_deal_id: string | null;
+  possible_company_id: string | null;
+  possible_deal_id: string | null;
+  provisional: boolean;
+  reasoning: string | null;
+  error: string | null;
+}
+
+export interface ProspectDryRunDuplicate {
+  duplicate_key: string;
+  count: number;
+  item_ids: string[];
+  company_name: string;
+}
+
+export interface ProspectDryRunResult {
+  dry_run: true;
+  rows_written: 0;
+  changed_db: false;
+  stats: ProspectDetectionStats;
+  decision_counts: Record<ProspectAction | 'classifier_error', number>;
+  decisions: ProspectDryRunDecision[];
+  duplicates: ProspectDryRunDuplicate[];
+}
+
+interface ProspectClassifierRuntimeOptions {
+  dryRunNoBudgetWrites?: boolean;
+  allowPartialSchema?: boolean;
+}
+
 function emptyStats(items: number): ProspectDetectionStats {
   return {
     items_scanned: items,
@@ -289,6 +340,9 @@ function emptyStats(items: number): ProspectDetectionStats {
     classifications_pending: 0,
     prefilter_dropped: 0,
     production_samples_recorded: 0,
+    known_deals_attached: 0,
+    record_context_skipped: 0,
+    ignored_or_noise_skipped: 0,
     skipped_known_deal: 0,
     skipped_intro_source: 0,
     skipped_news: 0,
@@ -296,6 +350,50 @@ function emptyStats(items: number): ProspectDetectionStats {
     skipped_web_analytics: 0,
     errors: [],
   };
+}
+
+function updateStatsForProspectClassification(stats: ProspectDetectionStats, cls: Classification): void {
+  if (cls.prospectAction === 'attach_existing_deal') {
+    stats.known_deals_attached++;
+  }
+  if (cls.prospectAction === 'record_context') {
+    stats.record_context_skipped++;
+  }
+  if (cls.prospectAction === 'ignore' || ['news', 'noise', 'web_analytics'].includes(cls.mentionType)) {
+    stats.ignored_or_noise_skipped++;
+  }
+}
+
+function prospectDryRunDecisionCounts(decisions: ProspectDryRunDecision[]): Record<ProspectAction | 'classifier_error', number> {
+  return {
+    create_prospect: decisions.filter(row => row.prospect_action === 'create_prospect').length,
+    attach_existing_deal: decisions.filter(row => row.prospect_action === 'attach_existing_deal').length,
+    record_context: decisions.filter(row => row.prospect_action === 'record_context').length,
+    ignore: decisions.filter(row => row.prospect_action === 'ignore').length,
+    classifier_error: decisions.filter(row => row.prospect_action === 'classifier_error').length,
+  };
+}
+
+function prospectDryRunDuplicateKey(sourceType: SourceType, sourceId: string, mention: MentionCandidate): string {
+  return `${sourceType}:${sourceId}:${mention.mentionOrdinal}:${mention.normalizedName}`;
+}
+
+function prospectDryRunDuplicates(decisions: ProspectDryRunDecision[]): ProspectDryRunDuplicate[] {
+  const grouped = new Map<string, ProspectDryRunDecision[]>();
+  for (const decision of decisions) {
+    const rows = grouped.get(decision.duplicate_key) || [];
+    rows.push(decision);
+    grouped.set(decision.duplicate_key, rows);
+  }
+  return [...grouped.entries()]
+    .filter(([, rows]) => rows.length > 1)
+    .map(([duplicateKey, rows]) => ({
+      duplicate_key: duplicateKey,
+      count: rows.length,
+      item_ids: rows.map(row => row.item_id).sort(),
+      company_name: rows[0]?.company_name || '',
+    }))
+    .sort((a, b) => b.count - a.count || a.duplicate_key.localeCompare(b.duplicate_key));
 }
 
 function clamp(n: number, min: number, max: number): number {
@@ -794,11 +892,19 @@ ${input.cleanedText.slice(0, 7000)}`;
 
 async function defaultLlmExtractOrganizations(
   input: ProspectOrgExtractionLlmInput,
-  env: Env
+  env: Env,
+  options: Pick<ProspectClassifierRuntimeOptions, 'dryRunNoBudgetWrites'> = {}
 ): Promise<ProspectOrgExtractionLlmOutput[]> {
   const prompt = buildOrgExtractionPrompt(input);
   const result = await callClaudeWithUsage(
-    { system: prompt.system, user: prompt.user, max_tokens: 900, orgId: input.orgId, model: orgExtractionModel(env) },
+    {
+      system: prompt.system,
+      user: prompt.user,
+      max_tokens: 900,
+      orgId: input.orgId,
+      model: orgExtractionModel(env),
+      dryRunNoBudgetWrites: options.dryRunNoBudgetWrites,
+    },
     'low',
     env
   );
@@ -912,6 +1018,16 @@ function prospectClassifierModel(env: Env, input?: ProspectClassifierInput): str
   const isListEntry = Boolean((input?.prefilterHints as any)?.mention?.parse_dealflow_list);
   if (isListEntry && env.PROSPECT_LIST_CLASSIFIER_MODEL) return env.PROSPECT_LIST_CLASSIFIER_MODEL;
   return env.PROSPECT_CLASSIFIER_MODEL || env.MARTY_LAB_HAIKU_MODEL || PROSPECT_CLASSIFIER_DEFAULT_MODEL;
+}
+
+export function prospectClassifierBudgetUpstreams(env: Env): string[] {
+  const models = [
+    env.PROSPECT_CLASSIFIER_MODEL,
+    env.PROSPECT_LIST_CLASSIFIER_MODEL,
+    env.MARTY_LAB_HAIKU_MODEL,
+    PROSPECT_CLASSIFIER_DEFAULT_MODEL,
+  ].filter(Boolean) as string[];
+  return [...new Set(['claude', ...models.map(model => budgetUpstreamForClaudeModel(model))])];
 }
 
 function compactClassifierText(value: string | undefined, max: number): string {
@@ -1926,7 +2042,9 @@ export async function extractOrganizationMentionsFromSource(
   addKnownContextMentions(mentions, cleanedText, options.knownContext, env);
 
   if (options.allowLlm !== false && (options.forceLlm || shouldRunOrgExtractionLlm(cleanedText, mentions.size))) {
-    const llmExtract = options.llmExtractor || ((input: ProspectOrgExtractionLlmInput) => defaultLlmExtractOrganizations(input, env));
+    const llmExtract = options.llmExtractor || ((input: ProspectOrgExtractionLlmInput) => defaultLlmExtractOrganizations(input, env, {
+      dryRunNoBudgetWrites: options.dryRunNoBudgetWrites,
+    }));
     const llmRows = await llmExtract({
       cleanedText,
       sourceContext: sourceContextForOrgExtraction(item),
@@ -1961,7 +2079,8 @@ async function lookupExistingContext(
   mention: MentionCandidate,
   item: ClassifiedItem,
   orgId: string,
-  env: Env
+  env: Env,
+  options: Pick<ProspectClassifierRuntimeOptions, 'allowPartialSchema'> = {}
 ): Promise<ExistingContext> {
   const candidates: Array<{ id: string; name: string; domain: string | null; is_internal_entity: number | null }> = [];
   const mentionDomain = domainFromMention(item, mention);
@@ -2009,7 +2128,12 @@ async function lookupExistingContext(
     `SELECT relationship_state
        FROM firm_company_relationships
       WHERE org_id = ? AND company_id = ? AND ended_at IS NULL`
-  ).bind(orgId, match.id).all<{ relationship_state: string }>().catch(() => ({ results: [] as Array<{ relationship_state: string }> }));
+  ).bind(orgId, match.id).all<{ relationship_state: string }>().catch(error => {
+    if (options.allowPartialSchema && isMissingSqlTableError(error, 'firm_company_relationships')) {
+      return { results: [] as Array<{ relationship_state: string }> };
+    }
+    throw error;
+  });
 
   const deal = await env.D1.prepare(
     `SELECT id
@@ -2032,6 +2156,11 @@ export function emptyProspectClassifierKnownContext(): ProspectClassifierKnownCo
   return { knownDeals: [], knownDealmakers: [] };
 }
 
+function isMissingSqlTableError(error: unknown, tableName: string): boolean {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return new RegExp(`no such table:\\s*${escapeRegExp(tableName)}`, 'i').test(message);
+}
+
 function entityListForPrompt(rows: ProspectClassifierKnownEntity[]): string {
   if (rows.length === 0) return '(none)';
   return rows
@@ -2040,26 +2169,45 @@ function entityListForPrompt(rows: ProspectClassifierKnownEntity[]): string {
     .join('; ');
 }
 
-export async function loadProspectClassifierKnownContext(orgId: string, env: Env): Promise<ProspectClassifierKnownContext> {
-  const [dealRows, dealmakerRows] = await Promise.all([
-    env.D1.prepare(
+export async function loadProspectClassifierKnownContext(
+  orgId: string,
+  env: Env,
+  options: Pick<ProspectClassifierRuntimeOptions, 'allowPartialSchema'> = {}
+): Promise<ProspectClassifierKnownContext> {
+  const dealRowsPromise = env.D1.prepare(
+    `SELECT DISTINCT c.name, c.domain
+       FROM companies c
+       LEFT JOIN deals d
+         ON d.org_id = c.org_id
+        AND d.company_id = c.id
+        AND d.deleted_at IS NULL
+        AND d.stage != 'closed'
+       LEFT JOIN firm_company_relationships f
+         ON f.org_id = c.org_id
+        AND f.company_id = c.id
+        AND f.ended_at IS NULL
+        AND f.relationship_state IN ('current_portfolio','active_pipeline','exited')
+      WHERE c.org_id = ? AND c.deleted_at IS NULL
+        AND (d.id IS NOT NULL OR f.company_id IS NOT NULL)
+      ORDER BY lower(c.name)
+      LIMIT 250`
+  ).bind(orgId).all<{ name: string; domain: string | null }>().catch(error => {
+    if (!options.allowPartialSchema || !isMissingSqlTableError(error, 'firm_company_relationships')) throw error;
+    return env.D1.prepare(
       `SELECT DISTINCT c.name, c.domain
          FROM companies c
-         LEFT JOIN deals d
+         JOIN deals d
            ON d.org_id = c.org_id
           AND d.company_id = c.id
           AND d.deleted_at IS NULL
           AND d.stage != 'closed'
-         LEFT JOIN firm_company_relationships f
-           ON f.org_id = c.org_id
-          AND f.company_id = c.id
-          AND f.ended_at IS NULL
-          AND f.relationship_state IN ('current_portfolio','active_pipeline','exited')
         WHERE c.org_id = ? AND c.deleted_at IS NULL
-          AND (d.id IS NOT NULL OR f.company_id IS NOT NULL)
         ORDER BY lower(c.name)
         LIMIT 250`
-    ).bind(orgId).all<{ name: string; domain: string | null }>(),
+    ).bind(orgId).all<{ name: string; domain: string | null }>();
+  });
+  const [dealRows, dealmakerRows] = await Promise.all([
+    dealRowsPromise,
     env.D1.prepare(
       `SELECT name,
               CASE
@@ -2072,7 +2220,10 @@ export async function loadProspectClassifierKnownContext(orgId: string, env: Env
         WHERE org_id = ? AND name IS NOT NULL AND trim(name) != ''
         ORDER BY last_seen_at DESC NULLS LAST, lower(name)
         LIMIT 250`
-    ).bind(orgId).all<{ name: string; domain: string | null }>(),
+    ).bind(orgId).all<{ name: string; domain: string | null }>().catch(error => {
+      if (!options.allowPartialSchema || !isMissingSqlTableError(error, 'dealmakers')) throw error;
+      return { results: [] as Array<{ name: string; domain: string | null }> };
+    }),
   ]);
 
   return {
@@ -2502,7 +2653,8 @@ function parseProspectClassifierResponse(
 
 export async function callProspectClassifier(
   input: ProspectClassifierInput,
-  env: Env
+  env: Env,
+  options: Pick<ProspectClassifierRuntimeOptions, 'dryRunNoBudgetWrites'> = {}
 ): Promise<LlmClassifierDecision> {
   if (input.prefilterHints.should_classify === false) {
     throw new Error('PREFILTER_REJECTED_CLASSIFIER_CALL');
@@ -2510,7 +2662,16 @@ export async function callProspectClassifier(
   const model = prospectClassifierModel(env, input);
   const prompt = buildProspectClassifierPrompt(input);
   const result = await callClaudeWithUsage(
-    { system: prompt.systemForApi, user: prompt.user, max_tokens: 700, orgId: input.orgId, model, assistantPrefill: '{', temperature: 0 },
+    {
+      system: prompt.systemForApi,
+      user: prompt.user,
+      max_tokens: 700,
+      orgId: input.orgId,
+      model,
+      assistantPrefill: '{',
+      temperature: 0,
+      dryRunNoBudgetWrites: options.dryRunNoBudgetWrites,
+    },
     'low',
     env
   );
@@ -2523,11 +2684,14 @@ async function classifyMention(
   existing: ExistingContext,
   knownContext: ProspectClassifierKnownContext,
   orgId: string,
-  env: Env
+  env: Env,
+  options: Pick<ProspectClassifierRuntimeOptions, 'dryRunNoBudgetWrites'> = {}
 ): Promise<Classification> {
   const prefilter = buildClassifierPrefilter(item, mention, existing, env);
   const classifierInput = classifierInputForRuntime(item, mention, existing, prefilter, knownContext, orgId);
-  const llm = await callProspectClassifier(classifierInput, env);
+  const llm = await callProspectClassifier(classifierInput, env, {
+    dryRunNoBudgetWrites: options.dryRunNoBudgetWrites,
+  });
   const llmValuableActionVeto = prospectValuableActionVetoForMention({
     prospectAction: llm.prospectAction,
     companyName: mention.canonicalName,
@@ -3600,6 +3764,7 @@ export async function detectAndRecordProspectSignals(
           stats.errors.push({ item_id: item.entityId, error: e instanceof Error ? e.message : String(e) });
           continue;
         }
+        updateStatsForProspectClassification(stats, cls);
         let prospectId: string | null = null;
         let dealmaker: { id: string | null; name: string | null } = { id: null, name: null };
 
@@ -3660,6 +3825,129 @@ export async function detectAndRecordProspectSignals(
   }
 
   return stats;
+}
+
+export async function classifyProspectSignalsDryRun(
+  items: ClassifiedItem[],
+  orgId: string,
+  env: Env,
+  options: Pick<ProspectClassifierRuntimeOptions, 'allowPartialSchema'> = {}
+): Promise<ProspectDryRunResult> {
+  const stats = emptyStats(items.length);
+  const decisions: ProspectDryRunDecision[] = [];
+  const knownContext = await loadProspectClassifierKnownContext(orgId, env, {
+    allowPartialSchema: options.allowPartialSchema === true,
+  });
+
+  for (const item of items) {
+    const sourceType = prospectSourceType(item);
+    if (!sourceType) continue;
+    try {
+      const sourceGate = sourcePrefilter(item, env);
+      if (!sourceGate.shouldScan) {
+        stats.prefilter_dropped++;
+        continue;
+      }
+      const fallbackName = await companyNameFor(item.companyId, orgId, env);
+      const mentions = await extractOrganizationMentionsFromSource(item, orgId, env, {
+        fallbackName,
+        knownContext,
+        dryRunNoBudgetWrites: true,
+      });
+      stats.mentions_seen += mentions.length;
+      for (const mention of mentions) {
+        const occurredAt = item.sentAt || new Date().toISOString();
+        const duplicateKey = prospectDryRunDuplicateKey(sourceType, item.entityId, mention);
+        try {
+          const existing = await lookupExistingContext(mention, item, orgId, env, {
+            allowPartialSchema: options.allowPartialSchema === true,
+          });
+          const cls = await classifyMention(item, mention, existing, knownContext, orgId, env, {
+            dryRunNoBudgetWrites: true,
+          });
+          updateStatsForProspectClassification(stats, cls);
+          if (cls.shouldCreateProspect) {
+            stats.prospects_upserted++;
+          } else if (cls.mentionType === 'intro_source') {
+            stats.skipped_intro_source++;
+          } else if (cls.mentionType === 'known_deal') {
+            stats.skipped_known_deal++;
+          } else if (cls.mentionType === 'news') {
+            stats.skipped_news++;
+          } else if (cls.mentionType === 'noise') {
+            stats.skipped_noise++;
+          } else if (cls.mentionType === 'web_analytics') {
+            stats.skipped_web_analytics++;
+          }
+          stats.signals_recorded++;
+          decisions.push({
+            item_id: item.entityId,
+            source_type: sourceType,
+            source_id: item.entityId,
+            source_title: item.subject || null,
+            occurred_at: occurredAt,
+            mention_ordinal: mention.mentionOrdinal,
+            company_name: mention.canonicalName,
+            normalized_company_name: mention.normalizedName,
+            duplicate_key: duplicateKey,
+            prospect_action: cls.prospectAction,
+            mention_type: cls.mentionType,
+            direction: cls.direction,
+            confidence: cls.confidence,
+            sector_key: cls.sectorKey,
+            prospect_company_name: cls.prospectCompanyName,
+            should_create_prospect: cls.shouldCreateProspect,
+            linked_deal_id: cls.linkedDealId,
+            possible_company_id: cls.possibleCompanyId,
+            possible_deal_id: cls.possibleDealId,
+            provisional: cls.provisional,
+            reasoning: typeof cls.metadata.llm_reasoning === 'string' ? cls.metadata.llm_reasoning : null,
+            error: null,
+          });
+        } catch (e) {
+          const error = e instanceof Error ? e.message : String(e);
+          stats.classifications_pending++;
+          stats.errors.push({ item_id: item.entityId, error });
+          decisions.push({
+            item_id: item.entityId,
+            source_type: sourceType,
+            source_id: item.entityId,
+            source_title: item.subject || null,
+            occurred_at: occurredAt,
+            mention_ordinal: mention.mentionOrdinal,
+            company_name: mention.canonicalName,
+            normalized_company_name: mention.normalizedName,
+            duplicate_key: duplicateKey,
+            prospect_action: 'classifier_error',
+            mention_type: 'classifier_error',
+            direction: null,
+            confidence: null,
+            sector_key: null,
+            prospect_company_name: null,
+            should_create_prospect: false,
+            linked_deal_id: null,
+            possible_company_id: null,
+            possible_deal_id: null,
+            provisional: false,
+            reasoning: null,
+            error,
+          });
+        }
+      }
+    } catch (e) {
+      stats.errors.push({ item_id: item.entityId, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  return {
+    dry_run: true,
+    rows_written: 0,
+    changed_db: false,
+    stats,
+    decision_counts: prospectDryRunDecisionCounts(decisions),
+    decisions,
+    duplicates: prospectDryRunDuplicates(decisions),
+  };
 }
 
 export async function recordProspectBackfillCoverage(

@@ -7,6 +7,7 @@ const enqueueWorkMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/lib/prospect-intelligence', () => ({
   detectAndRecordProspectSignals: detectAndRecordProspectSignalsMock,
+  prospectClassifierBudgetUpstreams: () => ['claude', 'anthropic_haiku'],
 }));
 
 vi.mock('../src/lib/work-queue', () => ({
@@ -49,7 +50,7 @@ function makeItem(sourceType: ProspectDetectSourceType, sourceId = `${sourceType
   };
 }
 
-function makeEnv(options: { missing?: boolean } = {}) {
+function makeEnv(options: { missing?: boolean; circuitOpen?: boolean } = {}) {
   const firstCalls: Array<{ sql: string; binds: unknown[] }> = [];
   return {
     D1: {
@@ -63,6 +64,9 @@ function makeEnv(options: { missing?: boolean } = {}) {
           },
           async first() {
             firstCalls.push({ sql, binds });
+            if (sql.includes('FROM upstream_budget_ledger')) {
+              return options.circuitOpen ? { upstream: 'anthropic_haiku' } : null;
+            }
             if (options.missing) return null;
             if (sql.includes('FROM conversations')) {
               return {
@@ -130,6 +134,9 @@ describe('prospect_detect work-queue handler', () => {
       classifications_pending: 0,
       prefilter_dropped: 0,
       production_samples_recorded: 0,
+      known_deals_attached: 0,
+      record_context_skipped: 0,
+      ignored_or_noise_skipped: 0,
       skipped_known_deal: 0,
       skipped_intro_source: 0,
       skipped_news: 0,
@@ -208,6 +215,9 @@ describe('prospect_detect work-queue handler', () => {
       classifications_pending: 1,
       prefilter_dropped: 0,
       production_samples_recorded: 0,
+      known_deals_attached: 0,
+      record_context_skipped: 0,
+      ignored_or_noise_skipped: 0,
       skipped_known_deal: 0,
       skipped_intro_source: 0,
       skipped_news: 0,
@@ -225,6 +235,65 @@ describe('prospect_detect work-queue handler', () => {
       expect.any(String),
       item.payload
     );
+  });
+
+  it('defers before classification when the classifier upstream circuit is open', async () => {
+    const item = makeItem('conversation');
+
+    await prospectDetectHandler.process(item, makeEnv({ circuitOpen: true }) as any);
+
+    expect(deferWorkMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'work-1',
+      expect.any(String),
+      item.payload
+    );
+    expect(detectAndRecordProspectSignalsMock).not.toHaveBeenCalled();
+    expect(deadLetterWorkMock).not.toHaveBeenCalled();
+  });
+
+  it('emits structured telemetry with prospect action counters', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    detectAndRecordProspectSignalsMock.mockResolvedValue({
+      items_scanned: 1,
+      mentions_seen: 4,
+      signals_recorded: 4,
+      prospects_upserted: 1,
+      classifications_pending: 0,
+      prefilter_dropped: 0,
+      production_samples_recorded: 0,
+      known_deals_attached: 1,
+      record_context_skipped: 1,
+      ignored_or_noise_skipped: 1,
+      skipped_known_deal: 1,
+      skipped_intro_source: 0,
+      skipped_news: 0,
+      skipped_noise: 1,
+      skipped_web_analytics: 0,
+      errors: [],
+    });
+
+    let payload: any;
+    try {
+      await prospectDetectHandler.process(makeItem('conversation'), makeEnv() as any);
+      payload = JSON.parse(String(logSpy.mock.calls.find(call => String(call[0]).includes('prospect_detect_processed'))?.[0]));
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(payload).toMatchObject({
+      event: 'prospect_detect_processed',
+      outcome: 'completed',
+      sources_scanned: 1,
+      mentions_seen: 4,
+      signals_recorded: 4,
+      prospects_created_or_updated: 1,
+      known_deals_attached: 1,
+      record_context_skipped: 1,
+      ignored_or_noise_skipped: 1,
+      classification_pending: 0,
+      errored: 0,
+      deferred_rate_limited: 0,
+    });
   });
 
   it('dead-letters malformed payloads and missing source rows', async () => {

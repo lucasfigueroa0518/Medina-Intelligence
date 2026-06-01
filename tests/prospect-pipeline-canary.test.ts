@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assertCanaryClassificationComplete,
   buildProspectPipelineCanarySummary,
   buildProspectPipelineRemoteCanarySummary,
   buildProspectPipelineRemoteReadCommands,
@@ -74,6 +75,10 @@ describe('prospect pipeline canary dry run', () => {
     expect(summary).toMatchObject({
       dry_run: true,
       read_mode: 'platform_proxy',
+      source_read_status: 'selected',
+      hydration_status: 'not_requested',
+      classification_status: 'not_requested',
+      write_proof_status: 'platform_proxy_read_only_adapter',
       rows_written: 0,
       changed_db: false,
       remote_d1_meta: null,
@@ -109,6 +114,9 @@ describe('prospect pipeline canary dry run', () => {
     expect(commands.every(command => /^\s*SELECT\b/i.test(command))).toBe(true);
     expect(commands.join('\n')).not.toMatch(/\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b/i);
     expect(commands.join('\n')).toContain("org-1''s team");
+    expect(commands.join('\n')).toMatch(/sent_at <= strftime/);
+    expect(commands.join('\n')).toMatch(/start_time <= strftime/);
+    expect(commands.join('\n')).toMatch(/created_at <= strftime/);
   });
 
   it('includes Cloudflare D1 read metadata in the remote proof summary', () => {
@@ -135,6 +143,10 @@ describe('prospect pipeline canary dry run', () => {
     expect(summary).toMatchObject({
       dry_run: true,
       read_mode: 'wrangler_d1_remote_select',
+      source_read_status: 'selected',
+      hydration_status: 'not_requested',
+      classification_status: 'not_requested',
+      write_proof_status: 'remote_d1_read_only_proved',
       rows_written: 0,
       changed_db: false,
       remote_d1_meta: {
@@ -150,5 +162,54 @@ describe('prospect pipeline canary dry run', () => {
       origin: 'prospect_pipeline_canary',
       ingestion_mode: 'live',
     });
+  });
+
+  it('rejects remote proof metadata that reports writes', () => {
+    expect(() => buildProspectPipelineRemoteCanarySummary({
+      orgId: 'org-1',
+      sourceType: 'conversation',
+      lookbackHours: 24,
+      limit: 5,
+      sources: [],
+      remoteMeta: {
+        rows_read: 1,
+        rows_written: 1,
+        changed_db: true,
+        query_count: 1,
+      },
+    })).toThrow(/REMOTE_D1_READ_ONLY_VIOLATION/);
+  });
+
+  it('fails remote classification proof when selected sources cannot be hydrated', () => {
+    const summary = buildProspectPipelineRemoteCanarySummary({
+      orgId: 'org-1',
+      sourceType: 'conversation',
+      lookbackHours: 24,
+      limit: 5,
+      sources: [{
+        source_type: 'conversation',
+        source_id: 'remote-only-conv',
+        title: 'Intro to Auguria',
+        occurred_at: '2026-06-01T10:00:00.000Z',
+        source_label: 'outlook',
+      }],
+      remoteMeta: {
+        rows_read: 1,
+        rows_written: 0,
+        changed_db: false,
+        query_count: 1,
+      },
+    });
+    summary.source_coverage = {
+      total_sources: 1,
+      hydratable_sources: 0,
+      by_source_type: { conversation: 1, event: 0, document: 0 },
+      missing_sources: [{ source_type: 'conversation', source_id: 'remote-only-conv' }],
+    };
+    summary.hydration_status = 'missing';
+    summary.classification_status = 'skipped_no_hydratable_sources';
+
+    expect(() => assertCanaryClassificationComplete(summary, false)).toThrow(/CANARY_CLASSIFICATION_INCOMPLETE/);
+    expect(() => assertCanaryClassificationComplete(summary, true)).not.toThrow();
   });
 });
