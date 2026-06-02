@@ -569,45 +569,46 @@ export default function CompanyDetailPage() {
                 const domain = hasValidUrl ? (() => {
                   try { return new URL(article.source_url).hostname.replace(/^www\./, ''); } catch { return null; }
                 })() : null;
-                return (
-                  <div key={article.id} className="flex items-start gap-3 py-2 px-3 rounded-lg hover:bg-bg-surface transition-colors">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        {hasValidUrl ? (
-                          <a href={article.source_url} target="_blank" rel="noopener noreferrer"
-                            className="text-sm font-medium text-text-primary hover:text-white hover:underline transition-colors truncate flex items-center gap-1.5">
-                            {article.title}
-                            <ExternalLink size={11} className="text-text-muted shrink-0" />
-                          </a>
-                        ) : (
-                          <div className="text-sm font-medium text-text-secondary truncate">
-                            {article.title}
-                          </div>
-                        )}
-                      </div>
-                      <div className="text-xs text-text-secondary line-clamp-2">{article.summary}</div>
-                      <div className="flex items-center gap-2 mt-1.5">
-                        <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded ${
-                          article.relevance_tag === 'direct_mention' ? 'bg-semantic-success/15 text-semantic-success' :
-                          article.relevance_tag === 'competitor' ? 'bg-semantic-warning/15 text-semantic-warning' :
-                          article.relevance_tag === 'industry_trend' ? 'bg-accent-purple/15 text-accent-purple' :
-                          article.relevance_tag === 'technology' ? 'bg-accent-magenta/15 text-accent-magenta' :
-                          'bg-text-muted/15 text-text-muted'
-                        }`}>
-                          {(article.relevance_tag || '').replace(/_/g, ' ')}
-                        </span>
-                        {domain ? (
-                          <span className="text-[10px] text-text-muted">{domain}</span>
-                        ) : article.source_name ? (
-                          <span className="text-[10px] text-text-muted">{article.source_name}</span>
-                        ) : null}
-                        {article.published_at && (
-                          <span className="text-[10px] text-text-muted">
-                            {new Date(article.published_at).toLocaleDateString()}
-                          </span>
-                        )}
-                      </div>
+                const cardContent = (
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className={`text-sm font-medium truncate flex items-center gap-1.5 ${hasValidUrl ? 'text-text-primary group-hover:text-white transition-colors' : 'text-text-secondary'}`}>
+                        {article.title}
+                        {hasValidUrl && <ExternalLink size={11} className="text-text-muted shrink-0" />}
+                      </span>
                     </div>
+                    <div className="text-xs text-text-secondary line-clamp-2">{article.summary}</div>
+                    <div className="flex items-center gap-2 mt-1.5">
+                      <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded ${
+                        article.relevance_tag === 'direct_mention' ? 'bg-semantic-success/15 text-semantic-success' :
+                        article.relevance_tag === 'competitor' ? 'bg-semantic-warning/15 text-semantic-warning' :
+                        article.relevance_tag === 'industry_trend' ? 'bg-accent-purple/15 text-accent-purple' :
+                        article.relevance_tag === 'technology' ? 'bg-accent-magenta/15 text-accent-magenta' :
+                        'bg-text-muted/15 text-text-muted'
+                      }`}>
+                        {(article.relevance_tag || '').replace(/_/g, ' ')}
+                      </span>
+                      {domain ? (
+                        <span className="text-[10px] text-text-muted">{domain}</span>
+                      ) : article.source_name ? (
+                        <span className="text-[10px] text-text-muted">{article.source_name}</span>
+                      ) : null}
+                      {article.published_at && (
+                        <span className="text-[10px] text-text-muted">
+                          {new Date(article.published_at).toLocaleDateString()}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+                return hasValidUrl ? (
+                  <a key={article.id} href={article.source_url} target="_blank" rel="noopener noreferrer"
+                    className="group flex items-start gap-3 py-2 px-3 rounded-lg hover:bg-bg-surface transition-colors cursor-pointer">
+                    {cardContent}
+                  </a>
+                ) : (
+                  <div key={article.id} className="flex items-start gap-3 py-2 px-3 rounded-lg">
+                    {cardContent}
                   </div>
                 );
               })}
