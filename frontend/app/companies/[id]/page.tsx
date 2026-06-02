@@ -566,15 +566,18 @@ export default function CompanyDetailPage() {
             <div className="space-y-3">
               {newsArticles.map((article: any) => {
                 const hasValidUrl = article.source_url && !article.source_url.includes('vertexaisearch.cloud.google.com');
+                const linkUrl = hasValidUrl
+                  ? article.source_url
+                  : `https://www.google.com/search?q=${encodeURIComponent(article.title)}`;
                 const domain = hasValidUrl ? (() => {
                   try { return new URL(article.source_url).hostname.replace(/^www\./, ''); } catch { return null; }
-                })() : null;
+                })() : 'google.com';
                 const cardContent = (
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1">
-                      <span className={`text-sm font-medium truncate flex items-center gap-1.5 ${hasValidUrl ? 'text-text-primary group-hover:text-white transition-colors' : 'text-text-secondary'}`}>
+                      <span className="text-sm font-medium truncate flex items-center gap-1.5 text-text-primary group-hover:text-white transition-colors">
                         {article.title}
-                        {hasValidUrl && <ExternalLink size={11} className="text-text-muted shrink-0" />}
+                        <ExternalLink size={11} className="text-text-muted shrink-0" />
                       </span>
                     </div>
                     <div className="text-xs text-text-secondary line-clamp-2">{article.summary}</div>
@@ -601,15 +604,11 @@ export default function CompanyDetailPage() {
                     </div>
                   </div>
                 );
-                return hasValidUrl ? (
-                  <a key={article.id} href={article.source_url} target="_blank" rel="noopener noreferrer"
+                return (
+                  <a key={article.id} href={linkUrl} target="_blank" rel="noopener noreferrer"
                     className="group flex items-start gap-3 py-2 px-3 rounded-lg hover:bg-bg-surface transition-colors cursor-pointer">
                     {cardContent}
                   </a>
-                ) : (
-                  <div key={article.id} className="flex items-start gap-3 py-2 px-3 rounded-lg">
-                    {cardContent}
-                  </div>
                 );
               })}
             </div>
