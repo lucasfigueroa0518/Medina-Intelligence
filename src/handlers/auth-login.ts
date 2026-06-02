@@ -244,19 +244,55 @@ export async function login(request: Request, env: Env): Promise<Response> {
   }>();
 
   if (!user || !user.password_hash) {
+    await emitAudit(env, {
+      org_id: '',
+      user_id: '',
+      action: 'login_failed',
+      entity_type: 'user',
+      entity_id: '',
+      metadata: { reason: 'user_not_found', email: normalizedEmail },
+      created_at: new Date().toISOString(),
+    });
     return errorResponse('INVALID_CREDENTIALS', 401, 'Invalid email or password');
   }
 
   if (!user.is_active) {
+    await emitAudit(env, {
+      org_id: user.org_id,
+      user_id: user.id,
+      action: 'login_failed',
+      entity_type: 'user',
+      entity_id: user.id,
+      metadata: { reason: 'account_disabled', email: normalizedEmail },
+      created_at: new Date().toISOString(),
+    });
     return errorResponse('ACCOUNT_DISABLED', 403, 'Account is disabled');
   }
 
   const valid = await verifyPassword(password, user.password_hash);
   if (!valid) {
+    await emitAudit(env, {
+      org_id: user.org_id,
+      user_id: user.id,
+      action: 'login_failed',
+      entity_type: 'user',
+      entity_id: user.id,
+      metadata: { reason: 'wrong_password', email: normalizedEmail },
+      created_at: new Date().toISOString(),
+    });
     return errorResponse('INVALID_CREDENTIALS', 401, 'Invalid email or password');
   }
 
   if (!user.email_verified) {
+    await emitAudit(env, {
+      org_id: user.org_id,
+      user_id: user.id,
+      action: 'login_failed',
+      entity_type: 'user',
+      entity_id: user.id,
+      metadata: { reason: 'email_not_verified', email: normalizedEmail },
+      created_at: new Date().toISOString(),
+    });
     return jsonResponse(
       { error: 'EMAIL_NOT_VERIFIED', message: 'Please verify your email address before signing in.', email: user.email },
       403
