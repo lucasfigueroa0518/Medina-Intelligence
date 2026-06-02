@@ -568,7 +568,7 @@ export default function CompanyDetailPage() {
                 const hasValidUrl = article.source_url && !article.source_url.includes('vertexaisearch.cloud.google.com');
                 const linkUrl = hasValidUrl
                   ? article.source_url
-                  : `https://www.google.com/search?q=${encodeURIComponent(article.title)}`;
+                  : `https://duckduckgo.com/?q=!ducky+${encodeURIComponent(article.title)}`;
                 const domain = hasValidUrl ? (() => {
                   try { return new URL(article.source_url).hostname.replace(/^www\./, ''); } catch { return null; }
                 })() : 'google.com';
