@@ -1,17 +1,22 @@
 'use client';
 
 import React from 'react';
+import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { TopBar } from '@/components/top-bar';
 import { api } from '@/lib/api';
 import { DocumentActions } from '@/components/document-actions';
-import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import {
   Upload, FileText, FileSpreadsheet, File, Presentation,
   Users, Building2, Handshake, Zap, ChevronDown, ChevronRight,
   Check, X as XIcon, Loader2, ArrowLeft, Sparkles, EyeOff, Trash2,
   AlertTriangle,
 } from 'lucide-react';
+
+const DocumentPreviewModal = dynamic(
+  () => import('@/components/document-preview-modal').then(mod => mod.DocumentPreviewModal),
+  { ssr: false },
+);
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types

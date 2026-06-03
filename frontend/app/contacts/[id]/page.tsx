@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import dynamic from 'next/dynamic';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
@@ -13,8 +14,6 @@ import { TopBar } from '@/components/top-bar';
 import { Timeline, TimelineEntry } from '@/components/timeline';
 import { CompanySearchField } from '@/components/company-search-field';
 import { TagPicker } from '@/components/tag-picker';
-import { DocumentUploadModal } from '@/components/document-upload-modal';
-import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { api, ApiError } from '@/lib/api';
@@ -26,6 +25,16 @@ import {
   demoToastMessage,
   useDemoMode,
 } from '@/lib/demo-mode';
+
+const DocumentUploadModal = dynamic(
+  () => import('@/components/document-upload-modal').then(mod => mod.DocumentUploadModal),
+  { ssr: false },
+);
+
+const DocumentPreviewModal = dynamic(
+  () => import('@/components/document-preview-modal').then(mod => mod.DocumentPreviewModal),
+  { ssr: false },
+);
 
 type Tab = 'overview' | 'timeline' | 'associations' | 'documents' | 'deals';
 

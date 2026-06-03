@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { MarkdownMessage } from '@/components/markdown-message';
+import dynamic from 'next/dynamic';
 import { ApiError, api, streamAgentQuery } from '@/lib/api';
 import {
   ArrowUp, Paperclip, Plus, Trash2,
@@ -12,14 +12,30 @@ import {
 } from 'lucide-react';
 import { MartyEmblem } from '@/components/marty-emblem';
 import { CitationPill } from '@/components/citation-pill';
-import { SourcePanel } from '@/components/source-panel';
 import { PendingUploadPill, SentUploadPill, formatBytes } from '@/components/chat-upload-pill';
-import { UploadPreviewModal } from '@/components/upload-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import { trimPartialCitation, type CitationSource } from '@/lib/citations';
 import { copyElementAsPortableContent, copySelectionAsPortableContent, textToPortableHtml, writePortableClipboard } from '@/lib/portable-copy';
 import type { ChatUploadSummary } from '@/lib/api';
 import { demoMartySessions, useDemoMode } from '@/lib/demo-mode';
+
+const MarkdownMessage = dynamic(
+  () => import('@/components/markdown-message').then(mod => mod.MarkdownMessage),
+  {
+    ssr: false,
+    loading: () => <div className="text-sm text-text-muted">Loading response...</div>,
+  },
+);
+
+const SourcePanel = dynamic(
+  () => import('@/components/source-panel').then(mod => mod.SourcePanel),
+  { ssr: false },
+);
+
+const UploadPreviewModal = dynamic(
+  () => import('@/components/upload-preview-modal').then(mod => mod.UploadPreviewModal),
+  { ssr: false },
+);
 
 // ---------------------------------------------------------------------------
 // Thinking verbs (crossfade)

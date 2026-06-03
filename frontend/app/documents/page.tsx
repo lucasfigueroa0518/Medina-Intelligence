@@ -1,6 +1,7 @@
 'use client';
 
 import React, { Suspense } from 'react';
+import dynamic from 'next/dynamic';
 import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { TopBar } from '@/components/top-bar';
@@ -9,8 +10,6 @@ import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { api } from '@/lib/api';
-import { DocumentUploadModal } from '@/components/document-upload-modal';
-import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { DocumentActions } from '@/components/document-actions';
 import {
   Search,
@@ -25,6 +24,16 @@ import {
   Wand2,
   Plus,
 } from 'lucide-react';
+
+const DocumentUploadModal = dynamic(
+  () => import('@/components/document-upload-modal').then(mod => mod.DocumentUploadModal),
+  { ssr: false },
+);
+
+const DocumentPreviewModal = dynamic(
+  () => import('@/components/document-preview-modal').then(mod => mod.DocumentPreviewModal),
+  { ssr: false },
+);
 
 interface Document {
   id: string;

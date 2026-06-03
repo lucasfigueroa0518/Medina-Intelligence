@@ -1,5 +1,3 @@
-'use client';
-
 import Image from 'next/image';
 
 interface MedinaLogoProps {
@@ -10,7 +8,7 @@ interface MedinaLogoProps {
 export function MedinaLogo({ size = 32, className = '' }: MedinaLogoProps) {
   return (
     <Image
-      src="/medina-logo.png"
+      src="/favicon.svg"
       alt="Medina Intelligence"
       width={size}
       height={size}

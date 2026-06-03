@@ -17,6 +17,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { api, clearAuthToken } from '@/lib/api';
+import { useAuthSession } from '@/components/auth-guard';
 import { MartyEmblem } from './marty-emblem';
 
 type NavItem = {
@@ -46,9 +47,9 @@ const MORE: NavItem[] = [
 export function MobileNav() {
   const pathname = usePathname();
   const router = useRouter();
+  const { isAdmin } = useAuthSession();
   const [open, setOpen] = React.useState(false);
   const [martyPending, setMartyPending] = React.useState(false);
-  const [isAdmin, setIsAdmin] = React.useState(false);
   const [loggingOut, setLoggingOut] = React.useState(false);
 
   React.useEffect(() => {
@@ -62,19 +63,6 @@ export function MobileNav() {
     };
     window.addEventListener('marty-pending-change', handler);
     return () => window.removeEventListener('marty-pending-change', handler);
-  }, []);
-
-  React.useEffect(() => {
-    let cancelled = false;
-    api.getMe()
-      .then(res => {
-        if (!cancelled) {
-          const role = res.user.role;
-          setIsAdmin(role === 'super_admin' || role === 'owner' || role === 'admin');
-        }
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
   }, []);
 
   React.useEffect(() => setOpen(false), [pathname]);

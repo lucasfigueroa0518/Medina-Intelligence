@@ -3,6 +3,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { api } from '@/lib/api';
+import { useAuthSession } from '@/components/auth-guard';
 
 interface Warning {
   type: string;
@@ -37,25 +38,22 @@ function displayMessage(w: Warning): string {
 }
 
 export function IntegrationWarningBanner() {
-  const [warnings, setWarnings] = React.useState<Warning[]>([]);
+  const { warnings } = useAuthSession();
   const [outlookLastSync, setOutlookLastSync] = React.useState<string | null>(null);
   const [dismissed, setDismissed] = React.useState<Set<string>>(new Set());
 
   React.useEffect(() => {
+    if (!warnings.length) {
+      setOutlookLastSync(null);
+      return;
+    }
     api
-      .getMe()
-      .then((data: any) => {
-        const nextWarnings = data.warnings || [];
-        if (nextWarnings.length) setWarnings(nextWarnings);
-        api
-          .getIntegrationsStatus()
-          .then(status => setOutlookLastSync(status.outlook.last_sync || null))
-          .catch(() => {});
-      })
+      .getIntegrationsStatus()
+      .then(status => setOutlookLastSync(status.outlook.last_sync || null))
       .catch(() => {});
-  }, []);
+  }, [warnings.length]);
 
-  const visible = warnings.filter(w => w.severity === 'critical' || !dismissed.has(w.type));
+  const visible = (warnings as Warning[]).filter(w => w.severity === 'critical' || !dismissed.has(w.type));
   if (visible.length === 0) return null;
 
   return (

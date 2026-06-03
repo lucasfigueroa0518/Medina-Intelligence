@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import dynamic from 'next/dynamic';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
@@ -21,7 +22,6 @@ import {
 } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { DocumentActions } from '@/components/document-actions';
-import { DocumentPreviewModal } from '@/components/document-preview-modal';
 import { ExpandableText } from '@/components/expandable-text';
 import { ApiError, api } from '@/lib/api';
 import { cleanIntelBrief } from '@/lib/intelligence-briefing';
@@ -33,6 +33,11 @@ import {
   SentimentIndicator,
   TopicChips,
 } from '@/components/deal-intelligence';
+
+const DocumentPreviewModal = dynamic(
+  () => import('@/components/document-preview-modal').then(mod => mod.DocumentPreviewModal),
+  { ssr: false },
+);
 
 type DealStage = 'new' | 'talking' | 'due_diligence' | 'term_sheet' | 'closed';
 

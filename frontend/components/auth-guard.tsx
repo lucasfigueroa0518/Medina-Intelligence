@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { MedinaLogo } from '@/components/medina-logo';
+import type { UserProfile } from '@/lib/api';
 
 const TOKEN_KEY = 'auth_token';
 const PUBLIC_PATHS = ['/login', '/signup', '/mfa', '/auth'];
@@ -10,11 +11,31 @@ const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL ?? '';
 
 type GuardState = 'loading' | 'authenticated' | 'unauthenticated' | 'unverified';
 
+export type AuthSessionUser = UserProfile;
+
+interface AuthSessionContextValue {
+  user: AuthSessionUser | null;
+  warnings: any[];
+  status: GuardState;
+  isAdmin: boolean;
+  refresh: () => Promise<void>;
+}
+
+const AuthSessionContext = React.createContext<AuthSessionContextValue | null>(null);
+
+export function useAuthSession(): AuthSessionContextValue {
+  const ctx = React.useContext(AuthSessionContext);
+  if (!ctx) throw new Error('useAuthSession must be used within AuthGuard');
+  return ctx;
+}
+
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const isPublicPath = PUBLIC_PATHS.some(p => pathname.startsWith(p));
   const [state, setState] = useState<GuardState>('loading');
+  const [user, setUser] = useState<AuthSessionUser | null>(null);
+  const [warnings, setWarnings] = useState<any[]>([]);
   const [userEmail, setUserEmail] = useState('');
   const [resending, setResending] = useState(false);
   const [resent, setResent] = useState(false);
@@ -22,6 +43,8 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
 
   const checkAuth = useCallback(async () => {
     if (isPublicPath) {
+      setUser(null);
+      setWarnings([]);
       setState('authenticated');
       return;
     }
@@ -29,6 +52,8 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     const token = localStorage.getItem(TOKEN_KEY);
     if (!token || token === 'undefined' || token === 'null') {
       localStorage.removeItem(TOKEN_KEY);
+      setUser(null);
+      setWarnings([]);
       setState('unauthenticated');
       return;
     }
@@ -40,13 +65,18 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
 
       if (res.status === 401) {
         localStorage.removeItem(TOKEN_KEY);
+        setUser(null);
+        setWarnings([]);
         setState('unauthenticated');
         return;
       }
 
       const data = await res.json().catch(() => ({} as any));
+      const nextWarnings = Array.isArray(data.warnings) ? data.warnings : [];
+      setWarnings(nextWarnings);
 
       if (data.user && !data.user.email_verified) {
+        setUser(data.user);
         setUserEmail(data.user.email || '');
         setState('unverified');
         return;
@@ -54,17 +84,23 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
 
       if (!res.ok) {
         if (data.error === 'EMAIL_NOT_VERIFIED') {
+          setUser(data.user ?? null);
           setUserEmail('');
           setState('unverified');
           return;
         }
         localStorage.removeItem(TOKEN_KEY);
+        setUser(null);
+        setWarnings([]);
         setState('unauthenticated');
         return;
       }
 
+      setUser(data.user ?? null);
       setState('authenticated');
     } catch {
+      setUser(null);
+      setWarnings([]);
       setState('authenticated');
     }
   }, [isPublicPath]);
@@ -90,50 +126,71 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     }
   }, [isPublicPath, router, state]);
 
+  const sessionValue = React.useMemo<AuthSessionContextValue>(() => {
+    const role = user?.role;
+    return {
+      user,
+      warnings,
+      status: state,
+      isAdmin: role === 'super_admin' || role === 'owner' || role === 'admin',
+      refresh: checkAuth,
+    };
+  }, [checkAuth, state, user, warnings]);
+
   if (state === 'loading') return null;
 
   if (state === 'unauthenticated') {
     if (!isPublicPath) return null;
-    return <>{children}</>;
+    return (
+      <AuthSessionContext.Provider value={sessionValue}>
+        {children}
+      </AuthSessionContext.Provider>
+    );
   }
 
   if (state === 'unverified') {
     return (
-      <EmailVerificationLockout
-        email={userEmail}
-        resending={resending}
-        resent={resent}
-        resendError={resendError}
-        onResend={async () => {
-          if (!userEmail || resending) return;
-          setResending(true);
-          setResendError('');
-          try {
-            const res = await fetch(`${API_ORIGIN}/api/auth/resend-verification`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ email: userEmail }),
-            });
-            if (res.status === 429) {
-              setResendError('Please wait a minute before requesting another email.');
-            } else {
-              setResent(true);
+      <AuthSessionContext.Provider value={sessionValue}>
+        <EmailVerificationLockout
+          email={userEmail}
+          resending={resending}
+          resent={resent}
+          resendError={resendError}
+          onResend={async () => {
+            if (!userEmail || resending) return;
+            setResending(true);
+            setResendError('');
+            try {
+              const res = await fetch(`${API_ORIGIN}/api/auth/resend-verification`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: userEmail }),
+              });
+              if (res.status === 429) {
+                setResendError('Please wait a minute before requesting another email.');
+              } else {
+                setResent(true);
+              }
+            } catch {
+              setResendError('Unable to connect to the server.');
+            } finally {
+              setResending(false);
             }
-          } catch {
-            setResendError('Unable to connect to the server.');
-          } finally {
-            setResending(false);
-          }
-        }}
-        onLogout={() => {
-          localStorage.removeItem(TOKEN_KEY);
-          router.replace('/login');
-        }}
-      />
+          }}
+          onLogout={() => {
+            localStorage.removeItem(TOKEN_KEY);
+            router.replace('/login');
+          }}
+        />
+      </AuthSessionContext.Provider>
     );
   }
 
-  return <>{children}</>;
+  return (
+    <AuthSessionContext.Provider value={sessionValue}>
+      {children}
+    </AuthSessionContext.Provider>
+  );
 }
 
 function EmailVerificationLockout({

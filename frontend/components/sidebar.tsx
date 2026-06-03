@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { api, clearAuthToken } from '@/lib/api';
+import { useAuthSession } from '@/components/auth-guard';
 import { MedinaLogo } from './medina-logo';
 import { MartyEmblem } from './marty-emblem';
 
@@ -39,22 +40,12 @@ const NAV_LINKS: NavLink[] = [
   { label: 'Settings', icon: SettingsIcon, route: '/settings' },
 ];
 
-interface MeUser {
-  id: string;
-  email: string;
-  full_name: string;
-  role: string;
-  org_id: string;
-  avatar_url: string | null;
-}
-
 export function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
+  const { user: me, isAdmin } = useAuthSession();
   const [martyPending, setMartyPending] = React.useState(false);
   const [loggingOut, setLoggingOut] = React.useState(false);
-  const [me, setMe] = React.useState<MeUser | null>(null);
-  const [isAdmin, setIsAdmin] = React.useState(false);
 
   React.useEffect(() => {
     // Check initial state
@@ -68,18 +59,6 @@ export function Sidebar() {
     };
     window.addEventListener('marty-pending-change', handler);
     return () => window.removeEventListener('marty-pending-change', handler);
-  }, []);
-
-  React.useEffect(() => {
-    let cancelled = false;
-    api.getMe()
-      .then(res => {
-        if (cancelled) return;
-        setMe(res.user);
-        setIsAdmin(res.user.role === 'super_admin' || res.user.role === 'owner' || res.user.role === 'admin');
-      })
-      .catch(() => { /* unauthenticated — leave defaults */ });
-    return () => { cancelled = true; };
   }, []);
 
   const initial = me?.full_name?.trim()?.charAt(0)?.toUpperCase() || me?.email?.charAt(0)?.toUpperCase() || '?';

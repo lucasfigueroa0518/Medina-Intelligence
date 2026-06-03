@@ -1,10 +1,15 @@
 'use client';
 
 import React from 'react';
+import dynamic from 'next/dynamic';
 import { useRouter } from 'next/navigation';
 import { Download, ExternalLink, Eye, Loader2, Sparkles } from 'lucide-react';
 import { api } from '@/lib/api';
-import { DocumentPreviewModal } from './document-preview-modal';
+
+const DocumentPreviewModal = dynamic(
+  () => import('./document-preview-modal').then(mod => mod.DocumentPreviewModal),
+  { ssr: false },
+);
 
 const API_BASE = `${process.env.NEXT_PUBLIC_API_URL ?? ''}/api`;
 

@@ -1,12 +1,21 @@
 'use client';
 
 import React, { Suspense } from 'react';
+import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { FileText, Upload, type LucideIcon } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
-import { ImportsPageContent } from '../imports/page';
-import { DocumentsPageContent } from '../documents/page';
+
+const ImportsPageContent = dynamic(
+  () => import('../imports/page').then(mod => mod.ImportsPageContent),
+  { ssr: false, loading: () => <div className="flex-1" /> },
+);
+
+const DocumentsPageContent = dynamic(
+  () => import('../documents/page').then(mod => mod.DocumentsPageContent),
+  { ssr: false, loading: () => <div className="flex-1" /> },
+);
 
 type FilesTab = 'imports' | 'documents';
 

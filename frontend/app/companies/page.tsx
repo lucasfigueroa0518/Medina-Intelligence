@@ -1,17 +1,22 @@
 'use client';
 
 import React, { Suspense } from 'react';
+import dynamic from 'next/dynamic';
 import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import { TopBar } from '@/components/top-bar';
 import { DataTable, Column } from '@/components/data-table';
 import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
-import { TagManagerModal } from '@/components/tag-manager-modal';
 import { api } from '@/lib/api';
 import { initialFromName, faviconUrl } from '@/lib/avatar';
 import { DEMO_COMPANY_TOTAL, demoCompanies, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import { Plus, Search, X as XIcon, Settings2 } from 'lucide-react';
+
+const TagManagerModal = dynamic(
+  () => import('@/components/tag-manager-modal').then(mod => mod.TagManagerModal),
+  { ssr: false },
+);
 
 interface Tag { id: string; name: string; color: string }
 interface CityOpt { name: string; count: number }

@@ -44,7 +44,7 @@ export function EntranceAnimation({ onComplete }: EntranceAnimationProps) {
         <div className="entrance-logo-wrap">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            src="/medina-ventures-logo.png"
+            src="/favicon.svg"
             alt=""
             className="entrance-logo-img"
             draggable={false}
