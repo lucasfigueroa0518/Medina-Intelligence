@@ -14,9 +14,11 @@ function makeD1Mock(options: {
   incidents?: unknown[];
   conversationStats?: unknown[];
   workQueueStats?: unknown[];
+  preparedSqls?: string[];
 } = {}) {
   return {
     prepare(sql: string) {
+      options.preparedSqls?.push(sql);
       let binds: unknown[] = [];
       return {
         bind(...args: unknown[]) {
@@ -133,5 +135,31 @@ describe('outlook app-only health', () => {
 
     expect(filterOutlookIncidentsForUserReports([stale, unrelated], health)).toEqual([unrelated]);
     expect(filterOutlookIncidentsForUserReports([stale], null)).toEqual([stale]);
+  });
+
+  it('scopes health source-state and incident reads to user rows only', async () => {
+    const preparedSqls: string[] = [];
+    const env = makeEnv(makeD1Mock({
+      preparedSqls,
+      users: [{
+        id: 'user-1',
+        email: 'raul@medinavc.com',
+        full_name: 'Raul Medina',
+        role: 'owner',
+        outlook_mailbox: null,
+      }],
+    }));
+
+    await getOutlookAppOnlyHealthSnapshot('org-1', env, {
+      includeGraphProbes: false,
+    });
+
+    const sourceStateSql = preparedSqls.find(sql => sql.includes('FROM ingestion_source_state')) || '';
+    const incidentSql = preparedSqls.find(sql => sql.includes('FROM ingestion_incidents')) || '';
+    const workQueueSql = preparedSqls.find(sql => sql.includes('FROM work_queue')) || '';
+
+    expect(sourceStateSql).toContain("scope_type = 'user'");
+    expect(incidentSql).toContain("scope_type = 'user'");
+    expect(workQueueSql).toContain("status IN ('pending','in_progress','dead_letter')");
   });
 });

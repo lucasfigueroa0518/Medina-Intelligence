@@ -303,12 +303,15 @@ export async function getOutlookAppOnlyHealthSnapshot(
     env.D1.prepare(
       `SELECT source, scope_id, status, last_success_at, last_failure_at, last_error_code, last_error
          FROM ingestion_source_state
-        WHERE org_id = ? AND source IN ('outlook_email','calendar')`
+        WHERE org_id = ?
+          AND scope_type = 'user'
+          AND source IN ('outlook_email','calendar')`
     ).bind(orgId).all<SourceStateRow>(),
     env.D1.prepare(
       `SELECT *
          FROM ingestion_incidents
         WHERE org_id = ?
+          AND scope_type = 'user'
           AND source IN ('outlook_email','calendar')
           AND status IN ('open','recovering','blocked')`
     ).bind(orgId).all<IngestionIncident>(),
@@ -332,6 +335,7 @@ export async function getOutlookAppOnlyHealthSnapshot(
          FROM work_queue
         WHERE org_id = ?
           AND domain IN ('calendar_refresh','outlook_email')
+          AND status IN ('pending','in_progress','dead_letter')
         GROUP BY json_extract(payload, '$.user_id')`
     ).bind(orgId).all<WorkQueueStatRow>(),
   ]);
