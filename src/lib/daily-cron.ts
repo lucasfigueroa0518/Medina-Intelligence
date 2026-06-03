@@ -20,7 +20,6 @@ import { repairContactSearchIndexDrift } from './contact-search';
 import { repairContactDetailReadModelDrift } from './contact-detail-read-model';
 import { CLAUDE_HAIKU_MODEL } from './model-policy';
 import { runProspectReconciliation } from './prospect-intelligence';
-import { CLAUDE_HAIKU_MODEL } from './model-policy';
 
 // Mirrors the visibility logic in classification.ts:233 — emails are always
 // 'private' regardless of source-side hint, transcripts/manual notes are
