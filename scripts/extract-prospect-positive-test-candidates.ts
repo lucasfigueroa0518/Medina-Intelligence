@@ -168,7 +168,7 @@ function runWranglerJson<T>(args: string[]): RemoteQueryResult<T> {
 }
 
 function remoteSelect<T>(db: string, command: string): RemoteQueryResult<T> {
-  return runWranglerJson<T>(['d1', 'execute', db, '--remote', '--command', command, '--json']);
+  return runWranglerJson<T>(['d1', 'execute', db, '--remote', '--json', '--command', command]);
 }
 
 function r2Get(bucket: string, key: string, maxChars: number): string | null {

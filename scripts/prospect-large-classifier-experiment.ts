@@ -490,7 +490,7 @@ function recordRemoteMeta(total: RemoteMeta, meta: Partial<RemoteMeta> | undefin
 }
 
 function remoteSelect<T>(args: Args, meta: RemoteMeta, command: string): T[] {
-  const result = runWranglerJson<T>(['d1', 'execute', args.database, '--remote', '--command', command, '--json']);
+  const result = runWranglerJson<T>(['d1', 'execute', args.database, '--remote', '--json', '--command', command]);
   recordRemoteMeta(meta, result.meta);
   return result.results;
 }

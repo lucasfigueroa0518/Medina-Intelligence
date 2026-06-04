@@ -154,7 +154,7 @@ function recordRemoteMeta(total: RemoteMeta, meta: Partial<RemoteMeta> | undefin
 
 function remoteSelect<T>(database: string, meta: RemoteMeta, command: string): T[] {
   assertReadOnlySql(command);
-  const result = runWranglerJson<T>(['d1', 'execute', database, '--remote', '--command', command, '--json']);
+  const result = runWranglerJson<T>(['d1', 'execute', database, '--remote', '--json', '--command', command]);
   recordRemoteMeta(meta, result.meta);
   return result.results;
 }

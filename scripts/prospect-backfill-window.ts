@@ -150,7 +150,7 @@ function runWranglerD1<T>(database: string, command: string, meta: RemoteD1Meta)
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const stdout = execFileSync('npx', ['wrangler', 'd1', 'execute', database, '--remote', '--command', command, '--json'], {
+      const stdout = execFileSync('npx', ['wrangler', 'd1', 'execute', database, '--remote', '--json', '--command', command], {
         cwd: process.cwd(),
         encoding: 'utf8',
         maxBuffer: 80 * 1024 * 1024,

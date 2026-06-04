@@ -295,7 +295,7 @@ class WranglerD1Executor implements D1Executor {
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const stdout = execFileSync('npx', ['wrangler', 'd1', 'execute', this.database, '--remote', '--command', sql, '--json'], {
+        const stdout = execFileSync('npx', ['wrangler', 'd1', 'execute', this.database, '--remote', '--json', '--command', sql], {
           cwd: process.cwd(),
           encoding: 'utf8',
           maxBuffer: 80 * 1024 * 1024,
