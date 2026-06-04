@@ -389,6 +389,11 @@ function isDeferrableClassifierError(error: unknown): boolean {
   return /CLAUDE_RATE_LIMITED|429|rate.?limit|timeout|overloaded|529/i.test(message);
 }
 
+function isNonRetryableProspectDetectError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /\bINVALID_(?:ORG_)?(?:EXTRACTION|CLASSIFICATION)_JSON\b/i.test(message);
+}
+
 async function prospectClassifierCircuitOpen(env: Env, orgId: string): Promise<string | null> {
   const upstreams = prospectClassifierBudgetUpstreams(env);
   const placeholders = upstreams.map(() => '?').join(',');
@@ -509,7 +514,21 @@ export const prospectDetectHandler: WorkQueueHandler = {
         return;
       }
       if (stats.errors.length > 0) {
-        throw new Error(`prospect_detect_failed:${stats.errors[0].item_id}:${stats.errors[0].error}`);
+        const firstError = stats.errors[0];
+        const error = `prospect_detect_failed:${firstError.item_id}:${firstError.error}`;
+        if (isNonRetryableProspectDetectError(error)) {
+          await deadLetterWork(env, item.id, error);
+          emitProspectDetectTelemetry({
+            itemId: item.id,
+            orgId: item.org_id,
+            payload,
+            stats,
+            outcome: 'dead_letter',
+            error,
+          });
+          return;
+        }
+        throw new Error(error);
       }
       emitProspectDetectTelemetry({
         itemId: item.id,

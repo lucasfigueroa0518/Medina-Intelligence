@@ -208,13 +208,13 @@ import { maxModeJobHandler } from './work-queue-handlers/max-mode-job';
  * midnight without consuming attempt budget).
  */
 export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
+  prospectDetectHandler,
   embedRetryHandler,
   attachmentBackfillHandler,
   calendarRefreshHandler,
   fireflyWindowHandler,
   dealReplayEvidenceHandler,
   dealEvidenceDetectHandler,
-  prospectDetectHandler,
   intelligentImportHandler,
   contactEnrichmentHandler,
   maxModeJobHandler,

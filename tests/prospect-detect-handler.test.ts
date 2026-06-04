@@ -237,6 +237,37 @@ describe('prospect_detect work-queue handler', () => {
     );
   });
 
+  it('dead-letters deterministic classifier JSON parse failures instead of retrying', async () => {
+    detectAndRecordProspectSignalsMock.mockResolvedValue({
+      items_scanned: 1,
+      mentions_seen: 1,
+      signals_recorded: 0,
+      prospects_upserted: 0,
+      classifications_pending: 1,
+      prefilter_dropped: 0,
+      production_samples_recorded: 0,
+      known_deals_attached: 0,
+      record_context_skipped: 0,
+      ignored_or_noise_skipped: 0,
+      skipped_known_deal: 0,
+      skipped_intro_source: 0,
+      skipped_news: 0,
+      skipped_noise: 0,
+      skipped_web_analytics: 0,
+      errors: [{ item_id: 'conversation-1', error: 'INVALID_ORG_EXTRACTION_JSON' }],
+    });
+    const item = makeItem('conversation');
+
+    await prospectDetectHandler.process(item, makeEnv() as any);
+
+    expect(deadLetterWorkMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'work-1',
+      'prospect_detect_failed:conversation-1:INVALID_ORG_EXTRACTION_JSON'
+    );
+    expect(deferWorkMock).not.toHaveBeenCalled();
+  });
+
   it('defers before classification when the classifier upstream circuit is open', async () => {
     const item = makeItem('conversation');
 
