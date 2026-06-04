@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import process from 'node:process';
 import { getPlatformProxy } from 'wrangler';
@@ -18,6 +19,7 @@ const DEFAULT_WRITE_BATCH_MAX = 50;
 interface Args {
   orgId: string;
   configPath: string;
+  database: string;
   windowStart: string;
   windowEnd: string;
   sourceFamilies: SourceFamily[];
@@ -25,6 +27,7 @@ interface Args {
   apply: boolean;
   allowExpandedWindow: boolean;
   confirmProductionWrite: string | null;
+  remoteD1: boolean;
 }
 
 interface BackfillPreviewRow {
@@ -35,6 +38,7 @@ interface BackfillPreviewRow {
 
 export interface ProspectBackfillWindowCliSummary {
   dry_run: boolean;
+  d1_mode: 'platform_proxy' | 'wrangler_remote';
   org_id: string;
   window_start: string;
   window_end: string;
@@ -44,6 +48,14 @@ export interface ProspectBackfillWindowCliSummary {
   source_preview: BackfillPreviewRow[];
   total_candidates: number;
   result: ProspectBackfillWindowResult | null;
+  remote_d1_meta?: RemoteD1Meta | null;
+}
+
+interface RemoteD1Meta {
+  query_count: number;
+  rows_read: number;
+  rows_written: number;
+  changed_db: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -73,6 +85,7 @@ function parseArgs(argv: string[]): Args {
   return {
     orgId: raw.get('org-id') || 'medina-ventures',
     configPath: raw.get('config') || 'wrangler.toml',
+    database: raw.get('database') || 'medina-ventures-db',
     windowStart: raw.get('window-start') || '',
     windowEnd: raw.get('window-end') || '',
     sourceFamilies,
@@ -80,6 +93,7 @@ function parseArgs(argv: string[]): Args {
     apply: raw.get('apply') === 'true',
     allowExpandedWindow: raw.get('allow-expanded-window') === 'true',
     confirmProductionWrite: raw.get('confirm-production-write') || null,
+    remoteD1: raw.get('remote-d1') === 'true',
   };
 }
 
@@ -109,6 +123,90 @@ function assertBackfillWriteAllowed(args: Pick<Args, 'apply' | 'allowExpandedWin
   if (!args.allowExpandedWindow && args.batchLimit > DEFAULT_WRITE_BATCH_MAX) {
     throw new Error(`PROSPECT_BACKFILL_BATCH_TOO_LARGE: max ${DEFAULT_WRITE_BATCH_MAX} without --allow-expanded-window true`);
   }
+}
+
+function sqlString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function sqlLiteral(value: unknown): string {
+  if (value === null || typeof value === 'undefined') return 'NULL';
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'boolean') return value ? '1' : '0';
+  return sqlString(String(value));
+}
+
+function bindSql(sql: string, binds: unknown[]): string {
+  let index = 0;
+  const bound = sql.replace(/\?/g, () => {
+    if (index >= binds.length) throw new Error('REMOTE_D1_BIND_MISMATCH');
+    return sqlLiteral(binds[index++]);
+  });
+  if (index !== binds.length) throw new Error('REMOTE_D1_BIND_MISMATCH');
+  return bound;
+}
+
+function runWranglerD1<T>(database: string, command: string, meta: RemoteD1Meta): T[] {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const stdout = execFileSync('npx', ['wrangler', 'd1', 'execute', database, '--remote', '--command', command, '--json'], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        maxBuffer: 80 * 1024 * 1024,
+      });
+      const parsed = JSON.parse(stdout) as Array<{ results?: T[]; meta?: Partial<RemoteD1Meta>; success?: boolean }>;
+      const first = parsed[0] || {};
+      if (first.success === false) throw new Error(`WRANGLER_D1_FAILED:${stdout.slice(0, 500)}`);
+      meta.query_count += 1;
+      meta.rows_read += Number(first.meta?.rows_read || 0);
+      meta.rows_written += Number(first.meta?.rows_written || 0);
+      meta.changed_db = Boolean(meta.changed_db || first.meta?.changed_db);
+      return first.results || [];
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt >= 3 || !/(7403|429|5\d\d|ETIMEDOUT|ECONNRESET|fetch failed|network)/i.test(message)) {
+        throw error;
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function remoteD1Env<TEnv extends Env>(env: TEnv, database: string, meta: RemoteD1Meta): TEnv {
+  const prepare = (sql: string) => {
+    let binds: unknown[] = [];
+    return {
+      bind(...args: unknown[]) {
+        binds = args;
+        return this;
+      },
+      async all<T = any>() {
+        return { results: runWranglerD1<T>(database, bindSql(sql, binds), meta) };
+      },
+      async first<T = any>() {
+        return runWranglerD1<T>(database, bindSql(sql, binds), meta)[0] || null;
+      },
+      async run() {
+        runWranglerD1(database, bindSql(sql, binds), meta);
+      },
+    };
+  };
+
+  return {
+    ...(env as any),
+    D1: {
+      prepare,
+      async batch(statements: Array<{ run: () => Promise<void> }>) {
+        const results: void[] = [];
+        for (const statement of statements) {
+          results.push(await statement.run());
+        }
+        return results;
+      },
+    },
+  } as TEnv;
 }
 
 async function countBackfillFamily(
@@ -145,11 +243,15 @@ export async function runProspectBackfillWindowCli(
 ): Promise<ProspectBackfillWindowCliSummary> {
   const hours = windowHours(args.windowStart, args.windowEnd);
   assertBackfillWriteAllowed(args);
+  const remoteMeta: RemoteD1Meta | null = args.remoteD1
+    ? { query_count: 0, rows_read: 0, rows_written: 0, changed_db: false }
+    : null;
+  const effectiveEnv = args.remoteD1 && remoteMeta ? remoteD1Env(env, args.database, remoteMeta) : env;
   const preview = await Promise.all(args.sourceFamilies.map(family =>
-    countBackfillFamily(env, args.orgId, family, args.windowStart, args.windowEnd, args.batchLimit)
+    countBackfillFamily(effectiveEnv, args.orgId, family, args.windowStart, args.windowEnd, args.batchLimit)
   ));
   const result = args.apply
-    ? await runProspectBackfillWindow(args.orgId, env, {
+    ? await runProspectBackfillWindow(args.orgId, effectiveEnv, {
       windowStart: args.windowStart,
       windowEnd: args.windowEnd,
       sourceFamilies: args.sourceFamilies,
@@ -158,6 +260,7 @@ export async function runProspectBackfillWindowCli(
     : null;
   return {
     dry_run: !args.apply,
+    d1_mode: args.remoteD1 ? 'wrangler_remote' : 'platform_proxy',
     org_id: args.orgId,
     window_start: args.windowStart,
     window_end: args.windowEnd,
@@ -167,6 +270,7 @@ export async function runProspectBackfillWindowCli(
     source_preview: preview,
     total_candidates: preview.reduce((sum, row) => sum + row.candidate_count, 0),
     result,
+    remote_d1_meta: remoteMeta,
   };
 }
 

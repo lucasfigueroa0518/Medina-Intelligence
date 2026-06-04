@@ -72,6 +72,17 @@ function sortCompanyNewsArticles(articles: any[] | undefined): any[] {
   });
 }
 
+function parseCustomFields(raw: any): Record<string, any> {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw;
+  try {
+    const parsed = JSON.parse(String(raw));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 interface EditFormData {
   name: string;
   description: string;
@@ -265,6 +276,13 @@ export default function CompanyDetailPage() {
       }, 450);
       return;
     }
+    const isProspectOrigin = (data?.prospect_signals || []).length > 0 ||
+      (tags || []).some((tag: any) => String(tag.name || '').toLowerCase() === 'investment prospect');
+    const hasDomainAnchor = Boolean(data?.company?.domain || data?.company?.website);
+    if (isProspectOrigin && !hasDomainAnchor) {
+      setToast('Limited information: enrichment is paused until a verified website/domain or additional corroborating evidence is available.');
+      return;
+    }
     setEnriching(true);
     try {
       await api.enrichCompany(id);
@@ -315,9 +333,22 @@ export default function CompanyDetailPage() {
   }
 
   const company = data.company;
+  const companyCustomFields = parseCustomFields(company.custom_fields);
+  const prospectOrigin = companyCustomFields.prospect_origin || {};
+  const limitedInfoProspect = Boolean(
+    prospectOrigin.limited_info ||
+    companyCustomFields.limited_info_prospect?.status === 'limited_info'
+  );
   const bio = cleanIntelBrief(fullBio);
   const bioParas = bio ? bio.split(/\n{2,}/).map((p: string) => p.trim()).filter(Boolean) : [];
   const newsArticles = sortCompanyNewsArticles(data.news_articles);
+  const prospectSignals = data.prospect_signals || [];
+  const primaryProspectSignal = prospectSignals[0] || null;
+  const isInvestmentProspect = prospectSignals.length > 0 ||
+    company.investment_status === 'prospect' ||
+    tags.some((tag: any) => String(tag.name || '').toLowerCase() === 'investment prospect');
+  const hasDomainAnchor = Boolean(company.domain || company.website);
+  const enrichmentBlocked = isInvestmentProspect && !hasDomainAnchor;
 
   return (
     <div className="flex-1 overflow-auto">
@@ -343,7 +374,12 @@ export default function CompanyDetailPage() {
           title={company.name}
           actions={
             <div className="flex gap-3">
-              <button className="btn-secondary" onClick={handleEnrich} disabled={enriching}>
+              <button
+                className="btn-secondary"
+                onClick={handleEnrich}
+                disabled={enriching || enrichmentBlocked}
+                title={enrichmentBlocked ? 'Limited information: enrichment is paused until a verified website/domain or additional corroborating evidence is available.' : undefined}
+              >
                 {enriching ? 'Enriching...' : enriched ? 'Re-enrich' : 'Enrich Now'}
               </button>
               <button className="btn-secondary" onClick={enterEditMode}>Edit</button>
@@ -432,8 +468,32 @@ export default function CompanyDetailPage() {
                       {company.investment_status.replace(/_/g, ' ')}
                     </span>
                   )}
+                  {limitedInfoProspect && (
+                    <span className="px-2 py-0.5 rounded text-[10px] font-medium uppercase tracking-wider"
+                      style={{ background: 'rgba(245,158,11,0.12)', color: '#F59E0B' }}>
+                      Limited info
+                    </span>
+                  )}
                   <TagPicker entityType="company" entityId={id} tags={tags} onTagsChange={setTags} />
                 </div>
+                {primaryProspectSignal && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-accent-magenta/20 bg-accent-magenta/10 px-3 py-2 text-xs text-text-secondary">
+                    <Target size={13} className="text-accent-magenta shrink-0" />
+                    <span className="font-medium text-text-primary">
+                      {primaryProspectSignal.mention_type === 'known_deal' ? 'Known Deal Signal' : 'Inbound Prospect'}
+                    </span>
+                    {primaryProspectSignal.confidence > 0 && (
+                      <span>{Math.round(Number(primaryProspectSignal.confidence) * 100)}% confidence</span>
+                    )}
+                    {primaryProspectSignal.source_title && (
+                      <span className="truncate max-w-[260px]">{primaryProspectSignal.source_title}</span>
+                    )}
+                    {primaryProspectSignal.occurred_at && <span>{fmtRel(primaryProspectSignal.occurred_at)}</span>}
+                    {primaryProspectSignal.match_method && (
+                      <span className="capitalize">{String(primaryProspectSignal.match_method).replace(/_/g, ' ')}</span>
+                    )}
+                  </div>
+                )}
               </>
             )}
           </div>
@@ -463,6 +523,73 @@ export default function CompanyDetailPage() {
             </div>
           )}
         </div>
+
+        {(prospectSignals.length > 0 || enrichmentBlocked || limitedInfoProspect) && (
+          <div className="card">
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <div className="text-xs uppercase text-text-muted">Prospect Signals</div>
+              {prospectSignals.length > 0 && (
+                <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold tabular-nums"
+                  style={{ background: 'rgba(217,70,168,0.12)', color: '#D946A8' }}>
+                  {prospectSignals.length}
+                </span>
+              )}
+            </div>
+            {limitedInfoProspect && (
+              <div className="mb-3 rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs text-text-secondary">
+                <div className="flex items-start gap-2">
+                  <Info size={13} className="text-semantic-warning shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-medium text-text-primary">Limited information prospect.</span>{' '}
+                    This card was created because the pipeline picked it up as a possible prospect, but it does not yet have a strong CRM match or full corroborating evidence.
+                  </div>
+                </div>
+              </div>
+            )}
+            {enrichmentBlocked && (
+              <div className="mb-3 rounded-lg border border-semantic-warning/25 bg-semantic-warning/10 px-3 py-2 text-xs text-text-secondary">
+                Limited information: enrichment is paused until a verified website/domain or additional corroborating evidence is available.
+              </div>
+            )}
+            {prospectSignals.length > 0 && (
+              <div className="space-y-2">
+                {prospectSignals.map((signal: any) => {
+                  const confidence = Number(signal.confidence || 0);
+                  const matchScore = signal.match_score == null ? null : Number(signal.match_score);
+                  return (
+                    <div key={signal.signal_id} className="rounded-lg border border-border bg-bg-surface/60 px-3 py-2.5">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <Target size={13} className="text-accent-magenta shrink-0" />
+                            <span className="text-sm font-medium text-text-primary truncate">{signal.prospect_name || signal.raw_mention_text}</span>
+                          </div>
+                          <div className="mt-1 text-xs text-text-secondary line-clamp-2">
+                            {signal.raw_mention_text}
+                          </div>
+                        </div>
+                        <span className="shrink-0 text-[10px] text-text-muted">{signal.occurred_at ? fmtRel(signal.occurred_at) : ''}</span>
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-text-muted">
+                        <span className="capitalize">{String(signal.source_type || '').replace(/_/g, ' ')}</span>
+                        {signal.signal_kind && <span className="capitalize">{String(signal.signal_kind).replace(/_/g, ' ')}</span>}
+                        {confidence > 0 && <span>{Math.round(confidence * 100)}% confidence</span>}
+                        {signal.match_method && (
+                          <span>
+                            {String(signal.match_method).replace(/_/g, ' ')}
+                            {matchScore != null && Number.isFinite(matchScore) ? ` ${Math.round(matchScore * 100)}%` : ''}
+                          </span>
+                        )}
+                        {signal.enrichment_status && <span className="capitalize">{String(signal.enrichment_status).replace(/_/g, ' ')}</span>}
+                        {signal.source_title && <span className="truncate max-w-[220px]">{signal.source_title}</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Edit-mode extra fields */}
         {editMode && (
@@ -497,7 +624,8 @@ export default function CompanyDetailPage() {
                       Enriched {fmtRel(enrichmentMeta.enrichment_last_run)}
                     </span>
                   )}
-                  <button onClick={handleEnrich} disabled={enriching}
+                  <button onClick={handleEnrich} disabled={enriching || enrichmentBlocked}
+                    title={enrichmentBlocked ? 'Limited information: enrichment is paused until a verified website/domain or additional corroborating evidence is available.' : undefined}
                     className="text-[10px] text-accent-magenta hover:text-accent-purple transition-colors disabled:opacity-40 flex items-center gap-1">
                     <RefreshCw size={10} className={enriching ? 'animate-spin' : ''} />
                     {enriching ? 'Enriching...' : 'Re-enrich'}

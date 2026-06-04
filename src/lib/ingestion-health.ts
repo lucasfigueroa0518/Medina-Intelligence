@@ -308,7 +308,7 @@ export async function reportIngestionSuccess(
         AND source = ?
         AND scope_type = ?
         AND scope_id = ?
-        AND status IN ('open','recovering')`
+        AND status IN ('open','recovering','blocked')`
   ).bind(at, at, input.orgId, input.source, scType, scId).run();
 }
 
@@ -332,6 +332,7 @@ export function incidentsToUserWarnings(
   incidents: IngestionIncident[]
 ): UserFacingIngestionWarning[] {
   return incidents
+    .filter(i => i.source !== 'work_queue')
     .filter(i => i.severity === 'critical' || i.human_action_required === 1)
     .slice(0, 5)
     .map(i => ({

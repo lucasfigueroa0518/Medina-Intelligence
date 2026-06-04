@@ -23,6 +23,7 @@ const MIGRATION_PATHS = [
   'migrations/0114_prospect_intelligence.sql',
   'migrations/0115_ingestion_evidence_hardening.sql',
   'migrations/0116_prospect_deal_backlinks.sql',
+  'migrations/0117_prospect_signal_company_bridge.sql',
 ] as const;
 
 const EXPECTED_INDEXES = [
@@ -37,6 +38,9 @@ const EXPECTED_INDEXES = [
   'idx_prospect_signals_source',
   'idx_prospect_signals_type',
   'idx_prospect_signals_pending',
+  'idx_prospect_signals_company',
+  'idx_prospects_company',
+  'idx_prospects_possible_company',
   'idx_pbj_org_status',
   'idx_pbj_user',
   'idx_entity_field_state_unique',
@@ -51,6 +55,7 @@ const EXPECTED_QUERY_PLAN_INDEXES = [
   'idx_prospects_deal',
   'idx_prospect_signals_source',
   'idx_prospect_signals_type',
+  'idx_prospect_signals_company',
   'idx_pbj_org_status',
 ] as const;
 
@@ -96,6 +101,11 @@ function queryLines(dbPath: string, sql: string): string[] {
     maxBuffer: 20 * 1024 * 1024,
   }).trim();
   return out ? out.split('\n').map(line => line.trim()).filter(Boolean) : [];
+}
+
+function columnExists(dbPath: string, table: string, column: string): boolean {
+  return queryLines(dbPath, `PRAGMA table_info(${table});`)
+    .some(line => line.split('|')[1] === column);
 }
 
 function bootstrapSql(input: { seeded?: boolean; staleEntityFieldStateNew?: boolean; staleProgressiveBackfillJobsNew?: boolean }): string {
@@ -152,8 +162,25 @@ VALUES ('pbj-1', 'org-1', 'user-1', 'active'),
 
 function applyMigrations(dbPath: string): void {
   for (const path of MIGRATION_PATHS) {
+    if (path.endsWith('0117_prospect_signal_company_bridge.sql')) {
+      applyProspectBridgeMigration(dbPath);
+      continue;
+    }
     runSql(dbPath, readFileSync(path, 'utf8'));
   }
+}
+
+function applyProspectBridgeMigration(dbPath: string): void {
+  const hasCompanyId = columnExists(dbPath, 'prospect_signals', 'company_id');
+  const migration = readFileSync('migrations/0117_prospect_signal_company_bridge.sql', 'utf8');
+  const statements = migration
+    .split(';')
+    .map(statement => statement.trim())
+    .filter(Boolean)
+    .filter(statement => hasCompanyId
+      ? !/ALTER\s+TABLE\s+prospect_signals\s+ADD\s+COLUMN\s+company_id/i.test(statement)
+      : true);
+  for (const statement of statements) runSql(dbPath, `${statement};`);
 }
 
 function makeTempDb(prefix: string): { dir: string; dbPath: string } {
@@ -203,6 +230,7 @@ function emptyScenario(): ProspectMigrationReadinessCheck[] {
       assertScalar(dbPath, 'empty.prospects_empty', 'SELECT COUNT(*) FROM prospects;', '0'),
       assertScalar(dbPath, 'empty.progressive_jobs_empty', 'SELECT COUNT(*) FROM progressive_backfill_jobs;', '0'),
       assertScalar(dbPath, 'empty.prospect_signals_exists', "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='prospect_signals';", '1'),
+      assertScalar(dbPath, 'empty.prospect_signals_company_id_exists', "SELECT COUNT(*) FROM pragma_table_info('prospect_signals') WHERE name='company_id';", '1'),
     ];
   });
 }
@@ -216,6 +244,7 @@ function seededScenario(): ProspectMigrationReadinessCheck[] {
     const checks = [
       assertScalar(dbPath, 'seeded.prospect_rows_survive_repeat_apply', 'SELECT COUNT(*) FROM prospects;', '1'),
       assertScalar(dbPath, 'seeded.signal_rows_survive_repeat_apply', 'SELECT COUNT(*) FROM prospect_signals;', '1'),
+      assertScalar(dbPath, 'seeded.signal_company_id_column_survives_repeat_apply', "SELECT COUNT(*) FROM pragma_table_info('prospect_signals') WHERE name='company_id';", '1'),
       assertScalar(dbPath, 'seeded.entity_field_state_rows_survive_repeat_apply', 'SELECT COUNT(*) FROM entity_field_state;', '2'),
       assertScalar(dbPath, 'seeded.progressive_jobs_survive_repeat_apply', 'SELECT COUNT(*) FROM progressive_backfill_jobs;', '2'),
     ];
@@ -274,6 +303,10 @@ function indexAndConstraintScenario(): ProspectMigrationReadinessCheck[] {
       {
         name: 'idx_prospect_signals_type',
         sql: "EXPLAIN QUERY PLAN SELECT * FROM prospect_signals WHERE org_id='org-1' AND mention_type='inbound_prospect' ORDER BY occurred_at DESC;",
+      },
+      {
+        name: 'idx_prospect_signals_company',
+        sql: "EXPLAIN QUERY PLAN SELECT * FROM prospect_signals WHERE org_id='org-1' AND company_id='company-1' ORDER BY occurred_at DESC;",
       },
       {
         name: 'idx_pbj_org_status',

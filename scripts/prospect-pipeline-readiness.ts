@@ -30,6 +30,7 @@ export interface ProspectPipelineReadinessSources {
   prospectPipelineHealth: string;
   prospectIntelligence: string;
   materializeKnownDeals: string;
+  bridgeMaterialize: string;
   migrationReadinessCheck: string;
   migration0114: string;
   migration0115: string;
@@ -51,6 +52,7 @@ const DEFAULT_FILES = {
   prospectPipelineHealth: 'scripts/prospect-pipeline-health.ts',
   prospectIntelligence: 'src/lib/prospect-intelligence.ts',
   materializeKnownDeals: 'scripts/prospect-materialize-known-deals.ts',
+  bridgeMaterialize: 'scripts/prospect-bridge-materialize.ts',
   migrationReadinessCheck: 'scripts/prospect-migration-readiness-check.ts',
   migration0114: 'migrations/0114_prospect_intelligence.sql',
   migration0115: 'migrations/0115_ingestion_evidence_hardening.sql',
@@ -271,6 +273,16 @@ export function evaluateProspectPipelineReadiness(input: {
       /APPLY_REQUIRES_EXPLICIT_GO/.test(sources.materializeKnownDeals) &&
         /confirmProductionWrite/.test(sources.materializeKnownDeals),
       'known-deal materialization cannot apply from CLI without explicit production-write confirmation'
+    ),
+    check(
+      'bridge_materialization.pipeline_ready',
+      /PROSPECT_BRIDGE_MATERIALIZE_PRODUCTION_GO/.test(sources.bridgeMaterialize) &&
+        /PROSPECT_BRIDGE_APPLY_REQUIRES_EXACT_CONFIRMATION/.test(sources.bridgeMaterialize) &&
+        /create_company/.test(sources.bridgeMaterialize) &&
+        /createProspectOriginCompany/.test(sources.bridgeMaterialize) &&
+        /REMOTE_D1_READ_ONLY_VIOLATION/.test(sources.bridgeMaterialize) &&
+        /prospect_signals s/.test(sources.bridgeMaterialize),
+      'prospect bridge materialization is dry-run/read-only by default, supports create-company decisions, and shares prospect-origin company creation'
     ),
     check(
       'migration.readiness_script_available',

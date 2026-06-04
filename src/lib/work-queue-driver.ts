@@ -64,6 +64,12 @@ export interface WorkQueueHandler {
   maxConcurrent?: number;
 
   /**
+   * Optional within-tick processing concurrency for a claimed batch.
+   * Default remains 1 so existing domains keep their sequential behavior.
+   */
+  processConcurrency?: number;
+
+  /**
    * 'minute' (default) runs every minute tick. 'hour' runs only when
    * the dispatching minute tick happens at minute :00 (caller decides).
    * Keeping the dispatch logic in src/index.ts means this field is
@@ -374,7 +380,7 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
     };
     let claimed: WorkQueueRow[] = [];
     try {
-      let claimLimit = Math.min(handler.batchSize, 10);
+      let claimLimit = Math.min(handler.batchSize, 20);
       if (handler.maxConcurrent !== undefined) {
         const active = await env.D1.prepare(
           `SELECT COUNT(*) AS count FROM work_queue
@@ -405,7 +411,7 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
       continue;
     }
 
-    for (const item of claimed) {
+    const processOne = async (item: WorkQueueRow) => {
       try {
         const itemResult = await processClaimedWorkItem(env, handler, item);
         if (itemResult.completed) stats.completed++;
@@ -432,6 +438,11 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
           result.sample_errors.push({ domain: handler.domain, ...entry });
         }
       }
+    };
+
+    const processConcurrency = Math.min(Math.max(Math.floor(handler.processConcurrency || 1), 1), 20);
+    for (let i = 0; i < claimed.length; i += processConcurrency) {
+      await Promise.all(claimed.slice(i, i + processConcurrency).map(processOne));
     }
     result.per_domain.push(stats);
   }

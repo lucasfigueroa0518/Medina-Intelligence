@@ -431,8 +431,9 @@ export async function enqueueProspectDetectSource(
 
 export const prospectDetectHandler: WorkQueueHandler = {
   domain: 'prospect_detect',
-  batchSize: 3,
-  maxConcurrent: 3,
+  batchSize: 20,
+  maxConcurrent: 60,
+  processConcurrency: 10,
   cadence: 'minute',
 
   process: async (item, env) => {

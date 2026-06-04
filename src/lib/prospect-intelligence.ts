@@ -3,8 +3,14 @@ import type { ClassifiedItem } from '../types/interfaces';
 import { callClaudeWithUsage, type ClaudeSystemPrompt } from './claude';
 import { emailDomain, getConfiguredInternalDomains, isInternalEmailDomain } from './internal-domains';
 import { budgetUpstreamForClaudeModel, CLAUDE_HAIKU_MODEL } from './model-policy';
+import { triggerCompanyEnrichment } from './enrichment';
+import { emitAudit } from './audit';
+import { invalidateRagCache } from './cache';
+import { updateEntityInIndex } from './entity-index';
+import { jaroWinkler } from './dedup';
+import { registrableDomain } from './discovery';
 
-export const PROSPECT_CLASSIFIER_VERSION = 'prospect-v1-llm-req-cl-veto-calibrated-2026-06-01';
+export const PROSPECT_CLASSIFIER_VERSION = 'prospect-v1-llm-req-cl-veto-dedupe-2026-06-02';
 const PROSPECT_CLASSIFIER_DEFAULT_MODEL = CLAUDE_HAIKU_MODEL;
 const DEFAULT_PROSPECT_PRODUCTION_SAMPLE_RATE = 0.02;
 export const PROSPECT_CONTEXT_WINDOW_CHARS = 4000;
@@ -103,6 +109,66 @@ interface ExistingContext {
   relationshipStates: string[];
   isInternal: boolean;
   matchStrength: 'none' | 'name' | 'domain' | 'company_id';
+}
+
+type CrossD1CompanyRole =
+  | 'startup_or_private_company'
+  | 'known_deal'
+  | 'bank'
+  | 'vc_firm'
+  | 'lp_or_family_office'
+  | 'nonprofit'
+  | 'government_or_event_channel'
+  | 'vendor_or_service_provider'
+  | 'advisor_or_intro_source'
+  | 'customer_or_buyer'
+  | 'internal_entity'
+  | 'portfolio_company'
+  | 'frequent_partner_or_source'
+  | 'public_or_acquired_company'
+  | 'unknown';
+
+type CrossD1RoleConfidence = 'authoritative' | 'high' | 'medium' | 'low';
+type CrossD1RoleActionOverride = 'attach_existing_deal' | 'record_context' | 'ignore' | 'mark_provisional' | null;
+type LowConfidenceVerificationVerdict =
+  | 'not_applicable'
+  | 'verified_create'
+  | 'provisional_create'
+  | 'record_context'
+  | 'ignore';
+type LowConfidenceVerificationActionOverride = 'record_context' | 'ignore' | 'mark_provisional' | null;
+
+interface CrossD1CompanyRoleCheck {
+  checked: boolean;
+  eligible: boolean;
+  role: CrossD1CompanyRole;
+  confidence: CrossD1RoleConfidence;
+  evidence: string[];
+  action_override: CrossD1RoleActionOverride;
+  matched_company_id: string | null;
+  matched_deal_id: string | null;
+  reason: string | null;
+}
+
+interface LowConfidenceProspectVerification {
+  checked: boolean;
+  eligible: boolean;
+  verdict: LowConfidenceVerificationVerdict;
+  action_override: LowConfidenceVerificationActionOverride;
+  reason: string | null;
+  scores: {
+    identity: number;
+    intent: number;
+    source_quality: number;
+    d1_support: number;
+    extraction_risk: number;
+    total: number;
+  };
+  identity_signals: string[];
+  intent_signals: string[];
+  source_quality_signals: string[];
+  d1_signals: string[];
+  extraction_flags: string[];
 }
 
 interface Classification {
@@ -748,9 +814,11 @@ export function cleanProspectSourceText(rawText: string): { cleanedText: string 
     if (stripEmailScaffoldingLine(line)) continue;
     const trimmed = line.trim();
     if (/^(?:lucas|tony|anthony|alicia)\b(?:\s+[A-Z][A-Za-z.'-]+)?\s*$/i.test(trimmed)) continue;
+    const pairedMedinaTitle = /^(?:re|fw|fwd)?\s*:?\s*[A-Z0-9][A-Za-z0-9&.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]+){0,5}\s*(?:<>|<->|x|\/|&|\band\b)\s*Medina(?:\s+Ventures)?\b/i.test(trimmed);
     if (
       /\bmedina\s+(?:ventures|vc|capital)\b/i.test(trimmed) &&
       trimmed.length < 80 &&
+      !pairedMedinaTitle &&
       !/\b(?:intro|introduction|meet|deck|update|fundrais|pitch|demo)\b|\([^)]+\)/i.test(trimmed)
     ) continue;
     kept.push(line);
@@ -766,6 +834,140 @@ function domainLabelToCompany(domain: string): string {
     .filter(Boolean)
     .map(part => part ? part[0].toUpperCase() + part.slice(1) : part)
     .join(' ');
+}
+
+const DOMAIN_BRAND_PREFIXES = [
+  'hello',
+  'get',
+  'try',
+  'use',
+  'go',
+  'join',
+  'ask',
+  'app',
+  'my',
+  'with',
+];
+
+function identityAliasVariants(normalized: string): Set<string> {
+  const aliases = new Set<string>();
+  const clean = String(normalized || '').replace(/[^a-z0-9]/g, '');
+  if (!clean || clean.length < 3) return aliases;
+  aliases.add(clean);
+  for (const prefix of DOMAIN_BRAND_PREFIXES) {
+    if (!clean.startsWith(prefix)) continue;
+    const remainder = clean.slice(prefix.length);
+    if (remainder.length >= 4 && !isGenericFragmentCandidate(remainder)) aliases.add(remainder);
+  }
+  return aliases;
+}
+
+function prospectIdentityAliasesForName(value: string | null | undefined): Set<string> {
+  return identityAliasVariants(normalizeProspectName(value));
+}
+
+function domainsInText(text: string, env?: Env): string[] {
+  const domains: string[] = [];
+  for (const match of String(text || '').matchAll(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|gov|mil|edu|health|tech|dev|finance|xyz))\b/gi)) {
+    const rawDomain = match[1]?.toLowerCase().replace(/^www\./, '') || '';
+    const domain = rawDomain ? registrableDomain(rawDomain) : '';
+    if (!domain || shouldIgnoreDomain(domain, env)) continue;
+    if (!domains.includes(domain)) domains.push(domain);
+  }
+  return domains;
+}
+
+function firstProspectDomainForMention(mention: MentionCandidate, env?: Env): string | null {
+  const fields = [
+    mention.listFields?.website || '',
+    mention.raw,
+    mention.lineText,
+    mention.contextText,
+  ];
+  for (const field of fields) {
+    const value = String(field || '').trim();
+    const direct = /^(?:https?:\/\/)?(?:www\.)?[a-z0-9-]+\.[a-z0-9.-]+/i.test(value) ? domainFromUrl(value) : null;
+    if (direct && !shouldIgnoreDomain(direct, env)) return direct;
+    const [domain] = domainsInText(value, env);
+    if (domain) return domain;
+  }
+  return null;
+}
+
+function prospectIdentityAliasesForMention(mention: MentionCandidate, env?: Env): Set<string> {
+  const aliases = prospectIdentityAliasesForName(mention.canonicalName);
+  const domain = firstProspectDomainForMention(mention, env);
+  if (domain) {
+    for (const alias of prospectIdentityAliasesForName(domainLabelToCompany(domain))) aliases.add(alias);
+  }
+  return aliases;
+}
+
+function setsIntersect(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) {
+    if (right.has(value)) return true;
+  }
+  return false;
+}
+
+function mentionLooksDomainDerived(mention: MentionCandidate, env?: Env): boolean {
+  const domain = firstProspectDomainForMention(mention, env);
+  if (!domain) return false;
+  const domainAliases = prospectIdentityAliasesForName(domainLabelToCompany(domain));
+  return domainAliases.has(mention.normalizedName) || /\.[a-z]{2,}\b/i.test(mention.raw) || /@[^@\s]+\.[a-z]{2,}\b/i.test(mention.raw);
+}
+
+function prospectDisplayNameScore(mention: MentionCandidate, env?: Env): number {
+  let score = 0;
+  const clean = normalizeWhitespace(mention.canonicalName);
+  if (mention.isListEntry) score += 8;
+  if (hasCompanyToken(clean) || isKnownConnectorCompanyName(clean)) score += 6;
+  if (/^[A-Z0-9][A-Za-z0-9&.'’/-]*(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]*){0,4}$/.test(clean)) score += 5;
+  if (mention.listFields?.website) score += 4;
+  if (mentionLooksDomainDerived(mention, env)) score -= 12;
+  if (/\.[a-z]{2,}\b/i.test(mention.raw)) score -= 8;
+  if (clean.length > 2 && clean.length <= 40) score += Math.max(0, 6 - Math.floor(clean.length / 12));
+  return score;
+}
+
+function betterProspectMention(left: MentionCandidate, right: MentionCandidate, env?: Env): MentionCandidate {
+  const leftScore = prospectDisplayNameScore(left, env);
+  const rightScore = prospectDisplayNameScore(right, env);
+  if (rightScore > leftScore) return right;
+  if (leftScore > rightScore) return left;
+  const leftStart = left.spanStart ?? Number.MAX_SAFE_INTEGER;
+  const rightStart = right.spanStart ?? Number.MAX_SAFE_INTEGER;
+  return rightStart < leftStart ? right : left;
+}
+
+function shouldMergeMentionIdentity(left: MentionCandidate, right: MentionCandidate, env?: Env): boolean {
+  if (left.normalizedName === right.normalizedName) return true;
+  const leftAliases = prospectIdentityAliasesForMention(left, env);
+  const rightAliases = prospectIdentityAliasesForMention(right, env);
+  if (!setsIntersect(leftAliases, rightAliases)) return false;
+  if (mentionLooksDomainDerived(left, env) || mentionLooksDomainDerived(right, env)) return true;
+  const leftDomain = firstProspectDomainForMention(left, env);
+  const rightDomain = firstProspectDomainForMention(right, env);
+  if (leftDomain && rightDomain && leftDomain === rightDomain) return true;
+  return false;
+}
+
+function dedupeMentionIdentityCandidates(candidates: MentionCandidate[], env?: Env): MentionCandidate[] {
+  const groups: MentionCandidate[] = [];
+  for (const candidate of candidates) {
+    const matchIndex = groups.findIndex(existing => shouldMergeMentionIdentity(existing, candidate, env));
+    if (matchIndex < 0) {
+      groups.push(candidate);
+      continue;
+    }
+    const winner = betterProspectMention(groups[matchIndex], candidate, env);
+    groups[matchIndex] = {
+      ...winner,
+      products: Array.from(new Set([...(groups[matchIndex].products || []), ...(candidate.products || [])])),
+      listFields: winner.listFields || groups[matchIndex].listFields || candidate.listFields,
+    };
+  }
+  return groups;
 }
 
 function shouldIgnoreDomain(domain: string, env?: Env): boolean {
@@ -1678,7 +1880,8 @@ function domainFromUrl(value: string | null | undefined): string | null {
   const raw = String(value || '').trim();
   if (!raw) return null;
   try {
-    return new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname.toLowerCase().replace(/^www\./, '') || null;
+    const host = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname.toLowerCase().replace(/^www\./, '');
+    return host ? registrableDomain(host) : null;
   } catch {
     return null;
   }
@@ -1778,12 +1981,14 @@ export function extractMentionCandidatesFromText(text: string, fallbackName?: st
     if (domainSubject?.[1]) pushTarget(domainSubject[1], cleanedText.indexOf(line));
     const titleTarget = normalizedLine.match(/^(?:re|fw|fwd)?\s*:?\s*([A-Z0-9][A-Za-z0-9&.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]+){0,4})\s+(?:update|deck|demo|diligence|fundrais(?:e|ing)|series\s+[A-Z]|pitch|follow[-\s]?up|materials)\b/);
     if (titleTarget?.[1]) pushTarget(titleTarget[1], cleanedText.indexOf(line));
-    const medinaPair = normalizedLine.match(/^(?:re|fw|fwd)?\s*:?\s*([A-Z0-9][A-Za-z0-9&.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]+){0,4})\s*(?:<>|<->|x|\/)\s*Medina\b/i);
+    const ampersandMedinaPair = normalizedLine.match(/^(?:re|fw|fwd)?\s*:?\s*([A-Z0-9][A-Za-z0-9.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9.'’/-]+){0,4})\s*&\s*Medina(?:\s+Ventures)?\b/i);
+    if (ampersandMedinaPair?.[1]) pushTarget(ampersandMedinaPair[1], cleanedText.indexOf(line));
+    const medinaPair = normalizedLine.match(/^(?:re|fw|fwd)?\s*:?\s*([A-Z0-9][A-Za-z0-9&.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]+){0,4})\s*(?:<>|<->|x|\/|\band\b)\s*Medina(?:\s+Ventures)?\b/i);
     if (medinaPair?.[1]) pushTarget(medinaPair[1], cleanedText.indexOf(line));
     if (candidates.length >= maxCandidates) break;
   }
 
-  for (const match of cleanedText.matchAll(/\bCompany[ \t]+Name[ \t]+([A-Za-z0-9][A-Za-z0-9&.'’/-]+(?:[ \t]+[A-Za-z0-9][A-Za-z0-9&.'’/-]+){0,5})(?=[ \t]+(?:Company[ \t]+URL|Founder(?:s|\(s\))?|Short[ \t]+Description|Location|Industry|Round[ \t]+Stage)\b)/gi)) {
+  for (const match of cleanedText.matchAll(/\bCompany[ \t]+Name[ \t:=-]+([A-Za-z0-9][A-Za-z0-9&.'’/-]+(?:[ \t]+[A-Za-z0-9][A-Za-z0-9&.'’/-]+){0,5}?)(?=[ \t]+(?:Company[ \t]+URL|Website|Founder(?:s|\(s\))?|Short[ \t]+Description|Location|Industry|Round[ \t]+Stage)\b)/gi)) {
     pushFieldTarget(match[1] || '', match.index || 0);
     if (candidates.length >= maxCandidates) break;
   }
@@ -2064,7 +2269,7 @@ export async function extractOrganizationMentionsFromSource(
     }
   }
 
-  return renumberMentionCandidates([...mentions.values()]);
+  return renumberMentionCandidates(dedupeMentionIdentityCandidates([...mentions.values()], env));
 }
 
 async function companyNameFor(id: string | undefined, orgId: string, env: Env): Promise<string | null> {
@@ -2120,7 +2325,10 @@ async function lookupExistingContext(
   const domainMatch = mentionDomain
     ? allCandidates.find(c => c.domain && c.domain.toLowerCase() === mentionDomain)
     : null;
-  const nameMatch = allCandidates.find(c => normalizeProspectName(c.name) === mention.normalizedName);
+  const nameMatch = allCandidates.find(c =>
+    normalizeProspectName(c.name) === mention.normalizedName &&
+    !companyNameMatchConflictsWithSourceDomain(c, mention, mentionDomain)
+  );
   const match = domainMatch || nameMatch;
   if (!match) return { companyId: null, dealId: null, companyDomain: mentionDomain, relationshipStates: [], isInternal: false, matchStrength: 'none' };
 
@@ -2232,6 +2440,705 @@ export async function loadProspectClassifierKnownContext(
   };
 }
 
+interface CrossD1CompanyRow {
+  id: string;
+  name: string;
+  domain: string | null;
+  website: string | null;
+  description: string | null;
+  company_type: string | null;
+  investment_status: string | null;
+  stage: string | null;
+  sector: string | null;
+  is_internal_entity: number | null;
+  last_news_summary: string | null;
+  custom_fields: string | null;
+}
+
+function emptyCrossD1CompanyRoleCheck(reason: string): CrossD1CompanyRoleCheck {
+  return {
+    checked: false,
+    eligible: false,
+    role: 'unknown',
+    confidence: 'low',
+    evidence: [],
+    action_override: null,
+    matched_company_id: null,
+    matched_deal_id: null,
+    reason,
+  };
+}
+
+function checkedCrossD1CompanyRoleCheck(input: Partial<CrossD1CompanyRoleCheck> & Pick<CrossD1CompanyRoleCheck, 'role' | 'confidence' | 'evidence'>): CrossD1CompanyRoleCheck {
+  return {
+    checked: true,
+    eligible: true,
+    role: input.role,
+    confidence: input.confidence,
+    evidence: input.evidence.slice(0, 12),
+    action_override: input.action_override ?? null,
+    matched_company_id: input.matched_company_id ?? null,
+    matched_deal_id: input.matched_deal_id ?? null,
+    reason: input.reason ?? null,
+  };
+}
+
+function crossD1RoleTextForCompany(row: CrossD1CompanyRow | null): string {
+  if (!row) return '';
+  const fields = [
+    row.description,
+    row.last_news_summary,
+    row.custom_fields,
+    row.sector,
+    row.stage,
+  ];
+  return normalizeWhitespace(fields.filter(Boolean).join(' ')).slice(0, 5000);
+}
+
+function crossD1TextRoleEvidence(text: string): Array<{ role: CrossD1CompanyRole; evidence: string; weight: number }> {
+  const compact = normalizeWhitespace(text).toLowerCase();
+  if (!compact) return [];
+  const hits: Array<{ role: CrossD1CompanyRole; evidence: string; weight: number }> = [];
+  const add = (role: CrossD1CompanyRole, evidence: string, weight = 1) => hits.push({ role, evidence, weight });
+
+  if (/\b(?:investment bank|merchant bank|commercial bank|banking institution|financial institution|broker[-\s]?dealer|wealth management|asset management firm)\b/.test(compact)) {
+    add('bank', 'company brief describes bank/financial institution', 2);
+  }
+  if (/\b(?:venture capital|private equity|investment firm|investment fund|vc firm|growth equity|family office|asset manager|fund manager)\b/.test(compact)) {
+    add(/\bfamily office\b/.test(compact) ? 'lp_or_family_office' : 'vc_firm', 'company brief describes investor/fund firm', 2);
+  }
+  if (/\b(?:nonprofit|non-profit|not[-\s]?for[-\s]?profit|501\(c\)|foundation|charitable organization|university|research institute)\b/.test(compact)) {
+    add('nonprofit', 'company brief describes nonprofit/foundation/academic institution', 2);
+  }
+  if (/\b(?:government agency|federal agency|department of|u\.s\. army|us army|devcom|dod|department of defense|municipality|public sector buyer|event host|conference organizer|showcase|accelerator program)\b/.test(compact)) {
+    add('government_or_event_channel', 'company brief describes government/event/channel entity', 2);
+  }
+  if (/\b(?:law firm|legal services|accounting firm|consulting firm|advisory firm|insurance broker|insurance brokerage|brokerage firm|risk management firm|investment banking services|placement agent|recruiting firm|marketing agency|service provider|systems integrator)\b/.test(compact)) {
+    add('vendor_or_service_provider', 'company brief describes service provider/advisor', 2);
+  }
+  if (/\b(?:partner(?:s|ed)? with medina|frequent partner|strategic partner|ecosystem partner|intro source|referral partner|channel partner)\b/.test(compact)) {
+    add('frequent_partner_or_source', 'company brief describes partner/source relationship', 2);
+  }
+  if (/\b(?:customer|buyer|procurement|end customer|public sector customer|strategic customer)\b/.test(compact)) {
+    add('customer_or_buyer', 'company brief describes customer/buyer role', 1);
+  }
+  if (/\b(?:startup|start-up|early[-\s]?stage|seed[-\s]?stage|series\s+[abc]|venture-backed|saas|software platform|ai platform|cybersecurity platform|founder-led)\b/.test(compact)) {
+    add('startup_or_private_company', 'company brief describes startup/private software company', 1);
+  }
+  if (/\b(?:public company|publicly traded|listed company|acquired by|subsidiary of|fortune 500)\b/.test(compact)) {
+    add('public_or_acquired_company', 'company brief describes public/acquired/large incumbent', 2);
+  }
+  return hits;
+}
+
+function chooseWeightedCrossD1Role(scores: Map<CrossD1CompanyRole, number>): CrossD1CompanyRole {
+  const priority: CrossD1CompanyRole[] = [
+    'known_deal',
+    'internal_entity',
+    'portfolio_company',
+    'bank',
+    'vc_firm',
+    'lp_or_family_office',
+    'nonprofit',
+    'government_or_event_channel',
+    'vendor_or_service_provider',
+    'advisor_or_intro_source',
+    'frequent_partner_or_source',
+    'customer_or_buyer',
+    'public_or_acquired_company',
+    'startup_or_private_company',
+    'unknown',
+  ];
+  let best: CrossD1CompanyRole = 'unknown';
+  let bestScore = 0;
+  for (const role of priority) {
+    const score = scores.get(role) || 0;
+    if (score > bestScore) {
+      best = role;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function confidenceForCrossD1Role(score: number, authoritative: boolean): CrossD1RoleConfidence {
+  if (authoritative) return 'authoritative';
+  if (score >= 3) return 'high';
+  if (score >= 2) return 'medium';
+  return 'low';
+}
+
+function actionForCrossD1Role(role: CrossD1CompanyRole, confidence: CrossD1RoleConfidence, dealId: string | null): CrossD1RoleActionOverride {
+  if (role === 'known_deal' && dealId) return 'attach_existing_deal';
+  if (role === 'internal_entity') return 'ignore';
+  if (confidence === 'low') return null;
+  if ([
+    'bank',
+    'vc_firm',
+    'lp_or_family_office',
+    'nonprofit',
+    'government_or_event_channel',
+    'vendor_or_service_provider',
+    'advisor_or_intro_source',
+    'customer_or_buyer',
+    'portfolio_company',
+    'frequent_partner_or_source',
+    'public_or_acquired_company',
+  ].includes(role)) return 'record_context';
+  if (role === 'known_deal') return 'mark_provisional';
+  return null;
+}
+
+async function loadCrossD1CompanyRow(
+  orgId: string,
+  mention: MentionCandidate,
+  existing: ExistingContext,
+  item: ClassifiedItem,
+  env: Env
+): Promise<CrossD1CompanyRow | null> {
+  if (existing.companyId) {
+    const byId = await env.D1.prepare(
+      `SELECT id, name, domain, website, description, company_type, investment_status, stage, sector,
+              is_internal_entity, last_news_summary, custom_fields
+         FROM companies
+        WHERE id = ? AND org_id = ? AND deleted_at IS NULL
+        LIMIT 1`
+    ).bind(existing.companyId, orgId).first<CrossD1CompanyRow>();
+    if (byId) return byId;
+  }
+
+  const domain = existing.companyDomain || domainFromMention(item, mention) || firstProspectDomainForMention(mention, env);
+  if (domain) {
+    const byDomain = await env.D1.prepare(
+      `SELECT id, name, domain, website, description, company_type, investment_status, stage, sector,
+              is_internal_entity, last_news_summary, custom_fields
+         FROM companies
+        WHERE org_id = ? AND deleted_at IS NULL
+          AND (lower(domain) = lower(?) OR lower(website) LIKE ?)
+        LIMIT 1`
+    ).bind(orgId, domain, `%${domain.toLowerCase()}%`).first<CrossD1CompanyRow>();
+    if (byDomain) return byDomain;
+  }
+
+  const token = mention.canonicalName.split(/\s+/)[0]?.toLowerCase();
+  if (token && token.length >= 3) {
+    const rows = await env.D1.prepare(
+      `SELECT id, name, domain, website, description, company_type, investment_status, stage, sector,
+              is_internal_entity, last_news_summary, custom_fields
+         FROM companies
+        WHERE org_id = ? AND deleted_at IS NULL AND lower(name) LIKE ?
+        LIMIT 20`
+    ).bind(orgId, `%${token}%`).all<CrossD1CompanyRow>();
+    let best: CrossD1CompanyRow | null = null;
+    let bestScore = 0;
+    const mentionAliases = prospectIdentityAliasesForMention(mention, env);
+    for (const row of rows.results || []) {
+      const rowAliases = prospectIdentityAliasesForRow({
+        canonical_name: row.name,
+        normalized_name: normalizeProspectName(row.name),
+        domain: row.domain,
+        website: row.website,
+      });
+      const score = setsIntersect(mentionAliases, rowAliases) ? 2 : normalizeProspectName(row.name) === mention.normalizedName ? 2 : 0;
+      if (score > bestScore) {
+        best = row;
+        bestScore = score;
+      }
+    }
+    if (best) return best;
+  }
+
+  return null;
+}
+
+async function crossD1ContactRoleEvidence(orgId: string, companyId: string | null, env: Env): Promise<Array<{ role: CrossD1CompanyRole; evidence: string; weight: number }>> {
+  if (!companyId) return [];
+  const rows = await env.D1.prepare(
+    `SELECT contact_type, relationship_status, job_title, email
+       FROM contacts
+      WHERE org_id = ? AND company_id = ? AND deleted_at IS NULL AND merged_into IS NULL
+      LIMIT 25`
+  ).bind(orgId, companyId).all<{ contact_type: string | null; relationship_status: string | null; job_title: string | null; email: string | null }>().catch(error => {
+    if (isMissingSqlTableError(error, 'contacts')) return { results: [] as Array<{ contact_type: string | null; relationship_status: string | null; job_title: string | null; email: string | null }> };
+    throw error;
+  });
+  const evidence: Array<{ role: CrossD1CompanyRole; evidence: string; weight: number }> = [];
+  for (const row of rows.results || []) {
+    const text = `${row.contact_type || ''} ${row.relationship_status || ''} ${row.job_title || ''}`.toLowerCase();
+    if (/\b(?:lp|institutional_investor|investor)\b/.test(text)) evidence.push({ role: 'lp_or_family_office', evidence: 'contact relationship indicates LP/investor', weight: 1 });
+    if (/\b(?:advisor|vendor)\b/.test(text)) evidence.push({ role: 'vendor_or_service_provider', evidence: 'contact relationship indicates advisor/vendor', weight: 1 });
+    if (/\b(?:portfolio_founder)\b/.test(text)) evidence.push({ role: 'portfolio_company', evidence: 'contact relationship indicates portfolio founder', weight: 1 });
+  }
+  return evidence;
+}
+
+async function crossD1DealmakerEvidence(orgId: string, mention: MentionCandidate, company: CrossD1CompanyRow | null, env: Env): Promise<Array<{ role: CrossD1CompanyRole; evidence: string; weight: number }>> {
+  const domain = String(company?.domain || firstProspectDomainForMention(mention, env) || '').toLowerCase().replace(/^www\./, '');
+  const normalizedName = normalizeProspectName(company?.name || mention.canonicalName);
+  if (!domain && !normalizedName) return [];
+  const clauses: string[] = [];
+  const binds: unknown[] = [orgId];
+  if (domain) {
+    clauses.push(`lower(domain) = lower(?)`);
+    binds.push(domain);
+  }
+  if (normalizedName) {
+    clauses.push(`normalized_name = ?`);
+    binds.push(normalizedName);
+  }
+  const rows = await env.D1.prepare(
+    `SELECT dealmaker_type, COUNT(*) AS n
+       FROM dealmakers
+      WHERE org_id = ? AND (${clauses.join(' OR ')})
+      GROUP BY dealmaker_type`
+  ).bind(...binds).all<{ dealmaker_type: string | null; n: number }>().catch(error => {
+    if (isMissingSqlTableError(error, 'dealmakers')) return { results: [] as Array<{ dealmaker_type: string | null; n: number }> };
+    throw error;
+  });
+  return (rows.results || []).map(row => ({
+    role: row.dealmaker_type === 'gov_channel' ? 'government_or_event_channel' : 'advisor_or_intro_source',
+    evidence: `dealmaker history as ${row.dealmaker_type || 'unknown'} (${row.n})`,
+    weight: Number(row.n || 0) >= 2 ? 2 : 1,
+  }));
+}
+
+async function crossD1PriorSignalEvidence(orgId: string, mention: MentionCandidate, env: Env): Promise<Array<{ role: CrossD1CompanyRole; evidence: string; weight: number }>> {
+  const rows = await env.D1.prepare(
+    `SELECT mention_type, metadata_json
+       FROM prospect_signals
+      WHERE org_id = ? AND normalized_mention = ?
+      ORDER BY created_at DESC
+      LIMIT 25`
+  ).bind(orgId, mention.normalizedName).all<{ mention_type: string | null; metadata_json: string | null }>().catch(error => {
+    if (isMissingSqlTableError(error, 'prospect_signals')) return { results: [] as Array<{ mention_type: string | null; metadata_json: string | null }> };
+    throw error;
+  });
+  const counts = new Map<string, number>();
+  for (const row of rows.results || []) {
+    const key = String(row.mention_type || 'unknown');
+    counts.set(key, (counts.get(key) || 0) + 1);
+    try {
+      const action = JSON.parse(row.metadata_json || '{}')?.prospect_action;
+      if (typeof action === 'string') counts.set(action, (counts.get(action) || 0) + 1);
+    } catch {}
+  }
+  const evidence: Array<{ role: CrossD1CompanyRole; evidence: string; weight: number }> = [];
+  const contextNoise = Number(counts.get('noise') || 0) + Number(counts.get('record_context') || 0) + Number(counts.get('ignore') || 0);
+  if (contextNoise >= 2) evidence.push({ role: 'frequent_partner_or_source', evidence: `prior prospect signals were context/noise (${contextNoise})`, weight: 1 });
+  if (Number(counts.get('known_deal') || 0) > 0) evidence.push({ role: 'known_deal', evidence: 'prior prospect signals include known_deal', weight: 1 });
+  if (Number(counts.get('inbound_prospect') || 0) >= 2) evidence.push({ role: 'startup_or_private_company', evidence: 'prior prospect signals include repeated inbound prospect', weight: 1 });
+  return evidence;
+}
+
+export async function classifyCompanyRoleFromD1(
+  orgId: string,
+  item: ClassifiedItem,
+  mention: MentionCandidate,
+  existing: ExistingContext,
+  env: Env,
+  options: { prospectAction: ProspectAction; confidence: number; provisional: boolean; directionUncertain: boolean }
+): Promise<CrossD1CompanyRoleCheck> {
+  if (options.prospectAction !== 'create_prospect') {
+    return emptyCrossD1CompanyRoleCheck('not_create_prospect');
+  }
+  if (options.confidence >= 0.9) {
+    return emptyCrossD1CompanyRoleCheck('high_confidence_create_exempt');
+  }
+
+  try {
+    const company = await loadCrossD1CompanyRow(orgId, mention, existing, item, env);
+    const evidence: string[] = [];
+    const scores = new Map<CrossD1CompanyRole, number>();
+    let authoritative = false;
+    let matchedDealId = existing.dealId;
+    const addScore = (role: CrossD1CompanyRole, weight: number, reason: string) => {
+      scores.set(role, (scores.get(role) || 0) + weight);
+      evidence.push(reason);
+    };
+
+    if (existing.isInternal || company?.is_internal_entity === 1) {
+      return checkedCrossD1CompanyRoleCheck({
+        role: 'internal_entity',
+        confidence: 'authoritative',
+        action_override: 'ignore',
+        evidence: ['company is marked internal in D1'],
+        matched_company_id: company?.id || existing.companyId,
+        matched_deal_id: matchedDealId,
+        reason: 'authoritative_internal_entity',
+      });
+    }
+
+    if (existing.dealId) {
+      return checkedCrossD1CompanyRoleCheck({
+        role: 'known_deal',
+        confidence: 'authoritative',
+        action_override: 'attach_existing_deal',
+        evidence: ['matched open deal in D1'],
+        matched_company_id: company?.id || existing.companyId,
+        matched_deal_id: existing.dealId,
+        reason: 'matched_open_deal',
+      });
+    }
+
+    const relationshipStates = new Set(existing.relationshipStates.map(state => state.toLowerCase()));
+    if (relationshipStates.has('current_portfolio') || relationshipStates.has('exited')) {
+      authoritative = true;
+      addScore('portfolio_company', 4, `firm relationship state: ${relationshipStates.has('current_portfolio') ? 'current_portfolio' : 'exited'}`);
+    }
+    if (relationshipStates.has('passed')) {
+      authoritative = true;
+      addScore('frequent_partner_or_source', 3, 'firm relationship state: passed');
+    }
+    if (relationshipStates.has('active_pipeline') || relationshipStates.has('watchlist')) {
+      addScore('known_deal', 2, `firm relationship state: ${relationshipStates.has('active_pipeline') ? 'active_pipeline' : 'watchlist'}`);
+    }
+
+    if (company) {
+      const companyType = String(company.company_type || '').toLowerCase();
+      const investmentStatus = String(company.investment_status || '').toLowerCase();
+      if (companyType === 'vc_firm') addScore('vc_firm', 4, 'company_type=vc_firm');
+      if (companyType === 'family_office' || companyType === 'lp') addScore('lp_or_family_office', 4, `company_type=${companyType}`);
+      if (companyType === 'portfolio') addScore('portfolio_company', 3, 'company_type=portfolio');
+      if (companyType === 'startup') addScore('startup_or_private_company', 1, 'company_type=startup');
+      if (investmentStatus === 'invested' || investmentStatus === 'exited') addScore('portfolio_company', 3, `investment_status=${investmentStatus}`);
+      if (investmentStatus === 'passed') addScore('frequent_partner_or_source', 2, 'investment_status=passed');
+      if (['prospect', 'due_diligence', 'term_sheet'].includes(investmentStatus)) addScore('known_deal', 2, `investment_status=${investmentStatus}`);
+
+      const deal = await env.D1.prepare(
+        `SELECT id
+           FROM deals
+          WHERE org_id = ? AND company_id = ? AND deleted_at IS NULL AND stage != 'closed'
+          LIMIT 1`
+      ).bind(orgId, company.id).first<{ id: string }>().catch(error => {
+        if (isMissingSqlTableError(error, 'deals')) return null;
+        throw error;
+      });
+      if (deal?.id) {
+        matchedDealId = deal.id;
+        authoritative = true;
+        addScore('known_deal', 4, 'matched open deal by company id');
+      }
+
+      for (const hit of crossD1TextRoleEvidence(crossD1RoleTextForCompany(company))) {
+        addScore(hit.role, hit.weight, hit.evidence);
+      }
+    }
+
+    for (const hit of await crossD1ContactRoleEvidence(orgId, company?.id || existing.companyId, env)) {
+      addScore(hit.role, hit.weight, hit.evidence);
+    }
+    for (const hit of await crossD1DealmakerEvidence(orgId, mention, company, env)) {
+      addScore(hit.role, hit.weight, hit.evidence);
+    }
+    for (const hit of await crossD1PriorSignalEvidence(orgId, mention, env)) {
+      addScore(hit.role, hit.weight, hit.evidence);
+    }
+
+    const role = chooseWeightedCrossD1Role(scores);
+    const score = scores.get(role) || 0;
+    const confidence = confidenceForCrossD1Role(score, authoritative);
+    const action = actionForCrossD1Role(role, confidence, matchedDealId);
+    return checkedCrossD1CompanyRoleCheck({
+      role,
+      confidence,
+      action_override: action,
+      evidence: evidence.length ? evidence : ['no disqualifying D1 role evidence found'],
+      matched_company_id: company?.id || existing.companyId,
+      matched_deal_id: matchedDealId,
+      reason: action ? `cross_d1_${role}` : null,
+    });
+  } catch (error) {
+    return {
+      ...emptyCrossD1CompanyRoleCheck('cross_d1_role_check_error'),
+      checked: true,
+      eligible: true,
+      evidence: [error instanceof Error ? error.message : String(error)],
+    };
+  }
+}
+
+function emptyLowConfidenceProspectVerification(reason: string): LowConfidenceProspectVerification {
+  return {
+    checked: false,
+    eligible: false,
+    verdict: 'not_applicable',
+    action_override: null,
+    reason,
+    scores: {
+      identity: 0,
+      intent: 0,
+      source_quality: 0,
+      d1_support: 0,
+      extraction_risk: 0,
+      total: 0,
+    },
+    identity_signals: [],
+    intent_signals: [],
+    source_quality_signals: [],
+    d1_signals: [],
+    extraction_flags: [],
+  };
+}
+
+function lowConfidenceSourceText(item: ClassifiedItem, mention: MentionCandidate): string {
+  return normalizeWhitespace([
+    item.subject,
+    item.bodyPreview,
+    item.bodyText,
+    item.text,
+    mention.raw,
+    mention.lineText,
+    mention.contextText,
+    mention.listFields?.problem,
+    mention.listFields?.approach,
+    mention.listFields?.stage,
+    mention.listFields?.amount,
+    mention.listFields?.poc,
+  ].filter(Boolean).join(' '));
+}
+
+function appendUnique(target: string[], value: string): void {
+  if (!target.includes(value)) target.push(value);
+}
+
+function sourceMentionsName(text: string, name: string): boolean {
+  const cleanName = normalizeWhitespace(name);
+  if (!cleanName || cleanName.length < 3) return false;
+  const escaped = cleanName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\b${escaped}\\b`, 'i').test(text);
+}
+
+function crossD1RoleSupportsCreate(roleCheck: CrossD1CompanyRoleCheck): number {
+  if (!roleCheck.checked || !roleCheck.eligible) return 0;
+  if (roleCheck.role === 'startup_or_private_company') return roleCheck.confidence === 'low' ? 1 : 2;
+  if (roleCheck.role === 'known_deal') return 2;
+  if (roleCheck.role === 'unknown') return 0;
+  if (roleCheck.confidence === 'authoritative' || roleCheck.confidence === 'high') return -3;
+  if (roleCheck.confidence === 'medium') return -2;
+  return -1;
+}
+
+function identityAliasSetsCompatible(left: Set<string>, right: Set<string>): boolean {
+  if (setsIntersect(left, right)) return true;
+  for (const a of left) {
+    for (const b of right) {
+      if (a.length < 4 || b.length < 4) continue;
+      if (b.startsWith(a) && b.length - a.length <= 8) return true;
+      if (a.startsWith(b) && a.length - b.length <= 8) return true;
+    }
+  }
+  return false;
+}
+
+export function verifyLowConfidenceProspect(
+  item: ClassifiedItem,
+  mention: MentionCandidate,
+  existing: ExistingContext,
+  prefilter: ClassifierPrefilter,
+  crossD1RoleCheck: CrossD1CompanyRoleCheck,
+  env: Env,
+  options: { prospectAction: ProspectAction; confidence: number; provisional: boolean; directionUncertain: boolean }
+): LowConfidenceProspectVerification {
+  if (options.prospectAction !== 'create_prospect') {
+    return emptyLowConfidenceProspectVerification('not_create_prospect');
+  }
+  if (options.confidence >= 0.8 && !options.provisional && !options.directionUncertain) {
+    return emptyLowConfidenceProspectVerification('not_low_confidence');
+  }
+
+  const identitySignals: string[] = [];
+  const intentSignals: string[] = [];
+  const sourceQualitySignals: string[] = [];
+  const d1Signals: string[] = [];
+  const extractionFlags: string[] = [];
+  let identity = 0;
+  let intent = 0;
+  let sourceQuality = 0;
+  let extractionRisk = 0;
+
+  const text = lowConfidenceSourceText(item, mention);
+  const compact = text.toLowerCase();
+  const mentionDomain = firstProspectDomainForMention(mention, env);
+  const bodyDomain = domainFromMention(item, mention);
+  const candidateDomain = mentionDomain || bodyDomain || existing.companyDomain;
+  const fromDomain = emailDomain(item.fromEmail);
+  const internalDomains = getConfiguredInternalDomains(env);
+  const fromInternal = isInternalEmailDomain(item.fromEmail, internalDomains);
+  const nameAliases = prospectIdentityAliasesForName(mention.canonicalName);
+  const domainAliases = candidateDomain
+    ? prospectIdentityAliasesForName(domainLabelToCompany(candidateDomain))
+    : new Set<string>();
+  const domainMatchesMention = candidateDomain ? identityAliasSetsCompatible(nameAliases, domainAliases) : false;
+
+  if (mention.listFields?.website) {
+    identity += 2;
+    appendUnique(identitySignals, 'structured_company_website');
+  }
+  if (mention.isListEntry || mention.listFields) {
+    identity += 1;
+    appendUnique(identitySignals, 'structured_dealflow_row');
+  }
+  if (candidateDomain && domainMatchesMention) {
+    identity += 2;
+    appendUnique(identitySignals, 'company_name_matches_domain');
+  }
+  if (fromDomain && candidateDomain && fromDomain === candidateDomain) {
+    identity += 2;
+    appendUnique(identitySignals, 'sender_domain_matches_company');
+  }
+  if (sourceMentionsName(text, mention.canonicalName)) {
+    identity += 1;
+    appendUnique(identitySignals, 'source_names_company');
+  }
+  if (existing.matchStrength === 'domain' || existing.matchStrength === 'company_id') {
+    identity += 2;
+    appendUnique(identitySignals, `existing_${existing.matchStrength}_match`);
+  } else if (existing.matchStrength === 'name') {
+    identity += 1;
+    appendUnique(identitySignals, 'existing_name_match');
+  }
+
+  if (prefilter.hasDeck) {
+    intent += 2;
+    appendUnique(intentSignals, 'deck_or_materials_present');
+  }
+  if (prefilter.hasWarmIntro) {
+    intent += 2;
+    appendUnique(intentSignals, 'warm_intro_language');
+  }
+  if (prefilter.hasMeeting) {
+    intent += 1;
+    appendUnique(intentSignals, 'meeting_or_call_signal');
+  }
+  if (['deck', 'intro', 'raise'].includes(prefilter.signalKind)) {
+    intent += 2;
+    appendUnique(intentSignals, `signal_kind_${prefilter.signalKind}`);
+  } else if (['meeting', 'list_entry'].includes(prefilter.signalKind)) {
+    intent += 1;
+    appendUnique(intentSignals, `signal_kind_${prefilter.signalKind}`);
+  }
+  if (/\b(?:raising|raise|fundrais|round|seed|series\s+[abc]|safe|term sheet|allocation)\b/.test(compact)) {
+    intent += 2;
+    appendUnique(intentSignals, 'financing_language');
+  }
+  if (/\b(?:pitch|deck|teaser|cim|data room|diligence|financial model|p&l|nda|demo|business plan|company materials|pre-read)\b/.test(compact)) {
+    intent += 2;
+    appendUnique(intentSignals, 'investment_materials_or_diligence_language');
+  }
+  if (/\b(?:founder|ceo|co-founder|introduced|intro|meet)\b/.test(compact)) {
+    intent += 1;
+    appendUnique(intentSignals, 'founder_or_intro_context');
+  }
+  if (mention.listFields?.problem || mention.listFields?.approach || mention.listFields?.amount || mention.listFields?.stage) {
+    intent += 1;
+    appendUnique(intentSignals, 'structured_company_profile_fields');
+  }
+
+  if (prefilter.newsletterLikely) {
+    sourceQuality -= 2;
+    appendUnique(sourceQualitySignals, 'newsletter_like_source');
+  }
+  if (fromDomain && candidateDomain && fromDomain === candidateDomain) {
+    sourceQuality += 2;
+    appendUnique(sourceQualitySignals, 'company_sent_from_own_domain');
+  } else if (fromDomain && !fromInternal) {
+    sourceQuality += 1;
+    appendUnique(sourceQualitySignals, 'external_sender');
+  }
+  if (fromInternal && prefilter.deterministicDirection === 'internal') {
+    sourceQuality -= 1;
+    appendUnique(sourceQualitySignals, 'internal_only_source');
+  }
+  if (/\b(?:generated meeting summary|meeting notes|transcript|weekly digest|newsletter|market update)\b/.test(compact)) {
+    sourceQuality -= 1;
+    appendUnique(sourceQualitySignals, 'summary_or_digest_source');
+  }
+  if (/\b(?:government briefing|road show|conference|showcase|webinar|venue|panel)\b/.test(compact) && !/\b(?:company name|pitch|deck|founder|raising|diligence)\b/.test(compact)) {
+    sourceQuality -= 2;
+    appendUnique(sourceQualitySignals, 'channel_or_event_context_without_target');
+  }
+
+  if (candidateDomain && !domainMatchesMention && existing.matchStrength !== 'domain' && existing.matchStrength !== 'company_id') {
+    extractionRisk += 3;
+    appendUnique(extractionFlags, 'domain_name_mismatch');
+  }
+  if (fromDomain && candidateDomain && fromDomain !== candidateDomain && !fromInternal && !prefilter.hasWarmIntro && !/\b(?:introduced|intro|referr|forwarded)\b/.test(compact)) {
+    extractionRisk += 1;
+    appendUnique(extractionFlags, 'sender_domain_differs_without_intro_context');
+  }
+  if (mention.normalizedName.length <= 4 && !candidateDomain && existing.matchStrength === 'none') {
+    extractionRisk += 1;
+    appendUnique(extractionFlags, 'short_name_without_domain_or_d1_match');
+  }
+  if (/\b(?:bank|capital|ventures|partners|advisory|consulting|government|army|event|conference|foundation)\b/i.test(mention.canonicalName) && crossD1RoleCheck.role !== 'startup_or_private_company') {
+    extractionRisk += 1;
+    appendUnique(extractionFlags, 'role_like_company_name');
+  }
+
+  const d1Support = crossD1RoleSupportsCreate(crossD1RoleCheck);
+  if (crossD1RoleCheck.checked && crossD1RoleCheck.eligible) {
+    appendUnique(d1Signals, `cross_d1_role_${crossD1RoleCheck.role}_${crossD1RoleCheck.confidence}`);
+    for (const evidence of crossD1RoleCheck.evidence.slice(0, 4)) appendUnique(d1Signals, evidence);
+  }
+
+  const total = identity + intent + sourceQuality + d1Support - extractionRisk;
+  const severeMismatch = extractionFlags.includes('domain_name_mismatch') &&
+    crossD1RoleCheck.role !== 'startup_or_private_company' &&
+    existing.matchStrength !== 'domain' &&
+    existing.matchStrength !== 'company_id';
+
+  let verdict: LowConfidenceVerificationVerdict = 'provisional_create';
+  let actionOverride: LowConfidenceVerificationActionOverride = 'mark_provisional';
+  let reason = 'low_confidence_needs_confirmation';
+
+  if (crossD1RoleCheck.role === 'known_deal' && crossD1RoleCheck.matched_deal_id) {
+    verdict = 'verified_create';
+    actionOverride = null;
+    reason = 'known_deal_handled_by_cross_d1';
+  } else if (severeMismatch && intent < 4) {
+    verdict = 'record_context';
+    actionOverride = 'record_context';
+    reason = 'low_confidence_identity_domain_mismatch';
+  } else if (identity <= 1 && intent <= 2 && d1Support <= 0) {
+    verdict = sourceQuality <= -1 || extractionRisk >= 2 ? 'ignore' : 'record_context';
+    actionOverride = verdict === 'ignore' ? 'ignore' : 'record_context';
+    reason = 'low_confidence_insufficient_identity_and_intent';
+  } else if ((identity >= 4 && intent >= 4 && total >= 5 && extractionRisk <= 2) || (intent >= 5 && total >= 5 && extractionRisk === 0)) {
+    verdict = 'verified_create';
+    actionOverride = null;
+    reason = 'low_confidence_verified_by_identity_and_intent';
+  } else if ((d1Support >= 2 && identity >= 3 && total >= 4 && extractionRisk <= 1) || (identity >= 5 && total >= 4 && extractionRisk <= 1) || (identity >= 3 && intent >= 2 && total >= 3) || (intent >= 4 && total >= 3)) {
+    verdict = 'provisional_create';
+    actionOverride = 'mark_provisional';
+    reason = 'low_confidence_plausible_but_not_fully_verified';
+  } else {
+    verdict = 'record_context';
+    actionOverride = 'record_context';
+    reason = 'low_confidence_unverified';
+  }
+
+  return {
+    checked: true,
+    eligible: true,
+    verdict,
+    action_override: actionOverride,
+    reason,
+    scores: {
+      identity,
+      intent,
+      source_quality: sourceQuality,
+      d1_support: d1Support,
+      extraction_risk: extractionRisk,
+      total,
+    },
+    identity_signals: identitySignals,
+    intent_signals: intentSignals,
+    source_quality_signals: sourceQualitySignals,
+    d1_signals: d1Signals,
+    extraction_flags: extractionFlags,
+  };
+}
+
 function emailInText(text: string): string | null {
   const match = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   return match ? match[0].toLowerCase() : null;
@@ -2239,13 +3146,21 @@ function emailInText(text: string): string | null {
 
 function domainInText(text: string): string | null {
   const email = emailInText(text);
-  if (email) return emailDomain(email);
+  if (email) {
+    const domain = emailDomain(email);
+    return domain ? registrableDomain(domain) : null;
+  }
   const match = text.match(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b/i);
-  return match ? match[1].toLowerCase() : null;
+  return match ? registrableDomain(match[1].toLowerCase()) : null;
 }
 
 function domainFromMention(item: ClassifiedItem, mention: MentionCandidate): string | null {
-  return domainInText(`${mention.contextText || mention.lineText}\n${item.bodyPreview || ''}\n${item.bodyText || ''}`);
+  return domainInText([
+    mention.listFields?.website || '',
+    mention.raw,
+    mention.lineText,
+    mention.contextText,
+  ].filter(Boolean).join('\n'));
 }
 
 async function upsertDealmakerIdentity(
@@ -2721,6 +3636,8 @@ async function classifyMention(
   let createProspectVetoReason: string | null = null;
   let valuableActionVetoApplied = false;
   let valuableActionVetoReason: string | null = null;
+  let crossD1RoleCheck: CrossD1CompanyRoleCheck = emptyCrossD1CompanyRoleCheck('not_evaluated');
+  let lowConfidenceVerification: LowConfidenceProspectVerification = emptyLowConfidenceProspectVerification('not_evaluated');
   const exactDealDomainMatch = Boolean(existing.dealId && existing.matchStrength === 'domain');
 
   if (exactDealDomainMatch && (prospectAction === 'create_prospect' || prospectAction === 'attach_existing_deal')) {
@@ -2767,6 +3684,72 @@ async function classifyMention(
     }
   }
 
+  if (prospectAction === 'create_prospect') {
+    crossD1RoleCheck = await classifyCompanyRoleFromD1(orgId, item, mention, existing, env, {
+      prospectAction,
+      confidence: effectiveConfidence,
+      provisional,
+      directionUncertain,
+    });
+    if (crossD1RoleCheck.action_override === 'attach_existing_deal' && crossD1RoleCheck.matched_deal_id) {
+      mentionType = 'known_deal';
+      prospectAction = 'attach_existing_deal';
+      shouldCreateProspect = false;
+      linkedDealId = crossD1RoleCheck.matched_deal_id;
+      possibleCompanyId = null;
+      possibleDealId = null;
+      provisional = false;
+      directionUncertain = false;
+      effectiveConfidence = Math.max(effectiveConfidence, 0.96);
+      createProspectVetoApplied = true;
+      createProspectVetoReason = crossD1RoleCheck.reason;
+    } else if (crossD1RoleCheck.action_override === 'record_context' || crossD1RoleCheck.action_override === 'ignore') {
+      mentionType = 'noise';
+      prospectAction = crossD1RoleCheck.action_override;
+      shouldCreateProspect = false;
+      possibleCompanyId = null;
+      possibleDealId = null;
+      linkedDealId = null;
+      provisional = false;
+      directionUncertain = false;
+      effectiveConfidence = Math.max(effectiveConfidence, crossD1RoleCheck.confidence === 'authoritative' ? 0.96 : 0.88);
+      createProspectVetoApplied = true;
+      createProspectVetoReason = crossD1RoleCheck.reason;
+      valuableActionVetoApplied = true;
+      valuableActionVetoReason = crossD1RoleCheck.reason;
+    } else if (crossD1RoleCheck.action_override === 'mark_provisional') {
+      provisional = true;
+      possibleCompanyId = crossD1RoleCheck.matched_company_id || possibleCompanyId;
+      possibleDealId = crossD1RoleCheck.matched_deal_id || possibleDealId;
+    }
+  }
+
+  if (prospectAction === 'create_prospect') {
+    lowConfidenceVerification = verifyLowConfidenceProspect(item, mention, existing, prefilter, crossD1RoleCheck, env, {
+      prospectAction,
+      confidence: effectiveConfidence,
+      provisional,
+      directionUncertain,
+    });
+
+    if (lowConfidenceVerification.action_override === 'record_context' || lowConfidenceVerification.action_override === 'ignore') {
+      mentionType = 'noise';
+      prospectAction = lowConfidenceVerification.action_override;
+      shouldCreateProspect = false;
+      possibleCompanyId = null;
+      possibleDealId = null;
+      linkedDealId = null;
+      provisional = false;
+      directionUncertain = false;
+      createProspectVetoApplied = true;
+      createProspectVetoReason = lowConfidenceVerification.reason;
+      valuableActionVetoApplied = true;
+      valuableActionVetoReason = lowConfidenceVerification.reason;
+    } else if (lowConfidenceVerification.action_override === 'mark_provisional') {
+      provisional = true;
+    }
+  }
+
   confidenceTier = confidenceTierFor(effectiveConfidence);
   const sampling = productionSamplingDecision({
     orgId,
@@ -2781,6 +3764,25 @@ async function classifyMention(
     possibleCompanyId = existing.companyId;
     possibleDealId = existing.dealId && existing.matchStrength === 'name' ? existing.dealId : null;
     if (possibleDealId) provisional = true;
+  }
+
+  const finalizationBlocked = shouldCreateProspect && (provisional || directionUncertain || confidenceTier === 'low');
+  const finalizationBlockReasons: string[] = [];
+  if (finalizationBlocked) {
+    if (provisional) finalizationBlockReasons.push('provisional_after_verification');
+    if (directionUncertain) finalizationBlockReasons.push('direction_uncertain');
+    if (confidenceTier === 'low') finalizationBlockReasons.push('low_confidence_tier');
+    mentionType = 'noise';
+    prospectAction = 'record_context';
+    shouldCreateProspect = false;
+    possibleCompanyId = null;
+    possibleDealId = null;
+    linkedDealId = null;
+    provisional = false;
+    createProspectVetoApplied = true;
+    createProspectVetoReason = finalizationBlockReasons.join(',') || 'not_finalized';
+    valuableActionVetoApplied = true;
+    valuableActionVetoReason = createProspectVetoReason;
   }
 
   return {
@@ -2816,6 +3818,13 @@ async function classifyMention(
       create_prospect_veto_reason: createProspectVetoReason,
       valuable_action_veto_applied: valuableActionVetoApplied,
       valuable_action_veto_reason: valuableActionVetoReason,
+      cross_d1_role_check: crossD1RoleCheck,
+      low_confidence_verification: lowConfidenceVerification,
+      prospect_finalization_gate: {
+        final: shouldCreateProspect,
+        blocked: finalizationBlocked,
+        reasons: finalizationBlockReasons,
+      },
       original_llm_prospect_action: llm.prospectAction,
       original_llm_reasoning: llm.reasoning,
       prospect_action: prospectAction,
@@ -2856,6 +3865,241 @@ function prospectSourceType(item: ClassifiedItem): SourceType | null {
   return null;
 }
 
+interface ProspectIdentityRow {
+  id: string;
+  canonical_name: string;
+  normalized_name: string;
+  domain: string | null;
+  website: string | null;
+  status: string | null;
+  signal_count: number | null;
+  evidence_count: number | null;
+  created_at: string | null;
+  possible_duplicate_of?: string | null;
+}
+
+interface ProspectIdentityMatch {
+  prospect: ProspectIdentityRow;
+  score: number;
+  method: string;
+}
+
+function prospectRowDomain(row: Pick<ProspectIdentityRow, 'domain' | 'website'>): string | null {
+  return String(row.domain || '').trim().toLowerCase().replace(/^www\./, '') || domainFromUrl(row.website);
+}
+
+function prospectIdentityAliasesForRow(row: Pick<ProspectIdentityRow, 'canonical_name' | 'normalized_name' | 'domain' | 'website'>): Set<string> {
+  const aliases = prospectIdentityAliasesForName(row.canonical_name);
+  for (const alias of identityAliasVariants(row.normalized_name)) aliases.add(alias);
+  const domain = prospectRowDomain(row);
+  if (domain) {
+    for (const alias of prospectIdentityAliasesForName(domainLabelToCompany(domain))) aliases.add(alias);
+  }
+  return aliases;
+}
+
+function scoreProspectIdentityMatch(mention: MentionCandidate, row: ProspectIdentityRow, env?: Env): ProspectIdentityMatch | null {
+  const mentionDomain = firstProspectDomainForMention(mention, env);
+  const rowDomain = prospectRowDomain(row);
+  if (mention.normalizedName === row.normalized_name) {
+    return { prospect: row, score: 1, method: 'exact_normalized_name' };
+  }
+  if (mentionDomain && rowDomain && mentionDomain === rowDomain) {
+    return { prospect: row, score: 1, method: 'exact_domain' };
+  }
+  const mentionAliases = prospectIdentityAliasesForMention(mention, env);
+  const rowAliases = prospectIdentityAliasesForRow(row);
+  if (setsIntersect(mentionAliases, rowAliases)) {
+    const score = mentionDomain || rowDomain || mentionLooksDomainDerived(mention, env) ? 0.94 : 0.92;
+    return { prospect: row, score, method: mentionDomain || rowDomain ? 'domain_brand_alias' : 'aggressive_name_alias' };
+  }
+  const a = mention.normalizedName;
+  const b = row.normalized_name;
+  const minLen = Math.min(a.length, b.length);
+  if (minLen >= 6 && (a.includes(b) || b.includes(a))) {
+    return { prospect: row, score: 0.89, method: 'substring_name_alias' };
+  }
+  return null;
+}
+
+function prospectIdentityWinnerRank(row: ProspectIdentityRow): number {
+  const statusScore = row.status === 'converted' ? 40 : row.status === 'active' ? 30 : row.status === 'provisional' ? 20 : 0;
+  const duplicatePenalty = row.possible_duplicate_of ? -10 : 0;
+  return statusScore + Number(row.signal_count || 0) * 3 + Number(row.evidence_count || 0) * 2 + duplicatePenalty;
+}
+
+function chooseBetterProspectIdentityMatch(left: ProspectIdentityMatch | null, right: ProspectIdentityMatch | null): ProspectIdentityMatch | null {
+  if (!left) return right;
+  if (!right) return left;
+  if (right.score > left.score) return right;
+  if (left.score > right.score) return left;
+  const rankDiff = prospectIdentityWinnerRank(right.prospect) - prospectIdentityWinnerRank(left.prospect);
+  if (rankDiff > 0) return right;
+  if (rankDiff < 0) return left;
+  const leftCreated = left.prospect.created_at || '';
+  const rightCreated = right.prospect.created_at || '';
+  return rightCreated && (!leftCreated || rightCreated < leftCreated) ? right : left;
+}
+
+function scoreProspectRowDuplicate(left: ProspectIdentityRow, right: ProspectIdentityRow): { score: number; method: string } | null {
+  if (left.normalized_name === right.normalized_name) return { score: 1, method: 'exact_normalized_name' };
+  const leftDomain = prospectRowDomain(left);
+  const rightDomain = prospectRowDomain(right);
+  if (leftDomain && rightDomain && leftDomain === rightDomain) return { score: 1, method: 'exact_domain' };
+  const leftAliases = prospectIdentityAliasesForRow(left);
+  const rightAliases = prospectIdentityAliasesForRow(right);
+  if (setsIntersect(leftAliases, rightAliases)) {
+    return { score: leftDomain || rightDomain ? 0.94 : 0.92, method: leftDomain || rightDomain ? 'domain_brand_alias' : 'aggressive_name_alias' };
+  }
+  const minLen = Math.min(left.normalized_name.length, right.normalized_name.length);
+  if (minLen >= 6 && (left.normalized_name.includes(right.normalized_name) || right.normalized_name.includes(left.normalized_name))) {
+    return { score: 0.89, method: 'substring_name_alias' };
+  }
+  return null;
+}
+
+function shouldPreferProspectIdentityWinner(candidate: ProspectIdentityRow, current: ProspectIdentityRow): boolean {
+  const rankDiff = prospectIdentityWinnerRank(candidate) - prospectIdentityWinnerRank(current);
+  if (rankDiff !== 0) return rankDiff > 0;
+  const candidateCreated = candidate.created_at || '';
+  const currentCreated = current.created_at || '';
+  if (candidateCreated && currentCreated && candidateCreated !== currentCreated) return candidateCreated < currentCreated;
+  return candidate.id < current.id;
+}
+
+function bestDuplicateWinnerForProspect(row: ProspectIdentityRow, rows: ProspectIdentityRow[]): { winner: ProspectIdentityRow; score: number; method: string } | null {
+  let best: { winner: ProspectIdentityRow; score: number; method: string } | null = null;
+  for (const candidate of rows) {
+    if (candidate.id === row.id) continue;
+    const score = scoreProspectRowDuplicate(row, candidate);
+    if (!score || score.score < 0.92) continue;
+    if (!shouldPreferProspectIdentityWinner(candidate, row)) continue;
+    if (!best || score.score > best.score || (score.score === best.score && shouldPreferProspectIdentityWinner(candidate, best.winner))) {
+      best = { winner: candidate, score: score.score, method: score.method };
+    }
+  }
+  return best;
+}
+
+async function findExistingProspectIdentityMatch(
+  orgId: string,
+  mention: MentionCandidate,
+  env: Env
+): Promise<ProspectIdentityMatch | null> {
+  const aliases = Array.from(prospectIdentityAliasesForMention(mention, env)).filter(alias => alias.length >= 3).slice(0, 8);
+  const domain = firstProspectDomainForMention(mention, env);
+  const clauses: string[] = [];
+  const binds: unknown[] = [orgId];
+  if (aliases.length > 0) {
+    clauses.push(`normalized_name IN (${aliases.map(() => '?').join(', ')})`);
+    binds.push(...aliases);
+  }
+  if (domain) {
+    clauses.push(`lower(domain) = lower(?)`);
+    binds.push(domain);
+    clauses.push(`lower(website) LIKE ?`);
+    binds.push(`%${domain.toLowerCase()}%`);
+  }
+  if (clauses.length === 0) return null;
+  const rows = await env.D1.prepare(
+    `SELECT id, canonical_name, normalized_name, domain, website, status, signal_count, evidence_count, created_at, possible_duplicate_of
+       FROM prospects
+      WHERE org_id = ? AND deleted_at IS NULL
+        AND status IN ('active','provisional','converted')
+        AND (${clauses.join(' OR ')})
+      ORDER BY signal_count DESC, evidence_count DESC, created_at ASC
+      LIMIT 25`
+  ).bind(...binds).all<ProspectIdentityRow>();
+
+  let best: ProspectIdentityMatch | null = null;
+  for (const row of rows.results || []) {
+    const match = scoreProspectIdentityMatch(mention, row, env);
+    if (match && match.score >= 0.92) best = chooseBetterProspectIdentityMatch(best, match);
+  }
+  return best;
+}
+
+function prospectIdentityWebsiteForDomain(domain: string | null): string | null {
+  return domain ? `https://${domain}` : null;
+}
+
+function companyNameMatchConflictsWithSourceDomain(
+  company: { name: string; domain: string | null },
+  mention: MentionCandidate,
+  mentionDomain: string | null
+): boolean {
+  if (!mentionDomain || !company.domain) return false;
+  const companyDomain = company.domain.toLowerCase().replace(/^www\./, '');
+  if (companyDomain === mentionDomain) return false;
+  const normalized = normalizeProspectName(company.name);
+  if (normalized.length >= 6) return false;
+  return normalizeProspectName(company.name) === mention.normalizedName;
+}
+
+function chooseCanonicalProspectName(existingName: string, mention: MentionCandidate, env?: Env): string {
+  if (mentionLooksDomainDerived(mention, env)) return existingName;
+  const existingNormalized = normalizeProspectName(existingName);
+  if (!existingNormalized || isGenericCandidate(existingName)) return mention.canonicalName;
+  if (mention.canonicalName.length > existingName.length && !/\.[a-z]{2,}\b/i.test(mention.canonicalName)) {
+    return mention.canonicalName;
+  }
+  return existingName;
+}
+
+async function updateProspectIdentityEvidence(
+  orgId: string,
+  prospectId: string,
+  mention: MentionCandidate,
+  cls: Classification,
+  occurredAt: string,
+  env: Env,
+  match?: ProspectIdentityMatch | null
+): Promise<void> {
+  const domain = firstProspectDomainForMention(mention, env);
+  const website = prospectIdentityWebsiteForDomain(domain);
+  const metadata = {
+    prospect_action: cls.prospectAction,
+    prospect_company_name: cls.prospectCompanyName,
+    identity_dedupe: {
+      req: 'REQ-ID-8',
+      domain,
+      aliases: Array.from(prospectIdentityAliasesForMention(mention, env)).slice(0, 12),
+      matched_existing_prospect_id: match?.prospect.id || null,
+      method: match?.method || 'self',
+      score: match?.score || null,
+    },
+  };
+
+  await env.D1.prepare(
+    `UPDATE prospects
+        SET domain = COALESCE(domain, ?),
+            website = COALESCE(website, ?),
+            last_seen_at = CASE
+              WHEN last_seen_at IS NULL OR ? > last_seen_at THEN ?
+              ELSE last_seen_at
+            END,
+            last_signal_at = CASE
+              WHEN last_signal_at IS NULL OR ? > last_signal_at THEN ?
+              ELSE last_signal_at
+            END,
+            confidence = MAX(confidence, ?),
+            metadata_json = json_patch(COALESCE(metadata_json, '{}'), ?),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(
+    domain,
+    website,
+    occurredAt,
+    occurredAt,
+    occurredAt,
+    occurredAt,
+    cls.confidence,
+    JSON.stringify(metadata),
+    prospectId,
+    orgId
+  ).run();
+}
+
 async function upsertProspect(
   orgId: string,
   mention: MentionCandidate,
@@ -2863,6 +4107,41 @@ async function upsertProspect(
   occurredAt: string,
   env: Env
 ): Promise<string> {
+  const identityMatch = await findExistingProspectIdentityMatch(orgId, mention, env);
+  if (identityMatch?.prospect.id) {
+    const canonicalName = chooseCanonicalProspectName(identityMatch.prospect.canonical_name, mention, env);
+    await env.D1.prepare(
+      `UPDATE prospects
+          SET canonical_name = ?,
+              status = CASE WHEN status = 'active' THEN status ELSE ? END,
+              sector_key = CASE
+                WHEN sector_key = 'uncategorized' OR ? > sector_confidence THEN ?
+                ELSE sector_key
+              END,
+              sector_confidence = MAX(sector_confidence, ?),
+              provisional = CASE WHEN ? = 1 THEN 1 ELSE provisional END,
+              direction_uncertain = CASE WHEN ? = 1 THEN 1 ELSE direction_uncertain END,
+              possible_company_id = COALESCE(possible_company_id, ?),
+              possible_deal_id = COALESCE(possible_deal_id, ?),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(
+      canonicalName,
+      cls.provisional ? 'provisional' : 'active',
+      cls.sectorConfidence,
+      cls.sectorKey,
+      cls.sectorConfidence,
+      cls.provisional ? 1 : 0,
+      cls.directionUncertain ? 1 : 0,
+      cls.possibleCompanyId,
+      cls.possibleDealId,
+      identityMatch.prospect.id,
+      orgId
+    ).run();
+    await updateProspectIdentityEvidence(orgId, identityMatch.prospect.id, mention, cls, occurredAt, env, identityMatch);
+    return identityMatch.prospect.id;
+  }
+
   const id = crypto.randomUUID();
   await env.D1.prepare(
     `INSERT INTO prospects (
@@ -2933,7 +4212,511 @@ async function upsertProspect(
     `SELECT id FROM prospects WHERE org_id = ? AND normalized_name = ? AND deleted_at IS NULL LIMIT 1`
   ).bind(orgId, mention.normalizedName).first<{ id: string }>();
   if (!row?.id) throw new Error('PROSPECT_UPSERT_FAILED');
+  await updateProspectIdentityEvidence(orgId, row.id, mention, cls, occurredAt, env, null);
   return row.id;
+}
+
+interface ProspectCompanyRow {
+  id: string;
+  name: string;
+  domain: string | null;
+  website: string | null;
+  description: string | null;
+  sector: string | null;
+  company_type: string | null;
+  investment_status: string | null;
+  enrichment_confidence: number | null;
+  enrichment_last_run: string | null;
+  custom_fields: string | null;
+}
+
+interface ProspectCompanyCandidate {
+  company: ProspectCompanyRow;
+  score: number;
+  method: string;
+  reasons: string[];
+  exact: boolean;
+}
+
+interface ProspectCompanyResolution {
+  action: 'linked_existing' | 'created' | 'needs_review' | 'skipped';
+  companyId: string | null;
+  matchMethod: string;
+  matchScore: number | null;
+  candidates: Array<{ company_id: string; name: string; score: number; method: string; reasons: string[] }>;
+  enrichment: { status: string; reason: string | null };
+}
+
+function prospectCompanyDomainForMention(mention: MentionCandidate, env?: Env): string | null {
+  const domain = firstProspectDomainForMention(mention, env);
+  return domain ? registrableDomain(domain.toLowerCase().replace(/^www\./, '')) : null;
+}
+
+function companyRowDomain(row: Pick<ProspectCompanyRow, 'domain' | 'website'>): string | null {
+  const domain = String(row.domain || '').trim().toLowerCase().replace(/^www\./, '');
+  if (domain) return registrableDomain(domain);
+  return domainFromUrl(row.website);
+}
+
+function companyIdentityAliases(row: Pick<ProspectCompanyRow, 'name' | 'domain' | 'website'>): Set<string> {
+  const aliases = prospectIdentityAliasesForName(row.name);
+  const domain = companyRowDomain(row);
+  if (domain) {
+    for (const alias of prospectIdentityAliasesForName(domainLabelToCompany(domain))) aliases.add(alias);
+  }
+  return aliases;
+}
+
+function tokenSet(value: string): Set<string> {
+  return new Set(normalizeWhitespace(value)
+    .toLowerCase()
+    .replace(/\b(incorporated|inc|llc|ltd|limited|corp|corporation|company|co|group|holdings)\b\.?/g, ' ')
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .map(token => token.trim())
+    .filter(token => token.length >= 2));
+}
+
+function tokenOverlapScore(left: Set<string>, right: Set<string>): number {
+  if (left.size === 0 || right.size === 0) return 0;
+  let overlap = 0;
+  for (const token of left) if (right.has(token)) overlap++;
+  return overlap / Math.max(left.size, right.size);
+}
+
+function scoreCompanyForProspect(mention: MentionCandidate, row: ProspectCompanyRow, env?: Env): ProspectCompanyCandidate | null {
+  const prospectDomain = prospectCompanyDomainForMention(mention, env);
+  const companyDomain = companyRowDomain(row);
+  const domainConflict = Boolean(prospectDomain && companyDomain && prospectDomain !== companyDomain);
+  const reasons: string[] = [];
+  let score = 0;
+  let method = 'no_match';
+  let exact = false;
+
+  if (prospectDomain && companyDomain && prospectDomain === companyDomain) {
+    score = 1;
+    method = 'exact_domain';
+    exact = true;
+    reasons.push(`domain:${prospectDomain}`);
+  }
+
+  const mentionAliases = prospectIdentityAliasesForMention(mention, env);
+  const rowAliases = companyIdentityAliases(row);
+  if (mention.normalizedName && normalizeProspectName(row.name) === mention.normalizedName && score < 0.97) {
+    score = domainConflict ? 0.86 : 0.97;
+    method = domainConflict ? 'exact_normalized_name_domain_conflict' : 'exact_normalized_name';
+    exact = !domainConflict;
+    reasons.push(domainConflict ? 'normalized_name_domain_conflict' : 'normalized_name');
+  }
+  if (!domainConflict && setsIntersect(mentionAliases, rowAliases) && score < 0.95) {
+    score = prospectDomain || companyDomain ? 0.95 : 0.92;
+    method = prospectDomain || companyDomain ? 'domain_brand_alias' : 'aggressive_name_alias';
+    exact = score >= 0.95;
+    reasons.push('identity_alias');
+  }
+
+  const mentionAlias = Array.from(mentionAliases).sort((a, b) => b.length - a.length)[0] || mention.normalizedName;
+  const rowAlias = Array.from(rowAliases).sort((a, b) => b.length - a.length)[0] || normalizeProspectName(row.name);
+  if (mentionAlias && rowAlias) {
+    const jw = jaroWinkler(mentionAlias, rowAlias);
+    if (jw >= 0.94 && score < 0.9) {
+      score = 0.9;
+      method = 'jaro_winkler_alias';
+      reasons.push(`jw:${jw.toFixed(2)}`);
+    }
+    const minLen = Math.min(mentionAlias.length, rowAlias.length);
+    if (minLen >= 6 && (mentionAlias.includes(rowAlias) || rowAlias.includes(mentionAlias)) && score < 0.88) {
+      score = 0.88;
+      method = 'substring_alias';
+      reasons.push('substring_alias');
+    }
+  }
+
+  const overlap = tokenOverlapScore(tokenSet(mention.canonicalName), tokenSet(row.name));
+  if (overlap >= 0.67 && score < 0.86) {
+    score = 0.86;
+    method = 'token_overlap';
+    reasons.push(`token_overlap:${overlap.toFixed(2)}`);
+  }
+
+  return score >= 0.7 ? { company: row, score, method, reasons, exact } : null;
+}
+
+async function loadCompanyResolutionCandidates(orgId: string, env: Env): Promise<ProspectCompanyRow[]> {
+  const rows = await env.D1.prepare(
+    `SELECT id, name, domain, website, description, sector, company_type, investment_status,
+            enrichment_confidence, enrichment_last_run, custom_fields
+       FROM companies
+      WHERE org_id = ? AND deleted_at IS NULL
+      LIMIT 5000`
+  ).bind(orgId).all<ProspectCompanyRow>();
+  return rows.results || [];
+}
+
+function chooseCompanyResolutionCandidate(candidates: ProspectCompanyCandidate[]): ProspectCompanyCandidate | null {
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score || a.company.name.localeCompare(b.company.name));
+  const top = candidates[0];
+  const second = candidates[1] || null;
+  if (top.exact && top.score >= 0.95) return top;
+  if (top.score >= 0.92 && (!second || top.score - second.score >= 0.05)) return top;
+  return null;
+}
+
+function prospectCompanyDescriptionFromMention(mention: MentionCandidate): string | null {
+  const fields = mention.listFields;
+  if (!fields) return null;
+  const parts = [
+    fields.problem ? `Problem: ${normalizeWhitespace(fields.problem)}` : '',
+    fields.approach ? `Approach: ${normalizeWhitespace(fields.approach)}` : '',
+  ].filter(Boolean);
+  const description = normalizeWhitespace(parts.join(' '));
+  return description || null;
+}
+
+export async function ensureInvestmentProspectTag(orgId: string, companyId: string, env: Env): Promise<string | null> {
+  let tag = await env.D1.prepare(
+    `SELECT id FROM tags
+      WHERE org_id = ? AND entity_type = 'company' AND lower(name) = lower('Investment Prospect')
+      LIMIT 1`
+  ).bind(orgId).first<{ id: string }>().catch(error => {
+    if (isMissingSqlTableError(error, 'tags')) return null;
+    throw error;
+  });
+
+  if (!tag?.id) {
+    const tagId = crypto.randomUUID();
+    await env.D1.prepare(
+      `INSERT INTO tags (id, org_id, name, color, entity_type, created_at)
+       VALUES (?, ?, 'Investment Prospect', '#D946A8', 'company', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+       ON CONFLICT(org_id, name, entity_type) DO NOTHING`
+    ).bind(tagId, orgId).run();
+    tag = await env.D1.prepare(
+      `SELECT id FROM tags
+        WHERE org_id = ? AND entity_type = 'company' AND lower(name) = lower('Investment Prospect')
+        LIMIT 1`
+    ).bind(orgId).first<{ id: string }>();
+  }
+  if (!tag?.id) return null;
+
+  await env.D1.prepare(
+    `INSERT OR IGNORE INTO company_tags (company_id, tag_id, applied_by, applied_at)
+     VALUES (?, ?, NULL, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+  ).bind(companyId, tag.id).run();
+  return tag.id;
+}
+
+async function updateCompanyProspectProvenance(args: {
+  orgId: string;
+  companyId: string;
+  prospectId: string;
+  signalId: string;
+  resolution: ProspectCompanyResolution;
+  created: boolean;
+}, env: Env): Promise<void> {
+  const patch = {
+    prospect_origin: {
+      origin: 'prospect_signal',
+      prospect_id: args.prospectId,
+      signal_id: args.signalId,
+      match_method: args.resolution.matchMethod,
+      match_score: args.resolution.matchScore,
+      created_by_prospect_pipeline: args.created,
+      updated_at: new Date().toISOString(),
+    },
+  };
+  await env.D1.prepare(
+    `UPDATE companies
+        SET investment_status = CASE
+              WHEN investment_status IS NULL OR trim(investment_status) = '' OR investment_status = 'tracking' THEN 'prospect'
+              ELSE investment_status
+            END,
+            custom_fields = json_patch(COALESCE(custom_fields, '{}'), ?),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(JSON.stringify(patch), args.companyId, args.orgId).run();
+}
+
+export interface ProspectOriginCompanyCreateInput {
+  orgId: string;
+  prospectId: string;
+  signalId: string;
+  name: string;
+  domain?: string | null;
+  website?: string | null;
+  description?: string | null;
+  origin?: 'prospect_signal' | 'prospect_bridge_materialization';
+  matchMethod?: string;
+  matchScore?: number | null;
+  limitedInfo?: boolean;
+  limitedInfoReason?: string | null;
+}
+
+export async function createProspectOriginCompany(
+  args: ProspectOriginCompanyCreateInput,
+  env: Env
+): Promise<string> {
+  const companyId = crypto.randomUUID();
+  const domain = domainFromUrl(args.domain || args.website || null) || args.domain || null;
+  const website = args.website || (domain ? `https://${domain}` : null);
+  const now = new Date().toISOString();
+  const origin = args.origin || 'prospect_signal';
+  const matchMethod = args.matchMethod || 'created_new_company';
+  const limitedInfo = Boolean(args.limitedInfo);
+  const limitedInfoReason = args.limitedInfoReason || (domain ? 'limited_info_prospect' : 'missing_verified_domain');
+  const customFields = {
+    prospect_origin: {
+      origin,
+      prospect_id: args.prospectId,
+      signal_id: args.signalId,
+      match_method: matchMethod,
+      match_score: args.matchScore ?? null,
+      created_by_prospect_pipeline: true,
+      limited_info: limitedInfo,
+      evidence_quality: limitedInfo ? 'limited_info' : 'verified',
+      updated_at: now,
+    },
+    enrichment_guard: limitedInfo
+      ? { status: domain ? 'limited_info' : 'blocked_insufficient_anchor', reason: limitedInfoReason }
+      : domain
+        ? { status: 'pending_domain_enrichment', reason: null }
+        : { status: 'blocked_insufficient_anchor', reason: 'missing_verified_domain' },
+  };
+  if (limitedInfo) {
+    (customFields as any).limited_info_prospect = {
+      status: 'limited_info',
+      reason: limitedInfoReason,
+      created_at: now,
+    };
+  }
+
+  await env.D1.prepare(
+    `INSERT INTO companies
+       (id, org_id, name, domain, website, description, company_type, investment_status, custom_fields, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'startup', 'prospect', ?, ?, ?)`
+  ).bind(
+    companyId,
+    args.orgId,
+    args.name,
+    domain,
+    website,
+    args.description || null,
+    JSON.stringify(customFields),
+    now,
+    now
+  ).run();
+
+  await emitAudit(env, {
+    org_id: args.orgId,
+    action: 'create',
+    entity_type: 'company',
+    entity_id: companyId,
+    metadata: { auto_created: true, origin, prospect_id: args.prospectId, signal_id: args.signalId, domain },
+    created_at: now,
+  });
+  try { await updateEntityInIndex(args.orgId, 'company', companyId, env); } catch {}
+  await invalidateRagCache(args.orgId, env).catch(() => undefined);
+  return companyId;
+}
+
+async function createCompanyForFinalProspect(args: {
+  orgId: string;
+  prospectId: string;
+  signalId: string;
+  mention: MentionCandidate;
+  cls: Classification;
+  matchMethod?: string;
+  matchScore?: number | null;
+  limitedInfoReason?: string | null;
+}, env: Env): Promise<string> {
+  const domain = prospectCompanyDomainForMention(args.mention, env);
+  const website = domain ? `https://${domain}` : null;
+  const description = prospectCompanyDescriptionFromMention(args.mention);
+  const limitedInfo = !domain || Boolean(args.limitedInfoReason);
+  return createProspectOriginCompany({
+    orgId: args.orgId,
+    prospectId: args.prospectId,
+    signalId: args.signalId,
+    name: args.mention.canonicalName,
+    domain,
+    website,
+    description,
+    origin: 'prospect_signal',
+    matchMethod: args.matchMethod || 'created_new_company',
+    matchScore: args.matchScore ?? null,
+    limitedInfo,
+    limitedInfoReason: args.limitedInfoReason || (domain ? null : 'missing_verified_domain'),
+  }, env);
+}
+
+async function companyHasStoredBrief(orgId: string, company: ProspectCompanyRow, env: Env): Promise<boolean> {
+  if (company.enrichment_last_run && Number(company.enrichment_confidence || 0) > 0) return true;
+  const r2 = (env as any).R2;
+  if (!r2?.get) return false;
+  const obj = await r2.get(`${orgId}/enrichment/aggregated/${company.id}.json`).catch(() => null);
+  if (!obj) return false;
+  try {
+    const raw = await obj.text();
+    const parsed = JSON.parse(raw);
+    return Boolean(String(parsed?.full_bio || raw || '').trim());
+  } catch {
+    return true;
+  }
+}
+
+async function maybeRunProspectCompanyEnrichment(orgId: string, companyId: string, env: Env): Promise<{ status: string; reason: string | null }> {
+  const company = await env.D1.prepare(
+    `SELECT id, name, domain, website, description, sector, company_type, investment_status,
+            enrichment_confidence, enrichment_last_run, custom_fields
+       FROM companies
+      WHERE id = ? AND org_id = ? AND deleted_at IS NULL
+      LIMIT 1`
+  ).bind(companyId, orgId).first<ProspectCompanyRow>();
+  if (!company) return { status: 'blocked', reason: 'company_not_found' };
+  if (!companyRowDomain(company)) return { status: 'blocked_insufficient_anchor', reason: 'missing_verified_domain' };
+  if (await companyHasStoredBrief(orgId, company, env)) return { status: 'skipped_existing_enrichment', reason: 'already_enriched' };
+  if (!(env as any).R2?.get) return { status: 'blocked', reason: 'missing_r2_binding' };
+  await triggerCompanyEnrichment(companyId, orgId, env);
+  return { status: 'queued_domain_enrichment', reason: null };
+}
+
+function resolutionCandidateMetadata(candidates: ProspectCompanyCandidate[]): ProspectCompanyResolution['candidates'] {
+  return candidates
+    .slice()
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+    .map(candidate => ({
+      company_id: candidate.company.id,
+      name: candidate.company.name,
+      score: Number(candidate.score.toFixed(3)),
+      method: candidate.method,
+      reasons: candidate.reasons,
+    }));
+}
+
+async function persistProspectCompanyResolution(args: {
+  orgId: string;
+  prospectId: string;
+  signalId: string;
+  resolution: ProspectCompanyResolution;
+}, env: Env): Promise<void> {
+  const metadata = {
+    company_resolution: {
+      action: args.resolution.action,
+      company_id: args.resolution.companyId,
+      match_method: args.resolution.matchMethod,
+      match_score: args.resolution.matchScore,
+      candidates: args.resolution.candidates,
+      enrichment: args.resolution.enrichment,
+    },
+  };
+  if (args.resolution.companyId) {
+    await env.D1.prepare(
+      `UPDATE prospects
+          SET company_id = ?,
+              possible_company_id = NULL,
+              metadata_json = json_patch(COALESCE(metadata_json, '{}'), ?),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(args.resolution.companyId, JSON.stringify(metadata), args.prospectId, args.orgId).run();
+  } else if (args.resolution.candidates[0]?.company_id) {
+    await env.D1.prepare(
+      `UPDATE prospects
+          SET possible_company_id = COALESCE(possible_company_id, ?),
+              metadata_json = json_patch(COALESCE(metadata_json, '{}'), ?),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ?`
+    ).bind(args.resolution.candidates[0].company_id, JSON.stringify(metadata), args.prospectId, args.orgId).run();
+  }
+
+  await env.D1.prepare(
+    `UPDATE prospect_signals
+        SET company_id = ?,
+            metadata_json = json_patch(COALESCE(metadata_json, '{}'), ?),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND org_id = ?`
+  ).bind(args.resolution.companyId, JSON.stringify(metadata), args.signalId, args.orgId).run();
+}
+
+async function ensureCompanyForFinalProspect(args: {
+  orgId: string;
+  prospectId: string;
+  signalId: string;
+  mention: MentionCandidate;
+  cls: Classification;
+}, env: Env): Promise<ProspectCompanyResolution> {
+  if (!args.cls.shouldCreateProspect || args.cls.provisional || args.cls.directionUncertain) {
+    const resolution: ProspectCompanyResolution = {
+      action: 'skipped',
+      companyId: null,
+      matchMethod: 'not_final_prospect',
+      matchScore: null,
+      candidates: [],
+      enrichment: { status: 'blocked', reason: 'not_final_prospect' },
+    };
+    await persistProspectCompanyResolution({ orgId: args.orgId, prospectId: args.prospectId, signalId: args.signalId, resolution }, env);
+    return resolution;
+  }
+
+  const rows = await loadCompanyResolutionCandidates(args.orgId, env);
+  const scored = rows
+    .map(row => scoreCompanyForProspect(args.mention, row, env))
+    .filter((row): row is ProspectCompanyCandidate => Boolean(row));
+  const selected = chooseCompanyResolutionCandidate(scored);
+  const topWeakCandidate = scored.slice().sort((a, b) => b.score - a.score)[0] || null;
+  let resolution: ProspectCompanyResolution;
+
+  if (selected) {
+    await ensureInvestmentProspectTag(args.orgId, selected.company.id, env);
+    const enrichment = await maybeRunProspectCompanyEnrichment(args.orgId, selected.company.id, env);
+    resolution = {
+      action: 'linked_existing',
+      companyId: selected.company.id,
+      matchMethod: selected.method,
+      matchScore: Number(selected.score.toFixed(3)),
+      candidates: resolutionCandidateMetadata(scored),
+      enrichment,
+    };
+    await updateCompanyProspectProvenance({
+      orgId: args.orgId,
+      companyId: selected.company.id,
+      prospectId: args.prospectId,
+      signalId: args.signalId,
+      resolution,
+      created: false,
+    }, env);
+  } else if (topWeakCandidate && topWeakCandidate.score >= 0.92) {
+    resolution = {
+      action: 'needs_review',
+      companyId: null,
+      matchMethod: 'ambiguous_strong_company_candidates',
+      matchScore: Number(topWeakCandidate.score.toFixed(3)),
+      candidates: resolutionCandidateMetadata(scored),
+      enrichment: { status: 'blocked', reason: 'ambiguous_strong_company_candidates' },
+    };
+  } else {
+    const ignoredWeakCandidates = scored.length > 0;
+    const companyId = await createCompanyForFinalProspect({
+      ...args,
+      matchMethod: ignoredWeakCandidates ? 'created_new_company_weak_candidates_ignored' : 'created_new_company',
+      matchScore: ignoredWeakCandidates && topWeakCandidate ? Number(topWeakCandidate.score.toFixed(3)) : null,
+      limitedInfoReason: ignoredWeakCandidates ? 'weak_existing_company_candidates_ignored' : null,
+    }, env);
+    await ensureInvestmentProspectTag(args.orgId, companyId, env);
+    const enrichment = await maybeRunProspectCompanyEnrichment(args.orgId, companyId, env);
+    resolution = {
+      action: 'created',
+      companyId,
+      matchMethod: ignoredWeakCandidates ? 'created_new_company_weak_candidates_ignored' : 'created_new_company',
+      matchScore: ignoredWeakCandidates && topWeakCandidate ? Number(topWeakCandidate.score.toFixed(3)) : null,
+      candidates: resolutionCandidateMetadata(scored),
+      enrichment,
+    };
+  }
+
+  await persistProspectCompanyResolution({ orgId: args.orgId, prospectId: args.prospectId, signalId: args.signalId, resolution }, env);
+  return resolution;
 }
 
 export async function ensureProspectForDeal(
@@ -3159,6 +4942,7 @@ async function upsertSignal(args: {
   orgId: string;
   prospectId: string | null;
   dealId: string | null;
+  companyId: string | null;
   sourceType: SourceType;
   sourceId: string;
   sourceTitle: string | null;
@@ -3170,13 +4954,13 @@ async function upsertSignal(args: {
   ingestionMode: 'live' | 'backfill';
 }, env: Env): Promise<{ signalId: string }> {
   const before = await env.D1.prepare(
-    `SELECT id, mention_type, direction, sector_key, confidence, classifier_version, prospect_id, deal_id,
+    `SELECT id, mention_type, direction, sector_key, confidence, classifier_version, prospect_id, deal_id, company_id,
             classification_status, resolution_status, classification_attempts, error_message
        FROM prospect_signals
       WHERE org_id = ? AND source_type = ? AND source_id = ? AND mention_ordinal = ?
       LIMIT 1`
   ).bind(args.orgId, args.sourceType, args.sourceId, args.mention.mentionOrdinal).first<{
-    id: string; mention_type: string; direction: string; sector_key: string; confidence: number; classifier_version: string; prospect_id: string | null; deal_id: string | null;
+    id: string; mention_type: string; direction: string; sector_key: string; confidence: number; classifier_version: string; prospect_id: string | null; deal_id: string | null; company_id: string | null;
     classification_status: string; resolution_status: string; classification_attempts: number; error_message: string | null;
   }>();
 
@@ -3193,13 +4977,14 @@ async function upsertSignal(args: {
     classifier_version: PROSPECT_CLASSIFIER_VERSION,
     prospect_id: args.prospectId,
     deal_id: args.dealId,
+    company_id: args.companyId,
     classification_status: 'classified',
     resolution_status: resolutionStatus,
   };
 
   await env.D1.prepare(
     `INSERT INTO prospect_signals (
-       id, org_id, prospect_id, deal_id, source_type, source_id, mention_ordinal,
+       id, org_id, prospect_id, deal_id, company_id, source_type, source_id, mention_ordinal,
        span_start, span_end, raw_mention_text, normalized_mention, source_title,
        occurred_at, direction, direction_source, direction_uncertain,
        mention_type, classifier_version, confidence, confidence_tier,
@@ -3207,7 +4992,7 @@ async function upsertSignal(args: {
        sector_key, sector_confidence, signal_kind, dealmaker_id, dealmaker_name,
        has_deck, has_meeting, ingestion_mode, metadata_json, created_at, updated_at
      ) VALUES (
-       ?, ?, ?, ?, ?, ?, ?,
+       ?, ?, ?, ?, ?, ?, ?, ?,
        ?, ?, ?, ?, ?,
        ?, ?, ?, ?,
        ?, ?, ?, ?,
@@ -3218,6 +5003,7 @@ async function upsertSignal(args: {
      ON CONFLICT(org_id, source_type, source_id, mention_ordinal) DO UPDATE SET
        prospect_id = excluded.prospect_id,
        deal_id = excluded.deal_id,
+       company_id = excluded.company_id,
        span_start = excluded.span_start,
        span_end = excluded.span_end,
        raw_mention_text = excluded.raw_mention_text,
@@ -3251,6 +5037,7 @@ async function upsertSignal(args: {
     args.orgId,
     args.prospectId,
     args.dealId,
+    args.companyId,
     args.sourceType,
     args.sourceId,
     args.mention.mentionOrdinal,
@@ -3290,6 +5077,7 @@ async function upsertSignal(args: {
     before.classifier_version !== PROSPECT_CLASSIFIER_VERSION ||
     before.prospect_id !== args.prospectId ||
     before.deal_id !== args.dealId ||
+    before.company_id !== args.companyId ||
     before.classification_status !== 'classified' ||
     before.resolution_status !== resolutionStatus
   )) {
@@ -3655,9 +5443,11 @@ export async function runProspectEnrichmentCycle(
   const limit = Math.min(Math.max(Number(options.limit || 10), 1), 50);
   const prospects = await env.D1.prepare(
     `SELECT id, canonical_name, domain, signal_strength, enrichment_status
-       FROM prospects
+      FROM prospects
       WHERE org_id = ? AND deleted_at IS NULL
-        AND status IN ('active','provisional')
+        AND status = 'active'
+        AND provisional = 0
+        AND direction_uncertain = 0
         AND enrichment_status IN ('not_started','candidate','failed')
       ORDER BY signal_strength DESC, last_seen_at DESC
       LIMIT ?`
@@ -3766,6 +5556,7 @@ export async function detectAndRecordProspectSignals(
         }
         updateStatsForProspectClassification(stats, cls);
         let prospectId: string | null = null;
+        let signalCompanyId: string | null = null;
         let dealmaker: { id: string | null; name: string | null } = { id: null, name: null };
 
         if (cls.shouldCreateProspect) {
@@ -3780,6 +5571,7 @@ export async function detectAndRecordProspectSignals(
           stats.skipped_intro_source++;
         } else if (cls.mentionType === 'known_deal') {
           prospectId = cls.linkedDealId ? dealBackedProspects.get(cls.linkedDealId) || null : null;
+          signalCompanyId = existing.companyId;
           stats.skipped_known_deal++;
         } else if (cls.mentionType === 'news') {
           stats.skipped_news++;
@@ -3793,6 +5585,7 @@ export async function detectAndRecordProspectSignals(
           orgId,
           prospectId,
           dealId: cls.linkedDealId,
+          companyId: signalCompanyId,
           sourceType,
           sourceId: item.entityId,
           sourceTitle: item.subject || null,
@@ -3804,6 +5597,22 @@ export async function detectAndRecordProspectSignals(
           ingestionMode,
         }, env);
         stats.signals_recorded++;
+        if (prospectId && cls.shouldCreateProspect) {
+          try {
+            await ensureCompanyForFinalProspect({
+              orgId,
+              prospectId,
+              signalId: signalResult.signalId,
+              mention,
+              cls,
+            }, env);
+          } catch (e) {
+            stats.errors.push({
+              item_id: item.entityId,
+              error: `company_resolution_failed:${e instanceof Error ? e.message : String(e)}`,
+            });
+          }
+        }
         const sampled = await recordProductionSample({
           orgId,
           signalId: signalResult.signalId,
@@ -4061,6 +5870,126 @@ async function readProspectSourceR2Text(env: Env, key?: string | null, maxChars 
   }
 }
 
+const BACKFILL_SOURCE_POOL_MIN = 200;
+const BACKFILL_SOURCE_POOL_MAX = 1000;
+const BACKFILL_SOURCE_POOL_MULTIPLIER = 8;
+
+type BackfillSourceRow = Record<string, any>;
+
+function sourcePoolLimitForBatch(limit: number): number {
+  return Math.min(
+    BACKFILL_SOURCE_POOL_MAX,
+    Math.max(BACKFILL_SOURCE_POOL_MIN, Math.floor(limit * BACKFILL_SOURCE_POOL_MULTIPLIER))
+  );
+}
+
+function normalizeBackfillSourceText(value: unknown): string {
+  return normalizeWhitespace(String(value || ''))
+    .toLowerCase()
+    .replace(/^(?:re|fw|fwd)\s*:\s*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function prospectBackfillSourceScore(row: BackfillSourceRow, family: ProspectBackfillSourceFamily): number {
+  const text = normalizeBackfillSourceText([
+    row.subject,
+    row.title,
+    row.body_preview,
+    row.extracted_text_preview,
+    row.description,
+    row.summary,
+    row.document_type,
+    row.file_name,
+    row.from_email,
+  ].filter(Boolean).join('\n'));
+  let score = 0;
+
+  const strongSignals: Array<[RegExp, number]> = [
+    [/\b(?:intro|introduction|introducing|connect(?:ing)?|warm intro)\b/, 18],
+    [/\b(?:pitch|deck|teaser|cim|one[-\s]?pager|company\s+2\s+pager|company\s+one[-\s]?pager|pre[-\s]?read|background information)\b/, 18],
+    [/\b(?:data room|diligence|financial model|p&l|profit and loss|term sheet|transaction document|investment memo)\b/, 16],
+    [/\b(?:raising|fundrais(?:e|ing)|round|series\s+[abc]|seed round|safe|allocation)\b/, 14],
+    [/\b(?:acquisition opportunity|acquisition opp|investment opportunity|opportunity)\b/, 12],
+    [/\b(?:founder|co[-\s]?founder|ceo|chief executive)\b/, 8],
+    [/\b(?:demo|pilot|materials|business plan)\b/, 8],
+  ];
+  for (const [pattern, weight] of strongSignals) {
+    if (pattern.test(text)) score += weight;
+  }
+
+  const weakOpsSignals: Array<[RegExp, number]> = [
+    [/\b(?:invoice|receipt|bank statement|deposit account|wire transfer|capital call|tax document|k-1|payroll|gusto)\b/, -18],
+    [/\b(?:newsletter|webinar|roundtable|conference reminder|daily digest|meeting report is ready)\b/, -8],
+    [/\b(?:phishing|quarantined|spam|payment due)\b/, -20],
+  ];
+  for (const [pattern, weight] of weakOpsSignals) {
+    if (pattern.test(text)) score += weight;
+  }
+
+  if (Number(row.has_attachments || 0) > 0 || Number(row.attachment_count || 0) > 0) score += 6;
+  if (family === 'document') score += 3;
+  if (family === 'event' && /\b(?:intro|diligence|demo|ventures|medina)\b/.test(text)) score += 4;
+  if (row.from_email && !isInternalEmailDomain(String(row.from_email), new Set(['medinavc.com', 'medinacapital.com']))) score += 4;
+  return score;
+}
+
+function backfillSourceDedupeKey(row: BackfillSourceRow, family: ProspectBackfillSourceFamily): string {
+  if (family === 'conversation') {
+    const subject = normalizeBackfillSourceText(row.subject);
+    const preview = normalizeBackfillSourceText(row.body_preview).slice(0, 240);
+    return [
+      'conversation',
+      String(row.from_email || '').toLowerCase(),
+      String(row.sent_at || ''),
+      subject,
+      preview,
+    ].join('|');
+  }
+  if (family === 'event') {
+    return [
+      'event',
+      String(row.start_time || ''),
+      normalizeBackfillSourceText(row.title),
+      normalizeBackfillSourceText(row.location),
+    ].join('|');
+  }
+  return [
+    'document',
+    String(row.content_hash || '').toLowerCase(),
+    normalizeBackfillSourceText(row.title || row.file_name),
+    String(row.created_at || ''),
+  ].join('|');
+}
+
+function rankAndDedupeBackfillSourceRows(
+  rows: BackfillSourceRow[],
+  family: ProspectBackfillSourceFamily,
+  limit: number
+): BackfillSourceRow[] {
+  const seen = new Set<string>();
+  return rows
+    .map(row => ({
+      row,
+      score: prospectBackfillSourceScore(row, family),
+      occurredAt: String(row.sent_at || row.start_time || row.created_at || ''),
+      id: String(row.id || ''),
+    }))
+    .sort((a, b) =>
+      b.score - a.score ||
+      b.occurredAt.localeCompare(a.occurredAt) ||
+      a.id.localeCompare(b.id)
+    )
+    .filter(entry => {
+      const key = backfillSourceDedupeKey(entry.row, family);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit)
+    .map(entry => entry.row);
+}
+
 async function loadBackfillItemsForFamily(
   orgId: string,
   env: Env,
@@ -4069,16 +5998,19 @@ async function loadBackfillItemsForFamily(
   windowEnd: string,
   limit: number
 ): Promise<ClassifiedItem[]> {
+  const poolLimit = sourcePoolLimitForBatch(limit);
   if (family === 'conversation') {
     const rows = await env.D1.prepare(
-      `SELECT id, source, subject, body_preview, sent_at, from_email, to_emails, cc_emails,
-              direction, 'private' AS visibility, participant_user_ids, body_r2_key
+      `SELECT id, source, external_thread_id, external_message_id, subject, body_preview, sent_at,
+              from_email, to_emails, cc_emails, direction, has_attachments, attachment_count,
+              'private' AS visibility, participant_user_ids, body_r2_key
          FROM conversations
         WHERE org_id = ? AND sent_at >= ? AND sent_at < ?
         ORDER BY sent_at DESC
         LIMIT ?`
-    ).bind(orgId, windowStart, windowEnd, limit).all<any>();
-    return Promise.all((rows.results || []).map(async row => {
+    ).bind(orgId, windowStart, windowEnd, poolLimit).all<any>();
+    const selectedRows = rankAndDedupeBackfillSourceRows(rows.results || [], family, limit);
+    return Promise.all(selectedRows.map(async row => {
       const bodyText = await readProspectSourceR2Text(env, row.body_r2_key) || row.body_preview || '';
       return {
         type: row.source === 'slack' ? 'slack_message' : 'email',
@@ -4114,13 +6046,18 @@ async function loadBackfillItemsForFamily(
   }
   if (family === 'event') {
     const rows = await env.D1.prepare(
-      `SELECT id, title, description, summary, start_time, source, transcript_r2_key
+      `SELECT id, title, description, summary, start_time, created_at, location, source, transcript_r2_key
          FROM events
-        WHERE org_id = ? AND deleted_at IS NULL AND start_time >= ? AND start_time < ?
+        WHERE org_id = ? AND deleted_at IS NULL
+          AND (
+            (start_time >= ? AND start_time < ?)
+            OR (created_at >= ? AND created_at < ? AND start_time >= ?)
+          )
         ORDER BY start_time DESC
         LIMIT ?`
-    ).bind(orgId, windowStart, windowEnd, limit).all<any>();
-    return Promise.all((rows.results || []).map(async row => {
+    ).bind(orgId, windowStart, windowEnd, windowStart, windowEnd, windowStart, poolLimit).all<any>();
+    const selectedRows = rankAndDedupeBackfillSourceRows(rows.results || [], family, limit);
+    return Promise.all(selectedRows.map(async row => {
       const fallbackText = row.summary || row.description || '';
       const bodyText = await readProspectSourceR2Text(env, row.transcript_r2_key) || fallbackText;
       return {
@@ -4155,13 +6092,13 @@ async function loadBackfillItemsForFamily(
   }
   const rows = await env.D1.prepare(
     `SELECT id, title, extracted_text_preview, document_type, source, visibility,
-            participant_user_ids, created_at
+            participant_user_ids, created_at, file_name, content_hash
        FROM documents
       WHERE org_id = ? AND deleted_at IS NULL AND created_at >= ? AND created_at < ?
       ORDER BY created_at DESC
       LIMIT ?`
-  ).bind(orgId, windowStart, windowEnd, limit).all<any>();
-  return (rows.results || []).map(row => ({
+  ).bind(orgId, windowStart, windowEnd, poolLimit).all<any>();
+  return rankAndDedupeBackfillSourceRows(rows.results || [], family, limit).map(row => ({
     type: 'email',
     source: 'outlook',
     externalId: row.id,
@@ -4268,14 +6205,14 @@ export async function runProspectBackfillWindow(
 
 export async function runProspectReconciliation(orgId: string, env: Env): Promise<{ scanned: number; converted: number; duplicate_links: number; resolved_soft_states: number; pending_classifications: number }> {
   const rows = await env.D1.prepare(
-    `SELECT id, canonical_name, normalized_name, domain, possible_deal_id, possible_duplicate_of
+    `SELECT id, canonical_name, normalized_name, domain, website, status, signal_count, evidence_count, created_at, possible_deal_id, possible_duplicate_of
        FROM prospects
       WHERE org_id = ? AND deleted_at IS NULL
         AND status IN ('active','provisional')
       ORDER BY updated_at ASC
-      LIMIT 100`
+      LIMIT 250`
   ).bind(orgId).all<{
-    id: string; canonical_name: string; normalized_name: string; domain: string | null; possible_deal_id: string | null; possible_duplicate_of: string | null;
+    id: string; canonical_name: string; normalized_name: string; domain: string | null; website: string | null; status: string | null; signal_count: number | null; evidence_count: number | null; created_at: string | null; possible_deal_id: string | null; possible_duplicate_of: string | null;
   }>();
 
   let converted = 0;
@@ -4305,25 +6242,27 @@ export async function runProspectReconciliation(orgId: string, env: Env): Promis
       }
     }
 
-    const dup = await env.D1.prepare(
-      `SELECT id FROM prospects
-        WHERE org_id = ? AND deleted_at IS NULL AND id != ? AND normalized_name = ?
-        ORDER BY signal_count DESC, created_at ASC
-        LIMIT 1`
-    ).bind(orgId, p.id, p.normalized_name).first<{ id: string }>();
-    if (dup?.id && p.possible_duplicate_of !== dup.id) {
+    const dup = bestDuplicateWinnerForProspect(p, rows.results);
+    if (dup?.winner.id && p.possible_duplicate_of !== dup.winner.id) {
       await env.D1.prepare(
         `UPDATE prospects
             SET possible_duplicate_of = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
           WHERE id = ? AND org_id = ?`
-      ).bind(dup.id, p.id, orgId).run();
+      ).bind(dup.winner.id, p.id, orgId).run();
       await env.D1.prepare(
         `INSERT OR IGNORE INTO prospect_soft_links
            (id, org_id, prospect_id, link_type, target_type, target_id, score, evidence_json, created_at, updated_at)
-         VALUES (?, ?, ?, 'possible_duplicate', 'prospect', ?, 1.0, '{}',
+         VALUES (?, ?, ?, 'possible_duplicate', 'prospect', ?, ?, ?,
                  strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-      ).bind(crypto.randomUUID(), orgId, p.id, dup.id).run();
+      ).bind(
+        crypto.randomUUID(),
+        orgId,
+        p.id,
+        dup.winner.id,
+        dup.score,
+        JSON.stringify({ method: dup.method, req: 'REQ-ID-8' })
+      ).run();
       duplicateLinks++;
     }
 
@@ -4516,6 +6455,12 @@ export const __prospectIntelligenceTestHooks = {
   extractMentionCandidatesFromText,
   extractOrganizationMentionsFromSource,
   parseDealflowList,
+  firstProspectDomainForMention,
+  prospectIdentityAliasesForName,
+  dedupeMentionIdentityCandidates,
+  scoreProspectRowDuplicate,
+  prospectBackfillSourceScore,
+  rankAndDedupeBackfillSourceRows,
   sourcePrefilter,
   productionSamplingDecision,
   sameCompanyForEnrichment,
@@ -4526,6 +6471,8 @@ export const __prospectIntelligenceTestHooks = {
   buildProspectClassifierPrompt,
   classifierInputForRuntime,
   prospectValuableActionVetoForMention,
+  classifyCompanyRoleFromD1,
+  verifyLowConfidenceProspect,
   prospectCreateVetoForMention,
   parseProspectClassifierResponse,
   parseDirection,

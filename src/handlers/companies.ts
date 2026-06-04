@@ -38,6 +38,70 @@ const COMPANY_SORT_MAP: Record<string, { col: string; defaultDir: 'ASC' | 'DESC'
   created_at: { col: 'co.created_at', defaultDir: 'DESC' },
 };
 
+function companyHasDomainAnchor(company: any): boolean {
+  return Boolean(String(company?.domain || '').trim() || String(company?.website || '').trim());
+}
+
+async function loadCompanyProspectSignals(id: string, orgId: string, env: Env): Promise<any[]> {
+  return env.D1.prepare(
+    `SELECT
+        s.id AS signal_id,
+        s.prospect_id,
+        COALESCE(p.canonical_name, s.raw_mention_text) AS prospect_name,
+        s.occurred_at,
+        s.source_type,
+        s.source_title,
+        s.signal_kind,
+        s.confidence,
+        s.raw_mention_text,
+        s.mention_type,
+        json_extract(s.metadata_json, '$.company_resolution.match_method') AS match_method,
+        json_extract(s.metadata_json, '$.company_resolution.match_score') AS match_score,
+        json_extract(s.metadata_json, '$.company_resolution.action') AS resolution_action,
+        json_extract(s.metadata_json, '$.company_resolution.enrichment.status') AS enrichment_status,
+        json_extract(s.metadata_json, '$.company_resolution.enrichment.reason') AS enrichment_reason
+       FROM prospect_signals s
+       LEFT JOIN prospects p ON p.id = s.prospect_id AND p.org_id = s.org_id
+      WHERE s.org_id = ?
+        AND (
+          s.company_id = ?
+          OR p.company_id = ?
+          OR s.deal_id IN (
+            SELECT id FROM deals WHERE org_id = ? AND company_id = ? AND deleted_at IS NULL
+          )
+        )
+        AND s.mention_type IN ('inbound_prospect','known_deal')
+      ORDER BY s.occurred_at DESC
+      LIMIT 20`
+  ).bind(orgId, id, id, orgId, id).all<any>()
+    .then(rows => rows.results || [])
+    .catch(error => {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (/no such column:\s*s\.company_id/i.test(message)) return [];
+      throw error;
+    });
+}
+
+async function companyHasProspectOrigin(id: string, orgId: string, env: Env): Promise<boolean> {
+  const row = await env.D1.prepare(
+    `SELECT 1
+       FROM company_tags ct
+       JOIN tags t ON t.id = ct.tag_id
+      WHERE ct.company_id = ?
+        AND t.org_id = ?
+        AND t.entity_type = 'company'
+        AND lower(t.name) = lower('Investment Prospect')
+      LIMIT 1`
+  ).bind(id, orgId).first().catch(() => null);
+  if (row) return true;
+  const signal = await env.D1.prepare(
+    `SELECT 1 FROM prospect_signals
+      WHERE org_id = ? AND company_id = ?
+      LIMIT 1`
+  ).bind(orgId, id).first().catch(() => null);
+  return Boolean(signal);
+}
+
 function parseList(raw: string | null): string[] | undefined {
   if (!raw) return undefined;
   const items = raw.split(',').map(s => s.trim()).filter(Boolean);
@@ -411,6 +475,7 @@ export async function getCompany(
               published_at DESC
      LIMIT 10`
   ).bind(id, ctx.orgId).all();
+  const prospectSignals = await loadCompanyProspectSignals(id, ctx.orgId, env);
 
   return jsonResponse({
     company,
@@ -418,6 +483,7 @@ export async function getCompany(
     deals: deals.results,
     tags: tags.results,
     news_articles: newsArticles.results,
+    prospect_signals: prospectSignals,
   });
 }
 
@@ -535,6 +601,20 @@ export async function enrichCompanyEndpoint(
   env: Env,
   ctxExec: ExecutionContext
 ): Promise<Response> {
+  const company = await env.D1.prepare(
+    `SELECT id, domain, website
+       FROM companies
+      WHERE id = ? AND org_id = ? AND deleted_at IS NULL
+      LIMIT 1`
+  ).bind(id, ctx.orgId).first<any>();
+  if (!company) return errorResponse('COMPANY_NOT_FOUND', 404);
+  if (!companyHasDomainAnchor(company) && await companyHasProspectOrigin(id, ctx.orgId, env)) {
+    return errorResponse(
+      'ENRICHMENT_BLOCKED_INSUFFICIENT_ANCHOR',
+      409,
+      'Limited information: enrichment is paused until a verified website/domain or additional corroborating evidence is available.'
+    );
+  }
   ctxExec.waitUntil(triggerCompanyEnrichment(id, ctx.orgId, env));
   return jsonResponse({ ok: true, message: 'Enrichment queued' });
 }

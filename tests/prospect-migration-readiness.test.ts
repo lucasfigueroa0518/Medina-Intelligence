@@ -19,10 +19,13 @@ describe('prospect migration readiness proof', () => {
     expect(result.checks.filter(check => check.status === 'fail')).toEqual([]);
     expect(result.checks).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: 'empty.sectors_seeded', status: 'pass' }),
+      expect.objectContaining({ name: 'empty.prospect_signals_company_id_exists', status: 'pass' }),
       expect.objectContaining({ name: 'seeded.prospect_rows_survive_repeat_apply', status: 'pass' }),
+      expect.objectContaining({ name: 'seeded.signal_company_id_column_survives_repeat_apply', status: 'pass' }),
       expect.objectContaining({ name: 'stale_temp.no_entity_field_state_new_leftover', status: 'pass' }),
       expect.objectContaining({ name: 'indexes.expected_indexes_present', status: 'pass' }),
       expect.objectContaining({ name: 'query_plan.idx_prospects_org_normalized_active', status: 'pass' }),
+      expect.objectContaining({ name: 'query_plan.idx_prospect_signals_company', status: 'pass' }),
       expect.objectContaining({ name: 'query_plan.idx_pbj_org_status', status: 'pass' }),
       expect.objectContaining({ name: 'constraints.duplicate_live_deal_backlink_rejected', status: 'pass' }),
       expect.objectContaining({ name: 'constraints.soft_deleted_duplicate_deal_backlink_allowed', status: 'pass' }),

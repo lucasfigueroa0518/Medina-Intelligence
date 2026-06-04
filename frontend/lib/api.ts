@@ -153,7 +153,7 @@ export const api = {
   listCompanyCities: () =>
     request<{ cities: { name: string; count: number }[] }>(`/companies/cities`),
   getCompany: (id: string) =>
-    request<{ company: any; contacts: any[]; deals: any[]; tags: any[]; news_articles: any[] }>(`/companies/${id}`),
+    request<{ company: any; contacts: any[]; deals: any[]; tags: any[]; news_articles: any[]; prospect_signals?: any[] }>(`/companies/${id}`),
   createCompany: (data: any) =>
     request<{ company: any }>('/companies', { method: 'POST', body: JSON.stringify(data) }),
   updateCompany: (id: string, data: any) =>

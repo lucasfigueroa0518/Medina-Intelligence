@@ -17,6 +17,7 @@ import {
   detectAndRecordProspectSignals,
   ensureProspectForDeal,
   extractMentionCandidatesFromText,
+  extractOrganizationMentionsFromSource,
   loadProspectClassifierKnownContext,
   mergeProspects,
   normalizeProspectName,
@@ -25,6 +26,7 @@ import {
   reverseProspectMerge,
   runProspectBackfillWindow,
   runProspectEnrichmentCycle,
+  runProspectReconciliation,
 } from '../src/lib/prospect-intelligence';
 
 class FakeStatement {
@@ -54,6 +56,8 @@ class FakeD1 {
   companies: any[] = [];
   deals: any[] = [];
   relationships: any[] = [];
+  contacts: any[] = [];
+  dealmakers: any[] = [];
   sourceConversations: any[] = [];
   sourceEvents: any[] = [];
   sourceDocuments: any[] = [];
@@ -66,6 +70,8 @@ class FakeD1 {
   entityFieldState: any[] = [];
   coverage: any[] = [];
   backfillRuns: any[] = [];
+  tags: any[] = [];
+  companyTags: any[] = [];
 
   prepare(sql: string): FakeStatement {
     return new FakeStatement(this, sql);
@@ -76,7 +82,31 @@ class FakeD1 {
   }
 
   all(sql: string, binds: unknown[]): any[] {
-    if (/FROM dealmakers/i.test(sql)) return [];
+    if (/FROM dealmakers/i.test(sql) && /GROUP BY dealmaker_type/i.test(sql)) {
+      const [orgId, ...criteria] = binds;
+      const normalized = new Set(criteria.filter(value => typeof value === 'string' && !String(value).includes('.')).map(String));
+      const domains = new Set(criteria.filter(value => typeof value === 'string' && String(value).includes('.')).map(value => String(value).toLowerCase()));
+      const grouped = new Map<string, number>();
+      for (const row of this.dealmakers) {
+        if (row.org_id !== orgId) continue;
+        const matches = normalized.has(String(row.normalized_name || '')) || domains.has(String(row.domain || '').toLowerCase());
+        if (!matches) continue;
+        const key = row.dealmaker_type || 'unknown';
+        grouped.set(key, (grouped.get(key) || 0) + 1);
+      }
+      return Array.from(grouped.entries()).map(([dealmaker_type, n]) => ({ dealmaker_type, n }));
+    }
+    if (/FROM dealmakers/i.test(sql)) {
+      return this.dealmakers
+        .filter(row => row.org_id === binds[0])
+        .map(row => ({ name: row.name, domain: row.domain || null }));
+    }
+    if (/FROM contacts/i.test(sql)) {
+      const [orgId, companyId] = binds;
+      return this.contacts
+        .filter(row => row.org_id === orgId && row.company_id === companyId && !row.deleted_at && !row.merged_into)
+        .map(row => ({ ...row }));
+    }
     if (/FROM companies c/i.test(sql)) {
       return this.companies
         .filter(company => company.org_id === binds[0] && this.deals.some(deal => deal.org_id === company.org_id && deal.company_id === company.id && deal.stage !== 'closed' && !deal.deleted_at))
@@ -101,6 +131,12 @@ class FakeD1 {
         .filter(row => row.prospect_id === prospectId && row.org_id === orgId && row.mention_type === 'inbound_prospect')
         .sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
     }
+    if (/FROM prospect_signals/i.test(sql) && /normalized_mention = \?/i.test(sql)) {
+      const [orgId, normalizedMention] = binds;
+      return this.prospectSignals
+        .filter(row => row.org_id === orgId && row.normalized_mention === normalizedMention)
+        .map(row => ({ mention_type: row.mention_type, metadata_json: row.metadata_json || '{}' }));
+    }
     if (/SELECT id, deal_id\s+FROM prospects/i.test(sql)) {
       const [orgId] = binds;
       return this.prospects
@@ -121,7 +157,14 @@ class FakeD1 {
     if (/FROM prospects/i.test(sql) && /ORDER BY signal_strength DESC/i.test(sql)) {
       const [orgId, limit] = binds;
       return this.prospects
-        .filter(row => row.org_id === orgId && !row.deleted_at && ['active', 'provisional'].includes(row.status) && ['not_started', 'candidate', 'failed'].includes(row.enrichment_status || 'not_started'))
+        .filter(row =>
+          row.org_id === orgId &&
+          !row.deleted_at &&
+          row.status === 'active' &&
+          Number(row.provisional || 0) === 0 &&
+          Number(row.direction_uncertain || 0) === 0 &&
+          ['not_started', 'candidate', 'failed'].includes(row.enrichment_status || 'not_started')
+        )
         .sort((a, b) => Number(b.signal_strength || 0) - Number(a.signal_strength || 0))
         .slice(0, Number(limit))
         .map(row => ({ ...row }));
@@ -131,21 +174,30 @@ class FakeD1 {
         expect(sql).toContain("'private' AS visibility");
         expect(sql).not.toMatch(/direction,\s*visibility\b/i);
       }
-      const [orgId, start, end, limit] = binds;
+      const [orgId, start, end] = binds;
+      const limit = binds[binds.length - 1];
       return this.sourceConversations
         .filter(row => row.org_id === orgId && row.sent_at >= start && row.sent_at < end)
         .sort((a, b) => String(b.sent_at).localeCompare(String(a.sent_at)))
         .slice(0, Number(limit));
     }
     if (/FROM events/i.test(sql)) {
-      const [orgId, start, end, limit] = binds;
+      const [orgId, start, end] = binds;
+      const createdStart = binds[3] || start;
+      const createdEnd = binds[4] || end;
+      const futureStart = binds[5] || start;
+      const limit = binds[binds.length - 1];
       return this.sourceEvents
-        .filter(row => row.org_id === orgId && !row.deleted_at && row.start_time >= start && row.start_time < end)
+        .filter(row => row.org_id === orgId && !row.deleted_at && (
+          (row.start_time >= start && row.start_time < end) ||
+          (row.created_at >= createdStart && row.created_at < createdEnd && row.start_time >= futureStart)
+        ))
         .sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)))
         .slice(0, Number(limit));
     }
     if (/FROM documents/i.test(sql)) {
-      const [orgId, start, end, limit] = binds;
+      const [orgId, start, end] = binds;
+      const limit = binds[binds.length - 1];
       return this.sourceDocuments
         .filter(row => row.org_id === orgId && !row.deleted_at && row.created_at >= start && row.created_at < end)
         .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
@@ -156,6 +208,28 @@ class FakeD1 {
       return this.prospects
         .filter(row => row.org_id === orgId && !row.deleted_at && ['active', 'provisional'].includes(row.status))
         .slice(0, 100);
+    }
+    if (/FROM prospects/i.test(sql) && /ORDER BY signal_count DESC, evidence_count DESC/i.test(sql)) {
+      const [orgId, ...criteria] = binds;
+      const normalizedCriteria = new Set(
+        criteria
+          .filter(value => typeof value === 'string' && !String(value).includes('%') && !String(value).includes('.'))
+          .map(value => String(value))
+      );
+      const domainCriteria = criteria
+        .filter(value => typeof value === 'string' && String(value).includes('.'))
+        .map(value => String(value).replace(/%/g, '').toLowerCase());
+      return this.prospects
+        .filter(row => {
+          if (row.org_id !== orgId || row.deleted_at || !['active', 'provisional', 'converted'].includes(row.status)) return false;
+          if (normalizedCriteria.has(String(row.normalized_name || ''))) return true;
+          const domain = String(row.domain || '').toLowerCase();
+          const website = String(row.website || '').toLowerCase();
+          return domainCriteria.some(criteria => domain === criteria || website.includes(criteria));
+        })
+        .sort((a, b) => Number(b.signal_count || 0) - Number(a.signal_count || 0))
+        .slice(0, 25)
+        .map(row => ({ ...row }));
     }
     return [];
   }
@@ -184,6 +258,15 @@ class FakeD1 {
     if (/FROM companies/i.test(sql) && /WHERE id = \?/i.test(sql)) {
       const [id, orgId] = binds;
       const row = this.companies.find(entry => entry.id === id && entry.org_id === orgId && !entry.deleted_at);
+      return row ? { ...row } : null;
+    }
+    if (/FROM tags/i.test(sql) && /lower\(name\)/i.test(sql)) {
+      const [orgId] = binds;
+      const name = sql.match(/lower\(name\) = lower\('([^']+)'\)/i)?.[1] || binds[1] || 'Investment Prospect';
+      const row = this.tags.find(entry =>
+        entry.org_id === orgId &&
+        String(entry.name || '').toLowerCase() === String(name || '').toLowerCase()
+      );
       return row ? { ...row } : null;
     }
     if (/FROM companies/i.test(sql) && /lower\(domain\) = lower\(\?\)/i.test(sql)) {
@@ -282,6 +365,17 @@ class FakeD1 {
         row.source_id === sourceId &&
         row.mention_ordinal === mentionOrdinal
       );
+  }
+
+  private jsonPatch(base: unknown, patch: unknown): string {
+    try {
+      return JSON.stringify({
+        ...(base ? JSON.parse(String(base)) : {}),
+        ...(patch ? JSON.parse(String(patch)) : {}),
+      });
+    } catch {
+      return String(patch || base || '{}');
+    }
   }
 
   run(sql: string, binds: unknown[]): void {
@@ -403,6 +497,113 @@ class FakeD1 {
         signal_strength: 0,
         signal_strength_reasons: '[]',
       });
+      return;
+    }
+
+    if (/INSERT INTO companies/i.test(sql)) {
+      this.companies.push({
+        id: binds[0],
+        org_id: binds[1],
+        name: binds[2],
+        domain: binds[3],
+        website: binds[4],
+        description: binds[5],
+        company_type: 'startup',
+        investment_status: 'prospect',
+        custom_fields: binds[6],
+        created_at: binds[7],
+        updated_at: binds[8],
+      });
+      return;
+    }
+
+    if (/UPDATE companies/i.test(sql) && /investment_status = CASE/i.test(sql)) {
+      const [customFields, companyId, orgId] = binds;
+      const row = this.companies.find(entry => entry.id === companyId && entry.org_id === orgId);
+      if (row) {
+        if (!row.investment_status || row.investment_status === 'tracking') row.investment_status = 'prospect';
+        row.custom_fields = customFields;
+      }
+      return;
+    }
+
+    if (/INSERT INTO tags/i.test(sql)) {
+      const name = sql.match(/VALUES \(\?, \?, '([^']+)'/i)?.[1] || binds[2] || 'Investment Prospect';
+      const color = sql.match(/VALUES \(\?, \?, '[^']+', '([^']+)'/i)?.[1] || binds[3] || '#D946A8';
+      const existing = this.tags.find(row => row.id === binds[0] || (row.org_id === binds[1] && row.name === name));
+      if (!existing) {
+        this.tags.push({
+          id: binds[0],
+          org_id: binds[1],
+          name,
+          color,
+          created_at: binds[4],
+        });
+      }
+      return;
+    }
+
+    if (/INSERT(?: OR IGNORE)? INTO company_tags/i.test(sql)) {
+      const existing = this.companyTags.find(row => row.company_id === binds[0] && row.tag_id === binds[1]);
+      if (!existing) {
+        this.companyTags.push({
+          company_id: binds[0],
+          tag_id: binds[1],
+          created_at: binds[2],
+        });
+      }
+      return;
+    }
+
+    if (/UPDATE prospects/i.test(sql) && /domain = COALESCE\(domain/i.test(sql)) {
+      const prospectId = binds[8];
+      const orgId = binds[9];
+      const row = this.prospects.find(entry => entry.id === prospectId && entry.org_id === orgId);
+      if (row) {
+        row.domain = row.domain || binds[0];
+        row.website = row.website || binds[1];
+        row.last_seen_at = binds[2];
+        row.last_signal_at = binds[4];
+        row.confidence = Math.max(Number(row.confidence || 0), Number(binds[6] || 0));
+        row.metadata_json = binds[7];
+      }
+      return;
+    }
+
+    if (/UPDATE prospects/i.test(sql) && /SET company_id = \?/i.test(sql) && /possible_company_id/i.test(sql)) {
+      const [companyId, metadataJson, prospectId, orgId] = binds;
+      const row = this.prospects.find(entry => entry.id === prospectId && entry.org_id === orgId);
+      if (row) {
+        row.company_id = companyId;
+        row.possible_company_id = null;
+        row.metadata_json = this.jsonPatch(row.metadata_json, metadataJson);
+      }
+      return;
+    }
+
+    if (/UPDATE prospects/i.test(sql) && /sector_confidence = MAX\(sector_confidence/i.test(sql)) {
+      const prospectId = binds[9];
+      const orgId = binds[10];
+      const row = this.prospects.find(entry => entry.id === prospectId && entry.org_id === orgId);
+      if (row) {
+        row.canonical_name = binds[0];
+        row.status = row.status === 'active' ? row.status : binds[1];
+        if (row.sector_key === 'uncategorized' || Number(binds[2] || 0) > Number(row.sector_confidence || 0)) {
+          row.sector_key = binds[3];
+        }
+        row.sector_confidence = Math.max(Number(row.sector_confidence || 0), Number(binds[4] || 0));
+        row.provisional = binds[5] === 1 ? 1 : row.provisional;
+        row.direction_uncertain = binds[6] === 1 ? 1 : row.direction_uncertain;
+        row.possible_company_id = row.possible_company_id || binds[7];
+        row.possible_deal_id = row.possible_deal_id || binds[8];
+      }
+      return;
+    }
+
+    if (/UPDATE prospects/i.test(sql) && /SET possible_duplicate_of = \?/i.test(sql)) {
+      const [winnerId, loserId, orgId] = binds;
+      const row = this.prospects.find(entry => entry.id === loserId && entry.org_id === orgId);
+      if (row) row.possible_duplicate_of = winnerId;
       return;
     }
 
@@ -537,6 +738,16 @@ class FakeD1 {
       return;
     }
 
+    if (/UPDATE prospect_signals/i.test(sql) && /SET company_id = \?/i.test(sql)) {
+      const [companyId, metadataJson, signalId, orgId] = binds;
+      const row = this.prospectSignals.find(entry => entry.id === signalId && entry.org_id === orgId);
+      if (row) {
+        row.company_id = companyId;
+        row.metadata_json = this.jsonPatch(row.metadata_json, metadataJson);
+      }
+      return;
+    }
+
     if (/UPDATE prospects/i.test(sql) && /status = 'merged'/i.test(sql)) {
       const [winnerId, loserId, orgId] = binds;
       const row = this.prospects.find(entry => entry.id === loserId && entry.org_id === orgId);
@@ -619,42 +830,43 @@ class FakeD1 {
   }
 
   private upsertSuccessfulSignal(binds: unknown[]): void {
-    const existing = this.storedSignalFor(binds[1], binds[4], binds[5], binds[6]);
+    const existing = this.storedSignalFor(binds[1], binds[5], binds[6], binds[7]);
     const row = existing || {};
     Object.assign(row, {
       id: binds[0],
       org_id: binds[1],
       prospect_id: binds[2],
       deal_id: binds[3],
-      source_type: binds[4],
-      source_id: binds[5],
-      mention_ordinal: binds[6],
-      span_start: binds[7],
-      span_end: binds[8],
-      raw_mention_text: binds[9],
-      normalized_mention: binds[10],
-      source_title: binds[11],
-      occurred_at: binds[12],
-      direction: binds[13],
-      direction_source: binds[14],
-      direction_uncertain: binds[15],
-      mention_type: binds[16],
-      classifier_version: binds[17],
-      confidence: binds[18],
-      confidence_tier: binds[19],
-      classification_status: binds[20],
-      resolution_status: binds[21],
-      error_message: binds[22],
-      classification_attempts: binds[23],
-      sector_key: binds[24],
-      sector_confidence: binds[25],
-      signal_kind: binds[26],
-      dealmaker_id: binds[27],
-      dealmaker_name: binds[28],
-      has_deck: binds[29],
-      has_meeting: binds[30],
-      ingestion_mode: binds[31],
-      metadata_json: binds[32],
+      company_id: binds[4],
+      source_type: binds[5],
+      source_id: binds[6],
+      mention_ordinal: binds[7],
+      span_start: binds[8],
+      span_end: binds[9],
+      raw_mention_text: binds[10],
+      normalized_mention: binds[11],
+      source_title: binds[12],
+      occurred_at: binds[13],
+      direction: binds[14],
+      direction_source: binds[15],
+      direction_uncertain: binds[16],
+      mention_type: binds[17],
+      classifier_version: binds[18],
+      confidence: binds[19],
+      confidence_tier: binds[20],
+      classification_status: binds[21],
+      resolution_status: binds[22],
+      error_message: binds[23],
+      classification_attempts: binds[24],
+      sector_key: binds[25],
+      sector_confidence: binds[26],
+      signal_kind: binds[27],
+      dealmaker_id: binds[28],
+      dealmaker_name: binds[29],
+      has_deck: binds[30],
+      has_meeting: binds[31],
+      ingestion_mode: binds[32],
+      metadata_json: binds[33],
     });
     if (!existing) this.prospectSignals.push(row);
   }
@@ -1220,6 +1432,11 @@ describe('prospect intelligence deterministic signals', () => {
     expect(candidate.canonicalName).toBe('Auguria');
   });
 
+  it('extracts ampersand Medina meeting titles as target company mentions', () => {
+    const [candidate] = extractMentionCandidatesFromText('NeuralSeek & Medina Ventures\nScheduled Zoom details.');
+    expect(candidate.canonicalName).toBe('NeuralSeek');
+  });
+
   it('extracts likely target companies from high-signal subjects and about blocks', () => {
     const names = extractMentionCandidatesFromText([
       'Overkast update and demo video',
@@ -1533,6 +1750,170 @@ describe('prospect intelligence deterministic signals', () => {
       mention_type: 'inbound_prospect',
       ingestion_mode: 'live',
       prospect_id: db.prospects[0].id,
+      company_id: db.prospects[0].company_id,
+    });
+    expect(db.companies).toHaveLength(1);
+    expect(db.companies[0]).toMatchObject({
+      name: 'Artlabs',
+      domain: 'artlabs.ai',
+      website: 'https://artlabs.ai',
+      company_type: 'startup',
+      investment_status: 'prospect',
+    });
+    expect(db.prospects[0].company_id).toBe(db.companies[0].id);
+    expect(db.tags[0]).toMatchObject({ name: 'Investment Prospect' });
+    expect(db.companyTags[0]).toMatchObject({ company_id: db.companies[0].id, tag_id: db.tags[0].id });
+    const metadata = JSON.parse(db.prospectSignals[0].metadata_json);
+    expect(metadata.company_resolution).toMatchObject({
+      action: 'created',
+      company_id: db.companies[0].id,
+      match_method: 'created_new_company',
+    });
+  });
+
+  it('deduplicates same-source company and website aliases before classification', async () => {
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'document',
+      entityType: 'document',
+      entityId: 'doc-abra',
+      subject: 'Pipeline Status Update',
+      bodyText: 'Company Name Abra Company URL helloabra.com Short Description Abra builds procurement workflow automation.',
+      text: 'Company Name Abra Company URL helloabra.com Short Description Abra builds procurement workflow automation.',
+      sentAt: '2026-05-31T12:04:16.301Z',
+    };
+
+    const mentions = await extractOrganizationMentionsFromSource(item, 'org-1', env, { allowLlm: false });
+
+    expect(mentions.map(mention => mention.canonicalName)).toContain('Abra');
+    expect(mentions.some(mention => mention.normalizedName === 'helloabra')).toBe(false);
+    const abra = mentions.find(mention => mention.normalizedName === 'abra');
+    expect(abra).toBeTruthy();
+    expect(__prospectIntelligenceTestHooks.firstProspectDomainForMention(abra!, env)).toBe('helloabra.com');
+  });
+
+  it('creates a new prospect-origin company instead of linking a domain-conflicting same-name CRM company', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock
+      .mockResolvedValueOnce({
+        text: '{"organizations":[]}',
+        usage: { input_tokens: 80, output_tokens: 8 },
+        model: 'claude-haiku-4-5-20251001',
+      })
+      .mockResolvedValueOnce({
+        text: '{"prospect_action":"create_prospect","prospect_company_name":"Abra","direction":"inbound","sector_key":"ai_data","sector_confidence":0.88,"confidence":0.85,"reasoning":"Abra is tracked as a Radar-stage AI procurement workflow prospect."}',
+        usage: { input_tokens: 100, output_tokens: 24 },
+        model: 'claude-haiku-4-5-20251001',
+      });
+    const db = new FakeD1();
+    db.companies.push({ id: 'company-abra-old', org_id: 'org-1', name: 'Abra', domain: 'abra.com' });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'document',
+      source: 'email_attachment',
+      entityType: 'document',
+      entityId: 'doc-abra-split',
+      subject: 'automatic_report - Pipeline Status Update.pdf',
+      bodyText: 'Company Name Abra Company URL helloabra.com Short Description Abra builds an AI-driven system of action for vendor relationships and is raising a seed round.',
+      text: 'Company Name Abra Company URL helloabra.com Short Description Abra builds an AI-driven system of action for vendor relationships and is raising a seed round.',
+      bodyPreview: 'Abra LOW Radar AI Mountain View helloabra.com',
+      sentAt: '2026-05-31T12:04:16.301Z',
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env, { ingestionMode: 'backfill' });
+
+    expect(stats.errors).toEqual([]);
+    expect(stats.signals_recorded).toBe(1);
+    expect(stats.prospects_upserted).toBe(1);
+    expect(db.prospects).toHaveLength(1);
+    expect(db.prospects[0]).toMatchObject({
+      canonical_name: 'Abra',
+      normalized_name: 'abra',
+      domain: 'helloabra.com',
+      website: 'https://helloabra.com',
+      company_id: db.companies.find(company => company.id !== 'company-abra-old')?.id,
+      possible_company_id: null,
+    });
+    const createdCompany = db.companies.find(company => company.id !== 'company-abra-old');
+    expect(createdCompany).toMatchObject({
+      name: 'Abra',
+      domain: 'helloabra.com',
+      website: 'https://helloabra.com',
+      company_type: 'startup',
+      investment_status: 'prospect',
+    });
+    expect(db.prospectSignals).toHaveLength(1);
+    expect(db.prospectSignals[0]).toMatchObject({
+      raw_mention_text: 'Abra',
+      normalized_mention: 'abra',
+      prospect_id: db.prospects[0].id,
+      company_id: createdCompany?.id,
+    });
+    expect(db.companyTags[0]).toMatchObject({ company_id: createdCompany?.id, tag_id: db.tags[0].id });
+    const metadata = JSON.parse(db.prospectSignals[0].metadata_json);
+    expect(metadata.company_resolution).toMatchObject({
+      action: 'created',
+      company_id: createdCompany?.id,
+      match_method: 'created_new_company_weak_candidates_ignored',
+      match_score: 0.86,
+    });
+    expect(metadata.company_resolution.candidates[0]).toMatchObject({
+      company_id: 'company-abra-old',
+      method: 'exact_normalized_name_domain_conflict',
+    });
+  });
+
+  it('routes later website-label mentions to the existing canonical prospect', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValueOnce({
+      text: '{"prospect_action":"create_prospect","prospect_company_name":"Helloabra","direction":"inbound","sector_key":"ai_data","sector_confidence":0.86,"confidence":0.82,"reasoning":"helloabra.com appears in a dealflow source as an AI procurement workflow prospect."}',
+      usage: { input_tokens: 100, output_tokens: 24 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    db.prospects.push({
+      id: 'prospect-abra',
+      org_id: 'org-1',
+      canonical_name: 'Abra',
+      normalized_name: 'abra',
+      domain: 'helloabra.com',
+      website: 'https://helloabra.com',
+      status: 'provisional',
+      sector_key: 'ai_data',
+      sector_confidence: 0.8,
+      signal_count: 1,
+      evidence_count: 1,
+      confidence: 0.54,
+      provisional: 1,
+      direction_uncertain: 1,
+      deleted_at: null,
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'document',
+      source: 'email_attachment',
+      entityType: 'document',
+      entityId: 'doc-helloabra',
+      subject: 'Pipeline Status Update',
+      bodyText: 'Website helloabra.com Description AI procurement workflow automation raise.',
+      text: 'Website helloabra.com Description AI procurement workflow automation raise.',
+      bodyPreview: 'helloabra.com',
+      sentAt: '2026-06-01T00:00:00.000Z',
+    };
+
+    const stats = await detectAndRecordProspectSignals([item], 'org-1', env, { ingestionMode: 'backfill' });
+
+    expect(stats.prospects_upserted).toBe(1);
+    expect(db.prospects).toHaveLength(1);
+    expect(db.prospects[0]).toMatchObject({
+      id: 'prospect-abra',
+      canonical_name: 'Abra',
+      normalized_name: 'abra',
+    });
+    expect(db.prospectSignals[0]).toMatchObject({
+      normalized_mention: 'helloabra',
+      prospect_id: 'prospect-abra',
     });
   });
 
@@ -1876,7 +2257,440 @@ describe('prospect intelligence deterministic signals', () => {
     });
   });
 
-  it('downgrades LLM direction conflicts to provisional direction_uncertain metadata', async () => {
+  it('does not let the cross-D1 role check second-guess high-confidence creates', async () => {
+    const db = new FakeD1();
+    db.companies.push({
+      id: 'company-helping-hands',
+      org_id: 'org-1',
+      name: 'Helping Hands',
+      domain: 'helpinghands.org',
+      company_type: 'other',
+      description: 'Helping Hands is a nonprofit foundation.',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-high-confidence-role-exempt',
+      source: 'email',
+      subject: 'Pitch deck',
+      bodyText: 'Company Name Helping Hands Company URL https://helpinghands.org Short Description AI platform with deck attached.',
+      bodyPreview: 'Company Name Helping Hands',
+      fromEmail: 'alice@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+    const [mention] = extractMentionCandidatesFromText(item.bodyText);
+
+    const result = await __prospectIntelligenceTestHooks.classifyCompanyRoleFromD1(
+      'org-1',
+      item,
+      mention,
+      { companyId: 'company-helping-hands', dealId: null, companyDomain: 'helpinghands.org', relationshipStates: [], isInternal: false, matchStrength: 'domain' },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.91, provisional: false, directionUncertain: false }
+    );
+
+    expect(result).toMatchObject({
+      checked: false,
+      reason: 'high_confidence_create_exempt',
+    });
+  });
+
+  it('uses company briefs and company_type to demote lower-confidence VC/fund creates', async () => {
+    const db = new FakeD1();
+    db.companies.push({
+      id: 'company-northstar',
+      org_id: 'org-1',
+      name: 'Northstar Ventures',
+      domain: 'northstarventures.com',
+      company_type: 'vc_firm',
+      description: 'Northstar Ventures is a venture capital investment firm.',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-vc-demote',
+      source: 'email',
+      subject: 'Pitch deck',
+      bodyText: 'Company Name Northstar Ventures Company URL https://northstarventures.com Short Description AI platform in dealflow note.',
+      bodyPreview: 'Company Name Northstar Ventures',
+      fromEmail: 'alice@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+    const [mention] = extractMentionCandidatesFromText(item.bodyText);
+
+    const result = await __prospectIntelligenceTestHooks.classifyCompanyRoleFromD1(
+      'org-1',
+      item,
+      mention,
+      { companyId: 'company-northstar', dealId: null, companyDomain: 'northstarventures.com', relationshipStates: [], isInternal: false, matchStrength: 'domain' },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.87, provisional: false, directionUncertain: false }
+    );
+
+    expect(result).toMatchObject({
+      checked: true,
+      role: 'vc_firm',
+      action_override: 'record_context',
+      matched_company_id: 'company-northstar',
+    });
+  });
+
+  it('uses brokerage/risk-management briefs to demote source-firm creates', async () => {
+    const db = new FakeD1();
+    db.companies.push({
+      id: 'company-lockton',
+      org_id: 'org-1',
+      name: 'Lockton Companies',
+      domain: 'lockton.com',
+      company_type: 'other',
+      description: 'Lockton is an insurance brokerage firm providing risk management and employee benefits services.',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-lockton-source',
+      source: 'email',
+      subject: 'Just FYI',
+      bodyText: 'I connected O2i with Lockton and several family offices. Fernando Silva, Lockton Companies.',
+      bodyPreview: 'I connected O2i with Lockton.',
+      fromEmail: 'fsilva@lockton.com',
+      toEmails: ['tony@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+    const mention = {
+      raw: 'O2i',
+      canonicalName: 'O2i',
+      normalizedName: 'o2i',
+      mentionOrdinal: 1,
+      spanStart: null,
+      spanEnd: null,
+      lineText: item.bodyText,
+      contextText: item.bodyText,
+      isListEntry: false,
+      products: [],
+    };
+
+    const result = await __prospectIntelligenceTestHooks.classifyCompanyRoleFromD1(
+      'org-1',
+      item,
+      mention,
+      { companyId: 'company-lockton', dealId: null, companyDomain: 'lockton.com', relationshipStates: [], isInternal: false, matchStrength: 'domain' },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.78, provisional: false, directionUncertain: false }
+    );
+
+    expect(result).toMatchObject({
+      role: 'vendor_or_service_provider',
+      action_override: 'record_context',
+      matched_company_id: 'company-lockton',
+    });
+  });
+
+  it('uses brief text to demote lower-confidence investment-bank creates', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValue({
+      text: '{"prospect_action":"create_prospect","prospect_company_name":"Bankco","direction":"inbound","sector_key":"fintech","sector_confidence":0.7,"confidence":0.86,"reasoning":"The source describes a software platform opportunity."}',
+      usage: { input_tokens: 90, output_tokens: 30 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    db.companies.push({
+      id: 'company-bankco',
+      org_id: 'org-1',
+      name: 'Bankco',
+      domain: 'bankco.com',
+      company_type: 'other',
+      description: 'Bankco is a commercial bank and financial institution.',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-bank-demote',
+      source: 'email',
+      subject: 'AI platform pitch deck',
+      bodyText: 'Company Name Bankco Company URL https://bankco.com Short Description enterprise software platform raising seed.',
+      bodyPreview: 'Company Name Bankco',
+      fromEmail: 'founder@bankco.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    const metadata = JSON.parse(db.prospectSignals[0].metadata_json);
+    expect(db.prospects).toHaveLength(0);
+    expect(metadata.cross_d1_role_check).toMatchObject({
+      role: 'bank',
+      action_override: 'record_context',
+    });
+  });
+
+  it('converts lower-confidence creates with open-deal D1 evidence into known-deal attaches', async () => {
+    const db = new FakeD1();
+    db.companies.push({ id: 'company-toluai', org_id: 'org-1', name: 'TOLUAI', domain: 'toluai.com', company_type: 'startup' });
+    db.deals.push({ id: 'deal-toluai', org_id: 'org-1', company_id: 'company-toluai', stage: 'due_diligence' });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-known-deal-role',
+      source: 'email',
+      subject: 'TOLUAI financial model',
+      bodyText: 'Company Name TOLUAI Company URL https://toluai.com Short Description updated P&L and data room access for diligence.',
+      bodyPreview: 'Company Name TOLUAI',
+      fromEmail: 'founder@toluai.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+    const [mention] = extractMentionCandidatesFromText(item.bodyText);
+
+    const result = await __prospectIntelligenceTestHooks.classifyCompanyRoleFromD1(
+      'org-1',
+      item,
+      mention,
+      { companyId: 'company-toluai', dealId: 'deal-toluai', companyDomain: 'toluai.com', relationshipStates: [], isInternal: false, matchStrength: 'name' },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.86, provisional: false, directionUncertain: false }
+    );
+
+    expect(result).toMatchObject({
+      role: 'known_deal',
+      action_override: 'attach_existing_deal',
+      matched_deal_id: 'deal-toluai',
+    });
+  });
+
+  it('does not demote lower-confidence creates when D1 brief evidence says startup', async () => {
+    const db = new FakeD1();
+    db.companies.push({
+      id: 'company-nair',
+      org_id: 'org-1',
+      name: 'Nair Engineering',
+      domain: 'nairengineering.com',
+      company_type: 'startup',
+      description: 'Nair Engineering is an early-stage medical AI startup building on-device AI models.',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-startup-allowed',
+      source: 'email',
+      subject: 'Pitch deck',
+      bodyText: 'Company Name Nair Engineering Company URL https://nairengineering.com Short Description medical AI startup with pitch deck.',
+      bodyPreview: 'Company Name Nair Engineering',
+      fromEmail: 'founder@nairengineering.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+      attachments: [{ id: 'deck', name: 'Nair Engineering Deck.pdf', size: 100, contentType: 'application/pdf' }],
+    };
+    const [mention] = extractMentionCandidatesFromText(item.bodyText);
+
+    const result = await __prospectIntelligenceTestHooks.classifyCompanyRoleFromD1(
+      'org-1',
+      item,
+      mention,
+      { companyId: 'company-nair', dealId: null, companyDomain: 'nairengineering.com', relationshipStates: [], isInternal: false, matchStrength: 'domain' },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.86, provisional: false, directionUncertain: false }
+    );
+
+    expect(result).toMatchObject({
+      role: 'startup_or_private_company',
+      action_override: null,
+    });
+  });
+
+  it('keeps sub-0.8 creates when identity and investment intent are strongly verified', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValue({
+      text: '{"prospect_action":"create_prospect","prospect_company_name":"Sentry AI","direction":"inbound","sector_key":"ai_data","sector_confidence":0.82,"confidence":0.78,"reasoning":"The founder sent a direct seed pitch with a deck."}',
+      usage: { input_tokens: 90, output_tokens: 30 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-low-confidence-verified',
+      source: 'email',
+      subject: 'Sentry AI seed pitch deck',
+      bodyText: 'Company Name Sentry AI Company URL https://sentryai.com Problem security teams need AI agents Approach autonomous AI SOC analyst raising seed with pitch deck attached.',
+      bodyPreview: 'Sentry AI seed pitch deck',
+      fromEmail: 'founder@sentryai.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+      attachments: [{ id: 'deck', name: 'Sentry AI Deck.pdf', size: 100, contentType: 'application/pdf' }],
+    };
+
+    await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(db.prospects).toHaveLength(1);
+    expect(db.prospects[0]).toMatchObject({ canonical_name: 'Sentry AI', status: 'active', provisional: 0 });
+    const metadata = JSON.parse(db.prospectSignals[0].metadata_json);
+    expect(metadata.low_confidence_verification).toMatchObject({
+      checked: true,
+      verdict: 'verified_create',
+      action_override: null,
+    });
+  });
+
+  it('keeps sub-0.8 one-signal opportunities as context instead of creating final prospects', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValue({
+      text: '{"prospect_action":"create_prospect","prospect_company_name":"MaybeCo","direction":"inbound","sector_key":"enterprise_software","sector_confidence":0.72,"confidence":0.78,"reasoning":"This looks like a possible software company opportunity but the source is thin."}',
+      usage: { input_tokens: 90, output_tokens: 30 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-low-confidence-provisional',
+      source: 'email',
+      subject: 'MaybeCo possible pitch',
+      bodyText: 'Company Name MaybeCo Company URL https://maybeco.ai Short Description enterprise workflow software. Potential pitch opportunity.',
+      bodyPreview: 'MaybeCo enterprise workflow software pitch.',
+      fromEmail: 'alice@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(db.prospects).toHaveLength(0);
+    expect(db.prospectSignals[0]).toMatchObject({
+      mention_type: 'noise',
+      prospect_id: null,
+      resolution_status: 'resolved',
+    });
+    const metadata = JSON.parse(db.prospectSignals[0].metadata_json);
+    expect(metadata).toMatchObject({
+      prospect_action: 'record_context',
+      should_create_prospect: false,
+    });
+    expect(metadata.low_confidence_verification).toMatchObject({
+      checked: true,
+      verdict: 'provisional_create',
+      action_override: 'mark_provisional',
+    });
+    expect(metadata.prospect_finalization_gate).toMatchObject({
+      final: false,
+      blocked: true,
+    });
+    expect(metadata.prospect_finalization_gate.reasons).toContain('provisional_after_verification');
+  });
+
+  it('keeps D1-backed startup rows provisional when low-confidence source evidence is thin', async () => {
+    const env = { D1: new FakeD1(), INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'calendar_event',
+      entityType: 'event',
+      entityId: 'event-hbeyond',
+      source: 'outlook',
+      subject: 'Accepted: Meet: Humberto Sanchez (HBeyond) & Medina Ventures',
+      bodyText: '',
+      bodyPreview: '',
+      fromEmail: 'raul@medinavc.com',
+      toEmails: ['tony@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+      direction: 'internal',
+    };
+    const mention = {
+      raw: 'HBeyond',
+      canonicalName: 'HBeyond',
+      normalizedName: 'hbeyond',
+      mentionOrdinal: 1,
+      spanStart: null,
+      spanEnd: null,
+      lineText: item.subject,
+      contextText: item.subject,
+      isListEntry: false,
+      products: [],
+    };
+    const prefilter = __prospectIntelligenceTestHooks.buildClassifierPrefilter(
+      item,
+      mention,
+      { companyId: 'company-hbeyond', dealId: null, companyDomain: 'hbeyond.com', relationshipStates: [], isInternal: false, matchStrength: 'domain' },
+      env
+    );
+    const result = __prospectIntelligenceTestHooks.verifyLowConfidenceProspect(
+      item,
+      mention,
+      { companyId: 'company-hbeyond', dealId: null, companyDomain: 'hbeyond.com', relationshipStates: [], isInternal: false, matchStrength: 'domain' },
+      prefilter,
+      {
+        checked: true,
+        eligible: true,
+        role: 'startup_or_private_company',
+        confidence: 'medium',
+        evidence: ['company brief describes startup/private software company'],
+        action_override: null,
+        matched_company_id: 'company-hbeyond',
+        matched_deal_id: null,
+        reason: null,
+      },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.54, provisional: true, directionUncertain: true }
+    );
+
+    expect(result).toMatchObject({
+      checked: true,
+      verdict: 'provisional_create',
+      action_override: 'mark_provisional',
+    });
+  });
+
+  it('demotes sub-0.8 source-domain/name mismatches to context', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValue({
+      text: '{"prospect_action":"create_prospect","prospect_company_name":"O2i","direction":"inbound","sector_key":"enterprise_software","sector_confidence":0.7,"confidence":0.78,"reasoning":"The source appears to mention a potential opportunity."}',
+      usage: { input_tokens: 90, output_tokens: 30 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-low-confidence-mismatch',
+      source: 'email',
+      subject: 'O2i update',
+      bodyText: 'Company Name O2i Company URL https://lockton.com Short Description enterprise software.',
+      bodyPreview: 'O2i update',
+      fromEmail: 'advisor@lockton.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(db.prospects).toHaveLength(0);
+    const signal = db.prospectSignals[0];
+    expect(signal).toMatchObject({ mention_type: 'noise' });
+    const metadata = JSON.parse(signal.metadata_json);
+    expect(metadata).toMatchObject({
+      prospect_action: 'record_context',
+      should_create_prospect: false,
+    });
+    expect(metadata.low_confidence_verification).toMatchObject({
+      checked: true,
+      verdict: 'record_context',
+      action_override: 'record_context',
+      reason: 'low_confidence_identity_domain_mismatch',
+    });
+    expect(metadata.low_confidence_verification.extraction_flags).toContain('domain_name_mismatch');
+  });
+
+  it('records LLM direction conflicts as pending context instead of creating prospects', async () => {
     callClaudeWithUsageMock.mockReset();
     callClaudeWithUsageMock
       .mockResolvedValueOnce({
@@ -1906,13 +2720,21 @@ describe('prospect intelligence deterministic signals', () => {
 
     await detectAndRecordProspectSignals([item], 'org-1', env);
 
-    expect(db.prospects[0]).toMatchObject({ status: 'provisional', provisional: 1, direction_uncertain: 1 });
+    expect(db.prospects).toHaveLength(0);
     expect(db.prospectSignals[0]).toMatchObject({
+      mention_type: 'noise',
+      prospect_id: null,
       confidence: 0.54,
       confidence_tier: 'low',
       direction_uncertain: 1,
       resolution_status: 'pending',
     });
+    const metadata = JSON.parse(db.prospectSignals[0].metadata_json);
+    expect(metadata.prospect_finalization_gate).toMatchObject({
+      final: false,
+      blocked: true,
+    });
+    expect(metadata.prospect_finalization_gate.reasons).toContain('direction_uncertain');
     expect(db.classifierSamples[0].sample_reason).toBe('direction_uncertain');
   });
 
@@ -2008,7 +2830,7 @@ describe('prospect intelligence deterministic signals', () => {
     });
   });
 
-  it('holds weak name-only deal matches as separate prospects with soft deal links', async () => {
+  it('holds weak name-only deal matches as context without creating provisional prospects', async () => {
     callClaudeWithUsageMock.mockReset();
     callClaudeWithUsageMock.mockResolvedValueOnce({
       text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"aerospace_defense","sector_confidence":0.8,"confidence":0.9,"reasoning":"Investment intro."}',
@@ -2034,22 +2856,20 @@ describe('prospect intelligence deterministic signals', () => {
 
     const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
 
-    expect(stats.prospects_upserted).toBe(1);
-    expect(db.prospects[0]).toMatchObject({
-      canonical_name: 'Portal Aircraft',
-      status: 'provisional',
-      possible_deal_id: 'deal-portal',
-    });
+    expect(stats.prospects_upserted).toBe(0);
+    expect(db.prospects).toHaveLength(0);
     expect(db.prospectSignals[0]).toMatchObject({
-      mention_type: 'inbound_prospect',
+      mention_type: 'noise',
       deal_id: null,
-      prospect_id: db.prospects[0].id,
+      prospect_id: null,
     });
-    expect(db.softLinks.some(link =>
-      link.link_type === 'possible_deal_attach' &&
-      link.target_type === 'deal' &&
-      link.target_id === 'deal-portal'
-    )).toBe(true);
+    expect(db.softLinks).toHaveLength(0);
+    const metadata = JSON.parse(db.prospectSignals[0].metadata_json);
+    expect(metadata).toMatchObject({
+      prospect_action: 'record_context',
+      should_create_prospect: false,
+    });
+    expect(metadata.prospect_finalization_gate).toMatchObject({ blocked: true });
   });
 
   it('records reversible audited prospect merges', async () => {
@@ -2087,6 +2907,52 @@ describe('prospect intelligence deterministic signals', () => {
     expect(db.prospectSignals[0].prospect_id).toBe('prospect-loser');
     expect(db.prospects[1]).toMatchObject({ status: 'provisional', possible_duplicate_of: null });
     expect(db.mergeAudit[1]).toMatchObject({ action: 'unmerge', loser_prospect_id: 'prospect-loser' });
+  });
+
+  it('aggressively flags domain-brand prospect splits during reconciliation', async () => {
+    const db = new FakeD1();
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    db.prospects.push(
+      {
+        id: 'prospect-abra',
+        org_id: 'org-1',
+        canonical_name: 'Abra',
+        normalized_name: 'abra',
+        status: 'provisional',
+        domain: null,
+        website: null,
+        signal_count: 1,
+        evidence_count: 1,
+        created_at: '2026-06-01T23:17:11.961Z',
+        deleted_at: null,
+      },
+      {
+        id: 'prospect-helloabra',
+        org_id: 'org-1',
+        canonical_name: 'Helloabra',
+        normalized_name: 'helloabra',
+        status: 'provisional',
+        domain: null,
+        website: null,
+        signal_count: 1,
+        evidence_count: 1,
+        created_at: '2026-06-01T23:17:23.490Z',
+        deleted_at: null,
+      },
+    );
+
+    const result = await runProspectReconciliation('org-1', env);
+
+    expect(result.duplicate_links).toBe(1);
+    expect(db.prospects.find(row => row.id === 'prospect-helloabra')).toMatchObject({
+      possible_duplicate_of: 'prospect-abra',
+    });
+    expect(db.softLinks[0]).toMatchObject({
+      prospect_id: 'prospect-helloabra',
+      target_id: 'prospect-abra',
+      link_type: 'possible_duplicate',
+      score: 0.92,
+    });
   });
 
   it('applies corroborated own-domain enrichment through entity_field_state without overwriting filled fields', async () => {
@@ -2206,6 +3072,21 @@ describe('prospect intelligence deterministic signals', () => {
         enrichment_status: 'not_started',
         deleted_at: null,
       },
+      {
+        id: 'prospect-provisional',
+        org_id: 'org-1',
+        canonical_name: 'ProvisionalSignal',
+        normalized_name: 'provisionalsignal',
+        domain: 'provisional.example',
+        website: null,
+        description: null,
+        signal_strength: 100,
+        status: 'provisional',
+        provisional: 1,
+        direction_uncertain: 0,
+        enrichment_status: 'not_started',
+        deleted_at: null,
+      },
     );
     const fetched: string[] = [];
     const fetcher = vi.fn(async (url: string) => {
@@ -2222,6 +3103,7 @@ describe('prospect intelligence deterministic signals', () => {
     expect(result.scanned).toBe(2);
     expect(fetched[0]).toBe('https://high.example');
     expect(fetched[1]).toBe('https://low.example');
+    expect(fetched).not.toContain('https://provisional.example');
   });
 
   it('runs a tiny local windowed backfill with coverage and idempotent signal keys', async () => {
@@ -2299,6 +3181,95 @@ describe('prospect intelligence deterministic signals', () => {
     expect(db.prospectSignals).toHaveLength(2);
     expect(new Set(db.prospectSignals.map(row => `${row.source_type}:${row.source_id}:${row.mention_ordinal}`)).size).toBe(2);
     expect(db.prospectSignals.every(row => row.ingestion_mode === 'backfill')).toBe(true);
+  });
+
+  it('prioritizes high-signal backfill sources and collapses mailbox duplicate rows before classification', () => {
+    const rows = [
+      {
+        id: 'ops-newest',
+        subject: 'SVB deposit account statement is ready',
+        body_preview: 'Your deposit account statement is ready.',
+        sent_at: '2026-06-02T12:00:00.000Z',
+        from_email: 'onlinebanking@svb.com',
+      },
+      {
+        id: 'whitehawk-a',
+        subject: 'Re: Zoom Meeting with Terry Roberts',
+        body_preview: 'In preparation for our Thursday meeting, sending our Company 2 Pager. Terry Roberts Founder, President & CEO, whitehawk.com',
+        sent_at: '2026-06-01T17:11:12.000Z',
+        from_email: 'twr@whitehawk.com',
+        has_attachments: 1,
+        attachment_count: 2,
+      },
+      {
+        id: 'whitehawk-b',
+        subject: 'Re: Zoom Meeting with Terry Roberts',
+        body_preview: 'In preparation for our Thursday meeting, sending our Company 2 Pager. Terry Roberts Founder, President & CEO, whitehawk.com',
+        sent_at: '2026-06-01T17:11:12.000Z',
+        from_email: 'twr@whitehawk.com',
+        has_attachments: 1,
+        attachment_count: 2,
+      },
+      {
+        id: 'tolu',
+        subject: 'Re: [eMerge Americas] 2026 Startup Showcase Winner - Next Steps',
+        body_preview: 'We are updating the P&L and financial model and added Sebastian to the data room.',
+        sent_at: '2026-06-01T15:50:48.000Z',
+        from_email: 'tosin@toluai.com',
+      },
+      {
+        id: 'acquisition',
+        subject: '$57M rev / $36M EBITDA SaaS Acquisition Opportunity',
+        body_preview: 'Quick check in on this acquisition opportunity.',
+        sent_at: '2026-05-26T12:52:25.000Z',
+        from_email: 'j.battison@settlucas.com',
+      },
+    ];
+
+    const selected = __prospectIntelligenceTestHooks.rankAndDedupeBackfillSourceRows(rows, 'conversation', 4);
+
+    expect(selected.map(row => row.id)).toEqual(['whitehawk-a', 'tolu', 'acquisition', 'ops-newest']);
+    expect(selected).toHaveLength(4);
+    expect(__prospectIntelligenceTestHooks.prospectBackfillSourceScore(rows[1], 'conversation'))
+      .toBeGreaterThan(__prospectIntelligenceTestHooks.prospectBackfillSourceScore(rows[0], 'conversation'));
+  });
+
+  it('includes future meetings created inside the backfill window', async () => {
+    callClaudeWithUsageMock.mockReset();
+    callClaudeWithUsageMock.mockResolvedValue({
+      text: '{"mention_type":"inbound_prospect","direction":"inbound","sector_key":"cybersecurity","sector_confidence":0.9,"confidence":0.95,"reasoning":"Warm intro meeting."}',
+      usage: { input_tokens: 90, output_tokens: 20 },
+      model: 'claude-haiku-4-5-20251001',
+    });
+    const db = new FakeD1();
+    db.sourceEvents.push({
+      id: 'future-event-1',
+      org_id: 'org-1',
+      title: 'WhiteHawk / Medina Ventures intro',
+      description: 'Future intro meeting created during the source window.',
+      summary: '',
+      start_time: '2026-06-04T19:30:00.000Z',
+      created_at: '2026-06-01T17:11:12.000Z',
+      source: 'outlook',
+      transcript_r2_key: '',
+      deleted_at: null,
+    });
+
+    const result = await runProspectBackfillWindow('org-1', { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any, {
+      windowStart: '2026-06-01T00:00:00.000Z',
+      windowEnd: '2026-06-02T00:00:00.000Z',
+      sourceFamilies: ['event'],
+      batchLimit: 10,
+    });
+
+    expect(result.items_found).toBe(1);
+    expect(result.items_processed).toBe(1);
+    expect(db.prospectSignals[0]).toMatchObject({
+      source_type: 'event',
+      source_id: 'future-event-1',
+      raw_mention_text: 'WhiteHawk',
+      ingestion_mode: 'backfill',
+    });
   });
 
   it('runs the Phase 6 north-star fixtures end to end without duplicate prospects', async () => {

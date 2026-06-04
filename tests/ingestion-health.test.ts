@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   incidentsToUserWarnings,
   reportIngestionFailure,
+  reportIngestionSuccess,
   scanAndRepairIngestion,
   type IngestionIncident,
 } from '../src/lib/ingestion-health';
@@ -103,6 +104,36 @@ describe('ingestion health', () => {
     });
   });
 
+  it('keeps work-queue item incidents out of global user warnings', () => {
+    const warnings = incidentsToUserWarnings([
+      {
+        id: 'inc-wq',
+        org_id: 'org-1',
+        source: 'work_queue',
+        scope_type: 'conversation',
+        scope_id: 'conv-1',
+        status: 'blocked',
+        severity: 'critical',
+        code: 'work_queue_prospect_detect_failed',
+        title: 'Prospect detector failed',
+        message: 'work queue work item failed: Claude API error 403',
+        first_seen_at: '2026-06-02T00:00:00.000Z',
+        last_seen_at: '2026-06-02T00:00:00.000Z',
+        resolved_at: null,
+        last_success_at: null,
+        human_action_required: 1,
+        recovery_status: 'blocked_on_auth',
+        recovery_window_start: null,
+        recovery_window_end: null,
+        repair_attempt_count: 0,
+        last_repair_at: null,
+        metadata: '{}',
+      } satisfies IngestionIncident,
+    ]);
+
+    expect(warnings).toEqual([]);
+  });
+
   it('records auth-blocked failures as human-action critical incidents', async () => {
     const d1 = makeD1Mock();
     await reportIngestionFailure(makeEnv(d1), {
@@ -121,6 +152,24 @@ describe('ingestion health', () => {
     expect(incidentInsert.binds).toContain('critical');
     expect(incidentInsert.binds).toContain(1);
     expect(incidentInsert.binds).toContain('blocked_on_auth');
+  });
+
+  it('resolves blocked incidents when the same source and scope succeeds', async () => {
+    const d1 = makeD1Mock();
+    await reportIngestionSuccess(makeEnv(d1), {
+      orgId: 'org-1',
+      source: 'work_queue',
+      scopeType: 'conversation',
+      scopeId: 'conv-1',
+      successAt: '2026-06-03T00:00:00.000Z',
+    });
+
+    const incidentUpdate = d1.runs.find((r: any) => r.sql.includes('UPDATE ingestion_incidents'));
+    expect(incidentUpdate).toBeTruthy();
+    expect(incidentUpdate?.sql).toContain("status IN ('open','recovering','blocked')");
+    expect(incidentUpdate?.binds).toContain('work_queue');
+    expect(incidentUpdate?.binds).toContain('conversation');
+    expect(incidentUpdate?.binds).toContain('conv-1');
   });
 
   it('treats non-auth dead letters as repairable and requeues them automatically', async () => {

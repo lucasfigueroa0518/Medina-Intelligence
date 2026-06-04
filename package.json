@@ -25,10 +25,13 @@
     "prospect:pipeline-canary": "tsx scripts/prospect-pipeline-canary.ts",
     "prospect:live-canary": "tsx scripts/prospect-live-canary.ts",
     "prospect:backfill-window": "tsx scripts/prospect-backfill-window.ts",
+    "prospect:backfill-enqueue": "tsx scripts/prospect-backfill-enqueue.ts",
     "prospect:pipeline-health": "tsx scripts/prospect-pipeline-health.ts",
     "prospect:migration-readiness": "tsx scripts/prospect-migration-readiness-check.ts",
     "prospect:large-experiment": "tsx scripts/prospect-large-classifier-experiment.ts",
-    "prospect:materialize-known-deals": "tsx scripts/prospect-materialize-known-deals.ts"
+    "prospect:materialize-known-deals": "tsx scripts/prospect-materialize-known-deals.ts",
+    "prospect:bridge-materialize": "tsx scripts/prospect-bridge-materialize.ts",
+    "crm:quality-review": "tsx scripts/crm-quality-review-export.ts"
   },
   "dependencies": {
     "@e965/xlsx": "^0.20.3",
