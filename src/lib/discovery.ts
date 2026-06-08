@@ -270,34 +270,91 @@ function domainStem(domain: string): string {
   return reg.split('.')[0].replace(/[-_]/g, '').toLowerCase();
 }
 
+function normalizeCompanyIdentityName(value: string | null | undefined): string {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\b(incorporated|inc|llc|ltd|limited|corp|corporation|company|co|group|holdings)\b\.?/g, ' ')
+    .replace(/&/g, 'and')
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\b(ai|lab|labs|system|systems|technology|technologies|tech)\b$/g, ' ')
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+function companyIdentityAliases(name: string | null | undefined, domain?: string | null, website?: string | null): Set<string> {
+  const aliases = new Set<string>();
+  const normalized = normalizeCompanyIdentityName(name);
+  if (normalized.length >= 3) aliases.add(normalized);
+  const domainValue = domain || (website ? normalizeDomain(website) : null);
+  if (domainValue) {
+    const stem = domainStem(domainValue);
+    if (stem.length >= 3) aliases.add(normalizeCompanyIdentityName(stem));
+    for (const prefix of ['get', 'try', 'use', 'join', 'hello', 'go', 'ask']) {
+      if (stem.startsWith(prefix) && stem.length - prefix.length >= 4) {
+        aliases.add(normalizeCompanyIdentityName(stem.slice(prefix.length)));
+      }
+    }
+  }
+  return aliases;
+}
+
+function companyAliasSetsIntersect(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) if (right.has(value)) return true;
+  return false;
+}
+
 export async function findDuplicateCompany(
   name: string,
   domain: string | null,
   orgId: string,
   env: Env
 ): Promise<string | null> {
+  const normalizedDomain = domain ? registrableDomain(domain.toLowerCase().replace(/^www\./, '')) : null;
+  const incomingAliases = companyIdentityAliases(name, normalizedDomain);
+
   // 1. Exact domain match
-  if (domain) {
+  if (normalizedDomain) {
     const byDomain = await env.D1.prepare(
-      'SELECT id FROM companies WHERE org_id = ? AND LOWER(domain) = ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(orgId, domain.toLowerCase()).first<{ id: string }>();
+      `SELECT id FROM companies
+        WHERE org_id = ? AND deleted_at IS NULL
+          AND (LOWER(domain) = ? OR LOWER(website) LIKE ?)
+        LIMIT 1`
+    ).bind(orgId, normalizedDomain, `%${normalizedDomain}%`).first<{ id: string }>();
     if (byDomain) return byDomain.id;
   }
 
-  // 2. Exact name match (case-insensitive)
-  const byName = await env.D1.prepare(
-    'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) = ? AND deleted_at IS NULL LIMIT 1'
-  ).bind(orgId, name.toLowerCase()).first<{ id: string }>();
-  if (byName) return byName.id;
+  const candidates = await env.D1.prepare(
+    `SELECT id, name, domain, website
+       FROM companies
+      WHERE org_id = ? AND deleted_at IS NULL
+      LIMIT 5000`
+  ).bind(orgId).all<{ id: string; name: string; domain: string | null; website: string | null }>();
 
-  // 3. Contains match for common suffixes (e.g. "Helios Marketing" matches "Helios Marketing Inc")
-  const baseName = name.toLowerCase().replace(/\s+(inc|llc|ltd|corp|co|company|group|holdings)\.?$/i, '').trim();
-  if (baseName.length >= 3 && baseName !== name.toLowerCase()) {
-    const byFuzzy = await env.D1.prepare(
-      'SELECT id FROM companies WHERE org_id = ? AND LOWER(name) LIKE ? AND deleted_at IS NULL LIMIT 1'
-    ).bind(orgId, `%${baseName}%`).first<{ id: string }>();
-    if (byFuzzy) return byFuzzy.id;
+  let best: { id: string; score: number } | null = null;
+  let second: { id: string; score: number } | null = null;
+  for (const candidate of candidates.results || []) {
+    const candidateAliases = companyIdentityAliases(candidate.name, candidate.domain, candidate.website);
+    let score = 0;
+    if (companyAliasSetsIntersect(incomingAliases, candidateAliases)) score = normalizedDomain || candidate.domain || candidate.website ? 0.95 : 0.92;
+    const incomingBest = Array.from(incomingAliases).sort((a, b) => b.length - a.length)[0] || '';
+    const candidateBest = Array.from(candidateAliases).sort((a, b) => b.length - a.length)[0] || '';
+    if (incomingBest && candidateBest) {
+      const jw = jaroWinkler(incomingBest, candidateBest);
+      if (jw >= 0.94) score = Math.max(score, 0.9);
+      const minLen = Math.min(incomingBest.length, candidateBest.length);
+      if (minLen >= 6 && (incomingBest.includes(candidateBest) || candidateBest.includes(incomingBest))) score = Math.max(score, 0.88);
+    }
+    if (score < 0.86) continue;
+    if (!best || score > best.score) {
+      second = best;
+      best = { id: candidate.id, score };
+    } else if (!second || score > second.score) {
+      second = { id: candidate.id, score };
+    }
   }
+  if (best && (best.score >= 0.95 || !second || best.score - second.score >= 0.05)) return best.id;
 
   return null;
 }

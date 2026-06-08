@@ -17,7 +17,7 @@
 // and chat_upload save (extracted text already cached on chat_uploads row).
 
 import type { Env } from '../types/env';
-import type { ChunkMetadata } from '../types/interfaces';
+import type { ChunkMetadata, ClassifiedItem } from '../types/interfaces';
 import { extractTextFromFile } from './file-extraction';
 import { classifyDocument } from './document-intelligence';
 import { classifyByFilename } from './document-filename-classifier';
@@ -519,6 +519,22 @@ export async function persistDocument(
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
           WHERE id = ?`
       ).bind(finalType, preview, documentId).run();
+
+      await recordDocumentProspectsBestEffort({
+        orgId: input.orgId,
+        documentId,
+        title: titleForVector,
+        fileName: input.file.name,
+        documentType: finalType,
+        source: sourceValue,
+        r2Key,
+        visibility,
+        participantUserIds: participants,
+        text,
+        preview,
+        createdAt: now,
+        primaryEntityId: firstLinkOf('deal') || firstLinkOf('company') || firstLinkOf('contact') || documentId,
+      }, env);
     } catch (e: any) {
       const msg = String(e?.message || e).slice(0, 500);
       console.error(`[persistDocument:finalize] failed for ${documentId}: ${msg}`);
@@ -541,4 +557,66 @@ export async function persistDocument(
     contentHash,
     finalize,
   };
+}
+
+async function recordDocumentProspectsBestEffort(input: {
+  orgId: string;
+  documentId: string;
+  title: string;
+  fileName: string;
+  documentType: string;
+  source: DocumentSource;
+  r2Key: string;
+  visibility: DocumentVisibility;
+  participantUserIds: string[];
+  text: string;
+  preview: string;
+  createdAt: string;
+  primaryEntityId: string;
+}, env: Env): Promise<void> {
+  if (input.text.trim().length < 80) return;
+  const chunkVisibility: 'private' | 'org_wide' | 'confidential' =
+    input.visibility === 'public' ? 'org_wide' : input.visibility;
+  const metadata: ChunkMetadata = {
+    org_id: input.orgId,
+    visibility: chunkVisibility,
+    participant_user_ids: input.participantUserIds.length > 0 ? input.participantUserIds.join(',') : undefined,
+    document_type: input.documentType,
+    source_table: 'documents',
+    source_id: input.documentId,
+    r2_key: input.r2Key,
+    created_at: input.createdAt,
+    primary_entity_id: input.primaryEntityId,
+    text_preview: input.preview,
+    entity_name: input.title,
+  };
+  const item = {
+    type: 'document',
+    source: 'outlook',
+    externalId: input.documentId,
+    subject: input.title || input.fileName,
+    bodyText: input.text,
+    bodyPreview: input.preview,
+    sentAt: input.createdAt,
+    orgId: input.orgId,
+    visibility: chunkVisibility,
+    entityType: 'document',
+    entityId: input.documentId,
+    contactIds: [],
+    participantUserIds: input.participantUserIds,
+    metadata,
+    text: input.text,
+  } as unknown as ClassifiedItem;
+
+  try {
+    const { detectAndRecordProspectSignals } = await import('./prospect-intelligence');
+    await detectAndRecordProspectSignals([item], input.orgId, env, {
+      ingestionMode: input.source === 'intelligent_import' || input.source === 'drive_import' ? 'backfill' : 'live',
+    });
+  } catch (e) {
+    console.error(
+      `[persistDocument:finalize] prospect detection failed for ${input.documentId}:`,
+      e instanceof Error ? e.message : e
+    );
+  }
 }

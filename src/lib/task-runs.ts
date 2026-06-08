@@ -25,6 +25,7 @@ export interface TaskRunCounts {
   items_processed?: number;
   items_failed?: number;
   items_skipped?: number;
+  last_error?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -192,7 +193,7 @@ export async function withTaskRun<T>(
   }
 
   // Accumulators captured by closure for the report() callback.
-  const acc: Required<TaskRunCounts> = {
+  const acc: Required<Omit<TaskRunCounts, 'last_error'>> & { last_error?: string } = {
     items_processed: 0,
     items_failed: 0,
     items_skipped: 0,
@@ -206,6 +207,7 @@ export async function withTaskRun<T>(
       if (typeof counts.items_processed === 'number') acc.items_processed += counts.items_processed;
       if (typeof counts.items_failed === 'number') acc.items_failed += counts.items_failed;
       if (typeof counts.items_skipped === 'number') acc.items_skipped += counts.items_skipped;
+      if (typeof counts.last_error === 'string' && counts.last_error) acc.last_error = counts.last_error;
       if (counts.metadata) Object.assign(acc.metadata, counts.metadata);
     },
   };
@@ -229,6 +231,7 @@ export async function withTaskRun<T>(
       itemsProcessed: acc.items_processed,
       itemsFailed: acc.items_failed,
       itemsSkipped: acc.items_skipped,
+      lastError: status === 'partial' ? acc.last_error : undefined,
       metadata: acc.metadata,
     });
     return result as T;

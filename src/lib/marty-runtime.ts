@@ -4,10 +4,10 @@ import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
 import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
 import { resolveMartyMaxModel, resolveMartyNormalModel } from './model-policy';
 
-export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-19-platform-aware-v1';
-export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-19-live-platform-aware-v1';
+export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-30-prospect-intel-v1';
+export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-30-live-prospect-intel-v1';
 export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v2';
-export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-19-agent-tools-platform-telemetry-v1';
+export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-30-agent-tools-prospect-intel-v1';
 export const MARTY_ARTIFACT_RUNTIME_VERSION = '2026-05-15-office-artifacts-v1';
 
 export interface MartyRuntimeFingerprint {

@@ -21,7 +21,7 @@ interface FieldUpdate {
 export type SourceType =
   | 'email_signature' | 'meeting_transcript' | 'slack'
   | 'enrichment' | 'llm_extraction' | 'display_name'
-  | 'web_enrichment_company' | 'news_article';
+  | 'web_enrichment_company' | 'web_enrichment_prospect' | 'news_article';
 
 /** @deprecated Wave 6: corroboration is the only quality signal. The
  *  policy distinction (always_queue vs auto_if_confident) is a no-op
@@ -44,15 +44,26 @@ const COMPANY_FIELDS = new Set([
   'linkedin_url', 'last_funding_amount', 'last_funding_round', 'last_funding_date',
 ]);
 
+const PROSPECT_FIELDS = new Set([
+  'canonical_name', 'domain', 'status', 'visibility',
+  'sector_key', 'sector_confidence',
+  'website', 'description', 'hq_location', 'founders_json',
+  'enrichment_priority', 'enrichment_status',
+  'possible_duplicate_of', 'possible_company_id', 'possible_deal_id',
+  'metadata_json', 'custom_fields',
+]);
+
 function tableForEntity(entityType: string): string {
   if (entityType === 'contact') return 'contacts';
   if (entityType === 'company') return 'companies';
+  if (entityType === 'prospect') return 'prospects';
   return 'deals';
 }
 
 function fieldsForEntity(entityType: string): Set<string> {
   if (entityType === 'contact') return CONTACT_FIELDS;
   if (entityType === 'company') return COMPANY_FIELDS;
+  if (entityType === 'prospect') return PROSPECT_FIELDS;
   return new Set<string>();
 }
 
@@ -131,7 +142,7 @@ function normalizeForComparison(field: string, value: string): string {
  */
 export async function proposeEntityUpdate(
   orgId: string,
-  entityType: 'contact' | 'company',
+  entityType: 'contact' | 'company' | 'prospect',
   entityId: string,
   field: string,
   proposedValue: string,
@@ -177,7 +188,9 @@ export async function proposeEntityUpdate(
 
   // Update Vectorize index when the entity's actual value changed.
   if (result.disposition === 'apply' && result.applyMode === 'fill_empty') {
-    try { await updateEntityInIndex(orgId, entityType, entityId, env); } catch {}
+    if (entityType !== 'prospect') {
+      try { await updateEntityInIndex(orgId, entityType, entityId, env); } catch {}
+    }
     return 'auto_applied';
   }
   if (result.disposition === 'queue') return 'proposed';
@@ -186,7 +199,7 @@ export async function proposeEntityUpdate(
 
 export async function proposeMultipleUpdates(
   orgId: string,
-  entityType: 'contact' | 'company',
+  entityType: 'contact' | 'company' | 'prospect',
   entityId: string,
   updates: FieldUpdate[],
   env: Env,
@@ -228,7 +241,7 @@ export async function proposeMultipleUpdates(
  */
 export async function markFieldsHumanEdited(
   orgId: string,
-  entityType: 'contact' | 'company' | 'deal',
+  entityType: 'contact' | 'company' | 'deal' | 'prospect',
   entityId: string,
   fields: string[],
   userId: string | null,
@@ -237,19 +250,22 @@ export async function markFieldsHumanEdited(
   if (fields.length === 0) return;
   const now = new Date().toISOString();
 
-  // Provenance table — legacy back-compat write.
-  await env.D1.batch(
-    fields.map(f =>
-      env.D1.prepare(
-        `INSERT INTO entity_field_provenance
-           (org_id, entity_type, entity_id, field_name, last_human_edit_at, last_human_edit_user_id)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(org_id, entity_type, entity_id, field_name) DO UPDATE SET
-           last_human_edit_at = excluded.last_human_edit_at,
-           last_human_edit_user_id = excluded.last_human_edit_user_id`
-      ).bind(orgId, entityType, entityId, f, now, userId)
-    )
-  );
+  // Provenance table — legacy back-compat write. Prospects use the newer
+  // entity_field_state path only; the legacy table predates prospect entities.
+  if (entityType !== 'prospect') {
+    await env.D1.batch(
+      fields.map(f =>
+        env.D1.prepare(
+          `INSERT INTO entity_field_provenance
+             (org_id, entity_type, entity_id, field_name, last_human_edit_at, last_human_edit_user_id)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(org_id, entity_type, entity_id, field_name) DO UPDATE SET
+             last_human_edit_at = excluded.last_human_edit_at,
+             last_human_edit_user_id = excluded.last_human_edit_user_id`
+        ).bind(orgId, entityType, entityId, f, now, userId)
+      )
+    );
+  }
 
   // entity_field_state — Wave 6 source of truth for corroboration math.
   // Per-field: read the (just-written) entity value, call recordApproval

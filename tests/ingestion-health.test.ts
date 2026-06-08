@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   incidentsToUserWarnings,
   reportIngestionFailure,
+  reportIngestionSuccess,
   scanAndRepairIngestion,
   type IngestionIncident,
 } from '../src/lib/ingestion-health';
@@ -103,6 +104,36 @@ describe('ingestion health', () => {
     });
   });
 
+  it('keeps work-queue item incidents out of global user warnings', () => {
+    const warnings = incidentsToUserWarnings([
+      {
+        id: 'inc-wq',
+        org_id: 'org-1',
+        source: 'work_queue',
+        scope_type: 'conversation',
+        scope_id: 'conv-1',
+        status: 'blocked',
+        severity: 'critical',
+        code: 'work_queue_prospect_detect_failed',
+        title: 'Prospect detector failed',
+        message: 'work queue work item failed: Claude API error 403',
+        first_seen_at: '2026-06-02T00:00:00.000Z',
+        last_seen_at: '2026-06-02T00:00:00.000Z',
+        resolved_at: null,
+        last_success_at: null,
+        human_action_required: 1,
+        recovery_status: 'blocked_on_auth',
+        recovery_window_start: null,
+        recovery_window_end: null,
+        repair_attempt_count: 0,
+        last_repair_at: null,
+        metadata: '{}',
+      } satisfies IngestionIncident,
+    ]);
+
+    expect(warnings).toEqual([]);
+  });
+
   it('records auth-blocked failures as human-action critical incidents', async () => {
     const d1 = makeD1Mock();
     await reportIngestionFailure(makeEnv(d1), {
@@ -121,6 +152,24 @@ describe('ingestion health', () => {
     expect(incidentInsert.binds).toContain('critical');
     expect(incidentInsert.binds).toContain(1);
     expect(incidentInsert.binds).toContain('blocked_on_auth');
+  });
+
+  it('resolves blocked incidents when the same source and scope succeeds', async () => {
+    const d1 = makeD1Mock();
+    await reportIngestionSuccess(makeEnv(d1), {
+      orgId: 'org-1',
+      source: 'work_queue',
+      scopeType: 'conversation',
+      scopeId: 'conv-1',
+      successAt: '2026-06-03T00:00:00.000Z',
+    });
+
+    const incidentUpdate = d1.runs.find((r: any) => r.sql.includes('UPDATE ingestion_incidents'));
+    expect(incidentUpdate).toBeTruthy();
+    expect(incidentUpdate?.sql).toContain("status IN ('open','recovering','blocked')");
+    expect(incidentUpdate?.binds).toContain('work_queue');
+    expect(incidentUpdate?.binds).toContain('conversation');
+    expect(incidentUpdate?.binds).toContain('conv-1');
   });
 
   it('treats non-auth dead letters as repairable and requeues them automatically', async () => {
@@ -171,5 +220,29 @@ describe('ingestion health', () => {
     expect(incidentInsert?.binds).toContain('calendar_reauth_required');
     expect(incidentInsert?.binds).toContain('critical');
     expect(incidentInsert?.binds).toContain(1);
+  });
+
+  it('does not auto-requeue deterministic Vectorize payload quarantines', async () => {
+    const d1 = makeD1Mock({
+      deadLetters: [{
+        id: 'wq-vector',
+        org_id: 'org-1',
+        domain: 'embed_retry',
+        payload: JSON.stringify({ entity_id: 'doc-1', source_table: 'documents' }),
+        last_error: 'vectorize_payload_quarantined: VECTOR_UPSERT_ERROR (code = 40023): failed to parse upsert vectors request',
+        created_at: '2026-05-23T00:00:00.000Z',
+      }],
+    });
+
+    const result = await scanAndRepairIngestion('org-1', makeEnv(d1));
+
+    expect(result.dead_letters_requeued).toBe(0);
+    expect(d1.runs.some((r: any) =>
+      r.sql.includes('UPDATE work_queue') &&
+      r.sql.includes("status = 'pending'")
+    )).toBe(false);
+    const incidentInsert = d1.runs.find((r: any) => r.sql.includes('INSERT INTO ingestion_incidents'));
+    expect(incidentInsert?.binds).toContain('vectorize_payload_quarantined');
+    expect(incidentInsert?.binds).toContain('embedding');
   });
 });

@@ -44,6 +44,10 @@ export interface Env {
   MARTY_LAB_CODE_PATCH_MODEL?: string;
   MARTY_NORMAL_MODEL?: string;
   MARTY_MAX_MODEL?: string;
+  PROSPECT_CLASSIFIER_MODEL?: string;
+  PROSPECT_LIST_CLASSIFIER_MODEL?: string;
+  PROSPECT_ORG_EXTRACTOR_MODEL?: string;
+  PROSPECT_PRODUCTION_SAMPLE_RATE?: string;
   MARTY_RUNTIME_GIT_SHA?: string;
   // Premium deck rendering is orchestrated by the Worker but executed by a
   // separate Node/Playwright service. Keep optional so the HTML-first fallback

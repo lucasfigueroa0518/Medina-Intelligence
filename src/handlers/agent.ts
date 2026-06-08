@@ -22,7 +22,7 @@ import { SESSION_TITLE_PROMPT } from '../prompts/session-title';
 import { estimateTokens, truncateToTokens } from '../lib/tokens';
 import { emitAudit } from '../lib/audit';
 import {
-  searchContacts, searchCompanies, searchDeals, searchConversations,
+  searchContacts, searchCompanies, searchDeals, searchProspects, queryDealFlow, getProspectEvidence, getProspectDigest, runProspectCleanupPassTool, searchConversations,
   searchEvents, recall, sweepConversations,
   getFirmRelationshipSnapshotTool, setFirmCompanyRelationshipTool,
   getContactDetail, getCompanyDetail, getDealDetail,
@@ -302,6 +302,73 @@ const AGENT_TOOLS: ToolDefinition[] = [
         company_id: { type: 'string' },
         limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
       },
+    },
+  },
+  {
+    name: 'query_deal_flow',
+    description: 'Exact aggregate prospect/deal-flow counts from the prospect intelligence tables. Defaults to reliable high-integrity active/converted prospects, including known-deal-backed prospects linked by prospect intelligence. Use for "how many prospects", sector counts such as fintech, recent flow, source coverage, and high-signal vs lazy enrichment rollups. Counts are firm-visible and do not depend on source-content ACL.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        days_back: { type: 'number', description: 'Lookback window. Default 180 days.' },
+        sector: { type: 'string', description: 'Optional exact sector key/label such as fintech, cybersecurity, ai_data, aerospace_defense, or materials_manufacturing.' },
+        include_provisional: { type: 'boolean', description: 'Include provisional and direction-uncertain prospects. Default false; the default view is high-integrity active/converted deal flow.' },
+        include_context: { type: 'boolean', description: 'Include weak record_context-style signal counts as a separate context_signals section. Default false; context signals never mix into the main prospect count.' },
+        limit: { type: 'number', description: 'Max recent prospects to include. Default 20, max 100.' },
+      },
+    },
+  },
+  {
+    name: 'search_prospects',
+    description: 'Search derived prospect identities. Default view is reliable active/converted prospects only; provisional, direction-uncertain, or weak context-only records require explicit filters. Default sort is recency first, then deterministic signal strength. Use sector to slice "show me fintech".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        keyword: { type: 'string', description: 'Search by prospect name or domain.' },
+        sector: { type: 'string', description: 'Exact sector key/label such as fintech, cybersecurity, ai_data, aerospace_defense, or uncategorized.' },
+        status: {
+          oneOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'string' } },
+          ],
+          description: 'Status filter. Defaults to high-integrity active and converted prospects. Pass provisional explicitly to inspect lower-confidence records.',
+        },
+        enrichment_priority: { type: 'string', enum: ['eager', 'lazy'], description: 'Filter by signal-strength enrichment priority.' },
+        limit: { type: 'number', description: 'Max results. Default 20; in MAX mode default 100. Max 50 normally, 200 in MAX mode.' },
+      },
+    },
+  },
+  {
+    name: 'get_prospect_evidence',
+    description: 'Drill into the source evidence for a prospect. Prospect identity/counts remain visible, while private conversation, meeting, or document snippets are replaced with placeholders when the viewer lacks source access.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prospect_id: { type: 'string', description: 'Prospect UUID from search_prospects or query_deal_flow.' },
+        limit: { type: 'number', description: 'Max evidence rows. Default 20; max follows mode limits.' },
+      },
+      required: ['prospect_id'],
+    },
+  },
+  {
+    name: 'get_prospect_digest',
+    description: 'Build a recent high-signal prospect digest from reliable active/converted prospects, with dedup-aware counts, unresolved classifier/reconciler qualifiers, and ACL-safe metadata. Weak context signals are hidden unless include_context is explicitly true. Use before proactive MARTy summaries of deal flow.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        days_back: { type: 'number', description: 'Lookback window. Default 14 days.' },
+        sector: { type: 'string', description: 'Optional exact sector key/label such as fintech, cybersecurity, ai_data, aerospace_defense, or uncategorized.' },
+        include_context: { type: 'boolean', description: 'Include weak record_context-style signal counts as a separate context_signals section. Default false.' },
+        limit: { type: 'number', description: 'Max prospects to include. Default follows current mode.' },
+      },
+    },
+  },
+  {
+    name: 'run_prospect_cleanup_pass',
+    description: 'Admin-only deterministic prospect cleanup: resolves eligible provisional/uncertain states, marks exact-domain deal conversions, and records duplicate soft links. Does not use a review queue.',
+    input_schema: {
+      type: 'object',
+      properties: {},
     },
   },
   {
@@ -606,7 +673,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
     input_schema: {
       type: 'object',
       properties: {
-        entity_type: { type: 'string', enum: ['contact', 'company', 'deal'] },
+        entity_type: { type: 'string', enum: ['contact', 'company', 'deal', 'prospect'] },
         entity_id: { type: 'string' },
         confirmed: { type: 'boolean', description: 'Set to true to confirm deletion' },
       },
@@ -750,7 +817,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
     input_schema: {
       type: 'object',
       properties: {
-        entity_type: { type: 'string', enum: ['contact', 'company', 'deal'] },
+        entity_type: { type: 'string', enum: ['contact', 'company', 'deal', 'prospect'] },
         entity_id: { type: 'string' },
         field_name: { type: 'string' },
         value: { type: 'string', description: 'Required unless is_deletion=true' },
@@ -765,7 +832,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
     input_schema: {
       type: 'object',
       properties: {
-        entity_type: { type: 'string', enum: ['contact', 'company', 'deal'] },
+        entity_type: { type: 'string', enum: ['contact', 'company', 'deal', 'prospect'] },
         entity_id: { type: 'string' },
         field_name: { type: 'string' },
         value: { type: 'string' },
@@ -780,7 +847,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
     input_schema: {
       type: 'object',
       properties: {
-        entity_type: { type: 'string', enum: ['contact', 'company', 'deal'] },
+        entity_type: { type: 'string', enum: ['contact', 'company', 'deal', 'prospect'] },
         entity_id: { type: 'string' },
         field_name: { type: 'string' },
       },
@@ -827,6 +894,11 @@ async function executeTool(
     case 'get_firm_relationship_snapshot': return getFirmRelationshipSnapshotTool(ctx, toolInput || {}, env);
     case 'set_firm_company_relationship': return setFirmCompanyRelationshipTool(ctx, toolInput || {}, env);
     case 'search_deals': return searchDeals(ctx, toolInput, env, toolContext);
+    case 'query_deal_flow': return queryDealFlow(ctx, toolInput || {}, env);
+    case 'search_prospects': return searchProspects(ctx, toolInput || {}, env, toolContext);
+    case 'get_prospect_evidence': return getProspectEvidence(ctx, toolInput || {}, env, toolContext);
+    case 'get_prospect_digest': return getProspectDigest(ctx, toolInput || {}, env, toolContext);
+    case 'run_prospect_cleanup_pass': return runProspectCleanupPassTool(ctx, toolInput || {}, env);
     case 'search_conversations': return searchConversations(ctx, toolInput, env, toolContext);
     case 'search_events': return searchEvents(ctx, toolInput, env, toolContext);
     case 'sweep_conversations': return sweepConversations(ctx, toolInput, env, toolContext);

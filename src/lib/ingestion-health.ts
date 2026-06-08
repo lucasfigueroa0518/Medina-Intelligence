@@ -162,9 +162,15 @@ function workQueueSource(domain: string): IngestionSource {
   if (domain === 'calendar_refresh') return 'calendar';
   if (domain === 'firefly_window') return 'firefly';
   if (domain === 'embed_retry') return 'embedding';
+  if (domain === 'attachment_backfill') return 'outlook_email';
+  if (domain === 'deal_evidence_detect') return 'deal_evidence';
   if (domain === 'rag_reindex_v2') return 'rag_v2';
   if (domain === 'slack_channel_backfill') return 'slack';
   return 'work_queue';
+}
+
+function isQuarantinedVectorizePayload(error: string): boolean {
+  return /vectorize_payload_quarantined|VECTORIZE_PAYLOAD_QUARANTINED|40023|failed to parse upsert vectors request|VECTOR_UPSERT_ERROR/i.test(error);
 }
 
 function maybeJson(metadata: Record<string, unknown> | undefined): string {
@@ -302,7 +308,7 @@ export async function reportIngestionSuccess(
         AND source = ?
         AND scope_type = ?
         AND scope_id = ?
-        AND status IN ('open','recovering')`
+        AND status IN ('open','recovering','blocked')`
   ).bind(at, at, input.orgId, input.source, scType, scId).run();
 }
 
@@ -326,6 +332,7 @@ export function incidentsToUserWarnings(
   incidents: IngestionIncident[]
 ): UserFacingIngestionWarning[] {
   return incidents
+    .filter(i => i.source !== 'work_queue')
     .filter(i => i.severity === 'critical' || i.human_action_required === 1)
     .slice(0, 5)
     .map(i => ({
@@ -483,7 +490,7 @@ export async function enqueueAutomaticRepairForIncident(
   else if (incident.source === 'slack') repaired = await repairSlackIncident(env, incident, start);
   else if (incident.source === 'firefly') repaired = await repairFireflyIncident(env, incident, start, end);
   else if (incident.source === 'rag_v2') repaired = await repairRagV2Incident(env, incident);
-  else if (incident.source === 'embedding') repaired = true;
+  else if (incident.source === 'embedding') repaired = false;
 
   if (repaired) {
     await markIncidentRepairQueued(env, incident.id, start, end);
@@ -500,8 +507,19 @@ export async function reportWorkQueueOutcome(
   const payload = parseWorkQueuePayload(row.payload);
   const userId = typeof payload.user_id === 'string' ? payload.user_id : '';
   const channelId = typeof payload.channel_id === 'string' ? payload.channel_id : '';
-  const scopeType = channelId ? 'channel' : userId ? 'user' : 'work_item';
-  const scId = channelId || userId || row.id;
+  const conversationId = typeof payload.conversation_id === 'string' ? payload.conversation_id : '';
+  const sourceType = typeof payload.source_type === 'string' ? payload.source_type : '';
+  const sourceId = typeof payload.source_id === 'string' ? payload.source_id : '';
+  const scopeType = conversationId
+    ? 'conversation'
+    : sourceId
+      ? sourceType || 'source'
+      : channelId
+        ? 'channel'
+        : userId
+          ? 'user'
+          : 'work_item';
+  const scId = conversationId || sourceId || channelId || userId || row.id;
 
   if (!error) {
     await reportIngestionSuccess(env, {
@@ -515,7 +533,10 @@ export async function reportWorkQueueOutcome(
   }
 
   const human = await isRepairBlockedByHumanAction(env, row, error);
-  const code = human && /token_refresh_failed/i.test(error)
+  const vectorizeQuarantine = row.domain === 'embed_retry' && isQuarantinedVectorizePayload(error);
+  const code = vectorizeQuarantine
+    ? 'vectorize_payload_quarantined'
+    : human && /token_refresh_failed/i.test(error)
     ? `${source}_reauth_required`
     : `work_queue_${row.domain}_failed`;
   await reportIngestionFailure(env, {
@@ -569,7 +590,7 @@ export async function scanAndRepairIngestion(
        FROM work_queue
       WHERE org_id = ?
         AND status = 'dead_letter'
-        AND domain IN ('calendar_refresh','firefly_window','embed_retry','rag_reindex_v2','slack_channel_backfill')
+        AND domain IN ('calendar_refresh','firefly_window','embed_retry','rag_reindex_v2','slack_channel_backfill','attachment_backfill','deal_evidence_detect')
       ORDER BY completed_at DESC
       LIMIT 100`
   ).bind(orgId).all<{
@@ -584,6 +605,9 @@ export async function scanAndRepairIngestion(
   for (const row of deadLetters.results) {
     const error = row.last_error || 'dead_letter';
     await reportWorkQueueOutcome(env, row, error);
+    if (row.domain === 'embed_retry' && isQuarantinedVectorizePayload(error)) {
+      continue;
+    }
     if (!(await isRepairBlockedByHumanAction(env, row, error))) {
       await env.D1.prepare(
         `UPDATE work_queue

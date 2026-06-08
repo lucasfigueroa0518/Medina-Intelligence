@@ -151,28 +151,98 @@ function buildGatewayHeaders(env: Env): Record<string, string> {
   return headers;
 }
 
-export async function callClaude(
-  params: { system: string; user: string; max_tokens: number; orgId?: string; model?: string },
+function buildAnthropicRequestBody(
+  params: {
+    system: ClaudeSystemPrompt;
+    user: string;
+    max_tokens: number;
+    model?: string;
+    assistantPrefill?: string;
+    temperature?: number;
+  },
+  model: string
+): Record<string, unknown> {
+  return {
+    model,
+    max_tokens: params.max_tokens,
+    ...(params.temperature != null ? { temperature: params.temperature } : {}),
+    system: params.system,
+    messages: params.assistantPrefill
+      ? [
+          { role: 'user', content: params.user },
+          { role: 'assistant', content: params.assistantPrefill },
+        ]
+      : [{ role: 'user', content: params.user }],
+  };
+}
+
+function hasAiGatewayBinding(env: Env): boolean {
+  return typeof (env as any).AI?.gateway === 'function';
+}
+
+async function fetchClaudeViaGateway(
+  env: Env,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const gatewayToken = (env as any).CLOUDFLARE_AI_GATEWAY_TOKEN as string | undefined;
+  if (!gatewayToken?.trim() && hasAiGatewayBinding(env)) {
+    return (env as any).AI.gateway(env.CLOUDFLARE_AI_GATEWAY_SLUG).run({
+      provider: 'anthropic',
+      endpoint: 'v1/messages',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': env.ANTHROPIC_API_KEY,
+        'anthropic-version': ANTHROPIC_VERSION,
+      },
+      query: body,
+    });
+  }
+
+  return fetch(buildGatewayUrl(env), {
+    method: 'POST',
+    headers: buildGatewayHeaders(env),
+    body: JSON.stringify(body),
+  });
+}
+
+export interface ClaudeCallResult {
+  text: string;
+  usage: { input_tokens: number; output_tokens: number };
+  model: string;
+}
+
+export type ClaudeSystemPrompt =
+  | string
+  | Array<{
+      type: 'text';
+      text: string;
+      cache_control?: { type: 'ephemeral' };
+    }>;
+
+export async function callClaudeWithUsage(
+  params: {
+    system: ClaudeSystemPrompt;
+    user: string;
+    max_tokens: number;
+    orgId?: string;
+    model?: string;
+    assistantPrefill?: string;
+    temperature?: number;
+    dryRunNoBudgetWrites?: boolean;
+  },
   priority: 'high' | 'low',
   env: Env
-): Promise<string> {
+): Promise<ClaudeCallResult> {
   const orgId = params.orgId || 'system';
   const model = params.model || resolveDefaultClaudeModel();
   const budgetSource = budgetUpstreamForClaudeModel(model);
-  if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
+  const dryRunNoBudgetWrites = params.dryRunNoBudgetWrites === true;
+  if (!dryRunNoBudgetWrites && !(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
     throw new Error('CLAUDE_RATE_LIMITED');
   }
+  const body = buildAnthropicRequestBody(params, model);
 
-  const response = await fetch(buildGatewayUrl(env), {
-    method: 'POST',
-    headers: buildGatewayHeaders(env),
-    body: JSON.stringify({
-      model,
-      max_tokens: params.max_tokens,
-      system: params.system,
-      messages: [{ role: 'user', content: params.user }],
-    }),
-  });
+  const response = await fetchClaudeViaGateway(env, body);
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -181,17 +251,31 @@ export async function callClaude(
       // 3 consecutive 429s → cap drops 10%, circuit opens 30 min.
       // Pre-3.3 the KV-backed limiter could only observe its own
       // counter; the ledger gives us upstream-driven evidence.
-      await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+      if (!dryRunNoBudgetWrites) {
+        await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+      }
       throw new Error('CLAUDE_RATE_LIMITED');
     }
     throw new Error(`Claude API error ${response.status}: ${errorBody}`);
   }
-  await recordBudgetSuccess(env, orgId, null, budgetSource, 'minute');
+  if (!dryRunNoBudgetWrites) {
+    await recordBudgetSuccess(env, orgId, null, budgetSource, 'minute');
+  }
 
   const data = (await response.json()) as ClaudeResponse;
   const textBlock = data.content.find(b => b.type === 'text');
   if (!textBlock) throw new Error('Claude returned no text content');
-  return textBlock.text!;
+  const text = params.assistantPrefill ? `${params.assistantPrefill}${textBlock.text!}` : textBlock.text!;
+  return { text, usage: data.usage, model };
+}
+
+export async function callClaude(
+  params: { system: ClaudeSystemPrompt; user: string; max_tokens: number; orgId?: string; model?: string; temperature?: number },
+  priority: 'high' | 'low',
+  env: Env
+): Promise<string> {
+  const result = await callClaudeWithUsage(params, priority, env);
+  return result.text;
 }
 
 export interface ToolDefinition {

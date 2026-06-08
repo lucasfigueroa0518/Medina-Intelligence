@@ -20,7 +20,7 @@
 //   • errors_sample — { phase, message } truncated to 500 chars, capped at 5.
 
 import type { Env } from '../types/env';
-import type { ChunkMetadata, SpeakerTurn } from '../types/interfaces';
+import type { ChunkMetadata, ClassifiedItem, SpeakerTurn } from '../types/interfaces';
 import { safelyUpsertEventTimelineItemsForContacts } from './contact-detail-read-model';
 import { upsertEventAttendee } from './event-attendees';
 
@@ -70,6 +70,9 @@ export interface TranscriptStats {
   chunks_embedded: number;
   /** Count of items where extractAndRouteSignals returned a non-null outcome. */
   signals_extracted: number;
+  prospect_signals_recorded: number;
+  prospects_upserted: number;
+  prospect_classifications_pending: number;
   errors: Array<{ phase: string; error: string }>;
   /** Canonical event ids for the items that staged. Callers can use these
    *  for follow-up work (e.g. webhook-consumer's eager extract path before
@@ -86,6 +89,9 @@ function emptyStats(syncJobId: string): TranscriptStats {
     attendees_linked: 0,
     chunks_embedded: 0,
     signals_extracted: 0,
+    prospect_signals_recorded: 0,
+    prospects_upserted: 0,
+    prospect_classifications_pending: 0,
     errors: [],
     staged_event_ids: [],
     sync_job_id: syncJobId,
@@ -127,6 +133,11 @@ function emptyStats(syncJobId: string): TranscriptStats {
  *      Phase 1, replacing the legacy webhook-consumer's "find latest event
  *      ORDER BY created_at LIMIT 1" pattern that could attribute signals
  *      to the wrong event under concurrent delivery.
+ *
+ *   4. Prospect detection — reshape the canonical events into ClassifiedItem
+ *      records and run the same prospect detector used by Outlook ingestion.
+ *      This keeps meeting-summary/live-transcript opportunities in the
+ *      prospect database without a separate classifier path.
  *
  * Phase 1 bail: if `items_staged < items_total` after the staging loop,
  * Phases 2 and 3 are skipped for the entire batch. Mirrors the structural-
@@ -511,6 +522,36 @@ export async function processTranscriptItems(
       }
     }
 
+    // ── PHASE 4 — Prospect detection on canonical event ids. ──
+    // Best-effort like the rest of the downstream phases: a classifier hiccup
+    // should mark the sync job partial, not prevent the transcript/event from
+    // being durable.
+    const prospectItems = stagedItems
+      .map(({ item, canonicalId }) => transcriptItemToProspectClassifiedItem(item, canonicalId, ctx.orgId))
+      .filter((item): item is ClassifiedItem => item != null);
+    if (prospectItems.length > 0) {
+      try {
+        const { detectAndRecordProspectSignals } = await import('./prospect-intelligence');
+        const prospectStats = await detectAndRecordProspectSignals(prospectItems, ctx.orgId, env, {
+          ingestionMode: ctx.sourcePath === 'firefly-progressive-backfill-window' ? 'backfill' : 'live',
+        });
+        stats.prospect_signals_recorded += prospectStats.signals_recorded;
+        stats.prospects_upserted += prospectStats.prospects_upserted;
+        stats.prospect_classifications_pending += prospectStats.classifications_pending;
+        for (const err of prospectStats.errors) {
+          stats.errors.push({
+            phase: 'detect-prospects',
+            error: `${err.item_id}: ${String(err.error).slice(0, 500)}`,
+          });
+        }
+      } catch (e: any) {
+        stats.errors.push({
+          phase: 'detect-prospects',
+          error: String(e?.message || e).slice(0, 500),
+        });
+      }
+    }
+
     return stats;
   } finally {
     const status: 'completed' | 'partial' | 'failed' =
@@ -521,6 +562,58 @@ export async function processTranscriptItems(
           : 'partial';
     await closeSyncJob(syncJobId, status, stats, env);
   }
+}
+
+function transcriptItemToProspectClassifiedItem(
+  item: TranscriptItem,
+  canonicalId: string,
+  orgId: string
+): ClassifiedItem | null {
+  const bodyText = [
+    item.summaryOverview,
+    item.actionItems.length ? `Action items:\n${item.actionItems.join('\n')}` : null,
+    item.topics.length ? `Topics:\n${item.topics.join(', ')}` : null,
+    item.transcriptText,
+  ].filter(Boolean).join('\n\n').trim();
+  if (bodyText.length < 80) return null;
+  const participantEmails = item.participants
+    .map(participant => participant.email)
+    .filter((email): email is string => typeof email === 'string' && email.length > 0);
+  const participantNames = item.participants
+    .map(participant => participant.displayName)
+    .filter((name): name is string => typeof name === 'string' && name.length > 0);
+  const metadata: ChunkMetadata = {
+    org_id: orgId,
+    visibility: 'private',
+    participant_user_ids: undefined,
+    document_type: 'meeting_transcript',
+    source_table: 'events',
+    source_id: canonicalId,
+    r2_key: item.transcriptR2Key || '',
+    created_at: item.startTime,
+    primary_entity_id: canonicalId,
+    text_preview: bodyText.slice(0, 500),
+  };
+  return {
+    type: 'calendar_event',
+    source: 'outlook',
+    externalId: item.fireflyEventId,
+    subject: item.title,
+    bodyText,
+    bodyPreview: item.summaryOverview || bodyText.slice(0, 300),
+    fromName: participantNames[0] || undefined,
+    toEmails: participantEmails,
+    sentAt: item.startTime,
+    direction: 'internal',
+    orgId,
+    visibility: 'private',
+    entityType: 'event',
+    entityId: canonicalId,
+    contactIds: [],
+    participantUserIds: [],
+    metadata,
+    text: bodyText,
+  };
 }
 
 async function closeSyncJob(
@@ -540,6 +633,9 @@ async function closeSyncJob(
     attendees_linked: stats.attendees_linked,
     chunks_embedded: stats.chunks_embedded,
     signals_extracted: stats.signals_extracted,
+    prospect_signals_recorded: stats.prospect_signals_recorded,
+    prospects_upserted: stats.prospects_upserted,
+    prospect_classifications_pending: stats.prospect_classifications_pending,
     staged_event_ids: stats.staged_event_ids,
     errors_sample: errorsSample,
   });

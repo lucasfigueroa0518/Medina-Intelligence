@@ -23,6 +23,7 @@ export interface ProcessClassifiedContext {
   orgId: string;
   /** Used for stage-and-commit's audit trail. Inline-backfill passes a synthetic key (`backfill-${userId}`). */
   syncJobId: string;
+  ingestionMode?: 'live' | 'backfill';
 }
 
 export interface ProcessClassifiedStats {
@@ -35,6 +36,13 @@ export interface ProcessClassifiedStats {
   attachments_skipped: number;
   attachments_failed: number;
   deal_signals_staged: number;
+  deal_candidates_seen: number;
+  deal_candidates_scanned: number;
+  deal_candidates_deferred: number;
+  deal_skip_reasons: Record<string, number>;
+  prospect_signals_recorded: number;
+  prospects_upserted: number;
+  prospect_classifications_pending: number;
   errors: Array<{ phase: string; error: string }>;
 }
 
@@ -49,6 +57,13 @@ function emptyStats(): ProcessClassifiedStats {
     attachments_skipped: 0,
     attachments_failed: 0,
     deal_signals_staged: 0,
+    deal_candidates_seen: 0,
+    deal_candidates_scanned: 0,
+    deal_candidates_deferred: 0,
+    deal_skip_reasons: {},
+    prospect_signals_recorded: 0,
+    prospects_upserted: 0,
+    prospect_classifications_pending: 0,
     errors: [],
   };
 }
@@ -61,6 +76,7 @@ function emptyStats(): ProcessClassifiedStats {
  *   2. chunk-and-embed   — split + embed each item's text, write vector rows
  *   3. process-attachments — Graph fetch + persist email attachments as docs
  *   4. detect-deals      — LLM-screen for deal-signal candidates, stage them
+ *   5. detect-prospects  — deterministic prospect mentions/signals, no holds
  *
  * Per-item failures within a phase are caught + counted in stats, not
  * rethrown — a single bad item can't take down the rest of the batch. The
@@ -154,12 +170,67 @@ export async function processClassifiedItems(
   }
 
   // Phase 4 — detect deals. Also missing from inline-backfill before Wave 2.
-  // detectAndStageDealSignals self-caps at 20 LLM calls per batch.
+  // detectAndStageDealSignalsDetailed scans the first 20 candidates inline and
+  // enqueues overflow to deal_evidence_detect so budget caps are visible and
+  // recoverable instead of silently dropping deal-looking sources.
   try {
-    const { detectAndStageDealSignals } = await import('./deal-detection');
-    stats.deal_signals_staged = await detectAndStageDealSignals(classified, ctx.orgId, env);
+    const { detectAndStageDealSignalsDetailed } = await import('./deal-detection');
+    const dealStats = await detectAndStageDealSignalsDetailed(classified, ctx.orgId, env);
+    stats.deal_signals_staged = dealStats.deal_signals_staged;
+    stats.deal_candidates_seen = dealStats.deal_candidates_seen;
+    stats.deal_candidates_scanned = dealStats.deal_candidates_scanned;
+    stats.deal_candidates_deferred = dealStats.deal_candidates_deferred;
+    stats.deal_skip_reasons = dealStats.deal_skip_reasons;
   } catch (e: any) {
     stats.errors.push({ phase: 'detect-deals', error: e?.message || String(e) });
+  }
+
+  // Phase 5 — detect prospects. This path deliberately records uncertainty as
+  // recoverable entity metadata.
+  try {
+    const {
+      detectAndRecordProspectSignals,
+      recordProspectBackfillCoverage,
+    } = await import('./prospect-intelligence');
+    const ingestionMode = ctx.ingestionMode || (ctx.syncJobId.includes('backfill') ? 'backfill' : 'live');
+    const prospectStats = await detectAndRecordProspectSignals(classified, ctx.orgId, env, {
+      ingestionMode,
+    });
+    stats.prospect_signals_recorded = prospectStats.signals_recorded;
+    stats.prospects_upserted = prospectStats.prospects_upserted;
+    stats.prospect_classifications_pending = prospectStats.classifications_pending;
+    for (const err of prospectStats.errors) {
+      stats.errors.push({ phase: 'detect-prospects', error: `${err.item_id}: ${err.error}` });
+    }
+    if (ingestionMode === 'backfill') {
+      const bySource = new Map<string, ClassifiedItem[]>();
+      for (const item of classified) {
+        const key = item.source || item.type || 'unknown';
+        const bucket = bySource.get(key) || [];
+        bucket.push(item);
+        bySource.set(key, bucket);
+      }
+      for (const [sourceFamily, items] of bySource) {
+        const dates = items
+          .map(item => item.sentAt)
+          .filter((value): value is string => typeof value === 'string' && value.length > 0)
+          .sort();
+        if (dates.length === 0) continue;
+        await recordProspectBackfillCoverage(ctx.orgId, env, {
+          sourceFamily,
+          windowStart: dates[0],
+          windowEnd: dates[dates.length - 1],
+          itemsScanned: items.length,
+          signalsRecorded: prospectStats.signals_recorded,
+          prospectsUpserted: prospectStats.prospects_upserted,
+          classificationsPending: prospectStats.classifications_pending,
+          status: prospectStats.errors.length > 0 ? 'partial' : 'completed',
+          error: prospectStats.errors[0]?.error || null,
+        });
+      }
+    }
+  } catch (e: any) {
+    stats.errors.push({ phase: 'detect-prospects', error: e?.message || String(e) });
   }
 
   return stats;
@@ -180,6 +251,10 @@ export async function persistClassifiedStats(
     stats.items_total > 0 ||
     stats.attachments_attempted > 0 ||
     stats.deal_signals_staged > 0 ||
+    stats.deal_candidates_seen > 0 ||
+    stats.deal_candidates_deferred > 0 ||
+    stats.prospect_signals_recorded > 0 ||
+    stats.prospect_classifications_pending > 0 ||
     stats.embed_failures > 0 ||
     stats.errors.length > 0;
   if (!hasAny) return;
@@ -197,15 +272,34 @@ export async function persistClassifiedStats(
             '$.attachments_processed', COALESCE(json_extract(metadata, '$.attachments_processed'), 0) + ?,
             '$.attachments_skipped',   COALESCE(json_extract(metadata, '$.attachments_skipped'),   0) + ?,
             '$.attachments_failed',    COALESCE(json_extract(metadata, '$.attachments_failed'),    0) + ?,
-            '$.deal_signals_staged',   COALESCE(json_extract(metadata, '$.deal_signals_staged'),   0) + ?
+            '$.deal_signals_staged',   COALESCE(json_extract(metadata, '$.deal_signals_staged'),   0) + ?,
+            '$.deal_candidates_seen',   COALESCE(json_extract(metadata, '$.deal_candidates_seen'),   0) + ?,
+            '$.deal_candidates_scanned', COALESCE(json_extract(metadata, '$.deal_candidates_scanned'), 0) + ?,
+            '$.deal_candidates_deferred', COALESCE(json_extract(metadata, '$.deal_candidates_deferred'), 0) + ?,
+            '$.prospect_signals_recorded', COALESCE(json_extract(metadata, '$.prospect_signals_recorded'), 0) + ?,
+            '$.prospects_upserted',    COALESCE(json_extract(metadata, '$.prospects_upserted'),    0) + ?,
+            '$.prospect_classifications_pending', COALESCE(json_extract(metadata, '$.prospect_classifications_pending'), 0) + ?
           )
         WHERE id = ?`
     ).bind(
       stats.items_total, stats.items_staged, stats.items_embedded, stats.embed_failures,
       stats.attachments_attempted, stats.attachments_processed, stats.attachments_skipped, stats.attachments_failed,
-      stats.deal_signals_staged,
+      stats.deal_signals_staged, stats.deal_candidates_seen, stats.deal_candidates_scanned, stats.deal_candidates_deferred,
+      stats.prospect_signals_recorded, stats.prospects_upserted, stats.prospect_classifications_pending,
       syncJobId
     ).run();
+
+    if (Object.keys(stats.deal_skip_reasons || {}).length > 0) {
+      await env.D1.prepare(
+        `UPDATE sync_jobs
+            SET metadata = json_set(
+              COALESCE(metadata, '{}'),
+              '$.deal_skip_reasons',
+              json(?)
+            )
+          WHERE id = ?`
+      ).bind(JSON.stringify(stats.deal_skip_reasons), syncJobId).run();
+    }
 
     // Persist error context for debugging. Latest-wins (no accumulation
     // across calls) — for the dangling-row diagnostic the first page's

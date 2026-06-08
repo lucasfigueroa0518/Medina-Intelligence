@@ -50,3 +50,4 @@ coverage
 **/coverage
 *.tsbuildinfo
 outputs/
+.prospect-gold-set/

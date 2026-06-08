@@ -17,7 +17,21 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:agent": "vitest run tests/agent-runtime.test.ts tests/agent-tools.test.ts tests/citations.test.ts tests/claude.test.ts tests/firm-relationship-state.test.ts",
-    "test:max": "vitest run tests/max-set-builder.test.ts"
+    "test:max": "vitest run tests/max-set-builder.test.ts",
+    "prospect:spike": "tsx scripts/prospect-classifier-spike.ts",
+    "prospect:universes": "tsx scripts/prospect-classifier-universe-spike.ts",
+    "prospect:classifier-gate": "tsx scripts/prospect-classifier-gate.ts",
+    "prospect:pipeline-readiness": "tsx scripts/prospect-pipeline-readiness.ts",
+    "prospect:pipeline-canary": "tsx scripts/prospect-pipeline-canary.ts",
+    "prospect:live-canary": "tsx scripts/prospect-live-canary.ts",
+    "prospect:backfill-window": "tsx scripts/prospect-backfill-window.ts",
+    "prospect:backfill-enqueue": "tsx scripts/prospect-backfill-enqueue.ts",
+    "prospect:pipeline-health": "tsx scripts/prospect-pipeline-health.ts",
+    "prospect:migration-readiness": "tsx scripts/prospect-migration-readiness-check.ts",
+    "prospect:large-experiment": "tsx scripts/prospect-large-classifier-experiment.ts",
+    "prospect:materialize-known-deals": "tsx scripts/prospect-materialize-known-deals.ts",
+    "prospect:bridge-materialize": "tsx scripts/prospect-bridge-materialize.ts",
+    "crm:quality-review": "tsx scripts/crm-quality-review-export.ts"
   },
   "dependencies": {
     "@e965/xlsx": "^0.20.3",
@@ -37,6 +51,7 @@
     "@cloudflare/workers-types": "^4.20240924.0",
     "@types/node": "^20.14.0",
     "concurrently": "^9.0.1",
+    "tsx": "^4.22.3",
     "typescript": "^5.6.0",
     "vitest": "^4.1.6",
     "wrangler": "^4.85.0"

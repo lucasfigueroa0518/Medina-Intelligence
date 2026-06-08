@@ -19,6 +19,7 @@ import type { Env } from '../types/env';
 import { parseParticipantUserIds } from './helpers';
 import { getGraphMailboxAuthForUser, graphMailboxUrl } from './graph-auth';
 import { persistDocument, type DocumentLink } from './persist-document';
+import { closeSyncJob, openSyncJob } from './sync-job-lifecycle';
 
 export interface OrchestratorConfig {
   orgId: string;
@@ -394,25 +395,31 @@ export async function runAttachmentBackfillBatch(
   config: OrchestratorConfig,
   env: Env
 ): Promise<OrchestratorResult> {
-  const jobId = crypto.randomUUID();
+  let jobId = crypto.randomUUID();
   const concurrency = Math.min(Math.max(1, config.concurrency || 25), 25);
-  const startedAt = new Date().toISOString();
+  let syncJobOpened = false;
 
   // sync_jobs row for observability — searchable from the same SQL surface
   // operators use for ingestion runs.
-  await env.D1.prepare(
-    `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, metadata)
-     VALUES (?, ?, 'attachment_backfill', 'running', ?, ?)`
-  ).bind(
-    jobId,
-    config.orgId,
-    startedAt,
-    JSON.stringify({
-      conversation_ids_count: config.conversationIds.length,
-      concurrency,
-      user_id: config.userId,
-    })
-  ).run();
+  try {
+    jobId = await openSyncJob(env, {
+      id: jobId,
+      orgId: config.orgId,
+      workflowType: 'attachment_backfill',
+      timeoutMinutes: 10,
+      metadata: {
+        phase: 'attachment_backfill_batch',
+        opened_by: 'runAttachmentBackfillBatch',
+        timeout_policy: '10m_running_window',
+        conversation_ids_count: config.conversationIds.length,
+        concurrency,
+        user_id: config.userId,
+      },
+    });
+    syncJobOpened = true;
+  } catch (e: any) {
+    console.error(`[backfill-orchestrator] sync_jobs insert failed for ${jobId}:`, e?.message || e);
+  }
 
   // Per-user mailbox auth cache. App-only token acquisition is cached globally;
   // this avoids repeated user/mailbox lookups inside one batch.
@@ -472,26 +479,23 @@ export async function runAttachmentBackfillBatch(
   // errors" — same shape ingestion runs use when chunks fail.
   const errorsForMeta = result.errors.slice(0, 50);
   const finalStatus = result.attachments_failed > 0 ? 'partial' : 'completed';
-  await env.D1.prepare(
-    `UPDATE sync_jobs
-        SET status = ?, completed_at = ?,
-            metadata = json_patch(COALESCE(metadata, '{}'), ?)
-      WHERE id = ?`
-  ).bind(
-    finalStatus,
-    new Date().toISOString(),
-    JSON.stringify({
-      conversations_processed: result.conversations_processed,
-      attachments_attempted: result.attachments_attempted,
-      attachments_persisted: result.attachments_persisted,
-      attachments_failed: result.attachments_failed,
-      attachments_skipped_unrecoverable: result.attachments_skipped_unrecoverable,
-      embeddings_queued: result.embeddings_queued,
-      errors_count: result.errors.length,
-      errors_sample: errorsForMeta,
-    }),
-    jobId
-  ).run();
+  if (syncJobOpened) {
+    await closeSyncJob(env, jobId, {
+      status: finalStatus,
+      errorMessage: result.errors.length > 0 ? result.errors[0].error : undefined,
+      metadata: {
+        phase: 'attachment_backfill_batch_closed',
+        conversations_processed: result.conversations_processed,
+        attachments_attempted: result.attachments_attempted,
+        attachments_persisted: result.attachments_persisted,
+        attachments_failed: result.attachments_failed,
+        attachments_skipped_unrecoverable: result.attachments_skipped_unrecoverable,
+        embeddings_queued: result.embeddings_queued,
+        errors_count: result.errors.length,
+        errors_sample: errorsForMeta,
+      },
+    });
+  }
 
   return result;
 }

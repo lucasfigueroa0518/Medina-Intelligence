@@ -19,6 +19,7 @@ import { embedDocumentItem as embedDocumentItemForRepair } from './document-embe
 import { repairContactSearchIndexDrift } from './contact-search';
 import { repairContactDetailReadModelDrift } from './contact-detail-read-model';
 import { CLAUDE_HAIKU_MODEL } from './model-policy';
+import { runProspectReconciliation } from './prospect-intelligence';
 
 // Mirrors the visibility logic in classification.ts:233 — emails are always
 // 'private' regardless of source-side hint, transcripts/manual notes are
@@ -63,6 +64,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await promoteToStandalone(orgId, env); } catch (e) { console.error('Standalone promotion:', e); }
   try { await flagStaleOrphanedEvents(orgId, env); } catch (e) { console.error('Orphan flagging:', e); }
   try { await recalculateAllAssociations(orgId, env); } catch (e) { console.error('Association recalc:', e); }
+  try { await runProspectReconciliation(orgId, env); } catch (e) { console.error('Prospect reconciliation:', e); }
   // Phase 0a-4 (2026-05-04): three org-wide bulk calcs migrated from
   // ingestion-finalizer to daily-cron after Terminal 5 confirmed the
   // finalizer was hitting the 1000-subreq cap consistently. Each is
@@ -104,6 +106,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await repairContactDetailReadModelDrift(orgId, env); } catch (e) { console.error('Contact detail read-model repair:', e); }
   try { await cleanupExpiredResetTokens(env); } catch (e) { console.error('Reset token cleanup:', e); }
   try { await detectIngestionDivergence(orgId, env); } catch (e) { console.error('Ingestion divergence:', e); }
+  try { await reapStaleProcessingDocuments(orgId, env); } catch (e) { console.error('Stale document reaper:', e); }
 }
 
 // Wave 2 self-heal: detect when conversations claim attachments but no
@@ -115,7 +118,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
 export async function detectIngestionDivergence(
   orgId: string,
   env: Env
-): Promise<{ orphan_attachment_conversations: number }> {
+): Promise<{ orphan_attachment_conversations: number; repairs_enqueued: number }> {
   // `conversations` has no deleted_at column — soft-delete is not modeled
   // for emails. Just guard against soft-deleted documents on the inner side.
   const row = await env.D1.prepare(
@@ -131,14 +134,120 @@ export async function detectIngestionDivergence(
   ).bind(orgId).first<{ n: number }>();
 
   const count = row?.n || 0;
+  let repairsEnqueued = 0;
   if (count > 0) {
     console.warn(
       `[cron:divergence-detect] org=${orgId} ${count} conversations declare attachments but have no email_attachment documents — ingestion divergence (or pending Wave 3 backfill)`
     );
+    try {
+      const { reportIngestionFailure } = await import('./ingestion-health');
+      await reportIngestionFailure(env, {
+        orgId,
+        source: 'outlook_email',
+        scopeType: 'org',
+        scopeId: orgId,
+        code: 'attachment_divergence_detected',
+        title: 'Outlook attachment ingestion is behind',
+        message: `${count} conversations declare attachments but have no email attachment document rows.`,
+        severity: 'warning',
+        humanActionRequired: false,
+        metadata: { orphan_attachment_conversations: count },
+      });
+
+      const { enqueueWork } = await import('./work-queue');
+      const { pickOrphanBatch } = await import('./attachment-backfill-orchestrator');
+      const detectedAt = new Date().toISOString();
+      const conversationIds = await pickOrphanBatch(orgId, 25, env);
+      for (const conversationId of conversationIds) {
+        const result = await enqueueWork(
+          env,
+          orgId,
+          'attachment_backfill',
+          {
+            conversation_id: conversationId,
+            origin: 'divergence_scan',
+            detected_at: detectedAt,
+          },
+          {
+            upstream: 'graph',
+            idempotency_key: `${orgId}:${conversationId}:attachment_backfill:v1`,
+            priority: 25,
+            max_attempts: 6,
+          }
+        );
+        if (result.inserted) repairsEnqueued++;
+      }
+    } catch (e) {
+      console.error('[cron:divergence-detect] attachment_backfill enqueue failed:', e);
+    }
   } else {
     console.log(`[cron:divergence-detect] org=${orgId} clean — no orphan attachment conversations`);
   }
-  return { orphan_attachment_conversations: count };
+  return { orphan_attachment_conversations: count, repairs_enqueued: repairsEnqueued };
+}
+
+export async function reapStaleProcessingDocuments(
+  orgId: string,
+  env: Env,
+  opts: { limit?: number; olderThanMinutes?: number } = {}
+): Promise<{ inspected: number; failed: number; embedding_repairs_enqueued: number }> {
+  const limit = Math.max(1, Math.min(200, opts.limit || 100));
+  const olderThanMinutes = Math.max(30, opts.olderThanMinutes || 120);
+  const rows = await env.D1.prepare(
+    `SELECT id, r2_key, file_name, title, created_at
+       FROM documents
+      WHERE org_id = ?
+        AND processing_status = 'processing'
+        AND deleted_at IS NULL
+        AND created_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)
+      ORDER BY created_at ASC
+      LIMIT ?`
+  ).bind(orgId, `-${olderThanMinutes} minutes`, limit).all<{
+    id: string;
+    r2_key: string | null;
+    file_name: string | null;
+    title: string | null;
+    created_at: string | null;
+  }>();
+
+  let failed = 0;
+  let embeddingRepairs = 0;
+  const { enqueueDocumentEmbeddingRepair } = await import('./document-embedding');
+  for (const row of rows.results) {
+    const hasSourceBytes = Boolean(row.r2_key && row.r2_key.trim());
+    const reason = hasSourceBytes
+      ? `stale processing document reaped after ${olderThanMinutes} minutes; source bytes still present, embedding repair queued`
+      : `stale processing document reaped after ${olderThanMinutes} minutes; missing source R2 key`;
+    await env.D1.prepare(
+      `UPDATE documents
+          SET processing_status = 'failed',
+              error_message = ?,
+              custom_fields = json_set(
+                CASE WHEN custom_fields IS NOT NULL AND json_valid(custom_fields)
+                     THEN custom_fields ELSE '{}' END,
+                '$.stale_processing_reaped_at', strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                '$.stale_processing_reason', ?,
+                '$.stale_processing_recoverable', ?
+              ),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND org_id = ? AND processing_status = 'processing'`
+    ).bind(reason, reason, hasSourceBytes ? 1 : 0, row.id, orgId).run();
+    failed++;
+    if (hasSourceBytes) {
+      await enqueueDocumentEmbeddingRepair(env, orgId, row.id, {
+        auditKey: `stale_document_reaper:${row.id}`,
+        priority: 20,
+      });
+      embeddingRepairs++;
+    }
+  }
+
+  if (rows.results.length > 0) {
+    console.warn(
+      `[cron:stale-doc-reaper] org=${orgId} inspected=${rows.results.length} failed=${failed} embedding_repairs=${embeddingRepairs}`
+    );
+  }
+  return { inspected: rows.results.length, failed, embedding_repairs_enqueued: embeddingRepairs };
 }
 
 export async function applyNewsScoreDecay(orgId: string, env: Env): Promise<void> {
@@ -716,6 +825,139 @@ export async function enqueueBackfillDocuments(orgId: string, env: Env): Promise
     console.log(`[daily-cron] enqueued ${enqueued} document embed-retry rows for org ${orgId}`);
   }
   return enqueued;
+}
+
+export async function enqueueDealEvidenceDocumentDetection(
+  orgId: string,
+  env: Env,
+  opts: { limit?: number; daysBack?: number; origin?: string } = {}
+): Promise<{ candidates: number; enqueued: number }> {
+  const limit = Math.max(1, Math.min(100, opts.limit || 50));
+  const daysBack = Math.max(1, Math.min(90, opts.daysBack || 14));
+  const dealDocumentTypes = ['deal_pitch', 'deal_terms', 'deal_financials', 'deal_diligence'];
+  const typePlaceholders = dealDocumentTypes.map(() => '?').join(',');
+  const cutoff = new Date(Date.now() - daysBack * 86400000).toISOString();
+  const rows = await env.D1.prepare(
+    `WITH candidates AS (
+       SELECT DISTINCT d.id AS source_id, d.created_at AS created_at, co.id AS company_id
+         FROM documents d
+         JOIN companies co ON co.id = d.company_id AND co.deleted_at IS NULL
+        WHERE d.org_id = ?
+          AND d.deleted_at IS NULL
+          AND d.processing_status = 'completed'
+          AND d.created_at >= ?
+          AND d.document_type IN (${typePlaceholders})
+          AND d.company_id IS NOT NULL
+          AND COALESCE(co.is_internal_entity, 0) = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM deal_suggestion_evidence e
+             WHERE e.org_id = d.org_id
+               AND e.source_type = 'document'
+               AND e.source_id = d.id
+          )
+       UNION
+       SELECT DISTINCT d.id AS source_id, d.created_at AS created_at, co.id AS company_id
+         FROM documents d
+         JOIN document_links dl ON dl.document_id = d.id
+          AND dl.org_id = d.org_id
+          AND dl.entity_type = 'company'
+          AND dl.deleted_at IS NULL
+         JOIN companies co ON co.id = dl.entity_id AND co.deleted_at IS NULL
+        WHERE d.org_id = ?
+          AND d.deleted_at IS NULL
+          AND d.processing_status = 'completed'
+          AND d.created_at >= ?
+          AND d.document_type IN (${typePlaceholders})
+          AND COALESCE(co.is_internal_entity, 0) = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM deal_suggestion_evidence e
+             WHERE e.org_id = d.org_id
+               AND e.source_type = 'document'
+               AND e.source_id = d.id
+          )
+       UNION
+       SELECT DISTINCT d.id AS source_id, d.created_at AS created_at, co.id AS company_id
+         FROM documents d
+         JOIN conversations c ON c.id = d.conversation_id AND c.org_id = d.org_id
+         JOIN conversation_contacts cc ON cc.conversation_id = c.id
+         JOIN contacts ct ON ct.id = cc.contact_id AND ct.deleted_at IS NULL
+         JOIN companies co ON co.id = ct.company_id AND co.deleted_at IS NULL
+        WHERE d.org_id = ?
+          AND d.deleted_at IS NULL
+          AND d.processing_status = 'completed'
+          AND d.created_at >= ?
+          AND d.document_type IN (${typePlaceholders})
+          AND d.conversation_id IS NOT NULL
+          AND ct.company_id IS NOT NULL
+          AND COALESCE(co.is_internal_entity, 0) = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM deal_suggestion_evidence e
+             WHERE e.org_id = d.org_id
+               AND e.source_type = 'document'
+               AND e.source_id = d.id
+          )
+     )
+     SELECT source_id, company_id
+       FROM candidates
+      ORDER BY created_at DESC
+      LIMIT ?`
+  ).bind(
+    orgId, cutoff, ...dealDocumentTypes,
+    orgId, cutoff, ...dealDocumentTypes,
+    orgId, cutoff, ...dealDocumentTypes,
+    limit
+  ).all<{ source_id: string; company_id: string }>();
+
+  const { enqueueWork } = await import('./work-queue');
+  let enqueued = 0;
+  const detectedAt = new Date().toISOString();
+  for (const row of rows.results) {
+    try {
+      const result = await enqueueWork(
+        env,
+        orgId,
+        'deal_evidence_detect',
+        {
+          source_type: 'document',
+          source_id: row.source_id,
+          company_id: row.company_id,
+          origin: opts.origin || 'document_coverage_scan',
+          detected_at: detectedAt,
+        },
+        {
+          upstream: 'claude',
+          idempotency_key: `${orgId}:document:${row.source_id}:${row.company_id}:deal_evidence_detect:v1`,
+          priority: 20,
+          max_attempts: 5,
+        }
+      );
+      if (result.inserted) enqueued++;
+    } catch (e) {
+      console.error(`[daily-cron:enqueueDealEvidenceDocumentDetection] failed for document ${row.source_id}:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  if (rows.results.length > 0) {
+    const { reportIngestionFailure } = await import('./ingestion-health');
+    await reportIngestionFailure(env, {
+      orgId,
+      source: 'deal_evidence',
+      scopeType: 'org',
+      scopeId: orgId,
+      code: 'deal_detection_coverage_lag',
+      title: 'Deal evidence detection is catching up on documents',
+      message: `${rows.results.length} completed deal-relevant documents have no recorded deal evidence yet.`,
+      severity: 'warning',
+      humanActionRequired: false,
+      metadata: {
+        candidates: rows.results.length,
+        enqueued,
+        days_back: daysBack,
+      },
+    });
+  }
+
+  return { candidates: rows.results.length, enqueued };
 }
 
 /**

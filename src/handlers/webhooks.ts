@@ -9,6 +9,7 @@ import { getOrgDomains, stripHtml } from '../lib/helpers';
 import { getGraphMailboxAuthForUser, graphMailboxUrl } from '../lib/graph-auth';
 import { classifyAndDeduplicate } from '../lib/classification';
 import { processClassifiedItems, persistClassifiedStats } from '../lib/ingestion-shared';
+import { closeSyncJob, openSyncJob } from '../lib/sync-job-lifecycle';
 
 export async function receiveFireflyWebhook(
   request: Request,
@@ -304,30 +305,42 @@ async function processOneNotification(
   // Real sync_jobs row so persistClassifiedStats has a target for the
   // attachments_attempted/processed/failed counters. workflow_type='webhook'
   // is allowed since migration 0062 relaxed the CHECK enum.
-  const jobId = crypto.randomUUID();
-  const startedAt = new Date().toISOString();
-  await env.D1.prepare(
-    `INSERT INTO sync_jobs (id, org_id, workflow_type, status, started_at, metadata)
-     VALUES (?, ?, 'webhook', 'running', ?, ?)`
-  ).bind(
-    jobId, orgId, startedAt,
-    JSON.stringify({
-      subscription_id: notification.subscriptionId,
-      message_id: messageId,
-      user_id: userId,
-    })
-  ).run().catch(e => {
+  let jobId = crypto.randomUUID();
+  let syncJobOpened = false;
+  try {
+    jobId = await openSyncJob(env, {
+      id: jobId,
+      orgId,
+      workflowType: 'webhook',
+      timeoutMinutes: 10,
+      metadata: {
+        phase: 'graph_webhook_message',
+        opened_by: 'receiveOutlookMailWebhook',
+        timeout_policy: '10m_running_window',
+        subscription_id: notification.subscriptionId,
+        message_id: messageId,
+        user_id: userId,
+      },
+    });
+    syncJobOpened = true;
+  } catch (e: any) {
     console.error(`[graph-webhook] sync_jobs insert failed for ${jobId}:`, e?.message || e);
-  });
+  }
 
   try {
     const stats = await processClassifiedItems(classified, { orgId, syncJobId: jobId }, env);
-    await persistClassifiedStats(stats, jobId, env);
+    if (syncJobOpened) await persistClassifiedStats(stats, jobId, env);
 
     const status = stats.errors.length > 0 ? 'partial' : 'completed';
-    await env.D1.prepare(
-      `UPDATE sync_jobs SET status = ?, completed_at = ? WHERE id = ?`
-    ).bind(status, new Date().toISOString(), jobId).run();
+    if (syncJobOpened) {
+      await closeSyncJob(env, jobId, {
+        status,
+        metadata: {
+          phase: 'graph_webhook_message_done',
+          errors: stats.errors.length,
+        },
+      });
+    }
 
     console.log(
       `[graph-webhook] msg="${msg.subject}" user=${userId} ` +
@@ -337,8 +350,15 @@ async function processOneNotification(
     );
   } catch (e: any) {
     console.error(`[graph-webhook] processClassifiedItems failed for msg ${messageId}:`, e?.message || e);
-    await env.D1.prepare(
-      `UPDATE sync_jobs SET status = 'failed', completed_at = ?, error_message = ? WHERE id = ?`
-    ).bind(new Date().toISOString(), String(e?.message || e).slice(0, 500), jobId).run().catch(() => undefined);
+    if (syncJobOpened) {
+      await closeSyncJob(env, jobId, {
+        status: 'failed',
+        errorMessage: String(e?.message || e).slice(0, 500),
+        metadata: {
+          phase: 'graph_webhook_message_failed',
+          reason: 'process_classified_items_failed',
+        },
+      }).catch(() => undefined);
+    }
   }
 }

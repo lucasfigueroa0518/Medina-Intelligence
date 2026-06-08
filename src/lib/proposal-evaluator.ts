@@ -65,9 +65,11 @@ export type ApplyMode =
   | 'overwrite_corroborated' // pending value crossed threshold, promoted
   | 'delete_corroborated';   // Q11: deletion crossed threshold, queued for review
 
+type FieldStateEntityType = 'contact' | 'company' | 'deal' | 'prospect';
+
 export interface ProposalInput {
   orgId: string;
-  entityType: 'contact' | 'company' | 'deal';
+  entityType: FieldStateEntityType;
   entityId: string;
   fieldName: string;
   /** Already a string — caller is responsible for serializing complex
@@ -127,9 +129,10 @@ interface FieldStateRow {
 const DELETION_SENTINEL = '__DELETE__';
 export { DELETION_SENTINEL };
 
-function tableForEntity(t: 'contact' | 'company' | 'deal'): string {
+function tableForEntity(t: FieldStateEntityType): string {
   if (t === 'contact') return 'contacts';
   if (t === 'company') return 'companies';
+  if (t === 'prospect') return 'prospects';
   return 'deals';
 }
 
@@ -636,9 +639,9 @@ export async function evaluateProposal(
         await applySilentCorroboration(state, currentSources, channel, env);
       } else if (decision.applyMode === 'fill_empty') {
         await applyFillEmpty(input, state, pending, channel, env);
-        // entity-index only knows contact/company; deals don't have a
-        // Vectorize index entry to refresh.
-        if (input.entityType !== 'deal') {
+        // entity-index only knows contact/company; deals/prospects don't have
+        // Vectorize index entries to refresh.
+        if (input.entityType === 'contact' || input.entityType === 'company') {
           try { await updateEntityInIndex(input.orgId, input.entityType, input.entityId, env); } catch {}
         }
       }
@@ -688,7 +691,7 @@ export async function evaluateProposal(
 export async function recordApproval(
   params: {
     orgId: string;
-    entityType: 'contact' | 'company' | 'deal';
+    entityType: FieldStateEntityType;
     entityId: string;
     fieldName: string;
     approvedValue: string;
@@ -740,7 +743,7 @@ export async function recordApproval(
 export async function recordApprovalOfDeletion(
   params: {
     orgId: string;
-    entityType: 'contact' | 'company' | 'deal';
+    entityType: FieldStateEntityType;
     entityId: string;
     fieldName: string;
     userId: string | null;
@@ -780,7 +783,7 @@ export async function recordApprovalOfDeletion(
 export async function recordRejection(
   params: {
     orgId: string;
-    entityType: 'contact' | 'company' | 'deal';
+    entityType: FieldStateEntityType;
     entityId: string;
     fieldName: string;
     rejectedValue: string;

@@ -18,6 +18,7 @@ import { preprocessQuery, retrieveContext } from './retrieval';
 import { buildSourcesAndContext, type CitationSource } from './citations';
 import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
 import { canViewerReadConversation, conversationAclSql } from './email-derived-visibility';
+import { isDocumentAccessibleToUser } from './document-acl';
 import { getRagV2SourceFreshness, type RagV2FreshnessRow } from './rag-v2';
 import {
   buildContactSearchQuery,
@@ -26,6 +27,7 @@ import {
   ensureContactSearchIndexReady,
 } from './contact-search';
 import { safelyMaintainContactReadModels } from './contact-maintenance';
+import { cleanProspectSourceText, prospectContextWindow, runProspectReconciliation } from './prospect-intelligence';
 
 export interface AgentToolContext {
   deepDive?: boolean;
@@ -1336,6 +1338,669 @@ export async function searchDeals(
   return { deals, count: deals.length };
 }
 
+function normalizeSectorKey(value: unknown): string | null {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return null;
+  return text.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80) || null;
+}
+
+function parseJsonArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function cleanEvidenceText(value: unknown, max = 4000): string | null {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return text.length > max ? `${text.slice(0, max).trim()}...` : text;
+}
+
+async function readEvidenceR2Text(env: Env, key?: string | null, max = 12000): Promise<string | null> {
+  const normalizedKey = String(key || '').trim();
+  if (!normalizedKey || !env.R2?.get) return null;
+  try {
+    const object = await env.R2.get(normalizedKey);
+    if (!object) return null;
+    const text = await object.text();
+    return text ? text.slice(0, max) : null;
+  } catch {
+    return null;
+  }
+}
+
+function mentionCenteredEvidenceSnippet(sourceText: unknown, rawMention: unknown): string | null {
+  const original = String(sourceText || '');
+  if (!original.trim()) return null;
+  const cleaned = cleanProspectSourceText(original).cleanedText || original;
+  const mention = String(rawMention || '').trim();
+  const haystack = cleaned.toLowerCase();
+  const needle = mention.toLowerCase();
+  const start = needle ? haystack.indexOf(needle) : -1;
+  const excerpt = prospectContextWindow(
+    cleaned,
+    start >= 0 ? start : null,
+    start >= 0 ? start + mention.length : null
+  );
+  return cleanEvidenceText(excerpt);
+}
+
+function prospectStatusFilter(inputStatus: unknown): string[] {
+  if (Array.isArray(inputStatus)) {
+    return inputStatus.map(s => String(s)).filter(Boolean);
+  }
+  const status = String(inputStatus || '').trim();
+  return status ? [status] : ['active', 'converted'];
+}
+
+function canonicalProspectIdSql(alias = 'p'): string {
+  return `COALESCE(${alias}.possible_duplicate_of, ${alias}.id)`;
+}
+
+function prospectAnswerConfidence(row: {
+  confidence?: unknown;
+  provisional?: unknown;
+  direction_uncertain?: unknown;
+  sector_key?: unknown;
+  possible_duplicate_of?: unknown;
+}): 'high' | 'qualified' | 'low' {
+  if (row.possible_duplicate_of) return 'qualified';
+  if (Number(row.provisional || 0) === 1) return 'qualified';
+  if (Number(row.direction_uncertain || 0) === 1) return 'qualified';
+  if (String(row.sector_key || '') === 'uncategorized') return 'qualified';
+  return Number(row.confidence || 0) >= 0.82 ? 'high' : 'low';
+}
+
+async function prospectAnswerQualifiers(
+  ctx: AuthContext,
+  env: Env,
+  options: { daysBack?: number; sector?: string | null } = {}
+): Promise<{
+  unresolved: {
+    provisional_prospects: number;
+    direction_uncertain_prospects: number;
+    uncategorized_prospects: number;
+    possible_duplicate_prospects: number;
+    pending_or_failed_classifications: number;
+    pending_resolutions: number;
+  };
+  coverage: unknown[];
+}> {
+  const prospectWhere: string[] = [
+    'p.org_id = ?',
+    'p.deleted_at IS NULL',
+    "p.status IN ('active','provisional','converted')",
+  ];
+  const prospectBinds: unknown[] = [ctx.orgId];
+  const signalWhere: string[] = ['s.org_id = ?'];
+  const signalBinds: unknown[] = [ctx.orgId];
+  if (options.daysBack && Number.isFinite(options.daysBack)) {
+    const lookback = `-${Math.min(Math.max(Math.floor(options.daysBack), 1), 3650)} days`;
+    prospectWhere.push("p.last_seen_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)");
+    prospectBinds.push(lookback);
+    signalWhere.push("s.occurred_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)");
+    signalBinds.push(lookback);
+  }
+  if (options.sector) {
+    prospectWhere.push('lower(p.sector_key) = ?');
+    prospectBinds.push(options.sector);
+    signalWhere.push('lower(s.sector_key) = ?');
+    signalBinds.push(options.sector);
+  }
+
+  const [prospectState, signalState, coverage] = await Promise.all([
+    env.D1.prepare(
+      `SELECT
+          COUNT(DISTINCT CASE WHEN p.provisional = 1 THEN ${canonicalProspectIdSql('p')} END) AS provisional_prospects,
+          COUNT(DISTINCT CASE WHEN p.direction_uncertain = 1 THEN ${canonicalProspectIdSql('p')} END) AS direction_uncertain_prospects,
+          COUNT(DISTINCT CASE WHEN p.sector_key = 'uncategorized' THEN ${canonicalProspectIdSql('p')} END) AS uncategorized_prospects,
+          COUNT(DISTINCT CASE WHEN p.possible_duplicate_of IS NOT NULL THEN p.id END) AS possible_duplicate_prospects
+         FROM prospects p
+        WHERE ${prospectWhere.join(' AND ')}`
+    ).bind(...prospectBinds).first<any>(),
+    env.D1.prepare(
+      `SELECT
+          SUM(CASE WHEN s.classification_status != 'classified' THEN 1 ELSE 0 END) AS pending_or_failed_classifications,
+          SUM(CASE WHEN s.resolution_status = 'pending' THEN 1 ELSE 0 END) AS pending_resolutions
+         FROM prospect_signals s
+        WHERE ${signalWhere.join(' AND ')}`
+    ).bind(...signalBinds).first<any>(),
+    env.D1.prepare(
+      `SELECT source_family, window_start, window_end, status,
+              items_scanned, signals_recorded, classifications_pending,
+              completed_at
+         FROM prospect_backfill_coverage
+        WHERE org_id = ?
+        ORDER BY window_end DESC, source_family ASC
+        LIMIT 12`
+    ).bind(ctx.orgId).all<any>(),
+  ]);
+
+  return {
+    unresolved: {
+      provisional_prospects: Number(prospectState?.provisional_prospects || 0),
+      direction_uncertain_prospects: Number(prospectState?.direction_uncertain_prospects || 0),
+      uncategorized_prospects: Number(prospectState?.uncategorized_prospects || 0),
+      possible_duplicate_prospects: Number(prospectState?.possible_duplicate_prospects || 0),
+      pending_or_failed_classifications: Number(signalState?.pending_or_failed_classifications || 0),
+      pending_resolutions: Number(signalState?.pending_resolutions || 0),
+    },
+    coverage: coverage.results || [],
+  };
+}
+
+async function prospectContextSignalSummary(
+  ctx: AuthContext,
+  env: Env,
+  options: { daysBack?: number; sector?: string | null } = {}
+): Promise<Array<{ mention_type: string; source_type: string; signal_count: number; source_count: number }>> {
+  const where: string[] = [
+    's.org_id = ?',
+    `(
+      json_extract(s.metadata_json, '$.prospect_action') = 'record_context'
+      OR (
+        json_extract(s.metadata_json, '$.prospect_action') IS NULL
+        AND s.mention_type IN ('intro_source','news','noise','web_analytics')
+      )
+    )`,
+    "COALESCE(json_extract(s.metadata_json, '$.prospect_action'), '') != 'ignore'",
+  ];
+  const binds: unknown[] = [ctx.orgId];
+  if (options.daysBack && Number.isFinite(options.daysBack)) {
+    const lookback = `-${Math.min(Math.max(Math.floor(options.daysBack), 1), 3650)} days`;
+    where.push("s.occurred_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)");
+    binds.push(lookback);
+  }
+  if (options.sector) {
+    where.push('lower(s.sector_key) = ?');
+    binds.push(options.sector);
+  }
+  const rows = await env.D1.prepare(
+    `SELECT s.mention_type, s.source_type,
+            COUNT(*) AS signal_count,
+            COUNT(DISTINCT s.source_id) AS source_count
+       FROM prospect_signals s
+      WHERE ${where.join(' AND ')}
+      GROUP BY s.mention_type, s.source_type
+      ORDER BY signal_count DESC, s.mention_type ASC, s.source_type ASC`
+  ).bind(...binds).all<any>();
+  return rows.results || [];
+}
+
+export async function searchProspects(
+  ctx: AuthContext,
+  input: {
+    keyword?: string;
+    sector?: string;
+    status?: string | string[];
+    enrichment_priority?: 'eager' | 'lazy';
+    limit?: number;
+  },
+  env: Env,
+  toolContext: AgentToolContext = {}
+): Promise<any> {
+  const where: string[] = ['p.org_id = ?', 'p.deleted_at IS NULL'];
+  const binds: unknown[] = [ctx.orgId];
+
+  const statuses = prospectStatusFilter(input.status);
+  if (statuses.length > 0) {
+    where.push(`p.status IN (${statuses.map(() => '?').join(',')})`);
+    binds.push(...statuses);
+  }
+  if (input.status == null) {
+    where.push('p.provisional = 0');
+    where.push('p.direction_uncertain = 0');
+  }
+
+  const keyword = cleanTerm(input.keyword);
+  if (keyword) {
+    where.push('(lower(p.canonical_name) LIKE ? OR lower(COALESCE(p.domain, \'\')) LIKE ?)');
+    binds.push(`%${keyword}%`, `%${keyword}%`);
+  }
+
+  const sector = normalizeSectorKey(input.sector);
+  if (sector) {
+    where.push('(lower(p.sector_key) = ? OR lower(COALESCE(ps.label, \'\')) = ?)');
+    binds.push(sector, sector.replace(/_/g, ' '));
+  }
+
+  if (input.enrichment_priority === 'eager' || input.enrichment_priority === 'lazy') {
+    where.push('p.enrichment_priority = ?');
+    binds.push(input.enrichment_priority);
+  }
+
+  const limit = structuredLimit(input.limit, toolContext);
+  const rows = await env.D1.prepare(
+    `SELECT p.id, p.canonical_name, p.domain, p.status, p.visibility,
+            p.sector_key, ps.label AS sector_label, p.sector_confidence,
+            p.signal_count, p.evidence_count, p.first_seen_at, p.last_seen_at,
+            p.last_signal_at, p.signal_strength, p.signal_strength_reasons,
+            p.enrichment_priority, p.enrichment_status, p.confidence,
+            p.provisional, p.direction_uncertain, p.possible_duplicate_of,
+            p.possible_company_id, p.possible_deal_id,
+            c.name AS possible_company_name, d.title AS possible_deal_title
+      FROM prospects p
+       LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
+       LEFT JOIN companies c ON c.id = p.possible_company_id
+       LEFT JOIN deals d ON d.id = p.possible_deal_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY p.last_seen_at DESC NULLS LAST, p.signal_strength DESC, p.canonical_name ASC
+      LIMIT ?`
+  ).bind(...binds, limit).all<any>();
+
+  const qualifiers = await prospectAnswerQualifiers(ctx, env, { sector });
+  const prospects = (rows.results || []).map(row => ({
+    ...row,
+    canonical_prospect_id: row.possible_duplicate_of || row.id,
+    provisional: row.provisional === 1,
+    direction_uncertain: row.direction_uncertain === 1,
+    signal_strength_reasons: parseJsonArray(row.signal_strength_reasons),
+    answer_confidence: prospectAnswerConfidence(row),
+  }));
+
+  return {
+    prospects,
+    count: prospects.length,
+    sort: 'last_seen_at_desc_then_signal_strength_desc',
+    qualifiers,
+    acl_note: 'Prospect identity and aggregate metadata are firm-visible for the org. Raw snippets are only returned by get_prospect_evidence after source ACL checks.',
+    coverage_note: 'Counts are dedup-aware where an explicit possible_duplicate_of exists; unresolved classifier/reconciler states are exposed in qualifiers.',
+  };
+}
+
+export async function queryDealFlow(
+  ctx: AuthContext,
+  input: {
+    days_back?: number;
+    sector?: string;
+    include_provisional?: boolean;
+    include_context?: boolean;
+    limit?: number;
+  },
+  env: Env
+): Promise<any> {
+  const where: string[] = ['p.org_id = ?', 'p.deleted_at IS NULL', "p.status IN ('active','provisional','converted')"];
+  const binds: unknown[] = [ctx.orgId];
+  const daysBack = typeof input.days_back === 'number' && Number.isFinite(input.days_back)
+    ? Math.min(Math.max(Math.floor(input.days_back), 1), 3650)
+    : 180;
+  where.push("p.last_seen_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)");
+  binds.push(`-${daysBack} days`);
+
+  const includeProvisional = input.include_provisional === true;
+  const includeContext = input.include_context === true;
+  if (!includeProvisional) {
+    where.push('p.provisional = 0');
+    where.push('p.direction_uncertain = 0');
+  }
+
+  const sector = normalizeSectorKey(input.sector);
+  if (sector) {
+    where.push('(lower(p.sector_key) = ? OR lower(COALESCE(ps.label, \'\')) = ?)');
+    binds.push(sector, sector.replace(/_/g, ' '));
+  }
+
+  const whereSql = where.join(' AND ');
+  const limit = Math.min(Math.max(Number(input.limit || 20), 1), 100);
+  const [totalRow, bySector, byPriority, bySource, recent, coverage, qualifiers, contextSignals] = await Promise.all([
+    env.D1.prepare(`SELECT COUNT(DISTINCT ${canonicalProspectIdSql('p')}) AS total FROM prospects p LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key WHERE ${whereSql}`).bind(...binds).first<{ total: number }>(),
+    env.D1.prepare(
+      `SELECT p.sector_key, COALESCE(ps.label, p.sector_key) AS sector_label, COUNT(DISTINCT ${canonicalProspectIdSql('p')}) AS total
+         FROM prospects p
+         LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
+        WHERE ${whereSql}
+        GROUP BY p.sector_key, sector_label
+        ORDER BY total DESC, sector_label ASC`
+    ).bind(...binds).all<any>(),
+    env.D1.prepare(
+      `SELECT p.enrichment_priority, COUNT(DISTINCT ${canonicalProspectIdSql('p')}) AS total
+         FROM prospects p
+         LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
+        WHERE ${whereSql}
+        GROUP BY p.enrichment_priority
+        ORDER BY p.enrichment_priority ASC`
+    ).bind(...binds).all<any>(),
+    env.D1.prepare(
+      `SELECT s.source_type, COUNT(*) AS signal_count, COUNT(DISTINCT ${canonicalProspectIdSql('p')}) AS prospect_count
+         FROM prospect_signals s
+         JOIN prospects p ON p.id = s.prospect_id
+         LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
+        WHERE ${whereSql.replace(/\bp\./g, 'p.')}
+          AND s.mention_type IN ('inbound_prospect','known_deal')
+        GROUP BY s.source_type
+        ORDER BY signal_count DESC`
+    ).bind(...binds).all<any>(),
+    env.D1.prepare(
+      `SELECT p.id, p.canonical_name, p.sector_key, COALESCE(ps.label, p.sector_key) AS sector_label,
+              p.last_seen_at, p.signal_count, p.signal_strength, p.enrichment_priority,
+              p.confidence, p.provisional, p.direction_uncertain, p.possible_duplicate_of
+         FROM prospects p
+         LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
+        WHERE ${whereSql}
+        ORDER BY p.last_seen_at DESC NULLS LAST, p.signal_strength DESC
+        LIMIT ?`
+    ).bind(...binds, limit).all<any>(),
+    env.D1.prepare(
+	      `SELECT source_family, MIN(window_start) AS earliest_window_start,
+	              MAX(window_end) AS latest_window_end,
+	              SUM(items_scanned) AS items_scanned,
+	              SUM(signals_recorded) AS signals_recorded,
+	              SUM(classifications_pending) AS classifications_pending,
+	              MAX(completed_at) AS latest_completed_at
+	         FROM prospect_backfill_coverage
+        WHERE org_id = ?
+        GROUP BY source_family`
+    ).bind(ctx.orgId).all<any>(),
+    prospectAnswerQualifiers(ctx, env, { daysBack, sector }),
+    includeContext ? prospectContextSignalSummary(ctx, env, { daysBack, sector }) : Promise.resolve(null),
+  ]);
+
+  return {
+    total_prospects: totalRow?.total || 0,
+    by_sector: bySector.results || [],
+    by_enrichment_priority: byPriority.results || [],
+    by_source: bySource.results || [],
+    context_signals: includeContext ? (contextSignals || []) : null,
+    recent_prospects: (recent.results || []).map(row => ({
+      ...row,
+      canonical_prospect_id: row.possible_duplicate_of || row.id,
+      provisional: row.provisional === 1,
+      direction_uncertain: row.direction_uncertain === 1,
+      answer_confidence: prospectAnswerConfidence(row),
+    })),
+    qualifiers: {
+      days_back: daysBack,
+      include_provisional: includeProvisional,
+      include_context: includeContext,
+      sector_filter: sector || null,
+      sort: 'recency_then_signal_strength',
+      dedup: 'COUNT(DISTINCT COALESCE(possible_duplicate_of, id))',
+      source_content_acl: 'Aggregate counts are firm-visible and identical across users in the org. Evidence snippets are filtered by get_prospect_evidence.',
+      unresolved: qualifiers.unresolved,
+      coverage: coverage.results || [],
+      coverage_windows_sampled: qualifiers.coverage,
+    },
+  };
+}
+
+export async function getProspectDigest(
+  ctx: AuthContext,
+  input: {
+    days_back?: number;
+    sector?: string;
+    include_context?: boolean;
+    limit?: number;
+  },
+  env: Env,
+  toolContext: AgentToolContext = {}
+): Promise<any> {
+  const daysBack = typeof input.days_back === 'number' && Number.isFinite(input.days_back)
+    ? Math.min(Math.max(Math.floor(input.days_back), 1), 3650)
+    : 14;
+  const sector = normalizeSectorKey(input.sector);
+  const where: string[] = [
+    'p.org_id = ?',
+    'p.deleted_at IS NULL',
+    "p.status IN ('active','provisional','converted')",
+    'p.provisional = 0',
+    'p.direction_uncertain = 0',
+    "p.last_seen_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)",
+  ];
+  const binds: unknown[] = [ctx.orgId, `-${daysBack} days`];
+  if (sector) {
+    where.push('(lower(p.sector_key) = ? OR lower(COALESCE(ps.label, \'\')) = ?)');
+    binds.push(sector, sector.replace(/_/g, ' '));
+  }
+
+  const limit = structuredLimit(input.limit, toolContext);
+  const [rows, flow, qualifiers] = await Promise.all([
+    env.D1.prepare(
+      `SELECT p.id, p.canonical_name, p.domain, p.sector_key, COALESCE(ps.label, p.sector_key) AS sector_label,
+              p.last_seen_at, p.signal_count, p.signal_strength, p.signal_strength_reasons,
+              p.enrichment_priority, p.confidence, p.provisional, p.direction_uncertain,
+              p.possible_duplicate_of, p.possible_company_id, p.possible_deal_id
+         FROM prospects p
+         LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
+        WHERE ${where.join(' AND ')}
+        ORDER BY p.signal_strength DESC, p.last_seen_at DESC NULLS LAST
+        LIMIT ?`
+    ).bind(...binds, limit).all<any>(),
+    queryDealFlow(ctx, {
+      days_back: daysBack,
+      sector: sector || undefined,
+      include_context: input.include_context === true,
+      limit: 5,
+    }, env),
+    prospectAnswerQualifiers(ctx, env, { daysBack, sector }),
+  ]);
+
+  const prospects = (rows.results || []).map(row => ({
+    ...row,
+    canonical_prospect_id: row.possible_duplicate_of || row.id,
+    provisional: row.provisional === 1,
+    direction_uncertain: row.direction_uncertain === 1,
+    signal_strength_reasons: parseJsonArray(row.signal_strength_reasons),
+    answer_confidence: prospectAnswerConfidence(row),
+  }));
+
+  return {
+    days_back: daysBack,
+    sector_filter: sector || null,
+    headline_counts: {
+      total_prospects: flow.total_prospects,
+      by_sector: flow.by_sector,
+      by_enrichment_priority: flow.by_enrichment_priority,
+    },
+    context_signals: flow.context_signals,
+    prospects,
+    qualifiers,
+    marty_guidance: 'When unresolved counts are non-zero, qualify summaries with pending/provisional/direction-uncertain state rather than presenting the digest as exhaustive truth.',
+    acl_note: 'Digest prospect metadata is firm-visible; call get_prospect_evidence before citing raw source details.',
+  };
+}
+
+export async function runProspectCleanupPassTool(
+  ctx: AuthContext,
+  _input: Record<string, never> | undefined,
+  env: Env
+): Promise<any> {
+  if (!['owner', 'admin', 'super_admin'].includes(ctx.userRole)) {
+    return {
+      error: 'AUTH_FORBIDDEN',
+      message: 'Only admins or owners can run the deterministic prospect cleanup pass.',
+    };
+  }
+  const reconciliation = await runProspectReconciliation(ctx.orgId, env);
+  return {
+    success: true,
+    mode: 'deterministic_reconciler',
+    queue_used: false,
+    reconciliation,
+  };
+}
+
+async function canReadEventEvidence(ctx: AuthContext, eventId: string, env: Env): Promise<boolean> {
+  if (hasOrgWidePrivateDataAccess(ctx.userRole)) return true;
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+  const readableUserIds = [ctx.userId, ...Object.keys(sharingFlags).filter(id => id !== ctx.userId)];
+  if (readableUserIds.length === 0) return false;
+  const ph = readableUserIds.map(() => '?').join(',');
+  const row = await env.D1.prepare(
+    `SELECT 1 AS ok FROM event_attendees
+      WHERE event_id = ? AND user_id IN (${ph})
+      LIMIT 1`
+  ).bind(eventId, ...readableUserIds).first<{ ok: number }>();
+  return !!row?.ok;
+}
+
+async function hydrateProspectEvidenceRow(
+  ctx: AuthContext,
+  signal: any,
+  env: Env,
+  sharingFlags: Record<string, boolean>
+): Promise<any> {
+  const base = {
+    signal_id: signal.id,
+    source_type: signal.source_type,
+    source_id: signal.source_id,
+    source_title: signal.source_title,
+    occurred_at: signal.occurred_at,
+    signal_kind: signal.signal_kind,
+    raw_mention_text: signal.raw_mention_text,
+    mention_type: signal.mention_type,
+    direction: signal.direction,
+    confidence: signal.confidence,
+    confidence_tier: signal.confidence_tier,
+    classification_status: signal.classification_status,
+    resolution_status: signal.resolution_status,
+    direction_uncertain: signal.direction_uncertain === 1,
+    can_read_content: false,
+    snippet: null as string | null,
+    placeholder: null as string | null,
+  };
+
+  if (signal.source_type === 'conversation') {
+    const row = await env.D1.prepare(
+      `SELECT c.id, c.source, c.subject, c.from_email, c.sent_at, c.body_preview,
+              c.body_r2_key, c.participant_user_ids, c.is_campaign_email,
+              sc.is_private AS slack_is_private
+         FROM conversations c
+         LEFT JOIN slack_channels sc
+           ON c.source = 'slack'
+          AND sc.org_id = c.org_id
+          AND sc.channel_id = CASE
+            WHEN instr(c.external_message_id, ':') > 0
+            THEN substr(c.external_message_id, 1, instr(c.external_message_id, ':') - 1)
+            ELSE c.external_message_id
+          END
+        WHERE c.id = ? AND c.org_id = ?`
+    ).bind(signal.source_id, ctx.orgId).first<any>();
+    if (!row) return { ...base, placeholder: 'Source conversation not found or no longer available.' };
+    const canRead = canReadConversationContent(row, ctx.userId, ctx.userRole, sharingFlags);
+    const sourceText = canRead
+      ? await readEvidenceR2Text(env, row.body_r2_key) || row.body_preview
+      : null;
+    return {
+      ...base,
+      source_title: row.subject || base.source_title,
+      occurred_at: row.sent_at || base.occurred_at,
+      source_subtype: row.source,
+      can_read_content: canRead,
+      snippet: canRead ? mentionCenteredEvidenceSnippet(sourceText, signal.raw_mention_text) : null,
+      placeholder: canRead ? null : 'Private conversation evidence hidden for this viewer.',
+    };
+  }
+
+  if (signal.source_type === 'event') {
+    const row = await env.D1.prepare(
+      `SELECT id, title, event_type, start_time, source, description, summary,
+              transcript_r2_key
+         FROM events
+        WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    ).bind(signal.source_id, ctx.orgId).first<any>();
+    if (!row) return { ...base, placeholder: 'Source event not found or no longer available.' };
+    const canRead = await canReadEventEvidence(ctx, signal.source_id, env);
+    const sourceText = canRead
+      ? await readEvidenceR2Text(env, row.transcript_r2_key) || row.summary || row.description
+      : null;
+    return {
+      ...base,
+      source_title: row.title || base.source_title,
+      occurred_at: row.start_time || base.occurred_at,
+      source_subtype: row.event_type,
+      has_transcript: !!row.transcript_r2_key,
+      can_read_content: canRead,
+      snippet: canRead ? mentionCenteredEvidenceSnippet(sourceText, signal.raw_mention_text) : null,
+      placeholder: canRead ? null : 'Private meeting evidence hidden for this viewer.',
+    };
+  }
+
+  if (signal.source_type === 'document') {
+    const row = await env.D1.prepare(
+      `SELECT id, title, document_type, source, visibility, participant_user_ids,
+              uploaded_by, extracted_text_preview, created_at
+         FROM documents
+        WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    ).bind(signal.source_id, ctx.orgId).first<any>();
+    if (!row) return { ...base, placeholder: 'Source document not found or no longer available.' };
+    const sharingSet = new Set(Object.keys(sharingFlags));
+    const canRead = isDocumentAccessibleToUser(row, ctx.userId, ctx.userRole, sharingSet);
+    return {
+      ...base,
+      source_title: row.title || base.source_title,
+      occurred_at: row.created_at || base.occurred_at,
+      source_subtype: row.document_type || row.source,
+      can_read_content: canRead,
+      snippet: canRead ? mentionCenteredEvidenceSnippet(row.extracted_text_preview, signal.raw_mention_text) : null,
+      placeholder: canRead ? null : 'Private document evidence hidden for this viewer.',
+    };
+  }
+
+  return { ...base, placeholder: 'Unsupported source type for evidence hydration.' };
+}
+
+export async function getProspectEvidence(
+  ctx: AuthContext,
+  input: { prospect_id: string; limit?: number },
+  env: Env,
+  toolContext: AgentToolContext = {}
+): Promise<any> {
+  if (!input.prospect_id) return { error: 'PROSPECT_ID_REQUIRED', message: 'Provide prospect_id.' };
+  const prospect = await env.D1.prepare(
+    `SELECT p.id, p.canonical_name, p.status, p.sector_key, COALESCE(ps.label, p.sector_key) AS sector_label,
+            p.signal_count, p.signal_strength, p.signal_strength_reasons, p.enrichment_priority,
+            p.confidence, p.provisional, p.direction_uncertain, p.possible_duplicate_of
+       FROM prospects p
+       LEFT JOIN prospect_sectors ps ON ps.key = p.sector_key
+      WHERE p.id = ? AND p.org_id = ? AND p.deleted_at IS NULL`
+  ).bind(input.prospect_id, ctx.orgId).first<any>();
+  if (!prospect) return { error: 'PROSPECT_NOT_FOUND', message: 'Prospect not found in your org.' };
+
+  const limit = structuredLimit(input.limit, toolContext);
+  const signals = await env.D1.prepare(
+    `SELECT id, source_type, source_id, source_title, occurred_at, signal_kind,
+            raw_mention_text, mention_type, direction, confidence, confidence_tier,
+            classification_status, resolution_status, direction_uncertain
+       FROM prospect_signals
+      WHERE org_id = ? AND prospect_id = ?
+      ORDER BY occurred_at DESC, confidence DESC
+      LIMIT ?`
+  ).bind(ctx.orgId, input.prospect_id, limit).all<any>();
+
+  const sharingFlags = await getSharingFlags(ctx.orgId, env);
+  const evidence: any[] = [];
+  for (const signal of signals.results || []) {
+    evidence.push(await hydrateProspectEvidenceRow(ctx, signal, env, sharingFlags));
+  }
+  const restrictedEvidenceCount = evidence.filter(row => !row.can_read_content).length;
+  const statusCounts = (signals.results || []).reduce((acc: Record<string, number>, signal: any) => {
+    const key = `${signal.classification_status || 'unknown'}:${signal.resolution_status || 'unknown'}`;
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+
+  return {
+    prospect: {
+      ...prospect,
+      signal_strength_reasons: parseJsonArray(prospect.signal_strength_reasons),
+    },
+    evidence,
+    count: evidence.length,
+    restricted_evidence_count: restrictedEvidenceCount,
+    coverage: {
+      returned_signals: evidence.length,
+      status_counts: statusCounts,
+      answer_confidence: prospectAnswerConfidence(prospect),
+    },
+    acl_note: 'Prospect identity and counts are firm-visible; source snippets are redacted per conversation/event/document ACL.',
+  };
+}
+
 // recall — semantic retrieval tool exposed to MARTy for in-loop information
 // gathering. Routes through preprocessQuery + retrieveContext + the citations
 // hydrator, then optionally post-filters by source.type.
@@ -2326,6 +2991,15 @@ export async function deleteEntityTool(
 // Phase 2 — additional MARTy write tools
 // ────────────────────────────────────────────────────────────────────
 
+type FieldStateToolEntityType = 'contact' | 'company' | 'deal' | 'prospect';
+
+const FIELD_STATE_ENTITY_TABLES: Record<FieldStateToolEntityType, string> = {
+  contact: 'contacts',
+  company: 'companies',
+  deal: 'deals',
+  prospect: 'prospects',
+};
+
 // Field deletions — set the entity column to NULL. User explicitly
 // asked via natural-language ("clear Tony's email") so this is direct
 // (no held-proposal queue). Routes through entity-writes.ts which
@@ -2626,7 +3300,7 @@ export async function dismissObservationTool(
 export async function approveHeldProposalTool(
   ctx: AuthContext,
   input: {
-    entity_type: 'contact' | 'company' | 'deal';
+    entity_type: FieldStateToolEntityType;
     entity_id: string;
     field_name: string;
     value?: string;
@@ -2642,8 +3316,7 @@ export async function approveHeldProposalTool(
   // clicking Approve in the held-proposals UI.
   const { recordApproval, recordApprovalOfDeletion } = await import('./proposal-evaluator');
   const { invalidateRagCache } = await import('./cache');
-  const tableMap: Record<string, string> = { contact: 'contacts', company: 'companies', deal: 'deals' };
-  const table = tableMap[input.entity_type];
+  const table = FIELD_STATE_ENTITY_TABLES[input.entity_type];
   if (!table) return { error: 'invalid entity_type' };
   const ownerCheck = await env.D1.prepare(
     `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
@@ -2682,7 +3355,7 @@ export async function approveHeldProposalTool(
 export async function dismissHeldProposalTool(
   ctx: AuthContext,
   input: {
-    entity_type: 'contact' | 'company' | 'deal';
+    entity_type: FieldStateToolEntityType;
     entity_id: string;
     field_name: string;
     value?: string;
@@ -2691,8 +3364,7 @@ export async function dismissHeldProposalTool(
   env: Env
 ): Promise<any> {
   const { recordRejection } = await import('./proposal-evaluator');
-  const tableMap: Record<string, string> = { contact: 'contacts', company: 'companies', deal: 'deals' };
-  const table = tableMap[input.entity_type];
+  const table = FIELD_STATE_ENTITY_TABLES[input.entity_type];
   if (!table) return { error: 'invalid entity_type' };
   const ownerCheck = await env.D1.prepare(
     `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
@@ -2714,7 +3386,7 @@ export async function dismissHeldProposalTool(
 
 export async function lockFieldPermanentlyTool(
   ctx: AuthContext,
-  input: { entity_type: 'contact' | 'company' | 'deal'; entity_id: string; field_name: string },
+  input: { entity_type: FieldStateToolEntityType; entity_id: string; field_name: string },
   env: Env
 ): Promise<any> {
   return setFieldLockHelper(ctx, input.entity_type, input.entity_id, input.field_name, true, env);
@@ -2722,7 +3394,7 @@ export async function lockFieldPermanentlyTool(
 
 export async function unlockFieldTool(
   ctx: AuthContext,
-  input: { entity_type: 'contact' | 'company' | 'deal'; entity_id: string; field_name: string },
+  input: { entity_type: FieldStateToolEntityType; entity_id: string; field_name: string },
   env: Env
 ): Promise<any> {
   return setFieldLockHelper(ctx, input.entity_type, input.entity_id, input.field_name, false, env);
@@ -2730,15 +3402,14 @@ export async function unlockFieldTool(
 
 async function setFieldLockHelper(
   ctx: AuthContext,
-  entityType: 'contact' | 'company' | 'deal',
+  entityType: FieldStateToolEntityType,
   entityId: string,
   fieldName: string,
   locked: boolean,
   env: Env
 ): Promise<any> {
   if (ctx.userRole !== 'owner') return { error: 'Owner role required to lock/unlock fields.' };
-  const tableMap: Record<string, string> = { contact: 'contacts', company: 'companies', deal: 'deals' };
-  const table = tableMap[entityType];
+  const table = FIELD_STATE_ENTITY_TABLES[entityType];
   const ownerCheck = await env.D1.prepare(
     `SELECT id FROM ${table} WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
   ).bind(entityId, ctx.orgId).first<{ id: string }>();
@@ -2788,6 +3459,7 @@ export const __agentToolsTestHooks = {
   cleanEventText,
   conversationLookbackDays,
   conversationSearchCteSql,
+  prospectStatusFilter,
   shouldCheckSlackFreshness,
   shouldUseSlackFreshnessFallback,
   shouldUseDeterministicSlackRecentFallback,

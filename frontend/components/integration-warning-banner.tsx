@@ -37,6 +37,22 @@ function displayMessage(w: Warning): string {
   return w.message;
 }
 
+function incidentDetail(w: Warning): string {
+  if (!w.human_action_required) {
+    return `Automatic repair is ${w.recovery_status === 'repair_queued' || w.recovery_status === 'repairing' ? 'queued' : 'active'} for the affected window.`;
+  }
+  if (w.source === 'outlook_email' || w.source === 'calendar') {
+    return 'Admin configuration is required. Automatic repair will run after Graph access is healthy.';
+  }
+  if (w.source === 'slack') {
+    return 'Slack app configuration is required before automatic repair can continue.';
+  }
+  if (w.source === 'firefly') {
+    return 'Fireflies configuration is required before automatic repair can continue.';
+  }
+  return 'Admin review is required. Open System Status for details.';
+}
+
 export function IntegrationWarningBanner() {
   const { warnings } = useAuthSession();
   const [outlookLastSync, setOutlookLastSync] = React.useState<string | null>(null);
@@ -83,9 +99,7 @@ export function IntegrationWarningBanner() {
 	              <span>{displayMessage(w)}</span>
 	              {isIncident && (
 	                <span className="block mt-1 text-xs text-text-secondary">
-	                  {w.human_action_required
-	                    ? 'Admin configuration is required. Automatic repair will run after Graph access is healthy.'
-	                    : `Automatic repair is ${w.recovery_status === 'repair_queued' || w.recovery_status === 'repairing' ? 'queued' : 'active'} for the affected window.`}
+	                  {incidentDetail(w)}
 	                </span>
 	              )}
 	              {!isIncident && backfillPrompt && (
