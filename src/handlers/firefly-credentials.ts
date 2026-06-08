@@ -24,10 +24,47 @@ import {
   storeFireflyKey,
   revokeFireflyKey,
   getFireflyKeyStatus,
+  getFireflyKey,
 } from '../lib/firefly-credentials';
 
 interface StoreBody {
   api_key?: string;
+}
+
+interface InternalGetBody {
+  user_id?: string;
+}
+
+/**
+ * POST /internal/firefly-credential
+ *
+ * Service-binding-only fallback for the pipelines worker. The API worker owns
+ * the original credential encryption key, so pipelines can ask API to decrypt
+ * a Fireflies key without rotating the whole token store. Protected by a
+ * shared Worker secret and never exposed to browser CORS.
+ */
+export async function getInternalFireflyCredential(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const expected = env.PIPELINES_INTERNAL_TOKEN;
+  const supplied = request.headers.get('X-Medina-Internal-Token');
+  if (!expected || supplied !== expected) {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'internal token required');
+  }
+
+  const body = await parseJsonBody<InternalGetBody>(request);
+  const userId = body?.user_id?.trim();
+  if (!userId) {
+    return errorResponse('VALIDATION_ERROR', 400, 'user_id is required');
+  }
+
+  const apiKey = await getFireflyKey(userId, env);
+  if (!apiKey) {
+    return errorResponse('NOT_FOUND', 404, 'no usable Fireflies credential');
+  }
+
+  return jsonResponse({ api_key: apiKey });
 }
 
 /**

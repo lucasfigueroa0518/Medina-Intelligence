@@ -141,6 +141,10 @@ crons = [
   "* * * * *",
 ]
 
+[[services]]
+binding = "API"
+service = "medina-ventures-api"
+
 # --- Queues ---
 #
 # Phase 8 (2026-05-06) deploy-time finding: CF Queues allow ONLY ONE

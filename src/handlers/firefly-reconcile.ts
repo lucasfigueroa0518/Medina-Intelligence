@@ -6,6 +6,15 @@ import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { reconcileFireflyToOutlook } from '../lib/reconciliation';
 import { getGraphMailboxAuthForUser, graphMailboxUrl } from '../lib/graph-auth';
+import {
+  createFireflyProgressiveBackfillRange,
+  MAX_BACKFILL_DAYS,
+} from '../lib/firefly-progressive-backfill';
+import {
+  getFireflyKeyStatus,
+  listFireflyKeyStatuses,
+} from '../lib/firefly-credentials';
+import { sixCalendarMonthsRange } from '../lib/firefly-transcript-rebuild';
 
 interface ReconcileBody {
   dry_run?: boolean;
@@ -231,4 +240,303 @@ export async function handleClearCalendarDelta(
   const userId = body.user_id || ctx.userId;
   await env.KV.delete(`calendar_delta:${userId}`);
   return jsonResponse({ ok: true, cleared: `calendar_delta:${userId}` });
+}
+
+function canOperateTranscriptRebuild(ctx: AuthContext): boolean {
+  return ctx.userRole === 'owner' || ctx.userRole === 'super_admin';
+}
+
+function virtualOutlookPredicate(alias = 'e'): string {
+  return `(
+    lower(coalesce(${alias}.location,'') || ' ' || coalesce(${alias}.description,'') || ' ' || coalesce(${alias}.title,'')) LIKE '%zoom%'
+    OR lower(coalesce(${alias}.location,'') || ' ' || coalesce(${alias}.description,'') || ' ' || coalesce(${alias}.title,'')) LIKE '%teams%'
+    OR lower(coalesce(${alias}.location,'') || ' ' || coalesce(${alias}.description,'') || ' ' || coalesce(${alias}.title,'')) LIKE '%google meet%'
+    OR lower(coalesce(${alias}.location,'') || ' ' || coalesce(${alias}.description,'') || ' ' || coalesce(${alias}.title,'')) LIKE '%meet.google%'
+    OR lower(coalesce(${alias}.location,'') || ' ' || coalesce(${alias}.description,'') || ' ' || coalesce(${alias}.title,'')) LIKE '%webex%'
+    OR lower(coalesce(${alias}.location,'') || ' ' || coalesce(${alias}.description,'') || ' ' || coalesce(${alias}.title,'')) LIKE '%online meeting%'
+    OR lower(coalesce(${alias}.location,'') || ' ' || coalesce(${alias}.description,'') || ' ' || coalesce(${alias}.title,'')) LIKE '%join meeting%'
+  )`;
+}
+
+function rangeFromCoverageUrl(url: URL): { startDate: string; endDate: string } {
+  const explicitStart = url.searchParams.get('start_date');
+  const explicitEnd = url.searchParams.get('end_date');
+  if (explicitStart && explicitEnd && !isNaN(Date.parse(explicitStart)) && !isNaN(Date.parse(explicitEnd))) {
+    return { startDate: new Date(explicitStart).toISOString(), endDate: new Date(explicitEnd).toISOString() };
+  }
+  const months = Math.min(Math.max(Number(url.searchParams.get('months') || 6), 1), 6);
+  const now = new Date();
+  const start = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth() - months,
+    now.getUTCDate(),
+    now.getUTCHours(),
+    now.getUTCMinutes(),
+    now.getUTCSeconds(),
+    now.getUTCMilliseconds()
+  ));
+  return { startDate: start.toISOString(), endDate: now.toISOString() };
+}
+
+/**
+ * GET /api/admin/firefly-transcript-coverage?months=6&user_id=...
+ *
+ * Owner-only transcript rebuild telemetry. Separates source transcripts,
+ * Outlook attachment, embedding, queue health, and missing credentials.
+ */
+export async function handleFireflyTranscriptCoverage(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (!canOperateTranscriptRebuild(ctx)) {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can inspect Fireflies transcript coverage.');
+  }
+
+  const url = new URL(request.url);
+  const userId = url.searchParams.get('user_id');
+  const { startDate, endDate } = rangeFromCoverageUrl(url);
+  const userFilter = userId
+    ? `AND EXISTS (SELECT 1 FROM event_attendees ea WHERE ea.event_id = e.id AND ea.user_id = ?)`
+    : '';
+  const userBinds = userId ? [userId] : [];
+
+  const [users, virtualOutlook, transcriptOutlook, transcriptItems, links, embedding, queued, jobs, failures, keyStatuses] =
+    await Promise.all([
+      env.D1.prepare(
+        `SELECT u.id, u.email, u.full_name, u.role,
+                CASE WHEN c.user_id IS NULL THEN 0 ELSE 1 END AS has_firefly_key,
+                c.created_at AS firefly_key_created_at,
+                c.last_used_at AS firefly_key_last_used_at
+           FROM users u
+           LEFT JOIN user_firefly_credentials c ON c.user_id = u.id
+          WHERE u.org_id = ? AND u.deleted_at IS NULL
+          ORDER BY u.email`
+      ).bind(ctx.orgId).all<Record<string, unknown>>(),
+      env.D1.prepare(
+        `SELECT COUNT(DISTINCT e.id) AS n
+           FROM events e
+          WHERE e.org_id = ? AND e.deleted_at IS NULL
+            AND e.source = 'outlook'
+            AND e.start_time >= ? AND e.start_time < ?
+            AND ${virtualOutlookPredicate('e')}
+            ${userFilter}`
+      ).bind(ctx.orgId, startDate, endDate, ...userBinds).first<{ n: number }>(),
+      env.D1.prepare(
+        `SELECT COUNT(DISTINCT e.id) AS n
+           FROM events e
+          WHERE e.org_id = ? AND e.deleted_at IS NULL
+            AND e.source = 'outlook'
+            AND e.start_time >= ? AND e.start_time < ?
+            AND e.transcript_r2_key IS NOT NULL AND e.transcript_r2_key != ''
+            AND ${virtualOutlookPredicate('e')}
+            ${userFilter}`
+      ).bind(ctx.orgId, startDate, endDate, ...userBinds).first<{ n: number }>(),
+      env.D1.prepare(
+        `SELECT canonical_status, COUNT(*) AS n
+           FROM firefly_transcript_items
+          WHERE org_id = ?
+            AND transcript_date >= ? AND transcript_date < ?
+            ${userId ? 'AND user_id = ?' : ''}
+          GROUP BY canonical_status`
+      ).bind(ctx.orgId, startDate, endDate, ...userBinds).all<{ canonical_status: string; n: number }>(),
+      env.D1.prepare(
+        `SELECT COUNT(*) AS n
+           FROM firefly_transcript_event_links l
+           JOIN events e ON e.id = l.event_id
+          WHERE l.org_id = ?
+            AND e.start_time >= ? AND e.start_time < ?
+            ${userId ? 'AND EXISTS (SELECT 1 FROM event_attendees ea WHERE ea.event_id = e.id AND ea.user_id = ?)' : ''}`
+      ).bind(ctx.orgId, startDate, endDate, ...userBinds).first<{ n: number }>(),
+      env.D1.prepare(
+        `SELECT COUNT(DISTINCT e.id) AS transcript_events,
+                COUNT(DISTINCT vei.entity_id) AS embedded_events
+           FROM events e
+           LEFT JOIN vector_entity_index vei
+             ON vei.org_id = e.org_id
+            AND vei.source_table = 'events'
+            AND vei.entity_id = e.id
+          WHERE e.org_id = ? AND e.deleted_at IS NULL
+            AND e.start_time >= ? AND e.start_time < ?
+            AND e.transcript_r2_key IS NOT NULL AND e.transcript_r2_key != ''
+            ${userFilter}`
+      ).bind(ctx.orgId, startDate, endDate, ...userBinds).first<{ transcript_events: number; embedded_events: number }>(),
+      env.D1.prepare(
+        `SELECT domain, status, COUNT(*) AS n
+           FROM work_queue
+          WHERE org_id = ?
+            AND domain IN ('firefly_window','embed_retry','prospect_detect')
+            AND status IN ('pending','in_progress','dead_letter')
+          GROUP BY domain, status
+          ORDER BY domain, status`
+      ).bind(ctx.orgId).all<Record<string, unknown>>(),
+      env.D1.prepare(
+        `SELECT id, user_id, status, start_date, end_date, source_transcripts,
+                r2_staged, linked_events, standalone_transcripts,
+                embedding_queued, prospect_queued, error_count, last_error,
+                started_at, completed_at
+           FROM firefly_transcript_runs
+          WHERE org_id = ?
+          ORDER BY started_at DESC
+          LIMIT 20`
+      ).bind(ctx.orgId).all<Record<string, unknown>>(),
+      env.D1.prepare(
+        `SELECT id, domain, status, last_error, attempt, max_attempts, updated_at, completed_at
+           FROM work_queue
+          WHERE org_id = ?
+            AND domain = 'firefly_window'
+            AND (status = 'dead_letter' OR last_error IS NOT NULL)
+          ORDER BY COALESCE(completed_at, started_at, created_at) DESC
+          LIMIT 20`
+      ).bind(ctx.orgId).all<Record<string, unknown>>(),
+      listFireflyKeyStatuses(ctx.orgId, env),
+    ]);
+
+  const keyUserIds = new Set(keyStatuses.map(k => k.user_id));
+  const missingCredentials = users.results
+    .filter(row => !keyUserIds.has(String(row.id)))
+    .map(row => ({
+      user_id: row.id,
+      email: row.email,
+      full_name: row.full_name,
+      reason: 'missing_fireflies_credential',
+    }));
+
+  return jsonResponse({
+    ok: true,
+    range: { start_date: startDate, end_date: endDate, max_backfill_days: MAX_BACKFILL_DAYS },
+    user_id: userId,
+    users: users.results,
+    missing_credentials: missingCredentials,
+    coverage: {
+      virtual_outlook_events: virtualOutlook?.n || 0,
+      virtual_outlook_with_transcript: transcriptOutlook?.n || 0,
+      fireflies_source_transcripts: transcriptItems.results.reduce((sum, row) => sum + Number(row.n || 0), 0),
+      fireflies_by_status: transcriptItems.results,
+      transcript_event_links: links?.n || 0,
+      transcript_events: embedding?.transcript_events || 0,
+      embedded_transcript_events: embedding?.embedded_events || 0,
+    },
+    work_queue: queued.results,
+    recent_runs: jobs.results,
+    recent_failures: failures.results,
+  });
+}
+
+interface TranscriptRebuildBody {
+  user_ids?: string[];
+  start_date?: string;
+  end_date?: string;
+  dry_run?: boolean;
+  repair_embeddings?: boolean;
+  repair_prospect_signals?: boolean;
+}
+
+function validateRebuildRange(startDate: string, endDate: string): string | null {
+  const start = Date.parse(startDate);
+  const end = Date.parse(endDate);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return 'start_date / end_date must be ISO 8601';
+  if (end <= start) return 'end_date must be after start_date';
+  const days = Math.ceil((end - start) / 86400000);
+  if (days > MAX_BACKFILL_DAYS) return `date span exceeds ${MAX_BACKFILL_DAYS} days`;
+  return null;
+}
+
+/**
+ * POST /api/admin/firefly-transcript-rebuild
+ *
+ * Body: { user_ids?, start_date?, end_date?, dry_run?, repair_embeddings?,
+ * repair_prospect_signals? }
+ */
+export async function handleFireflyTranscriptRebuild(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (!canOperateTranscriptRebuild(ctx)) {
+    return errorResponse('AUTH_FORBIDDEN', 403, 'Only owners can start Fireflies transcript rebuilds.');
+  }
+  const body = (await parseJsonBody<TranscriptRebuildBody>(request)) || {};
+  const fallbackRange = sixCalendarMonthsRange();
+  if (body.start_date && isNaN(Date.parse(body.start_date))) {
+    return errorResponse('VALIDATION_ERROR', 400, 'start_date must be ISO 8601');
+  }
+  if (body.end_date && isNaN(Date.parse(body.end_date))) {
+    return errorResponse('VALIDATION_ERROR', 400, 'end_date must be ISO 8601');
+  }
+  const startDate = body.start_date ? new Date(body.start_date).toISOString() : fallbackRange.startDate;
+  const endDate = body.end_date ? new Date(body.end_date).toISOString() : fallbackRange.endDate;
+  const rangeError = validateRebuildRange(startDate, endDate);
+  if (rangeError) return errorResponse('VALIDATION_ERROR', 400, rangeError);
+
+  let userIds = Array.isArray(body.user_ids)
+    ? body.user_ids.map(id => String(id || '').trim()).filter(Boolean)
+    : [];
+  if (userIds.length === 0) {
+    const credentialed = await listFireflyKeyStatuses(ctx.orgId, env);
+    userIds = credentialed.map(row => row.user_id);
+  }
+  userIds = Array.from(new Set(userIds));
+
+  const dryRun = body.dry_run === true;
+  const results: Array<Record<string, unknown>> = [];
+  for (const userId of userIds) {
+    const user = await env.D1.prepare(
+      `SELECT id, email FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+    ).bind(userId, ctx.orgId).first<{ id: string; email: string }>();
+    if (!user) {
+      results.push({ user_id: userId, created: false, reason: 'user_not_found' });
+      continue;
+    }
+    const credential = await getFireflyKeyStatus(userId, env);
+    if (!credential.exists) {
+      results.push({
+        user_id: userId,
+        email: user.email,
+        created: false,
+        reason: 'missing_fireflies_credential',
+      });
+      continue;
+    }
+
+    const totalWindows = Math.ceil(Math.ceil((Date.parse(endDate) - Date.parse(startDate)) / 86400000) / 10);
+    if (dryRun) {
+      results.push({
+        user_id: userId,
+        email: user.email,
+        created: false,
+        dry_run: true,
+        credential: { exists: true, last_used_at: credential.last_used_at },
+        start_date: startDate,
+        end_date: endDate,
+        window_size_days: 10,
+        total_windows: totalWindows,
+      });
+      continue;
+    }
+
+    const created = await createFireflyProgressiveBackfillRange(
+      ctx.orgId,
+      userId,
+      startDate,
+      endDate,
+      10,
+      undefined,
+      env
+    );
+    results.push({
+      user_id: userId,
+      email: user.email,
+      ...created,
+      repair_embeddings: body.repair_embeddings !== false,
+      repair_prospect_signals: body.repair_prospect_signals !== false,
+    });
+  }
+
+  return jsonResponse({
+    ok: true,
+    dry_run: dryRun,
+    range: { start_date: startDate, end_date: endDate, max_backfill_days: MAX_BACKFILL_DAYS },
+    results,
+  });
 }

@@ -774,9 +774,9 @@ export const api = {
   // start/cancel for org members, but the target user's stored credential is
   // always the credential used by the backend driver.
   //
-  // days_back ∈ {30,60,90}. The 180-day option was dropped in Phase 4 sub-
-  // stage 1c (MAX_BACKFILL_DAYS lowered to 120 in src/lib/firefly-progressive
-  // -backfill.ts; 180 would now be rejected at the backend).
+  // days_back ∈ {30,60,90}. Longer repair windows use explicit date ranges
+  // or /admin/firefly-transcript-rebuild so six calendar months can fit under
+  // the backend's 190-day cap.
   startFireflyProgressiveBackfill: (data: {
     user_id?: string;
     fireflies_api_key?: string;
@@ -843,6 +843,52 @@ export const api = {
       '/admin/firefly-progressive-backfill/cancel',
       { method: 'POST', body: JSON.stringify(userId ? { user_id: userId } : {}) }
     ),
+
+  getFireflyTranscriptCoverage: (params?: { months?: number; user_id?: string; start_date?: string; end_date?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.months) qs.set('months', String(params.months));
+    if (params?.user_id) qs.set('user_id', params.user_id);
+    if (params?.start_date) qs.set('start_date', params.start_date);
+    if (params?.end_date) qs.set('end_date', params.end_date);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return request<{
+      ok: boolean;
+      range: { start_date: string; end_date: string; max_backfill_days: number };
+      user_id?: string | null;
+      users: Array<Record<string, unknown>>;
+      missing_credentials: Array<Record<string, unknown>>;
+      coverage: {
+        virtual_outlook_events: number;
+        virtual_outlook_with_transcript: number;
+        fireflies_source_transcripts: number;
+        fireflies_by_status: Array<Record<string, unknown>>;
+        transcript_event_links: number;
+        transcript_events: number;
+        embedded_transcript_events: number;
+      };
+      work_queue: Array<Record<string, unknown>>;
+      recent_runs: Array<Record<string, unknown>>;
+      recent_failures: Array<Record<string, unknown>>;
+    }>(`/admin/firefly-transcript-coverage${suffix}`);
+  },
+
+  rebuildFireflyTranscripts: (data: {
+    user_ids?: string[];
+    start_date?: string;
+    end_date?: string;
+    dry_run?: boolean;
+    repair_embeddings?: boolean;
+    repair_prospect_signals?: boolean;
+  }) =>
+    request<{
+      ok: boolean;
+      dry_run: boolean;
+      range: { start_date: string; end_date: string; max_backfill_days: number };
+      results: Array<Record<string, unknown>>;
+    }>('/admin/firefly-transcript-rebuild', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   triggerSync: (workflow: 'ingestion' | 'enrichment') =>
     request<{ ok: boolean; instance_id: string }>('/admin/trigger-sync', {

@@ -11,9 +11,8 @@ import type { Env } from '../types/env';
 import type { SpeakerTurn } from '../types/interfaces';
 import { emitAudit } from '../lib/audit';
 import {
-  processTranscriptItems,
-  type TranscriptItem,
-} from '../lib/process-transcript-items';
+  ingestFireflyTranscriptRecord,
+} from '../lib/firefly-transcript-rebuild';
 
 interface FireflyWebhookPayload {
   event_type: 'meeting_completed' | 'meeting_started' | 'transcript_ready';
@@ -96,31 +95,16 @@ export async function processFireflyWebhook(
     return;
   }
 
-  // Caller-side R2 PUT. The helper accepts an already-staged key — keeping
-  // the upload here lets the webhook own its own R2 path scheme. We name the
-  // object by a transient UUID; the canonical event id from Phase 1's
-  // read-back may differ when a duplicate firefly_event_id wins the race
-  // (in that case our R2 object becomes orphaned but the existing winner's
-  // transcript_r2_key is preserved on its row).
-  const transientId = crypto.randomUUID();
-  const r2Stamp = new Date().toISOString().slice(0, 7);
-  const r2Key = `${orgId}/transcript/${r2Stamp}/${transientId}.txt`;
-
   const transcriptText = payload.transcript?.content ?? null;
-  if (transcriptText) {
-    await env.R2.put(r2Key, transcriptText);
-  }
-
   const speakerTurns = transcriptText
     ? parseTranscriptToTurns(transcriptText, payload.participants)
     : [];
 
-  const item: TranscriptItem = {
+  const result = await ingestFireflyTranscriptRecord({
     fireflyEventId,
     title: payload.meeting_title,
     startTime: payload.start_time,
     endTime: payload.end_time,
-    transcriptR2Key: transcriptText ? r2Key : null,
     transcriptText,
     participants: payload.participants.map(p => ({
       displayName: p.name,
@@ -130,15 +114,15 @@ export async function processFireflyWebhook(
     actionItems: payload.action_items ?? [],
     topics: payload.key_topics ?? [],
     speakerTurns,
-  };
+  }, {
+    orgId,
+    sourcePath: 'firefly-webhook',
+  }, env, {
+    repairEmbeddings: true,
+    repairProspectSignals: true,
+  });
 
-  const stats = await processTranscriptItems(
-    [item],
-    { orgId, sourcePath: 'firefly-webhook' },
-    env
-  );
-
-  const eventId = stats.staged_event_ids[0];
+  const eventId = result.event_ids[0];
   if (eventId) {
     await emitAudit(env, {
       org_id: orgId,
@@ -148,10 +132,10 @@ export async function processFireflyWebhook(
       metadata: {
         source: 'firefly',
         title: payload.meeting_title,
-        sync_job_id: stats.sync_job_id,
-        chunks_embedded: stats.chunks_embedded,
-        signals_extracted: stats.signals_extracted,
-        errors: stats.errors.length,
+        transcript_item_id: result.transcript_item_id,
+        linked_events: result.linked_events,
+        embedding_queued: result.embedding_queued,
+        prospect_queued: result.prospect_queued,
       },
       created_at: new Date().toISOString(),
     });
@@ -159,9 +143,7 @@ export async function processFireflyWebhook(
 
   console.log(
     `[firefly] webhook processed: firefly_event_id=${fireflyEventId} ` +
-    `staged=${stats.items_staged}/${stats.items_total} ` +
-    `chunks=${stats.chunks_embedded} attendees=${stats.attendees_linked} ` +
-    `signals=${stats.signals_extracted} errors=${stats.errors.length} ` +
-    `sync_job=${stats.sync_job_id}`
+    `status=${result.canonical_status} linked_events=${result.linked_events} ` +
+    `embedding_queued=${result.embedding_queued} prospect_queued=${result.prospect_queued}`
   );
 }

@@ -21,19 +21,19 @@
 import type { Env } from '../types/env';
 import type { SpeakerTurn } from '../types/interfaces';
 import {
-  processTranscriptItems,
-  type TranscriptItem,
-} from './process-transcript-items';
+  ingestFireflyTranscriptRecord,
+  type FireflyTranscriptIngestResult,
+} from './firefly-transcript-rebuild';
 
 const FIREFLY_GRAPHQL = 'https://api.fireflies.ai/graphql';
 export const FIREFLY_PAGE_SIZE = 50;
 
-// Per-tick budget for the progressive driver. Calibrated for transcripts
-// (~14 chunks/transcript averaged from production data) — 15 transcripts
-// × 14 chunks = ~210 BGE embed calls per tick, comfortably under the
-// 25s wallclock budget.
-export const FIREFLY_MAX_TRANSCRIPTS_PER_TICK = 15;
-export const FIREFLY_MAX_RUNTIME_MS = 25_000;
+// Per-tick budget for the progressive driver. Transcript ingestion now stages
+// canonical data and queues derived work, so several small window slices can
+// run safely in parallel. Keep each slice short so checkpoints persist before
+// Workers wallclock pressure or D1 contention can strand a lock.
+export const FIREFLY_MAX_TRANSCRIPTS_PER_TICK = 5;
+export const FIREFLY_MAX_RUNTIME_MS = 20_000;
 // Pace per-transcript work so we don't slam Workers AI / D1. Way smaller
 // than the legacy 1000ms — that one-shot delay multiplied across an
 // uncapped loop is what tipped the original endpoint past Worker CPU
@@ -66,6 +66,11 @@ export interface RunFireflyWindowResult {
   ingested: number;
   duplicates: number;
   failed: number;
+  r2_staged: number;
+  linked_events: number;
+  standalone_transcripts: number;
+  embedding_queued: number;
+  prospect_queued: number;
   last_skip: number;           // resume cursor (0 means "start fresh")
   reason?: string;             // pause/fail reason
   errors?: Array<{ transcript_id: string; error: string }>;
@@ -136,34 +141,21 @@ export async function ingestSingleFireflyTranscript(
   t: FireflyTranscript,
   orgId: string,
   sourcePath: FireflySourcePath,
-  env: Env
-): Promise<IngestOutcome> {
+  env: Env,
+  options: {
+    userId?: string | null;
+    runId?: string | null;
+    dryRun?: boolean;
+    repairEmbeddings?: boolean;
+    repairProspectSignals?: boolean;
+  } = {}
+): Promise<FireflyTranscriptIngestResult> {
   const startTime = normalizeFireflyDate(t.date);
   const durationMin = typeof t.duration === 'number' ? t.duration : 0;
   const endTime = startTime
     ? new Date(new Date(startTime).getTime() + durationMin * 60_000).toISOString()
     : null;
   const title = t.title?.trim() || '(untitled meeting)';
-
-  // Duplicate pre-check: firefly_event_id (UNIQUE), then fuzzy title+start.
-  // Optimization for the common case — avoids the helper's INSERT+read-back
-  // round-trip when we know the transcript is already ingested. The helper's
-  // Phase 1 read-back still backs us up if we lose a race after this check.
-  const existingById = await env.D1.prepare(
-    `SELECT id FROM events WHERE org_id = ? AND firefly_event_id = ? AND deleted_at IS NULL LIMIT 1`
-  ).bind(orgId, t.id).first<{ id: string }>();
-  if (existingById) return 'duplicate';
-
-  if (startTime) {
-    const fuzzy = await env.D1.prepare(
-      `SELECT id FROM events
-        WHERE org_id = ? AND deleted_at IS NULL
-          AND LOWER(title) = LOWER(?)
-          AND ABS(strftime('%s', start_time) - strftime('%s', ?)) < 60
-        LIMIT 1`
-    ).bind(orgId, title, startTime).first<{ id: string }>();
-    if (fuzzy) return 'duplicate';
-  }
 
   const sentences = t.sentences || [];
   const transcriptText = sentences
@@ -175,29 +167,17 @@ export async function ingestSingleFireflyTranscript(
     text: s.text,
   }));
 
-  // Caller-side R2 PUT — helper takes the already-staged key. Path scheme
-  // matches legacy backfill (`{org}/transcripts/{YYYY}/{MM}/{id}.txt`).
-  const transientId = crypto.randomUUID();
-  const startDate = startTime ? new Date(startTime) : new Date();
-  const yyyy = startDate.getUTCFullYear();
-  const mm = String(startDate.getUTCMonth() + 1).padStart(2, '0');
-  const r2Key = `${orgId}/transcripts/${yyyy}/${mm}/${transientId}.txt`;
-
-  if (transcriptText.length > 0) {
-    await env.R2.put(r2Key, transcriptText);
-  }
-
   const summaryOverview = t.summary?.overview?.trim() || null;
   const actionItemsRaw = t.summary?.action_items?.trim();
   const actionItems = actionItemsRaw ? [actionItemsRaw] : [];
   const topics = Array.isArray(t.summary?.keywords) ? t.summary!.keywords! : [];
 
-  const item: TranscriptItem = {
+  return ingestFireflyTranscriptRecord({
     fireflyEventId: t.id,
     title,
     startTime: startTime || new Date().toISOString(),
     endTime,
-    transcriptR2Key: transcriptText.length > 0 ? r2Key : null,
+    durationMinutes: durationMin,
     transcriptText: transcriptText.length > 0 ? transcriptText : null,
     participants: (t.meeting_attendees || []).map(a => ({
       displayName: a.displayName || a.name || null,
@@ -207,33 +187,16 @@ export async function ingestSingleFireflyTranscript(
     actionItems,
     topics,
     speakerTurns,
-  };
-
-  const stats = await processTranscriptItems(
-    [item],
-    { orgId, sourcePath },
-    env
-  );
-
-  // Phase 1 bail = fail this transcript. The helper's sync_jobs row already
-  // captured the staging error in errors_sample; surface the first message
-  // so the caller's error log is informative.
-  if (stats.items_staged === 0) {
-    const firstErr = stats.errors[0];
-    throw new Error(
-      firstErr ? `${firstErr.phase}: ${firstErr.error}` : 'staging failed'
-    );
-  }
-
-  if (stats.errors.length > 0) {
-    console.warn(
-      `[firefly-ingest] partial success firefly_event_id=${t.id} ` +
-      `errors=${stats.errors.length} sync_job=${stats.sync_job_id} ` +
-      `(see sync_jobs.metadata.errors_sample)`
-    );
-  }
-
-  return 'ingested';
+  }, {
+    orgId,
+    sourcePath,
+    userId: options.userId || null,
+    runId: options.runId || null,
+  }, env, {
+    dryRun: options.dryRun,
+    repairEmbeddings: options.repairEmbeddings,
+    repairProspectSignals: options.repairProspectSignals,
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -251,6 +214,7 @@ export interface RunFireflyWindowOpts {
   endDate: string;           // ISO 8601, exclusive
   initialSkip: number;       // resume cursor; 0 for fresh window
   progressiveWindowId: string;
+  runId?: string | null;
 }
 
 export async function runFireflyWindowBackfill(
@@ -264,6 +228,11 @@ export async function runFireflyWindowBackfill(
   let ingested = 0;
   let duplicates = 0;
   let failed = 0;
+  let r2Staged = 0;
+  let linkedEvents = 0;
+  let standaloneTranscripts = 0;
+  let embeddingQueued = 0;
+  let prospectQueued = 0;
   const errors: Array<{ transcript_id: string; error: string }> = [];
 
   // Per-tick sync_jobs row — mirrors what closeSyncJob does for Outlook.
@@ -306,6 +275,11 @@ export async function runFireflyWindowBackfill(
           ingested,
           duplicates,
           failed,
+          r2_staged: r2Staged,
+          linked_events: linkedEvents,
+          standalone_transcripts: standaloneTranscripts,
+          embedding_queued: embeddingQueued,
+          prospect_queued: prospectQueued,
           last_skip: skip,
           ...(extra || {}),
         }),
@@ -324,7 +298,9 @@ export async function runFireflyWindowBackfill(
         await closeSyncJob('paused', { reason: 'wallclock_cap' });
         return {
           status: 'paused', total_fetched: totalFetched, total_processed: totalProcessed,
-          ingested, duplicates, failed, last_skip: skip,
+          ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+          standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+          prospect_queued: prospectQueued, last_skip: skip,
           reason: 'wallclock_cap', errors,
         };
       }
@@ -332,7 +308,9 @@ export async function runFireflyWindowBackfill(
         await closeSyncJob('paused', { reason: 'transcript_count_cap' });
         return {
           status: 'paused', total_fetched: totalFetched, total_processed: totalProcessed,
-          ingested, duplicates, failed, last_skip: skip,
+          ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+          standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+          prospect_queued: prospectQueued, last_skip: skip,
           reason: 'transcript_count_cap', errors,
         };
       }
@@ -348,7 +326,9 @@ export async function runFireflyWindowBackfill(
           await closeSyncJob('paused', { reason: 'firefly_rate_limit' });
           return {
             status: 'paused', total_fetched: totalFetched, total_processed: totalProcessed,
-            ingested, duplicates, failed, last_skip: skip,
+            ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+            standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+            prospect_queued: prospectQueued, last_skip: skip,
             reason: 'firefly_rate_limit', errors,
           };
         }
@@ -356,7 +336,9 @@ export async function runFireflyWindowBackfill(
         await closeSyncJob('failed', { reason: 'fetch_error', error: msg.slice(0, 200) });
         return {
           status: 'failed', total_fetched: totalFetched, total_processed: totalProcessed,
-          ingested, duplicates, failed, last_skip: skip,
+          ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+          standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+          prospect_queued: prospectQueued, last_skip: skip,
           reason: msg.slice(0, 200), errors,
         };
       }
@@ -368,7 +350,9 @@ export async function runFireflyWindowBackfill(
         await closeSyncJob('completed', { reason: 'range_exhausted' });
         return {
           status: 'completed', total_fetched: totalFetched, total_processed: totalProcessed,
-          ingested, duplicates, failed, last_skip: skip,
+          ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+          standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+          prospect_queued: prospectQueued, last_skip: skip,
           errors,
         };
       }
@@ -378,7 +362,9 @@ export async function runFireflyWindowBackfill(
           await closeSyncJob('paused', { reason: 'wallclock_cap_inner' });
           return {
             status: 'paused', total_fetched: totalFetched, total_processed: totalProcessed,
-            ingested, duplicates, failed, last_skip: skip,
+            ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+            standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+            prospect_queued: prospectQueued, last_skip: skip,
             reason: 'wallclock_cap_inner', errors,
           };
         }
@@ -386,17 +372,27 @@ export async function runFireflyWindowBackfill(
           await closeSyncJob('paused', { reason: 'transcript_count_cap_inner' });
           return {
             status: 'paused', total_fetched: totalFetched, total_processed: totalProcessed,
-            ingested, duplicates, failed, last_skip: skip,
+            ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+            standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+            prospect_queued: prospectQueued, last_skip: skip,
             reason: 'transcript_count_cap_inner', errors,
           };
         }
 
         try {
-          const outcome = await ingestSingleFireflyTranscript(
-            t, opts.orgId, 'firefly-progressive-backfill-window', env
+          const result = await ingestSingleFireflyTranscript(
+            t, opts.orgId, 'firefly-progressive-backfill-window', env, {
+              userId: opts.userId,
+              runId: opts.runId || null,
+            }
           );
-          if (outcome === 'ingested') ingested++;
-          else if (outcome === 'duplicate') duplicates++;
+          if (result.outcome === 'ingested') ingested++;
+          else if (result.outcome === 'duplicate') duplicates++;
+          r2Staged += result.r2_staged;
+          linkedEvents += result.linked_events;
+          standaloneTranscripts += result.standalone_transcripts;
+          embeddingQueued += result.embedding_queued;
+          prospectQueued += result.prospect_queued;
         } catch (e: any) {
           failed++;
           errors.push({ transcript_id: t.id, error: String(e?.message || e).slice(0, 300) });
@@ -414,7 +410,9 @@ export async function runFireflyWindowBackfill(
         await closeSyncJob('completed', { reason: 'short_batch' });
         return {
           status: 'completed', total_fetched: totalFetched, total_processed: totalProcessed,
-          ingested, duplicates, failed, last_skip: skip,
+          ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+          standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+          prospect_queued: prospectQueued, last_skip: skip,
           errors,
         };
       }
@@ -424,7 +422,9 @@ export async function runFireflyWindowBackfill(
     await closeSyncJob('failed', { reason: 'unexpected', error: msg });
     return {
       status: 'failed', total_fetched: totalFetched, total_processed: totalProcessed,
-      ingested, duplicates, failed, last_skip: skip,
+      ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+      standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+      prospect_queued: prospectQueued, last_skip: skip,
       reason: msg, errors,
     };
   }
