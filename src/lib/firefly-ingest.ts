@@ -56,7 +56,7 @@ export interface FireflyTranscript {
   sentences: Array<{ speaker_name: string; text: string; start_time: number }> | null;
 }
 
-export type FireflySourcePath = 'firefly-progressive-backfill-window';
+export type FireflySourcePath = 'firefly-progressive-backfill-window' | 'firefly-webhook';
 export type IngestOutcome = 'ingested' | 'duplicate' | 'failed';
 
 export interface RunFireflyWindowResult {
@@ -131,6 +131,55 @@ export async function fetchTranscriptBatch(
   }
 
   return data.data?.transcripts || [];
+}
+
+export async function fetchTranscriptById(
+  apiKey: string,
+  transcriptId: string
+): Promise<FireflyTranscript> {
+  const query = `
+    query Transcript($transcriptId: String!) {
+      transcript(id: $transcriptId) {
+        id
+        title
+        date
+        duration
+        meeting_attendees { displayName email name }
+        summary { overview action_items keywords shorthand_bullet outline }
+        sentences { speaker_name text start_time }
+      }
+    }
+  `;
+  const resp = await fetch(FIREFLY_GRAPHQL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ query, variables: { transcriptId } }),
+  });
+
+  if (resp.status === 429) throw new Error('FIREFLY_RATE_LIMITED');
+  if (resp.status === 401 || resp.status === 403) throw new Error('FIREFLY_AUTH_FAILED');
+
+  const data = (await resp.json()) as {
+    data?: { transcript?: FireflyTranscript | null };
+    errors?: Array<{ message: string; extensions?: { code?: string } }>;
+  };
+
+  if (data.errors?.length) {
+    const msg = data.errors.map(e => e.message).join('; ');
+    const codes = data.errors.map(e => e.extensions?.code || '').join('; ');
+    if (/auth|api key|unauthor/i.test(msg)) throw new Error('FIREFLY_AUTH_FAILED');
+    if (/too many requests|rate.?limit/i.test(msg)) throw new Error('FIREFLY_RATE_LIMITED');
+    if (/object_not_found|not found|does not exist|do not have access/i.test(`${codes} ${msg}`)) {
+      throw new Error('FIREFLY_TRANSCRIPT_NOT_FOUND');
+    }
+    throw new Error(`FIREFLY_GRAPHQL_ERROR: ${msg.slice(0, 200)}`);
+  }
+
+  if (!data.data?.transcript?.id) throw new Error('FIREFLY_TRANSCRIPT_NOT_FOUND');
+  return data.data.transcript;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
