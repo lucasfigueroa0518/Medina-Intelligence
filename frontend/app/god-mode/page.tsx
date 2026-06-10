@@ -1112,7 +1112,7 @@ function DocumentCardList({
               </div>
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <div className="truncate text-sm font-semibold text-text-primary" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+                  <div className="truncate text-sm font-semibold text-text-primary" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
                     {title}
                   </div>
                   {card.confidence !== undefined && (
@@ -1296,7 +1296,7 @@ function DeckProductionPanel({ jobs, showQaDetails = true }: { jobs?: DeckJobVie
       <div className="mb-2 flex items-center gap-2">
         {!isTerminalDeckJob(latest) ? <MartyEmblem size={18} animate /> : latest.status === 'completed' ? <CheckCircle2 size={16} className="text-semantic-success" /> : latest.status === 'qa_blocked' ? <AlertCircle size={16} className="text-[#F59E0B]" /> : <AlertCircle size={16} className="text-semantic-error" />}
         <div className="min-w-0 flex-1">
-          <div className="truncate text-xs font-semibold text-text-primary" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+          <div className="truncate text-xs font-semibold text-text-primary" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
             Deck Production
           </div>
           <div className="truncate text-[11px] text-text-muted">
@@ -1362,7 +1362,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
           <CheckCircle2 size={14} className="text-semantic-success shrink-0 check-pop" />
         )}
         <Icon size={14} className={isRunning ? 'text-[#8B5CF6]' : 'text-text-muted'} style={{ flexShrink: 0 }} />
-        <span className="text-xs text-text-secondary flex-1 truncate" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
+        <span className="text-xs text-text-secondary flex-1 truncate" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 500 }}>
           {toolLabel(tool.tool)}
         </span>
         {runs.length > 1 && (
@@ -1377,7 +1377,7 @@ function ToolCallCard({ tool, onToggle }: { tool: ToolCall; onToggle: () => void
         )}
         <span className={`text-[10px] ${
           isError ? 'text-semantic-error' : isDeckBlocked ? 'text-[#F59E0B]' : isRunning ? 'text-text-muted' : isDone ? 'text-semantic-success' : isCancelled ? 'text-text-muted' : 'text-text-muted'
-        }`} style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
+        }`} style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 500 }}>
           {isDone && !isRunning && !isError && '\u2713 '}{toolStatusText(tool)}
         </span>
         {tool.collapsed ? <ChevronRight size={12} className="text-text-muted" /> : <ChevronDown size={12} className="text-text-muted" />}
@@ -1451,11 +1451,11 @@ function ErrorCard({ message, retryable = true, onRetry }: { message: string; re
     <div className="error-card rounded-xl border border-semantic-error/20 bg-semantic-error/5 backdrop-blur-sm p-4 max-w-md">
       <div className="flex items-center gap-2 mb-2">
         <AlertCircle size={16} className="text-semantic-error shrink-0" />
-        <span className="text-sm font-medium text-semantic-error" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+        <span className="text-sm font-medium text-semantic-error" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
           Something went wrong
         </span>
       </div>
-      <p className="text-xs text-text-secondary mb-3" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+      <p className="text-xs text-text-secondary mb-3" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
         {cleaned}
       </p>
       {retryable && (
@@ -1548,10 +1548,10 @@ function SessionItem({
             </div>
           ) : (
             <>
-              <div className="text-sm text-text-primary truncate" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
+              <div className="text-sm text-text-primary truncate" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 500 }}>
                 {session.title || 'New Session'}
               </div>
-              <div className="text-[10px] text-text-muted mt-0.5" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
+              <div className="text-[10px] text-text-muted mt-0.5" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 400 }}>
                 {session._running ? 'Working...' : formatRelative(session.last_activity_at)}
               </div>
             </>
@@ -3236,7 +3236,7 @@ export default function GodModePage() {
         <div className="px-4 pt-4 pb-2 flex items-center justify-between gap-2.5">
           <div className="flex items-center gap-2.5">
             <MartyEmblem size={22} />
-            <span className="text-sm text-text-primary" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
+            <span className="text-sm text-text-primary" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 600 }}>
               MARTy
             </span>
           </div>
@@ -3268,7 +3268,7 @@ export default function GodModePage() {
               onChange={e => setSidebarSearch(e.target.value)}
               placeholder="Search sessions..."
               className="w-full bg-bg-surface border border-border rounded-lg pl-9 pr-3 py-1.5 text-xs text-text-primary placeholder-text-muted outline-none focus:border-[#8B5CF6]/50 transition-colors"
-              style={{ fontFamily: "'DM Sans', sans-serif" }}
+              style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
             />
             {sidebarSearch && (
               <button onClick={() => setSidebarSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-primary">
@@ -3363,11 +3363,11 @@ export default function GodModePage() {
                 <Sparkles active={showSparkles} />
               </div>
 
-              <div className="text-4xl md:text-[48px] text-text-primary text-center mb-2 leading-tight" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700 }}>
+              <div className="text-4xl md:text-[48px] text-text-primary text-center mb-2 leading-tight" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 700 }}>
                 MARTy
               </div>
 
-              <div className="greet-fade text-sm text-text-muted text-center mb-10" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400, animationDelay: '300ms' }}>
+              <div className="greet-fade text-sm text-text-muted text-center mb-10" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 400, animationDelay: '300ms' }}>
                 {getGreeting()}
               </div>
 
@@ -3388,10 +3388,10 @@ export default function GodModePage() {
                         <CardIcon size={17} className="text-[#A855F7]" />
                       </div>
                       <div className="min-w-0">
-                        <div className="text-sm text-text-primary mb-0.5" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}>
+                        <div className="text-sm text-text-primary mb-0.5" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 500 }}>
                           {card.title}
                         </div>
-                        <div className="text-xs text-text-muted" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
+                        <div className="text-xs text-text-muted" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 400 }}>
                           {card.subtitle}
                         </div>
                       </div>
@@ -3400,7 +3400,7 @@ export default function GodModePage() {
                 })}
               </div>
 
-              <div className="text-[12px] text-text-muted/50 text-center" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+              <div className="text-[12px] text-text-muted/50 text-center" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
                 MARTy can search your CRM &middot; read emails &amp; Slack &middot; update contacts &amp; deals &middot; research the web
               </div>
             </div>
@@ -3428,7 +3428,7 @@ export default function GodModePage() {
                         </div>
                       )}
                       <div className="bg-bg-surface rounded-2xl rounded-br-sm px-5 py-3">
-                        <div className="text-sm text-text-primary whitespace-pre-wrap" data-marty-copy-root="true" style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 400 }}>
+                        <div className="text-sm text-text-primary whitespace-pre-wrap" data-marty-copy-root="true" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 400 }}>
                           {m.content}
                         </div>
                         {m.timestamp && (
@@ -3575,7 +3575,7 @@ export default function GodModePage() {
         <div className="absolute bottom-3 md:bottom-8 left-3 right-3 md:left-10 md:right-10 z-10">
           {/* Session attachment indicator — shows what MARTy currently sees */}
           {sessionUploads.length > 0 && (
-            <div className="mb-2 flex flex-wrap md:flex-nowrap items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 text-[11px]" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+            <div className="mb-2 flex flex-wrap md:flex-nowrap items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 text-[11px]" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
               <Paperclip size={12} className="text-text-muted shrink-0" />
               <span className="text-text-muted shrink-0">In this conversation:</span>
               <div className="flex flex-wrap gap-1 min-w-0 flex-1">
@@ -3602,7 +3602,7 @@ export default function GodModePage() {
           {/* Toast */}
           {uploadToast && (
             <div className="mb-2 px-3 py-2 rounded-lg bg-semantic-error/15 border border-semantic-error/30 text-semantic-error text-xs"
-              style={{ fontFamily: "'DM Sans', sans-serif" }}>
+              style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
               {uploadToast}
             </div>
           )}
@@ -3665,7 +3665,7 @@ export default function GodModePage() {
                     width: 92,
                     paddingLeft: 31,
                     paddingRight: 26,
-                    fontFamily: "'DM Sans', sans-serif",
+                    fontFamily: "var(--font-geist-sans), system-ui, sans-serif",
                     fontSize: 12,
                     fontWeight: 700,
                     color: deepDive ? '#D8B4FE' : 'rgba(255,255,255,0.76)',
@@ -3708,7 +3708,7 @@ export default function GodModePage() {
                 rows={1}
                 className="flex-1 resize-none bg-transparent border-none outline-none"
                 style={{
-                  fontFamily: "'DM Sans', sans-serif",
+                  fontFamily: "var(--font-geist-sans), system-ui, sans-serif",
                   fontWeight: 400,
                   fontSize: 15,
                   lineHeight: 1.5,

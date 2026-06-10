@@ -41,6 +41,7 @@ import * as SystemStatusHandler from './handlers/system-status';
 import * as Backfill from './handlers/backfill';
 import * as FireflyCredentials from './handlers/firefly-credentials';
 import * as MartyLab from './handlers/marty-lab';
+import * as ReadOnlyPreview from './handlers/read-only-preview';
 
 import { handleAuditBatch } from './workers/audit-consumer';
 import { handleWebhookBatch } from './workers/webhook-consumer';
@@ -104,6 +105,15 @@ async function handleRequest(
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  const readOnlyPreview = ReadOnlyPreview.isReadOnlyPreviewRequest(request, env);
+
+  if (path === '/api/dev/read-only-login' && method === 'POST') {
+    return withCors(await ReadOnlyPreview.handleReadOnlyPreviewLogin(request, env), reqOrigin, env);
+  }
+
+  if (readOnlyPreview && ReadOnlyPreview.isMutatingMethod(method)) {
+    return withCors(ReadOnlyPreview.readOnlyPreviewMutationResponse(), reqOrigin, env);
+  }
 
   // --- Public routes ---
   if (path === '/' && method === 'GET') {

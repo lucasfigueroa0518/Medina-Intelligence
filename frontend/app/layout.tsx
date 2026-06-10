@@ -1,20 +1,13 @@
 import type { Metadata } from 'next';
-import { DM_Sans, Exo_2, JetBrains_Mono, Space_Grotesk } from 'next/font/google';
+import { Exo_2, Geist, JetBrains_Mono } from 'next/font/google';
 import './globals.css';
 import { AuthGuard } from '@/components/auth-guard';
 import { AppShell } from '@/components/app-shell';
 
-const dmSans = DM_Sans({
-  subsets: ['latin'],
-  weight: ['400', '500', '700'],
-  variable: '--font-dm-sans',
-  display: 'swap',
-});
-
-const spaceGrotesk = Space_Grotesk({
+const geistSans = Geist({
   subsets: ['latin'],
   weight: ['400', '500', '600', '700'],
-  variable: '--font-space-grotesk',
+  variable: '--font-geist-sans',
   display: 'swap',
 });
 
@@ -47,7 +40,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="dark">
-      <body className={`${dmSans.variable} ${spaceGrotesk.variable} ${exo2.variable} ${jetBrainsMono.variable} bg-bg-root text-text-primary min-h-screen`}>
+      <body className={`${geistSans.variable} ${exo2.variable} ${jetBrainsMono.variable} bg-bg-root text-text-primary min-h-screen`}>
         <AuthGuard>
           <AppShell>{children}</AppShell>
         </AuthGuard>

@@ -50,7 +50,7 @@ export default function VerifyPage() {
           <MedinaLogo size={48} className="mb-4" />
         </div>
 
-        <div className="bg-bg-card border border-border rounded-xl p-6 space-y-4">
+        <div className="card-panel p-6 space-y-4">
           {state === 'loading' && (
             <>
               <div className="w-8 h-8 mx-auto border-2 border-accent-purple border-t-transparent rounded-full animate-spin" />

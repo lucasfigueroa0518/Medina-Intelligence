@@ -104,7 +104,7 @@ export default function ResetPasswordPage() {
       <div className="min-h-screen bg-bg-root flex items-center justify-center p-4">
         <div className="w-full max-w-sm text-center">
           <MedinaLogo size={48} className="mb-6 mx-auto" />
-          <div className="bg-bg-card border border-border rounded-xl p-6 space-y-4">
+          <div className="card-panel p-6 space-y-4">
             <p className="text-text-primary font-medium">Invalid reset link</p>
             <p className="text-text-secondary text-sm">No reset token was provided.</p>
             <Link
@@ -124,7 +124,7 @@ export default function ResetPasswordPage() {
       <div className="min-h-screen bg-bg-root flex items-center justify-center p-4">
         <div className="w-full max-w-sm text-center">
           <MedinaLogo size={48} className="mb-6 mx-auto" />
-          <div className="bg-bg-card border border-border rounded-xl p-6 space-y-4">
+          <div className="card-panel p-6 space-y-4">
             <div className="w-16 h-16 mx-auto rounded-full bg-semantic-success/10 flex items-center justify-center">
               <svg className="w-8 h-8 text-semantic-success" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -151,7 +151,7 @@ export default function ResetPasswordPage() {
       <div className="min-h-screen bg-bg-root flex items-center justify-center p-4">
         <div className="w-full max-w-sm text-center">
           <MedinaLogo size={48} className="mb-6 mx-auto" />
-          <div className="bg-bg-card border border-border rounded-xl p-6 space-y-4">
+          <div className="card-panel p-6 space-y-4">
             <div className="w-16 h-16 mx-auto rounded-full bg-semantic-error/10 flex items-center justify-center">
               <svg className="w-8 h-8 text-semantic-error" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />

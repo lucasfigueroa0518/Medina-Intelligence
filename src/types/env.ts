@@ -60,6 +60,10 @@ export interface Env {
   FRONTEND_URL?: string;
   // Comma-separated list of allowed CORS origins.
   ALLOWED_ORIGINS?: string;
+  // Local-only safety mode for previewing production D1 data through wrangler dev.
+  READ_ONLY_PROD_PREVIEW?: string;
+  // Optional guardrail: restrict local read-only preview token minting to one email.
+  READ_ONLY_PREVIEW_EMAIL?: string;
 
   // --- Secrets (via `wrangler secret put`) ---
   AZURE_CLIENT_ID: string;
