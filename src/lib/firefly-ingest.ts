@@ -32,8 +32,8 @@ export const FIREFLY_PAGE_SIZE = 50;
 // canonical data and queues derived work, so several small window slices can
 // run safely in parallel. Keep each slice short so checkpoints persist before
 // Workers wallclock pressure or D1 contention can strand a lock.
-export const FIREFLY_MAX_TRANSCRIPTS_PER_TICK = 5;
-export const FIREFLY_MAX_RUNTIME_MS = 20_000;
+export const FIREFLY_MAX_TRANSCRIPTS_PER_TICK = 2;
+export const FIREFLY_MAX_RUNTIME_MS = 15_000;
 // Pace per-transcript work so we don't slam Workers AI / D1. Way smaller
 // than the legacy 1000ms — that one-shot delay multiplied across an
 // uncapped loop is what tipped the original endpoint past Worker CPU
@@ -267,6 +267,21 @@ export interface RunFireflyWindowOpts {
   initialSkip: number;       // resume cursor; 0 for fresh window
   progressiveWindowId: string;
   runId?: string | null;
+  onCheckpoint?: (progress: RunFireflyWindowProgress) => Promise<void>;
+}
+
+export interface RunFireflyWindowProgress {
+  total_fetched: number;
+  total_processed: number;
+  ingested: number;
+  duplicates: number;
+  failed: number;
+  r2_staged: number;
+  linked_events: number;
+  standalone_transcripts: number;
+  embedding_queued: number;
+  prospect_queued: number;
+  last_skip: number;
 }
 
 export async function runFireflyWindowBackfill(
@@ -452,6 +467,37 @@ export async function runFireflyWindowBackfill(
 
         skip++;
         totalProcessed++;
+
+        if (opts.onCheckpoint) {
+          const progress: RunFireflyWindowProgress = {
+            total_fetched: totalFetched,
+            total_processed: totalProcessed,
+            ingested,
+            duplicates,
+            failed,
+            r2_staged: r2Staged,
+            linked_events: linkedEvents,
+            standalone_transcripts: standaloneTranscripts,
+            embedding_queued: embeddingQueued,
+            prospect_queued: prospectQueued,
+            last_skip: skip,
+          };
+          try {
+            await opts.onCheckpoint(progress);
+          } catch (e: any) {
+            const msg = String(e?.message || e).slice(0, 300);
+            errors.push({ transcript_id: t.id, error: `checkpoint_failed: ${msg}` });
+            await closeSyncJob('paused', { reason: 'checkpoint_failed', checkpoint_error: msg });
+            return {
+              status: 'paused', total_fetched: totalFetched, total_processed: totalProcessed,
+              ingested, duplicates, failed, r2_staged: r2Staged, linked_events: linkedEvents,
+              standalone_transcripts: standaloneTranscripts, embedding_queued: embeddingQueued,
+              prospect_queued: prospectQueued, last_skip: skip,
+              reason: 'checkpoint_failed', errors,
+            };
+          }
+        }
+
         await sleep(FIREFLY_PER_TRANSCRIPT_DELAY_MS);
       }
 

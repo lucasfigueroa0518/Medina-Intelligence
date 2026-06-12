@@ -39,7 +39,7 @@ import {
   recordFireflyApiCall,
   nextUtcMidnightIso,
 } from '../firefly-progressive-backfill';
-import type { RunFireflyWindowResult } from '../firefly-ingest';
+import type { RunFireflyWindowProgress, RunFireflyWindowResult } from '../firefly-ingest';
 
 interface FireflyWindowPayload {
   parent_id: string;
@@ -124,6 +124,36 @@ async function recordTranscriptRunCounters(
       e instanceof Error ? e.message : e
     );
   });
+}
+
+async function checkpointFireflyWindow(
+  env: Env,
+  itemId: string,
+  payload: FireflyWindowPayload,
+  progress: RunFireflyWindowProgress
+): Promise<void> {
+  const now = new Date();
+  const checkpointedPayload = JSON.stringify({
+    ...payload,
+    last_skip: progress.last_skip,
+    transcripts_fetched: payload.transcripts_fetched + progress.total_fetched,
+    transcripts_persisted: payload.transcripts_persisted + progress.ingested,
+    transcripts_skipped_duplicate: payload.transcripts_skipped_duplicate + progress.duplicates,
+    transcripts_failed: payload.transcripts_failed + progress.failed,
+  });
+
+  await env.D1.prepare(
+    `UPDATE work_queue
+        SET payload = ?,
+            heartbeat_at = ?,
+            locked_until = ?
+      WHERE id = ? AND status = 'in_progress'`
+  ).bind(
+    checkpointedPayload,
+    now.toISOString(),
+    new Date(now.getTime() + 5 * 60 * 1000).toISOString(),
+    itemId
+  ).run();
 }
 
 export const fireflyWindowHandler: WorkQueueHandler = {
@@ -273,6 +303,7 @@ export const fireflyWindowHandler: WorkQueueHandler = {
           initialSkip: last_skip ?? 0,
           progressiveWindowId: item.id,  // work_queue row id for log correlation
           runId: parent_id,
+          onCheckpoint: progress => checkpointFireflyWindow(env, item.id, payload, progress),
         },
         env
       );
