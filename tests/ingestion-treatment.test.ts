@@ -69,7 +69,7 @@ function makeEnv() {
           },
           async first() {
             firsts.push({ sql, binds });
-            if (sql.includes('FROM events')) {
+          if (sql.includes('FROM events')) {
               return {
                 id: 'event-1',
                 source: 'outlook',
@@ -78,6 +78,16 @@ function makeEnv() {
                 summary: 'Acme is raising a seed round.',
                 transcript_r2_key: 'org/transcript.txt',
                 start_time: '2026-06-01T12:00:00.000Z',
+              };
+            }
+            if (sql.includes('FROM news_articles')) {
+              return {
+                id: 'news-1',
+                company_id: 'company-1',
+                title: 'Acme raises seed',
+                summary: 'Acme announced new funding.',
+                source_url: 'https://example.com/acme',
+                published_at: '2026-06-12T12:00:00.000Z',
               };
             }
             if (sql.includes('FROM vector_entity_index')) return null;
@@ -234,5 +244,36 @@ describe('ingestion treatment', () => {
     expect(result.skipped_reasons).toContain('source_missing');
     expect(result.prospect_status).toBe('skipped');
     expect(result.deal_status).toBe('skipped');
+  });
+
+  it('loads news using production source_url column and fans out applicable treatment', async () => {
+    const env = makeEnv() as any;
+    const result = await processIngestionTreatment(env, 'org-1', {
+      source_table: 'news_articles',
+      source_id: 'news-1',
+      source_kind: 'news',
+      ingestion_mode: 'live',
+      origin: 'test',
+    });
+
+    const newsQuery = env.D1.firsts.find((call: any) => call.sql.includes('FROM news_articles'));
+    expect(newsQuery?.sql).toContain('source_url');
+    expect(newsQuery?.sql).not.toContain(' summary, url,');
+    expect(enqueueCompanyEnrichmentMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'org-1',
+      'company-1',
+      expect.objectContaining({ origin: 'ingestion_treatment' })
+    );
+    expect(enqueueRagV2SourceReindexMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'org-1',
+      'news_articles',
+      'news-1',
+      expect.any(Object)
+    );
+    expect(result.prospect_status).toBe('skipped');
+    expect(result.deal_status).toBe('skipped');
+    expect(result.skipped_reasons).toContain('prospect_source_not_supported');
   });
 });

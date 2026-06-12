@@ -6,7 +6,7 @@ import { deadLetterWork } from '../work-queue';
 interface AttachmentBackfillPayload {
   conversation_id: string;
   preferred_user_id?: string | null;
-  origin: 'divergence_scan' | 'manual';
+  origin: 'divergence_scan' | 'manual' | 'graph_webhook';
   detected_at: string;
 }
 

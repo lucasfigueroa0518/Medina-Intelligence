@@ -12,6 +12,16 @@ import type { SpeakerTurn } from '../types/interfaces';
 import { emitAudit } from '../lib/audit';
 import { getFireflyKey } from '../lib/firefly-credentials';
 import { fetchTranscriptById, ingestSingleFireflyTranscript } from '../lib/firefly-ingest';
+import { recordFireflyApiCall } from '../lib/firefly-progressive-backfill';
+import {
+  enqueueFireflyTranscriptHydration,
+  isFireflyTranscriptReadyEvent,
+  markFireflyWebhookDeliveryFailed,
+  markFireflyWebhookDeliveryHydrated,
+  markFireflyWebhookDeliveryIgnored,
+  markFireflyWebhookDeliveryQueued,
+  parseFireflyWebhookEnvelope,
+} from '../lib/firefly-webhook-deliveries';
 import {
   ingestFireflyTranscriptRecord,
   type FireflyTranscriptIngestResult,
@@ -63,34 +73,6 @@ export async function verifyFireflySignature(
   return result === 0;
 }
 
-function eventName(payload: FireflyWebhookPayload): string {
-  return String(payload.event_type || payload.eventType || payload.event || '').trim();
-}
-
-function transcriptId(payload: FireflyWebhookPayload): string {
-  return String(
-    payload.event_id ||
-    payload.meeting_id ||
-    payload.meetingId ||
-    payload.transcript_id ||
-    payload.transcriptId ||
-    ''
-  ).trim();
-}
-
-function isTranscriptReadyEvent(name: string): boolean {
-  const normalized = name.toLowerCase();
-  return (
-    normalized === 'transcript_ready' ||
-    normalized === 'meeting_completed' ||
-    normalized === 'transcription completed' ||
-    normalized === 'meeting.transcribed' ||
-    normalized === 'meeting.summarized' ||
-    normalized.includes('transcription completed') ||
-    normalized.includes('transcript')
-  );
-}
-
 function parseTranscriptToTurns(
   content: string,
   participants: Array<{ name: string; email?: string }>
@@ -130,14 +112,29 @@ async function credentialedUsersForOrg(
   return rows.results;
 }
 
-async function fetchAndIngestWebhookTranscript(
+export interface HydratedFireflyTranscriptResult extends FireflyTranscriptIngestResult {
+  selected_user_id: string;
+}
+
+export async function hydrateFireflyTranscriptById(
   fireflyEventId: string,
   orgId: string,
-  env: Env
-): Promise<FireflyTranscriptIngestResult> {
-  const credentialedUsers = await credentialedUsersForOrg(orgId, env);
+  env: Env,
+  options: {
+    preferredUserId?: string | null;
+    sourcePath?: 'firefly-webhook' | 'firefly-recent-sweep';
+  } = {}
+): Promise<HydratedFireflyTranscriptResult> {
+  let credentialedUsers = await credentialedUsersForOrg(orgId, env);
   if (credentialedUsers.length === 0) {
     throw new Error('FIREFLY_WEBHOOK_NO_STORED_CREDENTIALS');
+  }
+  if (options.preferredUserId) {
+    credentialedUsers = credentialedUsers.sort((a, b) => {
+      if (a.user_id === options.preferredUserId) return -1;
+      if (b.user_id === options.preferredUserId) return 1;
+      return 0;
+    });
   }
 
   const errors: string[] = [];
@@ -150,15 +147,26 @@ async function fetchAndIngestWebhookTranscript(
 
     try {
       const transcript = await fetchTranscriptById(key, fireflyEventId);
-      return ingestSingleFireflyTranscript(transcript, orgId, 'firefly-webhook', env, {
-        userId: user.user_id,
-        repairEmbeddings: true,
-        repairProspectSignals: true,
-      });
+      await recordFireflyApiCall(user.user_id, env, false, orgId).catch(() => {});
+      const ingestResult = await ingestSingleFireflyTranscript(
+        transcript,
+        orgId,
+        options.sourcePath || 'firefly-webhook',
+        env,
+        {
+          userId: user.user_id,
+          repairEmbeddings: true,
+          repairProspectSignals: true,
+        }
+      );
+      return { ...ingestResult, selected_user_id: user.user_id };
     } catch (e: any) {
       const msg = String(e?.message || e);
       errors.push(`${user.user_id}:${msg.slice(0, 120)}`);
-      if (msg.includes('FIREFLY_RATE_LIMITED')) throw e;
+      if (msg.includes('FIREFLY_RATE_LIMITED')) {
+        await recordFireflyApiCall(user.user_id, env, true, orgId).catch(() => {});
+        throw e;
+      }
       if (msg.includes('FIREFLY_AUTH_FAILED') || msg.includes('FIREFLY_TRANSCRIPT_NOT_FOUND')) continue;
       throw e;
     }
@@ -170,28 +178,36 @@ async function fetchAndIngestWebhookTranscript(
 export async function processFireflyWebhook(
   payload: FireflyWebhookPayload,
   orgId: string,
-  env: Env
+  env: Env,
+  deliveryId?: string | null
 ): Promise<void> {
-  const event = eventName(payload);
-  if (!isTranscriptReadyEvent(event)) {
+  const envelope = parseFireflyWebhookEnvelope(payload as Record<string, unknown>);
+  const event = envelope.eventName;
+  if (!isFireflyTranscriptReadyEvent(event)) {
+    await markFireflyWebhookDeliveryIgnored(env, deliveryId, `ignored_event:${event || 'unknown'}`).catch(() => {});
     return;
   }
 
-  const fireflyEventId = transcriptId(payload);
+  const fireflyEventId = envelope.fireflyEventId;
   if (!fireflyEventId) {
     console.warn(
       `[firefly] webhook payload missing meeting/transcript id; skipping event="${event}"`
     );
+    await markFireflyWebhookDeliveryFailed(env, deliveryId, 'missing_firefly_transcript_id').catch(() => {});
     return;
   }
 
   const transcriptText = payload.transcript?.content ?? null;
   if (!transcriptText) {
-    const result = await fetchAndIngestWebhookTranscript(fireflyEventId, orgId, env);
+    const queued = await enqueueFireflyTranscriptHydration(env, orgId, {
+      firefly_event_id: fireflyEventId,
+      delivery_id: deliveryId || null,
+      source: 'webhook',
+    });
+    await markFireflyWebhookDeliveryQueued(env, deliveryId, queued.id).catch(() => {});
     console.log(
-      `[firefly] webhook fetched+processed: firefly_event_id=${fireflyEventId} ` +
-      `status=${result.canonical_status} linked_events=${result.linked_events} ` +
-      `embedding_queued=${result.embedding_queued} prospect_queued=${result.prospect_queued}`
+      `[firefly] webhook queued hydration: firefly_event_id=${fireflyEventId} ` +
+      `delivery_id=${deliveryId || 'none'} work_queue_id=${queued.id || 'existing'} inserted=${queued.inserted}`
     );
     return;
   }
@@ -224,6 +240,14 @@ export async function processFireflyWebhook(
   });
 
   const eventId = result.event_ids[0];
+  await markFireflyWebhookDeliveryHydrated(env, deliveryId, {
+    selectedUserId: null,
+    transcriptItemId: result.transcript_item_id,
+    linkedEvents: result.linked_events,
+    r2Staged: result.r2_staged,
+    embeddingQueued: result.embedding_queued,
+    prospectQueued: result.prospect_queued,
+  }).catch(() => {});
   if (eventId) {
     await emitAudit(env, {
       org_id: orgId,

@@ -5,6 +5,12 @@ const fetchTranscriptByIdMock = vi.hoisted(() => vi.fn());
 const ingestSingleFireflyTranscriptMock = vi.hoisted(() => vi.fn());
 const ingestFireflyTranscriptRecordMock = vi.hoisted(() => vi.fn());
 const emitAuditMock = vi.hoisted(() => vi.fn());
+const recordFireflyApiCallMock = vi.hoisted(() => vi.fn());
+const enqueueHydrationMock = vi.hoisted(() => vi.fn());
+const markQueuedMock = vi.hoisted(() => vi.fn());
+const markHydratedMock = vi.hoisted(() => vi.fn());
+const markIgnoredMock = vi.hoisted(() => vi.fn());
+const markFailedMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/lib/firefly-credentials', () => ({
   getFireflyKey: getFireflyKeyMock,
@@ -23,7 +29,28 @@ vi.mock('../src/lib/audit', () => ({
   emitAudit: emitAuditMock,
 }));
 
-import { processFireflyWebhook } from '../src/integrations/firefly';
+vi.mock('../src/lib/firefly-progressive-backfill', () => ({
+  recordFireflyApiCall: recordFireflyApiCallMock,
+}));
+
+vi.mock('../src/lib/firefly-webhook-deliveries', () => ({
+  enqueueFireflyTranscriptHydration: enqueueHydrationMock,
+  markFireflyWebhookDeliveryQueued: markQueuedMock,
+  markFireflyWebhookDeliveryHydrated: markHydratedMock,
+  markFireflyWebhookDeliveryIgnored: markIgnoredMock,
+  markFireflyWebhookDeliveryFailed: markFailedMock,
+  parseFireflyWebhookEnvelope: (payload: any) => ({
+    eventName: String(payload.event_type || payload.eventType || payload.event || '').trim(),
+    normalizedEventName: String(payload.event_type || payload.eventType || payload.event || 'unknown').toLowerCase(),
+    fireflyEventId: String(payload.event_id || payload.meeting_id || payload.meetingId || payload.transcript_id || payload.transcriptId || '').trim(),
+  }),
+  isFireflyTranscriptReadyEvent: (name: string) => {
+    const normalized = name.toLowerCase();
+    return normalized.includes('transcript') || normalized === 'meeting.completed' || normalized === 'meeting_completed' || normalized === 'meeting.transcribed' || normalized === 'meeting.summarized';
+  },
+}));
+
+import { hydrateFireflyTranscriptById, processFireflyWebhook } from '../src/integrations/firefly';
 
 function makeEnv(users = [{ user_id: 'user-tony', email: 'tony@medinavc.com' }]) {
   return {
@@ -81,31 +108,36 @@ describe('Fireflies live webhook ingestion', () => {
     ingestSingleFireflyTranscriptMock.mockReset().mockResolvedValue(ingestResult);
     ingestFireflyTranscriptRecordMock.mockReset().mockResolvedValue(ingestResult);
     emitAuditMock.mockReset().mockResolvedValue(undefined);
+    recordFireflyApiCallMock.mockReset().mockResolvedValue(undefined);
+    enqueueHydrationMock.mockReset().mockResolvedValue({ inserted: true, id: 'hydrate-work' });
+    markQueuedMock.mockReset().mockResolvedValue(undefined);
+    markHydratedMock.mockReset().mockResolvedValue(undefined);
+    markIgnoredMock.mockReset().mockResolvedValue(undefined);
+    markFailedMock.mockReset().mockResolvedValue(undefined);
   });
 
-  it('fetches and ingests a Fireflies v1 notification-only webhook', async () => {
+  it('queues hydration for a Fireflies v1 notification-only webhook', async () => {
     await processFireflyWebhook(
       { meetingId: 'ff-123', eventType: 'Transcription completed' },
       'org-1',
-      makeEnv() as any
+      makeEnv() as any,
+      'delivery-1'
     );
 
-    expect(getFireflyKeyMock).toHaveBeenCalledWith('user-tony', expect.anything());
-    expect(fetchTranscriptByIdMock).toHaveBeenCalledWith('firefly-key', 'ff-123');
-    expect(ingestSingleFireflyTranscriptMock).toHaveBeenCalledWith(
-      transcript,
-      'org-1',
-      'firefly-webhook',
+    expect(fetchTranscriptByIdMock).not.toHaveBeenCalled();
+    expect(enqueueHydrationMock).toHaveBeenCalledWith(
       expect.anything(),
+      'org-1',
       expect.objectContaining({
-        userId: 'user-tony',
-        repairEmbeddings: true,
-        repairProspectSignals: true,
-      })
+        firefly_event_id: 'ff-123',
+        delivery_id: 'delivery-1',
+        source: 'webhook',
+      }),
     );
+    expect(markQueuedMock).toHaveBeenCalledWith(expect.anything(), 'delivery-1', 'hydrate-work');
   });
 
-  it('tries each stored credential until the transcript is readable', async () => {
+  it('hydrates by trying each stored credential until the transcript is readable', async () => {
     getFireflyKeyMock
       .mockResolvedValueOnce('wrong-owner-key')
       .mockResolvedValueOnce('owner-key');
@@ -113,8 +145,8 @@ describe('Fireflies live webhook ingestion', () => {
       .mockRejectedValueOnce(new Error('FIREFLY_TRANSCRIPT_NOT_FOUND'))
       .mockResolvedValueOnce(transcript);
 
-    await processFireflyWebhook(
-      { meeting_id: 'ff-123', event: 'meeting.transcribed' },
+    await hydrateFireflyTranscriptById(
+      'ff-123',
       'org-1',
       makeEnv([
         { user_id: 'user-alvaro', email: 'alvaro@medinavc.com' },

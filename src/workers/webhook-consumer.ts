@@ -9,7 +9,7 @@ export async function handleWebhookBatch(
 ): Promise<void> {
   for (const msg of batch.messages) {
     try {
-      const { source, rawPayload, orgId } = msg.body;
+      const { source, rawPayload, orgId, deliveryId } = msg.body;
       const data = JSON.parse(rawPayload);
 
       if (source === 'firefly') {
@@ -26,7 +26,7 @@ export async function handleWebhookBatch(
         // id internally — no more "find latest event ORDER BY created_at"
         // race window where concurrent deliveries could attribute signals
         // to the wrong event.
-        await processFireflyWebhook(data, resolvedOrgId, env);
+        await processFireflyWebhook(data, resolvedOrgId, env, deliveryId);
       } else if (source === 'slack') {
         // Slack events API — event callback
         // Full handling would route by event type; for now we ack events.

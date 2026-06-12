@@ -30,7 +30,11 @@ export interface FireflyTranscriptIngestContext {
   orgId: string;
   userId?: string | null;
   runId?: string | null;
-  sourcePath: 'firefly-progressive-backfill-window' | 'firefly-webhook' | 'firefly-transcript-rebuild';
+  sourcePath:
+    | 'firefly-progressive-backfill-window'
+    | 'firefly-webhook'
+    | 'firefly-recent-sweep'
+    | 'firefly-transcript-rebuild';
 }
 
 export interface FireflyTranscriptIngestOptions {

@@ -406,7 +406,7 @@ async function loadDocument(env: Env, orgId: string, sourceId: string): Promise<
 
 async function loadNews(env: Env, orgId: string, sourceId: string): Promise<SourceContext | null> {
   const row = await env.D1.prepare(
-    `SELECT id, company_id, title, summary, url, published_at
+    `SELECT id, company_id, title, summary, source_url, published_at
        FROM news_articles
       WHERE id = ? AND org_id = ?`
   ).bind(sourceId, orgId).first<{
@@ -414,7 +414,7 @@ async function loadNews(env: Env, orgId: string, sourceId: string): Promise<Sour
     company_id: string | null;
     title: string | null;
     summary: string | null;
-    url: string | null;
+    source_url: string | null;
     published_at: string | null;
   }>();
   if (!row) return null;
@@ -424,7 +424,7 @@ async function loadNews(env: Env, orgId: string, sourceId: string): Promise<Sour
     sourceKind: 'news',
     sourceType: 'news_article',
     sourceDate: row.published_at,
-    hasUsableText: Boolean(row.summary || row.title || row.url),
+    hasUsableText: Boolean(row.summary || row.title || row.source_url),
     contactIds: [],
     companyIds: unique([row.company_id]),
     participantEmails: [],

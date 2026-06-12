@@ -127,6 +127,10 @@ async function handleHealth(env: Env): Promise<Response> {
       ok: allOk,
       worker: 'medina-ventures-pipelines',
       env: env.ENVIRONMENT,
+      build: {
+        git_sha: env.MEDINA_BUILD_SHA || env.MARTY_RUNTIME_GIT_SHA || 'unknown',
+        fireflies_pipeline_version: env.FIREFLIES_PIPELINE_VERSION || 'unknown',
+      },
       elapsed_ms: elapsedMs,
       checks,
     }, null, 2),

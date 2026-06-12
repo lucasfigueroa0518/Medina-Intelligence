@@ -133,6 +133,23 @@ export async function getFireflyKey(
   return plaintext;
 }
 
+export async function peekFireflyKey(
+  userId: string,
+  env: Env
+): Promise<string | null> {
+  const row = await env.D1.prepare(
+    `SELECT api_key_encrypted FROM user_firefly_credentials WHERE user_id = ?`
+  ).bind(userId).first<{ api_key_encrypted: string }>();
+  if (!row?.api_key_encrypted) return null;
+  try {
+    const decrypted = await decryptToken(row.api_key_encrypted, env);
+    return decrypted.api_key || null;
+  } catch (e) {
+    console.error(`[firefly-creds] decrypt failed for read-only probe ${userId}:`, e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
 // ─── revokeFireflyKey ─────────────────────────────────────────────────────
 
 export interface RevokeResult {

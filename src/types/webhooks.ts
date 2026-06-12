@@ -6,4 +6,5 @@ export interface WebhookQueueMessage {
   eventType?: string;
   signatureHeader?: string;
   orgId?: string;
+  deliveryId?: string;
 }

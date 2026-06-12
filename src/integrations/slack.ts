@@ -31,6 +31,11 @@ export interface SlackFetchResult {
   messages: ClassifiableItem[];
   errors: SlackChannelError[];
   channels_visible: number;
+  channels_scanned: number;
+  history_calls_ok: number;
+  messages_seen: number;
+  channels_with_errors: number;
+  budget_exhausted: boolean;
 }
 
 // Subtypes that carry no human content. Anything else (file_share,
@@ -111,6 +116,10 @@ export async function fetchSlackMessages(
   const startedAt = Date.now();
   const messages: ClassifiableItem[] = [];
   const errors: SlackChannelError[] = [];
+  let channelsScanned = 0;
+  let historyCallsOk = 0;
+  let messagesSeen = 0;
+  let budgetExhausted = false;
 
   let botToken: string;
   try {
@@ -127,7 +136,16 @@ export async function fetchSlackMessages(
       severity: 'critical',
       humanActionRequired: true,
     }).catch(() => {});
-    return { messages, errors, channels_visible: 0 };
+    return {
+      messages,
+      errors,
+      channels_visible: 0,
+      channels_scanned: 0,
+      history_calls_ok: 0,
+      messages_seen: 0,
+      channels_with_errors: errors.length,
+      budget_exhausted: false,
+    };
   }
 
   const authHeaders = { Authorization: `Bearer ${botToken}` };
@@ -157,7 +175,16 @@ export async function fetchSlackMessages(
       humanActionRequired: count >= 3,
       metadata: { consecutive_failures: count, slack_error: authData.error || 'unknown' },
     }).catch(() => {});
-    return { messages, errors, channels_visible: 0 };
+    return {
+      messages,
+      errors,
+      channels_visible: 0,
+      channels_scanned: 0,
+      history_calls_ok: 0,
+      messages_seen: 0,
+      channels_with_errors: errors.length,
+      budget_exhausted: false,
+    };
   }
   // Clear the counter on success — sustained-failure window resets the
   // moment the token starts working again.
@@ -185,7 +212,16 @@ export async function fetchSlackMessages(
       humanActionRequired: /invalid_auth|not_authed|account_inactive|missing_scope/i.test(code),
       metadata: { slack_error: code },
     }).catch(() => {});
-    return { messages, errors, channels_visible: 0 };
+    return {
+      messages,
+      errors,
+      channels_visible: 0,
+      channels_scanned: 0,
+      history_calls_ok: 0,
+      messages_seen: 0,
+      channels_with_errors: errors.length,
+      budget_exhausted: false,
+    };
   }
 
   const channels = channelsData.channels || [];
@@ -237,8 +273,6 @@ export async function fetchSlackMessages(
     }
   }
 
-  let budgetExhausted = false;
-
   for (const channel of channels) {
     if (Date.now() - startedAt > SLACK_MAX_RUNTIME_MS) {
       budgetExhausted = true;
@@ -257,6 +291,9 @@ export async function fetchSlackMessages(
     let latestTsThisChannel = channelLastSync;
     let cursor: string | undefined;
     let channelHadError = false;
+    let channelHistoryCallsOk = 0;
+    let channelMessagesSeen = 0;
+    channelsScanned++;
 
     do {
       if (Date.now() - startedAt > SLACK_MAX_RUNTIME_MS) {
@@ -334,9 +371,13 @@ export async function fetchSlackMessages(
         break;
       }
 
+      historyCallsOk++;
+      channelHistoryCallsOk++;
       for (const msg of data.messages || []) {
         if (msg.subtype && SKIP_SUBTYPES.has(msg.subtype)) continue;
         if (!msg.user) continue;
+        messagesSeen++;
+        channelMessagesSeen++;
 
         const userEmail = await resolveSlackUserEmail(msg.user, botToken, env)
           || `${msg.user.toLowerCase()}@slack.local`;
@@ -390,7 +431,12 @@ export async function fetchSlackMessages(
         source: 'slack',
         scopeType: 'channel',
         scopeId: channel.id,
-        metadata: { channel_name: channel.name },
+        metadata: {
+          channel_name: channel.name,
+          history_calls_ok: channelHistoryCallsOk,
+          messages_seen: channelMessagesSeen,
+          messages_collected: channelMessagesSeen,
+        },
       }).catch(() => {});
     }
   }
@@ -406,16 +452,154 @@ export async function fetchSlackMessages(
     await reportIngestionSuccess(env, {
       orgId,
       source: 'slack',
-      metadata: { channels_visible: channels.length, messages: messages.length },
+      metadata: {
+        channels_visible: channels.length,
+        channels_scanned: channelsScanned,
+        history_calls_ok: historyCallsOk,
+        messages_seen: messagesSeen,
+        messages_collected: messages.length,
+        channels_with_errors: errors.length,
+        budget_exhausted: budgetExhausted,
+      },
     }).catch(() => {});
   }
 
   console.log(
-    `[slack] fetch complete: ${messages.length} messages from ${channels.length} channels, ${errors.length} channel errors` +
+    `[slack] fetch complete: messages_seen=${messagesSeen} messages_collected=${messages.length} ` +
+    `channels_scanned=${channelsScanned}/${channels.length} history_calls_ok=${historyCallsOk} ` +
+    `channel_errors=${errors.length}` +
     (budgetExhausted ? ` (budget_exhausted=true; some channels will resume next tick)` : '')
   );
 
-  return { messages, errors, channels_visible: channels.length };
+  return {
+    messages,
+    errors,
+    channels_visible: channels.length,
+    channels_scanned: channelsScanned,
+    history_calls_ok: historyCallsOk,
+    messages_seen: messagesSeen,
+    channels_with_errors: errors.length,
+    budget_exhausted: budgetExhausted,
+  };
+}
+
+export interface SlackRecentCoverageGap {
+  channel_id: string;
+  channel_name: string | null;
+  messages_seen: number;
+  missing_messages: number;
+}
+
+export interface SlackRecentCoverageResult {
+  channels_scanned: number;
+  history_calls_ok: number;
+  messages_seen: number;
+  missing_messages: number;
+  channels_with_missing: SlackRecentCoverageGap[];
+  channels_with_errors: number;
+  errors: SlackChannelError[];
+}
+
+export async function findSlackRecentCoverageGaps(
+  orgId: string,
+  env: Env,
+  opts: { daysBack?: number; maxChannels?: number; perChannelLimit?: number } = {}
+): Promise<SlackRecentCoverageResult> {
+  const daysBack = Math.max(1, Math.min(10, opts.daysBack ?? 7));
+  const maxChannels = Math.max(1, Math.min(25, opts.maxChannels ?? 25));
+  const perChannelLimit = Math.max(1, Math.min(50, opts.perChannelLimit ?? 20));
+  const result: SlackRecentCoverageResult = {
+    channels_scanned: 0,
+    history_calls_ok: 0,
+    messages_seen: 0,
+    missing_messages: 0,
+    channels_with_missing: [],
+    channels_with_errors: 0,
+    errors: [],
+  };
+
+  let botToken: string;
+  try {
+    botToken = await getDecryptedSlackBotToken(orgId, env);
+  } catch (e) {
+    result.channels_with_errors = 1;
+    result.errors.push({
+      channel_id: '*',
+      channel_name: '*',
+      error: `token_resolution_failed:${e instanceof Error ? e.message : String(e)}`,
+    });
+    return result;
+  }
+
+  const channels = await env.D1.prepare(
+    `SELECT channel_id, channel_name
+       FROM slack_channels
+      WHERE org_id = ?
+        AND is_member = 1
+        AND (last_error IS NULL OR trim(last_error) = '')
+      ORDER BY COALESCE(last_sync_at, last_join_attempt_at, '0000-00-00') DESC
+      LIMIT ?`
+  ).bind(orgId, maxChannels).all<{ channel_id: string; channel_name: string | null }>();
+
+  const oldest = String(Math.floor((Date.now() - daysBack * 86400000) / 1000));
+  const authHeaders = { Authorization: `Bearer ${botToken}` };
+  for (const channel of channels.results) {
+    result.channels_scanned++;
+    const params = new URLSearchParams({
+      channel: channel.channel_id,
+      oldest,
+      limit: String(perChannelLimit),
+    });
+    const resp = await slackFetchWithRetry(
+      `https://slack.com/api/conversations.history?${params}`,
+      authHeaders,
+      `conversations.history coverage #${channel.channel_name || channel.channel_id}`,
+    );
+    const data = (await resp.json()) as {
+      ok: boolean;
+      messages?: SlackMessage[];
+      error?: string;
+    };
+    if (!data.ok) {
+      result.channels_with_errors++;
+      result.errors.push({
+        channel_id: channel.channel_id,
+        channel_name: channel.channel_name || channel.channel_id,
+        error: data.error || 'unknown',
+      });
+      continue;
+    }
+
+    result.history_calls_ok++;
+    const sourceIds = (data.messages || [])
+      .filter(msg => !(msg.subtype && SKIP_SUBTYPES.has(msg.subtype)))
+      .filter(msg => Boolean(msg.user))
+      .map(msg => `${channel.channel_id}:${msg.ts}`);
+    result.messages_seen += sourceIds.length;
+    if (sourceIds.length === 0) continue;
+
+    const placeholders = sourceIds.map(() => '?').join(',');
+    const existing = await env.D1.prepare(
+      `SELECT external_message_id
+         FROM conversations
+        WHERE org_id = ?
+          AND source = 'slack'
+          AND external_message_id IN (${placeholders})`
+    ).bind(orgId, ...sourceIds).all<{ external_message_id: string }>();
+    const existingIds = new Set(existing.results.map(row => row.external_message_id));
+    const missing = sourceIds.filter(id => !existingIds.has(id)).length;
+    if (missing === 0) continue;
+
+    result.missing_messages += missing;
+    result.channels_with_missing.push({
+      channel_id: channel.channel_id,
+      channel_name: channel.channel_name,
+      messages_seen: sourceIds.length,
+      missing_messages: missing,
+    });
+  }
+
+  return result;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

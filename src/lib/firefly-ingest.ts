@@ -56,7 +56,10 @@ export interface FireflyTranscript {
   sentences: Array<{ speaker_name: string; text: string; start_time: number }> | null;
 }
 
-export type FireflySourcePath = 'firefly-progressive-backfill-window' | 'firefly-webhook';
+export type FireflySourcePath =
+  | 'firefly-progressive-backfill-window'
+  | 'firefly-webhook'
+  | 'firefly-recent-sweep';
 export type IngestOutcome = 'ingested' | 'duplicate' | 'failed';
 
 export interface RunFireflyWindowResult {

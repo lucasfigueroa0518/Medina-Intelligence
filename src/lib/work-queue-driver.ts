@@ -173,6 +173,7 @@ import { embedRetryHandler } from './work-queue-handlers/embed-retry';
 import { attachmentBackfillHandler } from './work-queue-handlers/attachment-backfill';
 import { calendarRefreshHandler } from './work-queue-handlers/calendar-refresh';
 import { fireflyWindowHandler } from './work-queue-handlers/firefly-window';
+import { fireflyTranscriptHydrateHandler } from './work-queue-handlers/firefly-transcript-hydrate';
 import { dealReplayEvidenceHandler } from './work-queue-handlers/deal-replay-evidence';
 import { dealEvidenceDetectHandler } from './work-queue-handlers/deal-evidence-detect';
 import { prospectDetectHandler } from './work-queue-handlers/prospect-detect';
@@ -216,6 +217,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   attachmentBackfillHandler,
   calendarRefreshHandler,
   fireflyWindowHandler,
+  fireflyTranscriptHydrateHandler,
   dealReplayEvidenceHandler,
   dealEvidenceDetectHandler,
   intelligentImportHandler,

@@ -1,14 +1,17 @@
 // TRD §5.2 — Webhook endpoints: Firefly + Slack + Outlook Graph
 import type { Env } from '../types/env';
-import type { ClassifiableItem, AttachmentMeta } from '../types/interfaces';
+import type { ClassifiableItem, AttachmentMeta, ClassifiedItem } from '../types/interfaces';
 import { jsonResponse } from './utils';
 import { extractIdempotencyKey } from '../lib/idempotency';
 import { verifyFireflySignature } from '../integrations/firefly';
+import { recordFireflyWebhookDelivery } from '../lib/firefly-webhook-deliveries';
 import { verifySlackSignature } from '../integrations/slack';
 import { getOrgDomains, stripHtml } from '../lib/helpers';
 import { getGraphMailboxAuthForUser, graphMailboxUrl } from '../lib/graph-auth';
 import { classifyAndDeduplicate } from '../lib/classification';
-import { processClassifiedItems, persistClassifiedStats } from '../lib/ingestion-shared';
+import { stageAndCommitApprovals } from '../lib/stage-approvals';
+import { enqueueIngestionTreatment, type IngestionTreatmentSourceTable } from '../lib/ingestion-treatment';
+import { enqueueWork } from '../lib/work-queue';
 import { closeSyncJob, openSyncJob } from '../lib/sync-job-lifecycle';
 
 export async function receiveFireflyWebhook(
@@ -31,12 +34,23 @@ export async function receiveFireflyWebhook(
   }
 
   const idempotencyKey = extractIdempotencyKey('firefly', rawBody);
+  const org = await env.D1.prepare('SELECT id FROM organizations LIMIT 1').first<{ id: string }>();
+  if (!org?.id) return jsonResponse({ error: 'ORG_NOT_FOUND' }, 500);
+
+  const delivery = await recordFireflyWebhookDelivery(env, {
+    orgId: org.id,
+    rawPayload: rawBody,
+    signatureHeader: signature,
+  });
+
   if (idempotencyKey) {
-    const seen = await env.KV.get(`webhook_idem:${idempotencyKey}`);
-    if (seen) return jsonResponse({ ok: true, duplicate: true });
-    await env.KV.put(`webhook_idem:${idempotencyKey}`, '1', {
+    await env.KV.put(`webhook_idem:${idempotencyKey}`, delivery.id, {
       expirationTtl: 86400,
     });
+  }
+
+  if (delivery.duplicate && !delivery.shouldQueue) {
+    return jsonResponse({ ok: true, duplicate: true, delivery_id: delivery.id });
   }
 
   await env.WEBHOOK_QUEUE.send({
@@ -45,9 +59,11 @@ export async function receiveFireflyWebhook(
     idempotencyKey,
     rawPayload: rawBody,
     signatureHeader: signature,
+    orgId: org.id,
+    deliveryId: delivery.id,
   });
 
-  return jsonResponse({ ok: true });
+  return jsonResponse({ ok: true, delivery_id: delivery.id });
 }
 
 export async function receiveSlackWebhook(
@@ -112,6 +128,93 @@ interface GraphNotification {
 
 interface GraphNotificationPayload {
   value: GraphNotification[];
+}
+
+interface GraphWebhookStageStats {
+  items_total: number;
+  items_staged: number;
+  treatment_enqueued: number;
+  attachment_backfill_enqueued: number;
+  errors: Array<{ phase: string; error: string }>;
+}
+
+function isTreatmentSourceTable(value: string): value is IngestionTreatmentSourceTable {
+  return (
+    value === 'conversations' ||
+    value === 'events' ||
+    value === 'documents' ||
+    value === 'news_articles'
+  );
+}
+
+async function stageAndQueueGraphWebhookItems(
+  classified: ClassifiedItem[],
+  ctx: { orgId: string; syncJobId: string; userId: string },
+  env: Env
+): Promise<GraphWebhookStageStats> {
+  const stats: GraphWebhookStageStats = {
+    items_total: classified.length,
+    items_staged: 0,
+    treatment_enqueued: 0,
+    attachment_backfill_enqueued: 0,
+    errors: [],
+  };
+  if (classified.length === 0) return stats;
+
+  try {
+    await stageAndCommitApprovals(classified, ctx.orgId, ctx.syncJobId, env);
+    stats.items_staged = classified.length;
+  } catch (e: any) {
+    stats.errors.push({ phase: 'stage-and-commit', error: e?.message || String(e) });
+    return stats;
+  }
+
+  for (const item of classified) {
+    const sourceTable = item.metadata.source_table;
+    if (isTreatmentSourceTable(sourceTable)) {
+      try {
+        const queued = await enqueueIngestionTreatment(env, {
+          orgId: ctx.orgId,
+          sourceTable,
+          sourceId: item.entityId,
+          sourceKind: item.type,
+          ingestionMode: 'live',
+          origin: 'outlook_graph_webhook',
+          priority: 35,
+        });
+        if (queued.inserted) stats.treatment_enqueued += 1;
+      } catch (e: any) {
+        stats.errors.push({ phase: 'enqueue-treatment', error: `${item.entityId}: ${e?.message || e}` });
+      }
+    }
+
+    if (item.attachments?.length && item.metadata.source_table === 'conversations') {
+      try {
+        const queued = await enqueueWork(
+          env,
+          ctx.orgId,
+          'attachment_backfill',
+          {
+            conversation_id: item.entityId,
+            preferred_user_id: ctx.userId,
+            origin: 'graph_webhook',
+            detected_at: new Date().toISOString(),
+          },
+          {
+            upstream: 'graph',
+            idempotency_key: `${ctx.orgId}:${item.entityId}:attachment_backfill:graph_webhook:v1`,
+            priority: 25,
+            max_attempts: 5,
+          }
+        );
+        if (queued.inserted) stats.attachment_backfill_enqueued += 1;
+      } catch (e: any) {
+        stats.errors.push({ phase: 'enqueue-attachment-backfill', error: `${item.entityId}: ${e?.message || e}` });
+      }
+    }
+  }
+
+  return stats;
 }
 
 export async function receiveOutlookMailWebhook(
@@ -294,17 +397,15 @@ async function processOneNotification(
     attachments,
   };
 
-  // Classify, then route through processClassifiedItems — the Wave 2
-  // converged helper that does stage → embed → process-attachments →
-  // detect-deals. Pre-Wave-3 the webhook open-coded only embed + stage,
-  // skipping attachments + deal signals (the same divergence Wave 2 closed
-  // for runHistoricalBackfill but didn't reach here).
+  // Webhook jobs must close after durable staging. Downstream embedding,
+  // attachment recovery, prospect detection, deal checks, and enrichment are
+  // queued idempotently so slow derived work does not make the live webhook
+  // sync job look stale.
   const classified = await classifyAndDeduplicate([item], orgId, env);
   if (classified.length === 0) return;
 
-  // Real sync_jobs row so persistClassifiedStats has a target for the
-  // attachments_attempted/processed/failed counters. workflow_type='webhook'
-  // is allowed since migration 0062 relaxed the CHECK enum.
+  // Real sync_jobs row so webhook staging remains auditable.
+  // workflow_type='webhook' is allowed since migration 0062 relaxed the CHECK enum.
   let jobId = crypto.randomUUID();
   let syncJobOpened = false;
   try {
@@ -328,28 +429,31 @@ async function processOneNotification(
   }
 
   try {
-    const stats = await processClassifiedItems(classified, { orgId, syncJobId: jobId }, env);
-    if (syncJobOpened) await persistClassifiedStats(stats, jobId, env);
+    const stats = await stageAndQueueGraphWebhookItems(classified, { orgId, syncJobId: jobId, userId }, env);
 
-    const status = stats.errors.length > 0 ? 'partial' : 'completed';
+    const status = stats.errors.length > 0 || stats.items_staged < stats.items_total ? 'partial' : 'completed';
     if (syncJobOpened) {
       await closeSyncJob(env, jobId, {
         status,
         metadata: {
-          phase: 'graph_webhook_message_done',
+          phase: 'graph_webhook_message_staged',
+          items_total: stats.items_total,
+          items_staged: stats.items_staged,
+          treatment_enqueued: stats.treatment_enqueued,
+          attachment_backfill_enqueued: stats.attachment_backfill_enqueued,
           errors: stats.errors.length,
+          errors_sample: stats.errors.slice(0, 5),
         },
       });
     }
 
     console.log(
       `[graph-webhook] msg="${msg.subject}" user=${userId} ` +
-      `embedded=${stats.items_embedded} attachments(att/proc/skip/fail)=` +
-      `${stats.attachments_attempted}/${stats.attachments_processed}/${stats.attachments_skipped}/${stats.attachments_failed} ` +
-      `deals_staged=${stats.deal_signals_staged} errors=${stats.errors.length}`
+      `staged=${stats.items_staged}/${stats.items_total} treatment_enqueued=${stats.treatment_enqueued} ` +
+      `attachment_backfill_enqueued=${stats.attachment_backfill_enqueued} errors=${stats.errors.length}`
     );
   } catch (e: any) {
-    console.error(`[graph-webhook] processClassifiedItems failed for msg ${messageId}:`, e?.message || e);
+    console.error(`[graph-webhook] stageAndQueueGraphWebhookItems failed for msg ${messageId}:`, e?.message || e);
     if (syncJobOpened) {
       await closeSyncJob(env, jobId, {
         status: 'failed',

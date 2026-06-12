@@ -136,7 +136,14 @@ async function handleRequest(
     return new Response(null, { status: 204 });
   }
 
-  if (path === '/health') return jsonResponse({ ok: true, env: env.ENVIRONMENT });
+  if (path === '/health') return jsonResponse({
+    ok: true,
+    env: env.ENVIRONMENT,
+    build: {
+      git_sha: env.MEDINA_BUILD_SHA || env.MARTY_RUNTIME_GIT_SHA || 'unknown',
+      fireflies_pipeline_version: env.FIREFLIES_PIPELINE_VERSION || 'unknown',
+    },
+  });
 
   if (path === '/internal/firefly-credential' && method === 'POST') {
     return FireflyCredentials.getInternalFireflyCredential(request, env);
@@ -872,6 +879,14 @@ async function routeAuthenticated(
       const { handleFireflyTranscriptRebuild } = await import('./handlers/firefly-reconcile');
       return handleFireflyTranscriptRebuild(request, ctx, env);
     }
+    if (path === '/api/admin/firefly-transcript-source-verify' && method === 'POST') {
+      const { handleFireflyTranscriptSourceVerify } = await import('./handlers/firefly-reconcile');
+      return handleFireflyTranscriptSourceVerify(request, ctx, env);
+    }
+    if (path === '/api/admin/firefly-transcript-targeted-repair' && method === 'POST') {
+      const { handleFireflyTranscriptTargetedRepair } = await import('./handlers/firefly-reconcile');
+      return handleFireflyTranscriptTargetedRepair(request, ctx, env);
+    }
     if (path === '/api/admin/ingestion-treatment-coverage' && method === 'GET') {
       const { handleIngestionTreatmentCoverage } = await import('./handlers/ingestion-treatment');
       return handleIngestionTreatmentCoverage(request, ctx, env);
@@ -1206,6 +1221,27 @@ export async function handleScheduled(
             }
           } catch (e) {
             console.error(`hourly self-heal: scanAndRepairRagV2Coverage failed for ${org.id}:`, e);
+          }
+        })());
+        // Hourly Fireflies recent transcript safety net. This is deliberately
+        // bounded to the last 7 days and only enqueues missing Fireflies IDs
+        // through firefly_transcript_hydrate, so it cannot become a broad
+        // database replay.
+        ctxExec.waitUntil((async () => {
+          const key = `firefly_recent_sweep:${org.id}:${new Date(event.scheduledTime ?? Date.now()).toISOString().slice(0, 13)}`;
+          try {
+            const seen = await env.KV.get(key);
+            if (seen) return;
+            await env.KV.put(key, '1', { expirationTtl: 7200 });
+            const { runFireflyRecentSweeper } = await import('./lib/firefly-recent-sweeper');
+            const result = await runFireflyRecentSweeper(org.id, env, { daysBack: 7, maxPagesPerUser: 2 });
+            if (result.enqueued > 0 || result.errors.length > 0) {
+              console.warn(
+                `[firefly-recent-sweep] org=${org.id} users=${result.users_scanned} source=${result.source_transcripts} missing=${result.missing_transcripts} enqueued=${result.enqueued} errors=${result.errors.length}`
+              );
+            }
+          } catch (e) {
+            console.error(`hourly self-heal: runFireflyRecentSweeper failed for ${org.id}:`, e);
           }
         })());
         // deal_intelligence batch refresh — recompute the oldest 50
