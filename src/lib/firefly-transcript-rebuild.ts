@@ -672,6 +672,28 @@ export async function ingestFireflyTranscriptRecord(
       await updateOutlookEventWithTranscript(match.event_id, input, r2Key, env);
       await upsertTranscriptLink(match, input, transcriptItemId, ctx.orgId, env);
       await upsertTranscriptAttendeesForEvent(match.event_id, input, ctx, env);
+    }
+
+    transcriptItemId = await upsertTranscriptItem(
+      input,
+      ctx,
+      r2Key,
+      sourceHash,
+      'linked',
+      eventIds[0] || null,
+      matches.length,
+      env
+    );
+
+    const supersededEventId = await markFireflyRowSuperseded(
+      input.fireflyEventId,
+      ctx.orgId,
+      eventIds,
+      env
+    );
+    await retireSupersededFireflyVectorsIfSafe(supersededEventId, eventIds, ctx.orgId, env).catch(() => {});
+
+    for (const match of matches) {
       if (repairEmbeddings) embeddingQueued += await enqueueEmbeddingIfMissing(match.event_id, ctx.orgId, env);
       prospectQueued += await enqueueProspectIfRequested(match.event_id, ctx.orgId, env, repairProspectSignals);
       await enqueueIngestionTreatment(env, {
@@ -687,25 +709,6 @@ export async function ingestFireflyTranscriptRecord(
       });
     }
 
-    const supersededEventId = await markFireflyRowSuperseded(
-      input.fireflyEventId,
-      ctx.orgId,
-      eventIds,
-      env
-    );
-    await retireSupersededFireflyVectorsIfSafe(supersededEventId, eventIds, ctx.orgId, env).catch(() => {});
-
-    transcriptItemId = await upsertTranscriptItem(
-      input,
-      ctx,
-      r2Key,
-      sourceHash,
-      'linked',
-      eventIds[0] || null,
-      matches.length,
-      env
-    );
-
     return {
       outcome: 'ingested',
       canonical_status: 'linked',
@@ -720,6 +723,17 @@ export async function ingestFireflyTranscriptRecord(
   }
 
   const standaloneEventId = await upsertStandaloneFireflyEvent(input, ctx, r2Key, env);
+  transcriptItemId = await upsertTranscriptItem(
+    input,
+    ctx,
+    r2Key,
+    sourceHash,
+    'standalone',
+    standaloneEventId,
+    0,
+    env
+  );
+
   await upsertTranscriptAttendeesForEvent(standaloneEventId, input, ctx, env);
   if (repairEmbeddings) embeddingQueued += await enqueueEmbeddingIfMissing(standaloneEventId, ctx.orgId, env);
   prospectQueued += await enqueueProspectIfRequested(standaloneEventId, ctx.orgId, env, repairProspectSignals);
@@ -734,17 +748,6 @@ export async function ingestFireflyTranscriptRecord(
   }).catch(e => {
     console.error(`[firefly-rebuild] treatment enqueue failed for standalone event=${standaloneEventId}:`, e);
   });
-
-  transcriptItemId = await upsertTranscriptItem(
-    input,
-    ctx,
-    r2Key,
-    sourceHash,
-    'standalone',
-    standaloneEventId,
-    0,
-    env
-  );
 
   return {
     outcome: 'ingested',
