@@ -26,6 +26,7 @@ CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
 # buffer so a runaway loop can't burn the day's quota. The rate-limit.ts
 # checker uses this value; the Command Center capacity gauge displays it.
 GEMINI_MAX_RPM = "500"
+MARTY_PROMPT_CACHE_PREWARM = "true"
 ALLOWED_ORIGINS = "https://medinaventures.ai,https://www.medinaventures.ai,http://localhost:3000"
 FRONTEND_URL = "https://medinaventures.ai"
 INTERNAL_DOMAINS = "medinavc.com,medinacapital.com"

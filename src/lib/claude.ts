@@ -8,9 +8,20 @@ import {
   resolveDefaultClaudeModel,
 } from './model-policy';
 
+export interface ClaudeUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number;
+    ephemeral_1h_input_tokens?: number;
+  };
+}
+
 interface ClaudeResponse {
   content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
-  usage: { input_tokens: number; output_tokens: number };
+  usage: ClaudeUsage;
   stop_reason?: string;
 }
 
@@ -110,13 +121,6 @@ function compactMessagesForProviderRetry(
   }));
 }
 
-export const __claudeTestHooks = {
-  compactForModel,
-  stringifyToolResultForModel,
-  compactMessagesForProviderRetry,
-  isRecoverableProviderRejection,
-};
-
 function buildGatewayUrl(env: Env): string {
   if (!env.CLOUDFLARE_ACCOUNT_ID) {
     throw new Error('CLAUDE_CONFIG_ERROR: CLOUDFLARE_ACCOUNT_ID is not set');
@@ -151,8 +155,170 @@ function buildGatewayHeaders(env: Env): Record<string, string> {
   return headers;
 }
 
+export type ClaudeCacheControl = { type: 'ephemeral'; ttl?: '5m' | '1h' };
+
+export type ClaudeSystemPromptBlock = {
+  type: 'text';
+  text: string;
+  cache_control?: ClaudeCacheControl;
+};
+
+export type ClaudeSystemPrompt =
+  | string
+  | ClaudeSystemPromptBlock[];
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  input_schema: any;
+  cache_control?: ClaudeCacheControl;
+}
+
+export type ClaudeMessage = { role: 'user' | 'assistant'; content: any };
+
+function cloneWithMessageCacheControl(
+  messages: ClaudeMessage[],
+  cacheControl?: ClaudeCacheControl
+): ClaudeMessage[] {
+  if (!cacheControl || messages.length === 0) return messages;
+  const out = messages.slice();
+  for (let i = out.length - 1; i >= 0; i--) {
+    const message = out[i];
+    if (message.role !== 'user') continue;
+    if (typeof message.content === 'string') {
+      out[i] = {
+        ...message,
+        content: [{ type: 'text', text: message.content, cache_control: cacheControl }],
+      };
+      return out;
+    }
+    if (!Array.isArray(message.content)) continue;
+    const content = message.content.slice();
+    for (let j = content.length - 1; j >= 0; j--) {
+      const block = content[j];
+      if (!block || typeof block !== 'object') continue;
+      if (block.type !== 'text' || typeof block.text !== 'string') continue;
+      content[j] = { ...block, cache_control: cacheControl };
+      out[i] = { ...message, content };
+      return out;
+    }
+  }
+  return messages;
+}
+
+function buildAnthropicRequestBody(
+  params: {
+    system: ClaudeSystemPrompt;
+    messages: ClaudeMessage[];
+    max_tokens: number;
+    model: string;
+    stream?: boolean;
+    tools?: ToolDefinition[];
+    temperature?: number;
+    messageCacheControl?: ClaudeCacheControl;
+  }
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: params.model,
+    max_tokens: params.max_tokens,
+    ...(params.temperature != null ? { temperature: params.temperature } : {}),
+    ...(params.stream ? { stream: true } : {}),
+    system: params.system,
+    messages: cloneWithMessageCacheControl(params.messages, params.messageCacheControl),
+  };
+  if (params.tools?.length) body.tools = params.tools;
+  return body;
+}
+
+function isZeroTokenPrewarmRejection(status: number, body: string): boolean {
+  return status === 400
+    && /max_tokens|maximum.*tokens|tokens.*maximum|at least|greater than|positive/i.test(body);
+}
+
+function buildPrewarmAnthropicRequestBody(
+  params: {
+    system: ClaudeSystemPrompt;
+    user?: string;
+    model: string;
+    tools?: ToolDefinition[];
+  },
+  maxTokens: number
+): Record<string, unknown> {
+  return buildAnthropicRequestBody({
+    model: params.model,
+    max_tokens: maxTokens,
+    system: params.system,
+    messages: [{ role: 'user', content: params.user || 'warmup' }],
+    tools: params.tools,
+  });
+}
+
+async function fetchClaudeRequest(
+  env: Env,
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<Response> {
+  return fetch(buildGatewayUrl(env), {
+    method: 'POST',
+    headers: buildGatewayHeaders(env),
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+function mergeUsage(target: Partial<ClaudeUsage>, next: any): void {
+  if (!next || typeof next !== 'object') return;
+  for (const key of [
+    'input_tokens',
+    'output_tokens',
+    'cache_creation_input_tokens',
+    'cache_read_input_tokens',
+  ] as const) {
+    if (typeof next[key] === 'number') {
+      target[key] = (target[key] || 0) + next[key];
+    }
+  }
+  if (next.cache_creation && typeof next.cache_creation === 'object') {
+    target.cache_creation = {
+      ephemeral_5m_input_tokens:
+        (target.cache_creation?.ephemeral_5m_input_tokens || 0)
+        + Number(next.cache_creation.ephemeral_5m_input_tokens || 0),
+      ephemeral_1h_input_tokens:
+        (target.cache_creation?.ephemeral_1h_input_tokens || 0)
+        + Number(next.cache_creation.ephemeral_1h_input_tokens || 0),
+    };
+  }
+}
+
+function hasPromptCacheUsage(usage: Partial<ClaudeUsage>): boolean {
+  return Number(usage.cache_creation_input_tokens || 0) > 0
+    || Number(usage.cache_read_input_tokens || 0) > 0
+    || Number(usage.cache_creation?.ephemeral_5m_input_tokens || 0) > 0
+    || Number(usage.cache_creation?.ephemeral_1h_input_tokens || 0) > 0;
+}
+
+export const __claudeTestHooks = {
+  compactForModel,
+  stringifyToolResultForModel,
+  compactMessagesForProviderRetry,
+  isRecoverableProviderRejection,
+  buildAnthropicRequestBody,
+  buildPrewarmAnthropicRequestBody,
+  cloneWithMessageCacheControl,
+  isZeroTokenPrewarmRejection,
+  hasPromptCacheUsage,
+};
+
 export async function callClaude(
-  params: { system: string; user: string; max_tokens: number; orgId?: string; model?: string },
+  params: {
+    system: ClaudeSystemPrompt;
+    user: string;
+    max_tokens: number;
+    orgId?: string;
+    model?: string;
+    assistantPrefill?: string;
+    temperature?: number;
+  },
   priority: 'high' | 'low',
   env: Env
 ): Promise<string> {
@@ -163,16 +329,22 @@ export async function callClaude(
     throw new Error('CLAUDE_RATE_LIMITED');
   }
 
-  const response = await fetch(buildGatewayUrl(env), {
-    method: 'POST',
-    headers: buildGatewayHeaders(env),
-    body: JSON.stringify({
+  const messages: ClaudeMessage[] = params.assistantPrefill
+    ? [
+        { role: 'user', content: params.user },
+        { role: 'assistant', content: params.assistantPrefill },
+      ]
+    : [{ role: 'user', content: params.user }];
+  const response = await fetchClaudeRequest(
+    env,
+    buildAnthropicRequestBody({
       model,
       max_tokens: params.max_tokens,
+      temperature: params.temperature,
       system: params.system,
-      messages: [{ role: 'user', content: params.user }],
-    }),
-  });
+      messages,
+    })
+  );
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -191,13 +363,7 @@ export async function callClaude(
   const data = (await response.json()) as ClaudeResponse;
   const textBlock = data.content.find(b => b.type === 'text');
   if (!textBlock) throw new Error('Claude returned no text content');
-  return textBlock.text!;
-}
-
-export interface ToolDefinition {
-  name: string;
-  description: string;
-  input_schema: any;
+  return params.assistantPrefill ? `${params.assistantPrefill}${textBlock.text!}` : textBlock.text!;
 }
 
 export type ToolExecutor = (name: string, input: any) => Promise<any>;
@@ -237,8 +403,8 @@ function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 
 export async function callClaudeStreaming(
   params: {
-    system: string;
-    messages: Array<{ role: 'user' | 'assistant'; content: any }>;
+    system: ClaudeSystemPrompt;
+    messages: ClaudeMessage[];
     max_tokens: number;
     model?: string;
     orgId?: string;
@@ -246,6 +412,7 @@ export async function callClaudeStreaming(
     fallbackMaxTokens?: number;
     maxIterations?: number;
     tools?: ToolDefinition[];
+    messageCacheControl?: ClaudeCacheControl;
     onToolCall?: ToolExecutor;
     onToolResult?: ToolResultTransformer;
     preludeEvents?: any[];
@@ -291,15 +458,16 @@ export async function callClaudeStreaming(
       iterations++;
       console.log(`[claude-stream] iteration ${iterations}/${maxIterations}, messages: ${messages.length}`);
 
-      const buildBody = (maxTokens: number): any => ({
+      const buildBody = (maxTokens: number): any => buildAnthropicRequestBody({
         model,
         max_tokens: maxTokens,
         stream: true,
         system: params.system,
         messages,
+        tools: params.tools,
+        messageCacheControl: params.messageCacheControl,
       });
       const body = buildBody(activeMaxTokens);
-      if (params.tools?.length) body.tools = params.tools;
 
       let response: Response;
       try {
@@ -315,14 +483,13 @@ export async function callClaudeStreaming(
           });
           break;
         }
-        response = await fetch(buildGatewayUrl(env), {
-          method: 'POST',
-          headers: buildGatewayHeaders(env),
-          body: JSON.stringify(body),
+        response = await fetchClaudeRequest(
+          env,
+          body,
           // AbortSignal threading: aborts the in-flight fetch + breaks the
           // SSE reader's next read with an error → caught by the outer try.
-          signal: params.signal,
-        });
+          params.signal
+        );
       } catch (fetchErr: any) {
         if (fetchErr?.name === 'AbortError' || params.signal?.aborted) {
           console.log('[claude-stream] fetch aborted');
@@ -351,7 +518,6 @@ export async function callClaudeStreaming(
             fallback_max_tokens: params.fallbackMaxTokens,
           });
           const fallbackBody = buildBody(activeMaxTokens);
-          if (params.tools?.length) fallbackBody.tools = params.tools;
           try {
             if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
               await emit({
@@ -365,12 +531,7 @@ export async function callClaudeStreaming(
               });
               break;
             }
-            response = await fetch(buildGatewayUrl(env), {
-              method: 'POST',
-              headers: buildGatewayHeaders(env),
-              body: JSON.stringify(fallbackBody),
-              signal: params.signal,
-            });
+            response = await fetchClaudeRequest(env, fallbackBody, params.signal);
             if (!response.ok) {
               finalErrorBody = await response.text();
               if (response.status === 429) {
@@ -428,6 +589,7 @@ export async function callClaudeStreaming(
       const assistantContent: any[] = [];
       let currentTextBlock = '';
       let inToolUse = false;
+      const streamUsage: Partial<ClaudeUsage> = {};
 
       let aborted = false;
       while (true) {
@@ -455,6 +617,10 @@ export async function callClaudeStreaming(
 
           try {
             const event = JSON.parse(jsonStr);
+
+            if (event.type === 'message_start') {
+              mergeUsage(streamUsage, event.message?.usage);
+            }
 
             if (event.type === 'content_block_start') {
               if (event.content_block?.type === 'tool_use') {
@@ -496,10 +662,21 @@ export async function callClaudeStreaming(
 
             if (event.type === 'message_delta') {
               stopReason = event.delta?.stop_reason || '';
+              mergeUsage(streamUsage, event.usage);
             }
 
             if (event.type === 'message_stop') {
               if (!stopReason) stopReason = 'end_turn';
+              if (hasPromptCacheUsage(streamUsage)) {
+                console.log('[claude-stream] prompt cache usage', {
+                  model,
+                  input_tokens: streamUsage.input_tokens || 0,
+                  output_tokens: streamUsage.output_tokens || 0,
+                  cache_creation_input_tokens: streamUsage.cache_creation_input_tokens || 0,
+                  cache_read_input_tokens: streamUsage.cache_read_input_tokens || 0,
+                  cache_creation: streamUsage.cache_creation || null,
+                });
+              }
             }
           } catch {
             // skip malformed
@@ -599,4 +776,67 @@ export async function callClaudeStreaming(
   });
 
   return readable;
+}
+
+export async function prewarmClaudePromptCache(
+  params: {
+    system: ClaudeSystemPrompt;
+    user?: string;
+    orgId?: string;
+    model?: string;
+    tools?: ToolDefinition[];
+  },
+  priority: 'high' | 'low',
+  env: Env
+): Promise<{ usage: ClaudeUsage; model: string; stop_reason?: string; usedFallbackMaxTokens: boolean }> {
+  const orgId = params.orgId || 'system';
+  const model = params.model || resolveDefaultClaudeModel();
+  const budgetSource = budgetUpstreamForClaudeModel(model);
+  if (!(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
+    throw new Error('CLAUDE_RATE_LIMITED');
+  }
+
+  const buildBody = (maxTokens: number) => buildPrewarmAnthropicRequestBody(
+    { system: params.system, user: params.user, model, tools: params.tools },
+    maxTokens
+  );
+
+  let response = await fetchClaudeRequest(env, buildBody(0));
+  let usedFallbackMaxTokens = false;
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    if (isZeroTokenPrewarmRejection(response.status, errorBody)) {
+      usedFallbackMaxTokens = true;
+      response = await fetchClaudeRequest(env, buildBody(1));
+    } else if (response.status === 429) {
+      await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+      throw new Error('CLAUDE_RATE_LIMITED');
+    } else {
+      throw new Error(`Claude API error ${response.status}: ${errorBody}`);
+    }
+  }
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    if (response.status === 429) {
+      await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+      throw new Error('CLAUDE_RATE_LIMITED');
+    }
+    throw new Error(`Claude API error ${response.status}: ${errorBody}`);
+  }
+
+  await recordBudgetSuccess(env, orgId, null, budgetSource, 'minute');
+  const data = (await response.json()) as ClaudeResponse;
+  if (hasPromptCacheUsage(data.usage)) {
+    console.log('[claude-prewarm] prompt cache usage', {
+      model,
+      org_id: orgId,
+      cache_creation_input_tokens: data.usage.cache_creation_input_tokens || 0,
+      cache_read_input_tokens: data.usage.cache_read_input_tokens || 0,
+      cache_creation: data.usage.cache_creation || null,
+      fallback_max_tokens: usedFallbackMaxTokens,
+    });
+  }
+  return { usage: data.usage, model, stop_reason: data.stop_reason, usedFallbackMaxTokens };
 }

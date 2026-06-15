@@ -1,14 +1,16 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { GOD_MODE_SYSTEM_PROMPT } from '../prompts/god-mode';
+import type { ClaudeSystemPrompt, ClaudeSystemPromptBlock } from './claude';
 import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from './max-mode';
 import { resolveMartyMaxModel, resolveMartyNormalModel } from './model-policy';
 
-export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-05-19-platform-aware-v1';
-export const MARTY_LIVE_RUNTIME_VERSION = '2026-05-19-live-platform-aware-v1';
+export const MARTY_RUNTIME_FINGERPRINT_VERSION = '2026-06-15-prompt-cache-v1';
+export const MARTY_LIVE_RUNTIME_VERSION = '2026-06-15-live-prompt-cache-v1';
 export const MARTY_LAB_SANDBOX_RUNTIME_VERSION = '2026-05-15-lab-sandbox-v2';
-export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-05-19-agent-tools-platform-telemetry-v1';
+export const MARTY_AGENT_TOOL_SCHEMA_VERSION = '2026-06-15-agent-tools-prompt-cache-v1';
 export const MARTY_ARTIFACT_RUNTIME_VERSION = '2026-05-15-office-artifacts-v1';
+export const MARTY_PROMPT_CACHE_TTL = '1h' as const;
 
 export interface MartyRuntimeFingerprint {
   fingerprint_version: string;
@@ -106,24 +108,30 @@ export function buildMartyPlatformAwarenessPrompt(): string {
 - If the telemetry tool returns a forbidden or unresolved-user result, say that directly and ask for the missing email/name only if needed.`;
 }
 
-export function buildMartyBaseSystemPrompt(ctx: AuthContext, now: Date = new Date()): string {
-  return `${GOD_MODE_SYSTEM_PROMPT}\n\n${buildMartyTimelineAwarenessPrompt(now)}\n\n${buildMartyCurrentUserPrivacyPrompt(ctx)}\n\n${buildMartyPlatformAwarenessPrompt()}`;
+export function buildMartyDynamicSystemPrompt(ctx: AuthContext, now: Date = new Date()): string {
+  return `${buildMartyTimelineAwarenessPrompt(now)}\n\n${buildMartyCurrentUserPrivacyPrompt(ctx)}\n\n${buildMartyPlatformAwarenessPrompt()}`;
 }
 
-export function buildMartyMaxModePrompt(stats?: {
-  emails: number;
-  meetings: number;
-  documents: number;
-  contacts: number;
-  companies: number;
-}): string {
-  const scope = stats
-    ? `MAX: Initial retrieval surfaced ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts before tool sweeps.`
-    : 'MAX: Starting from the broad Medina retrieval context; tool sweeps define exhaustive coverage.';
-  return `\n\nYou are in MAX mode, powered by Claude Opus 4.7 for a maximum sweep across the user's permitted Medina data.
+function textFromSystemPrompt(system: ClaudeSystemPrompt): string {
+  return typeof system === 'string'
+    ? system
+    : system.map(block => block.text).join('\n\n');
+}
 
-Begin your response with one brief scope line. If you used sweep_conversations or another structured sweep, report the actual sweep coverage and aggregation counts from the tool result. If you did not use a sweep, use:
-${scope}
+export function buildMartyBaseSystemPromptBlocks(ctx: AuthContext, now: Date = new Date()): ClaudeSystemPrompt {
+  return [
+    { type: 'text', text: GOD_MODE_SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: MARTY_PROMPT_CACHE_TTL } },
+    { type: 'text', text: buildMartyDynamicSystemPrompt(ctx, now) },
+  ];
+}
+
+export function buildMartyBaseSystemPrompt(ctx: AuthContext, now: Date = new Date()): string {
+  return textFromSystemPrompt(buildMartyBaseSystemPromptBlocks(ctx, now));
+}
+
+export const MARTY_MAX_MODE_STATIC_PROMPT = `You are in MAX mode, powered by Claude Opus 4.7 for a maximum sweep across the user's permitted Medina data.
+
+Begin your response with one brief scope line. If you used sweep_conversations or another structured sweep, report the actual sweep coverage and aggregation counts from the tool result. If you did not use a sweep, use the MAX MODE TURN CONTEXT scope line supplied later in this system prompt.
 
 MAX mode is built for exhaustive database work, not just richer prose:
 - If the user asks for "all", "every", "list everyone", a mail merge/export, a count, all touchpoints, "ever talked to", or a broad roster of people/firms/startups, do not rely on the initial SOURCES list or recall() alone.
@@ -141,6 +149,65 @@ Then write a cited evidence memo:
 - Recommended next actions
 
 Use multiple retrieval angles before finalizing when the question calls for it: build_max_set for exhaustive sets, search_events for calendar/meeting/transcript windows, broad recall/source-specific recall for narrative evidence, sweep_conversations/search_conversations for narrow email/Slack debugging, and structured entity search for specific CRM records. For exhaustive roster/export tasks, return the actual aggregated set or created artifact; do not collapse hundreds of possible rows into a handful of examples. Cite specific emails, meetings, Slack messages, and documents by name/date where available. Never use a zero-result conversation search as evidence that meeting transcripts do not exist.`;
+
+export function buildMartyMaxModeScopePrompt(stats?: {
+  emails: number;
+  meetings: number;
+  documents: number;
+  contacts: number;
+  companies: number;
+}): string {
+  const scope = stats
+    ? `MAX: Initial retrieval surfaced ${stats.emails} emails, ${stats.meetings} meetings, ${stats.documents} documents across ${stats.contacts} contacts before tool sweeps.`
+    : 'MAX: Starting from the broad Medina retrieval context; tool sweeps define exhaustive coverage.';
+  return `MAX MODE TURN CONTEXT:
+Default scope line if no tool result provides better coverage:
+${scope}`;
+}
+
+export function buildMartyMaxModePrompt(stats?: {
+  emails: number;
+  meetings: number;
+  documents: number;
+  contacts: number;
+  companies: number;
+}): string {
+  return `\n\n${MARTY_MAX_MODE_STATIC_PROMPT}\n\n${buildMartyMaxModeScopePrompt(stats)}`;
+}
+
+export function buildMartySystemPromptBlocks(
+  ctx: AuthContext,
+  now: Date = new Date(),
+  opts: {
+    deepDive?: boolean;
+    stats?: {
+      emails: number;
+      meetings: number;
+      documents: number;
+      contacts: number;
+      companies: number;
+    };
+    forcedMaxSetInstruction?: string | null;
+  } = {}
+): ClaudeSystemPrompt {
+  const blocks: ClaudeSystemPromptBlock[] = [
+    { type: 'text', text: GOD_MODE_SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: MARTY_PROMPT_CACHE_TTL } },
+  ];
+  if (opts.deepDive) {
+    blocks.push({
+      type: 'text',
+      text: MARTY_MAX_MODE_STATIC_PROMPT,
+      cache_control: { type: 'ephemeral', ttl: MARTY_PROMPT_CACHE_TTL },
+    });
+  }
+  blocks.push({ type: 'text', text: buildMartyDynamicSystemPrompt(ctx, now) });
+  if (opts.deepDive) {
+    blocks.push({ type: 'text', text: buildMartyMaxModeScopePrompt(opts.stats) });
+  }
+  if (opts.forcedMaxSetInstruction) {
+    blocks.push({ type: 'text', text: opts.forcedMaxSetInstruction });
+  }
+  return blocks;
 }
 
 function productionRuntimeComponents(env: Env, deepDive: boolean): Record<string, unknown> {
@@ -152,6 +219,7 @@ function productionRuntimeComponents(env: Env, deepDive: boolean): Record<string
       current_user_privacy_version: 'shared-v1',
       platform_awareness_version: 'platform-telemetry-v1',
       max_mode_addendum_version: 'max-set-builder-v2-forced',
+      prompt_cache_version: 'marty-static-prefix-1h-v1',
     },
     claude: {
       normal_model: resolveMartyNormalModel(env),

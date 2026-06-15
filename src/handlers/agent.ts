@@ -5,7 +5,7 @@ import { preprocessQuery, retrieveContext, TOKEN_BUDGET, type RetrievalOptions }
 import { buildSourcesAndContext, filterCitationSourcesForViewer, type CitationSource } from '../lib/citations';
 import { normalizeCitationMarkers } from '../lib/citation-format';
 import { verifySampleClaims } from '../lib/citation-verifier';
-import { callClaude, callClaudeStreaming } from '../lib/claude';
+import { callClaude, callClaudeStreaming, prewarmClaudePromptCache } from '../lib/claude';
 import type { ToolDefinition } from '../lib/claude';
 import { extractTextFromFile } from '../lib/file-extraction';
 import { assembleSessionAttachments, type UploadSummary } from '../lib/chat-uploads';
@@ -58,8 +58,7 @@ import { MAX_MODE_LIMITS, NORMAL_MODE_LIMITS } from '../lib/max-mode';
 import { CLAUDE_HAIKU_MODEL, resolveMartyMaxModel, resolveMartyNormalModel } from '../lib/model-policy';
 import {
   buildLiveMartyRuntimeFingerprint,
-  buildMartyBaseSystemPrompt,
-  buildMartyMaxModePrompt,
+  buildMartySystemPromptBlocks,
 } from '../lib/marty-runtime';
 import { buildMaxSetTool, compactMaxSetResultForContext, detectMaxSetIntent } from '../lib/max-set-builder';
 import {
@@ -801,6 +800,90 @@ const AGENT_TOOLS: ToolDefinition[] = [
     },
   },
 ];
+
+const MARTY_TOOL_CACHE_CONTROL = { type: 'ephemeral', ttl: '1h' } as const;
+let cachedAgentToolsForPromptCache: ToolDefinition[] | null = null;
+let lastMartyPromptPrewarmHour: string | null = null;
+
+function agentToolsForPromptCache(): ToolDefinition[] {
+  if (cachedAgentToolsForPromptCache) return cachedAgentToolsForPromptCache;
+  cachedAgentToolsForPromptCache = AGENT_TOOLS.map((tool, index) => (
+    index === AGENT_TOOLS.length - 1
+      ? { ...tool, cache_control: MARTY_TOOL_CACHE_CONTROL }
+      : tool
+  ));
+  return cachedAgentToolsForPromptCache;
+}
+
+function shouldPrewarmMartyPromptCache(env: Env): boolean {
+  return String(env.MARTY_PROMPT_CACHE_PREWARM || '').toLowerCase() === 'true';
+}
+
+export async function prewarmMartyAgentPromptCaches(
+  orgId: string,
+  env: Env,
+  now: Date = new Date()
+): Promise<{ attempted: boolean; warmed: string[]; skipped_reason?: string }> {
+  if (!shouldPrewarmMartyPromptCache(env)) {
+    return { attempted: false, warmed: [], skipped_reason: 'disabled' };
+  }
+  const hourKey = now.toISOString().slice(0, 13);
+  if (lastMartyPromptPrewarmHour === hourKey) {
+    return { attempted: false, warmed: [], skipped_reason: 'already_warmed_this_hour' };
+  }
+  lastMartyPromptPrewarmHour = hourKey;
+
+  const warmupCtx: AuthContext = {
+    orgId,
+    userId: 'marty-prompt-cache-prewarm',
+    userRole: 'owner',
+    email: 'marty-prompt-cache-prewarm@medinavc.com',
+  };
+  const tools = agentToolsForPromptCache();
+  const warmed: string[] = [];
+  const stages = [
+    {
+      name: 'normal',
+      model: resolveMartyNormalModel(env),
+      system: buildMartySystemPromptBlocks(warmupCtx, now),
+    },
+    {
+      name: 'max',
+      model: resolveMartyMaxModel(env),
+      system: buildMartySystemPromptBlocks(warmupCtx, now, { deepDive: true }),
+    },
+  ];
+
+  for (const stage of stages) {
+    try {
+      const result = await prewarmClaudePromptCache({
+        system: stage.system,
+        user: 'warmup',
+        orgId,
+        model: stage.model,
+        tools,
+      }, 'low', env);
+      warmed.push(stage.name);
+      console.log('[marty-prompt-cache] prewarm complete', {
+        org_id: orgId,
+        stage: stage.name,
+        model: result.model,
+        cache_creation_input_tokens: result.usage.cache_creation_input_tokens || 0,
+        cache_read_input_tokens: result.usage.cache_read_input_tokens || 0,
+        fallback_max_tokens: result.usedFallbackMaxTokens,
+      });
+    } catch (error: any) {
+      console.warn('[marty-prompt-cache] prewarm failed', {
+        org_id: orgId,
+        stage: stage.name,
+        model: stage.model,
+        error: String(error?.message || error).slice(0, 500),
+      });
+    }
+  }
+
+  return { attempted: true, warmed };
+}
 
 // ---------------------------------------------------------------------------
 // Tool executor
@@ -3189,11 +3272,14 @@ export async function queryAgent(
   }
 
   // --- Stream Claude response with tool use ---
-  let systemPrompt = buildMartyBaseSystemPrompt(ctx, new Date());
-  if (deepDive) systemPrompt += buildMartyMaxModePrompt(stats);
-  if (compactForcedMaxSet) {
-    systemPrompt += `\n\nA deterministic MAX set-builder run has already been executed for this turn and is included under "FORCED MAX SET BUILDER RESULT". Treat it as the source of truth for roster/list/set contents and coverage. Do not create a second spreadsheet from recall snippets. If safety_status is unsafe_incomplete, explicitly say the export is not safe, do not imply the set is complete, and explain the quality_gate reasons plus the fastest path to a clean run. If the forced run has an artifact_card, tell the user the workbook is ready and summarize counts, coverage, and real gaps from that run.`;
-  }
+  const forcedMaxSetInstruction = compactForcedMaxSet
+    ? 'A deterministic MAX set-builder run has already been executed for this turn and is included under "FORCED MAX SET BUILDER RESULT". Treat it as the source of truth for roster/list/set contents and coverage. Do not create a second spreadsheet from recall snippets. If safety_status is unsafe_incomplete, explicitly say the export is not safe, do not imply the set is complete, and explain the quality_gate reasons plus the fastest path to a clean run. If the forced run has an artifact_card, tell the user the workbook is ready and summarize counts, coverage, and real gaps from that run.'
+    : null;
+  const systemPrompt = buildMartySystemPromptBlocks(ctx, new Date(), {
+    deepDive,
+    stats,
+    forcedMaxSetInstruction,
+  });
 
   let stream: ReadableStream<Uint8Array>;
   try {
@@ -3207,7 +3293,8 @@ export async function queryAgent(
         max_tokens: deepDive ? MAX_MODE_LIMITS.outputTokens : NORMAL_MODE_LIMITS.outputTokens,
         fallbackMaxTokens: deepDive ? MAX_MODE_LIMITS.fallbackOutputTokens : undefined,
         maxIterations: deepDive ? MAX_MODE_LIMITS.toolIterations : NORMAL_MODE_LIMITS.toolIterations,
-        tools: AGENT_TOOLS,
+        tools: agentToolsForPromptCache(),
+        messageCacheControl: { type: 'ephemeral', ttl: '5m' },
         preludeEvents,
         onToolCall: (name, input) => {
           if (forcedMaxSetResult && name === 'build_max_set') return Promise.resolve(forcedMaxSetResult);

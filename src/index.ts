@@ -942,6 +942,16 @@ export async function handleScheduled(
     'SELECT id FROM organizations WHERE deleted_at IS NULL'
   ).all<{ id: string }>();
 
+  if (cron === '0 * * * *') {
+    const promptCacheOrgId = orgs.results[0]?.id;
+    if (promptCacheOrgId) {
+      ctxExec.waitUntil(
+        Agent.prewarmMartyAgentPromptCaches(promptCacheOrgId, env)
+          .catch(e => console.error('hourly self-heal: MARTy prompt-cache prewarm failed:', e))
+      );
+    }
+  }
+
   for (const org of orgs.results) {
     try {
       if (cron === '0 * * * *') {

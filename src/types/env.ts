@@ -45,6 +45,7 @@ export interface Env {
   MARTY_NORMAL_MODEL?: string;
   MARTY_MAX_MODEL?: string;
   MARTY_RUNTIME_GIT_SHA?: string;
+  MARTY_PROMPT_CACHE_PREWARM?: string;
   // Premium deck rendering is orchestrated by the Worker but executed by a
   // separate Node/Playwright service. Keep optional so the HTML-first fallback
   // can deploy before the renderer service is provisioned.
