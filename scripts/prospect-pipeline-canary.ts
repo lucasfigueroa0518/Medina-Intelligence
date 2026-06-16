@@ -30,6 +30,7 @@ interface Args {
   allowMissingSources: boolean;
   allowEmptyDecisions: boolean;
   highSignal: boolean;
+  prewarmPromptCache: boolean;
   outputDir: string;
 }
 
@@ -51,6 +52,7 @@ export interface ProspectPipelineCanarySummary {
   write_proof_statement: string;
   dry_run_counter_labels: Record<string, string>;
   high_signal: boolean;
+  prompt_prewarm_requested?: boolean;
   org_id: string;
   source_type: CanarySourceType;
   lookback_hours: number;
@@ -106,7 +108,7 @@ function parseArgs(argv: string[]): Args {
   if (!Number.isFinite(lookbackHours) || lookbackHours < 1 || lookbackHours > 24 * 30) {
     throw new Error('INVALID_LOOKBACK_HOURS');
   }
-  if (!Number.isFinite(limit) || limit < 1 || limit > 100) {
+  if (!Number.isFinite(limit) || limit < 1 || limit > 10000) {
     throw new Error('INVALID_LIMIT');
   }
   const today = new Date().toISOString().slice(0, 10);
@@ -122,6 +124,7 @@ function parseArgs(argv: string[]): Args {
     allowMissingSources: raw.get('allow-missing-sources') === 'true',
     allowEmptyDecisions: raw.get('allow-empty-decisions') === 'true',
     highSignal: raw.get('high-signal') === 'true',
+    prewarmPromptCache: raw.get('prewarm-prompt-cache') === 'true',
     outputDir: raw.get('output-dir') || join(homedir(), 'Downloads', `prospect-pipeline-canary-${today}`),
   };
 }
@@ -435,6 +438,7 @@ export async function buildProspectPipelineCanarySummary(
     write_proof_statement: CANARY_WRITE_PROOF_STATEMENT,
     dry_run_counter_labels: CANARY_DRY_RUN_COUNTER_LABELS,
     high_signal: args.highSignal === true,
+    prompt_prewarm_requested: false,
     org_id: args.orgId,
     source_type: args.sourceType,
     lookback_hours: args.lookbackHours,
@@ -483,6 +487,7 @@ export function buildProspectPipelineRemoteCanarySummary(input: {
     write_proof_statement: CANARY_WRITE_PROOF_STATEMENT,
     dry_run_counter_labels: CANARY_DRY_RUN_COUNTER_LABELS,
     high_signal: input.highSignal === true,
+    prompt_prewarm_requested: false,
     org_id: input.orgId,
     source_type: input.sourceType,
     lookback_hours: input.lookbackHours,
@@ -628,11 +633,15 @@ function renderCanaryReport(summary: ProspectPipelineCanarySummary): string {
   const classifier = summary.classifier;
   const coverage = summary.source_coverage;
   const decisions = classifier?.decisions || [];
+  const stageUsage = classifier?.stats.llm_stage_usage || {};
   const sampleFor = (action: string) => decisions.find(row => row.prospect_action === action);
   const sampleRows = ['create_prospect', 'attach_existing_deal', 'record_context', 'ignore']
     .map(action => ({ action, row: sampleFor(action) }))
     .filter(entry => entry.row)
     .map(entry => `| ${entry.action} | ${entry.row?.company_name || ''} | ${entry.row?.source_type}:${entry.row?.source_id} | ${entry.row?.reasoning || entry.row?.error || ''} |`);
+  const stageRows = Object.entries(stageUsage)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([stage, usage]) => `| ${stage} | ${usage.paid_calls} | ${usage.cache_hits} | ${usage.cache_misses} | ${usage.input_tokens} | ${usage.output_tokens} | ${usage.cache_creation_input_tokens} | ${usage.cache_read_input_tokens} |`);
 
   return [
     '# Prospect Pipeline Canary',
@@ -644,6 +653,7 @@ function renderCanaryReport(summary: ProspectPipelineCanarySummary): string {
     `- Classification status: ${summary.classification_status}`,
     `- Write proof status: ${summary.write_proof_status}`,
     `- High-signal mode: ${summary.high_signal}`,
+    `- Prompt prewarm requested: ${summary.prompt_prewarm_requested === true}`,
     `- Org: ${summary.org_id}`,
     `- Source type: ${summary.source_type}`,
     `- Lookback hours: ${summary.lookback_hours}`,
@@ -664,6 +674,15 @@ function renderCanaryReport(summary: ProspectPipelineCanarySummary): string {
     `- would_ignore: ${classifier?.decision_counts.ignore ?? 0}`,
     `- classifier_error: ${classifier?.decision_counts.classifier_error ?? 0}`,
     `- duplicate keys: ${classifier?.duplicates.length ?? 0}`,
+    `- source classifier paid calls: ${classifier?.stats.classifier_paid_calls ?? 0}`,
+    `- source classifier cache hits: ${classifier?.stats.classifier_cache_hits ?? 0}`,
+    `- source classifier cache misses: ${classifier?.stats.classifier_cache_misses ?? 0}`,
+    '',
+    '## LLM Stage Usage',
+    '',
+    '| Stage | Paid Calls | Cache Hits | Cache Misses | Input Tokens | Output Tokens | Cache Create Tokens | Cache Read Tokens |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    ...(stageRows.length ? stageRows : ['| (none) | 0 | 0 | 0 | 0 | 0 | 0 | 0 |']),
     '',
     '## Sane Decision Samples',
     '',
@@ -713,10 +732,14 @@ async function main(): Promise<void> {
       summary = await buildProspectPipelineCanarySummary(proxy.env as unknown as Env, args);
     }
     if (args.classify) {
+      summary.prompt_prewarm_requested = args.prewarmPromptCache;
       const remoteMeta = summary.remote_d1_meta;
-      const canaryEnv = args.remoteReadProof && remoteMeta
+      const canaryEnvBase = args.remoteReadProof && remoteMeta
         ? remoteReadOnlyCanaryEnv(proxy.env as unknown as Env, args.database, remoteMeta)
         : proxy.env as unknown as Env;
+      const canaryEnv = args.prewarmPromptCache
+        ? { ...(canaryEnvBase as any), PROSPECT_PREWARM_PROMPT_CACHE: 'true' } as Env
+        : canaryEnvBase;
       await classifyCanarySources(canaryEnv, summary, {
         allowMissingSources: args.allowMissingSources,
         allowEmptyDecisions: args.allowEmptyDecisions,

@@ -173,7 +173,7 @@ function familySourceSql(family: SourceFamily, orgId: string, windowStart: strin
          AND e.deleted_at IS NULL
          AND (
            (e.start_time >= ${start} AND e.start_time < ${end})
-           OR (e.created_at >= ${start} AND e.created_at < ${end} AND e.start_time >= ${start})
+           OR (e.created_at >= ${start} AND e.created_at < ${end} AND e.start_time >= ${start} AND e.start_time < ${end})
          )`;
   }
   return `

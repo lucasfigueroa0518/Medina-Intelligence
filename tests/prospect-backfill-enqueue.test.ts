@@ -129,4 +129,19 @@ describe('prospect large backfill enqueue launcher', () => {
     expect(insertSql).toContain("printf('+%d minutes'");
     expect(insertSql).toContain('/ 3');
   });
+
+  it('caps event backfills by event start time as well as created time', async () => {
+    const executor = new EnqueueFakeExecutor({ eventCount: 2 });
+
+    await runProspectBackfillEnqueue({
+      ...baseArgs,
+      sourceFamilies: ['event'],
+    } as any, executor as any);
+
+    const eventSql = executor.sqls.find(sql => /FROM events e/i.test(sql)) || '';
+    expect(eventSql).toContain('e.start_time >=');
+    expect(eventSql).toContain('e.start_time <');
+    expect(eventSql).toContain('e.created_at >=');
+    expect(eventSql).toMatch(/e\.created_at >= [\s\S]* e\.start_time >= [\s\S]* e\.start_time </);
+  });
 });

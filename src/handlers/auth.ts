@@ -2,6 +2,14 @@
 import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 
+const VALID_USER_ROLES = new Set(['owner', 'admin', 'member', 'super_admin']);
+
+function normalizeUserRole(role: unknown): AuthContext['userRole'] {
+  return typeof role === 'string' && VALID_USER_ROLES.has(role)
+    ? role as AuthContext['userRole']
+    : 'member';
+}
+
 /**
  * Verifies a JWT via HS256 and returns the AuthContext.
  * Returns null if invalid.
@@ -173,9 +181,24 @@ export async function requireAuth(
   }
 
   const userRow = await env.D1.prepare(
-    'SELECT email_verified FROM users WHERE id = ? AND deleted_at IS NULL'
-  ).bind(ctx.userId).first<{ email_verified: number | null }>();
-  if (userRow && !userRow.email_verified) {
+    `SELECT id, org_id, email, role, email_verified, is_active
+     FROM users
+     WHERE id = ? AND deleted_at IS NULL`
+  ).bind(ctx.userId).first<{
+    id: string;
+    org_id: string;
+    email: string | null;
+    role: string | null;
+    email_verified: number | null;
+    is_active: number | null;
+  }>();
+  if (!userRow || !userRow.is_active) {
+    return new Response(
+      JSON.stringify({ error: 'AUTH_TOKEN_INVALID' }),
+      { status: 401, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+  if (!userRow.email_verified) {
     const url = new URL(request.url);
     if (url.pathname !== '/api/auth/me') {
       return new Response(
@@ -185,7 +208,12 @@ export async function requireAuth(
     }
   }
 
-  return ctx;
+  return {
+    userId: userRow.id,
+    orgId: userRow.org_id,
+    userRole: normalizeUserRole(userRow.role),
+    email: userRow.email || ctx.email,
+  };
 }
 
 export function requireRole(

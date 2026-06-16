@@ -8,9 +8,20 @@ import {
   resolveDefaultClaudeModel,
 } from './model-policy';
 
+export interface ClaudeUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number;
+    ephemeral_1h_input_tokens?: number;
+  };
+}
+
 interface ClaudeResponse {
   content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
-  usage: { input_tokens: number; output_tokens: number };
+  usage: ClaudeUsage;
   stop_reason?: string;
 }
 
@@ -207,17 +218,29 @@ async function fetchClaudeViaGateway(
 
 export interface ClaudeCallResult {
   text: string;
-  usage: { input_tokens: number; output_tokens: number };
+  usage: ClaudeUsage;
   model: string;
 }
+
+export interface ClaudePromptCachePrewarmResult {
+  usage: ClaudeUsage;
+  model: string;
+  stop_reason?: string;
+}
+
+export type ClaudeCacheControl = { type: 'ephemeral'; ttl?: '5m' | '1h' };
 
 export type ClaudeSystemPrompt =
   | string
   | Array<{
       type: 'text';
       text: string;
-      cache_control?: { type: 'ephemeral' };
+      cache_control?: ClaudeCacheControl;
     }>;
+
+export function isClaudeHardQuotaErrorMessage(message: string): boolean {
+  return /specified API usage limits|monthly (?:usage|credit|spend) limit|regain access on/i.test(message);
+}
 
 export async function callClaudeWithUsage(
   params: {
@@ -246,6 +269,9 @@ export async function callClaudeWithUsage(
 
   if (!response.ok) {
     const errorBody = await response.text();
+    if (isClaudeHardQuotaErrorMessage(errorBody)) {
+      throw new Error(`CLAUDE_MONTHLY_QUOTA_EXHAUSTED: ${errorBody}`);
+    }
     if (response.status === 429) {
       // Phase 3.3: feed the upstream_budget_ledger circuit breaker.
       // 3 consecutive 429s → cap drops 10%, circuit opens 30 min.
@@ -267,6 +293,54 @@ export async function callClaudeWithUsage(
   if (!textBlock) throw new Error('Claude returned no text content');
   const text = params.assistantPrefill ? `${params.assistantPrefill}${textBlock.text!}` : textBlock.text!;
   return { text, usage: data.usage, model };
+}
+
+export async function prewarmClaudePromptCache(
+  params: {
+    system: ClaudeSystemPrompt;
+    user?: string;
+    orgId?: string;
+    model?: string;
+    dryRunNoBudgetWrites?: boolean;
+  },
+  priority: 'high' | 'low',
+  env: Env
+): Promise<ClaudePromptCachePrewarmResult> {
+  const orgId = params.orgId || 'system';
+  const model = params.model || resolveDefaultClaudeModel();
+  const budgetSource = budgetUpstreamForClaudeModel(model);
+  const dryRunNoBudgetWrites = params.dryRunNoBudgetWrites === true;
+  if (!dryRunNoBudgetWrites && !(await checkClaudeRateLimit(env, orgId, priority, budgetSource))) {
+    throw new Error('CLAUDE_RATE_LIMITED');
+  }
+  const body = buildAnthropicRequestBody({
+    system: params.system,
+    user: params.user || 'warmup',
+    max_tokens: 1,
+    model,
+  }, model);
+
+  const response = await fetchClaudeViaGateway(env, body);
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    if (isClaudeHardQuotaErrorMessage(errorBody)) {
+      throw new Error(`CLAUDE_MONTHLY_QUOTA_EXHAUSTED: ${errorBody}`);
+    }
+    if (response.status === 429) {
+      if (!dryRunNoBudgetWrites) {
+        await recordRateLimit(env, orgId, null, budgetSource, 'minute');
+      }
+      throw new Error('CLAUDE_RATE_LIMITED');
+    }
+    throw new Error(`Claude API error ${response.status}: ${errorBody}`);
+  }
+  if (!dryRunNoBudgetWrites) {
+    await recordBudgetSuccess(env, orgId, null, budgetSource, 'minute');
+  }
+
+  const data = (await response.json()) as ClaudeResponse;
+  return { usage: data.usage, model, stop_reason: data.stop_reason };
 }
 
 export async function callClaude(

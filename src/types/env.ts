@@ -47,6 +47,9 @@ export interface Env {
   PROSPECT_CLASSIFIER_MODEL?: string;
   PROSPECT_LIST_CLASSIFIER_MODEL?: string;
   PROSPECT_ORG_EXTRACTOR_MODEL?: string;
+  PROSPECT_REASONING_JUDGE_MODEL?: string;
+  PROSPECT_FINAL_QUALITY_MODEL?: string;
+  PROSPECT_PREWARM_PROMPT_CACHE?: string;
   PROSPECT_PRODUCTION_SAMPLE_RATE?: string;
   MARTY_RUNTIME_GIT_SHA?: string;
   // Premium deck rendering is orchestrated by the Worker but executed by a
