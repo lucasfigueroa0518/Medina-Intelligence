@@ -373,6 +373,9 @@ function contextSnapshotSql(table: string, orgId: string): string {
   if (table === 'prospectSignals') {
     return `SELECT * FROM prospect_signals WHERE org_id = ${org}`;
   }
+  if (table === 'identityAliases') {
+    return `SELECT * FROM entity_identity_aliases WHERE org_id = ${org}`;
+  }
   return `SELECT * FROM ${table} WHERE org_id = ${org}`;
 }
 
@@ -383,6 +386,8 @@ function buildContextSnapshot(args: Args, meta: RemoteMeta): Record<string, any[
     deals: runD1(args, contextSnapshotSql('deals', args.orgId), meta),
     dealmakers: runD1(args, contextSnapshotSql('dealmakers', args.orgId), meta),
     contacts: runD1(args, contextSnapshotSql('contacts', args.orgId), meta),
+    prospects: runD1(args, contextSnapshotSql('prospects', args.orgId), meta),
+    identityAliases: runD1(args, contextSnapshotSql('identityAliases', args.orgId), meta),
     prospectSignals: runD1(args, contextSnapshotSql('prospectSignals', args.orgId), meta),
     knownDeals: runD1(args, contextSnapshotSql('knownDeals', args.orgId), meta),
   };

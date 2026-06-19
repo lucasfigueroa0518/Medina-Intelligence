@@ -992,7 +992,7 @@ export function normalizeProspectName(value: string | null | undefined): string 
   let text = (value || '')
     .toLowerCase()
     .replace(/\([^)]*\)/g, ' ')
-    .replace(/\b(incorporated|inc|llc|ltd|limited|corp|corporation|company|co)\b\.?/g, ' ')
+    .replace(/\b(incorporated|inc|llc|ltd|limited|corp|corporation|company|co|pbc)\b\.?/g, ' ')
     .replace(/['’]/g, '')
     .replace(/&/g, 'and')
     .replace(/[^a-z0-9]+/g, ' ')
@@ -1107,7 +1107,7 @@ function canonicalizeMention(raw: string): { canonicalName: string; products: st
     .replace(/[.,:;]+$/g, '')
     .replace(/\s+\b(?:for|to|from|with|and|the|at)\b$/i, '')
     .trim();
-  const urlDomain = cleaned.match(/^([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|gov|mil|edu|health|tech|dev|finance|xyz))$/i)?.[1];
+  const urlDomain = cleaned.match(/^([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|gov|mil|edu|health|tech|dev|finance|xyz|systems))$/i)?.[1];
   if (urlDomain && /^<?https?:\/\//i.test(normalizeWhitespace(raw))) {
     cleaned = domainLabelToCompany(urlDomain);
   }
@@ -1328,7 +1328,7 @@ function emailMatchesInText(text: string): Array<{ value: string; start: number;
 
 function domainMatchesInText(text: string): Array<{ value: string; start: number; end: number }> {
   const matches: Array<{ value: string; start: number; end: number }> = [];
-  for (const match of String(text || '').matchAll(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|health|tech|dev|finance|xyz))\b/gi)) {
+  for (const match of String(text || '').matchAll(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|health|tech|dev|finance|xyz|systems))\b/gi)) {
     const value = String(match[1] || '').toLowerCase().replace(/^www\./, '');
     if (!value || shouldIgnoreDomain(value) || typeof match.index !== 'number') continue;
     const raw = String(match[0] || '');
@@ -1543,7 +1543,7 @@ export function cleanProspectSourceText(rawText: string): { cleanedText: string 
 
 function domainLabelToCompany(domain: string): string {
   let first = domain.toLowerCase().replace(/^www\./, '').split('.')[0] || '';
-  first = first.replace(/(?:inc|llc|ltd|corp|cpa|management)$/i, '');
+  first = first.replace(/(?:inc|llc|ltd|corp|pbc|cpa|management)$/i, '');
   return first
     .split(/[-_]+/)
     .filter(Boolean)
@@ -1669,7 +1669,7 @@ function prospectIdentityAcronymAlias(value: string | null | undefined): string 
 
 function domainsInText(text: string, env?: Env): string[] {
   const domains: string[] = [];
-  for (const match of String(text || '').matchAll(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|gov|mil|edu|health|tech|dev|finance|xyz))\b/gi)) {
+  for (const match of String(text || '').matchAll(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|gov|mil|edu|health|tech|dev|finance|xyz|systems))\b/gi)) {
     const rawDomain = match[1]?.toLowerCase().replace(/^www\./, '') || '';
     const domain = rawDomain ? registrableDomain(rawDomain) : '';
     if (!domain || shouldIgnoreDomain(domain, env)) continue;
@@ -1702,6 +1702,111 @@ function prospectIdentityAliasesForMention(mention: MentionCandidate, env?: Env)
     for (const alias of prospectIdentityAliasesForName(domainLabelToCompany(domain))) aliases.add(alias);
   }
   return aliases;
+}
+
+export type EntityIdentityAliasKind = 'normalized_name' | 'domain' | 'domain_brand' | 'product' | 'stealth' | 'manual';
+
+export interface EntityIdentityAliasValue {
+  aliasKind: EntityIdentityAliasKind;
+  aliasValue: string;
+  confidence: number;
+}
+
+function entityIdentityDomain(input: { domain?: string | null; website?: string | null }, env?: Env): string | null {
+  const domain = domainFromUrl(input.domain || input.website || '') || String(input.domain || '').trim().toLowerCase().replace(/^www\./, '');
+  if (!domain) return null;
+  const normalized = registrableDomain(domain);
+  return normalized && !shouldIgnoreDomain(normalized, env) ? normalized : null;
+}
+
+export function buildEntityIdentityAliasValues(input: {
+  name?: string | null;
+  normalizedName?: string | null;
+  domain?: string | null;
+  website?: string | null;
+  env?: Env;
+}): EntityIdentityAliasValue[] {
+  const aliases = new Map<string, EntityIdentityAliasValue>();
+  const add = (aliasKind: EntityIdentityAliasKind, value: string | null | undefined, confidence: number): void => {
+    const aliasValue = aliasKind === 'domain'
+      ? entityIdentityDomain({ domain: value }, input.env)
+      : normalizeProspectName(value);
+    if (!aliasValue || aliasValue.length < 3) return;
+    const key = `${aliasKind}:${aliasValue}`;
+    const existing = aliases.get(key);
+    if (!existing || confidence > existing.confidence) aliases.set(key, { aliasKind, aliasValue, confidence });
+  };
+
+  add('normalized_name', input.normalizedName || input.name, 1);
+  for (const alias of prospectIdentityAliasesForName(input.name)) {
+    add('normalized_name', alias, alias === normalizeProspectName(input.name) ? 1 : 0.92);
+  }
+
+  const domain = entityIdentityDomain(input, input.env);
+  if (domain) {
+    add('domain', domain, 1);
+    add('domain_brand', domainLabelToCompany(domain), 0.92);
+    for (const alias of prospectIdentityAliasesForName(domainLabelToCompany(domain))) {
+      add('domain_brand', alias, 0.9);
+    }
+  }
+
+  return Array.from(aliases.values());
+}
+
+function isMissingIdentityAliasTableError(error: unknown): boolean {
+  return /entity_identity_aliases|no such table|D1_ERROR/i.test(error instanceof Error ? error.message : String(error || ''));
+}
+
+export async function upsertEntityIdentityAliases(args: {
+  orgId: string;
+  entityType: 'company' | 'prospect';
+  entityId: string;
+  name?: string | null;
+  normalizedName?: string | null;
+  domain?: string | null;
+  website?: string | null;
+  sourceKind?: 'system' | 'classifier' | 'enrichment' | 'manual' | 'migration';
+  evidence?: Record<string, unknown>;
+}, env: Env): Promise<number> {
+  const values = buildEntityIdentityAliasValues({
+    name: args.name,
+    normalizedName: args.normalizedName,
+    domain: args.domain,
+    website: args.website,
+    env,
+  });
+  if (values.length === 0) return 0;
+  let written = 0;
+  for (const value of values) {
+    try {
+      await env.D1.prepare(
+        `INSERT INTO entity_identity_aliases (
+           org_id, entity_type, entity_id, alias_kind, alias_value, confidence, source_kind, evidence_json,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         ON CONFLICT(org_id, entity_type, entity_id, alias_kind, alias_value) DO UPDATE SET
+           confidence = MAX(entity_identity_aliases.confidence, excluded.confidence),
+           source_kind = excluded.source_kind,
+           evidence_json = excluded.evidence_json,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+      ).bind(
+        args.orgId,
+        args.entityType,
+        args.entityId,
+        value.aliasKind,
+        value.aliasValue,
+        value.confidence,
+        args.sourceKind || 'system',
+        JSON.stringify(args.evidence || {})
+      ).run();
+      written++;
+    } catch (error) {
+      if (isMissingIdentityAliasTableError(error)) return written;
+      throw error;
+    }
+  }
+  return written;
 }
 
 function setsIntersect(left: Set<string>, right: Set<string>): boolean {
@@ -2942,6 +3047,7 @@ function hasCandidateFundraisingListRowEvidence(
   const strongFieldCount = [
     fields.stage,
     fields.amount,
+    fields.website,
     fields.poc,
     fields.problem,
     fields.approach,
@@ -2951,10 +3057,11 @@ function hasCandidateFundraisingListRowEvidence(
   const hasRowInvestmentLanguage =
     /\b(?:fund\s*raising|fundraising|raising|raise|round|stage|ask|seeking|investment\s+ask|seed|pre[-\s]?seed|series\s+[abc]|safe|valuation|\$\s?\d|\d+(?:\.\d+)?\s*(?:m|mm|million|k)\b)\b/i.test(text) ||
     /\b(?:fund\s*raising|fundraising|raising|raise|round|stage|ask|seed|pre[-\s]?seed|series\s+[abc]|safe|valuation|\$)\b/i.test(fieldValues);
+  const hasCompanyDetails = /\b(?:founder|ceo|poc|contact|problem|approach|website|description|product|platform|solution|technology|location|revenue|traction|arr|mrr|bookings|pipeline)\b/i.test(text);
   const rowHasEnoughDetail =
     Boolean(fields.stage || fields.amount) ||
     strongFieldCount >= 2 ||
-    /\b(?:founder|ceo|poc|contact|problem|approach|website)\b/i.test(text) && hasRowInvestmentLanguage;
+    hasCompanyDetails && hasRowInvestmentLanguage;
   return hasListFrame && hasRowInvestmentLanguage && rowHasEnoughDetail;
 }
 
@@ -2962,13 +3069,19 @@ function hasStructuredPipelineRowEvidence(context: string, company: string): boo
   const text = normalizeWhitespace(context || '');
   const companyPattern = currentCompanyPattern(company);
   if (!text || !companyPattern) return false;
-  const rowPattern = new RegExp(
-    `\\b${companyPattern}\\b[^.\\n]{0,240}\\b(?:LOW|MEDIUM|HIGH)\\b[^.\\n]{0,120}\\b(?:Radar|Initial\\s+Meeting|Preliminary|Diligence|Term\\s*Sheet|Seed|Pre[-\\s]?Seed|Series\\s+[ABC]|SAFE|\\$\\s?\\d|website|\\.ai\\b|\\.com\\b|\\.io\\b|\\.co\\b)\\b`,
-    'i'
-  );
-  const tableFrame = /\b(?:pipeline\s+(?:status\s+update|industry\s+pie)|company\s+priority\s+status\s+industry|internal\s+pipeline\s+report|fundraising\s+list|dealflow\s+list)\b/i.test(text);
-  if (!tableFrame || !rowPattern.test(text)) return false;
-  return /\b(?:raise|raising|seed|pre[-\s]?seed|series\s+[abc]|safe|term\s*sheet|diligence|initial\s+meeting|radar|\$\s?\d|website|description|revenue|traction|pipeline)\b/i.test(text);
+  const tableFrame = /\b(?:pipeline\s+(?:status\s+update|industry\s+pie|tracker|report)|company\s+priority\s+status\s+industry|internal\s+pipeline\s+report|fundraising\s+list|dealflow\s+list|deal\s+flow\s+list|pipeline\s+fields?)\b/i.test(text);
+  if (!tableFrame) return false;
+  const companyIndex = text.search(new RegExp(`\\b${companyPattern}\\b`, 'i'));
+  if (companyIndex < 0) return false;
+  const rowWindow = text.slice(Math.max(0, companyIndex - 180), Math.min(text.length, companyIndex + 720));
+  const rowHasStatusOrIntent =
+    /\b(?:LOW|MEDIUM|HIGH)\b[^.\n]{0,180}\b(?:Radar|Initial\s+Meeting|Preliminary|Diligence|Term\s*Sheet|IC|Active|New)\b/i.test(rowWindow) ||
+    /\b(?:assigned\s+to|owner|status|prospect|pipeline|investment\s+opportunit(?:y|ies)|deal\s*flow|reviewing|presented|shared)\b/i.test(rowWindow);
+  const rowHasCompanyDetails =
+    /\b(?:https?:\/\/|www\.|website|\.ai\b|\.com\b|\.io\b|\.co\b|\.tech\b|location|description|product|platform|solution|technology|founder|ceo|contact|poc|revenue|arr|mrr|bookings|traction|customers?|pipeline)\b/i.test(rowWindow);
+  const rowHasInvestmentLanguage =
+    /\b(?:raise|raising|fundrais(?:e|ing)|seed|pre[-\s]?seed|series\s+[abc]|safe|term\s*sheet|diligence|initial\s+meeting|radar|\$\s?\d|investment\s+(?:round|opportunit(?:y|ies)|ask)|round|valuation|prospect|pipeline)\b/i.test(rowWindow);
+  return rowHasStatusOrIntent && rowHasCompanyDetails && rowHasInvestmentLanguage;
 }
 
 function hasStandoutInboundIntroEvidence(context: string, company: string): boolean {
@@ -3032,7 +3145,8 @@ function hasCandidateWarmIntroTargetEvidence(
   const hasFundRecipient = /\b(?:medina\s+ventures|medina\s+vc|medina|the\s+fund)\b/i.test(fullText);
   const hasIntro = /\b(?:warm\s+intro|intro(?:duction)?|introduced|introducing|referred|forwarded|shared|sent|connect(?:ing)?|meet(?:ing)?|call)\b/i.test(fullText);
   const hasTargetSignal = /\b(?:founder|ceo|company|deck|investor\s+(?:deck|presentation|overview)|board\s+deck|pitch|demo|investment\s+opportunit(?:y|ies)|dealflow|raise|raising|fundrais(?:e|ing)|round|seed|series\s+[abc]|safe|data\s+room|diligence)\b/i.test(fullText);
-  return hasFundRecipient && hasIntro && hasTargetSignal;
+  const hasRealAnchor = /\b(?:founder|ceo|co[-\s]?founder|contact|email|@[a-z0-9.-]+\.[a-z]{2,}|https?:\/\/|www\.|domain|deck|traction|arr|revenue|customers?|raise|raising|round|seed|series\s+[abc]|safe|deal\s*flow|dealflow|investment\s+opportunit(?:y|ies))\b/i.test(fullText);
+  return hasFundRecipient && hasIntro && hasTargetSignal && hasRealAnchor;
 }
 
 function hasCandidatePitchDocumentTargetEvidence(
@@ -3140,6 +3254,7 @@ function hasCandidateProspectTargetEvidence(
   if (hasCurrentCompanyInvestmentTargetEvidence(text, mention.canonicalName)) return true;
   if (hasCandidateFundraisingListRowEvidence(sourceText, reasoning, mention)) return true;
   if (hasProductPitchParentCompanyEvidence(sourceText, reasoning, mention.canonicalName)) return true;
+  if (hasMedinaOutboundProspectInterestEvidence(text, mention.canonicalName)) return true;
   if (hasStandoutInboundIntroEvidence(text, mention.canonicalName)) return true;
   if (hasCandidateWarmIntroTargetEvidence(text, reasoning, mention.canonicalName)) return true;
   if (hasCandidatePitchDocumentTargetEvidence(text, reasoning, mention.canonicalName)) return true;
@@ -3166,6 +3281,7 @@ function candidateProspectTargetEvidenceReasons(
   if (hasCurrentCompanyInvestmentTargetEvidence(text, mention.canonicalName)) reasons.push('current_company_investment_target_evidence');
   if (hasCandidateFundraisingListRowEvidence(sourceText, reasoning, mention)) reasons.push('fundraising_list_row');
   if (hasProductPitchParentCompanyEvidence(sourceText, reasoning, mention.canonicalName)) reasons.push('product_pitch_parent_company');
+  if (hasMedinaOutboundProspectInterestEvidence(text, mention.canonicalName)) reasons.push('medina_outbound_prospect_interest');
   if (hasStandoutInboundIntroEvidence(text, mention.canonicalName)) reasons.push('standout_inbound_intro');
   if (hasCandidateWarmIntroTargetEvidence(text, reasoning, mention.canonicalName)) reasons.push('warm_intro_target');
   if (hasCandidatePitchDocumentTargetEvidence(text, reasoning, mention.canonicalName)) reasons.push('pitch_or_investment_document_target');
@@ -3888,15 +4004,56 @@ function prospectSectorKeyFromCompanySector(value: unknown): { key: SectorKey; c
   return { key: 'uncategorized', confidence: 0 };
 }
 
+function strictRegistrableDomain(value: string | null | undefined): string | null {
+  const host = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^www\./, '')
+    .replace(/[),.;:]+$/g, '');
+  if (!host || !host.includes('.')) return null;
+  const labels = host.split('.').filter(Boolean);
+  const tld = labels[labels.length - 1] || '';
+  if (!/^[a-z]{2,24}$/.test(tld)) return null;
+  const domain = registrableDomain(host);
+  if (!domain || /^\d+(?:\.\d+)+$/.test(domain)) return null;
+  return domain;
+}
+
 function domainFromUrl(value: string | null | undefined): string | null {
-  const raw = String(value || '').trim();
+  const raw = String(value || '').trim().replace(/[),.;:]+$/g, '');
   if (!raw) return null;
   try {
     const host = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname.toLowerCase().replace(/^www\./, '');
-    return host ? registrableDomain(host) : null;
+    return strictRegistrableDomain(host);
   } catch {
     return null;
   }
+}
+
+function parseOptionalJsonObject(raw: string | null | undefined): Record<string, any> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, any> : {};
+  } catch {
+    return {};
+  }
+}
+
+function companyAuditDomain(row: { domain?: string | null; website?: string | null }): string | null {
+  return strictRegistrableDomain(row.domain) || domainFromUrl(row.website);
+}
+
+function limitedInfoCompanyReason(row: { domain?: string | null; website?: string | null; custom_fields?: string | null } | null | undefined): string | null {
+  if (!row) return null;
+  const custom = parseOptionalJsonObject(row.custom_fields);
+  const prospectOrigin = custom.prospect_origin && typeof custom.prospect_origin === 'object' ? custom.prospect_origin as Record<string, any> : {};
+  const enrichmentGuard = custom.enrichment_guard && typeof custom.enrichment_guard === 'object' ? custom.enrichment_guard as Record<string, any> : {};
+  if (custom.limited_info_prospect) return 'limited_info_prospect_company';
+  if (prospectOrigin.limited_info === true || prospectOrigin.evidence_quality === 'limited_info') return 'limited_info_prospect_origin';
+  if (enrichmentGuard.status === 'blocked_insufficient_anchor') return 'blocked_insufficient_anchor';
+  if (!companyAuditDomain(row) && prospectOrigin.created_by_prospect_pipeline === true) return 'prospect_pipeline_company_without_verified_domain';
+  return null;
 }
 
 function parseUnitConfidence(value: unknown, field: string): number {
@@ -3993,7 +4150,7 @@ export function extractMentionCandidatesFromText(text: string, fallbackName?: st
     if (namedOpportunity?.[1]) pushTarget(namedOpportunity[1], cleanedText.indexOf(line));
     const introParen = normalizedLine.match(/\b(?:intro(?:duction)?|meet|connecting|connect)\b[^()\n]{0,100}\(([^)]+)\)/i);
     if (introParen?.[1]) pushTarget(introParen[1], cleanedText.indexOf(line));
-    const domainSubject = normalizedLine.match(/^(?:re|fw|fwd)?\s*:?\s*([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|health|tech|dev|finance|xyz))\b/i);
+    const domainSubject = normalizedLine.match(/^(?:re|fw|fwd)?\s*:?\s*([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|health|tech|dev|finance|xyz|systems))\b/i);
     if (domainSubject?.[1]) pushTarget(domainSubject[1], cleanedText.indexOf(line));
     const titleTarget = normalizedLine.match(/^(?:re|fw|fwd)?\s*:?\s*([A-Z0-9][A-Za-z0-9&.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]+){0,4})\s+(?:update|deck|demo|diligence|fundrais(?:e|ing)|series\s+[A-Z]|pitch|follow[-\s]?up|materials)\b/);
     if (titleTarget?.[1]) pushTarget(titleTarget[1], cleanedText.indexOf(line));
@@ -4009,7 +4166,7 @@ export function extractMentionCandidatesFromText(text: string, fallbackName?: st
     if (candidates.length >= maxCandidates) break;
   }
 
-  for (const match of cleanedText.matchAll(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|gov|mil|edu|health|tech|dev|finance|xyz))\b/gi)) {
+  for (const match of cleanedText.matchAll(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|vc|capital|org|net|gov|mil|edu|health|tech|dev|finance|xyz|systems))\b/gi)) {
     const domain = match[1].toLowerCase();
     if (shouldIgnoreDomain(domain)) continue;
     const raw = match[0];
@@ -4050,13 +4207,19 @@ function isDealflowListText(text: string): boolean {
   const listLines = lines
     .filter(line => /^\s*(?:[-*•]|\d+[.)])\s+/.test(line) && /[A-Z][A-Za-z0-9&.'’/-]+/.test(line));
   const domainRows = lines.filter(line =>
-    /\b(?:https?:\/\/)?(?:www\.)?[a-z0-9-]+\.(?:ai|com|io|co|health|tech|dev|finance|xyz)\b/i.test(line) &&
+    /\b(?:https?:\/\/)?(?:www\.)?[a-z0-9-]+\.(?:ai|com|io|co|health|tech|dev|finance|xyz|systems)\b/i.test(line) &&
     /\b(?:raise|raising|capital|series|seed|safe|round|diligence|pipeline|pre[-\s]?seed|preliminary|radar|prospect|company|problem|approach|solution)\b/i.test(line)
   );
   const distinctDomainRows = new Set(domainRows.flatMap(line => domainMatchesInText(line).map(match => match.value)).filter(Boolean));
   const allDomains = new Set(domainMatchesInText(text).map(match => match.value).filter(Boolean));
   if (listLines.length >= 3) return true;
   if (distinctDomainRows.size >= 3) return true;
+  if (
+    isInternalPipelineReportText(text) &&
+    /\b(?:company\s+fields?|company\s+priority|prospect|pipeline\s+fields?|investment\s+opportunit(?:y|ies)|assigned\s+to|owner|assignee)\b/i.test(text)
+  ) {
+    return true;
+  }
   return /\b(army\s*fuze|armyfuze|cohort|batch|portfolio day|demo day|dealflow list|companies below|shortlist|pipeline status update|pipeline industry pie|internal pipeline report|fund raising packet|fundraising packet|private capital network|raise capital in the next 6 months|investor review)\b/i.test(text) &&
     (listLines.length >= 2 || distinctDomainRows.size >= 2 || allDomains.size >= 3);
 }
@@ -4123,6 +4286,7 @@ const PIPELINE_REPORT_SOURCE_PREFIX_WORDS = new Set([
   'ad',
   'alumni',
   'accelerator',
+  'automatic',
   'berkeley',
   'coast',
   'company',
@@ -4132,6 +4296,7 @@ const PIPELINE_REPORT_SOURCE_PREFIX_WORDS = new Set([
   'emerge',
   'external',
   'fou',
+  'foun',
   'founder',
   'gold',
   'he',
@@ -4142,9 +4307,11 @@ const PIPELINE_REPORT_SOURCE_PREFIX_WORDS = new Set([
   'jim',
   'jimenez',
   'pitch',
+  'pdf',
   'priority',
   'ra',
   'radar',
+  'report',
   'revenue',
   'round',
   'sm',
@@ -4155,6 +4322,7 @@ const PIPELINE_REPORT_SOURCE_PREFIX_WORDS = new Set([
   'to',
   'tony',
   'uc',
+  'update',
   'website',
 ]);
 
@@ -4169,7 +4337,8 @@ function isGeneratedPipelineReportArtifact(text: string): boolean {
 function pipelineReportRowNameFromPrefix(rawPrefix: string, rowSeed: string): { raw: string; canonicalRaw: string } | null {
   let prefix = normalizeWhitespace(rawPrefix.replace(/[|•]/g, ' '));
   if (!prefix) return null;
-  const domainToken = prefix.match(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|health|tech|dev|finance|xyz))\b/i)?.[1];
+  if (/\b(?:automatic_report|\.pdf|\.docx?|\.xlsx?)\b/i.test(prefix)) return null;
+  const domainToken = prefix.match(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+\.(?:ai|com|io|co|health|tech|dev|finance|xyz|systems))\b/i)?.[1];
   if (domainToken && !shouldIgnoreDomain(domainToken)) {
     const canonicalRaw = domainLabelToCompany(domainToken);
     return { raw: domainToken, canonicalRaw };
@@ -4185,9 +4354,15 @@ function pipelineReportRowNameFromPrefix(rawPrefix: string, rowSeed: string): { 
   while (tokens.length > 1 && PIPELINE_REPORT_SOURCE_PREFIX_WORDS.has(tokens[0].toLowerCase().replace(/[^a-z0-9]/g, ''))) {
     tokens = tokens.slice(1);
   }
+  while (tokens.length > 1 && PIPELINE_REPORT_SOURCE_PREFIX_WORDS.has(tokens[tokens.length - 1].toLowerCase().replace(/[^a-z0-9]/g, ''))) {
+    tokens = tokens.slice(0, -1);
+  }
   if (tokens.length > 5) tokens = tokens.slice(-5);
   while (tokens.length > 1 && PIPELINE_REPORT_SOURCE_PREFIX_WORDS.has(tokens[0].toLowerCase().replace(/[^a-z0-9]/g, ''))) {
     tokens = tokens.slice(1);
+  }
+  while (tokens.length > 1 && PIPELINE_REPORT_SOURCE_PREFIX_WORDS.has(tokens[tokens.length - 1].toLowerCase().replace(/[^a-z0-9]/g, ''))) {
+    tokens = tokens.slice(0, -1);
   }
   if (tokens.length > 2) {
     let trailingAcronymStart = -1;
@@ -4234,6 +4409,13 @@ function pipelineReportRowNameFromPrefix(rawPrefix: string, rowSeed: string): { 
     }
   }
   if (!raw || looksLikePersonName(raw) || isGenericFragmentCandidate(raw)) return null;
+  const normalizedRawWords = raw.split(/\s+/).map(token => token.toLowerCase().replace(/[^a-z0-9]/g, '')).filter(Boolean);
+  if (
+    normalizedRawWords.length > 0 &&
+    normalizedRawWords.every(token => PIPELINE_REPORT_SOURCE_PREFIX_WORDS.has(token) || /^(?:name|url|field|fields|owner|assignee|added|rounds?)$/.test(token))
+  ) {
+    return null;
+  }
   const extension = rowSeed.match(new RegExp(`\\b${escapeRegExp(raw)}\\s+(?:Solutions|Technologies|Technology|Systems|Labs|AI|Core|Tech)\\b`, 'i'))?.[0];
   const canonicalRaw = cleanCorrectedTargetName(extension || raw) || raw;
   return { raw, canonicalRaw };
@@ -4246,24 +4428,38 @@ function addInternalPipelineReportRows(
   startingOrdinal: number
 ): number {
   if (!isInternalPipelineReportText(source)) return startingOrdinal;
-  const rowPattern = /\b([A-Z0-9][A-Za-z0-9&.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]+){0,7})\s+(LOW|MEDIUM|HIGH)\s+(?:Radar|Initial\s+Meeting|Preliminary(?:\s+(?:IC\s*\/\s*Term\s*Sheet|Diligence))?|Diligence|Term\s*Sheet|IC|Active|New)\b/gi;
-  const matches = Array.from(source.matchAll(rowPattern));
+  const rowPattern = /\b([A-Z0-9][A-Za-z0-9&.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]+){0,7})\s+(?:\([^)]{1,32}\)\s+)?(LOW|MEDIUM|HIGH)\s+(?:Radar|Initial\s+Meeting|Preliminary(?:\s+(?:IC\s*\/\s*Term\s*Sheet|Diligence))?|Diligence|Term\s*Sheet|IC|Active|New)\b/g;
+  const fieldLabelPattern = String.raw`(?:[Aa]ssigned\s+[Tt]o|[Oo]wner|[Aa]ssignee|[Ss]tatus|[Ii]ndustry|[Ii]nvestment\s+[Rr]ound|[Rr]ound\s+[Dd]etails|[Rr]evenue|[Ll]ocation|[Ww]ebsite|[Dd]ate\s+[Aa]dded|[Dd]escription|[Ss]ource|[Ii]nternal\s+[Ss]ource|[Ee]xternal\s+[Ss]ource|[Ff]ounder\/[Tt]eam|[Pp]rospect\s+[Ss]tatus)`;
+  const fieldAnchoredPattern = new RegExp(String.raw`\b([A-Z0-9][A-Za-z0-9&.'’/-]+(?:\s+[A-Z0-9][A-Za-z0-9&.'’/-]+){1,7}?)\s+(?=${fieldLabelPattern}\b)`, 'g');
+  const priorityMatches = Array.from(source.matchAll(rowPattern));
+  const fieldMatches = Array.from(source.matchAll(fieldAnchoredPattern))
+    .filter(match => {
+      if (!/^[A-Z0-9]/.test(match[1] || '')) return false;
+      const start = match.index || 0;
+      const rowWindow = source.slice(start, Math.min(source.length, start + 520));
+      return /\b(?:assigned\s+to|owner|assignee|prospect|pipeline|investment\s+opportunit(?:y|ies)|product|platform|technology|description|revenue|traction|company\s+fields?)\b/i.test(rowWindow) &&
+        /\b(?:prospect|pipeline|investment|deal\s*flow|product|platform|technology|review|assignment|assigned)\b/i.test(rowWindow);
+    })
+    .sort((a, b) => (a.index || 0) - (b.index || 0))
+    .filter((match, index, allMatches) => index === 0 || (match.index || 0) !== (allMatches[index - 1].index || 0));
   let ordinal = startingOrdinal;
-  const parsed = matches.map((match, index) => {
-    const rawPrefix = normalizeWhitespace(match[1] || '');
-    const nextStart = matches[index + 1]?.index ?? source.length;
-    const rowSeed = source.slice(match.index || 0, Math.min(source.length, nextStart));
-    const name = pipelineReportRowNameFromPrefix(rawPrefix, rowSeed);
-    if (!name) return null;
-    const localNameIndex = findCaseInsensitive(rawPrefix, name.raw, 0);
-    const nameStart = (match.index || 0) + (localNameIndex >= 0 ? localNameIndex : 0);
-    return {
-      nameStart,
-      nextMatchStart: nextStart,
-      raw: name.raw,
-      canonicalRaw: name.canonicalRaw,
-    };
-  }).filter((entry): entry is { nameStart: number; nextMatchStart: number; raw: string; canonicalRaw: string } => Boolean(entry));
+  const parseMatches = (matches: RegExpMatchArray[]) => matches.map((match, index) => {
+      const rawPrefix = normalizeWhitespace(match[1] || '');
+      const nextStart = matches[index + 1]?.index ?? source.length;
+      const rowSeed = source.slice(match.index || 0, Math.min(source.length, nextStart));
+      const name = pipelineReportRowNameFromPrefix(rawPrefix, rowSeed);
+      if (!name) return null;
+      const localNameIndex = findCaseInsensitive(rawPrefix, name.raw, 0);
+      const nameStart = (match.index || 0) + (localNameIndex >= 0 ? localNameIndex : 0);
+      return {
+        nameStart,
+        nextMatchStart: nextStart,
+        raw: name.raw,
+        canonicalRaw: name.canonicalRaw,
+      };
+    }).filter((entry): entry is { nameStart: number; nextMatchStart: number; raw: string; canonicalRaw: string } => Boolean(entry));
+  const parsed = [...parseMatches(priorityMatches), ...parseMatches(fieldMatches)]
+    .sort((a, b) => a.nameStart - b.nameStart);
 
   for (const entry of parsed) {
     const line = source.slice(entry.nameStart, entry.nextMatchStart).trim();
@@ -4882,7 +5078,14 @@ async function lookupExistingContext(
 ): Promise<ExistingContext> {
   const mentionDomain = domainFromMention(item, mention);
   try {
-  type CompanyIdentityRow = { id: string; name: string; domain: string | null; is_internal_entity: number | null };
+  type CompanyIdentityRow = {
+    id: string;
+    name: string;
+    domain: string | null;
+    website?: string | null;
+    custom_fields?: string | null;
+    is_internal_entity: number | null;
+  };
   type ProspectIdentityLookupRow = {
     id: string;
     canonical_name: string;
@@ -4905,14 +5108,36 @@ async function lookupExistingContext(
       existing.reasons = [...new Set([...existing.reasons, ...candidate.reasons])];
     }
   };
-  const normalizeDomain = (value: string | null | undefined) => String(value || '').toLowerCase().replace(/^www\./, '') || null;
+  const normalizeDomain = (value: string | null | undefined) => strictRegistrableDomain(value);
+  const companyIdentityCompatibleWithMention = (row: CompanyIdentityRow, rowDomain: string | null): boolean => {
+    const normalizedCompanyName = normalizeProspectName(row.name);
+    if (normalizedCompanyName && normalizedCompanyName === mention.normalizedName) return true;
+    if (identityAliasSetsCompatible(prospectIdentityAliasesForName(row.name), prospectIdentityAliasesForMention(mention, env))) return true;
+    if (mentionDomain && rowDomain && mentionDomain === rowDomain) return true;
+    return false;
+  };
   const scoreCompany = (row: CompanyIdentityRow, baseScore: number, method: string, reasons: string[]): void => {
     let score = baseScore;
-    const rowDomain = normalizeDomain(row.domain);
+    const candidateReasons = [...reasons];
+    const rowDomain = normalizeDomain(row.domain) || domainFromUrl(row.website);
+    const limitedInfoReason = limitedInfoCompanyReason(row);
+    const sourceItemCompanyMismatch = method === 'direct_company_id' && !companyIdentityCompatibleWithMention(row, rowDomain);
     if (mentionDomain && rowDomain && rowDomain !== mentionDomain) score -= 20;
     if (row.is_internal_entity === 1) score -= 20;
     if (mention.normalizedName.length < 5 && !mentionDomain && method.includes('name')) score -= 15;
     if (companyNameMatchConflictsWithSourceDomain(row, mention, mentionDomain)) score -= 25;
+    if (sourceItemCompanyMismatch) {
+      score = Math.min(score - 16, 84);
+      candidateReasons.push('source_item_company_id_mismatch_candidate_name', 'source_company_context_audit_only');
+    }
+    if (limitedInfoReason) {
+      score = Math.min(score - 10, 84);
+      candidateReasons.push(limitedInfoReason, 'audit_only_limited_info_company_match');
+    }
+    if (!rowDomain && method.includes('name')) {
+      score = Math.min(score, 84);
+      candidateReasons.push('name_only_company_without_verified_domain');
+    }
     score = Math.max(0, Math.round(score));
     if (score < 75) return;
     addCandidate({
@@ -4921,10 +5146,10 @@ async function lookupExistingContext(
       company_id: row.id,
       deal_id: null,
       name: row.name,
-      domain: row.domain || null,
+      domain: rowDomain || row.domain || null,
       score,
       method,
-      reasons,
+      reasons: candidateReasons,
       is_internal_entity: row.is_internal_entity,
     });
   };
@@ -4950,7 +5175,7 @@ async function lookupExistingContext(
 
   if (item.companyId) {
     const direct = await env.D1.prepare(
-      `SELECT id, name, domain, is_internal_entity
+      `SELECT id, name, domain, website, custom_fields, is_internal_entity
          FROM companies
         WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
     ).bind(item.companyId, orgId).first<CompanyIdentityRow>();
@@ -4959,7 +5184,7 @@ async function lookupExistingContext(
 
   if (mentionDomain) {
     const byDomain = await env.D1.prepare(
-      `SELECT id, name, domain, is_internal_entity
+      `SELECT id, name, domain, website, custom_fields, is_internal_entity
          FROM companies
         WHERE org_id = ? AND deleted_at IS NULL AND lower(domain) = lower(?)
         LIMIT 5`
@@ -4970,7 +5195,7 @@ async function lookupExistingContext(
   const token = mention.canonicalName.split(/\s+/)[0]?.toLowerCase();
   if (token && token.length >= 3) {
     const rows = await env.D1.prepare(
-      `SELECT id, name, domain, is_internal_entity
+      `SELECT id, name, domain, website, custom_fields, is_internal_entity
          FROM companies
         WHERE org_id = ? AND deleted_at IS NULL AND lower(name) LIKE ?
         LIMIT 25`
@@ -5012,7 +5237,7 @@ async function lookupExistingContext(
       const prospectIds = aliasRows.results.filter(row => row.entity_type === 'prospect').map(row => row.entity_id);
       if (companyIds.length > 0) {
         const rows = await env.D1.prepare(
-          `SELECT id, name, domain, is_internal_entity
+          `SELECT id, name, domain, website, custom_fields, is_internal_entity
              FROM companies
             WHERE org_id = ? AND deleted_at IS NULL
               AND id IN (${companyIds.map(() => '?').join(', ')})
@@ -5554,6 +5779,13 @@ export async function classifyCompanyRoleFromD1(
     }
 
     const relationshipStates = new Set(existing.relationshipStates.map(state => state.toLowerCase()));
+    const sourceItemCompanyMismatchReason = company && (existing.identityCandidates || []).some(candidate =>
+      candidate.entity_type === 'company' &&
+      candidate.entity_id === company.id &&
+      candidate.reasons.some(reason => /source_item_company_id_mismatch_candidate_name|source_company_context_audit_only/i.test(reason))
+    ) ? 'source_item_company_id_mismatch_candidate_name' : null;
+    const limitedInfoReason = limitedInfoCompanyReason(company);
+    const auditOnlyCompanyReason = limitedInfoReason || sourceItemCompanyMismatchReason;
     if (relationshipStates.has('current_portfolio') || relationshipStates.has('exited')) {
       authoritative = true;
       addScore('portfolio_company', 4, `firm relationship state: ${relationshipStates.has('current_portfolio') ? 'current_portfolio' : 'exited'}`);
@@ -5567,15 +5799,18 @@ export async function classifyCompanyRoleFromD1(
     }
 
     if (company) {
+      if (auditOnlyCompanyReason) {
+        evidence.push(`${auditOnlyCompanyReason}: audit-only company identity support`);
+      }
       const companyType = String(company.company_type || '').toLowerCase();
       const investmentStatus = String(company.investment_status || '').toLowerCase();
       if (companyType === 'vc_firm') addScore('vc_firm', 4, 'company_type=vc_firm');
       if (companyType === 'family_office' || companyType === 'lp') addScore('lp_or_family_office', 4, `company_type=${companyType}`);
       if (companyType === 'portfolio') addScore('portfolio_company', 3, 'company_type=portfolio');
-      if (companyType === 'startup') addScore('startup_or_private_company', 1, 'company_type=startup');
+      if (companyType === 'startup' && !auditOnlyCompanyReason) addScore('startup_or_private_company', 1, 'company_type=startup');
       if (investmentStatus === 'invested' || investmentStatus === 'exited') addScore('portfolio_company', 3, `investment_status=${investmentStatus}`);
       if (investmentStatus === 'passed') addScore('frequent_partner_or_source', 2, 'investment_status=passed');
-      if (['prospect', 'due_diligence', 'term_sheet'].includes(investmentStatus)) addScore('startup_or_private_company', 2, `investment_status supports prospect identity: ${investmentStatus}`);
+      if (['prospect', 'due_diligence', 'term_sheet'].includes(investmentStatus) && !auditOnlyCompanyReason) addScore('startup_or_private_company', 2, `investment_status supports prospect identity: ${investmentStatus}`);
 
       const deal = await env.D1.prepare(
         `SELECT id
@@ -5720,10 +5955,32 @@ function sourceMentionsName(text: string, name: string): boolean {
   return new RegExp(`\\b${escaped}\\b`, 'i').test(text);
 }
 
+function hasMedinaOutboundProspectInterestEvidence(text: string, candidateName: string): boolean {
+  if (!sourceMentionsName(text, candidateName)) return false;
+  const compact = normalizeWhitespace(text);
+  if (!/\b(?:Medina|Medina Ventures|we|we'd|we would|I|I'd|I would|our)\b/i.test(compact)) return false;
+  const candidateEscaped = normalizeWhitespace(candidateName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const candidateThenInterest = new RegExp(`\\b${candidateEscaped}\\b[^.]{0,180}\\b(?:fits?\\s+(?:very\\s+much\\s+)?(?:in\\s+)?(?:our\\s+)?wheelhouse|learn\\s+more|interesting|interested|investment\\s+fit|go[-\\s]?to[-\\s]?market|national\\s+security\\s+opportunities)\\b`, 'i');
+  const interestThenCandidate = new RegExp(`\\b(?:love\\s+to\\s+learn\\s+more\\s+about|interested\\s+in|fits?\\s+(?:very\\s+much\\s+)?(?:in\\s+)?(?:our\\s+)?wheelhouse[^.]{0,80})\\b[^.]{0,180}\\b${candidateEscaped}\\b`, 'i');
+  return candidateThenInterest.test(compact) || interestThenCandidate.test(compact);
+}
+
+function hasThirdPartyAllocationContext(text: string): boolean {
+  const compact = normalizeWhitespace(text).toLowerCase();
+  if (!/\b(?:secured|received|got|landed|has|had|confirmed)\s+(?:an?\s+)?allocation(?:s)?\b/.test(compact)) return false;
+  return /\b(?:they|he|she|pablo|oso|onesixone|one\s*six\s*one|another\s+(?:party|fund|investor|firm))\b.{0,100}\b(?:secured|received|got|landed|has|had|confirmed)\s+(?:an?\s+)?allocation(?:s)?\b/.test(compact);
+}
+
+function hasLimitedInfoAuditSupport(roleCheck: CrossD1CompanyRoleCheck): boolean {
+  return roleCheck.evidence.some(evidence =>
+    /\b(?:limited_info|blocked_insufficient_anchor|audit-only company identity|prospect_pipeline_company_without_verified_domain)\b/i.test(evidence)
+  );
+}
+
 function crossD1RoleSupportsCreate(roleCheck: CrossD1CompanyRoleCheck): number {
   if (!roleCheck.checked || !roleCheck.eligible) return 0;
   if (roleCheck.role === 'startup_or_private_company') return roleCheck.confidence === 'low' ? 1 : 2;
-  if (roleCheck.role === 'known_deal') return 2;
+  if (roleCheck.role === 'known_deal') return roleCheck.confidence === 'low' ? 0 : 2;
   if (roleCheck.role === 'unknown') return 0;
   if (roleCheck.confidence === 'authoritative' || roleCheck.confidence === 'high') return -3;
   if (roleCheck.confidence === 'medium') return -2;
@@ -5787,6 +6044,7 @@ export function verifyLowConfidenceProspect(
   const subjectTargetInvestmentEvidence = hasSubjectTargetInvestmentEvidence(item, mention);
   const strongCandidatePitchMaterialEvidence = hasStrongCandidatePitchMaterialEvidence(text, mention.canonicalName);
   const productPitchParentCompanyEvidence = hasProductPitchParentCompanyEvidence(text, null, mention.canonicalName);
+  const medinaOutboundProspectInterestEvidence = hasMedinaOutboundProspectInterestEvidence(text, mention.canonicalName);
   const nameAliases = prospectIdentityAliasesForName(mention.canonicalName);
   const domainAliases = candidateDomain
     ? prospectIdentityAliasesForName(domainLabelToCompany(candidateDomain))
@@ -5854,6 +6112,14 @@ export function verifyLowConfidenceProspect(
     appendUnique(identitySignals, 'product_parent_company_named');
     appendUnique(intentSignals, 'product_parent_company_pitch');
     appendUnique(sourceQualitySignals, 'product_pitch_parent_company');
+  }
+  if (medinaOutboundProspectInterestEvidence) {
+    identity += 1;
+    intent += 4;
+    sourceQuality += 1;
+    appendUnique(identitySignals, 'medina_interest_names_candidate');
+    appendUnique(intentSignals, 'medina_outbound_prospect_interest');
+    appendUnique(sourceQualitySignals, 'medina_partner_interest');
   }
   if (sourceSupportedDealPitchDocument) {
     intent += 4;
@@ -5981,6 +6247,31 @@ export function verifyLowConfidenceProspect(
     appendUnique(d1Signals, `cross_d1_role_${crossD1RoleCheck.role}_${crossD1RoleCheck.confidence}`);
     for (const evidence of crossD1RoleCheck.evidence.slice(0, 4)) appendUnique(d1Signals, evidence);
   }
+  const limitedInfoAuditSupport = hasLimitedInfoAuditSupport(crossD1RoleCheck);
+  const internalGeneratedMeeting =
+    fromInternal &&
+    prefilter.deterministicDirection === 'internal' &&
+    (prefilter.hasMeeting || /\b(?:generated meeting summary|meeting notes|meeting recap|transcript|catch up|sync)\b/.test(compact));
+  const cleanInternalMeetingAnchor = Boolean(
+    sourceSupportedDealPitchDocument ||
+    subjectTargetInvestmentEvidence ||
+    strongCandidatePitchMaterialEvidence ||
+    productPitchParentCompanyEvidence ||
+    (candidateDomain && domainMatchesMention) ||
+    (existing.dealId && !limitedInfoAuditSupport) ||
+    ((existing.matchStrength === 'domain' || existing.matchStrength === 'company_id') && !limitedInfoAuditSupport)
+  );
+  if (internalGeneratedMeeting && limitedInfoAuditSupport && !cleanInternalMeetingAnchor) {
+    extractionRisk += 2;
+    appendUnique(sourceQualitySignals, 'internal_meeting_limited_info_identity_only');
+    appendUnique(extractionFlags, 'internal_meeting_without_clean_anchor');
+  }
+  const thirdPartyAllocationContext = internalGeneratedMeeting && hasThirdPartyAllocationContext(text);
+  if (thirdPartyAllocationContext) {
+    extractionRisk += 3;
+    appendUnique(sourceQualitySignals, 'third_party_allocation_context');
+    appendUnique(extractionFlags, 'third_party_allocation_context');
+  }
 
   const total = identity + intent + sourceQuality + d1Support - extractionRisk;
   const severeMismatch = extractionFlags.includes('domain_name_mismatch') &&
@@ -6001,6 +6292,7 @@ export function verifyLowConfidenceProspect(
     subjectTargetInvestmentEvidence ||
     strongCandidatePitchMaterialEvidence ||
     productPitchParentCompanyEvidence ||
+    medinaOutboundProspectInterestEvidence ||
     strongSourceInvestmentIntent ||
     hasCurrentCompanyInvestmentTargetEvidence(text, mention.canonicalName);
 
@@ -6008,10 +6300,26 @@ export function verifyLowConfidenceProspect(
   let actionOverride: LowConfidenceVerificationActionOverride = 'mark_provisional';
   let reason = 'low_confidence_needs_confirmation';
 
-  if (crossD1RoleCheck.role === 'known_deal' && crossD1RoleCheck.matched_deal_id) {
+  if (crossD1RoleCheck.role === 'known_deal' && crossD1RoleCheck.matched_deal_id && crossD1RoleCheck.confidence !== 'low') {
     verdict = 'verified_create';
     actionOverride = null;
     reason = 'known_deal_handled_by_cross_d1';
+  } else if (
+    crossD1RoleCheck.role === 'known_deal' &&
+    crossD1RoleCheck.confidence === 'low' &&
+    crossD1RoleCheck.evidence.some(evidence => /(?:possible\s+)?open deal by name only|matched open deal by name only/i.test(evidence))
+  ) {
+    verdict = 'record_context';
+    actionOverride = 'record_context';
+    reason = 'low_confidence_name_only_deal_match';
+  } else if (thirdPartyAllocationContext) {
+    verdict = 'record_context';
+    actionOverride = 'record_context';
+    reason = 'low_confidence_third_party_allocation_context';
+  } else if (internalGeneratedMeeting && limitedInfoAuditSupport && !cleanInternalMeetingAnchor) {
+    verdict = 'record_context';
+    actionOverride = 'record_context';
+    reason = 'low_confidence_internal_meeting_without_clean_anchor';
   } else if (severeMismatch && intent < 4) {
     verdict = 'record_context';
     actionOverride = 'record_context';
@@ -6073,10 +6381,10 @@ function domainInText(text: string): string | null {
   const email = emailInText(text);
   if (email) {
     const domain = emailDomain(email);
-    return domain ? registrableDomain(domain) : null;
+    return strictRegistrableDomain(domain);
   }
-  const match = text.match(/\b(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b/i);
-  return match ? registrableDomain(match[1].toLowerCase()) : null;
+  const [domain] = domainsInText(text);
+  return domain || null;
 }
 
 function domainFromMention(item: ClassifiedItem, mention: MentionCandidate): string | null {
@@ -6217,6 +6525,9 @@ function sourcePrefilter(item: ClassifiedItem, env: Env): { shouldScan: boolean;
   const body = `${item.bodyPreview || ''}\n${item.bodyText || ''}\n${item.text || ''}`.toLowerCase();
   const haystack = `${from}\n${subject}\n${body}`;
   if (isGeneratedPipelineReportArtifact(haystack)) {
+    if (isInternalPipelineReportText(haystack) && isDealflowListText(`${item.subject || ''}\n${item.bodyText || ''}\n${item.text || ''}`)) {
+      return { shouldScan: true, reasons: ['generated_pipeline_report_dealflow_allow_signal'] };
+    }
     return { shouldScan: false, reasons: ['generated_pipeline_report_artifact'] };
   }
   const allowSignals = [
@@ -6868,6 +7179,7 @@ function hasExplicitFinalCreateEvidence(
   if (hasExplicitTargetInvestmentSignal(llm, classifierInput, mention)) return true;
   if (hasPrivatePitchDocumentTargetEvidence(sourceText, mention.canonicalName, llm.prospectCompanyName)) return true;
   if (hasDirectInvestorForwardedRoundEvidence(item, mention, classifierInput, llm.reasoning)) return true;
+  if (hasMedinaOutboundProspectInterestEvidence(sourceText, mention.canonicalName)) return true;
   if (hasFounderBriefFollowupCreateEvidence(sourceText, mention.canonicalName)) return true;
   if (mention.isListEntry && hasStrongSourceInvestmentIntent(sourceText)) return true;
   if (
@@ -7002,6 +7314,9 @@ function acceptedSecondLookHasStrongCandidateSupport(input: {
   if (targetEvidence.includes('pitch_or_investment_document_target') && (hasNamedInvestmentTitle || hasDirectTargetLanguage)) return true;
   if (targetEvidence.includes('candidate_pitch_material_target') && (hasNamedInvestmentTitle || hasDirectTargetLanguage)) return true;
   if (targetEvidence.includes('subject_line_target_opportunity') && (hasNamedInvestmentTitle || hasDirectTargetLanguage)) return true;
+  if (hasStructuredPipelineRowEvidence(fullText, candidate)) return true;
+  if (hasCandidateFundraisingListRowEvidence(sourceText, originalReasoning, input.mention)) return true;
+  if (hasCandidateWarmIntroTargetEvidence(sourceText, originalReasoning, candidate)) return true;
   if (targetEvidence.includes('classifier_reasoning_affirms_target_investment') && hasDirectTargetLanguage) return true;
   if (input.secondLook.evidence.includes('final_create_evidence') && (hasCandidateRowDetails || hasNamedInvestmentTitle || hasDirectTargetLanguage || hasMeetingTargetLanguage)) return true;
   if (hasCandidateProspectTargetEvidence(sourceText, originalReasoning, input.mention)) return true;
@@ -7022,7 +7337,9 @@ function acceptedSecondLookCandidateNameRiskReason(candidate: string | null | un
   if (!name) return 'accepted_second_look_bad_identity_empty_candidate';
   const normalized = normalizeProspectName(name);
   if (!normalized) return 'accepted_second_look_bad_identity_empty_candidate';
+  const domainStyleStartupName = /^[a-z0-9][a-z0-9-]{1,62}\.(?:ai|com|io|co|tech|dev|health|bio|xyz|app|software|energy|finance|cloud|systems|network|net|org)$/i.test(name);
   if (/[.!?]/.test(name) || /\b(?:we|our|you|your|they|their)\b/i.test(name.split(/\s+/)[0] || '')) {
+    if (domainStyleStartupName) return null;
     return 'accepted_second_look_bad_identity_text_fragment';
   }
   if (/\b(?:so\s+you\s+can|you\s+can\s+review|review\s+it\s+thoroughly)\b/i.test(name)) {
@@ -8886,6 +9203,12 @@ Clean duplicates when identity is clear:
 - Exact or near-exact normalized names.
 - Acronym/full-name variants supported by the evidence.
 - Existing-prospect matches shown in the packet.
+- Do not rename a source-backed candidate to a CRM source/company id merely because
+  the packet contains source_item_company_id or direct_company_id context. Use a known
+  company as the canonical name only when the candidate name, domain, or aliases match
+  that company. If the source title, excerpt, classifier reasoning, and judge reasoning
+  clearly name the candidate as the prospect and the known company name differs, keep
+  the candidate as the new prospect record.
 
 Use the neighborhood context:
 - If existing_prospect is the same opportunity, prefer merge_into_record with merge_target_prospect_id.
@@ -9296,7 +9619,7 @@ function finalQualityDirtyKnownNameReason(name: string): string | null {
     return 'document_or_round_known_identity_name';
   }
   if (/^what\s+\S.{0,50}\s+is\s+\S/i.test(clean)) return 'explanation_fragment_known_identity_name';
-  if (/^(?:known\s+company\s+match|pipe\s+investor)$/i.test(clean) || /\b(?:so\s+you\s+can|you\s+can\s+review|review\s+it\s+thoroughly)\b/i.test(clean)) {
+  if (/^(?:known\s+company\s+match|existing\s+company\s+match|no\s+existing\s+company\s+match|no\s+known\s+company\s+identity|pipe\s+investor)$/i.test(clean) || /\b(?:so\s+you\s+can|you\s+can\s+review|review\s+it\s+thoroughly)\b/i.test(clean)) {
     return 'document_or_round_known_identity_name';
   }
   if (/^(?:vc|candidate|company|prospect|known\s+company\s+match)[.\s:;-]+/i.test(clean)) {
@@ -9622,6 +9945,7 @@ function finalQualityReasoningTargetCandidates(text: string): string[] {
   const invalidReasoningTarget = (value: string): boolean => {
     const candidate = normalizeWhitespace(value);
     if (!candidate) return true;
+    if (/^(?:no\s+existing\s+company\s+match|known\s+company\s+match|existing\s+company\s+match|hard\s+identity\s+match|no\s+known\s+company\s+identity)$/i.test(candidate)) return true;
     if (/[.!?]/.test(candidate)) return true;
     if (finalQualityGenericShortFinalNameReason(candidate)) return true;
     if (/^[A-Z][A-Za-z.'’-]{2,30}$/.test(candidate) && new RegExp(`(?:[A-Z][A-Za-z.'’-]{2,30}\\s*[·•]\\s*${escapeRegExp(candidate)}|${escapeRegExp(candidate)}\\s*[·•]\\s*[A-Z][A-Za-z.'’-]{2,30})`).test(clean)) return true;
@@ -10005,10 +10329,47 @@ function enforceProspectFinalQualityDecision(
     entry.row.mention.lineText || '',
     entry.row.mention.contextText || '',
   ].filter(Boolean).join('\n'), 5000);
+  const sourceBackedTargetProof = finalQualityFallbackTargetProof(entry.row);
+  const hasStrongSourceBackedTargetProof = sourceBackedTargetProof.some(reason =>
+    /(?:structured_pipeline_row_details|fundraising_list_row_details|warm_intro_target|medina_outbound_prospect_interest|private_pitch_document_target|candidate_pitch_document_target|meeting_or_diligence_target|final_create_evidence_with_target_support|accepted_second_look_strong_candidate_support)/i.test(reason)
+  );
   const cleanWrapperNameIsSourceBacked = Boolean(cleanWrapperName && (
     sourceMentionsName(rawSourceText, cleanWrapperName) ||
     sourceMentionsName(entry.row.item.subject || '', cleanWrapperName)
   ));
+  const rowBackedOriginalName = normalizeWhitespace(entry.row.cls.prospectCompanyName || entry.row.mention.canonicalName);
+  const proposedDiffersFromRowBackedName = Boolean(rowBackedOriginalName) &&
+    normalizeProspectName(proposedTargetName) !== normalizeProspectName(rowBackedOriginalName) &&
+    !identityAliasSetsCompatible(prospectIdentityAliasesForName(proposedTargetName), prospectIdentityAliasesForName(rowBackedOriginalName));
+  const sourceItemCompanyMismatchCandidate = (entry.row.existing.identityCandidates || []).some(candidate =>
+    normalizeProspectName(candidate.name) === normalizeProspectName(proposedTargetName) &&
+    candidate.reasons.some(reason => /source_item_company_id_mismatch_candidate_name|source_company_context_audit_only/i.test(reason))
+  );
+  const sourceBackedCandidateShouldWin = Boolean(
+    decision.decision === 'rename_and_allow' &&
+    proposedDiffersFromRowBackedName &&
+    rowBackedOriginalName &&
+    hasStrongSourceBackedTargetProof &&
+    sourceMentionsName(rawSourceText, rowBackedOriginalName) &&
+    (
+      sourceItemCompanyMismatchCandidate ||
+      /\b(?:source_item_company_id|direct_company_id|known\s+company|company_id|alias\s+or\s+working\s+name)\b/i.test(decision.reason || '')
+    )
+  );
+
+  if (sourceBackedCandidateShouldWin) {
+    return {
+      ...decision,
+      decision: 'allow_create',
+      canonical_name: rowBackedOriginalName,
+      reason: enforcedFinalQualityReason(
+        decision.reason,
+        `Deterministic final check preserved source-backed candidate ${rowBackedOriginalName}; mismatched source-company context is audit-only.`
+      ),
+      hard_block_reason: null,
+      target_proof: sourceBackedTargetProof,
+    };
+  }
 
   if (
     reasoningTargetName &&
@@ -10103,6 +10464,25 @@ function enforceProspectFinalQualityDecision(
   }
 
   if (dirtyKnownNameReason) {
+    const sourceBackedOriginalNameIsUsable = Boolean(rowBackedOriginalName) &&
+      !finalQualityDirtyKnownNameReason(rowBackedOriginalName) &&
+      !acceptedSecondLookCandidateNameRiskReason(rowBackedOriginalName) &&
+      !finalQualityExtractedNameRiskReason(entry.row, rowBackedOriginalName);
+    if (
+      rowBackedOriginalName &&
+      sourceBackedOriginalNameIsUsable &&
+      hasStrongSourceBackedTargetProof &&
+      sourceMentionsName(rawSourceText, rowBackedOriginalName)
+    ) {
+      return {
+        ...decision,
+        decision: 'rename_and_allow',
+        canonical_name: rowBackedOriginalName,
+        reason: `Deterministic final check replaced dirty final-review name with source-backed row target ${rowBackedOriginalName}.`,
+        hard_block_reason: null,
+        target_proof: sourceBackedTargetProof,
+      };
+    }
     const cleanKnownNameIsUsable = Boolean(cleanKnownName) &&
       !finalQualityDirtyKnownNameReason(cleanKnownName || '') &&
       !acceptedSecondLookCandidateNameRiskReason(cleanKnownName || '') &&
@@ -10177,7 +10557,11 @@ function enforceProspectFinalQualityDecision(
     };
   }
 
-  if (identityName && normalizeWhitespace(identityName).toLowerCase() !== normalizeWhitespace(proposedTargetName).toLowerCase()) {
+  if (
+    identityName &&
+    normalizeWhitespace(identityName).toLowerCase() !== normalizeWhitespace(proposedTargetName).toLowerCase() &&
+    !(hasStrongSourceBackedTargetProof && sourceMentionsName(rawSourceText, proposedTargetName))
+  ) {
     return {
       ...decision,
       decision: 'rename_and_allow',
@@ -10742,7 +11126,7 @@ function applyFinalQualityDecisionToOutcome(
     .test(initialDecision.reason || '');
   const identityConflictBlock = initialDecision.decision === 'block_create' &&
     row.cls.shouldCreateProspect === true &&
-    /\b(?:identity\s+conflict|resolves\s+to|alias\/duplicate|proposed\s+name|distinct\s+from|separate\s+company)\b/i.test(initialDecision.reason) &&
+    /\b(?:identity\s+conflict|conflicts\s+with\s+existing|known_company\s+record|resolves\s+to|alias\/duplicate|duplicate\s+alias|proposed\s+name|distinct\s+from|separate\s+company)\b/i.test(initialDecision.reason) &&
     (identityConflictTargetProof.length > 0 || identityConflictHasDirectProof) &&
     !finalQualitySurgicalRoleBlockReason(row, null) &&
     identityConflictHardBlockAllowsPreserve &&
@@ -10752,16 +11136,31 @@ function applyFinalQualityDecisionToOutcome(
     /\b(?:accepted_but_suspicious|second[_\s-]?look|suspicious|safety\s+net|deterministic\s+hint|pending)\b/i.test(initialDecision.reason || '') &&
     (
       identityConflictTargetProof.some(reason =>
-        /(?:private_pitch_document_target|candidate_pitch_document_target|final_create_evidence_with_target_support|meeting_or_diligence_target)/i.test(reason)
+        /(?:private_pitch_document_target|candidate_pitch_document_target|final_create_evidence_with_target_support|meeting_or_diligence_target|structured_pipeline_row_details|fundraising_list_row_details|warm_intro_target|accepted_second_look_strong_candidate_support)/i.test(reason)
       ) ||
       identityConflictHasDirectProof
     ) &&
     !finalQualitySurgicalRoleBlockReason(row, null) &&
     identityConflictHardBlockAllowsPreserve &&
     !identityConflictDecisionSaysDoNotPreserve;
-  const reasoningTargetName = initialDecision.decision === 'allow_create' || initialDecision.decision === 'rename_and_allow' || identityConflictBlock || strongPrivateDocumentBlock
+  const rawReasoningTargetName = initialDecision.decision === 'allow_create' || initialDecision.decision === 'rename_and_allow' || identityConflictBlock || strongPrivateDocumentBlock
     ? finalQualityReasoningTargetCanonicalName(row, null, initialDecision)
     : null;
+  const rowBackedTargetName = normalizeWhitespace(row.cls.prospectCompanyName || row.mention.canonicalName);
+  const rowBackedSourceText = compactClassifierText([
+    row.item.subject || '',
+    row.item.bodyPreview || '',
+    row.item.bodyText || '',
+    row.item.text || '',
+    row.mention.lineText || '',
+    row.mention.contextText || '',
+  ].filter(Boolean).join('\n'), 5000);
+  const reasoningTargetConflictsWithSourceBackedRow = Boolean(rawReasoningTargetName && rowBackedTargetName) &&
+    normalizeProspectName(rawReasoningTargetName) !== normalizeProspectName(rowBackedTargetName) &&
+    !identityAliasSetsCompatible(prospectIdentityAliasesForName(rawReasoningTargetName), prospectIdentityAliasesForName(rowBackedTargetName)) &&
+    identityConflictTargetProof.length > 0 &&
+    sourceMentionsName(rowBackedSourceText, rowBackedTargetName);
+  const reasoningTargetName = reasoningTargetConflictsWithSourceBackedRow ? null : rawReasoningTargetName;
   const identityConflictTargetName = identityConflictBlock
     ? finalQualityWrapperCanonicalName(row, null) || normalizeWhitespace(row.cls.prospectCompanyName || row.mention.canonicalName)
     : null;
@@ -10784,23 +11183,19 @@ function applyFinalQualityDecisionToOutcome(
             ...initialDecision,
             decision: 'rename_and_allow' as ProspectFinalQualityDecisionAction,
             canonical_name: identityConflictTargetName,
-          reason: enforcedFinalQualityReason(
-            initialDecision.reason,
-            `Deterministic final apply preserved target ${identityConflictTargetName} because identity conflict had strong candidate-specific proof.`
-          ),
+            reason: `Deterministic final apply preserved target ${identityConflictTargetName} because identity conflict had strong candidate-specific proof.`,
             hard_block_reason: null,
+            target_proof: identityConflictTargetProof,
           }
         : strongPrivateDocumentTargetName
           ? {
               ...initialDecision,
               decision: 'rename_and_allow' as ProspectFinalQualityDecisionAction,
               canonical_name: strongPrivateDocumentTargetName,
-              reason: enforcedFinalQualityReason(
-                initialDecision.reason,
-                `Deterministic final apply preserved target ${strongPrivateDocumentTargetName} because private investment document proof outweighed a suspicious-only block.`
-              ),
+              reason: `Deterministic final apply preserved target ${strongPrivateDocumentTargetName} because candidate-specific proof outweighed a suspicious-only block.`,
               hard_block_reason: null,
-          }
+              target_proof: identityConflictTargetProof,
+            }
           : initialDecision;
   if (effectiveDecision.decision !== 'block_create' && effectiveDecision.decision !== 'merge_into_record') {
     const effectiveTargetName = finalQualityDecisionTargetName(effectiveDecision, row, batchByOrdinal) ||
@@ -10854,6 +11249,44 @@ function applyFinalQualityDecisionToOutcome(
           `Deterministic final apply blocked because the final-review reason itself says the row is not a clean prospect (${effectiveReasonBlockReason}).`
         ),
         hard_block_reason: effectiveReasonBlockReason,
+      };
+    }
+  }
+  if (effectiveDecision.decision === 'merge_into_record') {
+    const target = effectiveDecision.merge_target_ordinal ? batchByOrdinal.get(effectiveDecision.merge_target_ordinal) || null : null;
+    const targetIsSelf = effectiveDecision.merge_target_ordinal != null && target === row;
+    const rowTargetName = normalizeWhitespace(row.cls.prospectCompanyName || row.mention.canonicalName);
+    const mergeTargetName = target
+      ? normalizeWhitespace(target.cls.prospectCompanyName || target.mention.canonicalName)
+      : '';
+    const incompatibleMergeTarget = Boolean(rowTargetName && mergeTargetName) &&
+      normalizeProspectName(rowTargetName) !== normalizeProspectName(mergeTargetName) &&
+      !identityAliasSetsCompatible(prospectIdentityAliasesForName(rowTargetName), prospectIdentityAliasesForName(mergeTargetName));
+    const sourceBackedMergeProof = identityConflictTargetProof.some(reason =>
+        /(?:structured_pipeline_row_details|fundraising_list_row_details|warm_intro_target|medina_outbound_prospect_interest|private_pitch_document_target|candidate_pitch_document_target|meeting_or_diligence_target|final_create_evidence_with_target_support|accepted_second_look_strong_candidate_support)/i.test(reason)
+    );
+    if (
+      target &&
+      incompatibleMergeTarget &&
+      sourceBackedMergeProof &&
+      sourceMentionsName(compactClassifierText([
+        row.item.subject || '',
+        row.item.bodyPreview || '',
+        row.item.bodyText || '',
+        row.item.text || '',
+        row.mention.lineText || '',
+        row.mention.contextText || '',
+      ].filter(Boolean).join('\n'), 5000), rowTargetName)
+    ) {
+      effectiveDecision = {
+        ...effectiveDecision,
+        decision: 'rename_and_allow',
+        canonical_name: rowTargetName,
+        merge_target_ordinal: null,
+        merge_target_prospect_id: null,
+        reason: `Deterministic final apply rejected incompatible merge target ${mergeTargetName} and preserved source-backed target ${rowTargetName}.`,
+        hard_block_reason: null,
+        target_proof: identityConflictTargetProof,
       };
     }
   }
@@ -11457,6 +11890,7 @@ async function classifyMention(
 
   if (
     prospectAction === 'record_context' &&
+    !createProspectVetoApplied &&
     hasFinalSelfContradictoryCreateSignal(llm, classifierInput, mention)
   ) {
     mentionType = 'inbound_prospect';
@@ -11743,10 +12177,18 @@ async function classifyMention(
     valuableActionVetoApplied = true;
     valuableActionVetoReason = secondLookCreateBlockReason;
   }
-  const effectiveFinalizationBlocked = finalizationBlocked || secondLookCreateBlocked;
-  const effectiveFinalizationBlockReasons = secondLookCreateBlocked
-    ? Array.from(new Set([...finalizationBlockReasons, 'second_look_create_blocked']))
-    : finalizationBlockReasons;
+  const lowConfidenceCreateBlocked = Boolean(
+    !shouldCreateProspect &&
+    lowConfidenceVerification.checked &&
+    (lowConfidenceVerification.action_override === 'record_context' || lowConfidenceVerification.action_override === 'ignore') &&
+    createProspectVetoReason === lowConfidenceVerification.reason
+  );
+  const effectiveFinalizationBlocked = finalizationBlocked || secondLookCreateBlocked || lowConfidenceCreateBlocked;
+  const effectiveFinalizationBlockReasons = Array.from(new Set([
+    ...finalizationBlockReasons,
+    ...(secondLookCreateBlocked ? ['second_look_create_blocked'] : []),
+    ...(lowConfidenceCreateBlocked ? [lowConfidenceVerification.reason] : []),
+  ])).filter((reason): reason is string => typeof reason === 'string' && reason.length > 0);
 
   return {
     direction: llm.direction,
@@ -12017,9 +12459,48 @@ async function findExistingProspectIdentityMatch(
       LIMIT 25`
   ).bind(...binds).all<ProspectIdentityRow>();
 
+  const collected = new Map<string, ProspectIdentityRow>();
+  const aliasMatchedIds = new Set<string>();
+  for (const row of rows.results || []) collected.set(row.id, row);
+  try {
+    const aliasValues = new Set<string>(aliases);
+    if (domain) {
+      aliasValues.add(domain);
+      aliasValues.add(normalizeProspectName(domainLabelToCompany(domain)));
+    }
+    const aliasList = Array.from(aliasValues).filter(value => value.length >= 3).slice(0, 16);
+    if (aliasList.length > 0) {
+      const aliasRows = await env.D1.prepare(
+        `SELECT entity_id
+           FROM entity_identity_aliases
+          WHERE org_id = ?
+            AND entity_type = 'prospect'
+            AND alias_value IN (${aliasList.map(() => '?').join(', ')})
+          ORDER BY confidence DESC, updated_at DESC
+          LIMIT 25`
+      ).bind(orgId, ...aliasList).all<{ entity_id: string }>();
+      const prospectIds = Array.from(new Set((aliasRows.results || []).map(row => row.entity_id).filter(Boolean)));
+      for (const id of prospectIds) aliasMatchedIds.add(id);
+      if (prospectIds.length > 0) {
+        const aliasProspects = await env.D1.prepare(
+          `SELECT id, canonical_name, normalized_name, domain, website, status, signal_count, evidence_count, created_at, possible_duplicate_of
+             FROM prospects
+            WHERE org_id = ? AND deleted_at IS NULL
+              AND status IN ('active','provisional','converted')
+              AND id IN (${prospectIds.map(() => '?').join(', ')})
+            LIMIT 25`
+        ).bind(orgId, ...prospectIds).all<ProspectIdentityRow>();
+        for (const row of aliasProspects.results || []) collected.set(row.id, row);
+      }
+    }
+  } catch (error) {
+    if (!/entity_identity_aliases|no such table|D1_ERROR/i.test(error instanceof Error ? error.message : String(error || ''))) throw error;
+  }
+
   let best: ProspectIdentityMatch | null = null;
-  for (const row of rows.results || []) {
-    const match = scoreProspectIdentityMatch(mention, row, env);
+  for (const row of collected.values()) {
+    const match = scoreProspectIdentityMatch(mention, row, env) ||
+      (aliasMatchedIds.has(row.id) ? { prospect: row, score: 0.94, method: 'manual_identity_alias' } : null);
     if (match && match.score >= 0.92) best = chooseBetterProspectIdentityMatch(best, match);
   }
   return best;
@@ -12104,6 +12585,24 @@ async function updateProspectIdentityEvidence(
     prospectId,
     orgId
   ).run();
+
+  await upsertEntityIdentityAliases({
+    orgId,
+    entityType: 'prospect',
+    entityId: prospectId,
+    name: mention.canonicalName,
+    normalizedName: mention.normalizedName,
+    domain,
+    website,
+    sourceKind: 'classifier',
+    evidence: {
+      source: 'prospect_identity_evidence',
+      prospect_action: cls.prospectAction,
+      occurred_at: occurredAt,
+      match_method: match?.method || 'self',
+      match_score: match?.score || null,
+    },
+  }, env);
 }
 
 async function upsertProspect(
@@ -12119,13 +12618,21 @@ async function upsertProspect(
     await env.D1.prepare(
       `UPDATE prospects
           SET canonical_name = ?,
-              status = CASE WHEN status = 'active' THEN status ELSE ? END,
+              status = CASE
+                WHEN status IN ('active','converted') THEN status
+                WHEN ? = 0 THEN 'active'
+                ELSE 'provisional'
+              END,
               sector_key = CASE
                 WHEN sector_key = 'uncategorized' OR ? > sector_confidence THEN ?
                 ELSE sector_key
               END,
               sector_confidence = MAX(sector_confidence, ?),
-              provisional = CASE WHEN ? = 1 THEN 1 ELSE provisional END,
+              provisional = CASE
+                WHEN status IN ('active','converted') THEN 0
+                WHEN ? = 0 THEN 0
+                ELSE 1
+              END,
               direction_uncertain = CASE WHEN ? = 1 THEN 1 ELSE direction_uncertain END,
               possible_company_id = COALESCE(possible_company_id, ?),
               possible_deal_id = COALESCE(possible_deal_id, ?),
@@ -12133,7 +12640,7 @@ async function upsertProspect(
         WHERE id = ? AND org_id = ?`
     ).bind(
       canonicalName,
-      cls.provisional ? 'provisional' : 'active',
+      cls.provisional ? 1 : 0,
       cls.sectorConfidence,
       cls.sectorKey,
       cls.sectorConfidence,
@@ -12166,7 +12673,11 @@ async function upsertProspect(
          WHEN length(excluded.canonical_name) > length(prospects.canonical_name) THEN excluded.canonical_name
          ELSE prospects.canonical_name
        END,
-       status = CASE WHEN prospects.status = 'active' THEN prospects.status ELSE excluded.status END,
+       status = CASE
+         WHEN prospects.status IN ('active','converted') THEN prospects.status
+         WHEN excluded.provisional = 0 THEN 'active'
+         ELSE 'provisional'
+       END,
        sector_key = CASE
          WHEN prospects.sector_key = 'uncategorized' OR excluded.sector_confidence > prospects.sector_confidence THEN excluded.sector_key
          ELSE prospects.sector_key
@@ -12185,7 +12696,11 @@ async function upsertProspect(
          ELSE prospects.last_signal_at
        END,
        confidence = MAX(prospects.confidence, excluded.confidence),
-       provisional = CASE WHEN excluded.provisional = 1 THEN 1 ELSE prospects.provisional END,
+       provisional = CASE
+         WHEN prospects.status IN ('active','converted') THEN 0
+         WHEN excluded.provisional = 0 THEN 0
+         ELSE 1
+       END,
        direction_uncertain = CASE WHEN excluded.direction_uncertain = 1 THEN 1 ELSE prospects.direction_uncertain END,
        possible_company_id = COALESCE(prospects.possible_company_id, excluded.possible_company_id),
        possible_deal_id = COALESCE(prospects.possible_deal_id, excluded.possible_deal_id),
@@ -12255,12 +12770,12 @@ interface ProspectCompanyResolution {
 
 function prospectCompanyDomainForMention(mention: MentionCandidate, env?: Env): string | null {
   const domain = firstProspectDomainForMention(mention, env);
-  return domain ? registrableDomain(domain.toLowerCase().replace(/^www\./, '')) : null;
+  return strictRegistrableDomain(domain);
 }
 
 function companyRowDomain(row: Pick<ProspectCompanyRow, 'domain' | 'website'>): string | null {
-  const domain = String(row.domain || '').trim().toLowerCase().replace(/^www\./, '');
-  if (domain) return registrableDomain(domain);
+  const domain = strictRegistrableDomain(row.domain);
+  if (domain) return domain;
   return domainFromUrl(row.website);
 }
 
@@ -12344,6 +12859,13 @@ function scoreCompanyForProspect(mention: MentionCandidate, row: ProspectCompany
     score = 0.86;
     method = 'token_overlap';
     reasons.push(`token_overlap:${overlap.toFixed(2)}`);
+  }
+
+  const limitedInfoReason = limitedInfoCompanyReason(row);
+  if (limitedInfoReason) {
+    score = Math.min(score, 0.88);
+    exact = false;
+    reasons.push(limitedInfoReason, 'audit_only_limited_info_company_match');
   }
 
   return score >= 0.7 ? { company: row, score, method, reasons, exact } : null;
@@ -12523,6 +13045,22 @@ export async function createProspectOriginCompany(
   });
   try { await updateEntityInIndex(args.orgId, 'company', companyId, env); } catch {}
   await invalidateRagCache(args.orgId, env).catch(() => undefined);
+  await upsertEntityIdentityAliases({
+    orgId: args.orgId,
+    entityType: 'company',
+    entityId: companyId,
+    name: args.name,
+    domain,
+    website,
+    sourceKind: 'classifier',
+    evidence: {
+      source: 'prospect_origin_company',
+      origin,
+      prospect_id: args.prospectId,
+      signal_id: args.signalId,
+      match_method: matchMethod,
+    },
+  }, env);
   return companyId;
 }
 
@@ -12691,6 +13229,22 @@ async function ensureCompanyForFinalProspect(args: {
       signalId: args.signalId,
       resolution,
       created: false,
+    }, env);
+    await upsertEntityIdentityAliases({
+      orgId: args.orgId,
+      entityType: 'company',
+      entityId: selected.company.id,
+      name: selected.company.name,
+      domain: selected.company.domain,
+      website: selected.company.website,
+      sourceKind: 'classifier',
+      evidence: {
+        source: 'prospect_company_resolution',
+        prospect_id: args.prospectId,
+        signal_id: args.signalId,
+        match_method: selected.method,
+        match_score: Number(selected.score.toFixed(3)),
+      },
     }, env);
   } else if (topWeakCandidate && topWeakCandidate.score >= 0.92) {
     resolution = {
@@ -13541,7 +14095,7 @@ function sourceLooksLikeMultiTargetDealflow(item: ClassifiedItem): boolean {
   if (isDealflowListText(text)) return true;
   const lines = text.split(/\n+/);
   const domainDealflowRows = lines.filter(line =>
-    /\b(?:https?:\/\/)?(?:www\.)?[a-z0-9-]+\.(?:ai|com|io|co|health|tech|dev|finance|xyz)\b/i.test(line) &&
+    /\b(?:https?:\/\/)?(?:www\.)?[a-z0-9-]+\.(?:ai|com|io|co|health|tech|dev|finance|xyz|systems)\b/i.test(line) &&
     /\b(?:raise|raising|capital|series|seed|safe|round|diligence|pipeline|pre[-\s]?seed|preliminary|radar|prospect|company|problem|approach|solution|valuation|allocation)\b/i.test(line)
   );
   const distinctDomains = new Set(domainDealflowRows.map(line => domainInText(line)).filter(Boolean));

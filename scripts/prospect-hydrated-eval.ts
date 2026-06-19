@@ -62,6 +62,8 @@ interface SnapshotData {
   deals?: any[];
   knownDeals?: any[];
   prospectSignals?: any[];
+  prospects?: any[];
+  identityAliases?: any[];
   relationships?: any[];
 }
 
@@ -173,6 +175,8 @@ class SnapshotD1 {
   readonly deals: any[];
   readonly knownDeals: any[];
   readonly prospectSignals: any[];
+  readonly prospects: any[];
+  readonly identityAliases: any[];
   readonly relationships: any[];
 
   constructor(snapshot: SnapshotData, private readonly orgId: string) {
@@ -185,6 +189,8 @@ class SnapshotD1 {
     }));
     this.knownDeals = (snapshot.knownDeals || []).map(row => normalizeSnapshotRow(row, orgId));
     this.prospectSignals = (snapshot.prospectSignals || []).map(row => normalizeSnapshotRow(row, orgId));
+    this.prospects = (snapshot.prospects || []).map(row => normalizeSnapshotRow(row, orgId));
+    this.identityAliases = (snapshot.identityAliases || []).map(row => normalizeSnapshotRow(row, orgId));
     this.relationships = (snapshot.relationships || []).map(row => normalizeSnapshotRow(row, orgId));
   }
 
@@ -210,8 +216,16 @@ class SnapshotD1 {
 
   private routeAll(sql: string, binds: unknown[]): any[] {
     if (/FROM prospect_classifier_cache/i.test(sql) || /FROM prospect_llm_cache/i.test(sql)) return [];
-    if (/FROM entity_identity_aliases/i.test(sql)) return [];
-    if (/FROM prospects/i.test(sql) && !/FROM prospect_signals/i.test(sql)) return [];
+    if (/FROM entity_identity_aliases/i.test(sql)) {
+      const [orgId, ...aliasValues] = binds;
+      const allowed = new Set(aliasValues.map(value => String(value)));
+      return this.identityAliases
+        .filter(row => row.org_id === orgId && allowed.has(String(row.alias_value)))
+        .map(row => ({ ...row }));
+    }
+    if (/FROM prospects/i.test(sql) && !/FROM prospect_signals/i.test(sql)) {
+      return this.routeProspects(sql, binds);
+    }
 
     if (/FROM companies c/i.test(sql)) {
       return this.knownDeals.map(row => ({ name: row.name, domain: row.domain || null }));
@@ -328,6 +342,38 @@ class SnapshotD1 {
 
     this.meta.unsupportedQueries.push({ sql: compactSql(sql), binds: binds.slice(0, 12) });
     return [];
+  }
+
+  private routeProspects(sql: string, binds: unknown[]): any[] {
+    let rows = this.prospects.filter(row => !row.deleted_at);
+    if (/WHERE id\s*=\s*\?\s+AND org_id\s*=\s*\?/i.test(sql)) {
+      const [id, orgId] = binds;
+      return rows.filter(row => row.id === id && row.org_id === orgId).map(row => ({ ...row }));
+    }
+    const orgId = binds[0];
+    rows = rows.filter(row => row.org_id === orgId);
+    if (/id IN/i.test(sql)) {
+      const ids = new Set(binds.slice(1).map(value => String(value)));
+      rows = rows.filter(row => ids.has(String(row.id)));
+    } else if (/normalized_name IN/i.test(sql) || /\(\s*normalized_name IN/i.test(sql)) {
+      const values = binds.slice(1).map(value => String(value));
+      const normalizedValues = new Set(values.filter(value => !value.includes('.') && !value.includes('%')));
+      const domains = values.filter(value => value.includes('.') && !value.includes('%')).map(value => value.toLowerCase());
+      const domainLikes = values
+        .filter(value => value.includes('%'))
+        .map(value => value.replace(/%/g, '').toLowerCase());
+      rows = rows.filter(row =>
+        normalizedValues.has(String(row.normalized_name || '')) ||
+        domains.some(domain => String(row.domain || '').toLowerCase() === domain) ||
+        domains.some(domain => String(row.website || '').toLowerCase().includes(domain)) ||
+        domainLikes.some(domain => String(row.website || '').toLowerCase().includes(domain))
+      );
+    } else if (/normalized_name\s*=\s*\?/i.test(sql)) {
+      const normalizedName = String(binds[1] || '');
+      rows = rows.filter(row => String(row.normalized_name || '') === normalizedName);
+    }
+    return rows.slice(0, /LIMIT\s+25/i.test(sql) ? 25 : /LIMIT\s+10/i.test(sql) ? 10 : /LIMIT\s+50/i.test(sql) ? 50 : rows.length)
+      .map(row => ({ ...row }));
   }
 
   private groupDealmakers(sql: string, binds: unknown[]): Array<{ dealmaker_type: string | null; n: number }> {

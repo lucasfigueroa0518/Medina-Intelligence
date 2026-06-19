@@ -370,12 +370,58 @@ async function markIncidentRepairQueued(
   ).bind(start, end, incidentId).run();
 }
 
+function incidentMetadataUserId(incident: IngestionIncident): string {
+  if (!incident.metadata) return '';
+  try {
+    const parsed = JSON.parse(incident.metadata) as { user_id?: unknown };
+    return typeof parsed.user_id === 'string' ? parsed.user_id : '';
+  } catch {
+    return '';
+  }
+}
+
+async function resolveOutlookEmailRepairUserId(env: Env, incident: IngestionIncident): Promise<string | null> {
+  let userId = '';
+
+  if (incident.scope_type === 'user') {
+    userId = incident.scope_id;
+  } else if (incident.scope_type === 'progressive_backfill_window') {
+    const row = await env.D1.prepare(
+      `SELECT p.user_id
+         FROM progressive_backfill_windows w
+         JOIN progressive_backfill_jobs p ON p.id = w.parent_id
+        WHERE w.id = ?
+          AND p.org_id = ?
+        LIMIT 1`
+    ).bind(incident.scope_id, incident.org_id).first<{ user_id: string }>();
+    userId = row?.user_id || '';
+  } else {
+    userId = incidentMetadataUserId(incident);
+  }
+
+  if (!userId) return null;
+
+  const active = await env.D1.prepare(
+    `SELECT id
+       FROM users
+      WHERE id = ?
+        AND org_id = ?
+        AND deleted_at IS NULL
+        AND is_active = 1
+      LIMIT 1`
+  ).bind(userId, incident.org_id).first<{ id: string }>();
+
+  return active?.id || null;
+}
+
 async function repairOutlookEmailIncident(env: Env, incident: IngestionIncident, start: string, end: string): Promise<boolean> {
-  if (!incident.scope_id) return false;
+  const userId = await resolveOutlookEmailRepairUserId(env, incident);
+  if (!userId) return false;
+
   const { createProgressiveBackfillRange } = await import('./progressive-backfill');
   const result = await createProgressiveBackfillRange(
     incident.org_id,
-    incident.scope_id,
+    userId,
     start,
     end,
     10,

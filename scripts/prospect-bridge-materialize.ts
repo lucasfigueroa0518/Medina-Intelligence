@@ -13,6 +13,7 @@ import {
   ensureInvestmentProspectTag as ensureProspectCompanyTag,
   mergeProspects,
   normalizeProspectName,
+  upsertEntityIdentityAliases,
 } from '../src/lib/prospect-intelligence';
 import { registrableDomain } from '../src/lib/discovery';
 import type { Env } from '../src/types/env';
@@ -956,6 +957,39 @@ async function applyMaterializationDecision(
       WHERE id = ? AND org_id = ?`
   ).bind(customFieldsWithProspectOrigin(company.custom_fields, decision), company.id, orgId).run();
   await ensureInvestmentProspectTag(env, orgId, company.id);
+  await upsertEntityIdentityAliases({
+    orgId,
+    entityType: 'prospect',
+    entityId: prospect.id,
+    name: prospect.canonical_name,
+    normalizedName: prospect.normalized_name,
+    domain: decision.evidence.repaired_domain || prospect.domain,
+    website: prospect.website || null,
+    sourceKind: 'migration',
+    evidence: {
+      source: 'prospect_bridge_materialization',
+      action: decision.action,
+      selected_company_id: decision.selected_company_id,
+      method: decision.method,
+      score: decision.score,
+    },
+  }, env);
+  await upsertEntityIdentityAliases({
+    orgId,
+    entityType: 'company',
+    entityId: company.id,
+    name: company.name,
+    domain: company.domain,
+    website: company.website,
+    sourceKind: 'migration',
+    evidence: {
+      source: 'prospect_bridge_materialization',
+      prospect_id: prospect.id,
+      action: decision.action,
+      method: decision.method,
+      score: decision.score,
+    },
+  }, env);
 
   return {
     signal_backfills: signals.length,

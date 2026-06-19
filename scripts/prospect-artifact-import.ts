@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import process from 'node:process';
 
-import { PROSPECT_CLASSIFIER_VERSION } from '../src/lib/prospect-intelligence';
+import { buildEntityIdentityAliasValues, PROSPECT_CLASSIFIER_VERSION } from '../src/lib/prospect-intelligence';
 
 const IMPORT_CONFIRMATION = 'PROSPECT_IMPORT_GO';
 const DEFAULT_DATABASE = 'medina-ventures-db';
@@ -150,7 +150,7 @@ function normalizeProspectName(value: string | null | undefined): string {
   let text = String(value || '')
     .toLowerCase()
     .replace(/\([^)]*\)/g, ' ')
-    .replace(/\b(incorporated|inc|llc|ltd|limited|corp|corporation|company|co)\b\.?/g, ' ')
+    .replace(/\b(incorporated|inc|llc|ltd|limited|corp|corporation|company|co|pbc)\b\.?/g, ' ')
     .replace(/['’]/g, '')
     .replace(/&/g, 'and')
     .replace(/[^a-z0-9]+/g, ' ')
@@ -163,7 +163,7 @@ function compactProspectName(value: string | null | undefined): string {
   return String(value || '')
     .toLowerCase()
     .replace(/\([^)]*\)/g, ' ')
-    .replace(/\b(incorporated|inc|llc|ltd|limited|corp|corporation|company|co)\b\.?/g, ' ')
+    .replace(/\b(incorporated|inc|llc|ltd|limited|corp|corporation|company|co|pbc)\b\.?/g, ' ')
     .replace(/['’]/g, '')
     .replace(/&/g, 'and')
     .replace(/[^a-z0-9]+/g, '');
@@ -322,6 +322,44 @@ function isFinalCreate(row: DecisionRow): boolean {
     (decision === 'allow_create' || decision === 'rename_and_allow' || decision === '');
 }
 
+function decisionRowAuditText(row: DecisionRow): string {
+  return [
+    row.source_title,
+    row.reasoning,
+    row.reasoning_judge_reason,
+    row.final_quality_reason,
+    row.target_evidence_reasons,
+    row.second_look_reasons,
+    row.second_look_warnings,
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function hasImportHardNonTargetRisk(row: DecisionRow): boolean {
+  const text = decisionRowAuditText(row);
+  return /\b(?:investor\s+list|vc\s+list|lp\s+list|fundraising\s+target(?:s)?|contact\s+directory|resume|curriculum\s+vitae|school|university|nonprofit|charity|foundation|philanthrop(?:y|ic)|consulting|consultant|advisor|adviser|service\s+provider|vendor|customer|buyer|lender|real\s+estate|property|calendar|security|billing|invoice|admin(?:istrative)?|document\s+(?:heading|wrapper)|text\s+fragment)\b/i.test(text) ||
+    /\b(?:not|isn['’]?t|is\s+not)\s+(?:an?\s+|the\s+)?(?:investment\s+)?(?:target|prospect|opportunity|company\s+being\s+pitched)\b/i.test(text);
+}
+
+function hasImportStrongTargetEvidence(row: DecisionRow): boolean {
+  const text = decisionRowAuditText(row);
+  if (/\b(?:structured_pipeline_row_details|fundraising_list_row_details|warm_intro_target|private_pitch_document_target|candidate_pitch_document_target|meeting_or_diligence_target|final_create_evidence_with_target_support|accepted_second_look_strong_candidate_support)\b/i.test(text)) {
+    return true;
+  }
+  const hasInvestment = /\b(?:pitch\s+deck|investor\s+deck|data\s+room|safe|term\s*sheet|valuation|allocation|diligence|raise|raising|fundrais(?:e|ing)|round|seed|series\s+[abc]|investment\s+opportunit(?:y|ies)|deal\s*flow|warm\s+intro)\b/i.test(text);
+  const hasCandidateDetails = /\b(?:website|https?:\/\/|www\.|\.ai\b|\.com\b|\.io\b|\.co\b|\.tech\b|founder|ceo|contact|poc|description|product|platform|technology|revenue|arr|mrr|traction|bookings|pipeline|stage|amount|ask)\b/i.test(text);
+  return hasInvestment && hasCandidateDetails;
+}
+
+function isMergeRecoveryCandidate(row: DecisionRow): boolean {
+  return row.prospect_action === 'create_prospect' &&
+    row.should_create_prospect === true &&
+    row.final_quality_decision === 'merge_into_record' &&
+    row.final_quality_blocked !== true &&
+    Boolean(finalName(row)) &&
+    hasImportStrongTargetEvidence(row) &&
+    !hasImportHardNonTargetRisk(row);
+}
+
 function asDateValue(value: string | null | undefined): number {
   const parsed = Date.parse(value || '');
   return Number.isFinite(parsed) ? parsed : 0;
@@ -400,16 +438,30 @@ function computeSignalStrength(rows: DecisionRow[]): { score: number; reasons: s
 function buildProspects(args: Args, rows: DecisionRow[], companiesById: Map<string, SnapshotCompany>): ProspectProjection[] {
   const groups = new Map<string, DecisionRow[]>();
   const aliasToGroup = new Map<string, string>();
-  for (const row of rows.filter(isFinalCreate)) {
+  const mergeRecoveredGroups = new Set<string>();
+  const addProjectionRow = (row: DecisionRow, recoveredMergeOnly = false) => {
     const aliases = prospectImportGroupAliases(finalName(row));
     const normalized = aliases.find(alias => aliasToGroup.has(alias))
       ? aliasToGroup.get(aliases.find(alias => aliasToGroup.has(alias)) || '') || aliases[0]
       : aliases[0];
-    if (!normalized) continue;
+    if (!normalized) return;
     const group = groups.get(normalized) || [];
     group.push(row);
     groups.set(normalized, group);
     for (const alias of aliases) aliasToGroup.set(alias, normalized);
+    if (recoveredMergeOnly) mergeRecoveredGroups.add(normalized);
+  };
+  for (const row of rows.filter(isFinalCreate)) {
+    addProjectionRow(row);
+  }
+  for (const row of rows.filter(isMergeRecoveryCandidate)) {
+    const aliases = prospectImportGroupAliases(finalName(row));
+    const existingGroup = aliases.map(alias => aliasToGroup.get(alias)).find(Boolean);
+    if (existingGroup) {
+      groups.get(existingGroup)?.push(row);
+      continue;
+    }
+    addProjectionRow(row, true);
   }
   return Array.from(groups.entries()).map(([normalizedName, groupRows]) => {
     const sorted = [...groupRows].sort((a, b) => asDateValue(a.occurred_at) - asDateValue(b.occurred_at));
@@ -462,6 +514,7 @@ function buildProspects(args: Args, rows: DecisionRow[], companiesById: Map<stri
         source_titles_sample: Array.from(new Set(groupRows.map(row => row.source_title).filter(Boolean))).slice(0, 10),
         representative_reasoning: strongest?.reasoning || null,
         representative_final_quality_reason: strongest?.final_quality_reason || null,
+        import_recovered_merge_only_group: mergeRecoveredGroups.has(normalizedName),
       },
     };
   }).sort((a, b) => b.signalCount - a.signalCount || a.canonicalName.localeCompare(b.canonicalName));
@@ -503,13 +556,63 @@ ON CONFLICT(org_id, normalized_name) WHERE deleted_at IS NULL DO UPDATE SET
   signal_strength = MAX(prospects.signal_strength, excluded.signal_strength),
   signal_strength_reasons = CASE WHEN excluded.signal_strength > prospects.signal_strength THEN excluded.signal_strength_reasons ELSE prospects.signal_strength_reasons END,
   enrichment_priority = CASE WHEN prospects.enrichment_priority = 'eager' THEN prospects.enrichment_priority ELSE excluded.enrichment_priority END,
-  confidence = MAX(prospects.confidence, excluded.confidence),
-  provisional = CASE WHEN excluded.provisional = 1 THEN 1 ELSE prospects.provisional END,
+       confidence = MAX(prospects.confidence, excluded.confidence),
+  status = CASE
+    WHEN prospects.status IN ('active','converted') THEN prospects.status
+    WHEN excluded.provisional = 0 THEN 'active'
+    ELSE 'provisional'
+  END,
+  provisional = CASE
+    WHEN prospects.status IN ('active','converted') THEN 0
+    WHEN excluded.provisional = 0 THEN 0
+    ELSE 1
+  END,
   direction_uncertain = CASE WHEN excluded.direction_uncertain = 1 THEN 1 ELSE prospects.direction_uncertain END,
   possible_company_id = COALESCE(prospects.possible_company_id, excluded.possible_company_id),
   possible_deal_id = COALESCE(prospects.possible_deal_id, excluded.possible_deal_id),
   metadata_json = json_patch(COALESCE(prospects.metadata_json, '{}'), excluded.metadata_json),
   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');`;
+}
+
+function buildIdentityAliasInserts(
+  prospects: ProspectProjection[],
+  prospectIds: Map<string, string>,
+  orgId: string
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const prospect of prospects) {
+    const prospectId = prospectIds.get(prospect.normalizedName) || prospect.id;
+    for (const alias of buildEntityIdentityAliasValues({
+      name: prospect.canonicalName,
+      normalizedName: prospect.normalizedName,
+      domain: prospect.domain,
+      website: prospect.website,
+    })) {
+      const key = `prospect:${prospectId}:${alias.aliasKind}:${alias.aliasValue}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const evidence = {
+        source: 'prospect_artifact_import',
+        canonical_name: prospect.canonicalName,
+        normalized_name: prospect.normalizedName,
+      };
+      out.push(`INSERT INTO entity_identity_aliases (
+  org_id, entity_type, entity_id, alias_kind, alias_value, confidence, source_kind, evidence_json,
+  created_at, updated_at
+) VALUES (
+  ${sqlString(orgId)}, 'prospect', ${sqlString(prospectId)}, ${sqlString(alias.aliasKind)}, ${sqlString(alias.aliasValue)},
+  ${sqlNumber(alias.confidence)}, 'migration', ${sqlString(JSON.stringify(evidence))},
+  strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
+)
+ON CONFLICT(org_id, entity_type, entity_id, alias_kind, alias_value) DO UPDATE SET
+  confidence = MAX(entity_identity_aliases.confidence, excluded.confidence),
+  source_kind = excluded.source_kind,
+  evidence_json = excluded.evidence_json,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');`);
+    }
+  }
+  return out;
 }
 
 function signalProspectNormalized(row: DecisionRow): string | null {
@@ -770,6 +873,7 @@ export async function runProspectArtifactImport(args: Args): Promise<Record<stri
 
   db.runChunk('prospects', prospects.map(row => buildProspectInsert(row, args.orgId)));
   const prospectIds = queryProspectIds(db, args.orgId, prospects.map(row => row.normalizedName));
+  db.runChunk('identity-aliases', buildIdentityAliasInserts(prospects, prospectIds, args.orgId));
   db.runChunk('signals', decisions.map(row => buildSignalInsert(row, args.orgId, prospectIds)));
   db.runChunk('prospect-aggregates', [recomputeProspectAggregateSql(args.orgId)]);
 

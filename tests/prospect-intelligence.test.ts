@@ -97,6 +97,7 @@ function resetClaudeMock(): void {
 
 import {
   __prospectIntelligenceTestHooks,
+  buildEntityIdentityAliasValues,
   callProspectClassifier,
   classifyProspectSignalsDryRun,
   computeSignalStrength,
@@ -558,16 +559,18 @@ class FakeD1 {
     }
 
     if (/INSERT INTO entity_identity_aliases/i.test(sql)) {
+      const hasExplicitId = binds[1] !== 'company' && binds[1] !== 'prospect';
+      const offset = hasExplicitId ? 1 : 0;
       this.identityAliases.push({
-        id: binds[0],
-        org_id: binds[1],
-        entity_type: binds[2],
-        entity_id: binds[3],
-        alias_kind: binds[4],
-        alias_value: binds[5],
-        confidence: binds[6],
-        source_kind: binds[7],
-        evidence_json: binds[8],
+        id: hasExplicitId ? binds[0] : `alias-${this.identityAliases.length + 1}`,
+        org_id: binds[offset],
+        entity_type: binds[offset + 1],
+        entity_id: binds[offset + 2],
+        alias_kind: binds[offset + 3],
+        alias_value: binds[offset + 4],
+        confidence: binds[offset + 5],
+        source_kind: binds[offset + 6],
+        evidence_json: binds[offset + 7],
       });
       return;
     }
@@ -658,12 +661,17 @@ class FakeD1 {
       const normalizedName = binds[3];
       const existing = this.prospects.find(row => row.org_id === binds[1] && row.normalized_name === normalizedName);
       if (existing) {
+        const incomingProvisional = binds[11] === 1;
         existing.canonical_name = binds[2];
-        existing.status = binds[4];
+        existing.status = existing.status === 'active' || existing.status === 'converted'
+          ? existing.status
+          : incomingProvisional ? 'provisional' : 'active';
         existing.sector_key = binds[5];
         existing.sector_confidence = binds[6];
         existing.confidence = binds[10];
-        existing.provisional = binds[11];
+        existing.provisional = existing.status === 'active' || existing.status === 'converted'
+          ? 0
+          : incomingProvisional ? 1 : 0;
         existing.direction_uncertain = binds[12];
         existing.possible_company_id = binds[13];
         existing.possible_deal_id = binds[14];
@@ -780,12 +788,16 @@ class FakeD1 {
       const row = this.prospects.find(entry => entry.id === prospectId && entry.org_id === orgId);
       if (row) {
         row.canonical_name = binds[0];
-        row.status = row.status === 'active' ? row.status : binds[1];
+        row.status = row.status === 'active' || row.status === 'converted'
+          ? row.status
+          : binds[1] === 0 ? 'active' : 'provisional';
         if (row.sector_key === 'uncategorized' || Number(binds[2] || 0) > Number(row.sector_confidence || 0)) {
           row.sector_key = binds[3];
         }
         row.sector_confidence = Math.max(Number(row.sector_confidence || 0), Number(binds[4] || 0));
-        row.provisional = binds[5] === 1 ? 1 : row.provisional;
+        row.provisional = row.status === 'active' || row.status === 'converted'
+          ? 0
+          : binds[5] === 1 ? 1 : row.provisional;
         row.direction_uncertain = binds[6] === 1 ? 1 : row.direction_uncertain;
         row.possible_company_id = row.possible_company_id || binds[7];
         row.possible_deal_id = row.possible_deal_id || binds[8];
@@ -1101,6 +1113,21 @@ describe('prospect intelligence deterministic signals', () => {
   it('normalizes prospect identity without thesis inputs', () => {
     expect(normalizeProspectName('NeuralSeek AI Inc.')).toBe('neuralseek');
     expect(normalizeProspectName('Qunnect Technologies, LLC')).toBe('qunnect');
+  });
+
+  it('builds durable identity aliases from names and domains', () => {
+    const aliases = buildEntityIdentityAliasValues({
+      name: 'Acme Robotics, PBC',
+      normalizedName: 'acmerobotics',
+      domain: 'www.acme-robotics.ai',
+      website: 'https://acme-robotics.ai/deck',
+    });
+
+    expect(aliases).toEqual(expect.arrayContaining([
+      { aliasKind: 'normalized_name', aliasValue: 'acmerobotics', confidence: 1 },
+      { aliasKind: 'domain', aliasValue: 'acme-robotics.ai', confidence: 1 },
+      { aliasKind: 'domain_brand', aliasValue: 'acmerobotics', confidence: 0.92 },
+    ]));
   });
 
   it('keeps ObjectSecurity as one company and stores slash products as metadata', () => {
@@ -2247,6 +2274,29 @@ describe('prospect intelligence deterministic signals', () => {
         reasoning_valid: true,
         confidence: 0.94,
         reason: 'Foundry Atlas is a named row entry in a private pipeline status update with concrete company details and fundraising-list evidence.',
+      } as any,
+    })).toBeNull();
+
+    expect(acceptedSecondLookCreateBlockReason({
+      secondLook: {
+        ...promotedSecondLook,
+        evidence: ['final_create_evidence'],
+        packet: {
+          target_evidence_reasons: ['fundraising_list_row'],
+          source_title: 'Pipeline Status Update',
+          excerpt: 'Beacon.tech LOW Radar AI Unknown Los Angeles beacon.tech AI no-code platform for healthcare teams with seed pipeline status.',
+          original_reasoning: 'Beacon.tech is a company row in a private pipeline report with website, product description, and seed pipeline signal.',
+        },
+      } as any,
+      mention: { canonicalName: 'Beacon.tech' } as any,
+      llm: {
+        reasoning: 'Beacon.tech is the company row, not a text fragment.',
+      } as any,
+      reasoningJudge: {
+        action: 'allow_create',
+        reasoning_valid: true,
+        confidence: 0.94,
+        reason: 'Beacon.tech is a named row entry with concrete company details and pipeline evidence.',
       } as any,
     })).toBeNull();
 
@@ -3990,6 +4040,24 @@ describe('prospect intelligence deterministic signals', () => {
     expect(dedupedNames).not.toEqual(expect.arrayContaining(['Airwayz', 'TechCrunch']));
   });
 
+  it('extracts no-domain multi-word company names from field-anchored internal pipeline rows', () => {
+    const { parseDealflowList } = __prospectIntelligenceTestHooks;
+    const text = [
+      'automatic_report - Pipeline Status Update -1800000000.pdf',
+      'Pipeline Status Update Company fields owner assignment product prospect status description',
+      'Vector Relay Systems owner Tony assigned to Tony prospect pipeline investment opportunity product wireless power transmission platform description long-range energy infrastructure for defense installations',
+      'Quantum Signal Corp (QSC) LOW Radar Quantum Series A Unknown Unknown Unknown US / South Korea Dec 11, 2025 Quantum Signal builds quantum-enabled sensing systems for autonomous platforms.',
+      'Northstar Capital owner Raul investor relationship update for fund outreach',
+    ].join(' ');
+
+    const names = parseDealflowList(text).map(mention => mention.canonicalName);
+
+    expect(names).toContain('Vector Relay Systems');
+    expect(names).toContain('Quantum Signal Corp');
+    expect(names).not.toContain('Northstar Capital');
+    expect(names).not.toContain('Pipeline Status Update');
+  });
+
   it('prioritizes subject target extraction before security footer noise', () => {
     const names = __prospectIntelligenceTestHooks.extractMentionCandidatesFromText([
       'Investment Opportunity: Project Prometheus',
@@ -4023,11 +4091,8 @@ describe('prospect intelligence deterministic signals', () => {
     expect(callClaudeWithUsageMock).not.toHaveBeenCalled();
   });
 
-  it('prefilter drops generated automatic pipeline reports before an LLM call', async () => {
-    resetClaudeMock();
-    const db = new FakeD1();
-    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
-    const item: any = {
+  it('prefilter scans generated automatic pipeline reports when they contain private company rows', () => {
+    const gate = __prospectIntelligenceTestHooks.sourcePrefilter({
       type: 'document',
       entityType: 'document',
       entityId: 'doc-generated-pipeline-report',
@@ -4037,13 +4102,12 @@ describe('prospect intelligence deterministic signals', () => {
       bodyPreview: 'Pipeline Status Update Company Priority Status Industry',
       sentAt: '2026-05-01T00:00:00.000Z',
       text: 'automatic_report - Pipeline Status Update -12345.pdf Pipeline Status Update Company Priority Status Industry Investment Round Website Description ExampleAI Seed $2M example.ai AI platform.',
-    };
+    } as any, {} as any);
 
-    const stats = await detectAndRecordProspectSignals([item], 'org-1', env);
-
-    expect(stats.prefilter_dropped).toBe(1);
-    expect(stats.signals_recorded).toBe(0);
-    expect(callClaudeWithUsageMock).not.toHaveBeenCalled();
+    expect(gate).toMatchObject({
+      shouldScan: true,
+      reasons: ['generated_pipeline_report_dealflow_allow_signal'],
+    });
   });
 
   it('records prospect signals from document source items with the same durable keying', async () => {
@@ -5965,6 +6029,232 @@ describe('prospect intelligence deterministic signals', () => {
     });
   });
 
+  it('preserves structured private pipeline rows when final quality blocks only because the row is suspicious', () => {
+    const row: any = {
+      item: {
+        entityId: 'doc-final-gate-structured-pipeline-preserve',
+        subject: 'Pipeline Status Update',
+        bodyText: 'Pipeline Status Update Company Priority Status Industry Website Description. HelioGrid Systems LOW Radar Energy Unknown heliogrid.ai HelioGrid Systems builds grid resilience software and is in the seed pipeline.',
+        bodyPreview: 'HelioGrid Systems LOW Radar seed pipeline.',
+      },
+      sourceType: 'document',
+      mention: {
+        raw: 'HelioGrid Systems',
+        canonicalName: 'HelioGrid Systems',
+        normalizedName: normalizeProspectName('HelioGrid Systems'),
+        mentionOrdinal: 1,
+        spanStart: null,
+        spanEnd: null,
+        lineText: 'HelioGrid Systems LOW Radar Energy Unknown heliogrid.ai HelioGrid Systems builds grid resilience software and is in the seed pipeline.',
+        contextText: 'Pipeline Status Update HelioGrid Systems LOW Radar Energy Unknown heliogrid.ai HelioGrid Systems builds grid resilience software and is in the seed pipeline.',
+        isListEntry: true,
+        products: [],
+      },
+      cls: {
+        prospectCompanyName: 'HelioGrid Systems',
+        prospectAction: 'create_prospect',
+        mentionType: 'inbound_prospect',
+        shouldCreateProspect: true,
+        possibleCompanyId: null,
+        possibleDealId: null,
+        linkedDealId: null,
+        provisional: false,
+        directionUncertain: false,
+        metadata: {
+          llm_reasoning: 'HelioGrid Systems is a company row in a private pipeline status report with website, product description, and seed pipeline signal.',
+          has_create_evidence: true,
+          target_evidence_reasons: ['fundraising_list_row'],
+        },
+      },
+      existing: {
+        companyId: null,
+        dealId: null,
+        companyDomain: null,
+        relationshipStates: [],
+        isInternal: false,
+        matchStrength: 'none',
+        identityScore: 0,
+        identityStrength: 'none',
+        identityCandidates: [],
+      },
+    };
+
+    const applied = __prospectIntelligenceTestHooks.applyFinalQualityDecisionToOutcome(
+      row,
+      {
+        record_ordinal: 1,
+        decision: 'block_create',
+        canonical_name: null,
+        merge_target_ordinal: null,
+        merge_target_prospect_id: null,
+        reason: 'accepted_but_suspicious row with recent mixed signal history and no known company identity match.',
+        model: 'claude-haiku-4-5-20251001',
+      },
+      'fqg_test_structured_pipeline_preserve',
+      new Map([[1, row]])
+    );
+
+    expect(applied.cls.shouldCreateProspect).toBe(true);
+    expect(applied.cls.prospectAction).toBe('create_prospect');
+    expect(applied.cls.prospectCompanyName).toBe('HelioGrid Systems');
+    expect(applied.cls.metadata.prospect_final_quality_gate).toMatchObject({
+      decision: 'rename_and_allow',
+      canonical_name: 'HelioGrid Systems',
+      blocked: false,
+    });
+    expect(applied.cls.metadata.prospect_final_quality_gate.target_proof).toEqual(expect.arrayContaining(['structured_pipeline_row_details']));
+  });
+
+  it('does not replace a source-backed structured row with a reasoning artifact canonical name', () => {
+    const row: any = {
+      item: {
+        entityId: 'doc-final-gate-structured-row-artifact-name',
+        subject: 'Pipeline Status Update',
+        bodyText: 'Pipeline Status Update Company Priority Status Industry Website Description. QuantumGrid LOW Radar Quantum Unknown quantumgrid.ai QuantumGrid builds quantum orchestration software for enterprise workloads.',
+        bodyPreview: 'QuantumGrid LOW Radar quantumgrid.ai.',
+      },
+      sourceType: 'document',
+      mention: {
+        raw: 'QuantumGrid',
+        canonicalName: 'QuantumGrid',
+        normalizedName: normalizeProspectName('QuantumGrid'),
+        mentionOrdinal: 1,
+        spanStart: null,
+        spanEnd: null,
+        lineText: 'QuantumGrid LOW Radar Quantum Unknown quantumgrid.ai QuantumGrid builds quantum orchestration software.',
+        contextText: 'Pipeline Status Update QuantumGrid LOW Radar Quantum Unknown quantumgrid.ai QuantumGrid builds quantum orchestration software.',
+        isListEntry: true,
+        products: [],
+      },
+      cls: {
+        prospectCompanyName: 'QuantumGrid',
+        prospectAction: 'create_prospect',
+        mentionType: 'inbound_prospect',
+        shouldCreateProspect: true,
+        possibleCompanyId: null,
+        possibleDealId: null,
+        linkedDealId: null,
+        provisional: false,
+        directionUncertain: false,
+        metadata: {
+          llm_reasoning: 'QuantumGrid is listed as a company row in the private pipeline status report.',
+          has_create_evidence: true,
+          target_evidence_reasons: ['fundraising_list_row'],
+        },
+      },
+      existing: {
+        companyId: null,
+        dealId: null,
+        companyDomain: null,
+        relationshipStates: [],
+        isInternal: false,
+        matchStrength: 'none',
+        identityScore: 0,
+        identityStrength: 'none',
+        identityCandidates: [],
+      },
+    };
+
+    const applied = __prospectIntelligenceTestHooks.applyFinalQualityDecisionToOutcome(
+      row,
+      {
+        record_ordinal: 1,
+        decision: 'rename_and_allow',
+        canonical_name: 'No existing company match',
+        merge_target_ordinal: null,
+        merge_target_prospect_id: null,
+        reason: 'QuantumGrid is a named row entry with company-specific details. No existing company match. Fundraising list evidence supports creation.',
+        model: 'claude-haiku-4-5-20251001',
+      },
+      'fqg_test_structured_row_artifact_name',
+      new Map([[1, row]])
+    );
+
+    expect(applied.cls.shouldCreateProspect).toBe(true);
+    expect(applied.cls.prospectCompanyName).toBe('QuantumGrid');
+    expect(applied.cls.metadata.prospect_final_quality_gate).toMatchObject({
+      decision: 'rename_and_allow',
+      canonical_name: 'QuantumGrid',
+      blocked: false,
+    });
+  });
+
+  it('preserves warm intro targets without requiring a verified website when private anchors are present', () => {
+    const row: any = {
+      item: {
+        entityId: 'conv-final-gate-warm-intro-preserve',
+        subject: 'FW: Orbit Loom intro',
+        bodyText: 'Forwarding a warm intro to Medina. Orbit Loom CEO Maya Chen is copied at maya@orbitloom.example and the deal-flow note says Orbit Loom is a suborbital logistics company for Medina review.',
+        bodyPreview: 'Orbit Loom warm intro for Medina review.',
+      },
+      sourceType: 'conversation',
+      mention: {
+        raw: 'Orbit Loom',
+        canonicalName: 'Orbit Loom',
+        normalizedName: normalizeProspectName('Orbit Loom'),
+        mentionOrdinal: 1,
+        spanStart: null,
+        spanEnd: null,
+        lineText: 'Orbit Loom CEO Maya Chen is copied at maya@orbitloom.example.',
+        contextText: 'Forwarding a warm intro to Medina. Orbit Loom CEO Maya Chen is copied at maya@orbitloom.example and the deal-flow note says Orbit Loom is a suborbital logistics company for Medina review.',
+        isListEntry: false,
+        products: [],
+      },
+      cls: {
+        prospectCompanyName: 'Orbit Loom',
+        prospectAction: 'create_prospect',
+        mentionType: 'inbound_prospect',
+        shouldCreateProspect: true,
+        possibleCompanyId: null,
+        possibleDealId: null,
+        linkedDealId: null,
+        provisional: false,
+        directionUncertain: false,
+        metadata: {
+          llm_reasoning: 'Orbit Loom is being introduced to Medina through a private deal-flow email with CEO contact evidence.',
+          has_create_evidence: true,
+          target_evidence_reasons: ['warm_intro_target'],
+        },
+      },
+      existing: {
+        companyId: null,
+        dealId: null,
+        companyDomain: null,
+        relationshipStates: [],
+        isInternal: false,
+        matchStrength: 'none',
+        identityScore: 0,
+        identityStrength: 'none',
+        identityCandidates: [],
+      },
+    };
+
+    const applied = __prospectIntelligenceTestHooks.applyFinalQualityDecisionToOutcome(
+      row,
+      {
+        record_ordinal: 1,
+        decision: 'block_create',
+        canonical_name: null,
+        merge_target_ordinal: null,
+        merge_target_prospect_id: null,
+        reason: 'accepted_but_suspicious row lacks verified website/domain despite intro context.',
+        model: 'claude-haiku-4-5-20251001',
+      },
+      'fqg_test_warm_intro_preserve',
+      new Map([[1, row]])
+    );
+
+    expect(applied.cls.shouldCreateProspect).toBe(true);
+    expect(applied.cls.prospectAction).toBe('create_prospect');
+    expect(applied.cls.prospectCompanyName).toBe('Orbit Loom');
+    expect(applied.cls.metadata.prospect_final_quality_gate).toMatchObject({
+      decision: 'rename_and_allow',
+      canonical_name: 'Orbit Loom',
+      blocked: false,
+    });
+    expect(applied.cls.metadata.prospect_final_quality_gate.target_proof).toEqual(expect.arrayContaining(['warm_intro_target']));
+  });
+
   it('preserves the full source-backed brand during identity-conflict final apply', () => {
     const row: any = {
       item: {
@@ -7031,6 +7321,174 @@ describe('prospect intelligence deterministic signals', () => {
     const abra = mentions.find(mention => mention.normalizedName === 'abra');
     expect(abra).toBeTruthy();
     expect(__prospectIntelligenceTestHooks.firstProspectDomainForMention(abra!, env)).toBe('helloabra.com');
+  });
+
+  it('does not treat money amounts as prospect domains', () => {
+    const env = { D1: new FakeD1(), INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const mention: any = {
+      raw: 'Atlas AI',
+      canonicalName: 'Atlas AI',
+      normalizedName: 'atlasai',
+      mentionOrdinal: 1,
+      spanStart: null,
+      spanEnd: null,
+      lineText: 'Atlas AI has $10.3M ARR and is reviewing a financing path.',
+      contextText: 'Generated meeting summary: Atlas AI has $10.3M ARR and $25.0M valuation discussion.',
+      isListEntry: false,
+      products: [],
+    };
+
+    expect(__prospectIntelligenceTestHooks.firstProspectDomainForMention(mention, env)).toBeNull();
+  });
+
+  it('uses manual prospect aliases to merge dirty spellings into existing prospects', async () => {
+    resetClaudeMock();
+    callClaudeWithUsageMock.mockImplementation(async (request: any) => {
+      if (isReasoningJudgeRequest(request)) return reasoningJudgeResponse();
+      if (isFinalQualityGateRequest(request)) return defaultFinalQualityGateResponseForRequest(request);
+      return {
+        text: '{"decisions":[{"mention_ordinal":1,"is_prospect":true,"prospect_company_name":"Neural Seq","direction":"inbound","sector_key":"ai_data","sector_confidence":0.8,"confidence":0.93,"reasoning":"Neural Seq is named as the direct company being reviewed with deck and diligence evidence."}]}',
+        usage: { input_tokens: 90, output_tokens: 30 },
+        model: 'claude-haiku-4-5-20251001',
+      };
+    });
+    const db = new FakeD1();
+    db.prospects.push({
+      id: 'prospect-neuralseek',
+      org_id: 'org-1',
+      canonical_name: 'NeuralSeek',
+      normalized_name: 'neuralseek',
+      domain: 'neuralseek.com',
+      website: 'https://neuralseek.com',
+      status: 'active',
+      signal_count: 12,
+      evidence_count: 12,
+      created_at: '2026-05-01T00:00:00.000Z',
+    });
+    db.identityAliases.push({
+      id: 'alias-neuralseq',
+      org_id: 'org-1',
+      entity_type: 'prospect',
+      entity_id: 'prospect-neuralseek',
+      alias_kind: 'manual',
+      alias_value: 'neuralseq',
+      confidence: 1,
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-neural-seq',
+      source: 'email',
+      subject: 'Neural Seq deck for Medina review',
+      bodyText: 'Neural Seq founder shared a deck and diligence materials for Medina review.',
+      bodyPreview: 'Neural Seq deck',
+      fromEmail: 'founder@example.com',
+      toEmails: ['lucas@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+    };
+
+    await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(db.prospects.filter(row => row.normalized_name === 'neuralseq' && !row.deleted_at)).toHaveLength(0);
+    expect(db.prospectSignals[0]).toMatchObject({
+      prospect_id: 'prospect-neuralseek',
+      mention_type: 'inbound_prospect',
+    });
+  });
+
+  it('does not rename a source-backed candidate to a mismatched source company id', async () => {
+    resetClaudeMock();
+    callClaudeWithUsageMock.mockImplementation(async (request: any) => {
+      if (isReasoningJudgeRequest(request)) {
+        return reasoningJudgeResponse(
+          'allow_create',
+          "Direct Medina partner email explicitly says the partner wants to learn more about Lattica and that Lattica fits Medina's wheelhouse."
+        );
+      }
+      if (isFinalQualityGateRequest(request)) {
+        const user = JSON.parse(String(request.user || '{}'));
+        return finalQualityGateResponse((user.records || []).map((record: any) => ({
+          record_ordinal: record.record_ordinal,
+          decision: 'rename_and_allow',
+          canonical_name: 'The Zeal Company',
+          merge_target_ordinal: null,
+          merge_target_prospect_id: null,
+          reason: "Proposed name 'Lattica' is an alias or working name for known company The Zeal Company based on source_item_company_id/direct_company_id context.",
+        })));
+      }
+      return {
+        text: JSON.stringify({
+          decisions: [{
+            mention_ordinal: 1,
+            is_prospect: true,
+            prospect_company_name: 'Lattica',
+            direction: 'outbound',
+            sector_key: 'cybersecurity',
+            sector_confidence: 0.86,
+            confidence: 0.92,
+            reasoning: "A Medina partner explicitly says he would love to learn more about Lattica, that it fits Medina Ventures' wheelhouse, and offers go-to-market support.",
+          }],
+        }),
+        usage: { input_tokens: 120, output_tokens: 40 },
+        model: 'claude-haiku-4-5-20251001',
+      };
+    });
+    const db = new FakeD1();
+    db.companies.push({
+      id: 'company-zeal',
+      org_id: 'org-1',
+      name: 'The Zeal Company',
+      domain: 'tz.co',
+      website: 'https://tz.co',
+      company_type: 'startup',
+      investment_status: 'prospect',
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'email',
+      entityType: 'conversation',
+      entityId: 'conv-lattica',
+      source: 'email',
+      companyId: 'company-zeal',
+      subject: 'Lattica & Medina Ventures',
+      bodyText: "Sebastian, I'd love to learn more about Lattica. As I mentioned, it feels very much in our wheelhouse at Medina Ventures. We'd be happy to be helpful on the go-to-market side, particularly around national security opportunities.",
+      bodyPreview: "I'd love to learn more about Lattica.",
+      fromEmail: 'raul@medinavc.com',
+      toEmails: ['sebastian@example.com'],
+      sentAt: '2026-06-18T21:00:00.000Z',
+      direction: 'outbound',
+    };
+
+    await detectAndRecordProspectSignals([item], 'org-1', env);
+
+    expect(db.prospects).toHaveLength(1);
+    expect(db.prospects[0]).toMatchObject({
+      canonical_name: 'Lattica',
+      normalized_name: 'lattica',
+    });
+    expect(db.prospects[0].company_id || null).toBeNull();
+    expect(db.prospectSignals[0]).toMatchObject({
+      mention_type: 'inbound_prospect',
+      raw_mention_text: 'Lattica',
+      normalized_mention: 'lattica',
+      prospect_id: db.prospects[0].id,
+    });
+    const metadata = JSON.parse(db.prospectSignals[0].metadata_json);
+    expect(metadata.known_entity_audit).toMatchObject({
+      match_strength: 'none',
+      identity_strength: 'weak',
+      identity_method: 'direct_company_id',
+    });
+    expect(metadata.known_entity_audit.identity_candidates[0].reasons).toEqual(
+      expect.arrayContaining(['source_item_company_id_mismatch_candidate_name', 'source_company_context_audit_only'])
+    );
+    expect(metadata.prospect_final_quality_gate).toMatchObject({
+      decision: 'allow_create',
+      canonical_name: 'Lattica',
+      renamed: false,
+    });
+    expect(metadata.prospect_final_quality_gate.reason).toMatch(/preserved source-backed candidate Lattica/i);
   });
 
   it('creates a new prospect-origin company instead of linking a domain-conflicting same-name CRM company', async () => {
@@ -8492,6 +8950,176 @@ describe('prospect intelligence deterministic signals', () => {
       role: 'startup_or_private_company',
       action_override: null,
     });
+  });
+
+  it('treats limited-info prospect-origin company rows as audit-only D1 support', async () => {
+    const db = new FakeD1();
+    db.companies.push({
+      id: 'company-thin',
+      org_id: 'org-1',
+      name: 'ThinCo',
+      domain: null,
+      website: null,
+      company_type: 'startup',
+      investment_status: 'prospect',
+      custom_fields: JSON.stringify({
+        prospect_origin: {
+          created_by_prospect_pipeline: true,
+          limited_info: true,
+          evidence_quality: 'limited_info',
+        },
+        enrichment_guard: { status: 'blocked_insufficient_anchor' },
+        limited_info_prospect: { status: 'limited_info' },
+      }),
+    });
+    const env = { D1: db, INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'event',
+      entityType: 'event',
+      entityId: 'event-thinco',
+      source: 'outlook',
+      subject: 'Catch up: ThinCo & Medina',
+      bodyText: 'Generated meeting summary: ThinCo was discussed in an investment-looking market update.',
+      bodyPreview: 'ThinCo discussion',
+      fromEmail: 'lucas@medinavc.com',
+      toEmails: ['tony@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+      direction: 'internal',
+    };
+    const mention: any = {
+      raw: 'ThinCo',
+      canonicalName: 'ThinCo',
+      normalizedName: 'thinco',
+      mentionOrdinal: 1,
+      spanStart: null,
+      spanEnd: null,
+      lineText: item.subject,
+      contextText: item.bodyText,
+      isListEntry: false,
+      products: [],
+    };
+
+    const result = await __prospectIntelligenceTestHooks.classifyCompanyRoleFromD1(
+      'org-1',
+      item,
+      mention,
+      {
+        companyId: 'company-thin',
+        dealId: null,
+        companyDomain: null,
+        relationshipStates: [],
+        isInternal: false,
+        matchStrength: 'name',
+      },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.86, provisional: true, directionUncertain: true }
+    );
+
+    expect(result.role).not.toBe('startup_or_private_company');
+    expect(result.evidence.join(' ')).toMatch(/limited_info|audit-only|blocked_insufficient_anchor/);
+    expect(result.action_override).toBeNull();
+  });
+
+  it('routes internal meeting rows with third-party allocation and only limited-info identity to context', () => {
+    const env = { D1: new FakeD1(), INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'calendar_event',
+      entityType: 'event',
+      entityId: 'event-third-party-allocation',
+      source: 'outlook',
+      subject: 'Catch up: OSO & Medina',
+      bodyText: 'Generated meeting summary: Pablo and OneSixOne secured allocations around ThinCo. Medina discussed market context and next steps.',
+      bodyPreview: 'Pablo secured allocations around ThinCo.',
+      fromEmail: 'lucas@medinavc.com',
+      toEmails: ['tony@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+      direction: 'internal',
+    };
+    const mention: any = {
+      raw: 'ThinCo',
+      canonicalName: 'ThinCo',
+      normalizedName: 'thinco',
+      mentionOrdinal: 1,
+      spanStart: null,
+      spanEnd: null,
+      lineText: item.subject,
+      contextText: item.bodyText,
+      isListEntry: false,
+      products: [],
+    };
+    const existing = { companyId: 'company-thin', dealId: null, companyDomain: null, relationshipStates: [], isInternal: false, matchStrength: 'name' as const };
+    const prefilter = __prospectIntelligenceTestHooks.buildClassifierPrefilter(item, mention, existing, env);
+    const result = __prospectIntelligenceTestHooks.verifyLowConfidenceProspect(
+      item,
+      mention,
+      existing,
+      prefilter,
+      {
+        checked: true,
+        eligible: true,
+        role: 'unknown',
+        confidence: 'low',
+        evidence: ['limited_info_prospect_company: audit-only company identity support'],
+        action_override: null,
+        matched_company_id: 'company-thin',
+        matched_deal_id: null,
+        reason: null,
+      },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.86, provisional: true, directionUncertain: true }
+    );
+
+    expect(result).toMatchObject({
+      checked: true,
+      verdict: 'record_context',
+      action_override: 'record_context',
+      reason: 'low_confidence_third_party_allocation_context',
+    });
+    expect(result.extraction_flags).toContain('third_party_allocation_context');
+  });
+
+  it('still allows internal meeting creates when direct Medina evidence has a clean domain anchor', () => {
+    const env = { D1: new FakeD1(), INTERNAL_DOMAINS: 'medinavc.com' } as any;
+    const item: any = {
+      type: 'calendar_event',
+      entityType: 'event',
+      entityId: 'event-clean-anchor',
+      source: 'outlook',
+      subject: 'CleanAI seed deck for Medina diligence',
+      bodyText: 'Generated meeting summary: Medina reviewed CleanAI seed deck and diligence materials. Company URL cleanai.com.',
+      bodyPreview: 'CleanAI seed deck',
+      fromEmail: 'lucas@medinavc.com',
+      toEmails: ['tony@medinavc.com'],
+      sentAt: '2026-05-01T00:00:00.000Z',
+      direction: 'internal',
+    };
+    const mention: any = {
+      raw: 'CleanAI',
+      canonicalName: 'CleanAI',
+      normalizedName: 'cleanai',
+      mentionOrdinal: 1,
+      spanStart: null,
+      spanEnd: null,
+      lineText: item.subject,
+      contextText: item.bodyText,
+      isListEntry: false,
+      products: [],
+      listFields: { website: 'cleanai.com' },
+    };
+    const existing = { companyId: null, dealId: null, companyDomain: null, relationshipStates: [], isInternal: false, matchStrength: 'none' as const };
+    const prefilter = __prospectIntelligenceTestHooks.buildClassifierPrefilter(item, mention, existing, env);
+    const result = __prospectIntelligenceTestHooks.verifyLowConfidenceProspect(
+      item,
+      mention,
+      existing,
+      prefilter,
+      { checked: false, eligible: false, role: 'unknown', confidence: 'low', evidence: [], action_override: null, matched_company_id: null, matched_deal_id: null, reason: 'not_evaluated' },
+      env,
+      { prospectAction: 'create_prospect', confidence: 0.86, provisional: true, directionUncertain: true }
+    );
+
+    expect(result.verdict).not.toBe('record_context');
+    expect(result.extraction_flags).not.toContain('internal_meeting_without_clean_anchor');
   });
 
   it('keeps sub-0.8 creates when identity and investment intent are strongly verified', async () => {

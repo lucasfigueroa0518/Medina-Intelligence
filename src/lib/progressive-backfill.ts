@@ -39,6 +39,19 @@ export interface ProgressiveBackfillWindow {
   last_error: string | null;
 }
 
+async function activeBackfillUserExists(orgId: string, userId: string, env: Env): Promise<boolean> {
+  const row = await env.D1.prepare(
+    `SELECT id
+       FROM users
+      WHERE org_id = ?
+        AND id = ?
+        AND deleted_at IS NULL
+        AND is_active = 1
+      LIMIT 1`
+  ).bind(orgId, userId).first<{ id: string }>();
+  return Boolean(row?.id);
+}
+
 async function markProgressiveBackfillFailed(
   env: Env,
   opts: {
@@ -115,6 +128,10 @@ export async function createProgressiveBackfill(
   windowSizeDays: number,
   env: Env
 ): Promise<{ created: boolean; parent_id?: string; reason?: string }> {
+  if (!(await activeBackfillUserExists(orgId, userId, env))) {
+    return { created: false, reason: `No active user ${userId} in org ${orgId}` };
+  }
+
   const existing = await env.D1.prepare(
     `SELECT id FROM progressive_backfill_jobs
        WHERE org_id = ? AND user_id = ? AND status = 'active' LIMIT 1`
@@ -191,6 +208,10 @@ export async function createProgressiveBackfillRange(
     return { created: false, reason: 'date range exceeds 730 days' };
   }
   const totalWindows = Math.ceil(totalDays / windowSizeDays);
+
+  if (!(await activeBackfillUserExists(orgId, userId, env))) {
+    return { created: false, reason: `No active user ${userId} in org ${orgId}` };
+  }
 
   const existing = await env.D1.prepare(
     `SELECT id FROM progressive_backfill_jobs

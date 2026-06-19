@@ -855,6 +855,12 @@ export async function enqueueDealEvidenceDocumentDetection(
                AND e.source_type = 'document'
                AND e.source_id = d.id
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM work_queue q
+             WHERE q.domain = 'deal_evidence_detect'
+               AND q.idempotency_key = d.org_id || ':document:' || d.id || ':' || co.id || ':deal_evidence_detect:v1'
+               AND q.status = 'completed'
+          )
        UNION
        SELECT DISTINCT d.id AS source_id, d.created_at AS created_at, co.id AS company_id
          FROM documents d
@@ -874,6 +880,12 @@ export async function enqueueDealEvidenceDocumentDetection(
              WHERE e.org_id = d.org_id
                AND e.source_type = 'document'
                AND e.source_id = d.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM work_queue q
+             WHERE q.domain = 'deal_evidence_detect'
+               AND q.idempotency_key = d.org_id || ':document:' || d.id || ':' || co.id || ':deal_evidence_detect:v1'
+               AND q.status = 'completed'
           )
        UNION
        SELECT DISTINCT d.id AS source_id, d.created_at AS created_at, co.id AS company_id
@@ -895,6 +907,12 @@ export async function enqueueDealEvidenceDocumentDetection(
              WHERE e.org_id = d.org_id
                AND e.source_type = 'document'
                AND e.source_id = d.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM work_queue q
+             WHERE q.domain = 'deal_evidence_detect'
+               AND q.idempotency_key = d.org_id || ':document:' || d.id || ':' || co.id || ':deal_evidence_detect:v1'
+               AND q.status = 'completed'
           )
      )
      SELECT source_id, company_id
@@ -953,6 +971,20 @@ export async function enqueueDealEvidenceDocumentDetection(
         candidates: rows.results.length,
         enqueued,
         days_back: daysBack,
+      },
+    });
+  } else {
+    const { reportIngestionSuccess } = await import('./ingestion-health');
+    await reportIngestionSuccess(env, {
+      orgId,
+      source: 'deal_evidence',
+      scopeType: 'org',
+      scopeId: orgId,
+      metadata: {
+        candidates: 0,
+        enqueued: 0,
+        days_back: daysBack,
+        origin: opts.origin || 'document_coverage_scan',
       },
     });
   }

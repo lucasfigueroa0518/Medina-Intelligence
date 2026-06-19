@@ -400,6 +400,9 @@ export function compactVectorizeMetadata(
 
 export function isDeterministicVectorizePayloadError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error || '');
+  if (/VECTOR_UPSERT_ERROR:\s*Status\s*\+\s*(?:429|5\d\d)\b/i.test(message)) {
+    return false;
+  }
   return (
     message.includes(VECTORIZE_PAYLOAD_QUARANTINE_ERROR) ||
     message.includes('40023') ||
