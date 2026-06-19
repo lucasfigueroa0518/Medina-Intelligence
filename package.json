@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "concurrently -n api,web -c magenta,cyan \"wrangler dev --remote\" \"npm --prefix frontend run dev\"",
     "dev:api": "wrangler dev --remote",
+    "dev:api:readonly": "wrangler dev -c wrangler.readonly.toml --port 8787 --show-interactive-dev-session=false",
     "dev:web": "npm --prefix frontend run dev",
     "deploy": "wrangler deploy",
     "deploy:pipelines": "wrangler deploy --config wrangler.pipelines.toml",

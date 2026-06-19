@@ -40,8 +40,8 @@ const config: Config = {
         },
       },
       fontFamily: {
-        sans: ['DM Sans', 'system-ui', '-apple-system', 'sans-serif'],
-        display: ['Space Grotesk', 'sans-serif'],
+        sans: ['var(--font-geist-sans)', 'system-ui', '-apple-system', 'sans-serif'],
+        display: ['var(--font-geist-sans)', 'system-ui', 'sans-serif'],
         accent: ['Exo 2', 'sans-serif'],
         mono: ['JetBrains Mono', 'monospace'],
       },

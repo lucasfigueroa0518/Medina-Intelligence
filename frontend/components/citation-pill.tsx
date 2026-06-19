@@ -29,7 +29,7 @@ export function CitationPill({ source, sourceId, variant = 'inline', onClick }: 
       <span
         title="Source no longer available"
         className="inline-flex items-center gap-1 px-1.5 py-[1px] mx-[2px] rounded-md bg-gray-500/15 border border-gray-500/25 text-gray-400 text-[10px] font-semibold leading-[1.4] tracking-tight align-baseline cursor-help whitespace-nowrap"
-        style={{ verticalAlign: 'baseline', fontFamily: "'DM Sans', sans-serif" }}
+        style={{ verticalAlign: 'baseline', fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
       >
         <HelpCircle className="w-2.5 h-2.5 flex-shrink-0" strokeWidth={2.5} />
         <span>{sourceId}</span>
@@ -48,7 +48,7 @@ export function CitationPill({ source, sourceId, variant = 'inline', onClick }: 
         onClick={() => onClick?.(source)}
         title={tooltip}
         className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-white/[0.03] border border-white/10 text-xs text-text-secondary hover:bg-white/[0.06] hover:border-white/20 hover:text-text-primary transition-all max-w-[280px]"
-        style={{ fontFamily: "'DM Sans', sans-serif" }}
+        style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
       >
         <span className="text-purple-400 font-mono text-[10px] font-bold flex-shrink-0">{source.id}</span>
         <Icon className="w-3 h-3 flex-shrink-0 text-text-muted" />
@@ -65,7 +65,7 @@ export function CitationPill({ source, sourceId, variant = 'inline', onClick }: 
       onClick={() => onClick?.(source)}
       title={tooltip}
       className="citation-pill inline-flex items-center gap-1 px-1.5 py-[1px] mx-[2px] rounded-md bg-purple-500/15 border border-purple-500/25 text-purple-300 text-[10px] font-semibold leading-[1.4] tracking-tight hover:bg-purple-500/25 hover:border-purple-500/40 hover:text-purple-200 transition-all align-baseline cursor-pointer whitespace-nowrap"
-      style={{ verticalAlign: 'baseline', fontFamily: "'DM Sans', sans-serif" }}
+      style={{ verticalAlign: 'baseline', fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
     >
       <Icon className="w-2.5 h-2.5 flex-shrink-0" strokeWidth={2.5} />
       <span>{source.id}</span>

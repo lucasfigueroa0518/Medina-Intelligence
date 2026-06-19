@@ -44,7 +44,7 @@ export function UploadPreviewModal({
               <FileText size={18} className="text-purple-300" />
             </div>
             <div className="min-w-0">
-              <div className="text-sm text-text-primary font-medium truncate" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+              <div className="text-sm text-text-primary font-medium truncate" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
                 {upload.filename}
               </div>
               <div className="text-[11px] text-text-muted">
@@ -66,7 +66,7 @@ export function UploadPreviewModal({
                 <a
                   href={`/documents/${upload.saved_document_id}`}
                   className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-text-secondary hover:bg-white/5 hover:text-text-primary transition-colors"
-                  style={{ fontFamily: "'DM Sans', sans-serif" }}
+                  style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
                 >
                   <ExternalLink size={12} /> Open
                 </a>

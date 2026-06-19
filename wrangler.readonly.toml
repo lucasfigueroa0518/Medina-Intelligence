@@ -1,0 +1,27 @@
+name = "medina-ventures-api-readonly"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+find_additional_modules = true
+[[rules]]
+type = "ESModule"
+globs = ["lib/pdfjs-vendor/**/*.mjs"]
+fallthrough = true
+
+[vars]
+ENVIRONMENT = "production"
+CLOUDFLARE_ACCOUNT_ID = "ad54df3fe69483d2c0b69be1b72864e8"
+CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
+GEMINI_MAX_RPM = "500"
+ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
+FRONTEND_URL = "http://127.0.0.1:3000"
+INTERNAL_DOMAINS = "medinavc.com,medinacapital.com"
+DECK_RENDERER_ENABLED = "false"
+OUTLOOK_AUTH_MODE = "app_only"
+
+[[d1_databases]]
+binding = "D1"
+database_name = "medina-ventures-db"
+database_id = "4bb3705c-c471-43f7-b42f-b44ab62f5dab"
+remote = true

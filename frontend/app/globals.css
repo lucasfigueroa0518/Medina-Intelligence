@@ -9,13 +9,13 @@
 html, body {
   background: #09090B;
   color: #FAFAFA;
-  font-family: var(--font-dm-sans), system-ui, -apple-system, sans-serif;
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
-/* Display font: Space Grotesk Bold (headers, names, section titles) */
+/* Display font: Geist Sans Bold (headers, names, section titles) */
 .font-display {
-  font-family: var(--font-space-grotesk), sans-serif !important;
+  font-family: var(--font-geist-sans), system-ui, sans-serif !important;
   font-weight: 700 !important;
 }
 

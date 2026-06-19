@@ -114,7 +114,7 @@ function SourceHeaderAndBody({ source, onClose }: { source: CitationSource; onCl
               <div className="text-[10px] uppercase tracking-wider text-text-muted font-semibold" style={{ fontFamily: "'Exo 2', sans-serif" }}>
                 {TYPE_LABEL[source.type]} · Source [{source.id}]
               </div>
-              <div className="text-sm text-text-primary font-medium truncate" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+              <div className="text-sm text-text-primary font-medium truncate" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
                 {source.title || 'Untitled'}
               </div>
             </div>
@@ -219,7 +219,7 @@ function NewsBody({ source }: { source: CitationSource }) {
           // eslint-disable-next-line @next/next/no-img-element
           <img src={favicon} alt="" className="w-4 h-4 rounded-sm" />
         )}
-        <div className="text-xs text-text-secondary" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+        <div className="text-xs text-text-secondary" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
           {source.subtitle || 'News'}{domain ? ` · ${domain}` : ''}
         </div>
       </div>
@@ -282,13 +282,13 @@ function MetaRow({ label, value, href }: { label: string; value: string; href?: 
         <a
           href={href}
           className="text-sm text-purple-300 hover:text-purple-200 underline-offset-2 hover:underline inline-flex items-center gap-1"
-          style={{ fontFamily: "'DM Sans', sans-serif" }}
+          style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
         >
           {value}
           <ArrowUpRight size={12} />
         </a>
       ) : (
-        <div className="text-sm text-text-secondary break-words" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+        <div className="text-sm text-text-secondary break-words" style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}>
           {value}
         </div>
       )}
@@ -305,7 +305,7 @@ function Excerpt({ text, label = 'Excerpt' }: { text?: string; label?: string })
       </div>
       <blockquote
         className="text-sm text-text-secondary leading-relaxed border-l-2 border-purple-500/40 pl-3"
-        style={{ fontFamily: "'DM Sans', sans-serif" }}
+        style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
       >
         {text}
       </blockquote>
@@ -322,7 +322,7 @@ function PrimaryAction({ href, label, external }: { href?: string; label: string
       target={external ? '_blank' : undefined}
       rel={external ? 'noopener noreferrer' : undefined}
       className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg bg-purple-500/10 hover:bg-purple-500/15 text-purple-300 transition-colors text-sm mt-2"
-      style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 500 }}
+      style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 500 }}
     >
       <span>{label}</span>
       <Icon size={14} />

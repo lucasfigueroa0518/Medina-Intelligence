@@ -20,8 +20,8 @@ function citationUrlTransform(url: string, _key: string, _node: any): string {
   return defaultUrlTransform(url);
 }
 
-const HEADER_STYLE: React.CSSProperties = { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700 };
-const BODY_STYLE: React.CSSProperties = { fontFamily: "'DM Sans', sans-serif", fontWeight: 400 };
+const HEADER_STYLE: React.CSSProperties = { fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 700 };
+const BODY_STYLE: React.CSSProperties = { fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 400 };
 
 function CodeBlock({ className, children }: { className?: string; children: React.ReactNode }) {
   const [copied, setCopied] = React.useState(false);

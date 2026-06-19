@@ -8,6 +8,7 @@ import type { UserProfile } from '@/lib/api';
 const TOKEN_KEY = 'auth_token';
 const PUBLIC_PATHS = ['/login', '/signup', '/mfa', '/auth'];
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL ?? '';
+const AUTH_CHECK_TIMEOUT_MS = 8000;
 
 type GuardState = 'loading' | 'authenticated' | 'unauthenticated' | 'unverified';
 
@@ -59,9 +60,9 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     }
 
     try {
-      const res = await fetch(`${API_ORIGIN}/api/auth/me`, {
+      const res = await fetchWithTimeout(`${API_ORIGIN}/api/auth/me`, {
         headers: { Authorization: `Bearer ${token}` },
-      });
+      }, AUTH_CHECK_TIMEOUT_MS);
 
       if (res.status === 401) {
         localStorage.removeItem(TOKEN_KEY);
@@ -137,7 +138,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     };
   }, [checkAuth, state, user, warnings]);
 
-  if (state === 'loading') return null;
+  if (state === 'loading') return <AuthLoadingScreen />;
 
   if (state === 'unauthenticated') {
     if (!isPublicPath) return null;
@@ -190,6 +191,34 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     <AuthSessionContext.Provider value={sessionValue}>
       {children}
     </AuthSessionContext.Provider>
+  );
+}
+
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function AuthLoadingScreen() {
+  return (
+    <div className="min-h-screen bg-bg-root flex items-center justify-center p-4">
+      <div className="flex flex-col items-center gap-4">
+        <MedinaLogo size={52} />
+        <div className="card-panel flex items-center gap-3 px-4 py-3 text-sm text-text-secondary">
+          <span className="h-2 w-2 rounded-full bg-accent-magenta animate-pulse" aria-hidden="true" />
+          <span>Loading Medina...</span>
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -152,7 +152,7 @@ export function DocumentActions({
     : iconOnly
       ? 'inline-flex h-8 w-8 items-center justify-center rounded-lg border border-border text-text-muted hover:text-text-primary hover:bg-white/[0.05] transition-colors disabled:opacity-35'
       : 'inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-xs text-text-muted hover:text-text-primary hover:bg-white/[0.04] transition-colors disabled:opacity-35';
-  const panelStyle = panel ? { fontFamily: "'DM Sans', sans-serif", fontWeight: 500 } : undefined;
+  const panelStyle = panel ? { fontFamily: "var(--font-geist-sans), system-ui, sans-serif", fontWeight: 500 } : undefined;
 
   return (
     <>

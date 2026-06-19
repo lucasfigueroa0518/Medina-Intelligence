@@ -157,7 +157,7 @@ export function PendingUploadPill({
           ? 'border-semantic-error/35 bg-semantic-error/10 text-semantic-error'
           : 'border-white/10 bg-[#18181d] text-text-primary'
       }`}
-      style={{ fontFamily: "'DM Sans', sans-serif" }}
+      style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
     >
       <AttachmentThumb uploadType={uploadType} previewUrl={localImageUrl} loading={uploading} failed={Boolean(failed)} />
       <div className="min-w-0 flex-1">
@@ -218,7 +218,7 @@ export function SentUploadPill({
           ? 'border-white/10 bg-[#18181d] text-text-secondary hover:border-white/18 hover:bg-[#202026] hover:text-text-primary'
           : 'border-white/5 bg-white/[0.025] text-text-muted opacity-75 hover:bg-white/[0.04]'
       }`}
-      style={{ fontFamily: "'DM Sans', sans-serif" }}
+      style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
     >
       <AttachmentThumb uploadType={upload.upload_type} previewUrl={imageUrl} compact />
       <div className="min-w-0 flex-1">

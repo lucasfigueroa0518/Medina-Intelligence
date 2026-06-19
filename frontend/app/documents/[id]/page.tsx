@@ -175,7 +175,7 @@ export default function DocumentDetailPage() {
         <div className="min-w-0 flex-1">
           <h1
             className="text-xl text-text-primary font-medium truncate"
-            style={{ fontFamily: "'DM Sans', sans-serif" }}
+            style={{ fontFamily: "var(--font-geist-sans), system-ui, sans-serif" }}
           >
             {doc.title || doc.file_name || 'Untitled document'}
           </h1>
