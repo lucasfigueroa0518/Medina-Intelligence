@@ -1,3 +1,5 @@
+import { fireflyDeliveryKey } from './firefly-webhook-deliveries';
+
 // TRD §5.2 — webhook idempotency key extraction
 export function extractIdempotencyKey(
   source: string,
@@ -7,9 +9,7 @@ export function extractIdempotencyKey(
     const data = JSON.parse(rawPayload);
     switch (source) {
       case 'firefly':
-        return data.event_id || data.meeting_id
-          ? `firefly:${data.event_id || data.meeting_id}`
-          : null;
+        return fireflyDeliveryKey(rawPayload);
       case 'slack':
         return data.event_id ? `slack:${data.event_id}` : null;
       default:

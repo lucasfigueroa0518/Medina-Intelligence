@@ -45,6 +45,7 @@ ALLOWED_ORIGINS = "https://medinaventures.ai,https://www.medinaventures.ai,http:
 FRONTEND_URL = "https://medinaventures.ai"
 INTERNAL_DOMAINS = "medinavc.com,medinacapital.com"
 OUTLOOK_AUTH_MODE = "app_only"
+FIREFLIES_PIPELINE_VERSION = "fireflies-hardening-self-repair-v1"
 DECK_RENDERER_ENABLED = "true"
 DECK_RENDERER_PROVIDER = "cloudflare"
 
@@ -140,6 +141,10 @@ crons = [
   "0 * * * *",
   "* * * * *",
 ]
+
+[[services]]
+binding = "API"
+service = "medina-ventures-api"
 
 # --- Queues ---
 #

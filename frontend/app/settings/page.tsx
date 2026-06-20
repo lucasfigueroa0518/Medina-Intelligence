@@ -1054,10 +1054,9 @@ function ProgressiveDateRangeModal({
 // selected member's credential state drives the controls so Tony's key is never
 // implied to work for Alvaro.
 
-// Phase 4 1c (2026-05-04): dropped 180 — backend MAX_BACKFILL_DAYS is now
-// 120 (src/lib/firefly-progressive-backfill.ts); a 180-day request would
-// be rejected. Custom Date Range is the escape hatch for >90-day windows
-// up to the 120-day cap.
+// Backend MAX_BACKFILL_DAYS is 190 so six calendar months fits safely.
+// The standard buttons stay short; six-month repair uses the rebuild API with
+// an explicit date range so it can report missing credentials separately.
 const FIREFLY_PROGRESSIVE_DAYS_OPTIONS: Array<30 | 60 | 90> = [30, 60, 90];
 
 type FireflyCredentialStatus = {
@@ -1079,6 +1078,18 @@ function FireflyHistoricalBackfillSection() {
   const [progress, setProgress] = React.useState<{
     parent: any | null;
     windows: any[];
+  } | null>(null);
+  const [coverage, setCoverage] = React.useState<{
+    coverage: {
+      virtual_outlook_events: number;
+      virtual_outlook_with_transcript: number;
+      fireflies_source_transcripts: number;
+      transcript_event_links: number;
+      transcript_events: number;
+      embedded_transcript_events: number;
+    };
+    missing_credentials: Array<Record<string, unknown>>;
+    recent_failures: Array<Record<string, unknown>>;
   } | null>(null);
   const [targetCredStatus, setTargetCredStatus] = React.useState<FireflyCredentialStatus | null>(null);
   const [days, setDays] = React.useState<30 | 60 | 90>(90);
@@ -1126,6 +1137,22 @@ function FireflyHistoricalBackfillSection() {
   }, [selectedUserId]);
 
   React.useEffect(() => { fetchProgress(); }, [fetchProgress]);
+
+  const fetchCoverage = React.useCallback(async () => {
+    if (!selectedUserId || !isOwner) return;
+    try {
+      const r = await api.getFireflyTranscriptCoverage({ months: 6, user_id: selectedUserId });
+      setCoverage({
+        coverage: r.coverage,
+        missing_credentials: r.missing_credentials,
+        recent_failures: r.recent_failures,
+      });
+    } catch {
+      setCoverage(null);
+    }
+  }, [selectedUserId, isOwner]);
+
+  React.useEffect(() => { fetchCoverage(); }, [fetchCoverage]);
 
   // 5s poll while active; 30s poll while idle so the card refreshes if a
   // backfill is started from another tab / curl.
@@ -1222,6 +1249,39 @@ function FireflyHistoricalBackfillSection() {
       fetchProgress();
     } catch (e: any) {
       setToast(`Cancel failed: ${e?.message || 'unknown'}`);
+    }
+    setLoading(false);
+  }
+
+  async function startSixMonthRepair() {
+    if (!selectedUserId) return;
+    setLoading(true);
+    try {
+      const end = new Date();
+      const start = new Date(Date.UTC(
+        end.getUTCFullYear(),
+        end.getUTCMonth() - 6,
+        end.getUTCDate(),
+        end.getUTCHours(),
+        end.getUTCMinutes(),
+        end.getUTCSeconds(),
+        end.getUTCMilliseconds()
+      ));
+      const r = await api.rebuildFireflyTranscripts({
+        user_ids: [selectedUserId],
+        start_date: start.toISOString(),
+        end_date: end.toISOString(),
+        repair_embeddings: true,
+        repair_prospect_signals: true,
+      });
+      const first = r.results[0] || {};
+      setToast(first.created === false
+        ? `Repair not started: ${String(first.reason || 'blocked')}`
+        : 'Six-month transcript repair started');
+      await fetchProgress();
+      await fetchCoverage();
+    } catch (e: any) {
+      setToast(`Repair failed: ${e?.message || 'unknown error'}`);
     }
     setLoading(false);
   }
@@ -1471,7 +1531,41 @@ function FireflyHistoricalBackfillSection() {
             >
               <Calendar size={13} /> Custom Date Range
             </button>
+            {isOwner && (
+              <button
+                onClick={startSixMonthRepair}
+                disabled={loading || !selectedHasCredential}
+                className="btn-secondary text-xs py-1.5 flex items-center gap-2"
+              >
+                <Mic size={13} /> Last 6 months
+              </button>
+            )}
           </div>
+        </div>
+      )}
+
+      {isOwner && coverage && (
+        <div className="mt-4 grid gap-3 sm:grid-cols-4">
+          <BackfillStat
+            label="Virtual Outlook"
+            value={`${coverage.coverage.virtual_outlook_with_transcript.toLocaleString()} / ${coverage.coverage.virtual_outlook_events.toLocaleString()}`}
+            hint="Transcript-bearing virtual Outlook events over the last 6 months"
+          />
+          <BackfillStat
+            label="Fireflies source"
+            value={coverage.coverage.fireflies_source_transcripts.toLocaleString()}
+            hint="Transcript IDs staged in the rebuild ledger"
+          />
+          <BackfillStat
+            label="Links"
+            value={coverage.coverage.transcript_event_links.toLocaleString()}
+            hint="Fireflies transcript to Outlook event links"
+          />
+          <BackfillStat
+            label="Embedded"
+            value={`${coverage.coverage.embedded_transcript_events.toLocaleString()} / ${coverage.coverage.transcript_events.toLocaleString()}`}
+            hint="Transcript events present in vector_entity_index"
+          />
         </div>
       )}
 
@@ -1682,11 +1776,10 @@ function FireflyTriggerModal({
 
 // Phase 4 1c (2026-05-04): API key input removed — backend resolves the
 // persistent credential row from user_firefly_credentials.
-// Phase 4 follow-up (2026-05-04): mirrors backend MAX_BACKFILL_DAYS in
-// src/lib/firefly-progressive-backfill.ts. Keep these in sync — the
-// backend cap is the source of truth; this client constant exists so
-// the UI can clamp before submit instead of surfacing a generic 409.
-const FIREFLY_MAX_BACKFILL_DAYS = 120;
+// Mirrors backend MAX_BACKFILL_DAYS in src/lib/firefly-progressive-backfill.ts.
+// Keep these in sync — the backend cap is the source of truth; this client
+// constant exists so the UI can clamp before submit.
+const FIREFLY_MAX_BACKFILL_DAYS = 190;
 
 // Auto-clamp helpers. Both inputs use yyyy-mm-dd strings (the native
 // shape of <input type="date">), so we work in that space without going
@@ -1721,7 +1814,7 @@ function FireflyDateRangeModal({
   const [error, setError] = React.useState<string | null>(null);
   const [clampedToast, setClampedToast] = React.useState<string | null>(null);
 
-  // Phase 4 follow-up: mirror backend's 120-day cap as an HTML5 input
+  // Mirror backend's range cap as an HTML5 input
   // constraint AND an explicit auto-clamp on change. The HTML max/min
   // attributes give immediate visual blocking on the date picker; the
   // useEffect-style onChange handlers handle paste/keyboard entry that
@@ -1738,7 +1831,7 @@ function FireflyDateRangeModal({
   function onStartDateChange(next: string) {
     setStartDate(next);
     // If existing end_date now puts us beyond the cap, pull end_date
-    // back to start + 120 days. User sees the clamp visibly + toast.
+    // back to start + max days. User sees the clamp visibly + toast.
     if (next && endDate && spanDays(next, endDate) > FIREFLY_MAX_BACKFILL_DAYS) {
       const clamped = shiftDateString(next, FIREFLY_MAX_BACKFILL_DAYS);
       setEndDate(clamped);

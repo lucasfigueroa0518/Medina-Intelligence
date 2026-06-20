@@ -23,6 +23,7 @@ import { classifyDocument } from './document-intelligence';
 import { classifyByFilename } from './document-filename-classifier';
 import { chunkEmbedAndPersistAll } from './embedding';
 import { enqueueDocumentEmbeddingRepair } from './document-embedding';
+import { enqueueIngestionTreatment } from './ingestion-treatment';
 
 // Wave 5 Phase E canonicalized to 4 active values. Legacy 'upload' and
 // 'manual' strings are migrated to canonical names by 0068 backfill.
@@ -155,6 +156,28 @@ async function enqueueEmbeddingRepairBestEffort(
     await enqueueDocumentEmbeddingRepair(env, orgId, documentId, { priority: 30 });
   } catch (e: any) {
     console.error(`[persistDocument:${context}] failed to enqueue embed repair for ${documentId}:`, e?.message || e);
+  }
+}
+
+async function enqueueDocumentTreatmentBestEffort(
+  env: Env,
+  orgId: string,
+  documentId: string,
+  sourceKind: string,
+  origin: string
+): Promise<void> {
+  try {
+    await enqueueIngestionTreatment(env, {
+      orgId,
+      sourceTable: 'documents',
+      sourceId: documentId,
+      sourceKind,
+      ingestionMode: 'live',
+      origin,
+      priority: 20,
+    });
+  } catch (e: any) {
+    console.error(`[persistDocument:${origin}] failed to enqueue ingestion treatment for ${documentId}:`, e?.message || e);
   }
 }
 
@@ -294,6 +317,13 @@ export async function persistDocument(
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
               WHERE id = ?`
           ).bind(finalType, text.slice(0, 500), existing.id).run();
+          await enqueueDocumentTreatmentBestEffort(
+            env,
+            input.orgId,
+            existing.id,
+            finalType,
+            `persist_document:${input.source}:dedup_finalize`
+          );
         },
       };
     }
@@ -535,6 +565,13 @@ export async function persistDocument(
         createdAt: now,
         primaryEntityId: firstLinkOf('deal') || firstLinkOf('company') || firstLinkOf('contact') || documentId,
       }, env);
+      await enqueueDocumentTreatmentBestEffort(
+        env,
+        input.orgId,
+        documentId,
+        finalType,
+        `persist_document:${sourceValue}`
+      );
     } catch (e: any) {
       const msg = String(e?.message || e).slice(0, 500);
       console.error(`[persistDocument:finalize] failed for ${documentId}: ${msg}`);

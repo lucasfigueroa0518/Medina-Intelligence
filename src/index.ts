@@ -146,7 +146,142 @@ async function handleRequest(
     return new Response(null, { status: 204 });
   }
 
-  if (path === '/health') return jsonResponse({ ok: true, env: env.ENVIRONMENT });
+  if (path === '/health') return jsonResponse({
+    ok: true,
+    env: env.ENVIRONMENT,
+    build: {
+      git_sha: env.MEDINA_BUILD_SHA || env.MARTY_RUNTIME_GIT_SHA || 'unknown',
+      fireflies_pipeline_version: env.FIREFLIES_PIPELINE_VERSION || 'unknown',
+    },
+  });
+
+  if (path === '/internal/firefly-credential' && method === 'POST') {
+    return FireflyCredentials.getInternalFireflyCredential(request, env);
+  }
+
+  if (path === '/internal/work-queue-tick' && method === 'POST') {
+    const expected = env.PIPELINES_INTERNAL_TOKEN;
+    const supplied = request.headers.get('X-Medina-Internal-Token');
+    if (!expected || supplied !== expected) {
+      return errorResponse('AUTH_FORBIDDEN', 403, 'internal token required');
+    }
+
+    const { processWorkQueueTick } = await import('./lib/work-queue-driver');
+    const result = await processWorkQueueTick(env);
+    return jsonResponse({ ok: true, result });
+  }
+
+  if (path === '/internal/firefly-window-tick' && method === 'POST') {
+    const expected = env.PIPELINES_INTERNAL_TOKEN;
+    const supplied = request.headers.get('X-Medina-Internal-Token');
+    if (!expected || supplied !== expected) {
+      return errorResponse('AUTH_FORBIDDEN', 403, 'internal token required');
+    }
+
+    const requestedLimit = Number(url.searchParams.get('limit') || '2');
+    const limit = Math.min(Math.max(Math.floor(requestedLimit) || 2, 1), 6);
+    const { claimNextBatch, getOpenCircuits, sweepStaleClaims } = await import('./lib/work-queue');
+    const { processClaimedWorkItem } = await import('./lib/work-queue-driver');
+    const { fireflyWindowHandler } = await import('./lib/work-queue-handlers/firefly-window');
+    const swept = await sweepStaleClaims(env);
+    const openCircuits = await getOpenCircuits(env).catch(() => []);
+    const claimed = await claimNextBatch(env, 'firefly_window', limit, openCircuits);
+    const results = await Promise.all(
+      claimed.map(item => processClaimedWorkItem(env, fireflyWindowHandler, item))
+    );
+    return jsonResponse({
+      ok: true,
+      swept,
+      open_circuits: openCircuits,
+      claimed: claimed.length,
+      completed: results.filter(r => r.completed).length,
+      failed: results.filter(r => r.failed).length,
+      errors: results.map((r, i) => r.error ? {
+        work_queue_id: claimed[i]?.id ?? null,
+        error: r.error,
+      } : null).filter(Boolean),
+    });
+  }
+
+  if (path === '/internal/firefly-window-repair' && method === 'POST') {
+    const expected = env.PIPELINES_INTERNAL_TOKEN;
+    const supplied = request.headers.get('X-Medina-Internal-Token');
+    if (!expected || supplied !== expected) {
+      return errorResponse('AUTH_FORBIDDEN', 403, 'internal token required');
+    }
+
+    const body = await request.json().catch(() => null) as {
+      parent_id?: string;
+      window_index?: number;
+      initial_skip?: number;
+    } | null;
+    const parentId = body?.parent_id?.trim();
+    const windowIndex = Number(body?.window_index);
+    const initialSkip = Math.max(0, Math.floor(Number(body?.initial_skip) || 0));
+    if (!parentId || !Number.isFinite(windowIndex)) {
+      return errorResponse('VALIDATION_ERROR', 400, 'parent_id and window_index are required');
+    }
+
+    const window = await env.D1.prepare(
+      `SELECT j.org_id, j.user_id, w.start_date, w.end_date
+         FROM firefly_progressive_backfill_jobs j
+         JOIN firefly_progressive_backfill_windows w
+           ON w.parent_id = j.id
+        WHERE j.id = ? AND w.window_index = ?`
+    ).bind(parentId, windowIndex).first<{
+      org_id: string;
+      user_id: string;
+      start_date: string;
+      end_date: string;
+    }>();
+    if (!window) {
+      return errorResponse('NOT_FOUND', 404, 'firefly window not found');
+    }
+
+    const { getFireflyKey } = await import('./lib/firefly-credentials');
+    const apiKey = await getFireflyKey(window.user_id, env);
+    if (!apiKey) {
+      return errorResponse('NOT_FOUND', 404, 'no usable Fireflies credential');
+    }
+
+    const { runFireflyWindowBackfill } = await import('./lib/firefly-ingest');
+    const result = await runFireflyWindowBackfill({
+      userId: window.user_id,
+      orgId: window.org_id,
+      fireflyApiKey: apiKey,
+      startDate: window.start_date,
+      endDate: window.end_date,
+      initialSkip,
+      progressiveWindowId: `repair:${parentId}:${windowIndex}:${initialSkip}`,
+      runId: parentId,
+    }, env);
+
+    await env.D1.prepare(
+      `UPDATE firefly_transcript_runs
+          SET source_transcripts = source_transcripts + ?,
+              r2_staged = r2_staged + ?,
+              linked_events = linked_events + ?,
+              standalone_transcripts = standalone_transcripts + ?,
+              embedding_queued = embedding_queued + ?,
+              prospect_queued = prospect_queued + ?,
+              error_count = error_count + ?,
+              last_error = COALESCE(?, last_error),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(
+      result.total_processed,
+      result.r2_staged,
+      result.linked_events,
+      result.standalone_transcripts,
+      result.embedding_queued,
+      result.prospect_queued,
+      result.failed,
+      result.reason || null,
+      parentId
+    ).run();
+
+    return jsonResponse({ ok: true, result });
+  }
 
 if (path === '/webhooks/firefly' && method === 'POST') {
     return Webhooks.receiveFireflyWebhook(request, env);
@@ -746,6 +881,30 @@ async function routeAuthenticated(
       const { handleReconcileOrphanedFireflies } = await import('./handlers/firefly-reconcile');
       return handleReconcileOrphanedFireflies(request, ctx, env);
     }
+    if (path === '/api/admin/firefly-transcript-coverage' && method === 'GET') {
+      const { handleFireflyTranscriptCoverage } = await import('./handlers/firefly-reconcile');
+      return handleFireflyTranscriptCoverage(request, ctx, env);
+    }
+    if (path === '/api/admin/firefly-transcript-rebuild' && method === 'POST') {
+      const { handleFireflyTranscriptRebuild } = await import('./handlers/firefly-reconcile');
+      return handleFireflyTranscriptRebuild(request, ctx, env);
+    }
+    if (path === '/api/admin/firefly-transcript-source-verify' && method === 'POST') {
+      const { handleFireflyTranscriptSourceVerify } = await import('./handlers/firefly-reconcile');
+      return handleFireflyTranscriptSourceVerify(request, ctx, env);
+    }
+    if (path === '/api/admin/firefly-transcript-targeted-repair' && method === 'POST') {
+      const { handleFireflyTranscriptTargetedRepair } = await import('./handlers/firefly-reconcile');
+      return handleFireflyTranscriptTargetedRepair(request, ctx, env);
+    }
+    if (path === '/api/admin/ingestion-treatment-coverage' && method === 'GET') {
+      const { handleIngestionTreatmentCoverage } = await import('./handlers/ingestion-treatment');
+      return handleIngestionTreatmentCoverage(request, ctx, env);
+    }
+    if (path === '/api/admin/ingestion-treatment-repair' && method === 'POST') {
+      const { handleIngestionTreatmentRepair } = await import('./handlers/ingestion-treatment');
+      return handleIngestionTreatmentRepair(request, ctx, env);
+    }
     if (path === '/api/admin/diagnose-calendar-sync' && method === 'POST') {
       const { handleDiagnoseCalendarSync } = await import('./handlers/firefly-reconcile');
       return handleDiagnoseCalendarSync(request, ctx, env);
@@ -1072,6 +1231,27 @@ export async function handleScheduled(
             }
           } catch (e) {
             console.error(`hourly self-heal: scanAndRepairRagV2Coverage failed for ${org.id}:`, e);
+          }
+        })());
+        // Hourly Fireflies recent transcript safety net. This is deliberately
+        // bounded to the last 7 days and only enqueues missing Fireflies IDs
+        // through firefly_transcript_hydrate, so it cannot become a broad
+        // database replay.
+        ctxExec.waitUntil((async () => {
+          const key = `firefly_recent_sweep:${org.id}:${new Date(event.scheduledTime ?? Date.now()).toISOString().slice(0, 13)}`;
+          try {
+            const seen = await env.KV.get(key);
+            if (seen) return;
+            await env.KV.put(key, '1', { expirationTtl: 7200 });
+            const { runFireflyRecentSweeper } = await import('./lib/firefly-recent-sweeper');
+            const result = await runFireflyRecentSweeper(org.id, env, { daysBack: 7, maxPagesPerUser: 2 });
+            if (result.enqueued > 0 || result.errors.length > 0) {
+              console.warn(
+                `[firefly-recent-sweep] org=${org.id} users=${result.users_scanned} source=${result.source_transcripts} missing=${result.missing_transcripts} enqueued=${result.enqueued} errors=${result.errors.length}`
+              );
+            }
+          } catch (e) {
+            console.error(`hourly self-heal: runFireflyRecentSweeper failed for ${org.id}:`, e);
           }
         })());
         // deal_intelligence batch refresh — recompute the oldest 50

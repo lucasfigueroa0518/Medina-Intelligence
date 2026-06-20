@@ -265,18 +265,51 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
           retries: { limit: 1, delay: '10 seconds' },
           timeout: '180 seconds',
         },
-        async (): Promise<{ slack: ClassifiableItem[]; failures: Array<{ source: string; error: string }> }> => {
+        async (): Promise<{
+          slack: ClassifiableItem[];
+          failures: Array<{ source: string; error: string }>;
+          telemetry: {
+            channels_visible: number;
+            channels_scanned: number;
+            history_calls_ok: number;
+            messages_seen: number;
+            messages_collected: number;
+            channels_with_errors: number;
+            budget_exhausted: boolean;
+          };
+        }> => {
           try {
             const result = await fetchSlackMessages(org_id!, this.env);
             const failures = result.errors.map(e => ({
               source: `slack:#${e.channel_name}`,
               error: e.error,
             }));
-            return { slack: result.messages, failures };
+            return {
+              slack: result.messages,
+              failures,
+              telemetry: {
+                channels_visible: result.channels_visible,
+                channels_scanned: result.channels_scanned,
+                history_calls_ok: result.history_calls_ok,
+                messages_seen: result.messages_seen,
+                messages_collected: result.messages.length,
+                channels_with_errors: result.channels_with_errors,
+                budget_exhausted: result.budget_exhausted,
+              },
+            };
           } catch (e: any) {
             return {
               slack: [],
               failures: [{ source: 'slack', error: errMessage(e) }],
+              telemetry: {
+                channels_visible: 0,
+                channels_scanned: 0,
+                history_calls_ok: 0,
+                messages_seen: 0,
+                messages_collected: 0,
+                channels_with_errors: 1,
+                budget_exhausted: false,
+              },
             };
           }
         }
@@ -384,6 +417,13 @@ export class IngestionWorkflow extends WorkflowEntrypoint<Env, IngestionParams> 
         const baseSummary = {
           fetched_outlook: sourceData.outlook.length,
           fetched_slack: sourceData.slack.length,
+          slack_channels_visible: slackResult.telemetry.channels_visible,
+          slack_channels_scanned: slackResult.telemetry.channels_scanned,
+          slack_history_calls_ok: slackResult.telemetry.history_calls_ok,
+          slack_messages_seen: slackResult.telemetry.messages_seen,
+          slack_messages_collected: slackResult.telemetry.messages_collected,
+          slack_channels_with_errors: slackResult.telemetry.channels_with_errors,
+          slack_budget_exhausted: slackResult.telemetry.budget_exhausted,
           fetched_news: sourceData.news.length,
           fetched_calendar: sourceData.calendar_events_upserted,
           source_failures: sourceData.failures,

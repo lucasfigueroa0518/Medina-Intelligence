@@ -78,6 +78,11 @@ export interface UserFacingIngestionWarning {
 const REPAIR_PADDING_DAYS = 14;
 const AUTO_REPAIR_COOLDOWN_MS = 15 * 60 * 1000;
 const RAG_V2_FRESHNESS_SLO_MS = 15 * 60 * 1000;
+const FIREFLY_SILENCE_MS = 48 * 60 * 60 * 1000;
+const FIREFLY_SELF_REPAIR_DAYS = 7;
+const FIREFLY_PERSISTENT_REPAIR_DAYS = 10;
+const SLACK_MESSAGE_STALE_MS = 48 * 60 * 60 * 1000;
+const SLACK_SELF_REPAIR_DAYS = 7;
 
 function scopeId(input: string | null | undefined): string {
   return input || '';
@@ -161,12 +166,144 @@ async function isRepairBlockedByHumanAction(
 function workQueueSource(domain: string): IngestionSource {
   if (domain === 'calendar_refresh') return 'calendar';
   if (domain === 'firefly_window') return 'firefly';
+  if (domain === 'firefly_transcript_hydrate') return 'firefly';
   if (domain === 'embed_retry') return 'embedding';
   if (domain === 'attachment_backfill') return 'outlook_email';
   if (domain === 'deal_evidence_detect') return 'deal_evidence';
   if (domain === 'rag_reindex_v2') return 'rag_v2';
   if (domain === 'slack_channel_backfill') return 'slack';
   return 'work_queue';
+}
+
+async function scanFireflySilence(
+  orgId: string,
+  env: Env
+): Promise<number> {
+  const credentialed = await env.D1.prepare(
+    `SELECT u.id AS user_id, u.email, c.created_at, c.updated_at, c.last_used_at
+       FROM user_firefly_credentials c
+       JOIN users u ON u.id = c.user_id
+      WHERE u.org_id = ?
+        AND u.deleted_at IS NULL
+        AND COALESCE(u.is_active, 1) = 1`
+  ).bind(orgId).all<{
+    user_id: string;
+    email: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+    last_used_at: string | null;
+  }>();
+
+  let incidents = 0;
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  for (const user of credentialed.results) {
+    const [latestItem, latestWebhook, activeJob, hydrateActive, existingIncident, deadLetters] = await Promise.all([
+      env.D1.prepare(
+        `SELECT MAX(COALESCE(updated_at, created_at)) AS last_item_at,
+                COUNT(*) AS total_items
+           FROM firefly_transcript_items
+          WHERE org_id = ? AND user_id = ?`
+      ).bind(orgId, user.user_id).first<{ last_item_at: string | null; total_items: number }>(),
+      env.D1.prepare(
+        `SELECT MAX(received_at) AS last_webhook_at,
+                MAX(CASE WHEN status = 'hydrated' THEN completed_at ELSE NULL END) AS last_hydrated_at
+           FROM firefly_webhook_deliveries
+          WHERE org_id = ?
+            AND (selected_user_id = ? OR selected_user_id IS NULL)`
+      ).bind(orgId, user.user_id).first<{ last_webhook_at: string | null; last_hydrated_at: string | null }>(),
+      env.D1.prepare(
+        `SELECT id
+           FROM firefly_progressive_backfill_jobs
+          WHERE org_id = ? AND user_id = ? AND status = 'active'
+          LIMIT 1`
+      ).bind(orgId, user.user_id).first<{ id: string }>(),
+      env.D1.prepare(
+        `SELECT COUNT(*) AS n
+           FROM work_queue
+          WHERE org_id = ?
+            AND domain = 'firefly_transcript_hydrate'
+            AND status IN ('pending','in_progress')
+            AND (json_extract(payload, '$.user_id') = ? OR json_extract(payload, '$.user_id') IS NULL)`
+      ).bind(orgId, user.user_id).first<{ n: number }>(),
+      env.D1.prepare(
+        `SELECT repair_attempt_count, first_seen_at
+           FROM ingestion_incidents
+          WHERE org_id = ?
+            AND source = 'firefly'
+            AND scope_type = 'user'
+            AND scope_id = ?
+            AND code = 'firefly_ingestion_silent'
+            AND status IN ('open','recovering','blocked')
+          LIMIT 1`
+      ).bind(orgId, user.user_id).first<{ repair_attempt_count: number; first_seen_at: string | null }>(),
+      env.D1.prepare(
+        `SELECT COUNT(*) AS n
+           FROM work_queue
+          WHERE org_id = ?
+            AND domain IN ('firefly_window','firefly_transcript_hydrate')
+            AND status = 'dead_letter'
+            AND (json_extract(payload, '$.user_id') = ? OR json_extract(payload, '$.user_id') IS NULL)`
+      ).bind(orgId, user.user_id).first<{ n: number }>(),
+    ]);
+
+    const latestTranscriptAt = latestItem?.last_item_at || null;
+    const newestSuccess = latestTranscriptAt || latestWebhook?.last_hydrated_at || null;
+    const credentialBaseline = user.last_used_at || user.updated_at || user.created_at || nowIso;
+    const observedAt = newestSuccess || credentialBaseline;
+    const observedMs = Date.parse(observedAt);
+    if (!Number.isFinite(observedMs)) continue;
+
+    if (activeJob?.id || (hydrateActive?.n || 0) > 0) {
+      continue;
+    }
+
+    if (now - observedMs < FIREFLY_SILENCE_MS) {
+      await reportIngestionSuccess(env, {
+        orgId,
+        source: 'firefly',
+        scopeType: 'user',
+        scopeId: user.user_id,
+        metadata: {
+          last_transcript_at: latestTranscriptAt,
+          last_webhook_at: latestWebhook?.last_webhook_at || null,
+          last_hydrated_at: latestWebhook?.last_hydrated_at || null,
+          total_transcript_items: latestItem?.total_items || 0,
+        },
+      }).catch(() => {});
+      continue;
+    }
+
+    const persistent = Boolean(existingIncident && (existingIncident.repair_attempt_count > 0));
+    const daysBack = persistent ? FIREFLY_PERSISTENT_REPAIR_DAYS : FIREFLY_SELF_REPAIR_DAYS;
+    const start = new Date(now - daysBack * 86400000).toISOString();
+    await reportIngestionFailure(env, {
+      orgId,
+      source: 'firefly',
+      scopeType: 'user',
+      scopeId: user.user_id,
+      code: 'firefly_ingestion_silent',
+      title: 'Fireflies transcript ingestion is silent',
+      message: `No Fireflies transcripts have been staged for ${user.email || user.user_id} since ${observedAt}. A bounded ${daysBack}-day catch-up will run automatically.`,
+      severity: 'warning',
+      humanActionRequired: false,
+      recoveryWindowStart: start,
+      recoveryWindowEnd: nowIso,
+      metadata: {
+        last_transcript_at: latestTranscriptAt,
+        last_webhook_at: latestWebhook?.last_webhook_at || null,
+        last_hydrated_at: latestWebhook?.last_hydrated_at || null,
+        firefly_key_last_used_at: user.last_used_at,
+        active_parent_id: activeJob?.id || null,
+        hydrate_active: hydrateActive?.n || 0,
+        firefly_dead_letters: deadLetters?.n || 0,
+        repair_days_back: daysBack,
+      },
+    });
+    incidents++;
+  }
+
+  return incidents;
 }
 
 function isQuarantinedVectorizePayload(error: string): boolean {
@@ -487,6 +624,123 @@ async function repairSlackIncident(env: Env, incident: IngestionIncident, start:
   return any;
 }
 
+async function scanSlackMessageStaleness(orgId: string, env: Env): Promise<number> {
+  const [latest, activeRepair] = await Promise.all([
+    env.D1.prepare(
+      `SELECT COUNT(*) AS total_rows,
+              MAX(COALESCE(created_at, sent_at)) AS latest_staged_at,
+              MAX(sent_at) AS latest_source_sent_at
+         FROM conversations
+        WHERE org_id = ? AND source = 'slack'`
+    ).bind(orgId).first<{
+      total_rows: number;
+      latest_staged_at: string | null;
+      latest_source_sent_at: string | null;
+    }>(),
+    env.D1.prepare(
+      `SELECT COUNT(*) AS n
+         FROM work_queue
+        WHERE org_id = ?
+          AND domain = 'slack_channel_backfill'
+          AND status IN ('pending','in_progress')`
+    ).bind(orgId).first<{ n: number }>(),
+  ]);
+
+  if ((activeRepair?.n || 0) > 0) return 0;
+
+  const now = Date.now();
+  const latestStagedAt = latest?.latest_staged_at || null;
+  const latestMs = latestStagedAt ? Date.parse(latestStagedAt) : NaN;
+  if (Number.isFinite(latestMs) && now - latestMs < SLACK_MESSAGE_STALE_MS) {
+    await reportIngestionSuccess(env, {
+      orgId,
+      source: 'slack',
+      metadata: {
+        latest_staged_at: latestStagedAt,
+        latest_source_sent_at: latest?.latest_source_sent_at || null,
+        total_rows: latest?.total_rows || 0,
+      },
+    }).catch(() => {});
+    return 0;
+  }
+
+  const { findSlackRecentCoverageGaps } = await import('../integrations/slack');
+  const coverage = await findSlackRecentCoverageGaps(orgId, env, {
+    daysBack: SLACK_SELF_REPAIR_DAYS,
+    maxChannels: 25,
+    perChannelLimit: 20,
+  });
+
+  if (coverage.missing_messages === 0) {
+    await reportIngestionSuccess(env, {
+      orgId,
+      source: 'slack',
+      metadata: {
+        latest_staged_at: latestStagedAt,
+        latest_source_sent_at: latest?.latest_source_sent_at || null,
+        total_rows: latest?.total_rows || 0,
+        recent_verify: true,
+        days_back: SLACK_SELF_REPAIR_DAYS,
+        channels_scanned: coverage.channels_scanned,
+        history_calls_ok: coverage.history_calls_ok,
+        messages_seen: coverage.messages_seen,
+        missing_messages: 0,
+        channels_with_errors: coverage.channels_with_errors,
+        errors_sample: coverage.errors.slice(0, 5),
+      },
+    }).catch(() => {});
+    return 0;
+  }
+
+  let enqueued = 0;
+  const hourKey = new Date(now).toISOString().slice(0, 13);
+  for (const gap of coverage.channels_with_missing.slice(0, 10)) {
+    const queued = await enqueueWork(
+      env,
+      orgId,
+      'slack_channel_backfill',
+      { channel_id: gap.channel_id, days_back: SLACK_SELF_REPAIR_DAYS },
+      {
+        upstream: 'slack',
+        idempotency_key: `${orgId}:${gap.channel_id}:slack_recent_gap:${SLACK_SELF_REPAIR_DAYS}:${hourKey}`,
+        max_attempts: 6,
+      }
+    );
+    if (queued.inserted || queued.id) enqueued++;
+  }
+
+  const end = new Date(now).toISOString();
+  const start = new Date(now - SLACK_SELF_REPAIR_DAYS * 86400000).toISOString();
+  await reportIngestionFailure(env, {
+    orgId,
+    source: 'slack',
+    scopeType: 'org',
+    scopeId: orgId,
+    code: 'slack_messages_stale',
+    title: 'Slack message ingestion is stale',
+    message: `Slack conversation rows have not advanced since ${latestStagedAt || 'never'}, and recent source verification found ${coverage.missing_messages} missing messages across ${coverage.channels_with_missing.length} channel(s).`,
+    severity: 'warning',
+    humanActionRequired: false,
+    recoveryWindowStart: start,
+    recoveryWindowEnd: end,
+    metadata: {
+      latest_staged_at: latestStagedAt,
+      latest_source_sent_at: latest?.latest_source_sent_at || null,
+      total_rows: latest?.total_rows || 0,
+      days_back: SLACK_SELF_REPAIR_DAYS,
+      channels_scanned: coverage.channels_scanned,
+      history_calls_ok: coverage.history_calls_ok,
+      messages_seen: coverage.messages_seen,
+      missing_messages: coverage.missing_messages,
+      channels_with_errors: coverage.channels_with_errors,
+      backfills_enqueued: enqueued,
+      gaps_sample: coverage.channels_with_missing.slice(0, 10),
+      errors_sample: coverage.errors.slice(0, 5),
+    },
+  });
+  return 1;
+}
+
 async function repairFireflyIncident(env: Env, incident: IngestionIncident, start: string, end: string): Promise<boolean> {
   if (!incident.scope_id) return false;
   const { createFireflyProgressiveBackfillRange } = await import('./firefly-progressive-backfill');
@@ -605,6 +859,31 @@ export async function scanAndRepairIngestion(
   let repairs = 0;
   let deadLettersRequeued = 0;
 
+  const newsTreatmentDeadLetters = await env.D1.prepare(
+    `SELECT id, last_error
+       FROM work_queue
+      WHERE org_id = ?
+        AND status = 'dead_letter'
+        AND domain = 'ingestion_treatment'
+        AND last_error LIKE '%no such column: url%'
+      ORDER BY completed_at DESC
+      LIMIT 500`
+  ).bind(orgId).all<{ id: string; last_error: string | null }>();
+  for (const row of newsTreatmentDeadLetters.results) {
+    const result = await env.D1.prepare(
+      `UPDATE work_queue
+          SET status = 'pending',
+              attempt = 0,
+              max_attempts = CASE WHEN max_attempts < 6 THEN 6 ELSE max_attempts END,
+              next_attempt_at = NULL,
+              completed_at = NULL,
+              locked_until = NULL,
+              last_error = ?
+        WHERE id = ? AND status = 'dead_letter'`
+    ).bind('auto_repair_requeued after news_articles.source_url fix', row.id).run();
+    if (Number(result.meta?.changes || 0) > 0) deadLettersRequeued++;
+  }
+
   const missingGraphConfig = !env.AZURE_CLIENT_ID ||
     !env.AZURE_TENANT_ID ||
     !env.AZURE_CLIENT_CERT_PRIVATE_KEY ||
@@ -636,7 +915,7 @@ export async function scanAndRepairIngestion(
        FROM work_queue
       WHERE org_id = ?
         AND status = 'dead_letter'
-        AND domain IN ('calendar_refresh','firefly_window','embed_retry','rag_reindex_v2','slack_channel_backfill','attachment_backfill','deal_evidence_detect')
+        AND domain IN ('calendar_refresh','firefly_window','firefly_transcript_hydrate','embed_retry','rag_reindex_v2','slack_channel_backfill','attachment_backfill','deal_evidence_detect')
       ORDER BY completed_at DESC
       LIMIT 100`
   ).bind(orgId).all<{
@@ -765,6 +1044,9 @@ export async function scanAndRepairIngestion(
       humanActionRequired: false,
     });
   }
+
+  await scanFireflySilence(orgId, env);
+  await scanSlackMessageStaleness(orgId, env);
 
   const incidents = await listActiveIngestionIncidents(env, orgId, 100);
   for (const incident of incidents) {

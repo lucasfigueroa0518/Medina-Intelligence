@@ -25,6 +25,7 @@ export interface Env {
 
   // --- Service bindings ---
   PIPELINES?: PipelinesService;
+  API?: Fetcher;
 
   // --- Workflows ---
   INGESTION_WORKFLOW: Workflow;
@@ -52,6 +53,8 @@ export interface Env {
   PROSPECT_PREWARM_PROMPT_CACHE?: string;
   PROSPECT_PRODUCTION_SAMPLE_RATE?: string;
   MARTY_RUNTIME_GIT_SHA?: string;
+  MEDINA_BUILD_SHA?: string;
+  FIREFLIES_PIPELINE_VERSION?: string;
   // Premium deck rendering is orchestrated by the Worker but executed by a
   // separate Node/Playwright service. Keep optional so the HTML-first fallback
   // can deploy before the renderer service is provisioned.
@@ -104,6 +107,7 @@ export interface Env {
   FIREFLY_WEBHOOK_SECRET: string;
 
   TOKEN_ENCRYPTION_KEY: string;
+  PIPELINES_INTERNAL_TOKEN?: string;
   JWT_SECRET: string;
 
   // --- Signup ---
