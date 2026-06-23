@@ -28,6 +28,7 @@ import {
 } from '../lib/contact-detail-read-model';
 import { conversationAclSql, loadConversationVisibilityMap } from '../lib/email-derived-visibility';
 import { shapeApprovalRowForViewer } from './approval';
+import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from '../lib/crm-quality-gate';
 
 // --- GET /api/contacts ---
 
@@ -549,21 +550,41 @@ export async function createContact(
   // Map frontend "notes" alias onto bio_summary — same field the contact detail
   // Overview tab renders as "Bio Summary".
   const bioSummary: string | null = body.bio_summary || body.notes || null;
+  const contactGate = evaluateCrmQualityGate({
+    entityType: 'contact',
+    action: 'create',
+    proposedName: body.full_name,
+    email: body.email ? String(body.email) : null,
+    manualOverride: true,
+    source: {
+      source_channel: 'manual_ui',
+      source_text: body.full_name,
+      codepath: 'contacts_handler_create_contact',
+    },
+  });
+  if (!contactGate.writeAllowed || !contactGate.normalizedName) {
+    return errorResponse(
+      'CRM_QUALITY_GATE_BLOCKED',
+      422,
+      contactGate.reasons.join('; ') || 'Contact failed CRM quality gate'
+    );
+  }
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const customFields = crmQualityCustomFieldsForGate(contactGate);
 
   await env.D1.prepare(
     `INSERT INTO contacts
        (id, org_id, full_name, email, phone, linkedin_url, contact_type, relationship_status,
         company_id, job_title, bio_summary,
-        source, source_confidence, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', 1.0, ?, ?)`
+        source, source_confidence, custom_fields, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', 1.0, ?, ?, ?)`
   )
     .bind(
       id,
       ctx.orgId,
-      body.full_name.trim(),
+      contactGate.normalizedName,
       body.email ? String(body.email).toLowerCase().trim() : null,
       body.phone || null,
       body.linkedin_url || null,
@@ -572,6 +593,7 @@ export async function createContact(
       body.company_id || null,
       body.job_title || null,
       bioSummary,
+      customFields,
       now,
       now
     )
@@ -583,7 +605,7 @@ export async function createContact(
     action: 'create',
     entity_type: 'contact',
     entity_id: id,
-    after_data: { id, full_name: body.full_name },
+    after_data: { id, full_name: contactGate.normalizedName },
     created_at: now,
   });
 

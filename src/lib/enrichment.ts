@@ -30,6 +30,7 @@ import { proposeEntityUpdate, proposeMultipleUpdates } from './progressive-enric
 import { jaroWinkler } from './dedup';
 import { isVerifiedContactCompanyAffiliation } from './contact-company-affiliation';
 import { CLAUDE_HAIKU_MODEL } from './model-policy';
+import { reconcileMatchedEntityName } from './crm-name-promotion';
 
 // Returns true if two company names plausibly refer to the same entity:
 // exact match, high Jaro-Winkler similarity (catches typos/spellings), or
@@ -1167,42 +1168,36 @@ async function resolveCompanyName(
   canonicalName: string,
   env: Env
 ): Promise<void> {
-  const dup = await env.D1.prepare(
-    `SELECT id FROM companies
-       WHERE org_id = ? AND LOWER(name) = LOWER(?) AND id != ?
-         AND deleted_at IS NULL AND merged_into IS NULL
-       LIMIT 1`
-  ).bind(orgId, canonicalName, companyId).first<{ id: string }>();
+  const company = await env.D1.prepare(
+    `SELECT id, name, domain, website, deleted_at, merged_into
+       FROM companies
+      WHERE id = ? AND org_id = ?`
+  ).bind(companyId, orgId).first<{
+    id: string;
+    name: string | null;
+    domain: string | null;
+    website: string | null;
+    deleted_at: string | null;
+    merged_into: string | null;
+  }>();
+  if (!company || company.deleted_at || company.merged_into) return;
 
-  if (dup) {
-    const survivor = dup.id;
-    await env.D1.batch([
-      env.D1.prepare(`UPDATE contacts SET company_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE company_id = ?`).bind(survivor, companyId),
-      env.D1.prepare(`UPDATE deals SET company_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE company_id = ?`).bind(survivor, companyId),
-      env.D1.prepare(`UPDATE documents SET company_id = ? WHERE company_id = ?`).bind(survivor, companyId),
-      env.D1.prepare(`UPDATE tasks SET company_id = ? WHERE company_id = ?`).bind(survivor, companyId),
-      env.D1.prepare(`UPDATE news_articles SET company_id = ? WHERE company_id = ?`).bind(survivor, companyId),
-      env.D1.prepare(`DELETE FROM company_tags WHERE company_id = ?`).bind(companyId),
-      env.D1.prepare(`UPDATE companies SET merged_into = ?, deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`).bind(survivor, companyId),
-    ]);
-
-    await emitAudit(env, {
-      org_id: orgId, action: 'merge', entity_type: 'company', entity_id: companyId,
-      metadata: { merged_into: survivor, canonical_name: canonicalName, reason: 'enrichment_resolved_existing_name' },
-      created_at: new Date().toISOString(),
-    });
-    console.log(`[enrichment] merged company ${companyId} → ${survivor} (canonical "${canonicalName}")`);
-    return;
-  }
-
-  await env.D1.prepare(
-    `UPDATE companies SET name = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-  ).bind(canonicalName, companyId).run();
-
-  await emitAudit(env, {
-    org_id: orgId, action: 'update', entity_type: 'company', entity_id: companyId,
-    metadata: { field: 'name', new_name: canonicalName, reason: 'enrichment_canonical_name' },
-    created_at: new Date().toISOString(),
-  });
-  console.log(`[enrichment] resolved company name: ${companyId} → "${canonicalName}"`);
+  const result = await reconcileMatchedEntityName({
+    entityType: 'company',
+    entityId: companyId,
+    orgId,
+    rawName: canonicalName,
+    domain: company.domain,
+    website: company.website,
+    trigger: 'company_enrichment_name_resolution',
+    source: {
+      source_channel: 'enrichment',
+      source_text: canonicalName,
+      codepath: 'enrichment_resolve_company_name',
+      evidence_level: 'corroborated',
+    },
+    channelSource: 'web_enrichment_company',
+    channelContext: {},
+  }, env);
+  console.log(`[enrichment] company name reconciliation for ${companyId}: ${result.action} (${result.reason})`);
 }

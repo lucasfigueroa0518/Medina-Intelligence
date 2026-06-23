@@ -30,6 +30,12 @@ import { emitAudit } from './audit';
 import { invalidateRagCache } from './cache';
 import { markFieldsHumanEdited } from './progressive-enrichment';
 import { recordApprovalOfDeletion } from './proposal-evaluator';
+import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate, type CrmQualitySourceEvidence } from './crm-quality-gate';
+import {
+  crmNameResolutionCustomFields,
+  resolveCrmEntityNameWithEvidence,
+  type CrmNameEvidenceCandidate,
+} from './crm-name-resolver';
 import {
   safelyRebuildContactSearchIndexForCompany,
   safelyRebuildContactSearchIndexForContact,
@@ -189,6 +195,8 @@ function writableSetFor(t: EntityType): Set<string> {
 // ── Lock check (the core safety primitive) ──────────────────────────
 
 const HUMAN_EDIT_LOCK_DAYS = 180;
+const SERVICE_CONTACT_EMAIL_DOMAIN_RE = /(^|\.)((e\.read\.ai)|(fireflies\.ai)|(otter\.ai)|(calendar\.luma-mail\.com)|(luma-mail\.com)|(calendly\.com)|(zoom\.us))$/i;
+const SERVICE_CONTACT_WRAPPER_SUFFIX_RE = /\s+(?:via|from)\s+(?:read\s*ai|qualified|calendly|zoom|fireflies|otter|luma|lu\.ma)\b.*$/i;
 
 export type LockCheckOutcome =
   | { allowed: true }
@@ -289,6 +297,10 @@ interface UpdateEntityOptions {
 const CONTACT_PRIVATE_DERIVED_FIELDS = new Set(['bio_summary', 'custom_fields']);
 const DEAL_PRIVATE_DERIVED_FIELDS = new Set(['notes', 'custom_fields']);
 const EMPTY_PRIVATE_DERIVED_FIELDS = new Set<string>();
+
+function verifiedNameCustomFieldsSql(): string {
+  return "custom_fields = json_set(CASE WHEN custom_fields IS NOT NULL AND json_valid(custom_fields) THEN custom_fields ELSE '{}' END, '$.crm_quality.name_status', 'verified', '$.crm_quality.label', NULL, '$.crm_quality.promotion_policy', NULL)";
+}
 
 async function isMartyPrivateDerivedWriteAllowed(
   field: string,
@@ -395,6 +407,12 @@ async function updateEntityFieldsCommon(
       extraSets.push('relationship_owner_manual = ?');
       extraBinds.push(1);
     }
+  }
+  if (
+    (entityType === 'contact' && 'full_name' in passingFields) ||
+    (entityType === 'company' && 'name' in passingFields)
+  ) {
+    extraSets.push(verifiedNameCustomFieldsSql());
   }
 
   if (Object.keys(passingFields).length === 0 && extraSets.length === 0) {
@@ -784,6 +802,8 @@ export interface CreateContactInput {
   company_id?: string | null;
   job_title?: string | null;
   bio_summary?: string | null;
+  source_evidence?: Pick<CrmQualitySourceEvidence, 'source_channel' | 'source_record_id' | 'source_text' | 'evidence_level'> | null;
+  evidence_candidates?: CrmNameEvidenceCandidate[] | null;
 }
 
 export async function createContactRecord(
@@ -807,26 +827,84 @@ export async function createContactRecord(
       },
     };
   }
+  const contactSource = {
+    source_channel: input.source_evidence?.source_channel || ctx.origin,
+    source_record_id: input.source_evidence?.source_record_id || undefined,
+    source_text: input.source_evidence?.source_text || input.full_name,
+    codepath: 'entity_writes_create_contact_record',
+    evidence_level: input.source_evidence?.evidence_level || (ctx.origin === 'manual_ui' ? 'manual' : 'unknown'),
+  } satisfies CrmQualitySourceEvidence;
+  const { resolution: contactResolution } = await resolveCrmEntityNameWithEvidence({
+    entityType: 'contact',
+    rawName: input.full_name,
+    email: input.email || null,
+    relationshipEvidence: Boolean(input.email || input.company_id || input.job_title),
+    orgId: ctx.orgId,
+    trigger: 'entity_writes_create_contact_record',
+    runtimeEvidenceCandidates: input.evidence_candidates || null,
+    source: contactSource,
+  }, env);
+  if (contactResolution.status === 'no_entity' || contactResolution.status === 'fail' || !contactResolution.normalizedName) {
+    return {
+      ok: false,
+      error: {
+        code: 'CRM_NAME_RESOLUTION_FAILED',
+        status: 422,
+        message: contactResolution.reasons.join('; ') || 'Contact name could not be resolved',
+      },
+    };
+  }
+  const serviceSenderEmail = input.email && SERVICE_CONTACT_EMAIL_DOMAIN_RE.test(input.email.split('@')[1] || '');
+  const sourceTextHadServiceSuffix = SERVICE_CONTACT_WRAPPER_SUFFIX_RE.test(input.full_name)
+    || SERVICE_CONTACT_WRAPPER_SUFFIX_RE.test(input.source_evidence?.source_text || '');
+  const resolvedServiceWrappedPerson = serviceSenderEmail
+    && contactResolution.status === 'verified'
+    && sourceTextHadServiceSuffix
+    && contactResolution.normalizedName
+    && contactResolution.normalizedName !== input.full_name;
+  const storeEmail = resolvedServiceWrappedPerson
+    ? null
+    : input.email ? input.email.toLowerCase().trim() : null;
+  const contactGate = evaluateCrmQualityGate({
+    entityType: 'contact',
+    action: 'create',
+    proposedName: contactResolution.normalizedName,
+    email: storeEmail,
+    manualOverride: ctx.origin === 'manual_ui',
+    nameStatus: contactResolution.nameStatus,
+    source: contactSource,
+  });
+  if (!contactGate.writeAllowed || !contactGate.normalizedName) {
+    return {
+      ok: false,
+      error: {
+        code: 'CRM_QUALITY_GATE_BLOCKED',
+        status: 422,
+        message: contactGate.reasons.join('; ') || 'Contact failed CRM quality gate',
+      },
+    };
+  }
   const allowedTypes = new Set(['individual', 'family', 'institutional_investor', 'company', 'other']);
   const contactType = input.contact_type && allowedTypes.has(input.contact_type) ? input.contact_type : 'individual';
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const sourceLabel = ctx.origin === 'marty' ? 'manual_marty' : 'manual';
+  const customFields = crmNameResolutionCustomFields(contactResolution, crmQualityCustomFieldsForGate(contactGate));
 
   await env.D1.prepare(
     `INSERT INTO contacts
        (id, org_id, full_name, email, phone, linkedin_url, contact_type, relationship_status,
         company_id, job_title, bio_summary,
-        source, source_confidence, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?)`
+        source, source_confidence, custom_fields, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?, ?)`
   ).bind(
-    id, ctx.orgId, input.full_name.trim(),
-    input.email ? input.email.toLowerCase().trim() : null,
+    id, ctx.orgId, contactGate.normalizedName,
+    storeEmail,
     input.phone || null, input.linkedin_url || null,
     contactType, input.relationship_status || null,
     input.company_id || null, input.job_title || null, input.bio_summary || null,
-    sourceLabel, now, now
+    sourceLabel, customFields, now, now
   ).run();
 
   await emitAudit(env, {
@@ -835,7 +913,7 @@ export async function createContactRecord(
     action: 'create',
     entity_type: 'contact',
     entity_id: id,
-    after_data: { id, full_name: input.full_name },
+    after_data: { id, full_name: contactGate.normalizedName },
     metadata: { origin: ctx.origin },
     created_at: now,
   });
@@ -862,6 +940,7 @@ export interface CreateCompanyInput {
   description?: string | null;
   sector?: string | null;
   company_type?: string | null;
+  evidence_candidates?: CrmNameEvidenceCandidate[] | null;
 }
 
 export async function createCompanyRecord(
@@ -872,19 +951,78 @@ export async function createCompanyRecord(
   if (!input.name || !input.name.trim()) {
     return { ok: false, error: { code: 'VALIDATION_ERROR', status: 400, message: 'name is required' } };
   }
+  const companySource = {
+    source_channel: ctx.origin,
+    source_text: input.name,
+    codepath: 'entity_writes_create_company_record',
+  } satisfies CrmQualitySourceEvidence;
+  const { resolution: companyResolution } = await resolveCrmEntityNameWithEvidence({
+    entityType: 'company',
+    rawName: input.name,
+    domain: input.domain || null,
+    website: input.website || null,
+    relationshipEvidence: true,
+    allowDomainPlaceholder: true,
+    orgId: ctx.orgId,
+    trigger: 'entity_writes_create_company_record',
+    runtimeEvidenceCandidates: input.evidence_candidates || null,
+    source: companySource,
+  }, env);
+  if (companyResolution.status === 'no_entity' || companyResolution.status === 'fail' || !companyResolution.normalizedName) {
+    return {
+      ok: false,
+      error: {
+        code: 'CRM_NAME_RESOLUTION_FAILED',
+        status: 422,
+        message: companyResolution.reasons.join('; ') || 'Company name could not be resolved',
+      },
+    };
+  }
+  if (companyResolution.splitNames && companyResolution.splitNames.length > 1) {
+    return {
+      ok: false,
+      error: {
+        code: 'CRM_COMPANY_SPLIT_REQUIRED',
+        status: 422,
+        message: `Company source contains multiple organizations: ${companyResolution.splitNames.join('; ')}`,
+      },
+    };
+  }
+  const companyGate = evaluateCrmQualityGate({
+    entityType: 'company',
+    action: 'create',
+    proposedName: companyResolution.normalizedName,
+    domain: input.domain || null,
+    website: input.website || null,
+    allowDomainPlaceholder: companyResolution.status === 'domain_placeholder',
+    nameStatus: companyResolution.nameStatus,
+    source: companySource,
+  });
+  if (!companyGate.writeAllowed || !companyGate.normalizedName) {
+    return {
+      ok: false,
+      error: {
+        code: 'CRM_QUALITY_GATE_BLOCKED',
+        status: 422,
+        message: companyGate.reasons.join('; ') || 'Company failed CRM quality gate',
+      },
+    };
+  }
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const customFields = crmNameResolutionCustomFields(companyResolution, crmQualityCustomFieldsForGate(companyGate));
 
   await env.D1.prepare(
     `INSERT INTO companies
-       (id, org_id, name, domain, website, description, sector, company_type, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, org_id, name, domain, website, description, sector, company_type, custom_fields, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
-    id, ctx.orgId, input.name.trim(),
+    id, ctx.orgId, companyGate.normalizedName,
     input.domain || null, input.website || null,
     input.description || null, input.sector || null,
     input.company_type || 'other',
+    customFields,
     now, now
   ).run();
 
@@ -894,7 +1032,7 @@ export async function createCompanyRecord(
     action: 'create',
     entity_type: 'company',
     entity_id: id,
-    after_data: { id, name: input.name },
+    after_data: { id, name: companyGate.normalizedName },
     metadata: { origin: ctx.origin },
     created_at: now,
   });

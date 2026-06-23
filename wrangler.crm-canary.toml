@@ -1,0 +1,47 @@
+name = "medina-crm-quality-canary"
+main = "src/crm-quality-cloud-canary-worker.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+find_additional_modules = true
+[[rules]]
+type = "ESModule"
+globs = ["lib/pdfjs-vendor/**/*.mjs"]
+fallthrough = true
+
+[vars]
+ENVIRONMENT = "production"
+CLOUDFLARE_ACCOUNT_ID = "ad54df3fe69483d2c0b69be1b72864e8"
+CLOUDFLARE_AI_GATEWAY_SLUG = "medina-ventures"
+GEMINI_MAX_RPM = "500"
+INTERNAL_DOMAINS = "medinavc.com,medinacapital.com"
+OUTLOOK_AUTH_MODE = "app_only"
+
+[[d1_databases]]
+binding = "D1"
+database_name = "medina-ventures-db"
+database_id = "4bb3705c-c471-43f7-b42f-b44ab62f5dab"
+preview_database_id = "4bb3705c-c471-43f7-b42f-b44ab62f5dab"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "medina-ventures-storage"
+preview_bucket_name = "medina-ventures-storage"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "29422591253b424d9094c37e0897d68e"
+preview_id = "59205fe013c84c548579bc2b503750f6"
+
+[[queues.producers]]
+queue = "crm-quality-canary-queue"
+binding = "CANARY_QUEUE"
+
+[[queues.consumers]]
+queue = "crm-quality-canary-queue"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 2
+retry_delay = 30
+max_concurrency = 8
+dead_letter_queue = "crm-quality-canary-dlq"

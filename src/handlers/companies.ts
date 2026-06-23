@@ -16,6 +16,7 @@ import {
   evaluateContactCompanyAffiliation,
 } from '../lib/contact-company-affiliation';
 import { safelyRebuildContactSearchIndexForCompany } from '../lib/contact-search';
+import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from '../lib/crm-quality-gate';
 
 // News-score buckets. The underlying scale is 0-10 (see lib/news-scoring).
 function newsScorePredicate(bucket: string): string | null {
@@ -379,7 +380,27 @@ export async function createCompany(
   const domain = body.website
     ? body.website.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].trim()
     : null;
-  const existingDup = await findDuplicateCompany(body.name, domain, ctx.orgId, env);
+  const companyGate = evaluateCrmQualityGate({
+    entityType: 'company',
+    action: 'create',
+    proposedName: body.name,
+    domain,
+    website: body.website || null,
+    source: {
+      source_channel: 'manual_ui',
+      source_text: body.name,
+      codepath: 'companies_handler_create_company',
+    },
+  });
+  if (!companyGate.writeAllowed || !companyGate.normalizedName) {
+    return errorResponse(
+      'CRM_QUALITY_GATE_BLOCKED',
+      422,
+      companyGate.reasons.join('; ') || 'Company failed CRM quality gate'
+    );
+  }
+
+  const existingDup = await findDuplicateCompany(companyGate.normalizedName, domain, ctx.orgId, env);
   if (existingDup) {
     const existing = await env.D1.prepare('SELECT * FROM companies WHERE id = ?').bind(existingDup).first();
     return jsonResponse({ company: existing, deduplicated: true });
@@ -387,16 +408,17 @@ export async function createCompany(
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const customFields = crmQualityCustomFieldsForGate(companyGate);
 
   await env.D1.prepare(
     `INSERT INTO companies
-       (id, org_id, name, domain, website, description, company_type, sector, stage, investment_status, linkedin_url, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, org_id, name, domain, website, description, company_type, sector, stage, investment_status, linkedin_url, custom_fields, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       id,
       ctx.orgId,
-      body.name,
+      companyGate.normalizedName,
       domain,
       body.website || null,
       body.description || null,
@@ -405,6 +427,7 @@ export async function createCompany(
       body.stage || null,
       body.investment_status || 'tracking',
       body.linkedin_url || null,
+      customFields,
       now,
       now
     )
@@ -416,7 +439,7 @@ export async function createCompany(
     action: 'create',
     entity_type: 'company',
     entity_id: id,
-    after_data: { id, name: body.name },
+    after_data: { id, name: companyGate.normalizedName },
     created_at: now,
   });
 

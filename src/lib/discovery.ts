@@ -2,7 +2,14 @@
 import type { Env } from '../types/env';
 import type { ClassifiableItem } from '../types/interfaces';
 import { emitAudit } from './audit';
-import { isValidContactName, resolveContactName } from './name-quality';
+import { resolveContactName } from './name-quality';
+import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from './crm-quality-gate';
+import {
+  crmNameResolutionCustomFields,
+  resolveCrmEntityNameWithEvidence,
+  type CrmNameEvidenceCandidate,
+} from './crm-name-resolver';
+import { reconcileMatchedEntityName } from './crm-name-promotion';
 import { jaroWinkler } from './dedup';
 import { updateEntityInIndex } from './entity-index';
 import { safelyMaintainContactReadModels } from './contact-maintenance';
@@ -196,6 +203,20 @@ export function isAutomatedEmail(email: string): { blocked: boolean; reason?: st
     }
   }
   return { blocked: false };
+}
+
+function serviceBridgePersonDisplay(value: string | null | undefined): string {
+  const stripped = String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\s+(?:via|from)\s+(?:read\s*ai|qualified|calendly|zoom|fireflies|otter|luma|lu\.ma)\b.*$/i, '')
+    .trim();
+  if (!stripped || stripped === String(value || '').trim()) return '';
+  const tokens = stripped.match(/[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'.-]*/g) || [];
+  const substantive = tokens.filter(token => token.replace(/\./g, '').length >= 2);
+  if (substantive.length < 2) return '';
+  if (/\b(service|support|desk|office|team|calendar|noreply|no-reply|info|sales|marketing|confirmation)\b/i.test(stripped)) return '';
+  return stripped;
 }
 
 // Common subdomains that should be stripped before deriving a company name.
@@ -416,7 +437,8 @@ export function isAutomatedDomain(domain: string): boolean {
 export async function findOrCreateCompanyByDomain(
   emailDomain: string,
   orgId: string,
-  env: Env
+  env: Env,
+  runtimeEvidenceCandidates: CrmNameEvidenceCandidate[] | null = null
 ): Promise<string | null> {
   const domainLower = emailDomain.toLowerCase();
   if (PERSONAL_DOMAINS.has(domainLower)) return null;
@@ -429,13 +451,65 @@ export async function findOrCreateCompanyByDomain(
   if (isAutomatedDomain(regDomain)) return null;
 
   const existing = await findCompanyByDomain(regDomain, orgId, env);
-  if (existing) return existing;
+  if (existing) {
+    await reconcileMatchedEntityName({
+      entityType: 'company',
+      entityId: existing,
+      orgId,
+      rawName: regDomain,
+      domain: regDomain,
+      website: `https://${regDomain}`,
+      trigger: 'find_or_create_company_by_domain_existing_match',
+      runtimeEvidenceCandidates,
+      source: {
+        source_channel: 'email_domain',
+        source_text: emailDomain,
+        codepath: 'find_or_create_company_by_domain_existing_match',
+        evidence_level: 'unknown',
+      },
+    }, env).catch(e => console.error(`[discovery] company name reconciliation failed for ${existing}:`, e));
+    return existing;
+  }
 
   if (regDomain.length < 2) return null;
 
   // Use the domain as the placeholder name. Real human-readable name resolution
-  // is the enrichment pipeline's job — don't fabricate one from the URL stem.
-  const placeholderName = regDomain;
+  // is the enrichment pipeline's job; the quality gate records this as a
+  // placeholder-only decision and blocks service/public-suffix-like domains.
+  const companySource = {
+    source_channel: 'email_domain',
+    source_text: emailDomain,
+    codepath: 'find_or_create_company_by_domain',
+  };
+  const { resolution: companyResolution } = await resolveCrmEntityNameWithEvidence({
+    entityType: 'company',
+    rawName: regDomain,
+    domain: regDomain,
+    allowDomainPlaceholder: true,
+    relationshipEvidence: true,
+    orgId,
+    trigger: 'find_or_create_company_by_domain',
+    runtimeEvidenceCandidates,
+    source: companySource,
+  }, env);
+  if (!companyResolution.normalizedName || companyResolution.status === 'no_entity' || companyResolution.status === 'fail') {
+    console.log(`[discovery] skip company auto-create for ${emailDomain}: ${companyResolution.reasons.join('; ')}`);
+    return null;
+  }
+  const companyGate = evaluateCrmQualityGate({
+    entityType: 'company',
+    action: 'create',
+    proposedName: companyResolution.normalizedName,
+    domain: regDomain,
+    allowDomainPlaceholder: companyResolution.status === 'domain_placeholder',
+    nameStatus: companyResolution.nameStatus,
+    source: companySource,
+  });
+  if (!companyGate.writeAllowed || !companyGate.normalizedName) {
+    console.log(`[discovery] skip company auto-create for ${emailDomain}: ${companyGate.reasons.join('; ')}`);
+    return null;
+  }
+  const placeholderName = companyGate.normalizedName;
 
   const dupCheck = await findDuplicateCompany(placeholderName, regDomain, orgId, env);
   if (dupCheck) return dupCheck;
@@ -446,12 +520,13 @@ export async function findOrCreateCompanyByDomain(
   try {
     await env.D1.prepare(
       `INSERT INTO companies
-         (id, org_id, name, domain, website, company_type, investment_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'other', 'tracking', ?, ?)`
+         (id, org_id, name, domain, website, company_type, investment_status, custom_fields, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'other', 'tracking', ?, ?, ?)`
     ).bind(
       companyId, orgId, placeholderName,
       regDomain,
       `https://${regDomain}`,
+      crmNameResolutionCustomFields(companyResolution, crmQualityCustomFieldsForGate(companyGate)),
       now, now
     ).run();
   } catch (e: any) {
@@ -517,15 +592,19 @@ export async function discoverNewContact(
     return null;
   }
 
+  const normalizedEmail = email.toLowerCase().trim();
+  const incomingDisplayName = sourceItem.fromName || sourceItem.recipientNames?.[normalizedEmail] || normalizedEmail;
   const spam = isAutomatedEmail(email);
-  if (spam.blocked) {
+  const serviceBridgeDisplay = serviceBridgePersonDisplay(incomingDisplayName);
+  if (spam.blocked && !serviceBridgeDisplay) {
     console.log(`[discovery] skip ${email}: ${spam.reason}`);
     return null;
   }
 
-  const normalizedEmail = email.toLowerCase().trim();
-
   const emailVariants = internalEmailVariants(normalizedEmail, getConfiguredInternalDomains(env));
+  const runtimeEvidenceCandidates = Array.isArray((sourceItem as any).crmNameEvidenceCandidates)
+    ? (sourceItem as any).crmNameEvidenceCandidates as CrmNameEvidenceCandidate[]
+    : null;
   const existing = await env.D1.prepare(
     `SELECT id FROM contacts
       WHERE org_id = ? AND LOWER(email) IN (${emailVariants.map(() => '?').join(',')})
@@ -540,6 +619,25 @@ export async function discoverNewContact(
     if (!hasCompany) {
       await linkContactToCompanyByEmail(existing.id, normalizedEmail, orgId, env);
     }
+
+    await reconcileMatchedEntityName({
+      entityType: 'contact',
+      entityId: existing.id,
+      orgId,
+      rawName: incomingDisplayName,
+      email: normalizedEmail,
+      trigger: 'discover_new_contact_existing_match',
+      runtimeEvidenceCandidates,
+      channelSource: 'display_name',
+      channelContext: { userId: sourceItem.userId || null, conversationId: sourceItem.externalId || null },
+      source: {
+        source_channel: sourceItem.source,
+        source_record_id: sourceItem.externalId,
+        source_text: incomingDisplayName,
+        codepath: 'discover_new_contact_existing_match',
+        evidence_level: 'corroborated',
+      },
+    }, env).catch(e => console.error(`[discovery] contact name reconciliation failed for ${existing.id}:`, e));
 
     return { id: existing.id, created: false };
   }
@@ -563,7 +661,41 @@ export async function discoverNewContact(
     return null;
   }
 
-  const displayName = resolvedName;
+  const contactSource = {
+    source_channel: sourceItem.source,
+    source_record_id: sourceItem.externalId,
+    source_text: sourceItem.fromName || sourceItem.recipientNames?.[normalizedEmail] || resolvedName,
+    codepath: 'discover_new_contact',
+    evidence_level: 'weak_single_source' as const,
+  };
+  const { resolution: contactResolution } = await resolveCrmEntityNameWithEvidence({
+    entityType: 'contact',
+    rawName: contactSource.source_text,
+    email: normalizedEmail,
+    relationshipEvidence: true,
+    orgId,
+    trigger: 'discover_new_contact',
+    runtimeEvidenceCandidates,
+    source: contactSource,
+  }, env);
+  if (!contactResolution.normalizedName || contactResolution.status === 'no_entity' || contactResolution.status === 'fail') {
+    console.log(`[discovery] skip ${normalizedEmail}: ${contactResolution.reasons.join('; ')}`);
+    return null;
+  }
+  const contactGate = evaluateCrmQualityGate({
+    entityType: 'contact',
+    action: 'create',
+    proposedName: contactResolution.normalizedName,
+    email: normalizedEmail,
+    nameStatus: contactResolution.nameStatus,
+    source: contactSource,
+  });
+  if (!contactGate.writeAllowed || !contactGate.normalizedName) {
+    console.log(`[discovery] skip ${normalizedEmail}: ${contactGate.reasons.join('; ')}`);
+    return null;
+  }
+
+  const displayName = contactGate.normalizedName;
 
   const domain = normalizedEmail.split('@')[1];
   let companyId: string | null = null;
@@ -583,11 +715,12 @@ export async function discoverNewContact(
   }
 
   const contactId = crypto.randomUUID();
+  const customFields = crmNameResolutionCustomFields(contactResolution, crmQualityCustomFieldsForGate(contactGate));
 
   const result = await env.D1.prepare(
-    `INSERT OR IGNORE INTO contacts (id, org_id, full_name, email, company_id, source, source_confidence, contact_type, total_interactions)
-     VALUES (?, ?, ?, ?, ?, ?, 0.6, 'individual', 0)`
-  ).bind(contactId, orgId, displayName, normalizedEmail, companyId, sourceItem.source).run();
+    `INSERT OR IGNORE INTO contacts (id, org_id, full_name, email, company_id, source, source_confidence, contact_type, total_interactions, custom_fields)
+     VALUES (?, ?, ?, ?, ?, ?, 0.6, 'individual', 0, ?)`
+  ).bind(contactId, orgId, displayName, normalizedEmail, companyId, sourceItem.source, customFields).run();
 
   if (!result.meta?.changes) {
     const raced = await env.D1.prepare(

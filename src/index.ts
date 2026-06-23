@@ -704,6 +704,25 @@ async function routeAuthenticated(
     if (m && method === 'POST') return Admin.replayDlq(m[1], ctx, env);
     m = path.match(/^\/api\/admin\/dlq\/([^/]+)\/discard$/);
     if (m && method === 'POST') return Admin.discardDlq(m[1], ctx, env);
+    if (path === '/api/admin/crm-name-backfill/start' && method === 'POST') {
+      const { startCrmNameBackfillHandler } = await import('./handlers/crm-name-backfill');
+      return startCrmNameBackfillHandler(request, ctx, env);
+    }
+    m = path.match(/^\/api\/admin\/crm-name-backfill\/([^/]+)$/);
+    if (m && method === 'GET') {
+      const { getCrmNameBackfillStatusHandler } = await import('./handlers/crm-name-backfill');
+      return getCrmNameBackfillStatusHandler(m[1], ctx, env);
+    }
+    m = path.match(/^\/api\/admin\/crm-name-backfill\/([^/]+)\/cancel$/);
+    if (m && method === 'POST') {
+      const { cancelCrmNameBackfillHandler } = await import('./handlers/crm-name-backfill');
+      return cancelCrmNameBackfillHandler(m[1], ctx, env);
+    }
+    m = path.match(/^\/api\/admin\/crm-name-backfill\/([^/]+)\/resume$/);
+    if (m && method === 'POST') {
+      const { resumeCrmNameBackfillHandler } = await import('./handlers/crm-name-backfill');
+      return resumeCrmNameBackfillHandler(m[1], ctx, env);
+    }
     if (path === '/api/admin/enrichment-status' && method === 'GET')
       return Admin.getEnrichmentStatus(ctx, env);
     if (path === '/api/admin/clear-rate-limit' && method === 'POST')

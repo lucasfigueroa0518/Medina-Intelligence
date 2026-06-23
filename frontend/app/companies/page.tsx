@@ -8,6 +8,7 @@ import { DataTable, Column } from '@/components/data-table';
 import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
+import { TentativeNameBadge } from '@/components/tentative-name-badge';
 import { api } from '@/lib/api';
 import { initialFromName, faviconUrl } from '@/lib/avatar';
 import { DEMO_COMPANY_TOTAL, demoCompanies, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
@@ -340,7 +341,12 @@ function CompaniesPage() {
   const columns: Column<any>[] = [
     {
       key: 'name', sortKey: 'name', header: 'Name', width: '220px', sortable: true,
-      accessor: row => <CompanyAvatarCell name={row.name} domain={row.domain} logoUrl={row.logo_url} />,
+      accessor: row => (
+        <div className="min-w-0">
+          <CompanyAvatarCell name={row.name} domain={row.domain} logoUrl={row.logo_url} />
+          <TentativeNameBadge customFields={row.custom_fields} className="ml-11 mt-1" />
+        </div>
+      ),
     },
     {
       key: 'type', header: 'Type', width: '110px', sortable: false,

@@ -1,6 +1,8 @@
 // Name quality validation + normalization for discovered contacts.
 // Used to reject garbage names like "noreply", "calendar", "f1", "g1" before
 // inserting a contact row.
+import { evaluateCrmQualityGate } from './crm-quality-gate';
+import { resolveCrmEntityName } from './crm-name-resolver';
 
 const AUTOMATED_LOCAL_RE = /^(calendar|invite|invites|notification|notifications|noreply|no-reply|info|support|help|admin|administrator|billing|news|newsletter|newsletters|updates|team|hello|contact|sales|marketing|accounts|payments|registration|system|mailer|daemon|postmaster|do-not-reply|donotreply|alerts|notice|notify|webmaster|abuse|security|hr|jobs|careers|press|media|legal|privacy|reply|replies|service|services|email|mail)$/i;
 
@@ -24,7 +26,16 @@ export function isValidContactName(name: string | null | undefined): boolean {
   // No spaces and unusually long — almost certainly not a real name
   if (!trimmed.includes(' ') && trimmed.length > 15) return false;
 
-  return true;
+  return evaluateCrmQualityGate({
+    entityType: 'contact',
+    action: 'create',
+    proposedName: trimmed,
+    source: {
+      source_channel: 'display_name',
+      source_text: trimmed,
+      codepath: 'name_quality_is_valid_contact_name',
+    },
+  }).writeAllowed;
 }
 
 export function toTitleCase(name: string): string {
@@ -54,16 +65,68 @@ export function resolveContactName(
 
   // 1. fromEmail matches and fromName is real
   if (fromEmail && fromEmail.toLowerCase() === lower && fromName) {
+    const resolved = resolveCrmEntityName({
+      entityType: 'contact',
+      rawName: fromName,
+      email: lower,
+      relationshipEvidence: true,
+      source: {
+        source_channel: 'email_header',
+        source_text: fromName,
+        codepath: 'resolve_contact_name_from_sender',
+        evidence_level: 'weak_single_source',
+      },
+    });
+    if (resolved.normalizedName && ['verified', 'provisional'].includes(resolved.status)) return resolved.normalizedName;
+
     const candidate = toTitleCase(fromName);
-    if (isValidContactName(candidate)) return candidate;
+    const gate = evaluateCrmQualityGate({
+      entityType: 'contact',
+      action: 'create',
+      proposedName: candidate,
+      email: lower,
+      source: {
+        source_channel: 'email_header',
+        source_text: fromName,
+        codepath: 'resolve_contact_name_from_sender',
+        evidence_level: 'weak_single_source',
+      },
+    });
+    if (gate.writeAllowed && gate.normalizedName) return gate.normalizedName;
   }
 
   // 2. recipientNames has an entry for this email
   if (recipientNames) {
     const direct = recipientNames[lower] || recipientNames[email];
     if (direct) {
+      const resolved = resolveCrmEntityName({
+        entityType: 'contact',
+        rawName: direct,
+        email: lower,
+        relationshipEvidence: true,
+        source: {
+          source_channel: 'email_header',
+          source_text: direct,
+          codepath: 'resolve_contact_name_from_recipient',
+          evidence_level: 'weak_single_source',
+        },
+      });
+      if (resolved.normalizedName && ['verified', 'provisional'].includes(resolved.status)) return resolved.normalizedName;
+
       const candidate = toTitleCase(direct);
-      if (isValidContactName(candidate)) return candidate;
+      const gate = evaluateCrmQualityGate({
+        entityType: 'contact',
+        action: 'create',
+        proposedName: candidate,
+        email: lower,
+        source: {
+          source_channel: 'email_header',
+          source_text: direct,
+          codepath: 'resolve_contact_name_from_recipient',
+          evidence_level: 'weak_single_source',
+        },
+      });
+      if (gate.writeAllowed && gate.normalizedName) return gate.normalizedName;
     }
   }
 

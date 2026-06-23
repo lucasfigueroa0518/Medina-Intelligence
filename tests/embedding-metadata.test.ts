@@ -28,7 +28,7 @@ describe('Vectorize metadata compaction', () => {
     expect(compact.giant_nested_object).toBeUndefined();
     expect(compact.org_id).toBe('org-1');
     expect(compact.source_id).toBe('conv-1');
-    expect(compact.chunk_index).toBe(2);
+    expect(compact.chunk_index).toBe('2');
     expect(JSON.stringify(compact).length).toBeLessThan(3000);
   });
 
@@ -58,6 +58,12 @@ describe('Vectorize metadata compaction', () => {
       values: Array.from({ length: 768 }, () => 0),
       metadata: { nested: { no: 'objects' } as any },
     })).toThrow(/metadata value/);
+
+    expect(() => validateVectorizePayload({
+      id: 'vector-1',
+      values: Array.from({ length: 768 }, () => 0),
+      metadata: { chunk_index: 2 as any },
+    })).toThrow(/must be string/);
   });
 
   it('classifies Cloudflare Vectorize 40023 parser errors as deterministic quarantine', () => {

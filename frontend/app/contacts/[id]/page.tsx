@@ -16,6 +16,7 @@ import { CompanySearchField } from '@/components/company-search-field';
 import { TagPicker } from '@/components/tag-picker';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
+import { TentativeNameBadge } from '@/components/tentative-name-badge';
 import { api, ApiError } from '@/lib/api';
 import { cleanIntelBrief } from '@/lib/intelligence-briefing';
 import {
@@ -572,8 +573,9 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
               </>
             ) : (
               <>
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
                   <h1 className="font-display text-2xl leading-tight">{contact.full_name}</h1>
+                  <TentativeNameBadge customFields={contact.custom_fields} />
                   <div className="flex items-center gap-1">
                     <SocialIcon url={contact.linkedin_url} Icon={Linkedin} color="#60A5FA" />
                     <SocialIcon url={contact.twitter_url} Icon={Twitter} color="#38BDF8" />
