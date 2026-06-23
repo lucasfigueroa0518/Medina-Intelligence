@@ -32,6 +32,8 @@ INTERNAL_DOMAINS = "medinavc.com,medinacapital.com"
 DECK_RENDERER_ENABLED = "true"
 DECK_RENDERER_PROVIDER = "cloudflare"
 OUTLOOK_AUTH_MODE = "app_only"
+CRM_NAME_RESOLVER_ENABLED = "true"
+CRM_NAME_BACKFILL_APPLY_ENABLED = "false"
 
 [browser]
 binding = "BROWSER"
