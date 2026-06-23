@@ -142,6 +142,25 @@ function shardForId(id: string, shardCount: number): number {
   return Math.abs(hash >>> 0) % shardCount;
 }
 
+export function selectCrmNameBackfillShardPage<T extends { id: string }>(args: {
+  candidates: T[];
+  shardIndex: number;
+  shardCount: number;
+  remaining: number;
+}): { selected: T[]; cursor: string | null; inspected: number } {
+  const selected: T[] = [];
+  let cursor: string | null = null;
+  let inspected = 0;
+  for (const row of args.candidates) {
+    cursor = row.id;
+    inspected++;
+    if (shardForId(row.id, args.shardCount) !== args.shardIndex) continue;
+    selected.push(row);
+    if (selected.length >= args.remaining) break;
+  }
+  return { selected, cursor, inspected };
+}
+
 function currentNameLooksSemanticallyUnsafe(value: string): boolean {
   const name = clean(value);
   if (!name) return true;
@@ -731,10 +750,15 @@ export async function processCrmNameBackfillShardPayload(
       done = true;
       break;
     }
-    scanned += candidates.length;
-    cursor = candidates[candidates.length - 1].id;
-    for (const row of candidates) {
-      if (shardForId(row.id, payload.shard_count) !== payload.shard_index) continue;
+    const page = selectCrmNameBackfillShardPage({
+      candidates,
+      shardIndex: payload.shard_index,
+      shardCount: payload.shard_count,
+      remaining: chunkSize - processed,
+    });
+    scanned += page.inspected;
+    cursor = page.cursor || cursor;
+    for (const row of page.selected) {
       await evaluateAndMaybeApplyCrmNameBackfillEntity({
         env,
         runId: payload.run_id,
@@ -746,7 +770,6 @@ export async function processCrmNameBackfillShardPayload(
         mode: payload.mode,
       });
       processed++;
-      if (processed >= chunkSize) break;
     }
   }
 

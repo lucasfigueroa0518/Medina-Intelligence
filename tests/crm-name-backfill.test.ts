@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CRM_NAME_BACKFILL_DOMAIN,
   DEFAULT_CRM_NAME_BACKFILL_SHARDS,
+  selectCrmNameBackfillShardPage,
   startCrmNameBackfillRun,
 } from '../src/lib/crm-name-backfill';
 import { crmNameBackfillHandler } from '../src/lib/work-queue-handlers/crm-name-backfill';
@@ -115,5 +116,24 @@ describe('CRM name backfill rollout infrastructure', () => {
       requestedBy: 'user-1',
       mode: 'apply',
     })).rejects.toThrow('CRM_NAME_BACKFILL_APPLY_DISABLED');
+  });
+
+  it('does not advance a shard cursor past uninspected rows when a chunk fills mid-page', () => {
+    const candidates = Array.from({ length: 200 }, (_, i) => ({
+      id: `entity-${String(i).padStart(4, '0')}`,
+    }));
+
+    const page = [0, 1, 2, 3]
+      .map(shardIndex => selectCrmNameBackfillShardPage({
+        candidates,
+        shardIndex,
+        shardCount: 4,
+        remaining: 1,
+      }))
+      .find(result => result.selected.length === 1 && result.cursor !== candidates[candidates.length - 1].id);
+
+    expect(page).toBeTruthy();
+    expect(page!.cursor).toBe(page!.selected[0].id);
+    expect(page!.inspected).toBeLessThan(candidates.length);
   });
 });
