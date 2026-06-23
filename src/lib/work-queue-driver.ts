@@ -70,6 +70,12 @@ export interface WorkQueueHandler {
   processConcurrency?: number;
 
   /**
+   * Optional vetted claim/processing cap for cheap, sharded operational
+   * domains. The default stays 20 to preserve the historical safety rail.
+   */
+  claimBatchCap?: number;
+
+  /**
    * 'minute' (default) runs every minute tick. 'hour' runs only when
    * the dispatching minute tick happens at minute :00 (caller decides).
    * Keeping the dispatch logic in src/index.ts means this field is
@@ -182,6 +188,7 @@ import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 import { deckRenderHandler } from './work-queue-handlers/deck-render';
 import { slackChannelBackfillHandler } from './work-queue-handlers/slack-channel-backfill';
 import { maxModeJobHandler } from './work-queue-handlers/max-mode-job';
+import { crmNameBackfillHandler } from './work-queue-handlers/crm-name-backfill';
 
 /**
  * Phase 5 shipped with an empty registry. Domain pilots append entries
@@ -218,6 +225,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   intelligentImportHandler,
   contactEnrichmentHandler,
   maxModeJobHandler,
+  crmNameBackfillHandler,
   // MARTy Sandbox handlers are intentionally not registered while the
   // sandbox is disabled; queued sandbox rows must not consume model credits.
   ragReindexV2Handler,
@@ -380,7 +388,8 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
     };
     let claimed: WorkQueueRow[] = [];
     try {
-      let claimLimit = Math.min(handler.batchSize, 20);
+      const claimBatchCap = Math.max(1, Math.floor(handler.claimBatchCap || 20));
+      let claimLimit = Math.min(handler.batchSize, claimBatchCap);
       if (handler.maxConcurrent !== undefined) {
         const active = await env.D1.prepare(
           `SELECT COUNT(*) AS count FROM work_queue
@@ -440,7 +449,8 @@ export async function processWorkQueueTick(env: Env): Promise<ProcessTickResult>
       }
     };
 
-    const processConcurrency = Math.min(Math.max(Math.floor(handler.processConcurrency || 1), 1), 20);
+    const claimBatchCap = Math.max(1, Math.floor(handler.claimBatchCap || 20));
+    const processConcurrency = Math.min(Math.max(Math.floor(handler.processConcurrency || 1), 1), claimBatchCap);
     for (let i = 0; i < claimed.length; i += processConcurrency) {
       await Promise.all(claimed.slice(i, i + processConcurrency).map(processOne));
     }

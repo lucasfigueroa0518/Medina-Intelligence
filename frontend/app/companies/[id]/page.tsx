@@ -12,6 +12,7 @@ import {
 import { TopBar } from '@/components/top-bar';
 import { TagPicker } from '@/components/tag-picker';
 import { DocumentActions } from '@/components/document-actions';
+import { TentativeNameBadge } from '@/components/tentative-name-badge';
 import { api } from '@/lib/api';
 import { initialFromName, faviconUrl } from '@/lib/avatar';
 import { cleanIntelBrief } from '@/lib/intelligence-briefing';
@@ -449,6 +450,7 @@ export default function CompanyDetailPage() {
                     {company.name}
                   </h1>
                   <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <TentativeNameBadge customFields={company.custom_fields} />
                     {activeDealCount > 0 && <IdentityTag tone="hot">{activeDealCount > 1 ? `${activeDealCount} active deals` : 'Active deal'}</IdentityTag>}
                     {company.investment_status && <IdentityTag tone="hot">{company.investment_status.replace(/_/g, ' ')}</IdentityTag>}
                     {company.company_type && <IdentityTag>{company.company_type.replace(/_/g, ' ')}</IdentityTag>}

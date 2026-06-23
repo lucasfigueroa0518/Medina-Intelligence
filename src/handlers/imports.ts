@@ -6,6 +6,7 @@ import { callClaude } from '../lib/claude';
 import { IMPORT_COLUMN_MAPPING_PROMPT } from '../prompts/import-mapping';
 import { isTextExtractionSupported } from '../lib/file-extraction';
 import { safelyMaintainContactReadModels } from '../lib/contact-maintenance';
+import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from '../lib/crm-quality-gate';
 
 interface ImportJobRow {
   id: string;
@@ -724,6 +725,23 @@ async function processImport(id: string, orgId: string, env: Env): Promise<void>
           const binds: unknown[] = [];
           for (const [k, v] of Object.entries(mapped)) {
             if (k === 'email' || !v) continue;
+            if (k === 'full_name') {
+              const gate = evaluateCrmQualityGate({
+                entityType: 'contact',
+                action: 'update_name',
+                proposedName: v,
+                email: mapped.email || null,
+                source: {
+                  source_channel: 'import',
+                  source_text: v,
+                  codepath: 'imports_update_contact',
+                },
+              });
+              if (!gate.writeAllowed || !gate.normalizedName) continue;
+              fields.push(`${k} = ?`);
+              binds.push(gate.normalizedName);
+              continue;
+            }
             fields.push(`${k} = ?`);
             binds.push(v);
           }
@@ -736,18 +754,36 @@ async function processImport(id: string, orgId: string, env: Env): Promise<void>
           updated++;
         } else {
           const newId = crypto.randomUUID();
+          const proposedFullName = mapped.full_name || mapped.email || 'Unknown';
+          const gate = evaluateCrmQualityGate({
+            entityType: 'contact',
+            action: 'create',
+            proposedName: proposedFullName,
+            email: mapped.email || null,
+            source: {
+              source_channel: 'import',
+              source_text: proposedFullName,
+              codepath: 'imports_create_contact',
+            },
+          });
+          if (!gate.writeAllowed || !gate.normalizedName) {
+            skipped++;
+            continue;
+          }
+          const customFields = crmQualityCustomFieldsForGate(gate);
           await env.D1.prepare(
-            `INSERT INTO contacts (id, org_id, full_name, email, phone, job_title, linkedin_url, source, source_confidence, contact_type)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'import', 0.9, 'individual')`
+            `INSERT INTO contacts (id, org_id, full_name, email, phone, job_title, linkedin_url, source, source_confidence, contact_type, custom_fields)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'import', 0.9, 'individual', ?)`
           )
             .bind(
               newId,
               orgId,
-              mapped.full_name || mapped.email || 'Unknown',
+              gate.normalizedName,
               mapped.email || null,
               mapped.phone || null,
               mapped.job_title || null,
-              mapped.linkedin_url || null
+              mapped.linkedin_url || null,
+              customFields
             )
             .run();
           await safelyMaintainContactReadModels(env, orgId, newId, 'csv_contact_created');

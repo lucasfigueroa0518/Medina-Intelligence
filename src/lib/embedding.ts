@@ -125,7 +125,7 @@ export const VECTORIZE_PAYLOAD_QUARANTINE_ERROR = 'VECTORIZE_PAYLOAD_QUARANTINED
 export interface VectorizeUpsertPayload {
   id: string;
   values: number[];
-  metadata: Record<string, string | number | boolean>;
+  metadata: Record<string, string>;
 }
 
 async function withInFlightCap<T>(fn: () => Promise<T>): Promise<T> {
@@ -348,20 +348,12 @@ export function sanitizeVectorizeTextPreview(value: string): string {
 }
 
 function addCompactMetadata(
-  out: Record<string, string | number | boolean>,
+  out: Record<string, string>,
   key: string,
   value: unknown,
   max = 240
 ): void {
   if (value == null) return;
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    out[key] = value;
-    return;
-  }
-  if (typeof value === 'boolean') {
-    out[key] = value;
-    return;
-  }
   const text = compactText(value, max);
   if (text) out[key] = text;
 }
@@ -371,8 +363,8 @@ export function compactVectorizeMetadata(
   chunkIndex: number,
   totalChunks: number,
   textPreview: string
-): Record<string, string | number | boolean> {
-  const out: Record<string, string | number | boolean> = {};
+): Record<string, string> {
+  const out: Record<string, string> = {};
   addCompactMetadata(out, 'org_id', meta.org_id, 80);
   addCompactMetadata(out, 'user_id', meta.user_id, 80);
   addCompactMetadata(out, 'visibility', meta.visibility, 32);
@@ -392,7 +384,10 @@ export function compactVectorizeMetadata(
   addCompactMetadata(out, 'date', meta.date, 80);
   addCompactMetadata(out, 'chunk_index', chunkIndex);
   addCompactMetadata(out, 'total_chunks', totalChunks);
-  addCompactMetadata(out, 'text_preview', textPreview, 200);
+  // Do not send content-derived previews to Vectorize metadata. A handful of
+  // real email/document chunks can contain byte sequences that pass JS
+  // JSON.stringify validation but are rejected by Vectorize's backend parser.
+  // The canonical chunk body remains in KV at chunk:<vectorId>.
   addCompactMetadata(out, 'embedding_model', 'bge-base-en-v1.5', 80);
   addCompactMetadata(out, 'chunk_config_version', CURRENT_CHUNK_VERSION, 80);
   return out;
@@ -449,12 +444,7 @@ export function validateVectorizePayload(
       }
       continue;
     }
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) fail(`metadata number is non-finite for key ${key}`);
-      continue;
-    }
-    if (typeof value === 'boolean') continue;
-    fail(`metadata value for key ${key} must be string, number, or boolean`);
+    fail(`metadata value for key ${key} must be string`);
   }
 }
 
@@ -484,7 +474,11 @@ export async function chunkEmbedAndPersist(
 
   try {
     await Promise.all([
-      env.VECTORIZE.upsert([vectorPayload]),
+      // New chunk IDs should be inserted, not upserted. Cloudflare Vectorize's
+      // upsert path can reject otherwise valid Worker-binding payloads with
+      // a backend NDJSON parser error; insert is sufficient here because the
+      // caller already dedupes by vector_entity_index and chunk id.
+      env.VECTORIZE.insert([vectorPayload]),
       // Retrying wrapper — bursty chunk writes (e.g., 15 chunks for a transcript
       // re-embed) can hit KV's per-namespace write throttle and 429. Audit
       // 2026-04-29 saw 3/5 transcripts fail on KV PUT 429 during reembed.

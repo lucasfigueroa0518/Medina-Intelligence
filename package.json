@@ -41,7 +41,14 @@
     "prospect:large-experiment": "tsx scripts/prospect-large-classifier-experiment.ts",
     "prospect:materialize-known-deals": "tsx scripts/prospect-materialize-known-deals.ts",
     "prospect:bridge-materialize": "tsx scripts/prospect-bridge-materialize.ts",
-    "crm:quality-review": "tsx scripts/crm-quality-review-export.ts"
+    "crm:quality-review": "tsx scripts/crm-quality-review-export.ts",
+    "crm:quality-canary": "tsx scripts/crm-quality-canary.ts",
+    "crm:quality-source-replay": "tsx scripts/crm-quality-source-replay.ts",
+    "crm:quality-local-d1-replay": "tsx scripts/crm-quality-local-d1-replay.ts",
+    "crm:quality-name-resolution-eval": "tsx scripts/crm-quality-name-resolution-eval.ts",
+    "crm:quality-approved-baseline": "tsx scripts/crm-quality-approved-baseline.ts",
+    "crm:quality-approved-harness-score": "tsx scripts/crm-quality-approved-harness-score.ts",
+    "crm:name-quality-experiment": "tsx scripts/crm-name-quality-experiment.ts"
   },
   "dependencies": {
     "@e965/xlsx": "^0.20.3",

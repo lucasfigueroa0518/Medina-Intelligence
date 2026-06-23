@@ -4,6 +4,8 @@ import { emitAudit } from './audit';
 import { updateEntityInIndex } from './entity-index';
 import type { ChannelContext } from './source-channels';
 import { evaluateProposal, recordApproval } from './proposal-evaluator';
+import { evaluateCrmQualityGate } from './crm-quality-gate';
+import { resolveCrmEntityNameWithEvidence } from './crm-name-resolver';
 
 interface FieldUpdate {
   field: string;
@@ -118,6 +120,7 @@ function normalizeTitle(value: string): string {
 
 function normalizeForComparison(field: string, value: string): string {
   const v = value.trim().toLowerCase();
+  if (field === 'full_name' || field === 'name' || field === 'canonical_name') return value.trim();
   if (field === 'phone') return v.replace(/[^\d+]/g, '');
   if (field === 'linkedin_url' || field === 'twitter_url') {
     return v.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '');
@@ -167,7 +170,45 @@ export async function proposeEntityUpdate(
   // case for non-meaningful fields) collapse to one corroboration
   // bucket. The evaluator keys pending_proposals by exact string so
   // normalization MUST happen here, not inside the evaluator.
-  const normalizedProposed = normalizeForComparison(field, proposedValue);
+  let qualityCheckedValue = proposedValue;
+  if ((entityType === 'contact' && field === 'full_name') || (entityType === 'company' && field === 'name')) {
+    const { resolution } = await resolveCrmEntityNameWithEvidence({
+      entityType,
+      rawName: proposedValue,
+      relationshipEvidence: true,
+      orgId,
+      entityId,
+      trigger: 'progressive_enrichment_propose_entity_update',
+      source: {
+        source_channel: source,
+        source_record_id: opts?.source_communication_id || null,
+        source_text: opts?.source_description || proposedValue,
+        codepath: 'progressive_enrichment_propose_entity_update',
+        evidence_level: confidence >= 0.8 ? 'corroborated' : 'weak_single_source',
+      },
+    }, env);
+    if (!resolution.normalizedName || resolution.status === 'no_entity' || resolution.status === 'fail') {
+      return 'skipped';
+    }
+    const gate = evaluateCrmQualityGate({
+      entityType,
+      action: 'update_name',
+      proposedName: resolution.normalizedName,
+      nameStatus: resolution.nameStatus,
+      source: {
+        source_channel: source,
+        source_record_id: opts?.source_communication_id || null,
+        source_text: opts?.source_description || proposedValue,
+        codepath: 'progressive_enrichment_propose_entity_update',
+      },
+    });
+    if (!['apply', 'queue'].includes(gate.decision) || !gate.normalizedName) {
+      return 'skipped';
+    }
+    qualityCheckedValue = gate.normalizedName;
+  }
+
+  const normalizedProposed = normalizeForComparison(field, qualityCheckedValue);
 
   const result = await evaluateProposal(
     {

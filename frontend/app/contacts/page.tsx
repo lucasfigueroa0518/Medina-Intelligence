@@ -8,6 +8,7 @@ import { DataTable, Column } from '@/components/data-table';
 import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
+import { TentativeNameBadge } from '@/components/tentative-name-badge';
 import { api } from '@/lib/api';
 import { initialFromName } from '@/lib/avatar';
 import { DEMO_CONTACT_TOTAL, demoCompany, demoContacts, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
@@ -33,6 +34,7 @@ interface Contact {
   last_contact_date?: string;
   total_interactions: number;
   next_followup_date?: string;
+  custom_fields?: string | Record<string, any> | null;
   tags?: { id: string; name: string; color: string }[];
 }
 
@@ -378,7 +380,10 @@ function ContactsPage() {
           <div className="w-8 h-8 shrink-0 rounded-full bg-brand-gradient flex items-center justify-center text-white text-xs font-medium">
             {initialFromName(row.full_name)}
           </div>
-          <span className="font-medium truncate" title={row.full_name}>{row.full_name}</span>
+          <div className="min-w-0">
+            <span className="font-medium truncate block" title={row.full_name}>{row.full_name}</span>
+            <TentativeNameBadge customFields={row.custom_fields} className="mt-1" />
+          </div>
         </div>
       ),
     },

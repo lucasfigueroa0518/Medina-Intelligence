@@ -71,6 +71,11 @@ export interface Env {
   READ_ONLY_PROD_PREVIEW?: string;
   // Optional guardrail: restrict local read-only preview token minting to one email.
   READ_ONLY_PREVIEW_EMAIL?: string;
+  // CRM name resolver rollout and production backfill controls.
+  CRM_NAME_RESOLVER_ENABLED?: string;
+  CRM_NAME_BACKFILL_APPLY_ENABLED?: string;
+  CRM_NAME_BACKFILL_MAX_NETWORK_ROWS?: string;
+  CRM_NAME_BACKFILL_MAX_FAILURE_RATE?: string;
 
   // --- Secrets (via `wrangler secret put`) ---
   AZURE_CLIENT_ID: string;

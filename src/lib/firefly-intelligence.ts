@@ -20,6 +20,13 @@ import {
 } from './discovery';
 import { isValidContactName, toTitleCase } from './name-quality';
 import { safelyMaintainContactReadModels } from './contact-maintenance';
+import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from './crm-quality-gate';
+import {
+  crmNameResolutionCustomFields,
+  resolveCrmEntityNameWithEvidence,
+  type CrmNameEvidenceCandidate,
+} from './crm-name-resolver';
+import { reconcileMatchedEntityName } from './crm-name-promotion';
 
 export interface AutoContactResult {
   contactId: string;
@@ -51,12 +58,11 @@ export function normalizeAttendeeName(raw: string | null | undefined): string | 
     }
   }
 
-  // Single lowercase token — title-case it. isValidContactName will accept
-  // a capitalized single-word name in our context (≥3 chars, no digit run).
+  // Single lowercase token: title-case it, then let the shared quality gate
+  // decide whether this context has enough evidence to create a contact.
   const cap = toTitleCase(s);
   // Single-word names below 3 chars almost always indicate truncation/junk
   if (!cap.includes(' ') && cap.length < 3) return null;
-  // Title-cased single token like "Tony" passes the all-lowercase guard.
   if (isValidContactName(cap)) return cap;
   return null;
 }
@@ -66,6 +72,7 @@ export async function autoCreateContactFromAttendee(args: {
   displayName: string | null | undefined;
   orgId: string;
   env: Env;
+  evidenceCandidates?: CrmNameEvidenceCandidate[] | null;
 }): Promise<AutoContactResult | null> {
   const { email, displayName, orgId, env } = args;
 
@@ -83,12 +90,59 @@ export async function autoCreateContactFromAttendee(args: {
     'SELECT id, company_id FROM contacts WHERE org_id = ? AND LOWER(email) = ? AND deleted_at IS NULL LIMIT 1'
   ).bind(orgId, normalized).first<{ id: string; company_id: string | null }>();
   if (existing) {
+    await reconcileMatchedEntityName({
+      entityType: 'contact',
+      entityId: existing.id,
+      orgId,
+      rawName: displayName || normalized,
+      email: normalized,
+      trigger: 'firefly_auto_create_contact_existing_match',
+      runtimeEvidenceCandidates: args.evidenceCandidates || null,
+      channelSource: 'firefly_attendee_data',
+      source: {
+        source_channel: 'firefly',
+        source_text: displayName || normalized,
+        codepath: 'firefly_auto_create_contact_existing_match',
+        evidence_level: 'corroborated',
+      },
+    }, env).catch(e => console.error(`[firefly-intel] contact name reconciliation failed for ${existing.id}:`, e));
     return { contactId: existing.id, created: false, companyId: existing.company_id };
   }
 
-  const cleanName = normalizeAttendeeName(displayName);
-  if (!cleanName) {
+  const { resolution: nameResolution } = await resolveCrmEntityNameWithEvidence({
+    entityType: 'contact',
+    rawName: displayName || normalized,
+    email: normalized,
+    relationshipEvidence: true,
+    orgId,
+    trigger: 'firefly_auto_create_contact_from_attendee',
+    runtimeEvidenceCandidates: args.evidenceCandidates || null,
+    source: {
+      source_channel: 'firefly',
+      source_text: displayName || normalized,
+      codepath: 'firefly_auto_create_contact_from_attendee',
+      evidence_level: 'weak_single_source',
+    },
+  }, env);
+  if (!nameResolution.normalizedName || nameResolution.status === 'no_entity' || nameResolution.status === 'fail') {
     console.log(`[firefly-intel] skip auto-create ${normalized}: unusable displayName=${JSON.stringify(displayName)}`);
+    return null;
+  }
+  const contactGate = evaluateCrmQualityGate({
+    entityType: 'contact',
+    action: 'create',
+    proposedName: nameResolution.normalizedName,
+    email: normalized,
+    nameStatus: nameResolution.nameStatus,
+    source: {
+      source_channel: 'firefly',
+      source_text: displayName || nameResolution.normalizedName,
+      codepath: 'firefly_auto_create_contact_from_attendee',
+      evidence_level: 'weak_single_source',
+    },
+  });
+  if (!contactGate.writeAllowed || !contactGate.normalizedName) {
+    console.log(`[firefly-intel] skip auto-create ${normalized}: ${contactGate.reasons.join('; ')}`);
     return null;
   }
 
@@ -103,11 +157,12 @@ export async function autoCreateContactFromAttendee(args: {
   }
 
   const contactId = crypto.randomUUID();
+  const customFields = crmNameResolutionCustomFields(nameResolution, crmQualityCustomFieldsForGate(contactGate));
   const result = await env.D1.prepare(
     `INSERT OR IGNORE INTO contacts
-       (id, org_id, full_name, email, company_id, source, source_confidence, contact_type, total_interactions)
-     VALUES (?, ?, ?, ?, ?, 'firefly', 0.7, 'individual', 0)`
-  ).bind(contactId, orgId, cleanName, normalized, companyId).run();
+       (id, org_id, full_name, email, company_id, source, source_confidence, contact_type, total_interactions, custom_fields)
+     VALUES (?, ?, ?, ?, ?, 'firefly', 0.7, 'individual', 0, ?)`
+  ).bind(contactId, orgId, contactGate.normalizedName, normalized, companyId, customFields).run();
 
   if (!result.meta?.changes) {
     // Race: someone created the contact between our SELECT and INSERT.
@@ -118,7 +173,7 @@ export async function autoCreateContactFromAttendee(args: {
     return null;
   }
 
-  console.log(`[firefly-intel] auto-created contact ${cleanName} <${normalized}> id=${contactId} company=${companyId || 'none'}`);
+  console.log(`[firefly-intel] auto-created contact ${contactGate.normalizedName} <${normalized}> id=${contactId} company=${companyId || 'none'}`);
   await safelyMaintainContactReadModels(env, orgId, contactId, 'firefly_contact_created');
   return { contactId, created: true, companyId };
 }

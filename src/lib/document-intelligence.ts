@@ -13,6 +13,7 @@ import { enqueueDocumentEmbeddingRepair } from './document-embedding';
 import { isVerifiedContactCompanyAffiliation } from './contact-company-affiliation';
 import { safelyMaintainContactReadModels } from './contact-maintenance';
 import { CLAUDE_HAIKU_MODEL, resolveQualityExceptionClaudeModel } from './model-policy';
+import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from './crm-quality-gate';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Types
@@ -1168,15 +1169,37 @@ async function routeContact(
   const now = new Date().toISOString();
 
   const companyId: string | null = companyIdForAssignment;
+  const contactGate = evaluateCrmQualityGate({
+    entityType: 'contact',
+    action: 'create',
+    proposedName: extracted.full_name,
+    email,
+    source: {
+      source_channel: 'document_intelligence',
+      source_record_id: documentId,
+      source_text: extracted.full_name,
+      codepath: 'document_intelligence_route_contact',
+    },
+  });
+  if (!contactGate.writeAllowed || !contactGate.normalizedName) {
+    return {
+      created: false,
+      updated: false,
+      skipped: true,
+      id: null,
+      skip_reason: 'crm_quality_gate_blocked',
+    };
+  }
+  const customFields = crmQualityCustomFieldsForGate(contactGate);
 
   await env.D1.prepare(
     `INSERT INTO contacts
        (id, org_id, full_name, email, phone, job_title, linkedin_url, location, company_id,
-        source, source_confidence, contact_type, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'import', ?, 'individual', ?, ?)`
+        source, source_confidence, contact_type, custom_fields, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'import', ?, 'individual', ?, ?, ?)`
   ).bind(
     contactId, orgId,
-    extracted.full_name,
+    contactGate.normalizedName,
     email,
     extracted.phone || null,
     extracted.job_title || null,
@@ -1184,6 +1207,7 @@ async function routeContact(
     extracted.location || null,
     companyId,
     extracted.confidence,
+    customFields,
     now, now
   ).run();
 
@@ -1202,7 +1226,22 @@ async function routeCompany(
   const normalizedStage = normalizeCompanyStage(extracted.stage);
   if (match.matched_id && match.match_type !== 'new') {
     const valuation = extracted.valuation ? String(extracted.valuation) : null;
+    const nameGate = extracted.name ? evaluateCrmQualityGate({
+      entityType: 'company',
+      action: 'update_name',
+      proposedName: extracted.name,
+      domain: extracted.domain || null,
+      website: extracted.website || null,
+      source: {
+        source_channel: 'document_intelligence',
+        source_record_id: documentId,
+        source_text: extracted.name,
+        codepath: 'document_intelligence_route_company_update',
+      },
+    }) : null;
+    const safeName = nameGate?.writeAllowed && nameGate.normalizedName ? nameGate.normalizedName : null;
     const hasUpdates = !!(
+      safeName ||
       extracted.sector ||
       extracted.website ||
       extracted.description ||
@@ -1233,7 +1272,7 @@ async function routeCompany(
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
           WHERE id = ? AND org_id = ?`
       ).bind(
-        extracted.name || null, extracted.name || null,
+        safeName, safeName,
         extracted.sector || null, extracted.sector || null,
         extracted.website || null, extracted.website || null,
         extracted.description || null, extracted.description || null,
@@ -1250,16 +1289,33 @@ async function routeCompany(
   const now = new Date().toISOString();
   const domain = normalizeLookupDomain(extracted.domain || extracted.website) || null;
   const website = extracted.website || (domain ? `https://${domain}` : null);
+  const companyGate = evaluateCrmQualityGate({
+    entityType: 'company',
+    action: 'create',
+    proposedName: extracted.name,
+    domain,
+    website,
+    source: {
+      source_channel: 'document_intelligence',
+      source_record_id: documentId,
+      source_text: extracted.name,
+      codepath: 'document_intelligence_route_company_create',
+    },
+  });
+  if (!companyGate.writeAllowed || !companyGate.normalizedName) {
+    throw new Error(`CRM_QUALITY_GATE_BLOCKED:${companyGate.reasons.join('; ')}`);
+  }
+  const customFields = crmQualityCustomFieldsForGate(companyGate);
 
   try {
     await env.D1.prepare(
       `INSERT INTO companies
          (id, org_id, name, domain, website, sector, company_type, hq_location, description,
-          stage, investment_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)`
+          stage, investment_status, custom_fields, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?, ?)`
     ).bind(
       companyId, orgId,
-      extracted.name,
+      companyGate.normalizedName,
       domain,
       website,
       extracted.sector || null,
@@ -1267,6 +1323,7 @@ async function routeCompany(
       extracted.location || null,
       extracted.description || null,
       normalizedStage || null,
+      customFields,
       now, now
     ).run();
   } catch (e: any) {
