@@ -723,6 +723,14 @@ async function routeAuthenticated(
       const { resumeCrmNameBackfillHandler } = await import('./handlers/crm-name-backfill');
       return resumeCrmNameBackfillHandler(m[1], ctx, env);
     }
+    if (path === '/api/admin/crm-entity-cleanup/validate' && method === 'GET') {
+      const { validateCrmEntityCleanupHandler } = await import('./handlers/crm-entity-cleanup');
+      return validateCrmEntityCleanupHandler(ctx, env);
+    }
+    if (path === '/api/admin/crm-entity-cleanup/apply' && method === 'POST') {
+      const { applyCrmEntityCleanupHandler } = await import('./handlers/crm-entity-cleanup');
+      return applyCrmEntityCleanupHandler(request, ctx, env);
+    }
     if (path === '/api/admin/enrichment-status' && method === 'GET')
       return Admin.getEnrichmentStatus(ctx, env);
     if (path === '/api/admin/clear-rate-limit' && method === 'POST')

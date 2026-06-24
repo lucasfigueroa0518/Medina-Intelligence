@@ -48,7 +48,8 @@
     "crm:quality-name-resolution-eval": "tsx scripts/crm-quality-name-resolution-eval.ts",
     "crm:quality-approved-baseline": "tsx scripts/crm-quality-approved-baseline.ts",
     "crm:quality-approved-harness-score": "tsx scripts/crm-quality-approved-harness-score.ts",
-    "crm:name-quality-experiment": "tsx scripts/crm-name-quality-experiment.ts"
+    "crm:name-quality-experiment": "tsx scripts/crm-name-quality-experiment.ts",
+    "crm:production-cleanup-build-sql": "tsx scripts/crm-production-cleanup-build-sql.ts"
   },
   "dependencies": {
     "@e965/xlsx": "^0.20.3",

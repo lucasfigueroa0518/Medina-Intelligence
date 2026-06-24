@@ -7,11 +7,14 @@ import {
   getCrmNameBackfillRunStatus,
   resumeCrmNameBackfillRun,
   startCrmNameBackfillRun,
+  type CrmNameBackfillApplyStrategy,
   type CrmNameBackfillMode,
 } from '../lib/crm-name-backfill';
 
 interface StartBackfillBody {
   mode?: CrmNameBackfillMode;
+  apply_strategy?: CrmNameBackfillApplyStrategy;
+  source_run_id?: string;
   shard_count?: number;
   chunk_size?: number;
 }
@@ -48,6 +51,7 @@ export async function startCrmNameBackfillHandler(
 ): Promise<Response> {
   const body = (await parseJsonBody<StartBackfillBody>(request)) || {};
   const mode: CrmNameBackfillMode = body.mode === 'apply' ? 'apply' : 'dry_run';
+  const applyStrategy: CrmNameBackfillApplyStrategy = body.apply_strategy === 'reviewed_results' ? 'reviewed_results' : 'resolver';
   const shardCount = normalizePositiveInt(body.shard_count, DEFAULT_CRM_NAME_BACKFILL_SHARDS, 64);
   const chunkSize = normalizePositiveInt(body.chunk_size, 4, 20);
   try {
@@ -58,6 +62,8 @@ export async function startCrmNameBackfillHandler(
       mode,
       shardCount,
       chunkSize,
+      applyStrategy,
+      sourceRunId: body.source_run_id || null,
     });
     return jsonResponse({ ok: true, ...result });
   } catch (error) {
