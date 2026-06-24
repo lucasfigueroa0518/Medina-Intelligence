@@ -70,7 +70,9 @@ function readCsv(file: string): Record<string, string>[] {
 }
 
 const statements: string[] = [
-  'BEGIN TRANSACTION;',
+  '-- Idempotent CRM reviewed name overlay + cleanup plan import.',
+  '-- D1 remote SQL uploads reject explicit BEGIN/COMMIT wrappers, so every',
+  '-- statement below is an upsert that can be safely retried.',
 ];
 
 let overrideCount = 0;
@@ -145,8 +147,6 @@ for (const row of cleanupRows) {
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');`
   );
 }
-
-statements.push('COMMIT;');
 
 if (mergeCount !== 26) throw new Error(`Expected 26 merge rows, found ${mergeCount}`);
 if (deleteCount !== 27) throw new Error(`Expected 27 delete rows, found ${deleteCount}`);
