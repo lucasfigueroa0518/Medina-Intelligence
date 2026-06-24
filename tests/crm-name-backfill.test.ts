@@ -118,6 +118,40 @@ describe('CRM name backfill rollout infrastructure', () => {
     })).rejects.toThrow('CRM_NAME_BACKFILL_APPLY_DISABLED');
   });
 
+  it('requires a source run for reviewed-results mode', async () => {
+    const env = { D1: new FakeD1(), CRM_NAME_BACKFILL_APPLY_ENABLED: 'false' } as any;
+    await expect(startCrmNameBackfillRun({
+      env,
+      orgId: 'org-1',
+      requestedBy: 'user-1',
+      mode: 'dry_run',
+      applyStrategy: 'reviewed_results',
+    })).rejects.toThrow('CRM_NAME_BACKFILL_SOURCE_RUN_REQUIRED');
+  });
+
+  it('threads reviewed-results source run metadata into every shard payload', async () => {
+    const db = new FakeD1();
+    const env = { D1: db } as any;
+    const result = await startCrmNameBackfillRun({
+      env,
+      orgId: 'org-1',
+      requestedBy: 'user-1',
+      mode: 'dry_run',
+      shardCount: 3,
+      applyStrategy: 'reviewed_results',
+      sourceRunId: 'source-run-1',
+    });
+
+    expect(result.apply_strategy).toBe('reviewed_results');
+    expect(result.source_run_id).toBe('source-run-1');
+    expect(db.work).toHaveLength(6);
+    for (const row of db.work) {
+      const payload = JSON.parse(row.payload);
+      expect(payload.apply_strategy).toBe('reviewed_results');
+      expect(payload.source_run_id).toBe('source-run-1');
+    }
+  });
+
   it('does not advance a shard cursor past uninspected rows when a chunk fills mid-page', () => {
     const candidates = Array.from({ length: 200 }, (_, i) => ({
       id: `entity-${String(i).padStart(4, '0')}`,

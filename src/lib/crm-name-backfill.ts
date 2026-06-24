@@ -19,6 +19,7 @@ const DEFAULT_ENTITY_CHUNK_SIZE = 4;
 const SCAN_MULTIPLIER = 12;
 
 export type CrmNameBackfillMode = 'dry_run' | 'apply';
+export type CrmNameBackfillApplyStrategy = 'resolver' | 'reviewed_results';
 export type CrmNameBackfillEntityType = Extract<CrmEntityType, 'contact' | 'company'>;
 
 export type CrmNameBackfillAction =
@@ -41,6 +42,8 @@ export interface CrmNameBackfillPayload {
   cursor?: string | null;
   mode: CrmNameBackfillMode;
   chunk_size?: number | null;
+  apply_strategy?: CrmNameBackfillApplyStrategy | null;
+  source_run_id?: string | null;
 }
 
 interface EntityRow {
@@ -77,12 +80,33 @@ interface BackfillRunRow {
   status: 'queued' | 'running' | 'completed' | 'cancelled' | 'failed';
   mode: CrmNameBackfillMode;
   shard_count: number;
+  apply_strategy?: CrmNameBackfillApplyStrategy | null;
+  source_run_id?: string | null;
 }
 
 interface BackfillBudgetRow {
   scanned_count: number;
   failed_count: number;
   network_rows: number;
+}
+
+interface ReviewedBackfillSourceRow {
+  entity_type: CrmNameBackfillEntityType;
+  entity_id: string;
+  before_name: string | null;
+  before_status: string | null;
+  proposed_name: string | null;
+  proposed_status: string | null;
+  action: CrmNameBackfillAction;
+  confidence: string | null;
+  evidence_summary: string | null;
+  rule_ids: string | null;
+  risk_flags: string | null;
+  cost_tier: number | null;
+  network_calls: number | null;
+  cache_hits: number | null;
+  override_rationale: string | null;
+  override_source_artifact: string | null;
 }
 
 function clean(value: unknown): string {
@@ -112,6 +136,16 @@ function parsePending(raw: string | null | undefined): Record<string, string[]> 
   return out;
 }
 
+function parseStringArray(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(item => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 function nameStatusFromCustomFields(customFields: string | null): CrmQualityNameStatus {
   const status = parseJson(customFields).crm_quality?.name_status;
   return status === 'provisional' || status === 'domain_placeholder' ? status : 'verified';
@@ -123,6 +157,10 @@ function statusFromResolution(resolution: CrmNameResolutionResult): CrmQualityNa
   if (resolution.status === 'provisional') return 'provisional';
   if (resolution.status === 'domain_placeholder') return 'domain_placeholder';
   return null;
+}
+
+function isCrmQualityNameStatus(value: string | null | undefined): value is CrmQualityNameStatus {
+  return value === 'verified' || value === 'provisional' || value === 'domain_placeholder';
 }
 
 function fieldNameFor(entityType: CrmNameBackfillEntityType): 'full_name' | 'name' {
@@ -429,6 +467,212 @@ async function applyNameBackfill(args: {
   return true;
 }
 
+function reviewedResolution(args: {
+  entityType: CrmNameBackfillEntityType;
+  entityId: string;
+  proposedName: string;
+  proposedStatus: CrmQualityNameStatus;
+  confidence: string | null;
+  evidenceSummary: string | null;
+  ruleIds: string[];
+  riskFlags: string[];
+}): CrmNameResolutionResult {
+  const confidence = args.confidence === 'high' || args.confidence === 'medium' || args.confidence === 'low'
+    ? args.confidence
+    : 'medium';
+  const ruleIds = Array.from(new Set(['RULE-CRM-NAME-REVIEWED-APPLY-001', ...args.ruleIds]));
+  return {
+    status: args.proposedStatus,
+    normalizedName: args.proposedName,
+    nameStatus: args.proposedStatus,
+    confidence,
+    ruleIds,
+    reasons: [
+      'reviewed production dry-run result applied without resolver recompute',
+      ...(args.evidenceSummary ? [args.evidenceSummary] : []),
+    ],
+    candidates: [{
+      candidateName: args.proposedName,
+      normalizedName: args.proposedName,
+      status: args.proposedStatus,
+      confidence,
+      score: 100,
+      ruleIds,
+      reason: 'reviewed production dry-run result',
+      sourceText: args.evidenceSummary || args.proposedName,
+      accepted: true,
+      risk_flags: args.riskFlags as any,
+    }],
+    evidence: {
+      source_channel: 'crm_name_reviewed_apply',
+      source_record_id: args.entityId,
+      source_text: args.evidenceSummary || args.proposedName,
+      codepath: 'crm_name_backfill_reviewed_results',
+      evidence_level: 'corroborated',
+    },
+  };
+}
+
+async function fetchReviewedResultCandidates(args: {
+  env: Env;
+  orgId: string;
+  sourceRunId: string;
+  entityType: CrmNameBackfillEntityType;
+  cursor: string | null;
+  scanLimit: number;
+}): Promise<ReviewedBackfillSourceRow[]> {
+  const rows = await args.env.D1.prepare(
+    `SELECT
+        s.entity_type,
+        s.entity_id,
+        s.before_name,
+        s.before_status,
+        COALESCE(o.corrected_name, s.proposed_name) AS proposed_name,
+        COALESCE(o.corrected_status, s.proposed_status) AS proposed_status,
+        COALESCE(o.corrected_action, s.action) AS action,
+        COALESCE(o.corrected_confidence, s.confidence) AS confidence,
+        CASE
+          WHEN o.id IS NOT NULL THEN COALESCE(o.rationale, '') || ' | reviewed_override=' || COALESCE(o.source_artifact, 'unknown')
+          ELSE s.evidence_summary
+        END AS evidence_summary,
+        s.rule_ids,
+        s.risk_flags,
+        s.cost_tier,
+        0 AS network_calls,
+        s.cache_hits,
+        o.rationale AS override_rationale,
+        o.source_artifact AS override_source_artifact
+       FROM crm_name_backfill_results s
+       LEFT JOIN crm_name_backfill_review_overrides o
+         ON o.org_id = s.org_id
+        AND o.source_run_id = s.run_id
+        AND o.entity_type = s.entity_type
+        AND o.entity_id = s.entity_id
+        AND o.apply_ready = 1
+      WHERE s.org_id = ?
+        AND s.run_id = ?
+        AND s.entity_type = ?
+        AND s.entity_id > ?
+      ORDER BY s.entity_id ASC
+      LIMIT ?`
+  ).bind(args.orgId, args.sourceRunId, args.entityType, args.cursor || '', args.scanLimit).all<ReviewedBackfillSourceRow>();
+  return rows.results;
+}
+
+async function evaluateAndMaybeApplyReviewedCrmNameBackfillResult(args: {
+  env: Env;
+  runId: string;
+  orgId: string;
+  sourceRunId: string;
+  sourceRow: ReviewedBackfillSourceRow;
+  shardIndex: number;
+  shardCount: number;
+  mode: CrmNameBackfillMode;
+}): Promise<CrmNameBackfillAction> {
+  const entityType = args.sourceRow.entity_type;
+  const entityId = args.sourceRow.entity_id;
+  const row = await loadEntity(args.env, args.orgId, entityType, entityId);
+  const beforeName = clean(row?.name || args.sourceRow.before_name || '');
+  const beforeStatus = row ? nameStatusFromCustomFields(row.custom_fields) : clean(args.sourceRow.before_status);
+  const proposedName = clean(args.sourceRow.proposed_name);
+  const proposedStatus = isCrmQualityNameStatus(args.sourceRow.proposed_status) ? args.sourceRow.proposed_status : null;
+  const action = args.sourceRow.action;
+  const ruleIds = parseStringArray(args.sourceRow.rule_ids);
+  const riskFlags = parseStringArray(args.sourceRow.risk_flags);
+  const evidenceSummary = clean(args.sourceRow.evidence_summary);
+
+  if (!row || row.deleted_at || row.merged_into) {
+    await writeResult({
+      env: args.env,
+      runId: args.runId,
+      orgId: args.orgId,
+      entityType,
+      entityId,
+      shardIndex: args.shardIndex,
+      shardCount: args.shardCount,
+      mode: args.mode,
+      beforeName,
+      beforeStatus,
+      proposedName: '',
+      proposedStatus: '',
+      action: 'skip_merged_or_deleted',
+      applied: false,
+      reviewedEvidenceSummary: evidenceSummary,
+      reviewedRuleIds: ruleIds,
+      reviewedRiskFlags: riskFlags,
+      reviewedCostTier: args.sourceRow.cost_tier || 0,
+      reviewedNetworkCalls: 0,
+      reviewedCacheHits: args.sourceRow.cache_hits || 0,
+    });
+    await bumpRunCounts({ env: args.env, runId: args.runId, action: 'skip_merged_or_deleted' });
+    return 'skip_merged_or_deleted';
+  }
+
+  let applied = false;
+  let error: string | null = null;
+  let resolution: CrmNameResolutionResult | undefined;
+  const canApplyNameAction = ['set_status_verified', 'rename_verified', 'rename_provisional', 'set_domain_placeholder', 'record_pending_proposal'].includes(action);
+
+  if (canApplyNameAction && proposedName && proposedStatus) {
+    resolution = reviewedResolution({
+      entityType,
+      entityId,
+      proposedName,
+      proposedStatus,
+      confidence: args.sourceRow.confidence,
+      evidenceSummary,
+      ruleIds,
+      riskFlags,
+    });
+    if (args.mode === 'apply' && args.env.CRM_NAME_BACKFILL_APPLY_ENABLED === 'true') {
+      applied = await applyNameBackfill({
+        env: args.env,
+        orgId: args.orgId,
+        entityType,
+        entityId,
+        beforeName,
+        proposedName,
+        proposedStatus,
+        action,
+        resolution,
+        existingCustomFields: row.custom_fields,
+      });
+    }
+  } else if (action === 'error') {
+    error = evidenceSummary || 'source dry-run result was an error';
+  } else if (!['no_op_verified', 'skip_locked', 'skip_merged_or_deleted'].includes(action)) {
+    error = `reviewed_result_not_applicable:${action}`;
+  }
+
+  await writeResult({
+    env: args.env,
+    runId: args.runId,
+    orgId: args.orgId,
+    entityType,
+    entityId,
+    shardIndex: args.shardIndex,
+    shardCount: args.shardCount,
+    mode: args.mode,
+    beforeName,
+    beforeStatus,
+    proposedName,
+    proposedStatus: proposedStatus || clean(args.sourceRow.proposed_status),
+    action,
+    applied,
+    resolution,
+    error,
+    reviewedConfidence: args.sourceRow.confidence,
+    reviewedEvidenceSummary: evidenceSummary,
+    reviewedRuleIds: ruleIds,
+    reviewedRiskFlags: riskFlags,
+    reviewedCostTier: args.sourceRow.cost_tier || 0,
+    reviewedNetworkCalls: 0,
+    reviewedCacheHits: args.sourceRow.cache_hits || 0,
+  });
+  await bumpRunCounts({ env: args.env, runId: args.runId, action });
+  return action;
+}
+
 async function writeResult(args: {
   env: Env;
   runId: string;
@@ -447,14 +691,21 @@ async function writeResult(args: {
   resolution?: CrmNameResolutionResult;
   bundle?: CrmNameEvidenceBundle;
   error?: string | null;
+  reviewedConfidence?: string | null;
+  reviewedEvidenceSummary?: string | null;
+  reviewedRuleIds?: string[];
+  reviewedRiskFlags?: string[];
+  reviewedCostTier?: number | null;
+  reviewedNetworkCalls?: number | null;
+  reviewedCacheHits?: number | null;
 }): Promise<void> {
-  const confidence = args.resolution?.confidence || null;
-  const riskFlags = args.resolution ? selectedRiskFlags(args.resolution) : [];
-  const ruleIds = args.resolution ? selectedRuleIds(args.resolution) : [];
-  const networkCalls = args.bundle?.network_calls || 0;
-  const cacheHits = args.bundle?.cache_hits || 0;
-  const costTier = args.bundle ? maxCostTier(args.bundle) : 0;
-  const summary = args.bundle && args.resolution ? evidenceSummary(args.bundle, args.resolution) : '';
+  const confidence = args.resolution?.confidence || args.reviewedConfidence || null;
+  const riskFlags = args.resolution ? selectedRiskFlags(args.resolution) : (args.reviewedRiskFlags || []);
+  const ruleIds = args.resolution ? selectedRuleIds(args.resolution) : (args.reviewedRuleIds || []);
+  const networkCalls = args.bundle?.network_calls || args.reviewedNetworkCalls || 0;
+  const cacheHits = args.bundle?.cache_hits || args.reviewedCacheHits || 0;
+  const costTier = args.bundle ? maxCostTier(args.bundle) : (args.reviewedCostTier || 0);
+  const summary = args.bundle && args.resolution ? evidenceSummary(args.bundle, args.resolution) : (args.reviewedEvidenceSummary || '');
 
   await args.env.D1.prepare(
     `INSERT INTO crm_name_backfill_results
@@ -737,6 +988,55 @@ export async function processCrmNameBackfillShardPayload(
   let processed = 0;
   let scanned = 0;
   let done = false;
+  const applyStrategy = payload.apply_strategy || 'resolver';
+
+  if (applyStrategy === 'reviewed_results') {
+    if (!payload.source_run_id) throw new Error('crm_name_backfill_source_run_id_required');
+    while (processed < chunkSize) {
+      const candidates = await fetchReviewedResultCandidates({
+        env,
+        orgId: payload.org_id,
+        sourceRunId: payload.source_run_id,
+        entityType: payload.entity_type,
+        cursor,
+        scanLimit,
+      });
+      if (candidates.length === 0) {
+        done = true;
+        break;
+      }
+      const page = selectCrmNameBackfillShardPage({
+        candidates: candidates.map(row => ({ ...row, id: row.entity_id })),
+        shardIndex: payload.shard_index,
+        shardCount: payload.shard_count,
+        remaining: chunkSize - processed,
+      });
+      scanned += page.inspected;
+      cursor = page.cursor || cursor;
+      for (const row of page.selected) {
+        await evaluateAndMaybeApplyReviewedCrmNameBackfillResult({
+          env,
+          runId: payload.run_id,
+          orgId: payload.org_id,
+          sourceRunId: payload.source_run_id,
+          sourceRow: row,
+          shardIndex: payload.shard_index,
+          shardCount: payload.shard_count,
+          mode: payload.mode,
+        });
+        processed++;
+      }
+    }
+
+    await env.D1.prepare(
+      `UPDATE crm_name_backfill_runs
+          SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(payload.run_id).run();
+
+    return { processed, scanned, cursor: cursor || null, done };
+  }
 
   while (processed < chunkSize) {
     const candidates = await fetchShardCandidates({
@@ -827,11 +1127,17 @@ export async function startCrmNameBackfillRun(args: {
   mode?: CrmNameBackfillMode;
   shardCount?: number;
   chunkSize?: number;
-}): Promise<{ run_id: string; enqueued: number; shard_count: number; mode: CrmNameBackfillMode }> {
+  applyStrategy?: CrmNameBackfillApplyStrategy;
+  sourceRunId?: string | null;
+}): Promise<{ run_id: string; enqueued: number; shard_count: number; mode: CrmNameBackfillMode; apply_strategy: CrmNameBackfillApplyStrategy; source_run_id: string | null }> {
   const mode = args.mode || 'dry_run';
+  const applyStrategy = args.applyStrategy || 'resolver';
   const shardCount = Math.max(1, Math.min(args.shardCount || DEFAULT_CRM_NAME_BACKFILL_SHARDS, 64));
   if (mode === 'apply' && args.env.CRM_NAME_BACKFILL_APPLY_ENABLED !== 'true') {
     throw new Error('CRM_NAME_BACKFILL_APPLY_DISABLED');
+  }
+  if (applyStrategy === 'reviewed_results' && !args.sourceRunId) {
+    throw new Error('CRM_NAME_BACKFILL_SOURCE_RUN_REQUIRED');
   }
   const existing = await args.env.D1.prepare(
     `SELECT id FROM crm_name_backfill_runs
@@ -844,9 +1150,9 @@ export async function startCrmNameBackfillRun(args: {
   const runId = crypto.randomUUID();
   await args.env.D1.prepare(
     `INSERT INTO crm_name_backfill_runs
-       (id, org_id, status, mode, shard_count, requested_by, started_at, heartbeat_at)
-     VALUES (?, ?, 'queued', ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
-  ).bind(runId, args.orgId, mode, shardCount, args.requestedBy || null).run();
+       (id, org_id, status, mode, shard_count, requested_by, started_at, heartbeat_at, apply_strategy, source_run_id)
+     VALUES (?, ?, 'queued', ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?)`
+  ).bind(runId, args.orgId, mode, shardCount, args.requestedBy || null, applyStrategy, args.sourceRunId || null).run();
 
   let enqueued = 0;
   for (const entityType of ['company', 'contact'] as CrmNameBackfillEntityType[]) {
@@ -860,6 +1166,8 @@ export async function startCrmNameBackfillRun(args: {
         cursor: null,
         mode,
         chunk_size: args.chunkSize || DEFAULT_ENTITY_CHUNK_SIZE,
+        apply_strategy: applyStrategy,
+        source_run_id: args.sourceRunId || null,
       };
       const result = await enqueueWork(args.env, args.orgId, CRM_NAME_BACKFILL_DOMAIN, payload, {
         idempotency_key: `crm-name-backfill:${runId}:${entityType}:${shardIndex}`,
@@ -870,7 +1178,7 @@ export async function startCrmNameBackfillRun(args: {
       if (result.inserted) enqueued++;
     }
   }
-  return { run_id: runId, enqueued, shard_count: shardCount, mode };
+  return { run_id: runId, enqueued, shard_count: shardCount, mode, apply_strategy: applyStrategy, source_run_id: args.sourceRunId || null };
 }
 
 export async function getCrmNameBackfillRunStatus(env: Env, orgId: string, runId: string): Promise<Record<string, unknown> | null> {
