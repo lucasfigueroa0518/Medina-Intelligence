@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { api, clearAuthToken } from '@/lib/api';
+import { prewarmContactsList } from '@/lib/use-contact-list';
 import { useAuthSession } from '@/components/auth-guard';
 import { MedinaLogo } from './medina-logo';
 import { MartyEmblem } from './marty-emblem';
@@ -46,6 +47,14 @@ export function Sidebar() {
   const { user: me, isAdmin } = useAuthSession();
   const [martyPending, setMartyPending] = React.useState(false);
   const [loggingOut, setLoggingOut] = React.useState(false);
+  const warmedContactsRef = React.useRef(false);
+
+  const prewarmContacts = React.useCallback(() => {
+    if (warmedContactsRef.current) return;
+    warmedContactsRef.current = true;
+    router.prefetch('/contacts');
+    prewarmContactsList();
+  }, [router]);
 
   React.useEffect(() => {
     // Check initial state
@@ -60,6 +69,17 @@ export function Sidebar() {
     window.addEventListener('marty-pending-change', handler);
     return () => window.removeEventListener('marty-pending-change', handler);
   }, []);
+
+  React.useEffect(() => {
+    if (!me) return;
+    const win = window as Window & { requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number; cancelIdleCallback?: (id: number) => void };
+    if (win.requestIdleCallback) {
+      const id = win.requestIdleCallback(prewarmContacts, { timeout: 3000 });
+      return () => win.cancelIdleCallback?.(id);
+    }
+    const id = window.setTimeout(prewarmContacts, 1500);
+    return () => window.clearTimeout(id);
+  }, [me, prewarmContacts]);
 
   const initial = me?.full_name?.trim()?.charAt(0)?.toUpperCase() || me?.email?.charAt(0)?.toUpperCase() || '?';
   const displayName = me?.full_name?.trim() || me?.email || 'Loading…';
@@ -87,6 +107,8 @@ export function Sidebar() {
             <Link
               key={link.route}
               href={link.href ?? link.route}
+              onPointerEnter={link.route === '/contacts' ? prewarmContacts : undefined}
+              onFocus={link.route === '/contacts' ? prewarmContacts : undefined}
               className={`flex items-center gap-3 px-3 h-10 rounded-lg transition-colors ${
                 active
                   ? 'bg-accent-magenta/10 text-text-primary border-l-2 border-accent-magenta pl-[10px]'

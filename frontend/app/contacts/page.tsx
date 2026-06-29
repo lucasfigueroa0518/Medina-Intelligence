@@ -9,8 +9,8 @@ import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { TentativeNameBadge } from '@/components/tentative-name-badge';
-import { api } from '@/lib/api';
 import { initialFromName } from '@/lib/avatar';
+import { useContactList } from '@/lib/use-contact-list';
 import { DEMO_CONTACT_TOTAL, demoCompany, demoContacts, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import { Search, Plus, X as XIcon, Settings2 } from 'lucide-react';
 
@@ -78,7 +78,7 @@ const SORT_OPTIONS: SortOption[] = [
   { key: 'created_at',   label: 'Date Added (newest first)',   defaultDir: 'desc' },
 ];
 
-const PAGE_SIZE = 100;
+const PAGE_SIZE = 250;
 
 interface FilterState {
   search: string;
@@ -196,13 +196,7 @@ function ContactsPage() {
   );
   const [searchInput, setSearchInput] = React.useState(filters.search);
   const searchDebounceRef = React.useRef<ReturnType<typeof setTimeout>>();
-  const contactsRequestSeqRef = React.useRef(0);
-  const contactsAbortRef = React.useRef<AbortController | null>(null);
 
-  const [contacts, setContacts] = React.useState<Contact[]>([]);
-  const [total, setTotal] = React.useState(0);
-  const [loading, setLoading] = React.useState(true);
-  const [loadingMore, setLoadingMore] = React.useState(false);
   const [createOpen, setCreateOpen] = React.useState(false);
   const [tagManagerOpen, setTagManagerOpen] = React.useState(false);
   const [toast, setToast] = React.useState<string | null>(null);
@@ -215,6 +209,40 @@ function ContactsPage() {
     tags: Record<string, number>;
     overdue_followups: number;
   }>({ contact_type: {}, engagement_status: {}, tags: {}, overdue_followups: 0 });
+
+  const contactQueryParams = React.useMemo(() => filtersToParams(filters), [filters]);
+  const contactList = useContactList(contactQueryParams, { enabled: !demoMode, pageSize: PAGE_SIZE });
+  const {
+    contacts: cachedContacts,
+    total: cachedTotal,
+    loading: cachedLoading,
+    loadingMore: cachedLoadingMore,
+    prefetching,
+    error: contactListError,
+    facets,
+    refresh: refreshContacts,
+    loadMore,
+  } = contactList;
+
+  const demoContactResult = React.useMemo(() => {
+    const q = filters.search.trim().toLowerCase();
+    const rows = q
+      ? demoContacts.filter(c => [c.full_name, c.email, c.company_name].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
+      : demoContacts;
+    return {
+      contacts: rows as Contact[],
+      total: q ? rows.length : DEMO_CONTACT_TOTAL,
+    };
+  }, [filters.search]);
+
+  const contacts = demoMode ? demoContactResult.contacts : cachedContacts as Contact[];
+  const total = demoMode ? demoContactResult.total : cachedTotal;
+  const loading = demoMode ? false : cachedLoading;
+  const loadingMore = demoMode ? false : (cachedLoadingMore || prefetching);
+  const loadContacts = React.useCallback(() => {
+    refreshContacts();
+    return Promise.resolve();
+  }, [refreshContacts]);
 
   // Sync filters back into the URL on every change. router.replace (not push)
   // so the back button doesn't undo individual filter clicks.
@@ -234,7 +262,7 @@ function ContactsPage() {
     return () => { if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current); };
   }, [searchInput]);
 
-  // Static rail data — tags, company list, filter counts. Loaded once.
+  // Static rail data — demo fixtures or the bootstrap facets from the list endpoint.
   React.useEffect(() => {
     if (demoMode) {
       setAllTags(demoTags);
@@ -247,71 +275,11 @@ function ContactsPage() {
       });
       return;
     }
-    api.listTags('contact').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
-    api.listContactCompanies().then(d => setAllCompanies(d.companies)).catch(() => {});
-    api.getContactFilterCounts().then(setFilterCounts).catch(() => {});
-  }, [demoMode]);
-
-  const buildParams = React.useCallback((offset: number): Record<string, string> => {
-    return {
-      ...filtersToParams(filters),
-      limit: String(PAGE_SIZE),
-      offset: String(offset),
-    };
-  }, [filters]);
-
-  const loadContacts = React.useCallback(() => {
-    if (demoMode) {
-      setLoading(false);
-      const q = filters.search.trim().toLowerCase();
-      const rows = q
-        ? demoContacts.filter(c => [c.full_name, c.email, c.company_name].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
-        : demoContacts;
-      setContacts(rows as Contact[]);
-      setTotal(q ? rows.length : DEMO_CONTACT_TOTAL);
-      return Promise.resolve();
-    }
-    contactsAbortRef.current?.abort();
-    const controller = new AbortController();
-    contactsAbortRef.current = controller;
-    const requestSeq = contactsRequestSeqRef.current + 1;
-    contactsRequestSeqRef.current = requestSeq;
-    setLoading(true);
-    return api.listContacts(buildParams(0), { signal: controller.signal })
-      .then(data => {
-        if (controller.signal.aborted || requestSeq !== contactsRequestSeqRef.current) return;
-        setContacts(data.contacts as Contact[]);
-        setTotal(data.total ?? data.contacts.length);
-      })
-      .catch(error => {
-        if ((error as any)?.name === 'AbortError') return;
-        if (requestSeq !== contactsRequestSeqRef.current) return;
-        setContacts([]);
-        setTotal(0);
-        setToast('Unable to load contacts');
-      })
-      .finally(() => {
-        if (contactsAbortRef.current === controller) contactsAbortRef.current = null;
-        if (requestSeq === contactsRequestSeqRef.current) setLoading(false);
-      });
-  }, [buildParams, demoMode, filters.search]);
-
-  const loadMore = React.useCallback(() => {
-    if (demoMode) return;
-    if (loadingMore || contacts.length >= total) return;
-    const requestSeq = contactsRequestSeqRef.current;
-    setLoadingMore(true);
-    api.listContacts(buildParams(contacts.length))
-      .then(data => {
-        if (requestSeq !== contactsRequestSeqRef.current) return;
-        setContacts(prev => [...prev, ...(data.contacts as Contact[])]);
-        if (typeof data.total === 'number') setTotal(data.total);
-      })
-      .finally(() => setLoadingMore(false));
-  }, [buildParams, contacts.length, total, loadingMore, demoMode]);
-
-  React.useEffect(() => { loadContacts(); }, [loadContacts]);
-  React.useEffect(() => () => contactsAbortRef.current?.abort(), []);
+    if (!facets) return;
+    setAllTags(facets.tags as Tag[]);
+    setAllCompanies(facets.companies);
+    setFilterCounts(facets.filter_counts);
+  }, [demoMode, facets]);
 
   React.useEffect(() => {
     if (!toast) return;
@@ -659,17 +627,36 @@ function ContactsPage() {
             {loading ? 'Loading...' : `Showing ${contacts.length} of ${total} ${isFiltered ? 'matching ' : ''}contacts`}
           </div>
 
-          <DataTable
-            columns={columns}
-            data={contacts}
-            loading={loading}
-            emptyMessage="No contacts match your filters"
-            getRowId={c => c.id}
-            onRowClick={c => router.push(`/contacts/${c.id}`)}
-            sortKey={filters.sort}
-            sortDir={filters.order}
-            onSort={handleSort}
-          />
+          {!demoMode && contactListError && contacts.length === 0 ? (
+            <div className="border border-semantic-error/30 bg-semantic-error/10 rounded-lg p-4">
+              <div className="text-sm font-medium text-text-primary">Contacts could not load.</div>
+              <div className="text-sm text-text-secondary mt-1">{contactListError}</div>
+              <button className="btn-secondary text-sm mt-3" onClick={loadContacts}>
+                Retry
+              </button>
+            </div>
+          ) : (
+            <DataTable
+              columns={columns}
+              data={contacts}
+              loading={loading}
+              emptyMessage={contactListError ? 'Contacts could not refresh. Retry from the error above.' : 'No contacts match your filters'}
+              getRowId={c => c.id}
+              onRowClick={c => router.push(`/contacts/${c.id}`)}
+              sortKey={filters.sort}
+              sortDir={filters.order}
+              onSort={handleSort}
+            />
+          )}
+
+          {!demoMode && contactListError && contacts.length > 0 && (
+            <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-semantic-error/30 bg-semantic-error/10 px-3 py-2">
+              <div className="text-sm text-text-secondary truncate">{contactListError}</div>
+              <button className="btn-secondary text-xs shrink-0" onClick={loadContacts}>
+                Retry
+              </button>
+            </div>
+          )}
 
           {!demoMode && !loading && contacts.length < total && (
             <div className="flex justify-center mt-4">
@@ -699,8 +686,7 @@ function ContactsPage() {
         open={tagManagerOpen}
         onClose={() => setTagManagerOpen(false)}
         onChanged={() => {
-          api.listTags('contact').then(d => setAllTags(d.tags as Tag[])).catch(() => {});
-          api.getContactFilterCounts().then(setFilterCounts).catch(() => {});
+          refreshContacts();
         }}
       />
 

@@ -55,6 +55,25 @@ export class ApiError extends Error {
   }
 }
 
+export interface ContactListResponse {
+  contacts: any[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more?: boolean;
+  next_cursor?: string | null;
+  facets?: {
+    tags: any[];
+    companies: { id: string; name: string; count: number }[];
+    filter_counts: {
+      contact_type: Record<string, number>;
+      engagement_status: Record<string, number>;
+      tags: Record<string, number>;
+      overdue_followups: number;
+    };
+  };
+}
+
 async function request<T>(
   path: string,
   options: RequestInit = {}
@@ -112,7 +131,11 @@ export const api = {
   // Contacts
   listContacts: (params?: Record<string, string>, options: RequestInit = {}) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ contacts: any[]; limit: number; offset: number; total: number; has_more?: boolean }>(`/contacts${q}`, options);
+    return request<ContactListResponse>(`/contacts${q}`, options);
+  },
+  bootstrapContacts: (params?: Record<string, string>, options: RequestInit = {}) => {
+    const q = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<ContactListResponse>(`/contacts/bootstrap${q}`, options);
   },
   listContactCompanies: () =>
     request<{ companies: { id: string; name: string; count: number }[] }>(`/contacts/companies`),

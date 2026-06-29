@@ -17,6 +17,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { api, clearAuthToken } from '@/lib/api';
+import { prewarmContactsList } from '@/lib/use-contact-list';
 import { useAuthSession } from '@/components/auth-guard';
 import { MartyEmblem } from './marty-emblem';
 
@@ -47,10 +48,18 @@ const MORE: NavItem[] = [
 export function MobileNav() {
   const pathname = usePathname();
   const router = useRouter();
-  const { isAdmin } = useAuthSession();
+  const { user: me, isAdmin } = useAuthSession();
   const [open, setOpen] = React.useState(false);
   const [martyPending, setMartyPending] = React.useState(false);
   const [loggingOut, setLoggingOut] = React.useState(false);
+  const warmedContactsRef = React.useRef(false);
+
+  const prewarmContacts = React.useCallback(() => {
+    if (warmedContactsRef.current) return;
+    warmedContactsRef.current = true;
+    router.prefetch('/contacts');
+    prewarmContactsList();
+  }, [router]);
 
   React.useEffect(() => {
     try {
@@ -64,6 +73,17 @@ export function MobileNav() {
     window.addEventListener('marty-pending-change', handler);
     return () => window.removeEventListener('marty-pending-change', handler);
   }, []);
+
+  React.useEffect(() => {
+    if (!me) return;
+    const win = window as Window & { requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number; cancelIdleCallback?: (id: number) => void };
+    if (win.requestIdleCallback) {
+      const id = win.requestIdleCallback(prewarmContacts, { timeout: 3000 });
+      return () => win.cancelIdleCallback?.(id);
+    }
+    const id = window.setTimeout(prewarmContacts, 1500);
+    return () => window.clearTimeout(id);
+  }, [me, prewarmContacts]);
 
   React.useEffect(() => setOpen(false), [pathname]);
 
@@ -114,7 +134,13 @@ export function MobileNav() {
       <nav className="md:hidden fixed inset-x-0 bottom-0 z-[80] border-t border-border bg-bg-root/95 backdrop-blur-xl pb-[env(safe-area-inset-bottom)]">
         <div className="grid grid-cols-6 h-[68px] px-1">
           {PRIMARY.map(item => (
-            <MobileTab key={item.route} item={item} active={isActive(pathname, item)} martyPending={martyPending} />
+            <MobileTab
+              key={item.route}
+              item={item}
+              active={isActive(pathname, item)}
+              martyPending={martyPending}
+              onPrewarm={item.route === '/contacts' ? prewarmContacts : undefined}
+            />
           ))}
           <button
             type="button"
@@ -132,11 +158,23 @@ export function MobileNav() {
   );
 }
 
-function MobileTab({ item, active, martyPending }: { item: NavItem; active: boolean; martyPending: boolean }) {
+function MobileTab({
+  item,
+  active,
+  martyPending,
+  onPrewarm,
+}: {
+  item: NavItem;
+  active: boolean;
+  martyPending: boolean;
+  onPrewarm?: () => void;
+}) {
   const Icon = item.icon;
   return (
     <Link
       href={item.href ?? item.route}
+      onPointerEnter={onPrewarm}
+      onFocus={onPrewarm}
       className={`flex flex-col items-center justify-center gap-1 rounded-xl text-[10px] transition-colors ${
         active ? 'text-text-primary bg-accent-magenta/10' : 'text-text-secondary'
       }`}

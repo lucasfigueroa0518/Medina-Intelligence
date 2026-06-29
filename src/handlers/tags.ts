@@ -3,6 +3,10 @@ import type { Env } from '../types/env';
 import type { AuthContext } from '../types/interfaces';
 import { jsonResponse, errorResponse, parseJsonBody } from './utils';
 import { emitAudit } from '../lib/audit';
+import {
+  safelyRebuildContactListEntriesForTag,
+  safelyUpsertContactListEntry,
+} from '../lib/contact-list-read-model';
 
 export async function listTags(
   request: Request,
@@ -85,6 +89,7 @@ export async function updateTag(
   await env.D1.prepare(
     `UPDATE tags SET ${updates.join(', ')} WHERE id = ? AND org_id = ?`
   ).bind(...binds, id, ctx.orgId).run();
+  await safelyRebuildContactListEntriesForTag(env, ctx.orgId, id);
 
   const tag = await env.D1.prepare('SELECT * FROM tags WHERE id = ?').bind(id).first();
   return jsonResponse({ tag });
@@ -95,6 +100,13 @@ export async function deleteTag(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
+  const linkedContacts = await env.D1.prepare(
+    `SELECT ct.contact_id
+       FROM contact_tags ct
+       JOIN contacts c ON c.id = ct.contact_id
+      WHERE ct.tag_id = ? AND c.org_id = ? AND c.deleted_at IS NULL`
+  ).bind(id, ctx.orgId).all<{ contact_id: string }>();
+
   await env.D1.prepare(
     'DELETE FROM tags WHERE id = ? AND org_id = ?'
   ).bind(id, ctx.orgId).run();
@@ -107,6 +119,10 @@ export async function deleteTag(
     entity_id: id,
     created_at: new Date().toISOString(),
   });
+
+  await Promise.all(linkedContacts.results.map(row =>
+    safelyUpsertContactListEntry(env, ctx.orgId, row.contact_id, 'tag_deleted')
+  ));
 
   return jsonResponse({ ok: true });
 }

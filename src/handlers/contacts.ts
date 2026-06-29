@@ -8,16 +8,19 @@ import { mergeContacts, resolveMergedContact, cleanupVectorsForEntity } from '..
 import { triggerContactEnrichment } from '../lib/enrichment';
 import { updateContactFields } from '../lib/entity-writes';
 import { cleanIntelligenceBrief } from '../lib/intelligence-briefing';
-import { getSharingFlags } from '../lib/helpers';
 import {
-  buildContactSearchQuery,
-  contactSearchCteBinds,
-  contactSearchCteSql,
-  ensureContactSearchIndexReady,
   rebuildContactSearchIndexForOrg,
   safelyDeleteContactSearchIndexForContact,
   safelyRebuildContactSearchIndexForContact,
 } from '../lib/contact-search';
+import {
+  bootstrapContactList,
+  listContactsFromReadModel,
+  loadContactListFacets,
+  rebuildContactListForOrg,
+  safelyDeleteContactListEntry,
+  safelyUpsertContactListEntry,
+} from '../lib/contact-list-read-model';
 import {
   listContactTimelineItems,
   loadContactActivityRollupForViewer,
@@ -26,7 +29,7 @@ import {
   safelyDeleteContactDetailReadModelForContact,
   safelyRebuildContactDetailReadModelForContact,
 } from '../lib/contact-detail-read-model';
-import { conversationAclSql, loadConversationVisibilityMap } from '../lib/email-derived-visibility';
+import { loadConversationVisibilityMap } from '../lib/email-derived-visibility';
 import { shapeApprovalRowForViewer } from './approval';
 import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from '../lib/crm-quality-gate';
 
@@ -75,315 +78,23 @@ export async function listContacts(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const filter = parseContactFilter(url);
-  const sp = url.searchParams;
-
-  const where: string[] = ['c.org_id = ?', 'c.deleted_at IS NULL'];
-  const binds: unknown[] = [ctx.orgId];
-
-  // Type — accepts new comma-separated `type` param OR legacy `contact_types`
-  // multi-value param. Both bucket into the same IN clause.
-  const typeList = readMulti(sp, 'type') ?? filter.contact_types;
-  if (typeList?.length) {
-    where.push(`c.contact_type IN (${typeList.map(() => '?').join(',')})`);
-    binds.push(...typeList);
+  const result = await listContactsFromReadModel(request, ctx, env);
+  if ('error' in result) {
+    return errorResponse(result.error.code, result.error.status, result.error.message);
   }
+  return jsonResponse(result);
+}
 
-  // Status — `status` is the user-facing alias for engagement_status. Legacy
-  // `engagement_statuses` still works.
-  const statusList = readMulti(sp, 'status') ?? filter.engagement_statuses;
-  if (statusList?.length) {
-    where.push(`c.engagement_status IN (${statusList.map(() => '?').join(',')})`);
-    binds.push(...statusList);
+export async function bootstrapContacts(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  const result = await bootstrapContactList(request, ctx, env);
+  if ('error' in result) {
+    return errorResponse(result.error.code, result.error.status, result.error.message);
   }
-
-  if (filter.company_id) {
-    where.push('c.company_id = ?');
-    binds.push(filter.company_id);
-  }
-
-  // Last-contact bucket. Multi-value via comma-separated list ORs the buckets
-  // (covers the "Stale 30+ Days" quick-filter that combines 1_3_months and
-  // 3_plus_months).
-  const lastContactBuckets = readMulti(sp, 'last_contact');
-  if (lastContactBuckets?.length) {
-    const predicates = lastContactBuckets
-      .map(b => lastContactPredicate(b))
-      .filter((p): p is string => !!p);
-    if (predicates.length) where.push(`(${predicates.join(' OR ')})`);
-  }
-
-  // Legacy date range filters still honored.
-  if (filter.last_contact_before) {
-    where.push('vr.viewer_last_contact_date < ?');
-    binds.push(filter.last_contact_before);
-  }
-  if (filter.last_contact_after) {
-    where.push('vr.viewer_last_contact_date > ?');
-    binds.push(filter.last_contact_after);
-  }
-
-  // Interactions bucket.
-  const interactionsBucket = sp.get('interactions');
-  if (interactionsBucket) {
-    const pred = interactionsPredicate(interactionsBucket);
-    if (pred) where.push(pred);
-  }
-
-  if (filter.meetings_last_30d_min !== undefined) {
-    where.push('c.meetings_last_30d >= ?');
-    binds.push(filter.meetings_last_30d_min);
-  }
-
-  const search = sp.get('search') ?? filter.keyword;
-  const contactSearch = buildContactSearchQuery(search);
-
-  if (filter.has_followup_overdue) {
-    where.push(
-      `c.next_followup_date IS NOT NULL AND c.next_followup_date < strftime('%Y-%m-%dT%H:%M:%fZ','now')`
-    );
-  }
-
-  // "In active deals" — quick-filter predicate. Active = stage NOT closed_*.
-  if (sp.get('in_active_deals') === 'true') {
-    where.push(
-      `EXISTS (SELECT 1 FROM deal_contacts dc
-               JOIN deals d ON dc.deal_id = d.id
-               WHERE dc.contact_id = c.id
-                 AND d.deleted_at IS NULL
-                 AND d.stage NOT IN ('closed','closed_won','closed_lost'))`
-    );
-  }
-
-  // Tag filtering — `tags` accepts comma-separated tag IDs (new behavior) OR
-  // the legacy `tags` multi-value with names. Production tag IDs are UUIDs,
-  // while older local/dev rows may use dashless hex IDs.
-  let tagJoin = '';
-  const tagsParam = readMulti(sp, 'tags') ?? filter.tags;
-  if (tagsParam?.length) {
-    const looksLikeIds = looksLikeTagIds(tagsParam);
-    tagJoin = `JOIN contact_tags ct ON c.id = ct.contact_id
-               JOIN tags t ON ct.tag_id = t.id`;
-    if (looksLikeIds) {
-      where.push(`t.id IN (${tagsParam.map(() => '?').join(',')})`);
-    } else {
-      where.push(`t.name IN (${tagsParam.map(() => '?').join(',')})`);
-    }
-    binds.push(...tagsParam);
-  }
-
-  // Sort. New `sort`/`order` aliases take precedence; legacy `sort_by`/
-  // `sort_dir` still works for older clients.
-  const sortKey = sp.get('sort') ?? legacySortAlias(filter.sort_by);
-  const sortMeta = CONTACT_SORT_MAP[sortKey ?? 'last_contact'] ?? CONTACT_SORT_MAP.last_contact;
-  const orderParam = sp.get('order') ?? filter.sort_dir;
-  const sortDir = orderParam
-    ? (orderParam.toLowerCase() === 'asc' ? 'ASC' : 'DESC')
-    : sortMeta.defaultDir;
-
-  // Default to 100/page, ceiling 500. Frontend uses cumulative "load more"
-  // pagination so initial load stays fast even at 10k+ records.
-  const limit = Math.min(filter.limit || 100, 500);
-  const offset = filter.offset || 0;
-
-  const havingClause =
-    tagsParam?.length && filter.tag_logic === 'and'
-      ? `HAVING COUNT(DISTINCT t.id) = ${tagsParam.length}`
-      : '';
-
-  // status sort breaks ties alphabetically so the "groups by status" output
-  // matches user expectation; otherwise just append id for stable pagination.
-  const tieBreak = sortKey === 'status' ? ', c.full_name ASC' : ', c.id ASC';
-
-  const sharingFlags = await getSharingFlags(ctx.orgId, env);
-  const rollupAcl = conversationAclSql('vc', ctx, sharingFlags, 'vsc.is_private');
-  const viewerRollupBinds: unknown[] = [ctx.orgId, ...rollupAcl.binds];
-  const viewerRollupJoin = `
-    LEFT JOIN (
-      SELECT cc.contact_id,
-             MAX(vc.sent_at) AS viewer_last_contact_date,
-             COUNT(*) AS viewer_total_interactions
-        FROM conversation_contacts cc
-        JOIN conversations vc
-          ON vc.id = cc.conversation_id
-         AND vc.org_id = ?
-        LEFT JOIN slack_channels vsc
-          ON vc.source = 'slack'
-         AND vsc.org_id = vc.org_id
-         AND vsc.channel_id = CASE
-           WHEN instr(vc.external_message_id, ':') > 0
-           THEN substr(vc.external_message_id, 1, instr(vc.external_message_id, ':') - 1)
-           ELSE vc.external_message_id
-         END
-       WHERE ${rollupAcl.sql}
-       GROUP BY cc.contact_id
-    ) vr ON vr.contact_id = c.id
-  `;
-
-  const companyNameSql = `
-    COALESCE(
-      co.name,
-      (
-        SELECT eco.name
-          FROM entity_associations ea
-          JOIN companies eco
-            ON eco.id = CASE
-                 WHEN ea.entity_a_type = 'company' THEN ea.entity_a_id
-                 ELSE ea.entity_b_id
-               END
-         WHERE ea.org_id = c.org_id
-           AND eco.org_id = c.org_id
-           AND eco.deleted_at IS NULL
-           AND eco.merged_into IS NULL
-           AND (
-             (ea.entity_a_type = 'contact' AND ea.entity_a_id = c.id AND ea.entity_b_type = 'company')
-             OR (ea.entity_b_type = 'contact' AND ea.entity_b_id = c.id AND ea.entity_a_type = 'company')
-           )
-         ORDER BY ea.strength DESC
-         LIMIT 1
-      ),
-      (
-        SELECT dco.name
-          FROM deal_contacts dc
-          JOIN deals d ON d.id = dc.deal_id
-          JOIN companies dco ON dco.id = d.company_id
-         WHERE dc.contact_id = c.id
-           AND d.org_id = c.org_id
-           AND d.deleted_at IS NULL
-           AND dco.org_id = c.org_id
-           AND dco.deleted_at IS NULL
-           AND dco.merged_into IS NULL
-         ORDER BY d.updated_at DESC
-         LIMIT 1
-      ),
-      (
-        SELECT sco.name
-          FROM companies sco
-         WHERE sco.org_id = c.org_id
-           AND sco.deleted_at IS NULL
-           AND sco.merged_into IS NULL
-           AND sco.domain IS NOT NULL
-           AND sco.domain != ''
-           AND c.email IS NOT NULL
-           AND (
-             LOWER(c.email) LIKE '%@' || LOWER(sco.domain)
-             OR LOWER(c.email) LIKE '%@%.' || LOWER(sco.domain)
-           )
-         ORDER BY LENGTH(sco.domain) DESC
-         LIMIT 1
-      )
-    )
-  `;
-
-  let sql: string;
-  let countSql: string;
-  let resultBinds: unknown[];
-  let countBinds: unknown[];
-
-  if (contactSearch) {
-    const ready = await ensureContactSearchIndexReady(env, ctx.orgId);
-    if (!ready.ok) return errorResponse(ready.code, 503, ready.message);
-
-    const searchBinds = contactSearchCteBinds(contactSearch, ctx.orgId);
-    const cte = contactSearchCteSql();
-
-    sql = `
-      ${cte}
-      SELECT c.*, ${companyNameSql} as company_name
-	      FROM matched m
-	      JOIN contacts c ON c.id = m.contact_id
-	      LEFT JOIN companies co ON c.company_id = co.id
-	      ${viewerRollupJoin}
-	      ${tagJoin}
-      WHERE ${where.join(' AND ')}
-      GROUP BY c.id
-      ${havingClause}
-      ORDER BY m.search_rank ASC, m.fts_rank ASC, ${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
-      LIMIT ? OFFSET ?
-    `;
-
-    const countFrom = `
-	      FROM matched m
-	      JOIN contacts c ON c.id = m.contact_id
-	      LEFT JOIN companies co ON c.company_id = co.id
-	      ${viewerRollupJoin}
-	      ${tagJoin}
-      WHERE ${where.join(' AND ')}
-    `;
-    countSql = havingClause
-      ? `${cte} SELECT COUNT(*) as n FROM (SELECT c.id ${countFrom} GROUP BY c.id ${havingClause})`
-      : `${cte} SELECT COUNT(DISTINCT c.id) as n ${countFrom}`;
-	    resultBinds = [...searchBinds, ...viewerRollupBinds, ...binds, limit, offset];
-	    countBinds = [...searchBinds, ...viewerRollupBinds, ...binds];
-	  } else {
-    sql = `
-      SELECT c.*, ${companyNameSql} as company_name
-	      FROM contacts c
-	      LEFT JOIN companies co ON c.company_id = co.id
-	      ${viewerRollupJoin}
-	      ${tagJoin}
-      WHERE ${where.join(' AND ')}
-      GROUP BY c.id
-      ${havingClause}
-      ORDER BY ${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
-      LIMIT ? OFFSET ?
-    `;
-
-    const countFrom = `
-	      FROM contacts c
-	      LEFT JOIN companies co ON c.company_id = co.id
-	      ${viewerRollupJoin}
-	      ${tagJoin}
-      WHERE ${where.join(' AND ')}
-    `;
-    countSql = havingClause
-      ? `SELECT COUNT(*) as n FROM (SELECT c.id ${countFrom} GROUP BY c.id ${havingClause})`
-      : `SELECT COUNT(DISTINCT c.id) as n ${countFrom}`;
-	    resultBinds = [...viewerRollupBinds, ...binds, limit, offset];
-	    countBinds = [...viewerRollupBinds, ...binds];
-	  }
-
-  const [result, countResult] = await Promise.all([
-    env.D1.prepare(sql).bind(...resultBinds).all(),
-    env.D1.prepare(countSql).bind(...countBinds).first<{ n: number }>(),
-  ]);
-  const total = countResult?.n ?? 0;
-
-  const contacts = result.results as any[];
-  if (contacts.length > 0) {
-    const ids = contacts.map(c => c.id);
-    const ph = ids.map(() => '?').join(',');
-    const tagRows = await env.D1.prepare(
-      `SELECT ct.contact_id, t.id, t.name, t.color
-       FROM contact_tags ct JOIN tags t ON ct.tag_id = t.id
-       WHERE ct.contact_id IN (${ph})`
-    ).bind(...ids).all();
-    const tagMap = new Map<string, any[]>();
-    for (const r of tagRows.results as any[]) {
-      const arr = tagMap.get(r.contact_id) || [];
-      arr.push({ id: r.id, name: r.name, color: r.color });
-      tagMap.set(r.contact_id, arr);
-    }
-    for (const c of contacts) {
-      c.tags = tagMap.get(c.id) || [];
-    }
-    const rollups = await Promise.all(contacts.map(c => loadContactActivityRollupForViewer(env, ctx, c.id)));
-    contacts.forEach((contact, index) => {
-      const rollup = rollups[index];
-      contact.last_contact_date = rollup.last_conversation_at || rollup.last_event_at || null;
-      contact.total_interactions = rollup.conversation_count + rollup.event_count;
-      contact.activity_rollup = rollup;
-    });
-  }
-
-  return jsonResponse({
-    contacts,
-    limit,
-    offset,
-    total,
-    has_more: offset + contacts.length < total,
-  });
+  return jsonResponse(result, 200, { 'Cache-Control': 'private, max-age=30' });
 }
 
 function parseList(raw: string | null): string[] | undefined {
@@ -426,17 +137,10 @@ export async function listContactCompanies(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const rows = await env.D1.prepare(
-    `SELECT co.id, co.name, COUNT(c.id) as count
-     FROM companies co
-     JOIN contacts c ON c.company_id = co.id
-     WHERE co.org_id = ? AND co.deleted_at IS NULL AND c.deleted_at IS NULL
-     GROUP BY co.id
-     ORDER BY co.name COLLATE NOCASE ASC`
-  ).bind(ctx.orgId).all<{ id: string; name: string; count: number }>();
+  const facets = await loadContactListFacets(ctx, env);
 
   return jsonResponse(
-    { companies: rows.results },
+    { companies: facets.companies },
     200,
     { 'Cache-Control': 'private, max-age=300' }
   );
@@ -471,51 +175,8 @@ export async function getContactFilterCounts(
   ctx: AuthContext,
   env: Env
 ): Promise<Response> {
-  const [typeCounts, statusCounts, tagCounts, overdueCount] = await Promise.all([
-    env.D1.prepare(
-      `SELECT contact_type, COUNT(*) as cnt FROM contacts
-       WHERE org_id = ? AND deleted_at IS NULL
-       GROUP BY contact_type`
-    ).bind(ctx.orgId).all<{ contact_type: string; cnt: number }>(),
-
-    env.D1.prepare(
-      `SELECT engagement_status, COUNT(*) as cnt FROM contacts
-       WHERE org_id = ? AND deleted_at IS NULL
-       GROUP BY engagement_status`
-    ).bind(ctx.orgId).all<{ engagement_status: string | null; cnt: number }>(),
-
-    env.D1.prepare(
-      `SELECT ct.tag_id, COUNT(*) as cnt FROM contact_tags ct
-       JOIN contacts c ON c.id = ct.contact_id
-       WHERE c.org_id = ? AND c.deleted_at IS NULL
-       GROUP BY ct.tag_id`
-    ).bind(ctx.orgId).all<{ tag_id: string; cnt: number }>(),
-
-    env.D1.prepare(
-      `SELECT COUNT(*) as cnt FROM contacts
-       WHERE org_id = ? AND deleted_at IS NULL
-         AND next_followup_date IS NOT NULL
-         AND next_followup_date < strftime('%Y-%m-%dT%H:%M:%fZ','now')`
-    ).bind(ctx.orgId).first<{ cnt: number }>(),
-  ]);
-
-  const contact_type: Record<string, number> = {};
-  for (const r of typeCounts.results) contact_type[r.contact_type] = r.cnt;
-
-  const engagement_status: Record<string, number> = {};
-  for (const r of statusCounts.results) {
-    if (r.engagement_status) engagement_status[r.engagement_status] = r.cnt;
-  }
-
-  const tags: Record<string, number> = {};
-  for (const r of tagCounts.results) tags[r.tag_id] = r.cnt;
-
-  return jsonResponse({
-    contact_type,
-    engagement_status,
-    tags,
-    overdue_followups: overdueCount?.cnt || 0,
-  });
+  const facets = await loadContactListFacets(ctx, env);
+  return jsonResponse(facets.filter_counts);
 }
 
 // --- POST /api/contacts ---
@@ -611,6 +272,7 @@ export async function createContact(
 
   await invalidateRagCache(ctx.orgId, env);
   await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, id);
+  await safelyUpsertContactListEntry(env, ctx.orgId, id, 'contact_created');
   ctxExec.waitUntil(safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, id, 'contact_created'));
 
   if (body.auto_enrich !== false) {
@@ -769,6 +431,7 @@ export async function deleteContact(
   try { await cleanupVectorsForEntity(id, 'contacts', env); } catch { /* best-effort */ }
   await safelyDeleteContactSearchIndexForContact(env, ctx.orgId, id);
   await safelyDeleteContactDetailReadModelForContact(env, ctx.orgId, id);
+  await safelyDeleteContactListEntry(env, ctx.orgId, id);
   await invalidateRagCache(ctx.orgId, env);
   return jsonResponse({ ok: true });
 }
@@ -805,6 +468,7 @@ export async function applyContactTags(
   await invalidateRagCache(ctx.orgId, env);
   await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, id);
   await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, id, 'contact_tags_changed');
+  await safelyUpsertContactListEntry(env, ctx.orgId, id, 'contact_tags_changed');
   return jsonResponse({ ok: true });
 }
 
@@ -830,6 +494,7 @@ export async function removeContactTag(
 
   await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, id);
   await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, id, 'contact_tags_changed');
+  await safelyUpsertContactListEntry(env, ctx.orgId, id, 'contact_tags_changed');
   return jsonResponse({ ok: true });
 }
 
@@ -866,6 +531,8 @@ export async function postContactMerge(
   await safelyDeleteContactSearchIndexForContact(env, ctx.orgId, body.discard_id);
   await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, body.keep_id, 'contact_merge');
   await safelyDeleteContactDetailReadModelForContact(env, ctx.orgId, body.discard_id);
+  await safelyUpsertContactListEntry(env, ctx.orgId, body.keep_id, 'contact_merge');
+  await safelyDeleteContactListEntry(env, ctx.orgId, body.discard_id);
   return jsonResponse({ ok: true });
 }
 
@@ -903,6 +570,20 @@ export async function rebuildContactDetailReadModelEndpoint(
   }
 
   const result = await rebuildContactDetailReadModelForOrg(env, ctx.orgId, body?.limit || 500);
+  return jsonResponse({ ok: result.errors === 0, ...result });
+}
+
+export async function rebuildContactListReadModelEndpoint(
+  request: Request,
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner' && ctx.userRole !== 'admin' && ctx.userRole !== 'super_admin') {
+    return errorResponse('FORBIDDEN', 403, 'owner/admin only');
+  }
+
+  const body = await parseJsonBody<{ limit?: number }>(request);
+  const result = await rebuildContactListForOrg(env, ctx.orgId, body?.limit || 1000);
   return jsonResponse({ ok: result.errors === 0, ...result });
 }
 

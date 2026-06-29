@@ -280,6 +280,9 @@ async function routeAuthenticated(
   if (path === '/api/contacts/filter-counts' && method === 'GET') {
     return Contacts.getContactFilterCounts(ctx, env);
   }
+  if (path === '/api/contacts/bootstrap' && method === 'GET') {
+    return Contacts.bootstrapContacts(request, ctx, env);
+  }
   if (path === '/api/contacts/companies' && method === 'GET') {
     return Contacts.listContactCompanies(ctx, env);
   }
@@ -843,6 +846,8 @@ async function routeAuthenticated(
       return Contacts.rebuildContactSearchIndexEndpoint(ctx, env);
     if (path === '/api/admin/rebuild-contact-detail-read-model' && method === 'POST')
       return Contacts.rebuildContactDetailReadModelEndpoint(request, ctx, env);
+    if (path === '/api/admin/rebuild-contact-list-read-model' && method === 'POST')
+      return Contacts.rebuildContactListReadModelEndpoint(request, ctx, env);
     if (path === '/api/admin/cleanup-vector-bloat' && method === 'POST')
       return Admin.cleanupVectorBloat(ctx, env);
     if (path === '/api/admin/calendar-token-health' && method === 'GET')

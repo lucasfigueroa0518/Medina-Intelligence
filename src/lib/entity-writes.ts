@@ -41,6 +41,10 @@ import {
   safelyRebuildContactSearchIndexForContact,
 } from './contact-search';
 import { safelyRebuildContactDetailReadModelForContact } from './contact-detail-read-model';
+import {
+  safelyRebuildContactListEntriesForCompany,
+  safelyUpsertContactListEntry,
+} from './contact-list-read-model';
 import { loadConversationVisibilityMap } from './email-derived-visibility';
 
 export type EntityType = 'contact' | 'company' | 'deal' | 'prospect';
@@ -471,8 +475,15 @@ async function updateEntityFieldsCommon(
   if (entityType === 'contact') {
     await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, entityId);
     await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, entityId, 'contact_updated');
+    await safelyUpsertContactListEntry(env, ctx.orgId, entityId, 'contact_updated');
   } else if (entityType === 'company') {
     await safelyRebuildContactSearchIndexForCompany(
+      env,
+      ctx.orgId,
+      entityId,
+      typeof (before as any).domain === 'string' ? (before as any).domain : null
+    );
+    await safelyRebuildContactListEntriesForCompany(
       env,
       ctx.orgId,
       entityId,
@@ -767,8 +778,15 @@ export async function deleteEntityField(
   if (entityType === 'contact') {
     await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, entityId);
     await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, entityId, 'contact_field_deleted');
+    await safelyUpsertContactListEntry(env, ctx.orgId, entityId, 'contact_field_deleted');
   } else if (entityType === 'company') {
     await safelyRebuildContactSearchIndexForCompany(
+      env,
+      ctx.orgId,
+      entityId,
+      typeof (before as any).domain === 'string' ? (before as any).domain : null
+    );
+    await safelyRebuildContactListEntriesForCompany(
       env,
       ctx.orgId,
       entityId,
@@ -929,6 +947,7 @@ export async function createContactRecord(
   await invalidateRagCache(ctx.orgId, env);
   await safelyRebuildContactSearchIndexForContact(env, ctx.orgId, id);
   await safelyRebuildContactDetailReadModelForContact(env, ctx.orgId, id, 'contact_created');
+  await safelyUpsertContactListEntry(env, ctx.orgId, id, 'contact_created');
 
   return { ok: true, id };
 }

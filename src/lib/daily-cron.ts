@@ -18,6 +18,7 @@ import { enqueueDueContactEnrichment } from './contact-enrichment-queue';
 import { embedDocumentItem as embedDocumentItemForRepair } from './document-embedding';
 import { repairContactSearchIndexDrift } from './contact-search';
 import { repairContactDetailReadModelDrift } from './contact-detail-read-model';
+import { repairContactListReadModelDrift } from './contact-list-read-model';
 import { CLAUDE_HAIKU_MODEL } from './model-policy';
 import { runProspectReconciliation } from './prospect-intelligence';
 
@@ -104,6 +105,7 @@ export async function runDailyCron(orgId: string, env: Env): Promise<void> {
   try { await rebuildEntityIndex(orgId, env); } catch (e) { console.error('Entity index rebuild:', e); }
   try { await repairContactSearchIndexDrift(orgId, env); } catch (e) { console.error('Contact search index repair:', e); }
   try { await repairContactDetailReadModelDrift(orgId, env); } catch (e) { console.error('Contact detail read-model repair:', e); }
+  try { await repairContactListReadModelDrift(orgId, env); } catch (e) { console.error('Contact list read-model repair:', e); }
   try { await cleanupExpiredResetTokens(env); } catch (e) { console.error('Reset token cleanup:', e); }
   try { await detectIngestionDivergence(orgId, env); } catch (e) { console.error('Ingestion divergence:', e); }
   try { await reapStaleProcessingDocuments(orgId, env); } catch (e) { console.error('Stale document reaper:', e); }

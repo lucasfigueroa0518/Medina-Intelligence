@@ -7,6 +7,7 @@ import {
   parseParticipantUserIds,
 } from './helpers';
 import { isDocumentAccessibleToUser } from './document-acl';
+import { safelyDeleteContactListEntry, safelyUpsertContactListEntry } from './contact-list-read-model';
 
 export interface CanonicalContactResolution {
   contactId: string;
@@ -290,6 +291,7 @@ export async function deleteContactDetailReadModelForContact(
     env.D1.prepare(`DELETE FROM contact_timeline_items WHERE org_id = ? AND contact_id = ?`).bind(orgId, contactId),
     env.D1.prepare(`DELETE FROM contact_activity_rollups WHERE org_id = ? AND contact_id = ?`).bind(orgId, contactId),
   ]);
+  await safelyDeleteContactListEntry(env, orgId, contactId);
 }
 
 export async function safelyDeleteContactDetailReadModelForContact(
@@ -384,6 +386,7 @@ async function refreshContactActivityRollupFromTimeline(
     now,
     now
   ).run();
+  await safelyUpsertContactListEntry(env, orgId, contactId, 'activity_rollup_refreshed');
 }
 
 export async function upsertConversationTimelineItemsForContacts(
@@ -662,6 +665,7 @@ export async function rebuildContactDetailReadModelForContact(
     now,
     now
   ).run();
+  await safelyUpsertContactListEntry(env, orgId, contactId, 'contact_detail_rebuilt');
 
   await env.D1.prepare(
     `UPDATE contact_detail_read_model_repairs

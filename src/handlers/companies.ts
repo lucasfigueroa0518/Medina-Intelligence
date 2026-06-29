@@ -16,6 +16,7 @@ import {
   evaluateContactCompanyAffiliation,
 } from '../lib/contact-company-affiliation';
 import { safelyRebuildContactSearchIndexForCompany } from '../lib/contact-search';
+import { safelyRebuildContactListEntriesForCompany } from '../lib/contact-list-read-model';
 import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from '../lib/crm-quality-gate';
 
 // News-score buckets. The underlying scale is 0-10 (see lib/news-scoring).
@@ -448,6 +449,7 @@ export async function createCompany(
   ctxExec.waitUntil(triggerCompanyEnrichment(id, ctx.orgId, env));
   await invalidateRagCache(ctx.orgId, env);
   await safelyRebuildContactSearchIndexForCompany(env, ctx.orgId, id, domain);
+  await safelyRebuildContactListEntriesForCompany(env, ctx.orgId, id, domain);
 
   const created = await env.D1.prepare('SELECT * FROM companies WHERE id = ?').bind(id).first();
   return jsonResponse({ company: created }, 201);
@@ -568,6 +570,12 @@ export async function deleteCompany(
   try { await cleanupVectorsForEntity(id, 'companies', env); } catch { /* best-effort */ }
   await invalidateRagCache(ctx.orgId, env);
   await safelyRebuildContactSearchIndexForCompany(
+    env,
+    ctx.orgId,
+    id,
+    typeof (before as any).domain === 'string' ? (before as any).domain : null
+  );
+  await safelyRebuildContactListEntriesForCompany(
     env,
     ctx.orgId,
     id,
