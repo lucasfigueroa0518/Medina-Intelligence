@@ -86,11 +86,14 @@ export interface Company {
   company_type: string;
   sector?: string | null;
   stage?: string | null;
+  location_mentioned?: string | null;
   investment_status?: string | null;
   investment_amount?: number | null;
   investment_date?: string | null;
   ownership_pct?: number | null;
-  current_valuation?: number | null;
+  last_known_valuation?: number | null;
+  last_known_valuation_seen_at?: string | null;
+  last_known_valuation_source_date?: string | null;
   currency?: string;
   linkedin_url?: string | null;
   enrichment_confidence?: number;
@@ -193,7 +196,7 @@ export interface CompanyFilter {
   stage?: string[];
   sector?: string[];
   keyword?: string;
-  sort_by?: 'name' | 'investment_status' | 'stage' | 'current_valuation' | 'created_at';
+  sort_by?: 'name' | 'investment_status' | 'stage' | 'last_known_valuation' | 'created_at';
   sort_dir?: 'asc' | 'desc';
   limit?: number;
   offset?: number;

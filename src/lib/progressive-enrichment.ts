@@ -14,6 +14,8 @@ interface FieldUpdate {
   confidence: number;
   source_description?: string;
   source_communication_id?: string;
+  source_date?: string | null;
+  seen_at?: string | null;
   /** Channel attribution for the Wave 6 corroboration model. Optional
    *  during Phase B rollout — sources that don't yet thread context
    *  will hit resolveChannel's fallback path. */
@@ -41,8 +43,8 @@ const CONTACT_FIELDS = new Set([
 ]);
 
 const COMPANY_FIELDS = new Set([
-  'name', 'sector', 'website', 'domain', 'description', 'hq_location',
-  'employee_count', 'investment_status', 'stage', 'current_valuation',
+  'name', 'sector', 'website', 'domain', 'description', 'location_mentioned',
+  'employee_count', 'investment_status', 'stage', 'last_known_valuation',
   'linkedin_url', 'last_funding_amount', 'last_funding_round', 'last_funding_date',
 ]);
 
@@ -160,6 +162,10 @@ export async function proposeEntityUpdate(
     policy?: UpdatePolicy;
     /** Channel attribution for the corroboration model. */
     context?: ChannelContext;
+    /** Date/time attached to the source itself, e.g. email sent_at or news published_at. */
+    source_date?: string | null;
+    /** Date/time when our system observed/extracted the source. */
+    seen_at?: string | null;
   }
 ): Promise<'auto_applied' | 'proposed' | 'skipped'> {
   const allowed = fieldsForEntity(entityType);
@@ -223,6 +229,8 @@ export async function proposeEntityUpdate(
       sourceCommunicationId: opts?.source_communication_id || null,
       sourceVisibility: 'org_wide',
       sourceDescription: opts?.source_description || source,
+      sourceDate: opts?.source_date || null,
+      seenAt: opts?.seen_at || null,
     },
     env
   );
@@ -256,6 +264,8 @@ export async function proposeMultipleUpdates(
         source_communication_id: u.source_communication_id,
         policy: opts?.policy,
         context: u.context,
+        source_date: u.source_date,
+        seen_at: u.seen_at,
       }
     );
     result[outcome].push(u.field);
@@ -354,12 +364,16 @@ export async function commitProgressiveApproval(
   if (!item.field_name || !item.proposed_value) return { reEnrich };
 
   let parsedValue: string;
+  let parsedMetadata: Record<string, unknown> = {};
   try {
     const parsed = JSON.parse(item.proposed_value);
     if (typeof parsed === 'string') {
       parsedValue = parsed;
     } else if (parsed && typeof parsed === 'object' && parsed.value !== undefined) {
       parsedValue = String(parsed.value);
+      if (parsed.metadata && typeof parsed.metadata === 'object' && !Array.isArray(parsed.metadata)) {
+        parsedMetadata = parsed.metadata as Record<string, unknown>;
+      }
     } else {
       parsedValue = String(parsed);
     }
@@ -373,9 +387,26 @@ export async function commitProgressiveApproval(
 
   const oldValue = await getCurrentFieldValue(item.entity_type, item.entity_id, item.field_name, env);
 
-  await env.D1.prepare(
-    `UPDATE ${table} SET ${item.field_name} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-  ).bind(parsedValue, item.entity_id).run();
+  if (item.entity_type === 'company' && item.field_name === 'last_known_valuation') {
+    const seenAt = typeof parsedMetadata.seen_at === 'string' && parsedMetadata.seen_at
+      ? parsedMetadata.seen_at
+      : new Date().toISOString();
+    const sourceDate = typeof parsedMetadata.source_date === 'string' && parsedMetadata.source_date
+      ? parsedMetadata.source_date
+      : null;
+    await env.D1.prepare(
+      `UPDATE ${table}
+          SET ${item.field_name} = ?,
+              last_known_valuation_seen_at = ?,
+              last_known_valuation_source_date = COALESCE(?, last_known_valuation_source_date),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(parsedValue, seenAt, sourceDate, item.entity_id).run();
+  } else {
+    await env.D1.prepare(
+      `UPDATE ${table} SET ${item.field_name} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+    ).bind(parsedValue, item.entity_id).run();
+  }
 
   // Clean up any other pending entries for this same field (stale duplicates)
   if (item.org_id) {

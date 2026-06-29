@@ -316,12 +316,16 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
   }
 
   let value: string;
+  let metadata: Record<string, unknown> = {};
   try {
     const parsed = JSON.parse(item.proposed_value);
     if (typeof parsed === 'string') {
       value = parsed;
     } else if (parsed && typeof parsed === 'object' && parsed.value !== undefined) {
       value = String(parsed.value);
+      if (parsed.metadata && typeof parsed.metadata === 'object' && !Array.isArray(parsed.metadata)) {
+        metadata = parsed.metadata as Record<string, unknown>;
+      }
     } else {
       value = typeof parsed === 'object' ? JSON.stringify(parsed) : String(parsed);
     }
@@ -333,7 +337,7 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
   const allowed = new Set([
     'full_name', 'job_title', 'company_id', 'phone', 'email',
     'linkedin_url', 'twitter_url', 'location',
-    'stage', 'current_valuation', 'topics_of_interest',
+    'stage', 'last_known_valuation', 'location_mentioned', 'topics_of_interest',
     'pain_points', 'investment_thesis_tags', 'sector', 'bio_summary',
     'investment_focus', 'check_size_range', 'communication_channel_preference',
     'introduced_via', 'fund_name',
@@ -341,11 +345,30 @@ async function commitApproval(item: any, env: Env): Promise<{ reEnrich?: boolean
   if (!allowed.has(item.field_name)) return {};
 
   try {
-    await env.D1.prepare(
-      `UPDATE ${table} SET ${item.field_name} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-    )
-      .bind(value, item.entity_id)
-      .run();
+    if (item.entity_type === 'company' && item.field_name === 'last_known_valuation') {
+      const seenAt = typeof metadata.seen_at === 'string' && metadata.seen_at
+        ? metadata.seen_at
+        : new Date().toISOString();
+      const sourceDate = typeof metadata.source_date === 'string' && metadata.source_date
+        ? metadata.source_date
+        : null;
+      await env.D1.prepare(
+        `UPDATE ${table}
+            SET ${item.field_name} = ?,
+                last_known_valuation_seen_at = ?,
+                last_known_valuation_source_date = COALESCE(?, last_known_valuation_source_date),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`
+      )
+        .bind(value, seenAt, sourceDate, item.entity_id)
+        .run();
+    } else {
+      await env.D1.prepare(
+        `UPDATE ${table} SET ${item.field_name} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+      )
+        .bind(value, item.entity_id)
+        .run();
+    }
   } catch (e) {
     console.error('Commit approval failed:', e);
   }
@@ -1049,11 +1072,21 @@ export async function approveHeldProposal(
   }
 
   // Write to entity table.
-  await env.D1.prepare(
-    `UPDATE ${table} SET ${body.field_name} = ?,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE id = ?`
-  ).bind(body.value, body.entity_id).run();
+  if (body.entity_type === 'company' && body.field_name === 'last_known_valuation') {
+    await env.D1.prepare(
+      `UPDATE ${table}
+          SET ${body.field_name} = ?,
+              last_known_valuation_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(body.value, body.entity_id).run();
+  } else {
+    await env.D1.prepare(
+      `UPDATE ${table} SET ${body.field_name} = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(body.value, body.entity_id).run();
+  }
 
   // recordApproval syncs entity_field_state — resets corroboration history
   // per the locked spec. current_value_sources becomes

@@ -1266,9 +1266,10 @@ async function routeCompany(
                 sector = CASE WHEN (sector IS NULL OR sector = '') AND ? IS NOT NULL THEN ? ELSE sector END,
                 website = CASE WHEN (website IS NULL OR website = '') AND ? IS NOT NULL THEN ? ELSE website END,
                 description = CASE WHEN (description IS NULL OR description = '') AND ? IS NOT NULL THEN ? ELSE description END,
-                hq_location = CASE WHEN (hq_location IS NULL OR hq_location = '') AND ? IS NOT NULL THEN ? ELSE hq_location END,
+                location_mentioned = CASE WHEN (location_mentioned IS NULL OR location_mentioned = '') AND ? IS NOT NULL THEN ? ELSE location_mentioned END,
                 stage = CASE WHEN (stage IS NULL OR stage = '') AND ? IS NOT NULL THEN ? ELSE stage END,
-                current_valuation = CASE WHEN current_valuation IS NULL AND ? IS NOT NULL THEN ? ELSE current_valuation END,
+                last_known_valuation = CASE WHEN last_known_valuation IS NULL AND ? IS NOT NULL THEN ? ELSE last_known_valuation END,
+                last_known_valuation_seen_at = CASE WHEN last_known_valuation IS NULL AND ? IS NOT NULL THEN ? ELSE last_known_valuation_seen_at END,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
           WHERE id = ? AND org_id = ?`
       ).bind(
@@ -1279,6 +1280,7 @@ async function routeCompany(
         extracted.location || null, extracted.location || null,
         normalizedStage || null, normalizedStage || null,
         valuation, valuation,
+        valuation, valuation ? new Date().toISOString() : null,
         match.matched_id, orgId
       ).run();
     }
@@ -1310,9 +1312,9 @@ async function routeCompany(
   try {
     await env.D1.prepare(
       `INSERT INTO companies
-         (id, org_id, name, domain, website, sector, company_type, hq_location, description,
-          stage, investment_status, custom_fields, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?, ?)`
+         (id, org_id, name, domain, website, sector, company_type, location_mentioned, description,
+          stage, investment_status, last_known_valuation, last_known_valuation_seen_at, custom_fields, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?, ?, ?, ?)`
     ).bind(
       companyId, orgId,
       companyGate.normalizedName,
@@ -1323,6 +1325,8 @@ async function routeCompany(
       extracted.location || null,
       extracted.description || null,
       normalizedStage || null,
+      extracted.valuation || null,
+      extracted.valuation ? now : null,
       customFields,
       now, now
     ).run();

@@ -1953,7 +1953,7 @@ async function scanCompanies(
   const limit = MAX_MODE_LIMITS.setBuilderRowCap;
   const rows = await env.D1.prepare(
     `SELECT id, name, domain, company_type, sector, investment_status, description,
-            investment_amount, current_valuation
+            investment_amount, last_known_valuation
        FROM companies
       WHERE ${where.join(' AND ')}
       ORDER BY name ASC

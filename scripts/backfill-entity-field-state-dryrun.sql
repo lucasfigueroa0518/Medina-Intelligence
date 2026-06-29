@@ -86,8 +86,8 @@ UNION ALL
 SELECT 'company', 'description', COUNT(*)
   FROM companies WHERE org_id='medina-ventures' AND deleted_at IS NULL AND description IS NOT NULL AND description != ''
 UNION ALL
-SELECT 'company', 'hq_location', COUNT(*)
-  FROM companies WHERE org_id='medina-ventures' AND deleted_at IS NULL AND hq_location IS NOT NULL AND hq_location != ''
+SELECT 'company', 'location_mentioned', COUNT(*)
+  FROM companies WHERE org_id='medina-ventures' AND deleted_at IS NULL AND location_mentioned IS NOT NULL AND location_mentioned != ''
 UNION ALL
 SELECT 'company', 'employee_count', COUNT(*)
   FROM companies WHERE org_id='medina-ventures' AND deleted_at IS NULL AND employee_count IS NOT NULL
@@ -98,8 +98,8 @@ UNION ALL
 SELECT 'company', 'stage', COUNT(*)
   FROM companies WHERE org_id='medina-ventures' AND deleted_at IS NULL AND stage IS NOT NULL AND stage != ''
 UNION ALL
-SELECT 'company', 'current_valuation', COUNT(*)
-  FROM companies WHERE org_id='medina-ventures' AND deleted_at IS NULL AND current_valuation IS NOT NULL
+SELECT 'company', 'last_known_valuation', COUNT(*)
+  FROM companies WHERE org_id='medina-ventures' AND deleted_at IS NULL AND last_known_valuation IS NOT NULL
 UNION ALL
 SELECT 'company', 'linkedin_url', COUNT(*)
   FROM companies WHERE org_id='medina-ventures' AND deleted_at IS NULL AND linkedin_url IS NOT NULL AND linkedin_url != ''

@@ -33,7 +33,7 @@ export interface FirmRelationshipCompany extends FirmRelationshipClassificationI
   website?: string | null;
   sector?: string | null;
   stage?: string | null;
-  current_valuation?: number | null;
+  last_known_valuation?: number | null;
   investment_amount?: number | null;
   investment_date?: string | null;
   classification: FirmRelationshipClassification;
@@ -229,7 +229,7 @@ export async function loadFirmRelationshipSnapshot(
       website: row.website,
       sector: row.sector,
       stage: row.stage,
-      current_valuation: normalizeNumber(row.current_valuation),
+      last_known_valuation: normalizeNumber(row.last_known_valuation),
       investment_amount: normalizeNumber(row.investment_amount),
       investment_date: row.investment_date,
       classification,
@@ -562,7 +562,7 @@ async function fetchCompanyStateRows(
         co.stage,
         co.company_type,
         co.investment_status,
-        co.current_valuation,
+        co.last_known_valuation,
         co.investment_amount,
         co.investment_date,
         GROUP_CONCAT(DISTINCT t.name) AS tag_names,

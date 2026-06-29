@@ -19,7 +19,7 @@
 --   wrangler d1 execute medina-ventures-db --remote \
 --     --file=scripts/backfill-entity-field-state.sql
 --
--- Numeric columns (employee_count, current_valuation, amount, valuation,
+-- Numeric columns (employee_count, last_known_valuation, amount, valuation,
 -- expected_close, last_funding_amount, last_funding_date) are cast to TEXT
 -- when written to current_value. The proposal evaluator reads current_value
 -- as text and compares against the proposed text — no numeric path needed.
@@ -127,9 +127,9 @@ SELECT 'company', c.id, 'description', c.description, '["historical_unknown"]',
   FROM companies c WHERE c.org_id='medina-ventures' AND c.deleted_at IS NULL AND c.description IS NOT NULL AND c.description != '';
 
 INSERT OR IGNORE INTO entity_field_state (entity_type, entity_id, field_name, current_value, current_value_sources, last_human_edit_at)
-SELECT 'company', c.id, 'hq_location', c.hq_location, '["historical_unknown"]',
-       (SELECT last_human_edit_at FROM entity_field_provenance p WHERE p.org_id=c.org_id AND p.entity_type='company' AND p.entity_id=c.id AND p.field_name='hq_location')
-  FROM companies c WHERE c.org_id='medina-ventures' AND c.deleted_at IS NULL AND c.hq_location IS NOT NULL AND c.hq_location != '';
+SELECT 'company', c.id, 'location_mentioned', c.location_mentioned, '["historical_unknown"]',
+       (SELECT last_human_edit_at FROM entity_field_provenance p WHERE p.org_id=c.org_id AND p.entity_type='company' AND p.entity_id=c.id AND p.field_name='location_mentioned')
+  FROM companies c WHERE c.org_id='medina-ventures' AND c.deleted_at IS NULL AND c.location_mentioned IS NOT NULL AND c.location_mentioned != '';
 
 INSERT OR IGNORE INTO entity_field_state (entity_type, entity_id, field_name, current_value, current_value_sources, last_human_edit_at)
 SELECT 'company', c.id, 'employee_count', CAST(c.employee_count AS TEXT), '["historical_unknown"]',
@@ -147,9 +147,9 @@ SELECT 'company', c.id, 'stage', c.stage, '["historical_unknown"]',
   FROM companies c WHERE c.org_id='medina-ventures' AND c.deleted_at IS NULL AND c.stage IS NOT NULL AND c.stage != '';
 
 INSERT OR IGNORE INTO entity_field_state (entity_type, entity_id, field_name, current_value, current_value_sources, last_human_edit_at)
-SELECT 'company', c.id, 'current_valuation', CAST(c.current_valuation AS TEXT), '["historical_unknown"]',
-       (SELECT last_human_edit_at FROM entity_field_provenance p WHERE p.org_id=c.org_id AND p.entity_type='company' AND p.entity_id=c.id AND p.field_name='current_valuation')
-  FROM companies c WHERE c.org_id='medina-ventures' AND c.deleted_at IS NULL AND c.current_valuation IS NOT NULL;
+SELECT 'company', c.id, 'last_known_valuation', CAST(c.last_known_valuation AS TEXT), '["historical_unknown"]',
+       (SELECT last_human_edit_at FROM entity_field_provenance p WHERE p.org_id=c.org_id AND p.entity_type='company' AND p.entity_id=c.id AND p.field_name='last_known_valuation')
+  FROM companies c WHERE c.org_id='medina-ventures' AND c.deleted_at IS NULL AND c.last_known_valuation IS NOT NULL;
 
 INSERT OR IGNORE INTO entity_field_state (entity_type, entity_id, field_name, current_value, current_value_sources, last_human_edit_at)
 SELECT 'company', c.id, 'linkedin_url', c.linkedin_url, '["historical_unknown"]',

@@ -22,8 +22,8 @@ const PROGRESSIVE_CONTACT_FIELDS = new Set([
   'topics_of_interest', 'pain_points', 'investment_thesis_tags',
 ]);
 const PROGRESSIVE_COMPANY_FIELDS = new Set([
-  'name', 'sector', 'website', 'domain', 'description', 'hq_location',
-  'employee_count', 'investment_status', 'stage', 'current_valuation',
+  'name', 'sector', 'website', 'domain', 'description', 'location_mentioned',
+  'employee_count', 'investment_status', 'stage', 'last_known_valuation',
   'linkedin_url', 'last_funding_amount', 'last_funding_round', 'last_funding_date',
 ]);
 
@@ -108,9 +108,9 @@ export async function getEntityFieldValue(
 
   const COMPANY_QUERIES: Record<string, string> = {
     stage: 'SELECT stage as v FROM companies WHERE id = ?',
-    current_valuation: 'SELECT current_valuation as v FROM companies WHERE id = ?',
+    last_known_valuation: 'SELECT last_known_valuation as v FROM companies WHERE id = ?',
     sector: 'SELECT sector as v FROM companies WHERE id = ?',
-    location: 'SELECT location as v FROM companies WHERE id = ?',
+    location_mentioned: 'SELECT location_mentioned as v FROM companies WHERE id = ?',
     description: 'SELECT description as v FROM companies WHERE id = ?',
     name: 'SELECT name as v FROM companies WHERE id = ?',
   };
@@ -164,7 +164,7 @@ export async function extractEnrichmentSignals(
       'job_title',
       'company_id',
       'stage',
-      'current_valuation',
+      'last_known_valuation',
     ].includes(signal.field);
     const threshold = isStructured ? 0.95 : 0.8;
     if (signal.confidence < threshold) continue;
@@ -207,6 +207,8 @@ export async function extractEnrichmentSignals(
           source_communication_id: conversation.id,
           source_description: 'llm_extraction',
           context: { userId: observerUserId, conversationId: conversation.id },
+          source_date: conversation.sent_at || null,
+          seen_at: new Date().toISOString(),
         }
       );
     } else if (isSyntheticType(signal.field)) {

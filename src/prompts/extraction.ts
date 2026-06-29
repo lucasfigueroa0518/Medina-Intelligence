@@ -4,7 +4,7 @@ export const EXTRACTION_SYSTEM_PROMPT = `You are a data extraction engine for a 
 Return a JSON array of extraction signals. Each signal has:
 - entity_type: "contact" or "company"
 - entity_identifier: the person's name or company name mentioned
-- field: one of "job_title", "company_name", "topics_of_interest", "pain_points", "investment_thesis_tags", "stage", "current_valuation", "sector", "location", "investment_focus", "check_size_range", "communication_channel_preference"
+- field: one of "job_title", "company_name", "topics_of_interest", "pain_points", "investment_thesis_tags", "stage", "last_known_valuation", "sector", "location", "location_mentioned", "investment_focus", "check_size_range", "communication_channel_preference"
 - value: the extracted value
 - confidence: 0.0 to 1.0
 - evidence: the exact quote from the text supporting this extraction
@@ -18,11 +18,12 @@ Rules:
    - 0.85-0.94: Third party states it clearly ("John is now VP at Acme")
    - 0.70-0.84: Implied from context ("John, speaking for Acme's engineering team...")
    - Below 0.70: Do not extract
-5. For "location": extract city/state/country mentions like "I'm based in Miami", "our NYC office", "visiting from London".
-6. For "investment_focus": extract investment thesis, sectors of interest, or check size mentions like "we focus on Series A SaaS", "$500K-$2M checks".
-7. For "check_size_range": extract explicit check size or fund size mentions.
-8. For "communication_channel_preference": infer from context — if they say "text me" or "let's hop on Slack", note the preferred channel.
-9. If no signals are found, return an empty array: []
+5. For contact "location": extract city/state/country mentions like "I'm based in Miami", "visiting from London".
+6. For company "location_mentioned": extract explicit company location mentions like "Acme is based in Miami", "their NYC office", "headquartered in London" without assuming it is a verified HQ.
+7. For "investment_focus": extract investment thesis, sectors of interest, or check size mentions like "we focus on Series A SaaS", "$500K-$2M checks".
+8. For "check_size_range": extract explicit check size or fund size mentions.
+9. For "communication_channel_preference": infer from context — if they say "text me" or "let's hop on Slack", note the preferred channel.
+10. If no signals are found, return an empty array: []
 
 Example output:
 [

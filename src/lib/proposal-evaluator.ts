@@ -96,6 +96,10 @@ export interface ProposalInput {
   sourceCommunicationId?: string | null;
   sourceVisibility?: 'private' | 'org_wide' | 'confidential';
   sourceDescription?: string | null;
+  /** Date/time attached to the source itself, e.g. an email sent_at or news published_at. */
+  sourceDate?: string | null;
+  /** Date/time when our system observed/extracted the source. */
+  seenAt?: string | null;
 }
 
 export interface EvaluationResult {
@@ -128,6 +132,10 @@ interface FieldStateRow {
 // existing rejected_values shape already carries timestamp values.
 const DELETION_SENTINEL = '__DELETE__';
 export { DELETION_SENTINEL };
+
+function isCompanyLastKnownValuation(input: ProposalInput): boolean {
+  return input.entityType === 'company' && input.fieldName === 'last_known_valuation';
+}
 
 function tableForEntity(t: FieldStateEntityType): string {
   if (t === 'contact') return 'contacts';
@@ -394,11 +402,27 @@ async function applyFillEmpty(
   // construction — they were attempts to fill an empty current that
   // is no longer empty).
   const table = tableForEntity(input.entityType);
-  await env.D1.prepare(
-    `UPDATE ${table} SET ${input.fieldName} = ?,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE id = ?`
-  ).bind(input.proposedValue, input.entityId).run();
+  if (isCompanyLastKnownValuation(input)) {
+    await env.D1.prepare(
+      `UPDATE ${table}
+          SET ${input.fieldName} = ?,
+              last_known_valuation_seen_at = ?,
+              last_known_valuation_source_date = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(
+      input.proposedValue,
+      input.seenAt || new Date().toISOString(),
+      input.sourceDate || null,
+      input.entityId
+    ).run();
+  } else {
+    await env.D1.prepare(
+      `UPDATE ${table} SET ${input.fieldName} = ?,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`
+    ).bind(input.proposedValue, input.entityId).run();
+  }
 
   await env.D1.prepare(
     `UPDATE entity_field_state
@@ -464,18 +488,23 @@ async function applyQueue(
   // the UI (Phase D) can render "Current sourced from [A,B,C].
   // Proposed sourced from [D,E,F]" without re-querying.
   const channelsForValue = Array.from(new Set([...(pending[input.proposedValue] || []), channel]));
+  const metadata: Record<string, unknown> = {
+    current_value: state.current_value,
+    source_type: input.source,
+    source_description: input.sourceDescription || input.source,
+    context: input.context,
+    // Wave 6 corroboration packet — Phase D reads this directly.
+    current_value_sources: currentSources,
+    proposed_value_sources: channelsForValue,
+    corroboration_count: channelsForValue.length,
+  };
+  if (isCompanyLastKnownValuation(input)) {
+    metadata.source_date = input.sourceDate || null;
+    metadata.seen_at = input.seenAt || new Date().toISOString();
+  }
   const proposedJson = JSON.stringify({
     value: input.proposedValue,
-    metadata: {
-      current_value: state.current_value,
-      source_type: input.source,
-      source_description: input.sourceDescription || input.source,
-      context: input.context,
-      // Wave 6 corroboration packet — Phase D reads this directly.
-      current_value_sources: currentSources,
-      proposed_value_sources: channelsForValue,
-      corroboration_count: channelsForValue.length,
-    },
+    metadata,
   });
 
   // Idempotency keyed on (entity, field, value) so repeated proposals

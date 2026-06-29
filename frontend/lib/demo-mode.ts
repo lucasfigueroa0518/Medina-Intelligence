@@ -161,7 +161,7 @@ export const demoCompany = {
   company_type: 'corporation',
   investment_status: 'tracking',
   stage: 'public',
-  hq_location: 'Mountain View, CA',
+  location_mentioned: 'Mountain View, CA',
   city: 'Mountain View',
   description:
     'Demo-only company profile used for screen recording. The fictional relationship highlights enterprise AI, sports media tooling, and event-scale data products without exposing real firm information.',
@@ -197,7 +197,7 @@ const demoCompanyRows = [
 
 export const demoCompanies = [
   demoCompany,
-  ...demoCompanyRows.map(([name, sector, company_type, investment_status, stage, hq_location, news_relevance_score, tags], index) => ({
+  ...demoCompanyRows.map(([name, sector, company_type, investment_status, stage, location_mentioned, news_relevance_score, tags], index) => ({
     id: `demo-company-row-${index + 1}`,
     name,
     domain: null,
@@ -206,7 +206,7 @@ export const demoCompanies = [
     company_type,
     investment_status,
     stage,
-    hq_location,
+    location_mentioned,
     news_relevance_score,
     logo_url: null,
     tags,
@@ -729,7 +729,7 @@ export const demoCompanyDetailFixture = {
       bio_summary: demoCompanyBio,
       created_at: isoDaysAgo(120),
       updated_at: isoDaysAgo(0),
-      location: demoCompany.hq_location,
+      location: demoCompany.location_mentioned,
     },
     contacts: demoContacts.slice(0, 10).map((c, index) => ({
       ...c,
@@ -817,7 +817,7 @@ export const demoDealDetailFixture = {
       company_type: 'corporation',
       sector: 'Sports media and live events',
       website: 'https://example.test/fifa-demo',
-      hq_location: 'Zurich',
+      location_mentioned: 'Zurich',
     },
     contacts: {
       theirs: [

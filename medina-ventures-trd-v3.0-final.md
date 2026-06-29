@@ -430,10 +430,8 @@ CREATE TABLE companies (
   investment_amount REAL,      -- Amount the firm has invested (USD)
   investment_date TEXT,
   ownership_pct REAL,          -- Percentage ownership
-  current_valuation REAL,      -- Most recent known valuation (USD)
+  last_known_valuation REAL,      -- Most recent known valuation (USD)
   currency TEXT DEFAULT 'USD',
-  pitchbook_id TEXT,           -- Legacy: enrichment pipeline no longer writes to this field. Retained for Four Degree import data.
-  pitchbook_data_r2_key TEXT,  -- Legacy: enrichment pipeline no longer writes to this field.
   linkedin_url TEXT,
   linkedin_data_r2_key TEXT,   -- R2 key for cached ReverseContact/LinkedIn response
   web_enrichment_r2_key TEXT,  -- R2 key for cached Claude web search results
@@ -452,7 +450,6 @@ CREATE TABLE companies (
 CREATE INDEX idx_companies_org_id ON companies(org_id);
 CREATE INDEX idx_companies_investment_status ON companies(investment_status);
 CREATE INDEX idx_companies_stage ON companies(stage);
-CREATE INDEX idx_companies_pitchbook_id ON companies(pitchbook_id);
 CREATE INDEX idx_companies_enrichment_last_run ON companies(enrichment_last_run);
 ```
 
@@ -483,9 +480,7 @@ CREATE TABLE contacts (
   merged_into TEXT REFERENCES contacts(id) ON DELETE SET NULL,
 
   -- Enrichment data pointers (raw API responses stored in R2, not D1)
-  pitchbook_id TEXT,              -- Legacy: enrichment pipeline no longer writes to this field
   linkedin_data_r2_key TEXT,
-  pitchbook_data_r2_key TEXT,     -- Legacy: enrichment pipeline no longer writes to this field
   web_enrichment_r2_key TEXT,
   enrichment_confidence REAL DEFAULT 0.0,
   enrichment_last_run TEXT,
@@ -3133,8 +3128,8 @@ function aggregateEnrichmentResult(contributions: EnrichmentSourceContribution[]
 | Category | Fields | Threshold | Auto-Approve |
 |---|---|---|---|
 | Soft | `topics_of_interest`, `pain_points`, `investment_thesis_tags` | >= 0.8 | If org setting enabled |
-| Structured | `job_title`, `company_id`, `stage`, `current_valuation` | >= 0.95 | Never auto-approve overwrites |
-| Financial (from Claude web search) | `current_valuation`, `investment_amount`, `stage`, `ownership_pct` | >= 0.95 AND cited source URL from credible financial publication | Never auto-approve. No citation → discard signal entirely. |
+| Structured | `job_title`, `company_id`, `stage`, `last_known_valuation` | >= 0.95 | Never auto-approve overwrites |
+| Financial (from Claude web search) | `last_known_valuation`, `investment_amount`, `stage`, `ownership_pct` | >= 0.95 AND cited source URL from credible financial publication | Never auto-approve. No citation → discard signal entirely. |
 
 ### 7.8 LLM Extraction from Communications
 
@@ -3164,7 +3159,7 @@ async function extractEnrichmentSignals(conversation: Conversation, orgId: strin
   const contributions: EnrichmentSourceContribution[] = [];
 
   for (const signal of signals) {
-    const isStructured = ['job_title', 'company_id', 'stage', 'current_valuation'].includes(signal.field);
+    const isStructured = ['job_title', 'company_id', 'stage', 'last_known_valuation'].includes(signal.field);
     const threshold = isStructured ? 0.95 : 0.8;
     if (signal.confidence < threshold) continue;
 
@@ -3732,7 +3727,7 @@ interface CompanyFilter {
   company_types?: string[]; tags?: string[]; tag_logic?: 'and' | 'or';
   investment_status?: string[]; stage?: string[]; sector?: string[];
   keyword?: string;
-  sort_by?: 'name' | 'investment_status' | 'stage' | 'current_valuation' | 'created_at';
+  sort_by?: 'name' | 'investment_status' | 'stage' | 'last_known_valuation' | 'created_at';
   sort_dir?: 'asc' | 'desc'; limit?: number; offset?: number;
 }
 ```
@@ -4161,7 +4156,7 @@ You are a data extraction engine for a venture capital CRM. Analyze the communic
 Return a JSON array of extraction signals. Each signal has:
 - entity_type: "contact" or "company"
 - entity_identifier: the person's name or company name mentioned
-- field: one of "job_title", "company_name", "topics_of_interest", "pain_points", "investment_thesis_tags", "stage", "current_valuation", "sector"
+- field: one of "job_title", "company_name", "topics_of_interest", "pain_points", "investment_thesis_tags", "stage", "last_known_valuation", "sector"
 - value: the extracted value
 - confidence: 0.0 to 1.0
 - evidence: the exact quote from the text supporting this extraction
@@ -4300,7 +4295,7 @@ Sample row 3: {row3}
 ## 17. Implementation Roadmap
 
 ### Phase 0 — Historical Data Migration (Pre-Launch)
-- [ ] Four Degree CRM export: bulk import, LLM column mapping (§16.7), dedup, approval queue. Note: imported records may contain `pitchbook_id` references — keep schema fields but do not attempt PitchBook re-enrichment.
+- [ ] Four Degree CRM export: bulk import, LLM column mapping (§16.7), dedup, approval queue.
 - [ ] Spreadsheet imports (CSV/Excel): LLM column mapping UI, preview, confirm
 - [ ] Historical document bulk upload: zip → R2 → embedding Workflow
 - [ ] Outlook historical backfill: configurable lookback, reverse-chronological

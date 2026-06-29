@@ -483,7 +483,7 @@ export async function warmCrmCache(orgId: string, env: Env): Promise<void> {
     ).bind(orgId).all();
 
     const companies = await env.D1.prepare(
-      `SELECT id, name, sector, stage, investment_status, current_valuation
+      `SELECT id, name, sector, stage, investment_status, last_known_valuation
        FROM companies WHERE org_id = ? AND deleted_at IS NULL
        ORDER BY news_relevance_score DESC LIMIT 500`
     ).bind(orgId).all();
@@ -554,6 +554,8 @@ export async function extractFactsFromRecentNews(orgId: string, env: Env): Promi
             confidence: f.confidence,
             source_description: a.source_url || a.title,
             source_communication_id: a.id,
+            source_date: a.published_at || null,
+            seen_at: new Date().toISOString(),
           })),
           env,
           { policy: 'auto_if_confident' }
@@ -582,11 +584,11 @@ async function extractFactsFromArticle(
   const system = `You extract verifiable company facts from a single news article. Return ONLY raw JSON, no markdown. Schema:
 {
   "stage": {"value": "pre_seed"|"seed"|"series_a"|"series_b"|"series_c"|"growth"|"public"|"acquired"|"other", "confidence": "high"|"medium"|"low"} | null,
-  "current_valuation": {"value": number, "confidence": "high"|"medium"|"low"} | null,
+  "last_known_valuation": {"value": number, "confidence": "high"|"medium"|"low"} | null,
   "last_funding_amount": {"value": number, "confidence": "high"|"medium"|"low"} | null,
   "last_funding_round": {"value": string, "confidence": "high"|"medium"|"low"} | null,
   "last_funding_date": {"value": "YYYY-MM-DD", "confidence": "high"|"medium"|"low"} | null,
-  "hq_location": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "location_mentioned": {"value": string, "confidence": "high"|"medium"|"low"} | null,
   "employee_count": {"value": number, "confidence": "high"|"medium"|"low"} | null
 }
 
@@ -620,7 +622,7 @@ Summary: ${article.summary?.slice(0, 2500) || ''}`;
   }
 
   const confMap: Record<string, number> = { high: 0.9, medium: 0.65, low: 0.4 };
-  const fields = ['stage','current_valuation','last_funding_amount','last_funding_round','last_funding_date','hq_location','employee_count'];
+  const fields = ['stage','last_known_valuation','last_funding_amount','last_funding_round','last_funding_date','location_mentioned','employee_count'];
   const out: ArticleFact[] = [];
   for (const field of fields) {
     const f = parsed[field];

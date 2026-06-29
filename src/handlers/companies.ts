@@ -33,10 +33,10 @@ function newsScorePredicate(bucket: string): string | null {
 const COMPANY_SORT_MAP: Record<string, { col: string; defaultDir: 'ASC' | 'DESC' }> = {
   news_score: { col: 'co.news_relevance_score', defaultDir: 'DESC' },
   name: { col: 'co.name', defaultDir: 'ASC' },
-  city: { col: 'co.hq_location', defaultDir: 'ASC' },
+  city: { col: 'co.location_mentioned', defaultDir: 'ASC' },
   investment_status: { col: 'co.investment_status', defaultDir: 'ASC' },
   stage: { col: 'co.stage', defaultDir: 'ASC' },
-  current_valuation: { col: 'co.current_valuation', defaultDir: 'DESC' },
+  last_known_valuation: { col: 'co.last_known_valuation', defaultDir: 'DESC' },
   created_at: { col: 'co.created_at', defaultDir: 'DESC' },
 };
 
@@ -174,12 +174,12 @@ export async function listCompanies(
     binds.push(...f.sector);
   }
 
-  // City filter — hq_location stores "City, Region" or just "City"; match on
+  // City filter — location_mentioned stores "City, Region" or just "City"; match on
   // the leading segment so queries are intuitive ("San Francisco" finds
   // "San Francisco, CA").
   const city = sp.get('city');
   if (city) {
-    where.push('(co.hq_location = ? OR co.hq_location LIKE ?)');
+    where.push('(co.location_mentioned = ? OR co.location_mentioned LIKE ?)');
     binds.push(city, `${city},%`);
   }
 
@@ -304,7 +304,7 @@ export async function listCompanies(
 }
 
 // --- GET /api/companies/cities ---
-// Distinct city list extracted from the leading segment of hq_location, with
+// Distinct city list extracted from the leading segment of location_mentioned, with
 // a count per city. Cached for 5 minutes — these don't move quickly and the
 // dropdown calls this on every page load.
 export async function listCompanyCities(
@@ -312,13 +312,13 @@ export async function listCompanyCities(
   env: Env
 ): Promise<Response> {
   const rows = await env.D1.prepare(
-    `SELECT hq_location FROM companies
-     WHERE org_id = ? AND deleted_at IS NULL AND hq_location IS NOT NULL AND hq_location != ''`
-  ).bind(ctx.orgId).all<{ hq_location: string }>();
+    `SELECT location_mentioned FROM companies
+     WHERE org_id = ? AND deleted_at IS NULL AND location_mentioned IS NOT NULL AND location_mentioned != ''`
+  ).bind(ctx.orgId).all<{ location_mentioned: string }>();
 
   const counts = new Map<string, number>();
   for (const r of rows.results) {
-    const city = r.hq_location.split(',')[0].trim();
+    const city = r.location_mentioned.split(',')[0].trim();
     if (!city) continue;
     counts.set(city, (counts.get(city) || 0) + 1);
   }

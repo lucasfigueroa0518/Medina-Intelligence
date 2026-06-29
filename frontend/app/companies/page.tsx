@@ -235,7 +235,7 @@ function CompaniesPage() {
       setLoading(false);
       const q = filters.search.trim().toLowerCase();
       const rows = q
-        ? demoCompanies.filter(c => [c.name, c.domain, c.sector, c.hq_location].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
+        ? demoCompanies.filter(c => [c.name, c.domain, c.sector, c.location_mentioned].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
         : demoCompanies;
       setCompanies(rows);
       setTotal(q ? rows.length : DEMO_COMPANY_TOTAL);
@@ -371,8 +371,8 @@ function CompaniesPage() {
     {
       key: 'city', sortKey: 'city', header: 'City', width: '140px', sortable: true,
       accessor: row => {
-        const city = extractCity(row.hq_location);
-        return <span className="truncate block" title={row.hq_location || undefined}>{city}</span>;
+        const city = extractCity(row.location_mentioned);
+        return <span className="truncate block" title={row.location_mentioned || undefined}>{city}</span>;
       },
     },
     {

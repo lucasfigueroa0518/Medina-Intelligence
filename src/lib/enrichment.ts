@@ -1082,8 +1082,8 @@ export interface ExtractedCompanyFact {
 }
 
 const COMPANY_FACT_FIELDS = [
-  'sector', 'stage', 'website', 'hq_location', 'employee_count',
-  'investment_status', 'linkedin_url', 'current_valuation',
+  'sector', 'stage', 'website', 'location_mentioned', 'employee_count',
+  'investment_status', 'linkedin_url', 'last_known_valuation',
   'last_funding_amount', 'last_funding_round', 'last_funding_date',
   'description',
 ] as const;
@@ -1099,11 +1099,11 @@ export async function extractCompanyStructuredFacts(
   "sector": {"value": string, "confidence": "high"|"medium"|"low"} | null,
   "stage": {"value": "pre_seed"|"seed"|"series_a"|"series_b"|"series_c"|"growth"|"public"|"acquired"|"other", "confidence": "high"|"medium"|"low"} | null,
   "website": {"value": string, "confidence": "high"|"medium"|"low"} | null,
-  "hq_location": {"value": string, "confidence": "high"|"medium"|"low"} | null,
+  "location_mentioned": {"value": string, "confidence": "high"|"medium"|"low"} | null,
   "employee_count": {"value": number, "confidence": "high"|"medium"|"low"} | null,
   "investment_status": {"value": "tracking"|"prospect"|"due_diligence"|"term_sheet"|"invested"|"passed"|"exited", "confidence": "high"|"medium"|"low"} | null,
   "linkedin_url": {"value": string, "confidence": "high"|"medium"|"low"} | null,
-  "current_valuation": {"value": number, "confidence": "high"|"medium"|"low"} | null,
+  "last_known_valuation": {"value": number, "confidence": "high"|"medium"|"low"} | null,
   "last_funding_amount": {"value": number, "confidence": "high"|"medium"|"low"} | null,
   "last_funding_round": {"value": string, "confidence": "high"|"medium"|"low"} | null,
   "last_funding_date": {"value": "YYYY-MM-DD", "confidence": "high"|"medium"|"low"} | null,

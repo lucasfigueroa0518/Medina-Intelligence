@@ -250,7 +250,6 @@ const CONTACT_REDACTED_FIELDS = [
   // today, but a future read-blob tool would expose them. Strip now.
   'r2_key',
   'linkedin_data_r2_key',
-  'pitchbook_data_r2_key',
   'web_enrichment_r2_key',
 ] as const;
 const DEAL_REDACTED_FIELDS = [
@@ -1179,7 +1178,7 @@ export async function searchCompanies(
         sector: company.sector,
         company_type: company.company_type,
         investment_status: company.investment_status,
-        current_valuation: company.current_valuation,
+        last_known_valuation: company.last_known_valuation,
         firm_relationship_state: company.classification.state,
         firm_relationship_confidence: company.classification.confidence,
         firm_relationship_reasons: company.classification.reasons,
@@ -1211,7 +1210,7 @@ export async function searchCompanies(
   const limit = structuredLimit(input.limit, toolContext);
   const result = await env.D1.prepare(
     `SELECT id, name, domain, website, sector, company_type, stage,
-            investment_status, current_valuation, news_relevance_score,
+            investment_status, last_known_valuation, news_relevance_score,
             (SELECT COUNT(*) FROM contacts WHERE company_id = companies.id AND deleted_at IS NULL) AS contact_count,
             (SELECT COUNT(*) FROM deals WHERE company_id = companies.id AND deleted_at IS NULL) AS deal_count
      FROM companies WHERE ${where.join(' AND ')}

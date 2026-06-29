@@ -239,7 +239,7 @@ export function DemoCompanyDetail() {
             <p className="mt-3 max-w-3xl text-sm leading-7 text-text-secondary">{demoCompany.description}</p>
             <div className="mt-4 flex flex-wrap gap-3 text-sm text-text-muted">
               <span className="inline-flex items-center gap-1.5"><Globe size={14} /> {demoCompany.domain}</span>
-              <span className="inline-flex items-center gap-1.5"><MapPin size={14} /> {demoCompany.hq_location}</span>
+              <span className="inline-flex items-center gap-1.5"><MapPin size={14} /> {demoCompany.location_mentioned}</span>
               <span className="inline-flex items-center gap-1.5"><Target size={14} /> {demoCompany.sector}</span>
             </div>
           </div>

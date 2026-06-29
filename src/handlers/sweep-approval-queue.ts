@@ -48,8 +48,8 @@ const CONTACT_FIELDS = new Set([
 ]);
 
 const COMPANY_FIELDS = new Set([
-  'name', 'sector', 'website', 'domain', 'description', 'hq_location',
-  'employee_count', 'investment_status', 'stage', 'current_valuation',
+  'name', 'sector', 'website', 'domain', 'description', 'location_mentioned',
+  'employee_count', 'investment_status', 'stage', 'last_known_valuation',
   'linkedin_url', 'last_funding_amount', 'last_funding_round', 'last_funding_date',
 ]);
 

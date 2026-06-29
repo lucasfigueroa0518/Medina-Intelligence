@@ -100,8 +100,8 @@ const CONTACT_WRITABLE = new Set([
 const COMPANY_WRITABLE = new Set([
   'name', 'domain', 'website', 'logo_url', 'description', 'company_type',
   'sector', 'stage', 'investment_status', 'investment_amount',
-  'investment_date', 'ownership_pct', 'current_valuation', 'currency',
-  'linkedin_url', 'custom_fields',
+  'investment_date', 'ownership_pct', 'last_known_valuation', 'currency',
+  'linkedin_url', 'location_mentioned', 'custom_fields',
 ]);
 
 const DEAL_WRITABLE = new Set([
@@ -417,6 +417,10 @@ async function updateEntityFieldsCommon(
     (entityType === 'company' && 'name' in passingFields)
   ) {
     extraSets.push(verifiedNameCustomFieldsSql());
+  }
+  if (entityType === 'company' && 'last_known_valuation' in passingFields) {
+    extraSets.push('last_known_valuation_seen_at = ?');
+    extraBinds.push(new Date().toISOString());
   }
 
   if (Object.keys(passingFields).length === 0 && extraSets.length === 0) {
