@@ -18,6 +18,7 @@
 
 import type { Env } from '../types/env';
 import type { ClassifiedItem } from '../types/interfaces';
+import { touchSyncJob } from './sync-job-lifecycle';
 
 export interface ProcessClassifiedContext {
   orgId: string;
@@ -92,14 +93,36 @@ export async function processClassifiedItems(
   stats.items_total = classified.length;
   if (classified.length === 0) return stats;
 
+  const heartbeat = async (phase: string, extra: Record<string, unknown> = {}) => {
+    if (!ctx.syncJobId) return;
+    await touchSyncJob(env, ctx.syncJobId, {
+      phase,
+      items_total: stats.items_total,
+      items_staged: stats.items_staged,
+      items_embedded: stats.items_embedded,
+      attachments_attempted: stats.attachments_attempted,
+      attachments_processed: stats.attachments_processed,
+      attachments_failed: stats.attachments_failed,
+      prospect_signals_recorded: stats.prospect_signals_recorded,
+      prospect_classifications_pending: stats.prospect_classifications_pending,
+      errors: stats.errors.length,
+      ...extra,
+    }, 10).catch(e => {
+      console.error(`[ingestion-shared] sync job heartbeat failed for ${ctx.syncJobId}:`, e?.message || e);
+    });
+  };
+
   // Phase 1 — stage and commit. Wrapped in try/catch because a transient FK
   // race inside contact-association inserts shouldn't fail the whole batch.
   try {
+    await heartbeat('stage-and-commit:start');
     const { stageAndCommitApprovals } = await import('./stage-approvals');
     await stageAndCommitApprovals(classified, ctx.orgId, ctx.syncJobId, env);
     stats.items_staged = classified.length;
+    await heartbeat('stage-and-commit:done');
   } catch (e: any) {
     stats.errors.push({ phase: 'stage-and-commit', error: e?.message || String(e) });
+    await heartbeat('stage-and-commit:error');
   }
 
   // If Phase 1 didn't stage every item, abort the rest of the pipeline.
@@ -126,6 +149,7 @@ export async function processClassifiedItems(
     const { chunkEmbedAndPersistAll } = await import('./embedding');
     for (const item of classified) {
       try {
+        await heartbeat('embed:start', { entity_id: item.entityId });
         const entries = await chunkEmbedAndPersistAll(item.text, item.metadata, env);
         if (entries.length > 0) {
           await env.D1.batch(
@@ -137,9 +161,11 @@ export async function processClassifiedItems(
           );
         }
         stats.items_embedded += 1;
+        await heartbeat('embed:done', { entity_id: item.entityId });
       } catch (e: any) {
         stats.embed_failures += 1;
         stats.errors.push({ phase: 'embed', error: `${item.entityId}: ${e?.message || e}` });
+        await heartbeat('embed:error', { entity_id: item.entityId });
       }
     }
   }
@@ -154,6 +180,7 @@ export async function processClassifiedItems(
       if (item.attachments?.length) {
         stats.attachments_attempted += item.attachments.length;
         try {
+          await heartbeat('process-attachments:start', { entity_id: item.entityId, attachments: item.attachments.length });
           const r = await processEmailAttachments(item, ctx.orgId, env);
           stats.attachments_processed += r.documents_created;
           stats.attachments_skipped += r.documents_skipped;
@@ -161,9 +188,11 @@ export async function processClassifiedItems(
           for (const err of r.errors) {
             stats.errors.push({ phase: 'process-attachments', error: err });
           }
+          await heartbeat('process-attachments:done', { entity_id: item.entityId });
         } catch (e: any) {
           stats.attachments_failed += item.attachments.length;
           stats.errors.push({ phase: 'process-attachments', error: `${item.entityId}: ${e?.message || e}` });
+          await heartbeat('process-attachments:error', { entity_id: item.entityId });
         }
       }
     }
@@ -174,6 +203,7 @@ export async function processClassifiedItems(
   // enqueues overflow to deal_evidence_detect so budget caps are visible and
   // recoverable instead of silently dropping deal-looking sources.
   try {
+    await heartbeat('detect-deals:start');
     const { detectAndStageDealSignalsDetailed } = await import('./deal-detection');
     const dealStats = await detectAndStageDealSignalsDetailed(classified, ctx.orgId, env);
     stats.deal_signals_staged = dealStats.deal_signals_staged;
@@ -181,13 +211,16 @@ export async function processClassifiedItems(
     stats.deal_candidates_scanned = dealStats.deal_candidates_scanned;
     stats.deal_candidates_deferred = dealStats.deal_candidates_deferred;
     stats.deal_skip_reasons = dealStats.deal_skip_reasons;
+    await heartbeat('detect-deals:done');
   } catch (e: any) {
     stats.errors.push({ phase: 'detect-deals', error: e?.message || String(e) });
+    await heartbeat('detect-deals:error');
   }
 
   // Phase 5 — detect prospects. This path deliberately records uncertainty as
   // recoverable entity metadata.
   try {
+    await heartbeat('detect-prospects:start');
     const {
       detectAndRecordProspectSignals,
       recordProspectBackfillCoverage,
@@ -229,8 +262,10 @@ export async function processClassifiedItems(
         });
       }
     }
+    await heartbeat('detect-prospects:done');
   } catch (e: any) {
     stats.errors.push({ phase: 'detect-prospects', error: e?.message || String(e) });
+    await heartbeat('detect-prospects:error');
   }
 
   return stats;

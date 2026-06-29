@@ -236,7 +236,7 @@ class WranglerD1ReadOnlyStatement implements ReadOnlyStatement {
   }
 
   private execute<T>(): T[] {
-    const sql = this.renderedSql();
+    const sql = this.renderedSql().replace(/\bCOUNT\(\*\)\s+AS\s+count\b/gi, 'COUNT(*) AS n');
     assertSelectOnly(sql);
     const stdout = execFileSync('npx', ['wrangler', 'd1', 'execute', this.database, '--remote', '--json', '--command', sql], {
       cwd: process.cwd(),
@@ -256,7 +256,11 @@ class WranglerD1ReadOnlyStatement implements ReadOnlyStatement {
       this.meta.rows_written += Number(first.meta?.rows_written || 0);
       this.meta.changed_db = Boolean(this.meta.changed_db || first.meta?.changed_db);
     }
-    return first.results || [];
+    return (first.results || []).map((row: any) =>
+      row && typeof row === 'object' && row.n !== undefined && row.count === undefined
+        ? { ...row, count: row.n }
+        : row
+    );
   }
 }
 

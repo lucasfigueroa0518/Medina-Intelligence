@@ -4,6 +4,7 @@ import {
   openSyncJob,
   patchSyncJobMetadata,
   reconcileStaleOperationalSyncJobs,
+  touchSyncJob,
 } from '../src/lib/sync-job-lifecycle';
 
 function makeD1Mock(options: { staleRows?: unknown[]; updateChanges?: number } = {}) {
@@ -58,6 +59,7 @@ describe('sync job lifecycle', () => {
       metadata: { phase: 'start' },
     });
     await patchSyncJobMetadata(env, id, { phase: 'middle', pages: 2 });
+    await touchSyncJob(env, id, { phase: 'still-working' }, 9);
     await closeSyncJob(env, id, {
       status: 'partial',
       metadata: { phase: 'done' },
@@ -73,6 +75,14 @@ describe('sync job lifecycle', () => {
 
     const patch = d1.runs.find((r: any) => r.sql.includes('json_patch') && r.sql.includes('WHERE id = ?') && r.binds.includes('job-1'));
     expect(patch?.binds[0]).toContain('"phase":"middle"');
+
+    const touch = d1.runs.find((r: any) =>
+      r.sql.includes('timeout_at = ?') &&
+      r.sql.includes("status = 'running'") &&
+      r.binds.includes('job-1')
+    );
+    expect(touch?.binds[1]).toContain('"phase":"still-working"');
+    expect(touch?.binds[1]).toContain('"heartbeat_at"');
 
     const close = d1.runs.find((r: any) => r.sql.includes('timeout_at = NULL') && r.sql.includes('error_message = ?'));
     expect(close?.binds).toContain('partial');

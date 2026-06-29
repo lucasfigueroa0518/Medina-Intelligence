@@ -85,6 +85,31 @@ export async function patchSyncJobMetadata(
   ).bind(metadataJson(metadata), syncJobId).run();
 }
 
+export async function touchSyncJob(
+  env: Env,
+  syncJobId: string,
+  metadata: Record<string, unknown> = {},
+  timeoutMinutes: number = DEFAULT_TIMEOUT_MINUTES
+): Promise<void> {
+  const minutes = Math.max(1, timeoutMinutes || DEFAULT_TIMEOUT_MINUTES);
+  await env.D1.prepare(
+    `UPDATE sync_jobs
+        SET timeout_at = ?,
+            metadata = json_patch(
+              CASE WHEN json_valid(COALESCE(metadata, '{}')) THEN COALESCE(metadata, '{}') ELSE '{}' END,
+              ?
+            )
+      WHERE id = ? AND status = 'running'`
+  ).bind(
+    addMinutes(minutes),
+    metadataJson({
+      heartbeat_at: nowIso(),
+      ...metadata,
+    }),
+    syncJobId
+  ).run();
+}
+
 export async function closeSyncJob(
   env: Env,
   syncJobId: string,
