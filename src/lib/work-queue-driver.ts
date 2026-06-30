@@ -184,6 +184,8 @@ import { dealEvidenceDetectHandler } from './work-queue-handlers/deal-evidence-d
 import { prospectDetectHandler } from './work-queue-handlers/prospect-detect';
 import { intelligentImportHandler } from './work-queue-handlers/intelligent-import';
 import { contactEnrichmentHandler } from './work-queue-handlers/contact-enrichment';
+import { companyEnrichmentHandler } from './work-queue-handlers/company-enrichment';
+import { ingestionTreatmentHandler } from './ingestion-treatment';
 import { ragReindexV2Handler } from './work-queue-handlers/rag-reindex-v2';
 import { deckRenderHandler } from './work-queue-handlers/deck-render';
 import { slackChannelBackfillHandler } from './work-queue-handlers/slack-channel-backfill';
@@ -215,6 +217,7 @@ import { crmNameBackfillHandler } from './work-queue-handlers/crm-name-backfill'
  * midnight without consuming attempt budget).
  */
 export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
+  ingestionTreatmentHandler,
   prospectDetectHandler,
   embedRetryHandler,
   attachmentBackfillHandler,
@@ -224,6 +227,7 @@ export const WORK_QUEUE_HANDLERS: WorkQueueHandler[] = [
   dealEvidenceDetectHandler,
   intelligentImportHandler,
   contactEnrichmentHandler,
+  companyEnrichmentHandler,
   maxModeJobHandler,
   crmNameBackfillHandler,
   // MARTy Sandbox handlers are intentionally not registered while the

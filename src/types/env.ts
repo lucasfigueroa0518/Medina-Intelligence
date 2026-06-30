@@ -25,6 +25,7 @@ export interface Env {
 
   // --- Service bindings ---
   PIPELINES?: PipelinesService;
+  API?: Fetcher;
 
   // --- Workflows ---
   INGESTION_WORKFLOW: Workflow;
@@ -109,6 +110,7 @@ export interface Env {
   FIREFLY_WEBHOOK_SECRET: string;
 
   TOKEN_ENCRYPTION_KEY: string;
+  PIPELINES_INTERNAL_TOKEN?: string;
   JWT_SECRET: string;
 
   // --- Signup ---

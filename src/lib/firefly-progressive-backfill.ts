@@ -20,26 +20,19 @@
 // per-user state).
 
 import type { Env } from '../types/env';
-import { encryptToken, decryptToken } from './encryption';
-import { runFireflyWindowBackfill } from './firefly-ingest';
-import { checkBudget, recordUsage, recordRateLimit } from './upstream-budget';
+import { encryptToken } from './encryption';
+import { recordUsage, recordRateLimit } from './upstream-budget';
 import { getFireflyKey, storeFireflyKey, getFireflyKeyStatus } from './firefly-credentials';
+import { FIREFLY_TRANSCRIPT_REBUILD_MAX_DAYS } from './firefly-transcript-rebuild';
 
 // Multi-day scheduling tunables.
 //
 // MAX_BACKFILL_DAYS: hard cap on total date span per parent. Pulls beyond
 // this need to be split into multiple parents.
 //
-// Phase 4 (2026-05-04): reduced 180 → 120. The frontend Fireflies
-// Historical Backfill card now offers presets up to 120 days (the
-// 180-day button was dropped per the bundled UX redesign). Aligning
-// the backend cap with the frontend UX prevents the "you can request
-// 180 in JSON but the dropdown maxes at 120" mismatch. Q3 audit on
-// 2026-05-04 confirmed zero in-flight backfills with
-// scheduled_days_count > 120, so the change is safely "cap NEW
-// creates" with no migration logic needed for existing rows
-// (Option C from the Phase 4 plan).
-export const MAX_BACKFILL_DAYS = 120;
+// Six-month Fireflies repair uses explicit date-range mode. 190 days gives a
+// safe cap for "same UTC date six calendar months back" across long months.
+export const MAX_BACKFILL_DAYS = FIREFLY_TRANSCRIPT_REBUILD_MAX_DAYS;
 
 // WINDOWS_PER_DAY: target windows scheduled to run on the same UTC day.
 // Each window does ~5-15 transcripts depending on density; 4 windows × ~10
@@ -324,6 +317,22 @@ export async function createFireflyProgressiveBackfill(
   // null for day 0 (run immediately) and (parent.created_at + day*24h) for
   // later days. The driver gates on earliest_run_at <= now when picking.
   const now = Date.now();
+  const runStart = new Date(now - totalDays * 86400000).toISOString();
+  const runEnd = new Date(now).toISOString();
+  await env.D1.prepare(
+    `INSERT OR IGNORE INTO firefly_transcript_runs
+       (id, org_id, user_id, mode, status, start_date, end_date, metadata)
+     VALUES (?, ?, ?, 'progressive_backfill', 'active', ?, ?, ?)`
+  ).bind(
+    parentId,
+    orgId,
+    userId,
+    runStart,
+    runEnd,
+    JSON.stringify({ mode: 'days_back', days_back: totalDays, window_size_days: windowSizeDays })
+  ).run().catch(e => {
+    console.warn(`[firefly-progressive] transcript run insert failed parent=${parentId}:`, e instanceof Error ? e.message : e);
+  });
   const stmts = [];
   // Phase 6.2 1a (2026-05-05): collect window descriptors so we can
   // dual-write into work_queue (domain='firefly_window') after the
@@ -437,6 +446,21 @@ export async function createFireflyProgressiveBackfillRange(
   }
   const parentId = insertedParent.id;
 
+  await env.D1.prepare(
+    `INSERT OR IGNORE INTO firefly_transcript_runs
+       (id, org_id, user_id, mode, status, start_date, end_date, metadata)
+     VALUES (?, ?, ?, 'rebuild', 'active', ?, ?, ?)`
+  ).bind(
+    parentId,
+    orgId,
+    userId,
+    start.toISOString(),
+    end.toISOString(),
+    JSON.stringify({ mode: 'date_range', window_size_days: windowSizeDays })
+  ).run().catch(e => {
+    console.warn(`[firefly-progressive] transcript run insert failed parent=${parentId}:`, e instanceof Error ? e.message : e);
+  });
+
   const stmts = [];
   const endMs = end.getTime();
   const startMs = start.getTime();
@@ -504,6 +528,17 @@ export async function cancelFireflyProgressiveBackfill(
   ).bind(parent.id).run();
 
   await env.D1.prepare(
+    `UPDATE firefly_transcript_runs
+        SET status = 'cancelled',
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            last_error = ?
+      WHERE id = ?`
+  ).bind(reason, parent.id).run().catch(e => {
+    console.warn(`[firefly-progressive] transcript run cancel failed parent=${parent.id}:`, e instanceof Error ? e.message : e);
+  });
+
+  await env.D1.prepare(
     `UPDATE firefly_progressive_backfill_windows
         SET status = 'failed',
             last_error = ?,
@@ -546,6 +581,15 @@ async function finalizeParent(parentId: string, env: Env): Promise<'completed' |
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = ?`
   ).bind(finalStatus, parentId).run();
+  await env.D1.prepare(
+    `UPDATE firefly_transcript_runs
+        SET status = ?,
+            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(finalStatus === 'partially_completed' ? 'partial' : 'completed', parentId).run().catch(e => {
+    console.warn(`[firefly-progressive] transcript run finalize failed parent=${parentId}:`, e instanceof Error ? e.message : e);
+  });
   return finalStatus;
 }
 

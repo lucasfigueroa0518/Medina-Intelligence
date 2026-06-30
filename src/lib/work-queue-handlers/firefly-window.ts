@@ -39,6 +39,7 @@ import {
   recordFireflyApiCall,
   nextUtcMidnightIso,
 } from '../firefly-progressive-backfill';
+import type { RunFireflyWindowResult } from '../firefly-ingest';
 
 interface FireflyWindowPayload {
   parent_id: string;
@@ -59,14 +60,81 @@ interface ParentLookupRow {
   status: 'active' | 'completed' | 'partially_completed' | 'cancelled';
 }
 
+async function getFireflyKeyFromApiService(
+  userId: string,
+  env: Env
+): Promise<string | null> {
+  if (!env.API || !env.PIPELINES_INTERNAL_TOKEN) return null;
+  try {
+    const res = await env.API.fetch(new Request('https://medina.internal/internal/firefly-credential', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Medina-Internal-Token': env.PIPELINES_INTERNAL_TOKEN,
+      },
+      body: JSON.stringify({ user_id: userId }),
+    }));
+    if (!res.ok) {
+      console.warn(`[firefly-handler] api service credential fallback failed status=${res.status}`);
+      return null;
+    }
+    const body = await res.json<{ api_key?: string }>();
+    return typeof body.api_key === 'string' && body.api_key.length > 0
+      ? body.api_key
+      : null;
+  } catch (e) {
+    console.error(
+      '[firefly-handler] api service credential fallback error:',
+      e instanceof Error ? e.message : e
+    );
+    return null;
+  }
+}
+
+async function recordTranscriptRunCounters(
+  env: Env,
+  runId: string,
+  result: RunFireflyWindowResult
+): Promise<void> {
+  await env.D1.prepare(
+    `UPDATE firefly_transcript_runs
+        SET source_transcripts = source_transcripts + ?,
+            r2_staged = r2_staged + ?,
+            linked_events = linked_events + ?,
+            standalone_transcripts = standalone_transcripts + ?,
+            embedding_queued = embedding_queued + ?,
+            prospect_queued = prospect_queued + ?,
+            error_count = error_count + ?,
+            last_error = COALESCE(?, last_error),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?`
+  ).bind(
+    result.total_processed,
+    result.r2_staged,
+    result.linked_events,
+    result.standalone_transcripts,
+    result.embedding_queued,
+    result.prospect_queued,
+    result.failed,
+    result.reason || null,
+    runId
+  ).run().catch(e => {
+    console.warn(
+      `[firefly-window] transcript run counter update failed run=${runId}:`,
+      e instanceof Error ? e.message : e
+    );
+  });
+}
+
 export const fireflyWindowHandler: WorkQueueHandler = {
   domain: 'firefly_window',
 
-  // Conservative per the Phase 6.2 audit subreq math: per-window can
-  // hit ~225 subreqs (1 GraphQL + 10 transcripts × ~20 each + book-
-  // keeping). batchSize=1 keeps Firefly's per-tick spend bounded;
-  // daily Firefly quota throttles real throughput regardless.
-  batchSize: 1,
+  // Transcript rebuild work is checkpointed after durable staging and derived
+  // embedding/prospect work is queued separately. Run a few small slices in
+  // parallel so 6-month repairs drain promptly without long-held row locks.
+  batchSize: 6,
+  maxConcurrent: 6,
+  processConcurrency: 6,
 
   cadence: 'minute',
 
@@ -177,6 +245,10 @@ export const fireflyWindowHandler: WorkQueueHandler = {
     }
 
     if (!apiKey) {
+      apiKey = await getFireflyKeyFromApiService(user_id, env);
+    }
+
+    if (!apiKey) {
       // No credential available. Throw → driver's failWork applies
       // 3-tier backoff. After max_attempts the row dead-letters and
       // surfaces in System Status DLQ. Legacy window is NOT updated
@@ -200,6 +272,7 @@ export const fireflyWindowHandler: WorkQueueHandler = {
           endDate: end_date,
           initialSkip: last_skip ?? 0,
           progressiveWindowId: item.id,  // work_queue row id for log correlation
+          runId: parent_id,
         },
         env
       );
@@ -218,6 +291,8 @@ export const fireflyWindowHandler: WorkQueueHandler = {
       ).bind(msg, parent_id, window_index).run();
       throw new Error(msg);
     }
+
+    await recordTranscriptRunCounters(env, parent_id, result);
 
     // ─── Result branching ────────────────────────────────────────────
 

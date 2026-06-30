@@ -141,6 +141,34 @@ export async function processClassifiedItems(
     return stats;
   }
 
+  // Universal treatment fan-out. The source rows are durable after
+  // stage-and-commit, so every live/backfilled conversation/event/news item
+  // gets an idempotent downstream treatment receipt.
+  try {
+    const { enqueueIngestionTreatment } = await import('./ingestion-treatment');
+    const ingestionMode = ctx.ingestionMode || (ctx.syncJobId.includes('backfill') ? 'backfill' : 'live');
+    for (const item of classified) {
+      const sourceTable = item.metadata.source_table;
+      if (
+        sourceTable !== 'conversations' &&
+        sourceTable !== 'events' &&
+        sourceTable !== 'documents' &&
+        sourceTable !== 'news_articles'
+      ) continue;
+      await enqueueIngestionTreatment(env, {
+        orgId: ctx.orgId,
+        sourceTable,
+        sourceId: item.entityId,
+        sourceKind: item.type,
+        ingestionMode,
+        origin: 'process_classified_items',
+        priority: ingestionMode === 'backfill' ? 20 : 30,
+      });
+    }
+  } catch (e: any) {
+    stats.errors.push({ phase: 'enqueue-treatment', error: e?.message || String(e) });
+  }
+
   // Phase 2 — chunk + embed. Per-item try/catch so a single bad text payload
   // (extraction error, AI rate-limit) doesn't drop the others. The hourly
   // self-heal cron (backfillUnembeddedConversations + embed_retry_queue)

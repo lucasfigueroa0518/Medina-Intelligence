@@ -10,20 +10,27 @@
 import type { Env } from '../types/env';
 import type { SpeakerTurn } from '../types/interfaces';
 import { emitAudit } from '../lib/audit';
+import { getFireflyKey } from '../lib/firefly-credentials';
+import { fetchTranscriptById, ingestSingleFireflyTranscript } from '../lib/firefly-ingest';
 import {
-  processTranscriptItems,
-  type TranscriptItem,
-} from '../lib/process-transcript-items';
+  ingestFireflyTranscriptRecord,
+  type FireflyTranscriptIngestResult,
+} from '../lib/firefly-transcript-rebuild';
 
 interface FireflyWebhookPayload {
-  event_type: 'meeting_completed' | 'meeting_started' | 'transcript_ready';
+  event_type?: 'meeting_completed' | 'meeting_started' | 'transcript_ready' | string;
+  eventType?: string;
+  event?: string;
   event_id?: string;
   meeting_id?: string;
-  meeting_title: string;
-  start_time: string;
-  end_time: string;
+  meetingId?: string;
+  transcript_id?: string;
+  transcriptId?: string;
+  meeting_title?: string;
+  start_time?: string;
+  end_time?: string;
   duration_seconds?: number;
-  participants: Array<{ name: string; email?: string }>;
+  participants?: Array<{ name: string; email?: string }>;
   transcript?: { format: 'text' | 'json'; content: string };
   summary?: string;
   action_items?: string[];
@@ -56,6 +63,34 @@ export async function verifyFireflySignature(
   return result === 0;
 }
 
+function eventName(payload: FireflyWebhookPayload): string {
+  return String(payload.event_type || payload.eventType || payload.event || '').trim();
+}
+
+function transcriptId(payload: FireflyWebhookPayload): string {
+  return String(
+    payload.event_id ||
+    payload.meeting_id ||
+    payload.meetingId ||
+    payload.transcript_id ||
+    payload.transcriptId ||
+    ''
+  ).trim();
+}
+
+function isTranscriptReadyEvent(name: string): boolean {
+  const normalized = name.toLowerCase();
+  return (
+    normalized === 'transcript_ready' ||
+    normalized === 'meeting_completed' ||
+    normalized === 'transcription completed' ||
+    normalized === 'meeting.transcribed' ||
+    normalized === 'meeting.summarized' ||
+    normalized.includes('transcription completed') ||
+    normalized.includes('transcript')
+  );
+}
+
 function parseTranscriptToTurns(
   content: string,
   participants: Array<{ name: string; email?: string }>
@@ -79,50 +114,100 @@ function parseTranscriptToTurns(
   return turns;
 }
 
+async function credentialedUsersForOrg(
+  orgId: string,
+  env: Env
+): Promise<Array<{ user_id: string; email: string | null }>> {
+  const rows = await env.D1.prepare(
+    `SELECT u.id AS user_id, u.email
+       FROM user_firefly_credentials c
+       JOIN users u ON u.id = c.user_id
+      WHERE u.org_id = ?
+        AND u.deleted_at IS NULL
+        AND COALESCE(u.is_active, 1) = 1
+      ORDER BY COALESCE(c.last_used_at, c.updated_at, c.created_at) DESC`
+  ).bind(orgId).all<{ user_id: string; email: string | null }>();
+  return rows.results;
+}
+
+async function fetchAndIngestWebhookTranscript(
+  fireflyEventId: string,
+  orgId: string,
+  env: Env
+): Promise<FireflyTranscriptIngestResult> {
+  const credentialedUsers = await credentialedUsersForOrg(orgId, env);
+  if (credentialedUsers.length === 0) {
+    throw new Error('FIREFLY_WEBHOOK_NO_STORED_CREDENTIALS');
+  }
+
+  const errors: string[] = [];
+  for (const user of credentialedUsers) {
+    const key = await getFireflyKey(user.user_id, env);
+    if (!key) {
+      errors.push(`${user.user_id}:missing_or_decrypt_failed`);
+      continue;
+    }
+
+    try {
+      const transcript = await fetchTranscriptById(key, fireflyEventId);
+      return ingestSingleFireflyTranscript(transcript, orgId, 'firefly-webhook', env, {
+        userId: user.user_id,
+        repairEmbeddings: true,
+        repairProspectSignals: true,
+      });
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      errors.push(`${user.user_id}:${msg.slice(0, 120)}`);
+      if (msg.includes('FIREFLY_RATE_LIMITED')) throw e;
+      if (msg.includes('FIREFLY_AUTH_FAILED') || msg.includes('FIREFLY_TRANSCRIPT_NOT_FOUND')) continue;
+      throw e;
+    }
+  }
+
+  throw new Error(`FIREFLY_WEBHOOK_FETCH_FAILED:${errors.join('|').slice(0, 500)}`);
+}
+
 export async function processFireflyWebhook(
   payload: FireflyWebhookPayload,
   orgId: string,
   env: Env
 ): Promise<void> {
-  if (payload.event_type !== 'transcript_ready' && payload.event_type !== 'meeting_completed') {
+  const event = eventName(payload);
+  if (!isTranscriptReadyEvent(event)) {
     return;
   }
 
-  const fireflyEventId = payload.event_id || payload.meeting_id || '';
+  const fireflyEventId = transcriptId(payload);
   if (!fireflyEventId) {
     console.warn(
-      `[firefly] webhook payload missing event_id and meeting_id; skipping (title="${payload.meeting_title}")`
+      `[firefly] webhook payload missing meeting/transcript id; skipping event="${event}"`
     );
     return;
   }
 
-  // Caller-side R2 PUT. The helper accepts an already-staged key — keeping
-  // the upload here lets the webhook own its own R2 path scheme. We name the
-  // object by a transient UUID; the canonical event id from Phase 1's
-  // read-back may differ when a duplicate firefly_event_id wins the race
-  // (in that case our R2 object becomes orphaned but the existing winner's
-  // transcript_r2_key is preserved on its row).
-  const transientId = crypto.randomUUID();
-  const r2Stamp = new Date().toISOString().slice(0, 7);
-  const r2Key = `${orgId}/transcript/${r2Stamp}/${transientId}.txt`;
-
   const transcriptText = payload.transcript?.content ?? null;
-  if (transcriptText) {
-    await env.R2.put(r2Key, transcriptText);
+  if (!transcriptText) {
+    const result = await fetchAndIngestWebhookTranscript(fireflyEventId, orgId, env);
+    console.log(
+      `[firefly] webhook fetched+processed: firefly_event_id=${fireflyEventId} ` +
+      `status=${result.canonical_status} linked_events=${result.linked_events} ` +
+      `embedding_queued=${result.embedding_queued} prospect_queued=${result.prospect_queued}`
+    );
+    return;
   }
 
+  const participants = payload.participants || [];
   const speakerTurns = transcriptText
-    ? parseTranscriptToTurns(transcriptText, payload.participants)
+    ? parseTranscriptToTurns(transcriptText, participants)
     : [];
 
-  const item: TranscriptItem = {
+  const result = await ingestFireflyTranscriptRecord({
     fireflyEventId,
-    title: payload.meeting_title,
-    startTime: payload.start_time,
-    endTime: payload.end_time,
-    transcriptR2Key: transcriptText ? r2Key : null,
+    title: payload.meeting_title || '(untitled meeting)',
+    startTime: payload.start_time || new Date().toISOString(),
+    endTime: payload.end_time || null,
     transcriptText,
-    participants: payload.participants.map(p => ({
+    participants: participants.map(p => ({
       displayName: p.name,
       email: p.email ?? null,
     })),
@@ -130,15 +215,15 @@ export async function processFireflyWebhook(
     actionItems: payload.action_items ?? [],
     topics: payload.key_topics ?? [],
     speakerTurns,
-  };
+  }, {
+    orgId,
+    sourcePath: 'firefly-webhook',
+  }, env, {
+    repairEmbeddings: true,
+    repairProspectSignals: true,
+  });
 
-  const stats = await processTranscriptItems(
-    [item],
-    { orgId, sourcePath: 'firefly-webhook' },
-    env
-  );
-
-  const eventId = stats.staged_event_ids[0];
+  const eventId = result.event_ids[0];
   if (eventId) {
     await emitAudit(env, {
       org_id: orgId,
@@ -148,10 +233,10 @@ export async function processFireflyWebhook(
       metadata: {
         source: 'firefly',
         title: payload.meeting_title,
-        sync_job_id: stats.sync_job_id,
-        chunks_embedded: stats.chunks_embedded,
-        signals_extracted: stats.signals_extracted,
-        errors: stats.errors.length,
+        transcript_item_id: result.transcript_item_id,
+        linked_events: result.linked_events,
+        embedding_queued: result.embedding_queued,
+        prospect_queued: result.prospect_queued,
       },
       created_at: new Date().toISOString(),
     });
@@ -159,9 +244,7 @@ export async function processFireflyWebhook(
 
   console.log(
     `[firefly] webhook processed: firefly_event_id=${fireflyEventId} ` +
-    `staged=${stats.items_staged}/${stats.items_total} ` +
-    `chunks=${stats.chunks_embedded} attendees=${stats.attendees_linked} ` +
-    `signals=${stats.signals_extracted} errors=${stats.errors.length} ` +
-    `sync_job=${stats.sync_job_id}`
+    `status=${result.canonical_status} linked_events=${result.linked_events} ` +
+    `embedding_queued=${result.embedding_queued} prospect_queued=${result.prospect_queued}`
   );
 }

@@ -2,6 +2,7 @@
 import type { Env } from '../types/env';
 import { safelyUpsertEventTimelineItemsForContacts } from './contact-detail-read-model';
 import { upsertEventAttendee } from './event-attendees';
+import { enqueueIngestionTreatment } from './ingestion-treatment';
 
 export interface OutlookEventLike {
   id: string;
@@ -80,6 +81,18 @@ export async function upsertOutlookEvent(
       );
     }
   }
+
+  await enqueueIngestionTreatment(env, {
+    orgId,
+    sourceTable: 'events',
+    sourceId: eventRow.id,
+    sourceKind: 'outlook_calendar_event',
+    ingestionMode: 'live',
+    origin: 'upsert_outlook_event',
+    priority: 20,
+  }).catch(e => {
+    console.error(`[reconciliation] treatment enqueue failed for event=${eventRow.id}:`, e);
+  });
 }
 
 /**
