@@ -11,18 +11,31 @@ interface ReconcileBody {
   dry_run?: boolean;
   user_id?: string;   // optional filter
   limit?: number;
+  /** dry_run only: cap how many per-row diagnostics are returned (default 50). */
+  explain_limit?: number;
 }
 
 /**
  * POST /api/admin/reconcile-orphaned-fireflies
  *
- * Runs the matcher against every Firefly event in `pending_reconciliation`
- * for this org. Owner-only.
+ * Runs the scored matcher against every Firefly event in
+ * `pending_reconciliation` for this org. Owner-only.
  *
- * Body: { dry_run?: boolean, user_id?: string, limit?: number }
- *   - dry_run: count candidates without mutating anything
+ * Body: { dry_run?: boolean, user_id?: string, limit?: number, explain_limit?: number }
+ *   - dry_run: score every pending row and return a per-row explanation of why
+ *     it did or did not match — WITHOUT mutating anything. This is the
+ *     diagnostic the audit asked for: each row shows its outcome, the chosen
+ *     Outlook candidate (if any), confidence, margin, and the top scored
+ *     candidates with their signal breakdown + reasons.
  *   - user_id: scope to a single user's events (event_attendees join)
  *   - limit: cap rows scanned (default 500, max 2000)
+ *   - explain_limit: dry_run only — cap returned per-row diagnostics (default 50)
+ *
+ * Production note: the live ingestion pipeline already runs this matcher per
+ * transcript. This endpoint is the *repair* path for rows that predate the
+ * matcher fix; run dry_run first, inspect the explanations, then re-run with
+ * dry_run:false to apply. Apply mode only attaches confident, unambiguous
+ * matches — ambiguous rows stay pending by design.
  */
 export async function handleReconcileOrphanedFireflies(
   request: Request,
@@ -36,6 +49,7 @@ export async function handleReconcileOrphanedFireflies(
   const body = (await parseJsonBody<ReconcileBody>(request)) || {};
   const dryRun = body.dry_run === true;
   const limit = Math.min(Math.max(body.limit ?? 500, 1), 2000);
+  const explainLimit = Math.min(Math.max(body.explain_limit ?? 50, 1), 500);
 
   // Pull pending Firefly events. Optionally scope to a user via the
   // event_attendees join — the user is an attendee on their own meetings,
@@ -67,27 +81,23 @@ export async function handleReconcileOrphanedFireflies(
 
   const candidates = rows.results;
 
-  if (dryRun) {
-    return jsonResponse({
-      ok: true,
-      dry_run: true,
-      candidate_count: candidates.length,
-      sample: candidates.slice(0, 5).map(r => ({
-        id: r.id,
-        start_time: r.start_time,
-        has_transcript: !!r.transcript_r2_key,
-        firefly_event_id: r.firefly_event_id,
-      })),
-    });
-  }
-
-  let reconciled = 0;
-  let still_pending = 0;
+  // Outcome tallies are produced in BOTH modes — dry_run scores without
+  // mutating, apply mode scores and writes. This keeps the diagnostic and the
+  // repair on exactly one code path (no drift between "what we'd do" and "what
+  // we did").
+  const tally: Record<string, number> = {
+    matched: 0,
+    ambiguous: 0,
+    no_match: 0,
+    no_candidates: 0,
+    already_reconciled: 0,
+  };
+  const explanations: Array<Record<string, unknown>> = [];
   const errors: Array<{ id: string; error: string }> = [];
 
   for (const row of candidates) {
     try {
-      const matched = await reconcileFireflyToOutlook(
+      const result = await reconcileFireflyToOutlook(
         {
           id: row.id,
           firefly_event_id: row.firefly_event_id,
@@ -95,10 +105,35 @@ export async function handleReconcileOrphanedFireflies(
           transcript_r2_key: row.transcript_r2_key,
         },
         ctx.orgId,
-        env
+        env,
+        { dryRun }
       );
-      if (matched) reconciled++;
-      else still_pending++;
+
+      tally[result.outcome] = (tally[result.outcome] ?? 0) + 1;
+
+      if (dryRun && explanations.length < explainLimit) {
+        explanations.push({
+          firefly_event_id: row.id,
+          start_time: row.start_time,
+          has_transcript: !!row.transcript_r2_key,
+          outcome: result.outcome,
+          chosen_outlook_event_id: result.chosenCandidateId,
+          confidence: result.confidence,
+          margin: result.margin,
+          explanation: result.explanation,
+          candidates_considered: result.scored.length,
+          // Top few scored candidates with the signal breakdown that drove the
+          // decision — this is the "why did/didn't it match" the audit wants.
+          top_candidates: result.scored.slice(0, 3).map(c => ({
+            outlook_event_id: c.candidateId,
+            score: c.signals.total,
+            attach_eligible: c.attachEligible,
+            duplicate_of: c.duplicateOf,
+            signals: c.signals,
+            reasons: c.reasons,
+          })),
+        });
+      }
     } catch (e: any) {
       errors.push({ id: row.id, error: String(e?.message || e).slice(0, 200) });
     }
@@ -106,11 +141,16 @@ export async function handleReconcileOrphanedFireflies(
 
   return jsonResponse({
     ok: true,
+    dry_run: dryRun,
     scanned: candidates.length,
-    reconciled,
-    still_pending,
+    outcomes: tally,
+    // In apply mode, `matched` rows were actually written; in dry_run they
+    // would have been.
+    reconciled: tally.matched,
+    still_pending: tally.ambiguous + tally.no_match + tally.no_candidates,
     errors_count: errors.length,
     errors_sample: errors.slice(0, 10),
+    ...(dryRun ? { explanations } : {}),
   });
 }
 

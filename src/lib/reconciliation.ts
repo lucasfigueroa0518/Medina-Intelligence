@@ -2,6 +2,14 @@
 import type { Env } from '../types/env';
 import { safelyUpsertEventTimelineItemsForContacts } from './contact-detail-read-model';
 import { upsertEventAttendee } from './event-attendees';
+import {
+  scoreReconciliation,
+  type AttendeeRef,
+  type FireflyMeeting,
+  type OutlookCandidate,
+  type ReconcileWeights,
+  type ReconciliationDecision,
+} from './reconciliation-scoring';
 
 export interface OutlookEventLike {
   id: string;
@@ -49,9 +57,36 @@ export async function upsertOutlookEvent(
   ).bind(event.id).first<{ id: string }>();
   if (!eventRow) return;
 
-  for (const att of event.attendees || []) {
+  // Always treat the organizer as an attendee, even when Microsoft Graph omits
+  // them from attendees[] (which it routinely does for the organizer's own
+  // copy of the event). Without this, a 2-person meeting that an internal user
+  // organized persists with a single attendee row, so Firefly→Outlook
+  // reconciliation sees overlap=1 against the (organizer+guest) transcript and
+  // strands the row in pending_reconciliation. upsertEventAttendee dedups on
+  // (event_id, lower(email)), so unioning the organizer in is idempotent even
+  // when Graph *did* include them. (This is the structural fix for the Tony
+  // pending-reconciliation class; existing rows backfill on the next hourly
+  // calendarView upsert, which is idempotent via ON CONFLICT.)
+  const organizerAddr = event.organizer?.emailAddress.address;
+  const attendeesWithOrganizer = [...(event.attendees || [])];
+  if (
+    organizerAddr &&
+    !attendeesWithOrganizer.some(
+      a => a.emailAddress.address?.toLowerCase() === organizerAddr.toLowerCase()
+    )
+  ) {
+    attendeesWithOrganizer.push({
+      emailAddress: {
+        address: organizerAddr,
+        name: event.organizer?.emailAddress.name,
+      },
+      type: 'required',
+    });
+  }
+
+  for (const att of attendeesWithOrganizer) {
     const isOrganizer =
-      event.organizer?.emailAddress.address === att.emailAddress.address;
+      organizerAddr?.toLowerCase() === att.emailAddress.address?.toLowerCase();
 
     const contact = await env.D1.prepare(
       'SELECT id FROM contacts WHERE email = ? AND org_id = ? AND deleted_at IS NULL'
@@ -82,29 +117,134 @@ export async function upsertOutlookEvent(
   }
 }
 
+// How far on either side of the Firefly recording start we pull Outlook
+// candidates. The scorer applies time-decay inside this window and excludes
+// anything past its own maxDeltaMinutes; ±24h is the outer bound so reschedules
+// (calendar moved, transcript recorded against the original slot) are reachable.
+const CANDIDATE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+interface FireflyEventRow {
+  id: string;
+  title: string;
+  start_time: string;
+  transcript_r2_key: string | null;
+}
+
+async function loadAttendeeRefs(
+  eventId: string,
+  env: Env
+): Promise<AttendeeRef[]> {
+  const rows = await env.D1.prepare(
+    `SELECT email, user_id, is_internal FROM event_attendees WHERE event_id = ?`
+  ).bind(eventId).all<{ email: string; user_id: string | null; is_internal: number | null }>();
+  return rows.results.map(r => ({
+    email: r.email,
+    // An attendee is internal when it resolved to an org user (user_id) — the
+    // is_internal flag is a denormalised mirror of the same fact.
+    isInternal: !!r.user_id || Number(r.is_internal || 0) === 1,
+  }));
+}
+
 /**
- * Match a Firefly transcript event to an Outlook calendar event by attendee
- * overlap + start-time window, and reconcile both rows on match.
+ * Gather the Firefly meeting and its scoreable Outlook candidates from D1.
+ * Pure-data output so `scoreReconciliation` can decide without further I/O and
+ * the dry-run diagnostic can reuse the exact same candidate set.
+ */
+export async function gatherReconciliationInputs(
+  eventId: string,
+  orgId: string,
+  env: Env
+): Promise<{ firefly: FireflyMeeting; candidates: OutlookCandidate[] } | null> {
+  const fireflyRow = await env.D1.prepare(
+    `SELECT id, title, start_time, transcript_r2_key
+       FROM events
+      WHERE id = ? AND org_id = ? AND deleted_at IS NULL`
+  ).bind(eventId, orgId).first<FireflyEventRow>();
+  if (!fireflyRow) return null;
+
+  const fireflyAttendees = await loadAttendeeRefs(fireflyRow.id, env);
+
+  const windowStart = new Date(
+    new Date(fireflyRow.start_time).getTime() - CANDIDATE_WINDOW_MS
+  ).toISOString();
+  const windowEnd = new Date(
+    new Date(fireflyRow.start_time).getTime() + CANDIDATE_WINDOW_MS
+  ).toISOString();
+
+  const candidateRows = await env.D1.prepare(
+    `SELECT id, title, start_time, created_at, updated_at, transcript_r2_key
+       FROM events
+      WHERE org_id = ? AND source = 'outlook'
+        AND start_time BETWEEN ? AND ?
+        AND deleted_at IS NULL`
+  ).bind(orgId, windowStart, windowEnd).all<{
+    id: string;
+    title: string;
+    start_time: string;
+    created_at: string | null;
+    updated_at: string | null;
+    transcript_r2_key: string | null;
+  }>();
+
+  const candidates: OutlookCandidate[] = [];
+  for (const row of candidateRows.results) {
+    candidates.push({
+      id: row.id,
+      startTime: row.start_time,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      title: row.title,
+      attendees: await loadAttendeeRefs(row.id, env),
+      existingTranscriptR2Key: row.transcript_r2_key,
+    });
+  }
+
+  return {
+    firefly: {
+      id: fireflyRow.id,
+      startTime: fireflyRow.start_time,
+      title: fireflyRow.title,
+      transcriptR2Key: fireflyRow.transcript_r2_key,
+      attendees: fireflyAttendees,
+    },
+    candidates,
+  };
+}
+
+export interface ReconcileOptions {
+  /** Score + explain only; never mutate. Powers the dry-run diagnostic. */
+  dryRun?: boolean;
+  weights?: Partial<ReconcileWeights>;
+}
+
+export interface ReconcileResult extends ReconciliationDecision {
+  /** True only when this call mutated rows (matched + !dryRun + new attach). */
+  applied: boolean;
+}
+
+/**
+ * Match a transcript-bearing Firefly event to its Outlook calendar event by
+ * scored evidence — time proximity, external/internal attendee overlap, title
+ * similarity — and, on a confident *unambiguous* match, stamp the transcript
+ * onto the Outlook row and flip both rows to `reconciled`.
  *
- * Runs the same matcher whether or not `firefly_event_id` is set — the prior
- * `reconcileFireflyWithoutId` (since renamed) bailed when the id was present,
- * which silently skipped 100% of Phase F backfill events and 100% of webhook
- * events (both always carry firefly_event_id from Fireflies' GraphQL/payload).
- * As a result, every Firefly event landed `pending_reconciliation` and stayed
- * there. This unconditional matcher is the bidirectional reconciliation called
- * out in TRD v2.3 §7.4 that shipped only one direction.
+ * Replaces the prior phased thresholds (±15min/≥2, ±24h/≥3, first-match-wins),
+ * which stranded legitimate matches (organizer dropped from Outlook attendees,
+ * recording-start drift, single-external-attendee meetings, duplicate Outlook
+ * rows). See reconciliation-scoring.ts for the model and the invariant.
  *
- * Match phases (unchanged from prior helper):
- *   • Phase 1: ±15 min, ≥2 attendee overlap (typical case)
- *   • Phase 2: ±24h, ≥3 attendee overlap, Outlook event updated > 1h after
- *     creation (catches reschedules where the calendar event moved but the
- *     transcript was recorded against the original time)
+ * Safety properties:
+ *   • Never attaches ambiguously — two distinct candidate meetings within the
+ *     score margin leave the row `pending_reconciliation` with a diagnostic.
+ *   • Never steals — a candidate already holding a different transcript is
+ *     ineligible.
+ *   • Idempotent — a candidate already holding *this* transcript returns
+ *     `already_reconciled` and writes nothing.
+ *   • dryRun returns the full decision (per-candidate scores + reasons) and
+ *     mutates nothing.
  *
- * On match: stamp the Outlook row with the transcript pointer + transcript_source,
- * flip both rows to `reconciled`. On no match: leave the Firefly row at
- * `pending_reconciliation`; the existing `promoteToStandalone` daily-cron pass
- * promotes it to `standalone` after 48-72h depending on whether firefly_event_id
- * is set.
+ * On no/ambiguous match the row stays `pending_reconciliation`; the existing
+ * `promoteToStandalone` daily cron promotes long-pending rows to `standalone`.
  */
 export async function reconcileFireflyToOutlook(
   event: {
@@ -114,94 +254,72 @@ export async function reconcileFireflyToOutlook(
     transcript_r2_key?: string | null;
   },
   orgId: string,
-  env: Env
-): Promise<boolean> {
-  const fireflyAttendees = await env.D1.prepare(
-    'SELECT email FROM event_attendees WHERE event_id = ?'
-  ).bind(event.id).all<{ email: string }>();
-  const fireflyEmails = new Set(
-    fireflyAttendees.results.map(a => a.email.toLowerCase())
-  );
-
-  // Phase 1: ±15 min, ≥2 attendee overlap
-  const windowStart = new Date(
-    new Date(event.start_time).getTime() - 15 * 60 * 1000
-  ).toISOString();
-  const windowEnd = new Date(
-    new Date(event.start_time).getTime() + 15 * 60 * 1000
-  ).toISOString();
-
-  const candidates = await env.D1.prepare(
-    `SELECT e.id FROM events e WHERE e.org_id = ? AND e.source = 'outlook'
-       AND e.start_time BETWEEN ? AND ? AND e.deleted_at IS NULL AND e.reconciliation_status = 'reconciled'`
-  ).bind(orgId, windowStart, windowEnd).all<{ id: string }>();
-
-  for (const candidate of candidates.results) {
-    const outlookAtt = await env.D1.prepare(
-      'SELECT email FROM event_attendees WHERE event_id = ?'
-    ).bind(candidate.id).all<{ email: string }>();
-    const overlap = outlookAtt.results.filter(a =>
-      fireflyEmails.has(a.email.toLowerCase())
-    ).length;
-
-    if (overlap >= 2) {
-      await env.D1.batch([
-        env.D1
-          .prepare(
-            `UPDATE events SET transcript_r2_key = ?, transcript_source = 'firefly', reconciliation_status = 'reconciled', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-          )
-          .bind(event.transcript_r2_key || null, candidate.id),
-        env.D1
-          .prepare(
-            `UPDATE events SET reconciliation_status = 'reconciled', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-          )
-          .bind(event.id),
-      ]);
-      return true;
-    }
+  env: Env,
+  opts: ReconcileOptions = {}
+): Promise<ReconcileResult> {
+  const gathered = await gatherReconciliationInputs(event.id, orgId, env);
+  if (!gathered) {
+    return {
+      outcome: 'no_candidates',
+      chosenCandidateId: null,
+      confidence: null,
+      margin: null,
+      scored: [],
+      logicalGroups: [],
+      explanation: `firefly event ${event.id} not found for org ${orgId}`,
+      applied: false,
+    };
   }
 
-  // Phase 2: ±24h, ≥3 attendees, recently updated Outlook event
-  const wideStart = new Date(
-    new Date(event.start_time).getTime() - 24 * 60 * 60 * 1000
-  ).toISOString();
-  const wideEnd = new Date(
-    new Date(event.start_time).getTime() + 24 * 60 * 60 * 1000
-  ).toISOString();
-  const oneHourAfterCreate = `strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at, '+1 hour')`;
-
-  const rescheduleCandidates = await env.D1.prepare(
-    `SELECT e.id FROM events e WHERE e.org_id = ? AND e.source = 'outlook'
-       AND e.start_time BETWEEN ? AND ? AND e.deleted_at IS NULL AND e.reconciliation_status = 'reconciled'
-       AND e.updated_at > ${oneHourAfterCreate}`
-  ).bind(orgId, wideStart, wideEnd).all<{ id: string }>();
-
-  for (const candidate of rescheduleCandidates.results) {
-    const outlookAtt = await env.D1.prepare(
-      'SELECT email FROM event_attendees WHERE event_id = ?'
-    ).bind(candidate.id).all<{ email: string }>();
-    const overlap = outlookAtt.results.filter(a =>
-      fireflyEmails.has(a.email.toLowerCase())
-    ).length;
-
-    if (overlap >= 3) {
-      await env.D1.batch([
-        env.D1
-          .prepare(
-            `UPDATE events SET transcript_r2_key = ?, transcript_source = 'firefly', reconciliation_status = 'reconciled', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-          )
-          .bind(event.transcript_r2_key || null, candidate.id),
-        env.D1
-          .prepare(
-            `UPDATE events SET reconciliation_status = 'reconciled', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-          )
-          .bind(event.id),
-      ]);
-      return true;
-    }
+  if (!gathered.firefly.transcriptR2Key) {
+    return {
+      outcome: 'no_match',
+      chosenCandidateId: null,
+      confidence: null,
+      margin: null,
+      scored: [],
+      logicalGroups: [],
+      explanation: `firefly event ${event.id} has no transcript_r2_key; refusing calendar attachment`,
+      applied: false,
+    };
   }
 
-  return false;
+  const decision = scoreReconciliation(gathered.firefly, gathered.candidates, opts.weights);
+
+  if (opts.dryRun || decision.outcome !== 'matched' || !decision.chosenCandidateId) {
+    if (!opts.dryRun && decision.outcome === 'already_reconciled') {
+      await env.D1.prepare(
+        `UPDATE events
+            SET reconciliation_status = 'reconciled',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND reconciliation_status != 'reconciled'`
+      ).bind(event.id).run();
+      return { ...decision, applied: true };
+    }
+    return { ...decision, applied: false };
+  }
+
+  await env.D1.batch([
+    env.D1
+      .prepare(
+        `UPDATE events
+            SET transcript_r2_key = ?, transcript_source = 'firefly',
+                reconciliation_status = 'reconciled',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`
+      )
+      .bind(gathered.firefly.transcriptR2Key, decision.chosenCandidateId),
+    env.D1
+      .prepare(
+        `UPDATE events
+            SET reconciliation_status = 'reconciled',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`
+      )
+      .bind(event.id),
+  ]);
+
+  return { ...decision, applied: true };
 }
 
 export async function promoteToStandalone(orgId: string, env: Env): Promise<void> {
