@@ -103,9 +103,13 @@
 - GitHub Actions are pinned to full commit SHAs (tag in the trailing
   comment). Updating a pin = resolving the new tag's SHA deliberately —
   never float on a moving major tag. New workflows follow suit.
-- `secrets-scan.yml` runs gitleaks over FULL history on every PR; a leak
-  fails CI until rotated or explicitly allowlisted with a documented
-  reason in `.gitleaks.toml`.
+- `secrets-scan.yml` runs gitleaks over FULL history on every PR by
+  invoking the checksum-pinned BINARY directly — never gitleaks-action,
+  whose scan scope silently narrows to the PR's commit range on
+  pull_request events (round-2 audit catch). NEW leaks fail CI
+  immediately; known historical findings live as REDACTED fingerprints
+  in `.gitleaks-baseline.json` pending rotation/cleanup — shrinking that
+  baseline is the goal, growing it needs allowlist-grade scrutiny.
 - Node version source of truth is `.nvmrc` (workflows use
   `node-version-file`; both package.jsons declare `engines`). Bump Node
   in ONE place.
