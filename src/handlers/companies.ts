@@ -16,6 +16,15 @@ import {
   evaluateContactCompanyAffiliation,
 } from '../lib/contact-company-affiliation';
 import { safelyRebuildContactSearchIndexForCompany } from '../lib/contact-search';
+import {
+  buildCompanySearchQuery,
+  companySearchCteSql,
+  companySearchCteBinds,
+  isCompanySearchIndexUsable,
+  rebuildCompanySearchIndexForOrg,
+  safelyRebuildCompanySearchIndexForCompany,
+  safelyDeleteCompanySearchIndexForCompany,
+} from '../lib/company-search';
 import { safelyRebuildContactListEntriesForCompany } from '../lib/contact-list-read-model';
 import { crmQualityCustomFieldsForGate, evaluateCrmQualityGate } from '../lib/crm-quality-gate';
 
@@ -204,14 +213,28 @@ export async function listCompanies(
     );
   }
 
-  // Search — name + domain + description. Matches the placeholder text in
-  // the companies search input.
+  // Search — name + domain + description. Prefer the dedicated FTS5 index
+  // (company_search_fts, migration 0136) when it's usable; fall back to the
+  // original wide LIKE scan when the index is empty, missing (local DBs without
+  // the migration), or the term doesn't tokenize. The FTS path joins a `matched`
+  // CTE and ranks by search_rank; the LIKE path stays inline in `where`.
   const search = sp.get('search') ?? f.keyword;
-  if (search) {
-    const pat = `%${search}%`;
-    where.push('(co.name LIKE ? OR co.domain LIKE ? OR co.description LIKE ?)');
-    binds.push(pat, pat, pat);
+  const searchQuery = search ? buildCompanySearchQuery(search) : null;
+  let useFts = false;
+  if (searchQuery) {
+    try {
+      useFts = await isCompanySearchIndexUsable(env, ctx.orgId);
+    } catch {
+      useFts = false;
+    }
   }
+  // NOTE: the LIKE predicate is applied via buildQueries/likeFallback below
+  // (not pushed into `where` here) so the FTS→LIKE runtime fallback can add it
+  // without double-applying.
+  const searchCte = useFts && searchQuery ? companySearchCteSql() : '';
+  const searchJoin = useFts && searchQuery ? 'JOIN matched m ON m.company_id = co.id' : '';
+  const searchOrderPrefix = useFts && searchQuery ? 'm.search_rank ASC, ' : '';
+  const cteBinds = useFts && searchQuery ? companySearchCteBinds(searchQuery, ctx.orgId) : [];
 
   // Tag filtering — IDs preferred, fall back to names for legacy callers.
   let tagJoin = '';
@@ -250,28 +273,79 @@ export async function listCompanies(
       ? `HAVING COUNT(DISTINCT t.id) = ${tagsParam.length}`
       : '';
 
-  const sql = `
-    SELECT co.*
-    FROM companies co
-    ${tagJoin}
-    WHERE ${where.join(' AND ')}
-    GROUP BY co.id
-    ${havingClause}
-    ORDER BY ${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
-    LIMIT ? OFFSET ?
-  `;
+  // Assemble the list + count SQL for a given search strategy. `ftsBinds` is the
+  // CTE bind prefix (empty in LIKE mode). `likeWhere` carries the LIKE predicate
+  // that must be appended to `where` when FTS is not used.
+  type SearchStrategy = {
+    cte: string;
+    join: string;
+    orderPrefix: string;
+    ftsBinds: unknown[];
+    likeWhere: string[];
+    likeBinds: unknown[];
+  };
 
-  const countSql = `
-    SELECT COUNT(DISTINCT co.id) as n
-    FROM companies co
-    ${tagJoin}
-    WHERE ${where.join(' AND ')}
-  `;
+  function buildQueries(opts: SearchStrategy) {
+    const whereAll = [...where, ...opts.likeWhere];
+    const listSql = `
+      ${opts.cte}
+      SELECT co.*
+      FROM companies co
+      ${opts.join}
+      ${tagJoin}
+      WHERE ${whereAll.join(' AND ')}
+      GROUP BY co.id
+      ${havingClause}
+      ORDER BY ${opts.orderPrefix}${sortMeta.col} ${sortDir} NULLS LAST${tieBreak}
+      LIMIT ? OFFSET ?
+    `;
+    const cntSql = `
+      ${opts.cte}
+      SELECT COUNT(DISTINCT co.id) as n
+      FROM companies co
+      ${opts.join}
+      ${tagJoin}
+      WHERE ${whereAll.join(' AND ')}
+    `;
+    const listBinds = [...opts.ftsBinds, ...binds, ...opts.likeBinds, limit, offset];
+    const cntBinds = [...opts.ftsBinds, ...binds, ...opts.likeBinds];
+    return { listSql, cntSql, listBinds, cntBinds };
+  }
 
-  const [result, countResult] = await Promise.all([
-    env.D1.prepare(sql).bind(...binds, limit, offset).all(),
-    env.D1.prepare(countSql).bind(...binds).first<{ n: number }>(),
-  ]);
+  const likeFallback = (): SearchStrategy => {
+    const pat = `%${search}%`;
+    return {
+      cte: '',
+      join: '',
+      orderPrefix: '',
+      ftsBinds: [],
+      likeWhere: search ? ['(co.name LIKE ? OR co.domain LIKE ? OR co.description LIKE ?)'] : [],
+      likeBinds: search ? [pat, pat, pat] : [],
+    };
+  };
+
+  const primary: SearchStrategy = useFts && searchQuery
+    ? { cte: searchCte, join: searchJoin, orderPrefix: searchOrderPrefix, ftsBinds: cteBinds, likeWhere: [], likeBinds: [] }
+    : likeFallback();
+
+  async function runQueries(opts: SearchStrategy) {
+    const q = buildQueries(opts);
+    return Promise.all([
+      env.D1.prepare(q.listSql).bind(...q.listBinds).all(),
+      env.D1.prepare(q.cntSql).bind(...q.cntBinds).first<{ n: number }>(),
+    ]);
+  }
+
+  let result: Awaited<ReturnType<typeof runQueries>>[0];
+  let countResult: Awaited<ReturnType<typeof runQueries>>[1];
+  try {
+    [result, countResult] = await runQueries(primary);
+  } catch (error) {
+    // FTS query failed at runtime (e.g. malformed MATCH or a table that
+    // vanished mid-request). Fall back to the LIKE scan rather than 500ing.
+    if (!(useFts && searchQuery)) throw error;
+    [result, countResult] = await runQueries(likeFallback());
+  }
   const total = countResult?.n ?? 0;
 
   const companies = result.results as any[];
@@ -448,6 +522,7 @@ export async function createCompany(
 
   ctxExec.waitUntil(triggerCompanyEnrichment(id, ctx.orgId, env));
   await invalidateRagCache(ctx.orgId, env);
+  await safelyRebuildCompanySearchIndexForCompany(env, ctx.orgId, id);
   await safelyRebuildContactSearchIndexForCompany(env, ctx.orgId, id, domain);
   await safelyRebuildContactListEntriesForCompany(env, ctx.orgId, id, domain);
 
@@ -533,6 +608,10 @@ export async function updateCompany(
   if (!result.ok && result.error) {
     return errorResponse(result.error.code, result.error.status, result.error.message);
   }
+  // Keep the company FTS index in step with edits to searchable fields
+  // (name/domain/website/sector/location/description). Best-effort; a missing
+  // index (local DB without migration 0136) is silently ignored.
+  await safelyRebuildCompanySearchIndexForCompany(env, ctx.orgId, id);
   const responseBody: Record<string, unknown> = { company: result.after };
   if (result.rejected.length > 0) responseBody.rejected_fields = result.rejected;
   return jsonResponse(responseBody);
@@ -569,6 +648,7 @@ export async function deleteCompany(
 
   try { await cleanupVectorsForEntity(id, 'companies', env); } catch { /* best-effort */ }
   await invalidateRagCache(ctx.orgId, env);
+  await safelyDeleteCompanySearchIndexForCompany(env, ctx.orgId, id);
   await safelyRebuildContactSearchIndexForCompany(
     env,
     ctx.orgId,
@@ -724,6 +804,7 @@ export async function applyCompanyTags(
     });
   }
   await invalidateRagCache(ctx.orgId, env);
+  await safelyRebuildCompanySearchIndexForCompany(env, ctx.orgId, id);
   return jsonResponse({ ok: true });
 }
 
@@ -836,5 +917,21 @@ export async function removeCompanyTag(
     metadata: { tag_id: tagId },
     created_at: new Date().toISOString(),
   });
+  await safelyRebuildCompanySearchIndexForCompany(env, ctx.orgId, id);
   return jsonResponse({ ok: true });
+}
+
+// --- POST /api/admin/rebuild-company-search-index ---
+// Full backfill/rebuild of company_search_fts for the org. Mirrors the contact
+// search rebuild endpoint; owner/admin only. Use this to seed the index on a
+// DB that has run migration 0136 but has no rows yet.
+export async function rebuildCompanySearchIndexEndpoint(
+  ctx: AuthContext,
+  env: Env
+): Promise<Response> {
+  if (ctx.userRole !== 'owner' && ctx.userRole !== 'admin' && ctx.userRole !== 'super_admin') {
+    return errorResponse('FORBIDDEN', 403, 'owner/admin only');
+  }
+  const result = await rebuildCompanySearchIndexForOrg(env, ctx.orgId);
+  return jsonResponse({ ok: result.errors === 0, ...result });
 }
