@@ -74,4 +74,23 @@ describe('wrangler config drift check', () => {
     const { failures } = runChecks(dir);
     expect(failures.some(f => f.includes('wrangler.readonly.toml') && f.includes('unexpected r2 binding'))).toBe(true);
   });
+
+  it('catches a renamed binding (deploys fine, crashes at runtime)', () => {
+    const dir = repoCopy();
+    const file = join(dir, 'wrangler.toml');
+    writeFileSync(file, readFileSync(file, 'utf8').replace('binding = "D1"', 'binding = "DBX"'));
+    const { failures } = runChecks(dir);
+    expect(failures.some(f => f.includes('d1 binding named "DBX"'))).toBe(true);
+  });
+
+  it('catches a diverged database_name', () => {
+    const dir = repoCopy();
+    const file = join(dir, 'wrangler.crm-canary.toml');
+    writeFileSync(
+      file,
+      readFileSync(file, 'utf8').replace('database_name = "medina-ventures-db"', 'database_name = "medina-ventures-db-typo"')
+    );
+    const { failures } = runChecks(dir);
+    expect(failures.some(f => f.includes('d1_database_name differs'))).toBe(true);
+  });
 });

@@ -106,7 +106,13 @@ const EXPECTED_CRONS = {
 };
 
 // Shared infra identity: these ids must be identical wherever present.
-const IDENTITY_KEYS = ['d1_database_id', 'r2_bucket_name', 'kv_id'];
+const IDENTITY_KEYS = ['d1_database_id', 'd1_database_name', 'r2_bucket_name', 'kv_id'];
+
+// Binding NAMES the shared codebase compiles against (env.D1, env.R2,
+// env.KV). A renamed binding deploys fine and then crashes at runtime
+// on the first env access — outside npm-audit/typecheck reach, so it
+// belongs to this gate (audit round 1, F6).
+const EXPECTED_BINDING_NAMES = { d1: 'D1', r2: 'R2', kv: 'KV' };
 
 // Bindings each config is expected to declare (presence, not values).
 // readonly is deliberately thin: D1 only, remote=true — giving it
@@ -267,9 +273,10 @@ export function runChecks(rootDir) {
   }
 
   // 5. Infra identity where present.
-  const identity = { d1_database_id: new Map(), r2_bucket_name: new Map(), kv_id: new Map() };
+  const identity = { d1_database_id: new Map(), d1_database_name: new Map(), r2_bucket_name: new Map(), kv_id: new Map() };
   for (const file of CONFIG_FILES) {
     for (const d1 of configs[file].d1) if (d1.database_id) identity.d1_database_id.set(file, d1.database_id);
+    for (const d1 of configs[file].d1) if (d1.database_name) identity.d1_database_name.set(file, d1.database_name);
     for (const r2 of configs[file].r2) if (r2.bucket_name) identity.r2_bucket_name.set(file, r2.bucket_name);
     for (const kv of configs[file].kv) if (kv.id) identity.kv_id.set(file, kv.id);
   }
@@ -286,6 +293,19 @@ export function runChecks(rootDir) {
     const want = new Set(EXPECTED_BINDINGS[file]);
     for (const b of want) if (!got.has(b)) failures.push(`${file}: expected ${b} binding is missing`);
     for (const b of got) if (!want.has(b)) failures.push(`${file}: unexpected ${b} binding — classify it in EXPECTED_BINDINGS deliberately (readonly especially: R2/KV there would let a "readonly" preview write production storage)`);
+  }
+
+  // 6b. Binding NAMES the shared code compiles against (env.D1 etc.).
+  for (const file of CONFIG_FILES) {
+    const groups = { d1: configs[file].d1, r2: configs[file].r2, kv: configs[file].kv };
+    for (const [kind, entries] of Object.entries(groups)) {
+      for (const entry of entries) {
+        const want = EXPECTED_BINDING_NAMES[kind];
+        if (entry.binding && entry.binding !== want) {
+          failures.push(`${file}: ${kind} binding named ${JSON.stringify(entry.binding)} — shared code expects ${JSON.stringify(want)}; a rename deploys fine and crashes at runtime`);
+        }
+      }
+    }
   }
 
   // 7. readonly safety invariants.
