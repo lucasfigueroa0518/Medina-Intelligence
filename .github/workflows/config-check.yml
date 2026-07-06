@@ -1,0 +1,28 @@
+name: Config check
+
+# Wrangler config drift gate — encodes the canonical [vars] parity set,
+# documented intentional divergences, cron-trigger expectations, and
+# shared infra identity across the four wrangler configs. Dependency-free
+# (no npm install) and runs in seconds, so it runs on EVERY PR — no
+# paths filter: a filtered job can never be a branch-protection
+# required check (PRs not touching the paths would wait on a check
+# that never reports).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  wrangler-drift:
+    name: wrangler config drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: node scripts/check-wrangler-drift.mjs
