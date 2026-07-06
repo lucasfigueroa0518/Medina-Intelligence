@@ -139,7 +139,21 @@ export function classifySqliteMaster(rows: SqliteMasterRow[]): BackupPlan {
 
   const tables: string[] = [];
   const skipped: SkippedTable[] = [];
-  const schemaParts: string[] = [];
+  // schema.sql must be emitted in DEPENDENCY order, not sqlite_master
+  // row order: the plan query sorts by (type, name), which puts every
+  // CREATE INDEX alphabetically before every CREATE TABLE — applying
+  // that verbatim fails with "no such table" on the first index. Found
+  // by the first restore drill against a REAL production backup (the
+  // synthetic fixtures all happened to list tables first). Tables and
+  // virtual tables first, then indexes (validate their table at CREATE),
+  // then triggers (validate their ON table), then views last. FK targets
+  // are NOT validated at CREATE, so table-vs-table order is free.
+  const schemaBuckets: Record<'table' | 'index' | 'trigger' | 'view', string[]> = {
+    table: [],
+    index: [],
+    trigger: [],
+    view: [],
+  };
 
   for (const row of rows) {
     const isInternal = row.name.startsWith('sqlite_') || row.name.startsWith('_cf_');
@@ -152,7 +166,7 @@ export function classifySqliteMaster(rows: SqliteMasterRow[]): BackupPlan {
         skipped.push({ name: row.name, reason: 'virtual_table_content_rebuilt_on_restore' });
         // Schema still carries the CREATE VIRTUAL TABLE so a from-scratch
         // restore recreates the structure before rebuild.
-        if (row.sql) schemaParts.push(`${row.sql};`);
+        if (row.sql) schemaBuckets.table.push(`${row.sql};`);
         continue;
       }
       if (shadowNames.has(row.name)) {
@@ -160,16 +174,22 @@ export function classifySqliteMaster(rows: SqliteMasterRow[]): BackupPlan {
         continue;
       }
       tables.push(row.name);
-      if (row.sql) schemaParts.push(`${row.sql};`);
+      if (row.sql) schemaBuckets.table.push(`${row.sql};`);
     } else if (row.type === 'index' || row.type === 'trigger' || row.type === 'view') {
       // sql IS NULL for auto-indexes (PK/UNIQUE) — those come back with
       // their CREATE TABLE. Skip internal/shadow-owned objects.
       if (!row.sql || isInternal || shadowNames.has(row.tbl_name) || row.tbl_name.startsWith('_cf_')) continue;
-      schemaParts.push(`${row.sql};`);
+      schemaBuckets[row.type as 'index' | 'trigger' | 'view'].push(`${row.sql};`);
     }
   }
 
   tables.sort();
+  const schemaParts = [
+    ...schemaBuckets.table,
+    ...schemaBuckets.index,
+    ...schemaBuckets.trigger,
+    ...schemaBuckets.view,
+  ];
   return { tables, skipped, schemaSql: schemaParts.join('\n') + '\n' };
 }
 
