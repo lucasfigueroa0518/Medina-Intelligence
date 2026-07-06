@@ -105,8 +105,17 @@ const EXPECTED_CRONS = {
   'wrangler.crm-canary.toml': [],
 };
 
-// Shared infra identity: these ids must be identical wherever present.
+// Shared infra identity: these ids must be identical wherever present —
+// AND equal to the pinned canonical value, so a coordinated typo across
+// all four configs (a careless sed) still fails. Migrating to a new
+// database/bucket/namespace is a conscious manifest edit here.
 const IDENTITY_KEYS = ['d1_database_id', 'd1_database_name', 'r2_bucket_name', 'kv_id'];
+const CANONICAL_IDENTITY = {
+  d1_database_id: '4bb3705c-c471-43f7-b42f-b44ab62f5dab',
+  d1_database_name: 'medina-ventures-db',
+  r2_bucket_name: 'medina-ventures-storage',
+  kv_id: '29422591253b424d9094c37e0897d68e',
+};
 
 // Binding NAMES the shared codebase compiles against (env.D1, env.R2,
 // env.KV). A renamed binding deploys fine and then crashes at runtime
@@ -284,6 +293,11 @@ export function runChecks(rootDir) {
     const distinct = new Set(identity[key].values());
     if (distinct.size > 1) {
       failures.push(`${key} differs across configs: ${[...identity[key].entries()].map(([f, v]) => `${f}=${v}`).join(' vs ')}`);
+    }
+    for (const [file, value] of identity[key].entries()) {
+      if (value !== CANONICAL_IDENTITY[key]) {
+        failures.push(`${file}: ${key}=${JSON.stringify(value)} != canonical ${JSON.stringify(CANONICAL_IDENTITY[key])} — infra migration is a conscious CANONICAL_IDENTITY edit`);
+      }
     }
   }
 

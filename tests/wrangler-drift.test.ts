@@ -91,6 +91,23 @@ describe('wrangler config drift check', () => {
       readFileSync(file, 'utf8').replace('database_name = "medina-ventures-db"', 'database_name = "medina-ventures-db-typo"')
     );
     const { failures } = runChecks(dir);
-    expect(failures.some(f => f.includes('d1_database_name differs'))).toBe(true);
+    expect(failures.some(f => f.includes('d1_database_name') && f.includes('canonical'))).toBe(true);
+  });
+
+  it('catches a COORDINATED identical typo across all configs (pinned canon)', () => {
+    const dir = repoCopy();
+    for (const name of CONFIG_FILES) {
+      const file = join(dir, name);
+      writeFileSync(
+        file,
+        readFileSync(file, 'utf8').replaceAll(
+          'database_id = "4bb3705c-c471-43f7-b42f-b44ab62f5dab"',
+          'database_id = "4bb3705c-c471-43f7-b42f-b44ab62f5dac"'
+        )
+      );
+    }
+    const { failures } = runChecks(dir);
+    // Equality-across-configs holds, so only the canonical pin can catch it.
+    expect(failures.some(f => f.includes('d1_database_id') && f.includes('canonical'))).toBe(true);
   });
 });
