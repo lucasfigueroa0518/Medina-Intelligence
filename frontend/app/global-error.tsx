@@ -14,6 +14,7 @@
 import './globals.css';
 import { Exo_2, Geist, JetBrains_Mono } from 'next/font/google';
 import { useEffect } from 'react';
+import { reportClientError } from '@/lib/report-client-error';
 import { ErrorFallback } from '@/components/error-fallback';
 
 const geistSans = Geist({
@@ -46,6 +47,7 @@ export default function GlobalError({
 }) {
   useEffect(() => {
     console.error('[global-error-boundary]', error);
+    reportClientError('global-error', error);
   }, [error]);
 
   return (

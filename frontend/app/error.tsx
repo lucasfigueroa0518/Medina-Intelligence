@@ -9,6 +9,7 @@
 import { useEffect, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import { ErrorFallback } from '@/components/error-fallback';
+import { reportClientError } from '@/lib/report-client-error';
 
 export default function RouteError({
   error,
@@ -21,9 +22,10 @@ export default function RouteError({
   const [, startTransition] = useTransition();
 
   useEffect(() => {
-    // No external error-reporting sink exists yet; console is the sink
-    // (surfaces in Vercel function logs for SSR crashes).
+    // Console covers SSR crashes (Vercel function logs); the beacon
+    // makes CLIENT crashes visible there too.
     console.error('[error-boundary]', error);
+    reportClientError('error-boundary', error);
   }, [error]);
 
   // reset() alone only re-renders the client tree; refresh() re-fetches
