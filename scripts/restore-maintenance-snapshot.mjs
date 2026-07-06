@@ -35,20 +35,12 @@ function parseArgs(argv) {
   return out;
 }
 
-function sqlLiteral(value) {
-  if (value === null || typeof value === 'undefined') return 'NULL';
-  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'NULL';
-  if (typeof value === 'boolean') return value ? '1' : '0';
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
-
-function insertSql(table, row) {
-  const columns = Object.keys(row).filter(c => /^[A-Za-z_][A-Za-z0-9_]*$/.test(c));
-  if (columns.length === 0) return '';
-  const columnSql = columns.map(c => `"${c}"`).join(', ');
-  const valueSql = columns.map(c => sqlLiteral(row[c])).join(', ');
-  return `INSERT OR REPLACE INTO "${table}" (${columnSql}) VALUES (${valueSql});`;
-}
+// Literal encoding + statement generation now come from the shared
+// restore core (hex-encoded text literals). This closes the same
+// wrangler-trimmer hazard the full-backup restore had: a snapshot row
+// whose text contains `BEGIN TRANSACTION`/`COMMIT;` used to abort (or
+// silently mangle) the replay. See scripts/lib/d1-restore-core.mjs.
+import { insertSql } from './lib/d1-restore-core.mjs';
 
 async function* readJsonl(file) {
   const rl = createInterface({
@@ -72,7 +64,9 @@ async function main() {
   async function flush() {
     if (batch.length === 0) return;
     const file = join(dir, `restore-${String(++batchNo).padStart(4, '0')}.sql`);
-    await writeFile(file, ['BEGIN TRANSACTION;', ...batch, 'COMMIT;'].join('\n'));
+    // No BEGIN/COMMIT wrapper — wrangler's d1 trimmer strips it anyway
+    // (never atomic) and errors when the tokens also appear in data.
+    await writeFile(file, batch.join('\n'));
     const cmdArgs = ['wrangler', 'd1', 'execute', args.database, '--file', file];
     if (args.remote) cmdArgs.push('--remote');
     const result = spawnSync('npx', cmdArgs, { stdio: 'inherit' });

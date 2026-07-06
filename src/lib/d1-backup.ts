@@ -234,7 +234,12 @@ export async function dumpTablePart(
   const maxBytes = budgets.maxBytes ?? MAX_PART_BYTES;
 
   let mode: 'rowid' | 'offset' = cursor?.mode ?? 'rowid';
-  let last = cursor?.mode === 'rowid' ? cursor.last : -Infinity;
+  // null = no keyset position yet. The first query runs WITHOUT a
+  // rowid predicate (plain ORDER BY rowid LIMIT ?) so tables containing
+  // negative or zero rowids are captured too — a `WHERE rowid > <seed>`
+  // constant would silently drop everything at or below the seed
+  // (audit round 1, F2).
+  let last: number | null = cursor?.mode === 'rowid' ? cursor.last : null;
   let offset = cursor?.mode === 'offset' ? cursor.offset : 0;
 
   const lines: string[] = [];
@@ -248,9 +253,13 @@ export async function dumpTablePart(
     let results: Record<string, unknown>[];
     try {
       if (mode === 'rowid') {
-        const r = await env.D1.prepare(
-          `SELECT rowid AS __rowid, * FROM "${table}" WHERE rowid > ? ORDER BY rowid LIMIT ?`
-        ).bind(last === -Infinity ? -1 : last, limit).all<Record<string, unknown>>();
+        const r = last === null
+          ? await env.D1.prepare(
+              `SELECT rowid AS __rowid, * FROM "${table}" ORDER BY rowid LIMIT ?`
+            ).bind(limit).all<Record<string, unknown>>()
+          : await env.D1.prepare(
+              `SELECT rowid AS __rowid, * FROM "${table}" WHERE rowid > ? ORDER BY rowid LIMIT ?`
+            ).bind(last, limit).all<Record<string, unknown>>();
         results = r.results || [];
       } else {
         const r = await env.D1.prepare(
@@ -304,10 +313,12 @@ export async function dumpTablePart(
       break;
     }
   }
+  // A non-exhausted rowid part always consumed ≥1 row, so `last` is set;
+  // the null-coalesce is unreachable and exists only for the type.
   const nextCursor: DumpCursor | null = exhausted
     ? null
     : mode === 'rowid'
-      ? { mode: 'rowid', last: last === -Infinity ? -1 : last }
+      ? { mode: 'rowid', last: last ?? Number.MIN_SAFE_INTEGER }
       : { mode: 'offset', offset };
 
   return {

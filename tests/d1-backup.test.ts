@@ -19,6 +19,10 @@ type Row = Record<string, unknown>;
 interface FakeTable {
   rows: Row[];
   noRowid?: boolean;
+  // Explicit rowid per row (defaults to index+1). Lets tests cover
+  // negative/zero rowids, which a seeded `WHERE rowid > -1` keyset
+  // would silently drop (audit round 1, F2).
+  rowids?: number[];
 }
 
 interface MasterRow {
@@ -52,15 +56,18 @@ class FakeD1 {
     if (/FROM sqlite_master/i.test(sql)) {
       return this.master as unknown as Row[];
     }
-    const rowidMatch = sql.match(/^SELECT rowid AS __rowid, \* FROM "([^"]+)" WHERE rowid > \? ORDER BY rowid LIMIT \?$/);
-    if (rowidMatch) {
-      const table = this.tables.get(rowidMatch[1]);
-      if (!table) throw new Error(`no such table: ${rowidMatch[1]}`);
+    const rowidFirstMatch = sql.match(/^SELECT rowid AS __rowid, \* FROM "([^"]+)" ORDER BY rowid LIMIT \?$/);
+    const rowidKeysetMatch = sql.match(/^SELECT rowid AS __rowid, \* FROM "([^"]+)" WHERE rowid > \? ORDER BY rowid LIMIT \?$/);
+    if (rowidFirstMatch || rowidKeysetMatch) {
+      const name = (rowidFirstMatch ?? rowidKeysetMatch)![1];
+      const table = this.tables.get(name);
+      if (!table) throw new Error(`no such table: ${name}`);
       if (table.noRowid) throw new Error('no such column: rowid');
-      const last = Number(binds[0]);
-      const limit = Number(binds[1]);
+      const last = rowidKeysetMatch ? Number(binds[0]) : -Infinity;
+      const limit = Number(rowidKeysetMatch ? binds[1] : binds[0]);
       return table.rows
-        .map((row, i) => ({ __rowid: i + 1, ...row }))
+        .map((row, i) => ({ __rowid: table.rowids ? table.rowids[i] : i + 1, ...row }))
+        .sort((a, b) => (a.__rowid as number) - (b.__rowid as number))
         .filter(r => (r.__rowid as number) > last)
         .slice(0, limit);
     }
@@ -190,6 +197,24 @@ describe('dumpTablePart pagination', () => {
     expect(all.map(r => r.id)).toEqual(Array.from({ length: 25 }, (_, i) => `r${i}`));
   });
 
+  it('captures negative and zero rowids (no keyset seed constant)', async () => {
+    const d1 = new FakeD1();
+    d1.tables.set('t', {
+      rows: [{ id: 'neg5' }, { id: 'neg1' }, { id: 'zero' }, { id: 'two' }, { id: 'forty' }],
+      rowids: [-5, -1, 0, 2, 40],
+    });
+    const env = makeEnv(d1, new FakeR2());
+
+    const part1 = await dumpTablePart(env, 't', null, { maxRows: 2 });
+    expect(part1.rows).toBe(2);
+    expect(part1.nextCursor).toEqual({ mode: 'rowid', last: -1 });
+    const part2 = await dumpTablePart(env, 't', part1.nextCursor, { maxRows: 2 });
+    const part3 = await dumpTablePart(env, 't', part2.nextCursor, { maxRows: 2 });
+    const all = [...rowsFromJsonlText(part1.lines + part2.lines + part3.lines)];
+    expect(all.map(r => r.id)).toEqual(['neg5', 'neg1', 'zero', 'two', 'forty']);
+    expect(part3.nextCursor).toBeNull();
+  });
+
   it('falls back to offset pagination for WITHOUT ROWID tables', async () => {
     const d1 = new FakeD1();
     d1.tables.set('t', { rows: Array.from({ length: 7 }, (_, i) => ({ k: `k${i}` })), noRowid: true });
@@ -316,15 +341,40 @@ describe('retention', () => {
 });
 
 describe('restore SQL literals', () => {
-  it('encodes every JSONL value type safely', () => {
+  it('encodes scalars safely and text as hex casts', () => {
     expect(sqlLiteral(null)).toBe('NULL');
     expect(sqlLiteral(undefined)).toBe('NULL');
     expect(sqlLiteral(42)).toBe('42');
     expect(sqlLiteral(-0.5)).toBe('-0.5');
     expect(sqlLiteral(NaN)).toBe('NULL');
     expect(sqlLiteral(true)).toBe('1');
-    expect(sqlLiteral("it's")).toBe("'it''s'");
+    expect(sqlLiteral('')).toBe("''");
+    // Text never appears as a quoted literal — only hex bytes.
+    expect(sqlLiteral("it's")).toBe(`CAST(X'${Buffer.from("it's", 'utf8').toString('hex').toUpperCase()}' AS TEXT)`);
     expect(sqlLiteral({ $b64: Buffer.from([0, 255]).toString('base64') })).toBe("X'00FF'");
+  });
+
+  it('generated SQL never contains data-shaped SQL tokens (wrangler trimmer hazard)', () => {
+    // wrangler's d1 file trimmer greps for these tokens and aborts or
+    // strips them even when they occur INSIDE data. Hex text literals
+    // make that structurally impossible.
+    const hostile = {
+      id: 'h1',
+      body: 'meeting notes: BEGIN TRANSACTION; then we agreed. COMMIT; -- done\nAlso: DROP TABLE contacts;',
+      quote: `O'Brien said "COMMIT;"`,
+    };
+    const sql = insertSql('notes', hostile);
+    expect(sql).not.toMatch(/BEGIN TRANSACTION/);
+    expect(sql).not.toMatch(/COMMIT;/);
+    expect(sql).not.toMatch(/DROP TABLE/);
+
+    // And the statement still restores the exact content into real SQLite.
+    const db = new DatabaseSync(':memory:');
+    db.exec('CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT, quote TEXT)');
+    db.exec(sql);
+    const row = db.prepare('SELECT * FROM notes').get() as Record<string, unknown>;
+    expect(row.body).toBe(hostile.body);
+    expect(row.quote).toBe(hostile.quote);
   });
 
   it('fnv1a is stable', () => {

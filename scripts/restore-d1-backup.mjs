@@ -42,6 +42,7 @@ function usage(message) {
     '  --remote            Target the REAL production D1 — requires --yes',
     '  --yes               Confirm a --remote restore',
     '  --verify            After restore, compare per-table row counts to the manifest',
+    '  --persist-to <dir>  Local-mode state directory (isolated drills against a fresh DB)',
     '  --keep-download     Keep the fetched backup directory instead of deleting it',
   ].join('\n'));
   process.exit(2);
@@ -70,12 +71,14 @@ function parseArgs(argv) {
     else if (arg === '--remote') out.remote = true;
     else if (arg === '--yes') out.yes = true;
     else if (arg === '--verify') out.verify = true;
+    else if (arg === '--persist-to') out.persistTo = argv[++i];
     else if (arg === '--keep-download') out.keepDownload = true;
     else usage(`Unknown argument: ${arg}`);
   }
   if (!out.date && !out.dir) usage('Provide --date or --dir');
   if (out.date && !/^\d{4}-\d{2}-\d{2}$/.test(out.date)) usage(`--date must be YYYY-MM-DD, got: ${out.date}`);
   if (out.remote && !out.yes) usage('--remote restores production data; add --yes to confirm');
+  if (out.remote && out.persistTo) usage('--persist-to only applies to --local targets');
   return out;
 }
 
@@ -119,6 +122,10 @@ async function main() {
   const backupDir = args.dir ?? await fetchBackup(args);
   const manifest = JSON.parse(await readFile(join(backupDir, 'manifest.json'), 'utf8'));
   const target = args.remote ? '--remote' : '--local';
+  // Isolated local drills: point wrangler's local D1 state at a scratch
+  // directory so --schema restores land on a genuinely fresh database
+  // instead of colliding with existing local dev state.
+  const persistArgs = !args.remote && args.persistTo ? ['--persist-to', args.persistTo] : [];
   const wantedTables = args.tables.length ? new Set(args.tables) : null;
 
   console.log(`Backup: ${manifest.date} (${manifest.format}) — ${manifest.total_rows} rows across ${manifest.tables.length} tables`);
@@ -131,16 +138,25 @@ async function main() {
   async function executeSqlStatements(statements) {
     if (statements.length === 0) return;
     const file = join(workDir, `restore-${String(++batchNo).padStart(5, '0')}.sql`);
-    await writeFile(file, ['BEGIN TRANSACTION;', ...statements, 'COMMIT;'].join('\n'));
-    runWrangler(['d1', 'execute', args.database, '--file', file, target]);
+    // No BEGIN/COMMIT wrapper: wrangler's d1 trimmer strips (or errors
+    // on) those tokens client-side, so the wrapper never provided
+    // atomicity — it only risked colliding with the trimmer. Batches
+    // are idempotent (INSERT OR REPLACE), so a mid-batch failure is
+    // safely re-runnable.
+    await writeFile(file, statements.join('\n'));
+    runWrangler(['d1', 'execute', args.database, '--file', file, target, ...persistArgs]);
   }
 
   try {
     if (args.schema) {
       const schemaPath = join(backupDir, 'schema.sql');
       if (!existsSync(schemaPath)) throw new Error(`--schema requested but ${schemaPath} is missing`);
+      // schema.sql is plain CREATE statements: it expects an EMPTY
+      // database (from-scratch rebuild). For local drills use
+      // --persist-to with a fresh directory; on a non-empty target this
+      // step fails with "table already exists" by design.
       console.log('Applying schema.sql…');
-      runWrangler(['d1', 'execute', args.database, '--file', schemaPath, target]);
+      runWrangler(['d1', 'execute', args.database, '--file', schemaPath, target, ...persistArgs]);
     }
 
     let restoredRows = 0;
@@ -175,7 +191,7 @@ async function main() {
       for (const table of manifest.tables) {
         if (wantedTables && !wantedTables.has(table.name)) continue;
         const result = runWrangler(
-          ['d1', 'execute', args.database, '--command', `SELECT COUNT(*) AS cnt FROM "${table.name}"`, '--json', target],
+          ['d1', 'execute', args.database, '--command', `SELECT COUNT(*) AS cnt FROM "${table.name}"`, '--json', target, ...persistArgs],
           { capture: true }
         );
         const parsed = JSON.parse(result.stdout);

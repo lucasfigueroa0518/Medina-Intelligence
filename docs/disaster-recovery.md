@@ -23,10 +23,13 @@ days. It is also all-or-nothing — no per-table restore.
 ## Line 2: scheduled R2 exports (this repo's backup job)
 
 `D1BackupWorkflow` (src/workflows/d1-backup.ts, logic in src/lib/d1-backup.ts)
-exports every base table to R2 daily at 03:15 UTC, dispatched from the
-minute-tick scheduled handler on the **pipelines** Worker (the 03:15 gate in
-`handleScheduled`, src/index.ts — deliberately not a third cron trigger; a
-4th trigger registration broke CF cron dispatch on 2026-04-28).
+exports every base table to R2 daily, dispatched from the minute-tick
+scheduled handler on the **pipelines** Worker inside a 03:15–03:29 UTC window
+(`handleScheduled`, src/index.ts — deliberately not a third cron trigger; a
+4th trigger registration broke CF cron dispatch on 2026-04-28). The window
+gives the dispatch up to 15 attempts against transient failures; the
+date-keyed workflow instance id (`d1-backup-YYYY-MM-DD`, checked via `get()`
+before `create()`) guarantees at most one backup per day.
 
 Properties:
 
@@ -52,10 +55,11 @@ Properties:
 - **Retention:** the newest 14 date partitions are kept; older partitions are
   deleted by the workflow's final step. Only date-shaped prefixes under
   `backups/d1/` are candidates — nothing else in the bucket is touched.
-- **Observability:** each dispatch writes a `task_runs` row
-  (`d1_backup_dispatch`, idempotency-keyed per date; duplicate deliveries
-  dedupe via both the task-run key and the date-keyed workflow instance id).
-  Workflow progress: `npx wrangler workflows instances list d1-backup-workflow`.
+- **Observability:** each dispatch attempt writes a `task_runs` row
+  (`d1_backup_dispatch`, idempotency-keyed per date+minute; once the day's
+  instance exists, later window minutes close as `skipped`). The workflow
+  instance id is the single-backup-per-day authority. Workflow progress:
+  `npx wrangler workflows instances list d1-backup-workflow`.
 
 Manual trigger (any time, e.g. before a risky migration):
 
@@ -72,10 +76,15 @@ npx wrangler workflows trigger d1-backup-workflow --config wrangler.pipelines.to
 rebuild restore into a fresh database).
 
 ```bash
-# 1. Drill (local D1) — fetches from R2, replays, verifies counts:
-node scripts/restore-d1-backup.mjs --date 2026-07-06 --local --schema --verify
+# 1. Drill (fresh, isolated local D1) — fetches from R2, rebuilds schema,
+#    replays, verifies counts. --persist-to points wrangler's local state
+#    at a scratch dir so the drill starts from a genuinely EMPTY database;
+#    --schema expects an empty target (plain CREATE statements) and will
+#    correctly fail with "table already exists" on a non-empty one.
+node scripts/restore-d1-backup.mjs --date 2026-07-06 --local --schema --verify \
+  --persist-to /tmp/d1-restore-drill
 
-# 2. Single-table surgical restore:
+# 2. Single-table surgical restore (into existing local state):
 node scripts/restore-d1-backup.mjs --date 2026-07-06 --local --table contacts
 
 # 3. Production restore (deliberate friction):

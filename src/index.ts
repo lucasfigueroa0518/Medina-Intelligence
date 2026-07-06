@@ -1355,18 +1355,28 @@ export async function handleScheduled(
             initialMetadata: { cron, scheduled_date: tick.toISOString().slice(0, 10) },
           });
         }
-        // Daily D1 → R2 disaster-recovery backup at 03:15 UTC — after the
-        // 02:10 daily cron and 02:25 maintenance so it snapshots their
-        // settled output, before the workday. Same folded time-of-day-gate
-        // pattern as d1_maintenance above (NOT a new cron trigger: a 4th
-        // trigger registration broke CF cron dispatch on 2026-04-28).
-        // The heavy lifting runs in D1BackupWorkflow (per-step subrequest
-        // budgets + retries); this gate only creates the instance. The
-        // date-keyed instance id + task_runs idempotency key both dedupe
-        // duplicate scheduled deliveries. Read-only against D1 by design —
-        // see docs/disaster-recovery.md.
-        if (tick.getUTCHours() === 3 && tick.getUTCMinutes() === 15) {
+        // Daily D1 → R2 disaster-recovery backup, dispatch window
+        // 03:15–03:29 UTC — after the 02:10 daily cron and 02:25
+        // maintenance so it snapshots their settled output, before the
+        // workday. Same folded time-of-day-gate pattern as
+        // d1_maintenance above (NOT a new cron trigger: a 4th trigger
+        // registration broke CF cron dispatch on 2026-04-28). The heavy
+        // lifting runs in D1BackupWorkflow (per-step subrequest budgets
+        // + retries); this gate only creates the instance.
+        //
+        // Retry semantics (audit round 1, F4): a single-minute gate made
+        // one transient failure — or one failed sibling task in the same
+        // tick — silently lose the day's backup, because the per-day
+        // task_runs idempotency key stays claimed even by a FAILED run.
+        // The window gives 15 attempts; each minute gets its OWN
+        // idempotency key (dedupes duplicate deliveries of that minute),
+        // and cross-minute dedup is the date-keyed workflow instance id,
+        // checked positively via get() rather than by parsing create()'s
+        // error text. Read-only against D1 by design — see
+        // docs/disaster-recovery.md.
+        if (tick.getUTCHours() === 3 && tick.getUTCMinutes() >= 15 && tick.getUTCMinutes() < 30) {
           const backupDate = tick.toISOString().slice(0, 10);
+          const instanceId = `d1-backup-${backupDate}`;
           await withTaskRun(env, 'system', 'd1_backup_dispatch', async (taskRun) => {
             if (!env.D1_BACKUP_WORKFLOW) {
               // api Worker shares this bundle but declares no workflow
@@ -1378,8 +1388,17 @@ export async function handleScheduled(
               return { dispatched: false };
             }
             try {
+              await env.D1_BACKUP_WORKFLOW.get(instanceId);
+              // get() resolving means today's instance already exists —
+              // dispatched by an earlier minute of the window.
+              return { skip: true as const, reason: 'backup already dispatched today' };
+            } catch {
+              // Not found (or transient) — proceed to create; create()
+              // itself dedupes by instance id.
+            }
+            try {
               const instance = await env.D1_BACKUP_WORKFLOW.create({
-                id: `d1-backup-${backupDate}`,
+                id: instanceId,
                 params: { date: backupDate },
               });
               taskRun.report({
@@ -1389,16 +1408,15 @@ export async function handleScheduled(
               return { dispatched: true };
             } catch (e) {
               const message = e instanceof Error ? e.message : String(e);
-              // An instance with this id already exists → today's backup was
-              // already dispatched (duplicate delivery) — benign.
+              // Backstop: duplicate create raced between get() and here.
               if (/already exists|instance.already/i.test(message)) {
                 taskRun.report({ items_processed: 0, metadata: { deduped_by_instance_id: true } });
                 return { dispatched: false };
               }
-              throw e;
+              throw e; // real failure → task_run failed; next minute retries
             }
           }, {
-            idempotencyKey: `d1_backup_dispatch:${backupDate}`,
+            idempotencyKey: `d1_backup_dispatch:${backupDate}:${String(tick.getUTCMinutes()).padStart(2, '0')}`,
             initialMetadata: { cron, backup_date: backupDate },
           });
         }
