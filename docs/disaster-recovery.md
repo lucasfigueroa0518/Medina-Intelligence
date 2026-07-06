@@ -75,6 +75,14 @@ npx wrangler workflows trigger d1-backup-workflow --config wrangler.pipelines.to
 (idempotent; rows created after the backup are NOT deleted — for a byte-clean
 rebuild restore into a fresh database).
 
+Known limitation (audit round 4, structural, deliberately unpatched): a
+RE-RUN over already-restored data aborts loudly (UNIQUE constraint; no
+corruption — batches are atomic per file locally) if a table's only
+PK/UNIQUE key is itself an oversized (>~44KB) value. No current table can
+hit this (all unique keys are short ids); it matters only if a future
+schema puts huge values in unique columns. First restores into an empty
+database are unaffected.
+
 ```bash
 # 1. Drill (fresh, isolated local D1) — fetches from R2, rebuilds schema,
 #    replays, verifies counts. --persist-to points wrangler's local state

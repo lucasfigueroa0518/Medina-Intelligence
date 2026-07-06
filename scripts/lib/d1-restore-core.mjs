@@ -96,10 +96,22 @@ export function insertSql(table, row) {
 // STATELESS (no last_insert_rowid(), no PK/schema knowledge, no session
 // affinity), so groups survive any statement/file/request splitting as
 // long as order is preserved — which sequential execution guarantees.
-// Re-running a group is idempotent: the INSERT OR REPLACE resets the row
-// (same PK), appends redo, the final statement converts once. The
-// substr() scan per append is unindexed but oversized rows are rare;
-// correctness over speed in a DR path.
+// Re-running a group is idempotent PROVIDED the row's uniqueness key is
+// not itself a moved (oversized) column: the INSERT OR REPLACE re-keys
+// on the small PK, appends redo, the final statement converts once.
+//
+// KNOWN LIMITATION (audit round 4, structural — deliberately not
+// patched): if an oversized value IS the row's only PK/UNIQUE key, the
+// re-run INSERT carries the sentinel (≠ real key), creating a second
+// row whose final convert then fails loudly on the UNIQUE constraint —
+// an abort, not corruption (local wrangler runs each batch file
+// atomically and rolls back). Unreachable on the current schema: no
+// table has a >44KB unique key. The encoder is schema-blind by design;
+// making it refuse/handle unique-key oversized columns (the backup's
+// schema.sql is available at restore time) or moving to a parameterized
+// transport is an owner-level design decision — see PR #86's audit
+// trail. The substr() scan per append is unindexed but oversized rows
+// are rare; correctness over speed in a DR path.
 export const MAX_STATEMENT_BYTES = 90_000;
 // Chunks are sized in RAW bytes; in-statement cost is 4× raw (hex chars
 // of the content, hex-encoded again into the CAST literal):
