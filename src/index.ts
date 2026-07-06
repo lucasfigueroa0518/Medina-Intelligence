@@ -1355,6 +1355,53 @@ export async function handleScheduled(
             initialMetadata: { cron, scheduled_date: tick.toISOString().slice(0, 10) },
           });
         }
+        // Daily D1 → R2 disaster-recovery backup at 03:15 UTC — after the
+        // 02:10 daily cron and 02:25 maintenance so it snapshots their
+        // settled output, before the workday. Same folded time-of-day-gate
+        // pattern as d1_maintenance above (NOT a new cron trigger: a 4th
+        // trigger registration broke CF cron dispatch on 2026-04-28).
+        // The heavy lifting runs in D1BackupWorkflow (per-step subrequest
+        // budgets + retries); this gate only creates the instance. The
+        // date-keyed instance id + task_runs idempotency key both dedupe
+        // duplicate scheduled deliveries. Read-only against D1 by design —
+        // see docs/disaster-recovery.md.
+        if (tick.getUTCHours() === 3 && tick.getUTCMinutes() === 15) {
+          const backupDate = tick.toISOString().slice(0, 10);
+          await withTaskRun(env, 'system', 'd1_backup_dispatch', async (taskRun) => {
+            if (!env.D1_BACKUP_WORKFLOW) {
+              // api Worker shares this bundle but declares no workflow
+              // binding (and fires no crons); pipelines always has it.
+              taskRun.report({
+                items_processed: 0,
+                last_error: 'D1_BACKUP_WORKFLOW binding missing on this worker',
+              });
+              return { dispatched: false };
+            }
+            try {
+              const instance = await env.D1_BACKUP_WORKFLOW.create({
+                id: `d1-backup-${backupDate}`,
+                params: { date: backupDate },
+              });
+              taskRun.report({
+                items_processed: 1,
+                metadata: { workflow_instance_id: instance.id, backup_date: backupDate },
+              });
+              return { dispatched: true };
+            } catch (e) {
+              const message = e instanceof Error ? e.message : String(e);
+              // An instance with this id already exists → today's backup was
+              // already dispatched (duplicate delivery) — benign.
+              if (/already exists|instance.already/i.test(message)) {
+                taskRun.report({ items_processed: 0, metadata: { deduped_by_instance_id: true } });
+                return { dispatched: false };
+              }
+              throw e;
+            }
+          }, {
+            idempotencyKey: `d1_backup_dispatch:${backupDate}`,
+            initialMetadata: { cron, backup_date: backupDate },
+          });
+        }
       } catch (e) {
         console.error('work-queue tick failed:', e);
       }
