@@ -476,7 +476,7 @@ async function routeAuthenticated(
     return Conversations.listConversations(request, ctx, env);
   }
   m = path.match(/^\/api\/conversations\/([^/]+)\/thread$/);
-  if (m && method === 'GET') return Conversations.getConversationThread(m[1], ctx, env);
+  if (m && method === 'GET') return Conversations.getConversationThread(m[1], ctx, env, request);
   m = path.match(/^\/api\/conversations\/([^/]+)$/);
   if (m && method === 'GET') return Conversations.getConversation(m[1], ctx, env);
 
