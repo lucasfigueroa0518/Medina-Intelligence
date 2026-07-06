@@ -66,19 +66,31 @@ export function insertSql(table, row) {
 // single-statement form exceeds MAX_STATEMENT_BYTES are therefore
 // emitted as a bounded statement GROUP.
 //
-// The group assembles oversized values ENTIRELY IN TEXT SPACE — for
-// BLOBs too — because SQLite's || operator casts BLOB operands to TEXT
-// (a blob-appending group would silently store TEXT and the typed strip
-// predicate would never match; caught by the round-3 wrangler drill):
+// The group assembles oversized values as PURE-ASCII HEX TEXT — for
+// text values too, not only blobs. Three platform semantics forced this
+// exact shape, each caught by a live drill or audit round:
+//   - SQLite's || casts BLOB operands to TEXT (round 3 drill): so
+//     assembly must be TEXT-typed throughout.
+//   - SQLite's TEXT substr() char-scan is NUL-guarded (round 3 audit,
+//     Finding 1): raw-byte text assembly silently truncated values
+//     containing U+0000 at the final strip. Hex chars can never
+//     contain NUL, so the guard is unreachable.
+//   - Column affinity coerces numeric-LOOKING text (round 3 audit,
+//     Finding 2): the sentinel starts with a literal 'G' — not a hex
+//     digit, not 'E', not a sign — so neither the sentinel nor any
+//     sentinel-prefixed assembly state can ever look numeric.
 //
+// Group shape:
 //   1. INSERT OR REPLACE with each oversized value replaced by a random
-//      per-row 32-hex-char TEXT sentinel,
-//   2. one UPDATE per chunk appending content as TEXT — raw bytes for
-//      text values, pure-ASCII hex characters for blob values — keyed
-//      on `substr(col, 1, 32) = <sentinel>`,
-//   3. a final UPDATE stripping the sentinel and converting: substr()
-//      for text, unhex(substr()) for blobs (unhex → real BLOB; needs
-//      SQLite ≥3.41 — D1, workerd, and node:sqlite all ship newer).
+//      per-row sentinel: 'G' + 31 hex chars (TEXT, never numeric-like),
+//   2. one UPDATE per chunk appending the value's HEX CHARACTERS as
+//      TEXT, keyed on `substr(col, 1, 32) = <sentinel>`,
+//   3. a final UPDATE stripping the sentinel and converting:
+//      `unhex(substr(col, 33))` for blobs,
+//      `CAST(unhex(substr(col, 33)) AS TEXT)` for text — byte-exact
+//      including embedded NULs, exactly like the single-statement
+//      CAST(X'…' AS TEXT) path. unhex needs SQLite ≥3.41 (D1, workerd,
+//      and node:sqlite all ship newer).
 //
 // Every statement stays under the cap by construction. Predicates are
 // STATELESS (no last_insert_rowid(), no PK/schema knowledge, no session
@@ -89,11 +101,10 @@ export function insertSql(table, row) {
 // substr() scan per append is unindexed but oversized rows are rare;
 // correctness over speed in a DR path.
 export const MAX_STATEMENT_BYTES = 90_000;
-// Text chunks: raw utf8 bytes, hex-doubled in the statement → ≤80KB.
-export const CHUNK_RAW_BYTES = 40_000;
-// Blob chunks: content is hex CHARS (2× raw) which the statement then
-// hex-encodes again (4× raw) → 18KB raw = 72KB in-statement.
-export const BLOB_CHUNK_RAW_BYTES = 18_000;
+// Chunks are sized in RAW bytes; in-statement cost is 4× raw (hex chars
+// of the content, hex-encoded again into the CAST literal):
+// 18KB raw → 72KB in-statement, under the 90KB cap with headroom.
+export const CHUNK_RAW_BYTES = 18_000;
 
 function chunkBuffer(buf, size) {
   const chunks = [];
@@ -106,7 +117,6 @@ function chunkBuffer(buf, size) {
 export function statementsForRow(table, row, opts = {}) {
   const maxStatement = opts.maxStatementBytes ?? MAX_STATEMENT_BYTES;
   const chunkRaw = opts.chunkRawBytes ?? CHUNK_RAW_BYTES;
-  const blobChunkRaw = opts.blobChunkRawBytes ?? BLOB_CHUNK_RAW_BYTES;
 
   const simple = insertSql(table, row);
   if (!simple) return [];
@@ -114,9 +124,10 @@ export function statementsForRow(table, row, opts = {}) {
 
   const columns = Object.keys(row).filter(c => IDENTIFIER.test(c));
   const sentinelBytes = opts.sentinelBytes ?? cryptoRandomBytes(16);
-  // The sentinel is always a 32-hex-char TEXT value (ASCII), for blob
-  // columns too — assembly is uniformly TEXT until the final convert.
-  const sentinel = Buffer.from(sentinelBytes).toString('hex').toUpperCase();
+  // 'G' + 31 hex chars: structurally non-numeric (round 3, Finding 2 —
+  // an all-digit sentinel coerced to REAL under numeric column affinity
+  // and killed the group's predicates), still ~124 bits of entropy.
+  const sentinel = `G${Buffer.from(sentinelBytes).toString('hex').toUpperCase().slice(0, 31)}`;
   const sentinelLit = `CAST(X'${Buffer.from(sentinel, 'utf8').toString('hex').toUpperCase()}' AS TEXT)`;
 
   // Move the largest chunkable values out of the INSERT until it fits.
@@ -135,7 +146,10 @@ export function statementsForRow(table, row, opts = {}) {
     .filter(Boolean)
     .sort((a, b) => b.bytes - a.bytes);
 
-  const moved = new Map(); // col -> {kind, chunks: Buffer[] of TEXT-space content}
+  // col -> {kind, chunks: hex-char Buffers}. Assembly content is the
+  // value's HEX CHARACTERS for text and blob alike — pure ASCII, so no
+  // NUL can ever enter the in-flight TEXT value (round 3, Finding 1).
+  const moved = new Map();
   const insertFor = () => {
     const columnSql = columns.map(c => `"${c}"`).join(', ');
     const valueSql = columns.map(c => (moved.has(c) ? sentinelLit : sqlLiteral(row[c]))).join(', ');
@@ -146,13 +160,11 @@ export function statementsForRow(table, row, opts = {}) {
   for (const candidate of candidates) {
     if (Buffer.byteLength(insert, 'utf8') <= maxStatement) break;
     const value = row[candidate.col];
-    if (candidate.kind === 'blob') {
-      // TEXT-space content for a blob is its hex characters.
-      const hexChars = Buffer.from(Buffer.from(value.$b64, 'base64').toString('hex').toUpperCase(), 'utf8');
-      moved.set(candidate.col, { kind: 'blob', chunks: chunkBuffer(hexChars, blobChunkRaw * 2) });
-    } else {
-      moved.set(candidate.col, { kind: 'text', chunks: chunkBuffer(Buffer.from(String(value), 'utf8'), chunkRaw) });
-    }
+    const raw = candidate.kind === 'blob'
+      ? Buffer.from(value.$b64, 'base64')
+      : Buffer.from(String(value), 'utf8');
+    const hexChars = Buffer.from(raw.toString('hex').toUpperCase(), 'utf8');
+    moved.set(candidate.col, { kind: candidate.kind, chunks: chunkBuffer(hexChars, chunkRaw * 2) });
     insert = insertFor();
   }
   if (Buffer.byteLength(insert, 'utf8') > maxStatement) {
@@ -167,9 +179,12 @@ export function statementsForRow(table, row, opts = {}) {
         `UPDATE "${table}" SET "${col}" = "${col}" || ${chunkLit} WHERE substr("${col}", 1, 32) = ${sentinelLit};`
       );
     }
+    // unhex → raw bytes; text columns cast the bytes back to TEXT —
+    // byte-exact including embedded NULs, matching the single-statement
+    // CAST(X'…' AS TEXT) path.
     const finalExpr = m.kind === 'blob'
       ? `unhex(substr("${col}", 33))`
-      : `substr("${col}", 33)`;
+      : `CAST(unhex(substr("${col}", 33)) AS TEXT)`;
     statements.push(
       `UPDATE "${table}" SET "${col}" = ${finalExpr} WHERE substr("${col}", 1, 32) = ${sentinelLit};`
     );

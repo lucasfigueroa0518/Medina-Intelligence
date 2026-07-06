@@ -470,4 +470,53 @@ describe('oversized values restore via bounded statement groups (R2-1)', () => {
     expect(rows[0].body).toBe(`${big}A`);
     expect(rows[1].body).toBe(`${big}B`);
   });
+
+  it('preserves embedded NUL characters in oversized text (round-3 Finding 1)', () => {
+    // SQLite's TEXT substr() char-scan is NUL-guarded: raw-byte
+    // assembly silently truncated NUL-bearing oversized text at the
+    // final strip. Hex-space assembly makes NULs unreachable in-flight;
+    // the final CAST(unhex(…) AS TEXT) restores them byte-exactly.
+    const nulEarly = 'abc ' + 'x'.repeat(60_000);
+    const nulMid = 'y'.repeat(30_000) + '  ' + 'z'.repeat(30_000);
+    // NULs astride the raw-chunk boundary region (18,000-byte chunks).
+    const nulAtBoundary = 'q'.repeat(17_999) + ' ' + 'r'.repeat(42_000);
+    const db = new DatabaseSync(':memory:');
+    db.exec('CREATE TABLE nt (id TEXT PRIMARY KEY, body TEXT)');
+    for (const [id, body] of [['e', nulEarly], ['m', nulMid], ['b', nulAtBoundary]] as const) {
+      for (const statement of statementsForRow('nt', { id, body }) as string[]) {
+        expect(Buffer.byteLength(statement, 'utf8')).toBeLessThanOrEqual(MAX_STATEMENT_BYTES);
+        db.exec(statement);
+      }
+    }
+    // Compare at BYTE level via SQL: NUL-guarded instruments (SQLite
+    // length()/char scans, node:sqlite JS string reads) under-report
+    // NUL-bearing TEXT on EVERY path, including single-statement — the
+    // fidelity criterion is stored bytes, where the paths must agree.
+    const rows = db.prepare(
+      'SELECT id, typeof(body) AS ty, length(CAST(body AS BLOB)) AS bytes, hex(CAST(body AS BLOB)) AS h FROM nt'
+    ).all() as Record<string, unknown>[];
+    const byId = Object.fromEntries(rows.map(r => [r.id as string, r]));
+    for (const [id, original] of [['e', nulEarly], ['m', nulMid], ['b', nulAtBoundary]] as const) {
+      expect(byId[id].ty).toBe('text');
+      expect(byId[id].bytes).toBe(Buffer.byteLength(original, 'utf8'));
+      expect(byId[id].h).toBe(Buffer.from(original, 'utf8').toString('hex').toUpperCase());
+    }
+  });
+
+  it('sentinel is structurally non-numeric and survives numeric column affinity (round-3 Finding 2)', () => {
+    // An all-digit random sentinel coerced to REAL under NUMERIC
+    // affinity, killing every predicate in the group. The G-prefix
+    // makes the sentinel (and any sentinel-prefixed assembly state)
+    // never numeric-looking. Force worst-case all-digit sentinel bytes
+    // and prove the group still lands intact in a NUMERIC column.
+    const digitBytes = new Uint8Array(16).fill(0x11); // hex '1111…' = all digits
+    const big = 'n'.repeat(60_000);
+    const statements = statementsForRow('t2', { id: 'x', notes: big }, { sentinelBytes: digitBytes }) as string[];
+    const db = new DatabaseSync(':memory:');
+    db.exec('CREATE TABLE t2 (id TEXT PRIMARY KEY, notes NUMERIC)');
+    for (const statement of statements) db.exec(statement);
+    const got = db.prepare('SELECT notes, typeof(notes) AS ty FROM t2').get() as Record<string, unknown>;
+    expect(got.ty).toBe('text');
+    expect(got.notes).toBe(big);
+  });
 });
