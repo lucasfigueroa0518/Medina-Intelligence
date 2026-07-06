@@ -40,3 +40,61 @@
 - Frontend expects the Worker API at `http://localhost:8787`
   (`frontend/.env.local`). Run wrangler local-only; `wrangler.readonly.toml` sets
   `remote = true` on D1 and will hit production — do not use it for local testing.
+
+## CI gates
+- Every PR and push to main runs `.github/workflows/ci.yml` (root: `tsc --noEmit`
+  + `vitest run`; frontend: `tsc --noEmit` + lint + `next build`) and
+  `config-check.yml` (wrangler drift). Keep them green; they are required-check
+  candidates. CI does NOT deploy — Worker deploys stay manual, Vercel deploys
+  off main.
+- Tests must pass on a CLEAN CHECKOUT. A test that needs gitignored local
+  artifacts (e.g. `outputs/` review contracts) must `describe.skipIf` on the
+  artifact's existence, not fail without it — and never commit real CRM data
+  as fixtures.
+
+## Backups & disaster recovery
+- DR contract: D1 Time Travel is the first line (≤30-day point-in-time);
+  `D1BackupWorkflow` exports all base tables to R2 (`backups/d1/<date>/`)
+  daily at 03:15 UTC with 14-day retention as the second line. Restore via
+  `scripts/restore-d1-backup.mjs`. Runbook: `docs/disaster-recovery.md`.
+- The backup path must stay strictly READ-ONLY against D1. Anything that
+  mutates data belongs in maintenance, never in backup.
+- New scheduled work does NOT get a new cron trigger (a 4th registered
+  trigger broke CF cron dispatch on 2026-04-28). Add a UTC time-of-day gate
+  inside the minute-tick branch of `handleScheduled` with a `withTaskRun`
+  idempotency key, like `d1_maintenance` (02:25) and `d1_backup_dispatch`
+  (03:15). Heavy work goes in a Workflow, not inline `waitUntil`.
+
+## Frontend resilience
+- `app/error.tsx` + `app/global-error.tsx` are load-bearing: pages must never
+  white-screen. They are the LAST-RESORT net — per-surface data-error cards
+  with retry (the contacts-style card) remain mandatory for fetch failures.
+  New boundary UIs reuse `components/error-fallback.tsx`.
+
+## Security headers
+- `frontend/next.config.mjs` `headers()` is the baseline: HSTS, nosniff,
+  `X-Frame-Options: DENY` + `frame-ancestors 'none'`, Referrer-Policy,
+  Permissions-Policy, and a full CSP in REPORT-ONLY mode. Don't remove
+  headers; tighten the CSP only with report-only violation data in hand,
+  then flip to enforcing (nonce-based script-src is the end state).
+- `connect-src` derives from `NEXT_PUBLIC_API_URL` at build time — never
+  hardcode an API origin into the policy.
+
+## Dependencies
+- Patch posture: security patches ride minor/patch bumps promptly (run
+  `npm audit` in both roots); MAJOR bumps (React, Tailwind, TypeScript,
+  Next majors) are deliberate, scheduled decisions — they collide with the
+  overhaul's UI phases. Known accepted residual: the postcss copy vendored
+  inside Next (moderate, unfixable locally without a breaking downgrade).
+- Spreadsheet parsing uses `@e965/xlsx` (maintained SheetJS build) in BOTH
+  roots — the upstream `xlsx` package is frozen with unfixed advisories;
+  do not reintroduce it.
+
+## Wrangler configs
+- The four wrangler configs are governed by
+  `scripts/check-wrangler-drift.mjs` (runs in CI): parity vars must match
+  everywhere, intentional divergences are pinned in its manifest, cron sets
+  are exact, and any NEW var must be classified there — extend the manifest
+  in the same PR that adds the var. `wrangler.readonly.toml` stays D1-only
+  (+`remote=true`): giving it R2/KV would let a "readonly" preview write
+  production storage.
