@@ -55,6 +55,14 @@ export class ApiError extends Error {
   }
 }
 
+// Mirrors src/lib/entity-writes.ts FieldRejection — the per-field reason a write
+// was not applied. Surfaced to the user so silently-rejected edits are visible.
+export interface FieldRejection {
+  field_name: string;
+  reason: 'permanently_locked' | 'human_edit_locked_other_user' | 'unknown_field' | 'not_writable' | 'private_source_taint';
+  detail?: string;
+}
+
 export interface ContactListResponse {
   contacts: any[];
   limit: number;
@@ -144,7 +152,7 @@ export const api = {
   createContact: (data: any) =>
     request<{ contact: any }>('/contacts', { method: 'POST', body: JSON.stringify(data) }),
   updateContact: (id: string, data: any) =>
-    request<{ contact: any }>(`/contacts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    request<{ contact: any; rejected_fields?: FieldRejection[] }>(`/contacts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteContact: (id: string) =>
     request<{ ok: boolean }>(`/contacts/${id}`, { method: 'DELETE' }),
   getContactTimeline: (id: string, params?: Record<string, string>, options: RequestInit = {}) => {
@@ -169,9 +177,9 @@ export const api = {
     }),
 
   // Companies
-  listCompanies: (params?: Record<string, string>) => {
+  listCompanies: (params?: Record<string, string>, options: RequestInit = {}) => {
     const q = params ? '?' + new URLSearchParams(params).toString() : '';
-    return request<{ companies: any[]; limit: number; offset: number; total: number; has_more?: boolean }>(`/companies${q}`);
+    return request<{ companies: any[]; limit: number; offset: number; total: number; has_more?: boolean }>(`/companies${q}`, options);
   },
   listCompanyCities: () =>
     request<{ cities: { name: string; count: number }[] }>(`/companies/cities`),
@@ -345,8 +353,13 @@ export const api = {
       truncated: boolean;
     }>(`/deals/${id}/conversations${q}`);
   },
-  getConversationThread: (id: string) =>
-    request<ConversationThreadResponse>(`/conversations/${id}/thread`),
+  getConversationThread: (id: string, opts?: ConversationThreadOptions) => {
+    const params = new URLSearchParams();
+    if (opts?.limit != null) params.set('limit', String(opts.limit));
+    if (opts?.before) params.set('before', opts.before);
+    const q = params.toString();
+    return request<ConversationThreadResponse>(`/conversations/${id}/thread${q ? `?${q}` : ''}`);
+  },
   addDealContact: (dealId: string, data: { contact_id: string; role: string; side: string }) =>
     request<{ ok: boolean }>(`/deals/${dealId}/contacts`, { method: 'POST', body: JSON.stringify(data) }),
 
@@ -1267,10 +1280,24 @@ export interface ConversationThreadResponse {
     external_thread_id: string | null;
     subject: string;
     source: string;
+    /** Total messages in the thread, not the number returned in this window. */
     message_count: number;
     last_sent_at: string | null;
     messages: ConversationThreadMessage[];
+    /** Number of messages returned in this window (additive; older backends omit it). */
+    window_size?: number;
+    /** True when older messages exist before this window. */
+    has_more_older?: boolean;
+    /** Opaque cursor; pass as `before` to fetch the previous (older) page. */
+    older_cursor?: string | null;
   };
+}
+
+export interface ConversationThreadOptions {
+  /** Max messages to return in this window (server caps it). */
+  limit?: number;
+  /** Opaque cursor from a prior response's `older_cursor` to page into older messages. */
+  before?: string | null;
 }
 
 // --- Settings → System Status types (mirror src/handlers/system-status.ts) ---
@@ -1794,6 +1821,11 @@ export async function streamAgentQuery(
   const decoder = new TextDecoder();
   let buffer = '';
   let receivedContent = false;
+  // 3.7(2): `receivedContent` only flips on text tokens, so a turn that did
+  // real work via tool calls / document cards / max_step events but emitted no
+  // prose would be misclassified as "no response received" on a premature
+  // close. Track whether ANY meaningful work streamed, separately from text.
+  let receivedAnything = false;
   let sawRunId: string | null = null;
   let sawRequestId: string | null = opts?.clientRequestId || opts?.interruptRequestId || null;
   let sawSessionId: string | null = sessionId;
@@ -1835,10 +1867,12 @@ export async function streamAgentQuery(
           } else if (evt.type === 'attachments') {
             onToolEvent?.(evt);
           } else if (evt.type === 'document_cards') {
+            receivedAnything = true;
             onToolEvent?.(evt);
           } else if (evt.type === 'model_error') {
             onToolEvent?.(evt);
           } else if (evt.type === 'max_step') {
+            receivedAnything = true;
             sawDurableRun = sawDurableRun || !!evt.durable;
             sawRunId = evt.run_id || sawRunId;
             sawRequestId = evt.request_id || sawRequestId;
@@ -1846,9 +1880,11 @@ export async function streamAgentQuery(
             onToolEvent?.(evt);
           } else if (evt.text) {
             receivedContent = true;
+            receivedAnything = true;
             onToken(evt.text);
           }
           if (evt.type === 'tool_call' || evt.type === 'tool_result') {
+            receivedAnything = true;
             onToolEvent?.(evt);
           }
         } catch {
@@ -1875,7 +1911,10 @@ export async function streamAgentQuery(
   }
 
   // Stream ended without [DONE] — premature close
-  if (receivedContent) {
+  if (receivedContent || receivedAnything) {
+    // 3.7(2): The turn streamed real work (text and/or tool calls / document
+    // cards / max_step progress). Finalize the draft rather than reporting it
+    // as a failure just because no prose token happened to arrive.
     onDone();
   } else if (sawDurableRun || sawRunId) {
     onError('MAX is still running. Reconnecting to progress events...', {
@@ -1885,6 +1924,16 @@ export async function streamAgentQuery(
       requestId: sawRequestId,
     });
   } else {
-    onError('Connection lost — no response received. The request may have timed out.');
+    // 3.7(1): Premature close with nothing received and no durable marker. The
+    // server's waitUntil capture tail may still be persisting a good answer, so
+    // classify this as a soft, recoverable interruption (with the session id)
+    // rather than a bare terminal error. page.tsx routes STREAM_INTERRUPTED
+    // through its recovery/poll path (serverMayHaveAcceptedTurn) instead of
+    // marking the message failed; a genuinely-failed turn still surfaces via
+    // the poll when the server later reports the error.
+    onError('Connection lost — reconnecting to check whether MARTy finished...', {
+      code: 'STREAM_INTERRUPTED',
+      sessionId: sawSessionId,
+    });
   }
 }

@@ -17,7 +17,8 @@ import { TagPicker } from '@/components/tag-picker';
 import { DocumentActions } from '@/components/document-actions';
 import { RecentObservations } from '@/components/recent-observations';
 import { TentativeNameBadge } from '@/components/tentative-name-badge';
-import { api, ApiError } from '@/lib/api';
+import { api, ApiError, FieldRejection } from '@/lib/api';
+import { patchContactInList } from '@/lib/use-contact-list';
 import { cleanIntelBrief } from '@/lib/intelligence-briefing';
 import {
   DEMO_IDS,
@@ -362,7 +363,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
         setToast(demoToastMessage('Contact edit'));
         return;
       }
-      await api.updateContact(activeContactId, {
+      const result = await api.updateContact(activeContactId, {
         full_name: editForm.full_name.trim(),
         email: editForm.email.trim() || null, phone: editForm.phone.trim() || null,
         job_title: editForm.job_title.trim() || null, contact_type: editForm.contact_type,
@@ -376,9 +377,42 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
         fund_name: editForm.fund_name.trim() || null,
         commitment_status: editForm.commitment_status.trim() || null,
       });
+      // Fields the backend silently rejected (locks/taint) — the real "edits
+      // don't save" symptom. Computed first because company_name handling
+      // depends on whether the company_id write actually applied.
+      const rejected = result.rejected_fields || [];
+      const companyIdApplied = !rejected.some(r => r.field_name === 'company_id');
+      // Update local state directly from the server's post-write row instead of
+      // a blind refetch. company_name isn't returned by the write path; only
+      // trust the name the user picked when the company_id write was applied —
+      // otherwise `updated.company_id` still holds the old value, so keep the
+      // prior company_name rather than mislabelling the old company.
+      const updated = result.contact;
+      const nextCompanyName = (c: any) =>
+        !companyIdApplied ? (c?.company_name ?? null)
+          : updated.company_id ? editForm.company_name
+          : null;
+      setContact((c: any) => ({
+        ...c,
+        ...updated,
+        company_name: nextCompanyName(c) ?? '',
+      }));
       setEditMode(false);
-      setRefreshKey(k => k + 1);
-      setToast('Contact updated');
+      // Reflect the edit in the contacts LIST cache immediately (60s TTL) so it
+      // shows the new values right after save without waiting out the TTL.
+      patchContactInList(activeContactId, (row: any) => ({
+        ...row,
+        full_name: updated.full_name ?? row.full_name,
+        email: updated.email ?? row.email,
+        company_name: nextCompanyName(row),
+        contact_type: updated.contact_type ?? row.contact_type,
+      }));
+      // Surface the rejected fields to the user.
+      if (rejected.length > 0) {
+        setToast(`Contact updated. ${describeRejections(rejected)}`);
+      } else {
+        setToast('Contact updated');
+      }
     } catch (e: any) { setToast(`Save failed: ${e.message || 'Unknown error'}`); }
     finally { setSaving(false); }
   }
@@ -391,8 +425,14 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       return;
     }
     try {
-      await api.updateContact(activeContactId, { engagement_status: v });
+      const result = await api.updateContact(activeContactId, { engagement_status: v });
+      const rejected = result.rejected_fields || [];
+      if (rejected.some(r => r.field_name === 'engagement_status')) {
+        setToast(describeRejections(rejected));
+        return;
+      }
       setContact((c: any) => ({ ...c, engagement_status: v, engagement_status_manual: 1 }));
+      patchContactInList(activeContactId, (row: any) => ({ ...row, engagement_status: v }));
       setToast(`Status → ${v}`);
     } catch (e: any) { setToast(`Failed: ${e.message}`); }
   }
@@ -1532,6 +1572,25 @@ function jsonArr(raw: string | null | undefined): string[] {
 
 function humanField(f: string): string {
   return f.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+const REJECTION_REASON_LABEL: Record<FieldRejection['reason'], string> = {
+  permanently_locked: 'locked',
+  human_edit_locked_other_user: 'locked by another user',
+  unknown_field: 'not editable here',
+  not_writable: 'not editable here',
+  private_source_taint: 'from a private source',
+};
+
+// Compose a single human-readable sentence naming the fields the backend
+// silently dropped and why. This is the actual "edits don't save" symptom —
+// locked/tainted fields rejected without any feedback to the user.
+function describeRejections(rejected: FieldRejection[]): string {
+  const parts = rejected.map(
+    r => `${humanField(r.field_name)} (${REJECTION_REASON_LABEL[r.reason] || 'not applied'})`
+  );
+  const label = parts.length === 1 ? 'field wasn’t saved' : 'fields weren’t saved';
+  return `Some ${label}: ${parts.join(', ')}.`;
 }
 
 function cleanValue(raw: any): string {
