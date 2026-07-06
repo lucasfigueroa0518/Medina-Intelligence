@@ -12,7 +12,7 @@ import {
 // The restore side of the round trip uses the exact primitives the
 // restore CLI uses.
 // eslint-disable-next-line import/no-relative-packages
-import { insertSql, rowsFromJsonlText, sqlLiteral } from '../scripts/lib/d1-restore-core.mjs';
+import { insertSql, rowsFromJsonlText, sqlLiteral, statementsForRow, MAX_STATEMENT_BYTES } from '../scripts/lib/d1-restore-core.mjs';
 
 type Row = Record<string, unknown>;
 
@@ -380,5 +380,94 @@ describe('restore SQL literals', () => {
   it('fnv1a is stable', () => {
     expect(__d1BackupTestHooks.fnv1a('hello')).toBe(__d1BackupTestHooks.fnv1a('hello'));
     expect(__d1BackupTestHooks.fnv1a('hello')).not.toBe(__d1BackupTestHooks.fnv1a('hellp'));
+  });
+});
+
+describe('oversized values restore via bounded statement groups (R2-1)', () => {
+  // D1 caps statements at ~100KB and hex doubles bytes, so values
+  // ≥ ~45KB must restore via sentinel + chunked appends with EVERY
+  // statement under the cap.
+  function applyStatements(db: InstanceType<typeof DatabaseSync>, statements: string[]) {
+    for (const statement of statements) {
+      expect(Buffer.byteLength(statement, 'utf8')).toBeLessThanOrEqual(MAX_STATEMENT_BYTES);
+      db.exec(statement);
+    }
+  }
+
+  it('round-trips 60KB and 150KB text plus an 80KB blob byte-exactly', () => {
+    // 60KB sits in the band that regressed vs quoted literals; 150KB
+    // was un-restorable under any prior encoding. Unicode padding makes
+    // chunk boundaries land mid-character (multi-byte splits).
+    const text60 = ('ü✓' + 'a'.repeat(58)).repeat(1000);        // ~60KB utf8
+    const text150 = ('名前🚀' + 'b'.repeat(89)).repeat(1500);    // ~150KB utf8
+    const blob = new Uint8Array(80_000).map((_, i) => i % 256);
+    const row = {
+      id: 'big1',
+      body: text60,
+      extracted: text150,
+      payload: { $b64: Buffer.from(blob).toString('base64') },
+      small: 'ordinary',
+      empty: '',
+      maybe_null: null,
+    };
+
+    const statements = statementsForRow('chat_uploads', row) as string[];
+    expect(statements.length).toBeGreaterThan(3); // insert + appends + strips
+    for (const statement of statements) {
+      expect(statement).not.toMatch(/BEGIN TRANSACTION/);
+      expect(statement).not.toMatch(/COMMIT;/);
+    }
+
+    const db = new DatabaseSync(':memory:');
+    db.exec('CREATE TABLE chat_uploads (id TEXT PRIMARY KEY, body TEXT, extracted TEXT, payload BLOB, small TEXT, empty TEXT, maybe_null TEXT)');
+    applyStatements(db, statements);
+
+    const got = db.prepare('SELECT * FROM chat_uploads').get() as Record<string, unknown>;
+    expect(got.body).toBe(text60);
+    expect(got.extracted).toBe(text150);
+    expect([...(got.payload as Uint8Array)]).toEqual([...blob]);
+    expect(got.small).toBe('ordinary');
+    expect(got.empty).toBe('');
+    expect(got.maybe_null).toBeNull();
+
+    // Stored TYPES must survive too: SQLite's || casts blobs to text,
+    // which is exactly the corruption the TEXT-space assembly avoids.
+    const types = db.prepare(
+      'SELECT typeof(body) AS t_body, typeof(payload) AS t_payload FROM chat_uploads'
+    ).get() as Record<string, string>;
+    expect(types.t_body).toBe('text');
+    expect(types.t_payload).toBe('blob');
+
+    // Idempotency: replaying the whole group again converges to the
+    // same single row with identical content.
+    applyStatements(db, statementsForRow('chat_uploads', row) as string[]);
+    const rows = db.prepare('SELECT * FROM chat_uploads').all() as Record<string, unknown>[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].extracted).toBe(text150);
+  });
+
+  it('small rows keep the single-statement path', () => {
+    const statements = statementsForRow('t', { id: 'x', v: 'small' }) as string[];
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toBe(insertSql('t', { id: 'x', v: 'small' }));
+  });
+
+  it('groups for two oversized rows use distinct sentinels and coexist', () => {
+    const big = 'z'.repeat(60_000);
+    const rowA = { id: 'a', body: `${big}A` };
+    const rowB = { id: 'b', body: `${big}B` };
+    const db = new DatabaseSync(':memory:');
+    db.exec('CREATE TABLE t (id TEXT PRIMARY KEY, body TEXT)');
+    // Interleave the two groups' inserts before appends run — the
+    // stateless sentinel predicates must not cross-contaminate.
+    const groupA = statementsForRow('t', rowA) as string[];
+    const groupB = statementsForRow('t', rowB) as string[];
+    db.exec(groupA[0]);
+    db.exec(groupB[0]);
+    for (const statement of groupA.slice(1)) db.exec(statement);
+    for (const statement of groupB.slice(1)) db.exec(statement);
+    const rows = db.prepare('SELECT id, body FROM t ORDER BY id').all() as Record<string, unknown>[];
+    expect(rows[0].body).toBe(`${big}A`);
+    expect(rows[1].body).toBe(`${big}B`);
   });
 });

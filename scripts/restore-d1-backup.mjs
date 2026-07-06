@@ -23,7 +23,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { insertSql, rowsFromJsonlText } from './lib/d1-restore-core.mjs';
+import { statementsForRow, rowsFromJsonlText } from './lib/d1-restore-core.mjs';
 
 function usage(message) {
   if (message) console.error(`Error: ${message}\n`);
@@ -168,18 +168,21 @@ async function main() {
         const partPath = join(backupDir, 'parts', part.key.split('/').pop());
         const text = await readFile(partPath, 'utf8');
         for (const row of rowsFromJsonlText(text)) {
-          const sql = insertSql(table.name, row);
-          if (!sql) continue;
-          batch.push(sql);
+          // Oversized values expand to a bounded statement GROUP
+          // (sentinel insert + chunked appends) — see d1-restore-core.
+          // Statements are stateless and order-preserved, so a group
+          // may span batch files safely.
+          const statements = statementsForRow(table.name, row);
+          if (statements.length === 0) continue;
+          batch.push(...statements);
+          tableRows += 1;
           if (batch.length >= 200) {
             await executeSqlStatements(batch);
-            tableRows += batch.length;
             batch = [];
           }
         }
       }
       await executeSqlStatements(batch);
-      tableRows += batch.length;
       restoredRows += tableRows;
       console.log(`  ${table.name}: ${tableRows} rows replayed (manifest says ${table.rows})`);
     }

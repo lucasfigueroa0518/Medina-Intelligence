@@ -40,7 +40,7 @@ function parseArgs(argv) {
 // wrangler-trimmer hazard the full-backup restore had: a snapshot row
 // whose text contains `BEGIN TRANSACTION`/`COMMIT;` used to abort (or
 // silently mangle) the replay. See scripts/lib/d1-restore-core.mjs.
-import { insertSql } from './lib/d1-restore-core.mjs';
+import { statementsForRow } from './lib/d1-restore-core.mjs';
 
 async function* readJsonl(file) {
   const rl = createInterface({
@@ -73,15 +73,17 @@ async function main() {
     if (result.status !== 0) {
       throw new Error(`wrangler d1 execute failed for ${file}`);
     }
-    restored += batch.length;
     batch = [];
   }
 
   try {
     for await (const row of readJsonl(args.file)) {
-      const sql = insertSql(args.table, row);
-      if (!sql) continue;
-      batch.push(sql);
+      // Oversized values expand to a bounded statement group (sentinel
+      // insert + chunked appends) — see d1-restore-core.
+      const statements = statementsForRow(args.table, row);
+      if (statements.length === 0) continue;
+      batch.push(...statements);
+      restored += 1;
       if (batch.length >= 200) await flush();
     }
     await flush();
