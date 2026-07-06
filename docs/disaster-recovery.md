@@ -111,6 +111,13 @@ cleanup steps). Same JSONL shape, single-table, kept as-is.
 3. Confirm `backups/d1/<today>/manifest.json` exists and `total_rows` looks
    sane; confirm the `d1_backup_dispatch` task_run row.
 4. Run the local drill (restore runbook step 1) once and file the result.
+5. ONCE, before ever relying on a `--remote` restore: run a supervised
+   remote drill against a THROWAWAY D1 database (create a scratch DB,
+   `--database <scratch> --remote --yes --verify`, then delete it).
+   Rationale: `wrangler d1 execute --remote --file` uses a different
+   transport than local (service-side import pipeline, no client-side
+   statement splitting); the restore audits exercised the local path
+   exhaustively but deliberately never wrote to remote resources.
 
 ## Proposed (not implemented): R2 lifecycle & orphan hygiene
 
