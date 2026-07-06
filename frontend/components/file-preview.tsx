@@ -177,7 +177,11 @@ function XlsxPreview({ src, fileName }: { src: string; fileName?: string }) {
     (async () => {
       try {
         const [XLSX, res] = await Promise.all([
-          import('xlsx'),
+          // @e965/xlsx is the maintained SheetJS build (same API) — the
+          // upstream `xlsx` npm package is frozen at 0.18 with unfixed
+          // prototype-pollution + ReDoS advisories. The backend already
+          // uses this fork.
+          import('@e965/xlsx'),
           fetch(src),
         ]);
         if (!res.ok) throw new Error(`Workbook preview failed (${res.status})`);
