@@ -314,13 +314,28 @@ export async function listCompanies(
 
   const likeFallback = (): SearchStrategy => {
     const pat = `%${search}%`;
+    // Degraded-mode coverage parity: match every field company_search_fts
+    // indexes (name, domain, website, sector, location_mentioned, description,
+    // custom_fields, and tag names via the same join the FTS backfill uses) so
+    // a search that succeeds through FTS never silently misses when the index
+    // is empty or unavailable.
+    const likeWhere = `(
+      co.name LIKE ? OR co.domain LIKE ? OR co.website LIKE ?
+      OR co.sector LIKE ? OR co.location_mentioned LIKE ?
+      OR co.description LIKE ? OR co.custom_fields LIKE ?
+      OR EXISTS (
+        SELECT 1 FROM company_tags ct
+        JOIN tags t ON t.id = ct.tag_id
+        WHERE ct.company_id = co.id AND t.name LIKE ?
+      )
+    )`;
     return {
       cte: '',
       join: '',
       orderPrefix: '',
       ftsBinds: [],
-      likeWhere: search ? ['(co.name LIKE ? OR co.domain LIKE ? OR co.description LIKE ?)'] : [],
-      likeBinds: search ? [pat, pat, pat] : [],
+      likeWhere: search ? [likeWhere] : [],
+      likeBinds: search ? [pat, pat, pat, pat, pat, pat, pat, pat] : [],
     };
   };
 
