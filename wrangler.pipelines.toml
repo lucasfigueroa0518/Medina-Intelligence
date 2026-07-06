@@ -126,9 +126,9 @@ binding = "DAILY_CRON_WORKFLOW"
 class_name = "DailyCronWorkflow"
 
 # Daily D1 → R2 disaster-recovery export (docs/disaster-recovery.md).
-# Dispatched from the minute-tick handler's 03:15 UTC gate — deliberately
-# NOT a third cron trigger: a 4th trigger registration broke CF cron
-# dispatch on 2026-04-28 (see the Cron Triggers comment below).
+# Dispatched from the minute-tick handler's 03:15–03:29 UTC window gate —
+# deliberately NOT a third cron trigger: a 4th trigger registration broke
+# CF cron dispatch on 2026-04-28 (see the Cron Triggers comment below).
 [[workflows]]
 name = "d1-backup-workflow"
 binding = "D1_BACKUP_WORKFLOW"
