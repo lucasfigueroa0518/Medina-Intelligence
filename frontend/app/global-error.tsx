@@ -7,7 +7,9 @@
 // crashed layout survived. The font instantiations mirror layout.tsx
 // (same variable names) so the recovery screen keeps the brand
 // typography instead of falling back to system fonts (audit round 1,
-// N5); next/font dedupes identical loaders at build time.
+// N5). The duplicate loaders cost a few duplicated CSS rules in the
+// bundle — the underlying woff2 files are shared — which is the right
+// trade for a boundary that must be self-sufficient.
 
 import './globals.css';
 import { Exo_2, Geist, JetBrains_Mono } from 'next/font/google';
