@@ -44,7 +44,11 @@ const contentSecurityPolicy = [
   `font-src 'self' data:`,
   `connect-src 'self'${apiOrigin ? ` ${apiOrigin}` : ''}${previewConnect}`,
   `worker-src 'self' blob:`,
-  `frame-src 'self'${isVercelPreview ? ' https://vercel.live' : ''}`,
+  // blob: is load-bearing: the app's own document previews (PDF/HTML)
+  // iframe URL.createObjectURL blob: URLs (file-preview, document
+  // modals). Without it, enforcing this policy would break previews —
+  // caught as a report-only violation by the round-1 audit.
+  `frame-src 'self' blob:${isVercelPreview ? ' https://vercel.live' : ''}`,
   `object-src 'none'`,
   `base-uri 'self'`,
   `form-action 'self'`,
