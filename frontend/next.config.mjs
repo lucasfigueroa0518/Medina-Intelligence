@@ -76,7 +76,9 @@ const securityHeaders = [
   // directive is enforced immediately; the full policy above reports.
   { key: 'Content-Security-Policy', value: `frame-ancestors 'none'` },
   { key: 'Content-Security-Policy-Report-Only', value: contentSecurityPolicy },
-  // Named endpoint for the CSP report-to directive above.
+  // No report-to directive exists above (deliberate — see the
+  // report-uri comment); this header is pre-wiring for the day batched
+  // Reporting-API delivery becomes acceptable.
   { key: 'Reporting-Endpoints', value: 'csp-endpoint="/api/csp-report"' },
 ];
 

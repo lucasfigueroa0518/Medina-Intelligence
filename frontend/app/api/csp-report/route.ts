@@ -17,7 +17,11 @@ export async function POST(request: Request) {
   try {
     const body = await request.text();
     if (body) {
-      console.warn('[csp-report]', body.slice(0, MAX_LOGGED_BYTES));
+      // JSON.stringify escapes newlines/controls: a forged payload can
+      // pollute the telemetry but cannot fabricate separate log LINES
+      // (audit F4). Public CSP sinks are inherently spammable — treat
+      // aggregated counts as signals, individual reports as untrusted.
+      console.warn('[csp-report]', JSON.stringify(body.slice(0, MAX_LOGGED_BYTES)));
     }
   } catch {
     // Malformed/aborted report bodies are dropped silently.
