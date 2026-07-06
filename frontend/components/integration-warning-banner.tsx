@@ -73,7 +73,14 @@ export function IntegrationWarningBanner() {
   if (visible.length === 0) return null;
 
   return (
-    <>
+    // In-flow (sticky, not fixed) so the banner RESERVES layout space and pushes
+    // page content down instead of floating over it. `fixed` pulled the banner
+    // out of flow and let it cover whatever rendered at the top of the scroll
+    // container — on /contacts/[id] that was the Edit/Delete header actions, so
+    // clicks landed on the banner. `sticky top-0` keeps it pinned while
+    // scrolling AND occupies its box, so it can never overlap interactive
+    // elements on any page that mounts the shell.
+    <div className="sticky top-0 z-[95] flex flex-col gap-3 px-4 pt-4 md:px-6">
       {visible.map(w => {
         const isIncident = w.type.startsWith('ingestion_incident:');
         const isOutlookHealth = w.type === 'outlook_app_only_health';
@@ -93,7 +100,7 @@ export function IntegrationWarningBanner() {
 	        return (
 	          <div
 	            key={w.type}
-	            className={`fixed top-4 left-4 right-4 md:left-[340px] md:right-6 z-[95] bg-bg-elevated/95 backdrop-blur-xl border border-border border-l-4 ${w.severity === 'critical' ? 'border-l-semantic-error' : 'border-l-semantic-warning'} rounded-xl shadow-2xl px-4 py-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between`}
+	            className={`bg-bg-elevated/95 backdrop-blur-xl border border-border border-l-4 ${w.severity === 'critical' ? 'border-l-semantic-error' : 'border-l-semantic-warning'} rounded-xl shadow-2xl px-4 py-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between`}
 	          >
 	            <div className="min-w-0 text-sm text-text-primary">
 	              <span>{displayMessage(w)}</span>
@@ -143,6 +150,6 @@ export function IntegrationWarningBanner() {
           </div>
         );
       })}
-    </>
+    </div>
   );
 }
