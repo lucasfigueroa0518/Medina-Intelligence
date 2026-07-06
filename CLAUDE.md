@@ -55,15 +55,20 @@
 ## Backups & disaster recovery
 - DR contract: D1 Time Travel is the first line (≤30-day point-in-time);
   `D1BackupWorkflow` exports all base tables to R2 (`backups/d1/<date>/`)
-  daily at 03:15 UTC with 14-day retention as the second line. Restore via
+  daily (dispatch window 03:15–03:29 UTC; date-keyed instance id makes it
+  at-most-once) with 14-day retention as the second line. Restore via
   `scripts/restore-d1-backup.mjs`. Runbook: `docs/disaster-recovery.md`.
 - The backup path must stay strictly READ-ONLY against D1. Anything that
   mutates data belongs in maintenance, never in backup.
+- Restore tooling never emits data as quoted SQL text: text literals are
+  hex casts (`CAST(X'…' AS TEXT)`, scripts/lib/d1-restore-core.mjs) because
+  wrangler's d1 file trimmer greps SQL — including data — for transaction
+  tokens. Keep it that way for any new replay tooling.
 - New scheduled work does NOT get a new cron trigger (a 4th registered
   trigger broke CF cron dispatch on 2026-04-28). Add a UTC time-of-day gate
   inside the minute-tick branch of `handleScheduled` with a `withTaskRun`
   idempotency key, like `d1_maintenance` (02:25) and `d1_backup_dispatch`
-  (03:15). Heavy work goes in a Workflow, not inline `waitUntil`.
+  (03:15–03:29). Heavy work goes in a Workflow, not inline `waitUntil`.
 
 ## Frontend resilience
 - `app/error.tsx` + `app/global-error.tsx` are load-bearing: pages must never
