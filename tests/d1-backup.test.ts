@@ -54,7 +54,12 @@ class FakeD1 {
 
   private execute(sql: string, binds: unknown[]): Row[] {
     if (/FROM sqlite_master/i.test(sql)) {
-      return this.master as unknown as Row[];
+      // Emulate the real plan query's ORDER BY (type, name) — indexes
+      // sort BEFORE tables. The first production restore drill caught a
+      // schema-ordering escape precisely because fixtures used to hand
+      // the rows over tables-first.
+      return [...this.master]
+        .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type.localeCompare(b.type))) as unknown as Row[];
     }
     const rowidFirstMatch = sql.match(/^SELECT rowid AS __rowid, \* FROM "([^"]+)" ORDER BY rowid LIMIT \?$/);
     const rowidKeysetMatch = sql.match(/^SELECT rowid AS __rowid, \* FROM "([^"]+)" WHERE rowid > \? ORDER BY rowid LIMIT \?$/);
@@ -160,6 +165,44 @@ describe('backup table classification', () => {
       'contact_search_fts_idx',
       'sqlite_sequence',
     ]);
+  });
+
+  it('emits schema.sql in dependency order and it executes on a fresh database (real-backup escape)', () => {
+    // Feed rows in the plan query's actual ORDER BY (type, name) —
+    // every index alphabetically precedes every table. The emitted
+    // schema must still be apply-able from scratch: tables first, then
+    // indexes, then triggers, then views.
+    const ordered = [...MASTER_FIXTURE].sort((a, b) =>
+      a.type === b.type ? a.name.localeCompare(b.name) : a.type.localeCompare(b.type)
+    );
+    expect(ordered[0].type).toBe('index'); // precondition: mirrors the escape
+    const plan = classifySqliteMaster(ordered);
+    const firstTable = plan.schemaSql.indexOf('CREATE TABLE');
+    const firstIndex = plan.schemaSql.indexOf('CREATE INDEX');
+    const firstTrigger = plan.schemaSql.indexOf('CREATE TRIGGER');
+    const firstView = plan.schemaSql.indexOf('CREATE VIEW');
+    expect(firstTable).toBeGreaterThanOrEqual(0);
+    expect(firstIndex).toBeGreaterThan(firstTable);
+    expect(firstTrigger).toBeGreaterThan(firstIndex);
+    expect(firstView).toBeGreaterThan(firstTrigger);
+
+    // Executable proof — this exact apply is what --schema does on a
+    // from-scratch restore. Skip only the FTS virtual table if this
+    // runtime's SQLite lacks the module; ordering errors still throw.
+    const db = new DatabaseSync(':memory:');
+    try {
+      db.exec(plan.schemaSql);
+    } catch (e) {
+      if (!/fts5|no such module/i.test(String(e))) throw e;
+      const withoutVirtual = plan.schemaSql
+        .split('\n')
+        .filter(line => !line.includes('CREATE VIRTUAL TABLE'))
+        .join('\n');
+      db.exec(withoutVirtual);
+    }
+    expect(
+      (db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='contacts'").get() as { c: number }).c
+    ).toBe(1);
   });
 
   it('captures schema for tables, virtual tables, named indexes, triggers, views — not auto-indexes or internals', () => {
