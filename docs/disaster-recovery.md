@@ -127,6 +127,13 @@ cleanup steps). Same JSONL shape, single-table, kept as-is.
    statement splitting); the restore audits exercised the local path
    exhaustively but deliberately never wrote to remote resources.
 
+## R2 ops report
+
+`node scripts/r2-ops-report.mjs` — read-only report of lifecycle rules,
+backup storage economics, and maintenance-snapshot accumulation (via the
+`maintenance_runs` table; the CLI has no object listing). Run it before
+deciding on the proposals below.
+
 ## Proposed (not implemented): R2 lifecycle & orphan hygiene
 
 Flagged for a future pass, owner decision needed:
