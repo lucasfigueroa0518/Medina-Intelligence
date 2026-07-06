@@ -64,6 +64,10 @@
   hex casts (`CAST(X'…' AS TEXT)`, scripts/lib/d1-restore-core.mjs) because
   wrangler's d1 file trimmer greps SQL — including data — for transaction
   tokens. Keep it that way for any new replay tooling.
+- schema.sql is emitted in DEPENDENCY order (tables → indexes → triggers
+  → views), never sqlite_master row order — `ORDER BY type, name` puts
+  indexes first and breaks from-scratch restores (found by the first
+  live restore drill). Any schema-dump tooling must bucket by type.
 - New scheduled work does NOT get a new cron trigger (a 4th registered
   trigger broke CF cron dispatch on 2026-04-28). Add a UTC time-of-day gate
   inside the minute-tick branch of `handleScheduled` with a `withTaskRun`
@@ -94,6 +98,30 @@
 - Spreadsheet parsing uses `@e965/xlsx` (maintained SheetJS build) in BOTH
   roots — the upstream `xlsx` package is frozen with unfixed advisories;
   do not reintroduce it.
+
+## Supply chain & toolchain
+- GitHub Actions are pinned to full commit SHAs (tag in the trailing
+  comment). Updating a pin = resolving the new tag's SHA deliberately —
+  never float on a moving major tag. New workflows follow suit.
+- `secrets-scan.yml` runs gitleaks over FULL history on every PR; a leak
+  fails CI until rotated or explicitly allowlisted with a documented
+  reason in `.gitleaks.toml`.
+- Node version source of truth is `.nvmrc` (workflows use
+  `node-version-file`; both package.jsons declare `engines`). Bump Node
+  in ONE place.
+- Dependabot vulnerability alerts + automated security fixes are ON
+  (repo settings) — the automation behind the dependency posture above.
+
+## Frontend observability
+- Report-only CSP violations POST to `/api/csp-report`; error boundaries
+  beacon client crashes to `/api/client-error`. Both land in Vercel
+  function logs — check them before flipping the CSP to enforcing.
+- The CSP uses `report-uri` ONLY (no `report-to` directive): Chrome
+  prefers report-to when both exist, and Reporting-API delivery is
+  batched — short sessions never flush. Don't "modernize" this without
+  re-proving delivery.
+- Lint is a RATCHET: `eslint . --max-warnings=<N>` — new warnings can't
+  land; burning down existing ones lowers N in the same PR.
 
 ## Wrangler configs
 - The four wrangler configs are governed by
