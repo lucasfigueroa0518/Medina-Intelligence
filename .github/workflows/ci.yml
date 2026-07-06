@@ -1,0 +1,55 @@
+name: CI
+
+# Quality gates only — no deploys. Worker deploys stay manual
+# (`npm run deploy` / `deploy:pipelines`); Vercel deploys off origin/main.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: backend typecheck + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+
+  frontend:
+    name: frontend typecheck + lint + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      # Production build as a compile-level regression gate. No secrets:
+      # NEXT_PUBLIC_* values are compile-time inlined and the app must
+      # tolerate their absence (it falls back to same-origin/localhost).
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
