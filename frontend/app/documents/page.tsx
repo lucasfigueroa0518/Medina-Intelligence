@@ -10,6 +10,7 @@ import { FilterPanel } from '@/components/filter-panel';
 import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { api } from '@/lib/api';
+import { useDocumentList, invalidateDocumentsList } from '@/lib/use-document-list';
 import { DocumentActions } from '@/components/document-actions';
 import {
   Search,
@@ -244,11 +245,6 @@ export function DocumentsPageContent({ embedded = false }: { embedded?: boolean 
   const [searchInput, setSearchInput] = React.useState(filters.search);
   const searchDebounceRef = React.useRef<ReturnType<typeof setTimeout>>();
 
-  const [documents, setDocuments] = React.useState<Document[]>([]);
-  const [total, setTotal] = React.useState(0);
-  const [loading, setLoading] = React.useState(true);
-  const [loadingMore, setLoadingMore] = React.useState(false);
-
   // Upload modal — opened via TopBar button or page-level drag-drop.
   // initialFiles seeds the queue from a drop hand-off.
   const [uploadOpen, setUploadOpen] = React.useState(false);
@@ -288,36 +284,30 @@ export function DocumentsPageContent({ embedded = false }: { embedded?: boolean 
     api.getDocumentFilterCounts().then(setFilterCounts).catch(() => {});
   }, []);
 
-  const buildParams = React.useCallback((offset: number): Record<string, string> => {
-    return {
-      ...filtersToParams(filters),
-      limit: String(PAGE_SIZE),
-      offset: String(offset),
-    };
-  }, [filters]);
+  const documentQueryParams = React.useMemo(() => filtersToParams(filters), [filters]);
+  const documentListState = useDocumentList(documentQueryParams, { pageSize: PAGE_SIZE });
+  const {
+    documents: cachedDocuments,
+    total: cachedTotal,
+    loading: cachedLoading,
+    loadingMore: cachedLoadingMore,
+    prefetching,
+    error: documentListError,
+    refresh: refreshDocuments,
+    loadMore,
+  } = documentListState;
 
+  const documents = cachedDocuments as Document[];
+  const total = cachedTotal;
+  const loading = cachedLoading;
+  const loadingMore = cachedLoadingMore || prefetching;
+  // Uploads/deletes can land in any filter view; drop the whole cache then
+  // refetch the current key so the new state is visible immediately.
   const loadDocuments = React.useCallback(() => {
-    setLoading(true);
-    return api.listDocuments(buildParams(0))
-      .then(data => {
-        setDocuments(data.documents as Document[]);
-        setTotal(data.total ?? data.documents.length);
-      })
-      .finally(() => setLoading(false));
-  }, [buildParams]);
-
-  const loadMore = React.useCallback(() => {
-    if (loadingMore || documents.length >= total) return;
-    setLoadingMore(true);
-    api.listDocuments(buildParams(documents.length))
-      .then(data => {
-        setDocuments(prev => [...prev, ...(data.documents as Document[])]);
-        if (typeof data.total === 'number') setTotal(data.total);
-      })
-      .finally(() => setLoadingMore(false));
-  }, [buildParams, documents.length, total, loadingMore]);
-
-  React.useEffect(() => { loadDocuments(); }, [loadDocuments]);
+    invalidateDocumentsList();
+    refreshDocuments();
+    return Promise.resolve();
+  }, [refreshDocuments]);
 
   // -- chips --------------------------------------------------------------
   type Chip = { label: string; onRemove: () => void };
@@ -668,17 +658,36 @@ export function DocumentsPageContent({ embedded = false }: { embedded?: boolean 
             {loading ? 'Loading...' : `Showing ${documents.length} of ${total} ${isFiltered ? 'matching ' : ''}documents`}
           </div>
 
-          <DataTable
-            columns={columns}
-            data={documents}
-            loading={loading}
-            emptyMessage="No documents match your filters"
-            getRowId={d => d.id}
-            onRowClick={d => setPreviewDocId(d.id)}
-            sortKey={filters.sort}
-            sortDir={filters.order}
-            onSort={handleSort}
-          />
+          {documentListError && documents.length === 0 ? (
+            <div className="border border-semantic-error/30 bg-semantic-error/10 rounded-lg p-4">
+              <div className="text-sm font-medium text-text-primary">Documents could not load.</div>
+              <div className="text-sm text-text-secondary mt-1">{documentListError}</div>
+              <button className="btn-secondary text-sm mt-3" onClick={loadDocuments}>
+                Retry
+              </button>
+            </div>
+          ) : (
+            <DataTable
+              columns={columns}
+              data={documents}
+              loading={loading}
+              emptyMessage={documentListError ? 'Documents could not refresh. Retry from the error above.' : 'No documents match your filters'}
+              getRowId={d => d.id}
+              onRowClick={d => setPreviewDocId(d.id)}
+              sortKey={filters.sort}
+              sortDir={filters.order}
+              onSort={handleSort}
+            />
+          )}
+
+          {documentListError && documents.length > 0 && (
+            <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-semantic-error/30 bg-semantic-error/10 px-3 py-2">
+              <div className="text-sm text-text-secondary truncate">{documentListError}</div>
+              <button className="btn-secondary text-xs shrink-0" onClick={loadDocuments}>
+                Retry
+              </button>
+            </div>
+          )}
 
           {!loading && documents.length < total && (
             <div className="flex justify-center mt-4">

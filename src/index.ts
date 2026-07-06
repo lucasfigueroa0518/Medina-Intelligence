@@ -476,7 +476,7 @@ async function routeAuthenticated(
     return Conversations.listConversations(request, ctx, env);
   }
   m = path.match(/^\/api\/conversations\/([^/]+)\/thread$/);
-  if (m && method === 'GET') return Conversations.getConversationThread(m[1], ctx, env);
+  if (m && method === 'GET') return Conversations.getConversationThread(m[1], ctx, env, request);
   m = path.match(/^\/api\/conversations\/([^/]+)$/);
   if (m && method === 'GET') return Conversations.getConversation(m[1], ctx, env);
 
@@ -844,6 +844,8 @@ async function routeAuthenticated(
       return Admin.rebuildEntityIndexEndpoint(ctx, env);
     if (path === '/api/admin/rebuild-contact-search-index' && method === 'POST')
       return Contacts.rebuildContactSearchIndexEndpoint(ctx, env);
+    if (path === '/api/admin/rebuild-company-search-index' && method === 'POST')
+      return Companies.rebuildCompanySearchIndexEndpoint(ctx, env);
     if (path === '/api/admin/rebuild-contact-detail-read-model' && method === 'POST')
       return Contacts.rebuildContactDetailReadModelEndpoint(request, ctx, env);
     if (path === '/api/admin/rebuild-contact-list-read-model' && method === 'POST')

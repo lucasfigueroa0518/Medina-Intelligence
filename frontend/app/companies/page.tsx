@@ -10,6 +10,7 @@ import { SortDropdown, SortOption } from '@/components/sort-dropdown';
 import { QuickFilters, QuickFilter } from '@/components/quick-filters';
 import { TentativeNameBadge } from '@/components/tentative-name-badge';
 import { api } from '@/lib/api';
+import { useCompanyList, invalidateCompaniesList } from '@/lib/use-company-list';
 import { initialFromName, faviconUrl } from '@/lib/avatar';
 import { DEMO_COMPANY_TOTAL, demoCompanies, demoTags, demoToastMessage, useDemoMode } from '@/lib/demo-mode';
 import { Plus, Search, X as XIcon, Settings2 } from 'lucide-react';
@@ -170,10 +171,6 @@ function CompaniesPage() {
   const [searchInput, setSearchInput] = React.useState(filters.search);
   const searchDebounceRef = React.useRef<ReturnType<typeof setTimeout>>();
 
-  const [companies, setCompanies] = React.useState<any[]>([]);
-  const [total, setTotal] = React.useState(0);
-  const [loading, setLoading] = React.useState(true);
-  const [loadingMore, setLoadingMore] = React.useState(false);
   const [createOpen, setCreateOpen] = React.useState(false);
   const [createForm, setCreateForm] = React.useState({ name: '', domain: '', website: '', sector: '', company_type: '', location: '' });
   const [creating, setCreating] = React.useState(false);
@@ -224,45 +221,35 @@ function CompaniesPage() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const buildParams = React.useCallback((offset: number): Record<string, string> => ({
-    ...toParams(filters),
-    limit: String(PAGE_SIZE),
-    offset: String(offset),
-  }), [filters]);
+  const companyQueryParams = React.useMemo(() => toParams(filters), [filters]);
+  const companyListState = useCompanyList(companyQueryParams, { enabled: !demoMode, pageSize: PAGE_SIZE });
+  const {
+    companies: cachedCompanies,
+    total: cachedTotal,
+    loading: cachedLoading,
+    loadingMore: cachedLoadingMore,
+    prefetching,
+    error: companyListError,
+    refresh: refreshCompanies,
+    loadMore,
+  } = companyListState;
 
+  const demoCompanyResult = React.useMemo(() => {
+    const q = filters.search.trim().toLowerCase();
+    const rows = q
+      ? demoCompanies.filter(c => [c.name, c.domain, c.sector, c.location_mentioned].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
+      : demoCompanies;
+    return { companies: rows, total: q ? rows.length : DEMO_COMPANY_TOTAL };
+  }, [filters.search]);
+
+  const companies = demoMode ? demoCompanyResult.companies : cachedCompanies;
+  const total = demoMode ? demoCompanyResult.total : cachedTotal;
+  const loading = demoMode ? false : cachedLoading;
+  const loadingMore = demoMode ? false : (cachedLoadingMore || prefetching);
   const loadCompanies = React.useCallback(() => {
-    if (demoMode) {
-      setLoading(false);
-      const q = filters.search.trim().toLowerCase();
-      const rows = q
-        ? demoCompanies.filter(c => [c.name, c.domain, c.sector, c.location_mentioned].filter(Boolean).some(v => String(v).toLowerCase().includes(q)))
-        : demoCompanies;
-      setCompanies(rows);
-      setTotal(q ? rows.length : DEMO_COMPANY_TOTAL);
-      return Promise.resolve();
-    }
-    setLoading(true);
-    return api.listCompanies(buildParams(0))
-      .then(d => {
-        setCompanies(d.companies);
-        setTotal(d.total ?? d.companies.length);
-      })
-      .finally(() => setLoading(false));
-  }, [buildParams, demoMode, filters.search]);
-
-  const loadMore = React.useCallback(() => {
-    if (demoMode) return;
-    if (loadingMore || companies.length >= total) return;
-    setLoadingMore(true);
-    api.listCompanies(buildParams(companies.length))
-      .then(d => {
-        setCompanies(prev => [...prev, ...d.companies]);
-        if (typeof d.total === 'number') setTotal(d.total);
-      })
-      .finally(() => setLoadingMore(false));
-  }, [buildParams, companies.length, total, loadingMore, demoMode]);
-
-  React.useEffect(() => { loadCompanies(); }, [loadCompanies]);
+    refreshCompanies();
+    return Promise.resolve();
+  }, [refreshCompanies]);
 
   async function handleCreateCompany() {
     if (!createForm.name.trim()) return;
@@ -284,6 +271,7 @@ function CompaniesPage() {
       setCreateOpen(false);
       setCreateForm({ name: '', domain: '', website: '', sector: '', company_type: '', location: '' });
       setToast('Company created');
+      invalidateCompaniesList();
       loadCompanies();
     } catch (e: any) { setToast(`Failed: ${e.message || 'Unknown error'}`); }
     finally { setCreating(false); }
@@ -572,17 +560,36 @@ function CompaniesPage() {
             {loading ? 'Loading...' : `Showing ${companies.length} of ${total} ${isFiltered ? 'matching ' : ''}companies`}
           </div>
 
-          <DataTable
-            columns={columns}
-            data={companies}
-            loading={loading}
-            emptyMessage="No companies match your filters"
-            getRowId={c => c.id}
-            onRowClick={c => router.push(`/companies/${c.id}`)}
-            sortKey={filters.sort}
-            sortDir={filters.order}
-            onSort={handleSort}
-          />
+          {!demoMode && companyListError && companies.length === 0 ? (
+            <div className="border border-semantic-error/30 bg-semantic-error/10 rounded-lg p-4">
+              <div className="text-sm font-medium text-text-primary">Companies could not load.</div>
+              <div className="text-sm text-text-secondary mt-1">{companyListError}</div>
+              <button className="btn-secondary text-sm mt-3" onClick={loadCompanies}>
+                Retry
+              </button>
+            </div>
+          ) : (
+            <DataTable
+              columns={columns}
+              data={companies}
+              loading={loading}
+              emptyMessage={companyListError ? 'Companies could not refresh. Retry from the error above.' : 'No companies match your filters'}
+              getRowId={c => c.id}
+              onRowClick={c => router.push(`/companies/${c.id}`)}
+              sortKey={filters.sort}
+              sortDir={filters.order}
+              onSort={handleSort}
+            />
+          )}
+
+          {!demoMode && companyListError && companies.length > 0 && (
+            <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-semantic-error/30 bg-semantic-error/10 px-3 py-2">
+              <div className="text-sm text-text-secondary truncate">{companyListError}</div>
+              <button className="btn-secondary text-xs shrink-0" onClick={loadCompanies}>
+                Retry
+              </button>
+            </div>
+          )}
 
           {!demoMode && !loading && companies.length < total && (
             <div className="flex justify-center mt-4">

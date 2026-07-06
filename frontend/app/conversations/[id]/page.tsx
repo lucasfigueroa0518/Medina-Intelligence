@@ -3,9 +3,11 @@
 import React from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, Loader2, Mail, MessageSquareText, Paperclip } from 'lucide-react';
+import { ArrowLeft, ChevronUp, Loader2, Mail, MessageSquareText, Paperclip } from 'lucide-react';
 import { TopBar } from '@/components/top-bar';
 import { api, type ConversationThreadResponse } from '@/lib/api';
+
+type ThreadMessage = ConversationThreadResponse['thread']['messages'][number];
 
 function fmtDate(value: string | null | undefined): string {
   if (!value) return 'Unknown date';
@@ -20,7 +22,7 @@ function fmtDate(value: string | null | undefined): string {
   });
 }
 
-function senderLabel(message: ConversationThreadResponse['thread']['messages'][number]): string {
+function senderLabel(message: ThreadMessage): string {
   return message.from_name || message.from_email || 'Unknown sender';
 }
 
@@ -29,17 +31,32 @@ export default function ConversationThreadPage() {
   const router = useRouter();
   const id = params?.id;
   const [data, setData] = React.useState<ConversationThreadResponse | null>(null);
+  // Messages are accumulated separately so "load older" can prepend an older
+  // page onto the newest window without refetching what's already displayed.
+  const [messages, setMessages] = React.useState<ThreadMessage[]>([]);
+  const [olderCursor, setOlderCursor] = React.useState<string | null>(null);
+  const [hasMoreOlder, setHasMoreOlder] = React.useState(false);
   const [loading, setLoading] = React.useState(true);
+  const [loadingOlder, setLoadingOlder] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [olderError, setOlderError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     let cancelled = false;
     if (!id) return;
     setLoading(true);
     setError(null);
+    setOlderError(null);
+    setMessages([]);
+    setOlderCursor(null);
+    setHasMoreOlder(false);
     api.getConversationThread(id)
       .then(res => {
-        if (!cancelled) setData(res);
+        if (cancelled) return;
+        setData(res);
+        setMessages(res.thread.messages);
+        setOlderCursor(res.thread.older_cursor ?? null);
+        setHasMoreOlder(!!res.thread.has_more_older);
       })
       .catch((e: any) => {
         if (!cancelled) {
@@ -52,6 +69,30 @@ export default function ConversationThreadPage() {
       });
     return () => { cancelled = true; };
   }, [id]);
+
+  const loadOlder = React.useCallback(() => {
+    if (!id || !olderCursor || loadingOlder) return;
+    setLoadingOlder(true);
+    setOlderError(null);
+    api.getConversationThread(id, { before: olderCursor })
+      .then(res => {
+        // Prepend the older page ahead of the messages already shown, dropping
+        // any overlap by id so a repeated cursor can never duplicate a message.
+        setMessages(prev => {
+          const seen = new Set(prev.map(m => m.id));
+          const older = res.thread.messages.filter(m => !seen.has(m.id));
+          return [...older, ...prev];
+        });
+        setOlderCursor(res.thread.older_cursor ?? null);
+        setHasMoreOlder(!!res.thread.has_more_older);
+      })
+      .catch((e: any) => {
+        setOlderError(e?.message || 'Could not load older messages');
+      })
+      .finally(() => {
+        setLoadingOlder(false);
+      });
+  }, [id, olderCursor, loadingOlder]);
 
   const thread = data?.thread;
 
@@ -106,7 +147,30 @@ export default function ConversationThreadPage() {
             </section>
 
             <section className="space-y-3">
-              {thread.messages.map(message => {
+              {hasMoreOlder && (
+                <div className="flex flex-col items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={loadOlder}
+                    disabled={loadingOlder}
+                    className="inline-flex items-center gap-2 rounded-lg border border-border bg-bg-elevated/55 px-4 py-2 text-sm text-text-secondary transition hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {loadingOlder ? (
+                      <>
+                        <Loader2 className="animate-spin" size={15} /> Loading older messages...
+                      </>
+                    ) : (
+                      <>
+                        <ChevronUp size={15} /> Load older messages
+                      </>
+                    )}
+                  </button>
+                  {olderError && (
+                    <p className="text-xs text-semantic-error">{olderError}</p>
+                  )}
+                </div>
+              )}
+              {messages.map(message => {
                 const body = message.body || message.body_preview || 'No readable body is available for this message.';
                 return (
                   <article

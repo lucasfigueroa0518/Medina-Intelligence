@@ -1642,6 +1642,12 @@ export default function GodModePage() {
   // Fix 4: Explicit isThinking state — only cleared on first text token
   const [isThinking, setIsThinking] = React.useState(false);
 
+  // 3.4: Loading state for the message pane while an existing session's
+  // messages are being hydrated from the server. Only used when there is no
+  // local draft to show (a live streaming draft renders immediately and must
+  // never be covered by this indicator).
+  const [messagesLoading, setMessagesLoading] = React.useState(false);
+
   // MARTy Wave 1 cancellation. The server emits a request_id as the first
   // stream event; we POST it to /api/agent/cancel on stop / Esc / Cmd+Backspace.
   // Stored in a ref because we don't need React renders when it changes.
@@ -2174,8 +2180,24 @@ export default function GodModePage() {
     const nextMessages = preserveHydratedLocalUiState(hydrateAgentMessages(rows), localMessages);
     const runningMessage = getRunningAssistantMessage(nextMessages);
     const existingRun = targetSessionId ? runningStreamsRef.current[targetSessionId] : null;
-    if (targetSessionId && !runningMessage?.pendingRequestId && existingRun?.abortController) {
-      return getRunningAssistantMessage(sessionDraftsRef.current[targetSessionId] || messagesSnapshotRef.current) || runningMessage;
+    // 3.7(3): Protect a live local draft from being clobbered by a re-fetch.
+    // The original guard only covered runs with a live abortController, but
+    // durable/reconnected runs carry abortController:null — so switching away
+    // and back to a durable-run session replaced its rich streaming draft with
+    // the server's stale snapshot (the disappear/reappear flicker). Broaden the
+    // guard to any registered run whose local draft still holds a running
+    // (streaming + pending) assistant message, not just abortController-backed
+    // ones. This only defers the apply while the run is registered; the 2.5s
+    // recovery poll clears the run and reconciles the finalized turn once the
+    // server has it.
+    const localRunningMessage = targetSessionId
+      ? getRunningAssistantMessage(sessionDraftsRef.current[targetSessionId] || messagesSnapshotRef.current)
+      : undefined;
+    const hasLiveLocalRun = Boolean(
+      existingRun && (existingRun.abortController || localRunningMessage?.pendingRequestId)
+    );
+    if (targetSessionId && !runningMessage?.pendingRequestId && hasLiveLocalRun) {
+      return localRunningMessage || runningMessage;
     }
     if (sessionIdForPending) {
       sessionDraftsRef.current = { ...sessionDraftsRef.current, [sessionIdForPending]: nextMessages };
@@ -2301,6 +2323,10 @@ export default function GodModePage() {
   streamingRef.current = streaming;
 
   React.useEffect(() => {
+    // 3.4: Reset the pane loading flag on every session change; only the
+    // fetch branch below turns it back on, so paths that don't fetch (new
+    // session, draft present, streaming/provisional) never leave it stuck on.
+    setMessagesLoading(false);
     if (demoMode) {
       if (activeSessionId) {
         const demoSession = demoMartySessions.find(s => s.id === activeSessionId);
@@ -2326,6 +2352,10 @@ export default function GodModePage() {
         setMessages(draft);
       }
       if (!isProvisional && !isRunningLocally) {
+        // 3.4: Show the pane loading indicator only when there is nothing to
+        // display yet (no local draft). A draft — including a live streaming
+        // one — renders immediately, so it must not be masked by the spinner.
+        if (!draft || draft.length === 0) setMessagesLoading(true);
         api.getSessionMessages(activeSessionId).then(d => {
           applyServerMessages(d.messages, activeSessionId);
           if (d.session) upsertSessionInSidebar(d.session);
@@ -2347,6 +2377,10 @@ export default function GodModePage() {
           }]);
           api.listSessions().then(d => mergeSessionsFromServer(d.sessions)).catch(() => {});
         }
+        }).finally(() => {
+          // 3.4: Only clear if this is still the session being viewed — a rapid
+          // switch away must not let a stale fetch drop the new session's spinner.
+          if (activeSessionIdRef.current === activeSessionId) setMessagesLoading(false);
         });
       }
       api.listSessionUploads(activeSessionId).then(d => {
@@ -3354,7 +3388,28 @@ export default function GodModePage() {
           className="flex-1 overflow-y-auto px-4 md:px-8 py-4 md:py-6"
           style={{ paddingBottom: 140 }}
         >
-          {isEmptyState ? (
+          {messagesLoading && isEmptyState ? (
+            /* 3.4: Existing session's messages are being hydrated. Show a
+               message-shaped skeleton (matching the sidebar's animate-pulse
+               affordance) instead of a blank pane or the new-chat splash. */
+            <div className="max-w-4xl mx-auto space-y-5" aria-busy="true" aria-label="Loading conversation">
+              <div className="flex justify-end">
+                <div className="animate-pulse h-9 w-2/5 bg-bg-surface rounded-2xl rounded-br-sm" />
+              </div>
+              <div className="max-w-[85%] space-y-2">
+                <div className="animate-pulse h-4 bg-bg-surface rounded w-11/12" />
+                <div className="animate-pulse h-4 bg-bg-surface rounded w-4/5" />
+                <div className="animate-pulse h-4 bg-bg-surface rounded w-3/5" />
+              </div>
+              <div className="flex justify-end">
+                <div className="animate-pulse h-9 w-1/3 bg-bg-surface rounded-2xl rounded-br-sm" />
+              </div>
+              <div className="max-w-[85%] space-y-2">
+                <div className="animate-pulse h-4 bg-bg-surface rounded w-10/12" />
+                <div className="animate-pulse h-4 bg-bg-surface rounded w-2/3" />
+              </div>
+            </div>
+          ) : isEmptyState ? (
             <div className="h-full flex flex-col items-center justify-center">
               {/* Fix 3: MARTy's own emblem */}
               <div className="relative logo-entrance mb-6">
