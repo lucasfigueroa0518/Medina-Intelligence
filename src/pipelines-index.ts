@@ -34,6 +34,7 @@ export { IngestionFinalizerWorkflow } from './workflows/ingestion-finalizer';
 export { EnrichmentWorkflow } from './workflows/enrichment';
 export { CampaignSendWorkflow } from './workflows/campaign-send';
 export { DailyCronWorkflow } from './workflows/daily-cron';
+export { D1BackupWorkflow } from './workflows/d1-backup';
 
 // Scheduled + queue handlers shared with api — Phase 8 added `export`
 // to both so this entry point can dispatch the same code paths. The

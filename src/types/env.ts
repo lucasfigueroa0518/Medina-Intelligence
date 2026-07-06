@@ -33,6 +33,10 @@ export interface Env {
   ENRICHMENT_WORKFLOW: Workflow;
   CAMPAIGN_WORKFLOW: Workflow;
   DAILY_CRON_WORKFLOW: Workflow;
+  // Optional: declared only on the pipelines Worker
+  // (wrangler.pipelines.toml). The dispatch gate in handleScheduled
+  // guards for absence so the shared bundle stays safe on api.
+  D1_BACKUP_WORKFLOW?: Workflow;
 
   // --- Vars (from wrangler.toml [vars]) ---
   ENVIRONMENT: string;
