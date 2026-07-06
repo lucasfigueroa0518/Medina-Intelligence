@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { MedinaLogo } from '@/components/medina-logo';
+import { AppShellSkeleton } from '@/components/app-shell-skeleton';
 import type { UserProfile } from '@/lib/api';
 
 const TOKEN_KEY = 'auth_token';
@@ -138,7 +139,15 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     };
   }, [checkAuth, state, user, warnings]);
 
-  if (state === 'loading') return <AuthLoadingScreen />;
+  // While the auth check resolves, paint an instant app-shell skeleton for
+  // protected paths instead of a blank/logo-only screen (worse on a Worker cold
+  // start). Public paths short-circuit checkAuth to 'authenticated' in the same
+  // tick, so they keep the minimal logo screen and never flash the shell.
+  // SECURITY: the skeleton renders placeholders only — no children, no
+  // protected data — so the gate still fully controls when real content mounts.
+  if (state === 'loading') {
+    return isPublicPath ? <AuthLoadingScreen /> : <AppShellSkeleton />;
+  }
 
   if (state === 'unauthenticated') {
     if (!isPublicPath) return null;
