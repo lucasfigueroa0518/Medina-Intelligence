@@ -175,13 +175,17 @@ export function DealEvidencePanel({ dealId }: { dealId: string }) {
     }
   };
 
+  // Hooks must precede any early return — this useState previously sat
+  // below the loading/error returns, so the loading->loaded transition
+  // changed the hook count and crashed with "rendered more hooks".
+  const [showAdd, setShowAdd] = React.useState(false);
+
   if (loading) {
     return <div className="text-xs text-text-muted py-6 text-center">Loading evidence...</div>;
   }
   if (error) {
     return <div className="text-xs text-text-muted py-6 text-center italic">{error}</div>;
   }
-  const [showAdd, setShowAdd] = React.useState(false);
 
   const empty = !data || data.evidence.length === 0;
 

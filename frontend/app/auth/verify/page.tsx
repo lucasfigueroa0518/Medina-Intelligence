@@ -12,16 +12,12 @@ export default function VerifyPage() {
   const params = useSearchParams();
   const router = useRouter();
   const token = params.get('token');
-  const [state, setState] = useState<VerifyState>('loading');
-  const [message, setMessage] = useState('');
+  const [state, setState] = useState<VerifyState>(token ? 'loading' : 'error');
+  const [message, setMessage] = useState(token ? '' : 'No verification token provided.');
   const [errorCode, setErrorCode] = useState('');
 
   useEffect(() => {
-    if (!token) {
-      setState('error');
-      setMessage('No verification token provided.');
-      return;
-    }
+    if (!token) return; // tokenless state is set at initialization
 
     (async () => {
       try {

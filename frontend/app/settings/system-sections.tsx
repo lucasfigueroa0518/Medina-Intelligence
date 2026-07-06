@@ -44,9 +44,15 @@ const MARTY_SANDBOX_EXECUTION_DISABLED = true;
 export function SystemStatusSection() {
   const [data, setData] = React.useState<SystemStatusResponse | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  // Data-arrival timestamp: lets children evaluate time-window logic
+  // (circuit open-until) as-of the snapshot instead of calling
+  // Date.now() during render (impure + stale-memo hazard).
+  const [fetchedAt, setFetchedAt] = React.useState(0);
 
   const load = React.useCallback(() => {
-    api.getSettingsSystemStatus().then(setData).catch(e => setError(e?.message || 'Failed to load'));
+    api.getSettingsSystemStatus()
+      .then(d => { setData(d); setFetchedAt(Date.now()); })
+      .catch(e => setError(e?.message || 'Failed to load'));
   }, []);
 
   React.useEffect(() => {
@@ -71,7 +77,7 @@ export function SystemStatusSection() {
 
 	  return (
 	    <div className="space-y-6">
-	      <RateLimitIndicator budgets={data.budgets || []} />
+	      <RateLimitIndicator budgets={data.budgets || []} asOf={fetchedAt} />
 	      <OutlookAppOnlyHealthCard health={data.outlook_app_only_health} />
 	      <IngestionIncidentsCard incidents={data.ingestion_incidents || []} />
 	      <ActiveTasksCard tasks={data.active_tasks} />
@@ -4099,16 +4105,16 @@ function OutlookAppOnlyHealthCard({ health }: { health: SystemStatusResponse['ou
 
 // ── Section 1: Active Tasks ──────────────────────────────────────────────
 
-function RateLimitIndicator({ budgets }: { budgets: BudgetSnapshotRow[] }) {
+function RateLimitIndicator({ budgets, asOf }: { budgets: BudgetSnapshotRow[]; asOf: number }) {
   const limited = React.useMemo(() => {
-    const now = Date.now();
+    const now = asOf;
     return budgets.filter(b => {
       const openUntil = b.circuit_open_until ? new Date(b.circuit_open_until).getTime() : 0;
       const circuitActuallyOpen = b.circuit_open === true && openUntil > now;
       const hardCapHit = b.cap > 0 && b.used >= b.cap && b.consecutive_429s > 0;
       return circuitActuallyOpen || hardCapHit;
     });
-  }, [budgets]);
+  }, [budgets, asOf]);
 
   if (limited.length === 0) return null;
   const primary = limited[0];

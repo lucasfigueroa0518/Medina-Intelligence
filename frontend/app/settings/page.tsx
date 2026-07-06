@@ -691,14 +691,15 @@ function EmailHistoricalBackfillSection({
     }
   }, [sessionUser]);
 
+  const meId = me?.id;
   const fetchProgress = React.useCallback(async () => {
     if (!selectedUserId) return;
     try {
-      const isSelf = selectedUserId === me?.id;
+      const isSelf = selectedUserId === meId;
       const r = await api.getProgressiveBackfillProgress(isSelf ? undefined : selectedUserId);
       setProgress({ parent: r.parent, windows: r.windows, summary: r.summary });
     } catch { /* ignore */ }
-  }, [selectedUserId, me?.id]);
+  }, [selectedUserId, meId]);
 
   React.useEffect(() => { fetchProgress(); }, [fetchProgress]);
 
