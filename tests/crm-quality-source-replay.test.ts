@@ -1,9 +1,14 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { buildCrmQualitySourceReplaySummary } from '../scripts/crm-quality-source-replay';
+
+// Same contract dependency as crm-quality-canary.test.ts: the reviewed canary
+// artifacts live in gitignored outputs/ and are never committed. Skip (not
+// fail) on checkouts without them — CI and fresh clones.
+const CONTRACT_DIR = join(process.cwd(), 'outputs', 'crm-stage1-investigation-20260619');
 
 const tempDirs: string[] = [];
 
@@ -17,10 +22,10 @@ afterEach(() => {
   while (tempDirs.length) rmSync(tempDirs.pop()!, { recursive: true, force: true });
 });
 
-describe('CRM quality source-shaped replay', () => {
+describe.skipIf(!existsSync(CONTRACT_DIR))('CRM quality source-shaped replay', () => {
   it('replays reviewed canary rows through source-shaped paths without unsafe writes', async () => {
     const summary = await buildCrmQualitySourceReplaySummary({
-      contractDir: join(process.cwd(), 'outputs', 'crm-stage1-investigation-20260619'),
+      contractDir: CONTRACT_DIR,
       outputDir: tempOutputDir(),
       allowFailures: false,
     });

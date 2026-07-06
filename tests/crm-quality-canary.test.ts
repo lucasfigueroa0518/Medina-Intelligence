@@ -1,10 +1,16 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { CRM_QUALITY_RULES } from '../src/lib/crm-quality-gate';
 import { buildCrmQualityCanarySummary } from '../scripts/crm-quality-canary';
+
+// The reviewed canary contract lives in gitignored outputs/ (real reviewed CRM
+// rows — intentionally never committed). On checkouts without the artifacts
+// (CI, fresh clones) this replay suite skips instead of failing; it runs in
+// full wherever the contract directory exists.
+const CONTRACT_DIR = join(process.cwd(), 'outputs', 'crm-stage1-investigation-20260619');
 
 const tempDirs: string[] = [];
 
@@ -20,10 +26,10 @@ afterEach(() => {
   }
 });
 
-describe('CRM quality canary harness', () => {
+describe.skipIf(!existsSync(CONTRACT_DIR))('CRM quality canary harness', () => {
   it('evaluates the reviewed 200-entity canary without writing rows', () => {
     const summary = buildCrmQualityCanarySummary({
-      contractDir: join(process.cwd(), 'outputs', 'crm-stage1-investigation-20260619'),
+      contractDir: CONTRACT_DIR,
       outputDir: tempOutputDir(),
       minPassRate: 1,
       allowFailures: false,
