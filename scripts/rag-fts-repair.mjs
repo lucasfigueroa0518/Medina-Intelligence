@@ -49,7 +49,7 @@ if (APPLY && losers.length) {
 
 // Status reconcile, server-side in rowid ranges (each range = one small
 // FTS slice; the UPDATE's IN(SELECT ...) touches only that slice).
-const maxRowid = pairs.length ? Math.max(...pairs.map(p => p.r)) : 0;
+const maxRowid = pairs.reduce((m, p) => (p.r > m ? p.r : m), 0); // no spread: 156k args overflows the call stack
 let reconciled = 0;
 if (APPLY) {
   for (let lo = 0; lo <= maxRowid; lo += 5000) {
