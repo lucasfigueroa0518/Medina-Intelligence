@@ -53,6 +53,15 @@ const contentSecurityPolicy = [
   `base-uri 'self'`,
   `form-action 'self'`,
   `frame-ancestors 'none'`,
+  // Violations POST to our own sink (app/api/csp-report) and land in
+  // Vercel function logs — the telemetry that decides when this policy
+  // flips to enforcing. Deliberately report-uri ONLY: when report-to is
+  // also present Chrome prefers it, and Reporting-API delivery is
+  // batched/delayed — short sessions never flush (proven in the drill:
+  // zero reports with both directives, immediate with report-uri
+  // alone). The Reporting-Endpoints header below stays as the
+  // documented future switch once batched delivery is acceptable.
+  `report-uri /api/csp-report`,
 ].join('; ');
 
 const securityHeaders = [
@@ -67,6 +76,10 @@ const securityHeaders = [
   // directive is enforced immediately; the full policy above reports.
   { key: 'Content-Security-Policy', value: `frame-ancestors 'none'` },
   { key: 'Content-Security-Policy-Report-Only', value: contentSecurityPolicy },
+  // No report-to directive exists above (deliberate — see the
+  // report-uri comment); this header is pre-wiring for the day batched
+  // Reporting-API delivery becomes acceptable.
+  { key: 'Reporting-Endpoints', value: 'csp-endpoint="/api/csp-report"' },
 ];
 
 /** @type {import('next').NextConfig} */
