@@ -147,20 +147,32 @@ export async function upsertRagChunksD1Fts(env: Env, records: SearchableChunk[])
   // status→synced write joins the SAME batch: D1 batches are
   // transactional, so delete+insert+mark are atomic — a crash leaves
   // status 'pending' with no FTS row (clean retry), never a duplicate.
+  // Chunk ids are content-addressed (id embeds the content hash), so a
+  // base row already 'synced' has an identical, correct FTS row — the
+  // right operation is a full NO-OP. 'failed' may have a partial row →
+  // delete (the rare scan) + insert. Anything else has no FTS row
+  // (guaranteed going forward by the sticky ON CONFLICT status in
+  // rag-v2.ts plus the one-time scripts/rag-fts-repair.mjs backfill) →
+  // insert only. Status flips to 'synced' inside the SAME transactional
+  // batch, so crash-retry can never duplicate.
   const ids = records.map(record => record.id);
-  const needsDelete = new Set<string>();
+  const statusById = new Map<string, string>();
   for (let i = 0; i < ids.length; i += 50) {
     const chunk = ids.slice(i, i + 50);
     const marks = chunk.map(() => '?').join(',');
     const rows = await env.D1.prepare(
-      `SELECT id FROM rag_chunks_v2 WHERE id IN (${marks}) AND opensearch_status IN ('synced','failed')`
-    ).bind(...chunk).all<{ id: string }>();
-    for (const row of rows.results || []) needsDelete.add(row.id);
+      `SELECT id, opensearch_status FROM rag_chunks_v2 WHERE id IN (${marks})`
+    ).bind(...chunk).all<{ id: string; opensearch_status: string }>();
+    for (const row of rows.results || []) statusById.set(row.id, row.opensearch_status);
   }
 
+  const toWrite = records.filter(record => statusById.get(record.id) !== 'synced');
+  if (toWrite.length === 0) return { errors: [] };
+  const writeIds = toWrite.map(record => record.id);
+
   const statements: D1PreparedStatement[] = [];
-  for (const record of records) {
-    if (needsDelete.has(record.id)) {
+  for (const record of toWrite) {
+    if (statusById.get(record.id) === 'failed') {
       statements.push(env.D1.prepare('DELETE FROM rag_chunks_v2_fts WHERE chunk_id = ?').bind(record.id));
     }
     statements.push(
@@ -186,8 +198,8 @@ export async function upsertRagChunksD1Fts(env: Env, records: SearchableChunk[])
     );
   }
 
-  for (let i = 0; i < ids.length; i += 50) {
-    const chunk = ids.slice(i, i + 50);
+  for (let i = 0; i < writeIds.length; i += 50) {
+    const chunk = writeIds.slice(i, i + 50);
     const marks = chunk.map(() => '?').join(',');
     statements.push(
       env.D1.prepare(`UPDATE rag_chunks_v2 SET opensearch_status = 'synced' WHERE id IN (${marks})`).bind(...chunk)

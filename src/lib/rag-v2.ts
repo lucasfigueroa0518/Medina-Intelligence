@@ -1217,6 +1217,12 @@ export async function persistRagV2Trace(
   }
 }
 
+// opensearch_status is deliberately ABSENT from the ON CONFLICT update
+// list: chunk ids are content-addressed, so a same-id re-upsert carries
+// identical searchable content and the prior lexical state must stick.
+// Resetting it to 'pending' here defeated the FTS delete gate in
+// upsertRagChunksD1Fts and duplicated FTS rows (audit 2026-07-07 F1).
+// Status transitions happen only via the FTS batch / markLexicalStatuses.
 function upsertRagChunkRecordStatement(env: Env, record: RagChunkRecord): D1PreparedStatement {
   return env.D1.prepare(
     `INSERT INTO rag_chunks_v2
@@ -1251,7 +1257,6 @@ function upsertRagChunkRecordStatement(env: Env, record: RagChunkRecord): D1Prep
        created_at_epoch = excluded.created_at_epoch,
        chunk_config_version = excluded.chunk_config_version,
        lexical_doc_id = excluded.lexical_doc_id,
-       opensearch_status = excluded.opensearch_status,
        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
   ).bind(
     record.id,
