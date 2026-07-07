@@ -213,7 +213,10 @@ function SettingsPageInner() {
           />
         )}
         {activeTab === 'approvals' && <ApprovalQueueSection />}
-        {activeTab === 'system' && <SystemStatusSection />}
+        {activeTab === 'system' && !currentUserLoaded && (
+          <div className="card p-6 text-sm text-text-muted">Loading settings...</div>
+        )}
+        {activeTab === 'system' && currentUserLoaded && isAdmin && <SystemStatusSection />}
       </div>
 
       {showFirstConnect && (
