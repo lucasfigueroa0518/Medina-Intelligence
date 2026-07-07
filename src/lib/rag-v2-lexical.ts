@@ -136,9 +136,33 @@ export async function searchRagChunksD1Fts(
 
 export async function upsertRagChunksD1Fts(env: Env, records: SearchableChunk[]): Promise<{ errors: string[] }> {
   if (records.length === 0) return { errors: [] };
+
+  // DELETE FROM the FTS table by chunk_id is a full tokenized scan —
+  // chunk_id is UNINDEXED in FTS5 — costing ~155k rows read PER RECORD
+  // at current size (measured 1.46B rows/day; the D1 CPU resets it
+  // triggered took down unrelated user queries on 2026-07-06). A prior
+  // FTS row can only exist for chunks whose base row reached 'synced'
+  // or 'failed', so gate the delete on an O(1) PK lookup and skip it
+  // for first-time indexing (the overwhelming majority). The
+  // status→synced write joins the SAME batch: D1 batches are
+  // transactional, so delete+insert+mark are atomic — a crash leaves
+  // status 'pending' with no FTS row (clean retry), never a duplicate.
+  const ids = records.map(record => record.id);
+  const needsDelete = new Set<string>();
+  for (let i = 0; i < ids.length; i += 50) {
+    const chunk = ids.slice(i, i + 50);
+    const marks = chunk.map(() => '?').join(',');
+    const rows = await env.D1.prepare(
+      `SELECT id FROM rag_chunks_v2 WHERE id IN (${marks}) AND opensearch_status IN ('synced','failed')`
+    ).bind(...chunk).all<{ id: string }>();
+    for (const row of rows.results || []) needsDelete.add(row.id);
+  }
+
   const statements: D1PreparedStatement[] = [];
   for (const record of records) {
-    statements.push(env.D1.prepare('DELETE FROM rag_chunks_v2_fts WHERE chunk_id = ?').bind(record.id));
+    if (needsDelete.has(record.id)) {
+      statements.push(env.D1.prepare('DELETE FROM rag_chunks_v2_fts WHERE chunk_id = ?').bind(record.id));
+    }
     statements.push(
       env.D1.prepare(
         `INSERT INTO rag_chunks_v2_fts
@@ -159,6 +183,14 @@ export async function upsertRagChunksD1Fts(env: Env, records: SearchableChunk[])
         record.entity_names || '',
         record.exact_terms || ''
       )
+    );
+  }
+
+  for (let i = 0; i < ids.length; i += 50) {
+    const chunk = ids.slice(i, i + 50);
+    const marks = chunk.map(() => '?').join(',');
+    statements.push(
+      env.D1.prepare(`UPDATE rag_chunks_v2 SET opensearch_status = 'synced' WHERE id IN (${marks})`).bind(...chunk)
     );
   }
 
