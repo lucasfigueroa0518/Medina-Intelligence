@@ -4,7 +4,6 @@
 const API_ORIGIN = process.env.NEXT_PUBLIC_API_URL;
 if (!API_ORIGIN && typeof window !== 'undefined') {
   // Surface misconfiguration loudly in dev — the app is unusable without this var.
-  // eslint-disable-next-line no-console
   console.error(
     '[api] NEXT_PUBLIC_API_URL is not set. Create frontend/.env.local with NEXT_PUBLIC_API_URL=http://localhost:8787 and restart `next dev`.'
   );

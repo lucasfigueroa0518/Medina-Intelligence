@@ -9,7 +9,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint .",
+    "lint": "eslint . --max-warnings=35",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
