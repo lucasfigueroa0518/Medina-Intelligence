@@ -3,6 +3,9 @@
   "version": "3.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "concurrently -n api,web -c magenta,cyan \"wrangler dev --remote\" \"npm --prefix frontend run dev\"",
     "dev:api": "wrangler dev --remote",
