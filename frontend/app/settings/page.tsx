@@ -21,32 +21,20 @@ const INTERNAL_DOMAINS = (process.env.NEXT_PUBLIC_INTERNAL_DOMAINS ?? 'medinavc.
   .split(',')
   .map(d => d.trim().toLowerCase())
   .filter(Boolean);
-const MARTY_SANDBOX_VISIBLE_LOCAL_PART = 'intel';
 
-type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals' | 'system' | 'marty-sandbox';
+type SettingsTab = 'profile' | 'security' | 'integrations' | 'approvals' | 'system';
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: 'profile', label: 'Profile' },
   { id: 'system', label: 'System Status' },
-  { id: 'marty-sandbox', label: 'MARTy Sandbox' },
   { id: 'integrations', label: 'Sync & Integrations' },
   { id: 'security', label: 'Security' },
   { id: 'approvals', label: 'Approval Queue' },
 ];
 
-function canViewMartySandboxEmail(email?: string | null): boolean {
-  const [local, domain] = (email || '').trim().toLowerCase().split('@');
-  return local === MARTY_SANDBOX_VISIBLE_LOCAL_PART && INTERNAL_DOMAINS.includes(domain || '');
-}
-
 const SystemStatusSection = dynamic(
   () => import('./system-sections').then(mod => mod.SystemStatusSection),
   { ssr: false, loading: () => <div className="card p-6 text-sm text-text-muted">Loading...</div> },
-);
-
-const MartySandboxSection = dynamic(
-  () => import('./system-sections').then(mod => mod.MartySandboxSection),
-  { ssr: false, loading: () => <div className="card p-6 text-sm text-text-muted">Loading MARTy Sandbox...</div> },
 );
 
 export default function SettingsPageWrapper() {
@@ -60,7 +48,7 @@ export default function SettingsPageWrapper() {
 function SettingsPageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const { user: currentUser, status: authStatus } = useAuthSession();
+  const { user: currentUser, status: authStatus, isAdmin } = useAuthSession();
 
   const tabParam = searchParams.get('tab') as SettingsTab | null;
   const [activeTab, setActiveTab] = React.useState<SettingsTab>(
@@ -77,17 +65,19 @@ function SettingsPageInner() {
   const [error, setError] = React.useState<string | null>(null);
   const [showFirstConnect, setShowFirstConnect] = React.useState(false);
   const currentUserLoaded = authStatus !== 'loading';
-  const canViewMartySandbox = currentUserLoaded && canViewMartySandboxEmail(currentUser?.email);
+  // System Status is admin/owner-gated server-side (requireRole in the
+  // API); showing the tab to members just hands them an AUTH_FORBIDDEN
+  // card. Hide what the caller cannot open.
   const visibleTabs = React.useMemo(
-    () => TABS.filter(tab => tab.id !== 'marty-sandbox' || canViewMartySandbox),
-    [canViewMartySandbox]
+    () => TABS.filter(tab => tab.id !== 'system' || isAdmin || !currentUserLoaded),
+    [isAdmin, currentUserLoaded]
   );
 
   React.useEffect(() => {
-    if (!currentUserLoaded || activeTab !== 'marty-sandbox' || canViewMartySandbox) return;
+    if (!currentUserLoaded || activeTab !== 'system' || isAdmin) return;
     setActiveTab('profile');
     router.replace('/settings?tab=profile', { scroll: false });
-  }, [activeTab, canViewMartySandbox, currentUserLoaded, router]);
+  }, [activeTab, isAdmin, currentUserLoaded, router]);
 
   const loadStatus = React.useCallback(async () => {
     setLoading(true);
@@ -198,7 +188,7 @@ function SettingsPageInner() {
         </div>
       </div>
 
-      <div className={`p-4 md:p-8 w-full ${activeTab === 'marty-sandbox' && canViewMartySandbox ? 'max-w-[112rem]' : 'max-w-4xl'}`}>
+      <div className="p-4 md:p-8 w-full max-w-4xl">
         {banner && (
           <div
             className={`card border-l-4 mb-6 ${
@@ -224,10 +214,6 @@ function SettingsPageInner() {
         )}
         {activeTab === 'approvals' && <ApprovalQueueSection />}
         {activeTab === 'system' && <SystemStatusSection />}
-        {activeTab === 'marty-sandbox' && !currentUserLoaded && (
-          <div className="card p-6 text-sm text-text-muted">Loading settings...</div>
-        )}
-        {activeTab === 'marty-sandbox' && canViewMartySandbox && <MartySandboxSection />}
       </div>
 
       {showFirstConnect && (

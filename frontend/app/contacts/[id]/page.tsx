@@ -97,6 +97,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
   });
   const [saving, setSaving] = React.useState(false);
   const [refreshKey, setRefreshKey] = React.useState(0);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
   const [toast, setToast] = React.useState<string | null>(null);
   const [enriching, setEnriching] = React.useState(false);
   const [enriched, setEnriched] = React.useState(false);
@@ -152,6 +153,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
     const seq = ++detailSeqRef.current;
     setLoading(true);
     setNotFound(false);
+    setLoadError(null);
     setContact(null);
     setTimeline([]);
     setEntityAssociations([]);
@@ -179,7 +181,7 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       if (err instanceof ApiError && err.status === 404) {
         setNotFound(true);
       } else {
-        setToast(err?.message ? `Contact load failed: ${err.message}` : 'Contact load failed');
+        setLoadError(err?.message || 'Contact load failed');
       }
     }).finally(() => {
       if (seq === detailSeqRef.current) setLoading(false);
@@ -532,7 +534,19 @@ export function ContactDetailContent({ forcedId }: { forcedId?: string } = {}) {
       <Link href="/contacts" className="btn-secondary">Back to Contacts</Link>
     </div>
   );
-  if (!contact) return <div className="flex-1 flex items-center justify-center text-text-secondary">Unable to load contact</div>;
+  if (!contact) {
+    return (
+      <div className="flex-1 flex items-center justify-center p-6">
+        <div className="border border-semantic-error/30 bg-semantic-error/10 rounded-lg p-4 max-w-md w-full">
+          <div className="text-sm font-medium text-text-primary">Contact could not load.</div>
+          <div className="text-sm text-text-secondary mt-1">{loadError || 'The request failed or timed out.'}</div>
+          <button className="btn-secondary text-sm mt-3" onClick={() => setRefreshKey(k => k + 1)}>
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const es = ENGAGEMENT_STATUSES.find(s => s.value === contact.engagement_status) || ENGAGEMENT_STATUSES[2];
   const bio = cleanIntelBrief(fullBio || contact.bio_summary);
