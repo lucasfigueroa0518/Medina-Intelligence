@@ -2,7 +2,7 @@
 
 VC CRM and intelligence platform built on Cloudflare Workers. Ingests email, calendar, meeting transcripts (Firefly), and Slack into a deduplicated graph of contacts, companies, and deals; enriches with ReverseContact and Gemini; serves a RAG agent (MARTy) over the firm's full data with citation enforcement. Frontend is Next.js on Vercel.
 
-This README targets a new engineer with a clean machine. If you follow it top-to-bottom you should have a local backend running against a fresh D1 database and a local frontend that talks to it in roughly 30 minutes (excluding integration OAuth setup, which is per-integration).
+This README targets a new engineer with a clean machine. Run the golden path below and you should have a local backend running against a fresh D1 database and a local frontend talking to it in **under 15 minutes** (excluding integration OAuth dashboard setup, which is per-integration and done separately).
 
 ## Status
 
@@ -10,6 +10,16 @@ This README targets a new engineer with a clean machine. If you follow it top-to
 - Phase 8 partial ship (2026-05-06): a second Worker `medina-ventures-pipelines` now owns the Workflow class definitions and the cron triggers. The `medina-ventures-api` Worker still has direct `env.<WORKFLOW>.create()` callsites pending the planned strip + service-binding refactor — see `src/index.ts` header comment.
 - All 95 migrations through `0091_marty_lab.sql` are applied in production. Backend typechecks clean.
 - This is a single-tenant production system. Treat schema changes and migrations as live-data operations.
+
+## Current no-fly zones
+
+These restrictions apply while Phase 8's strip-and-service-binding refactor is in progress. Do not work around them without explicit coordination.
+
+- **Do not add new `env.<WORKFLOW>.create()` callsites in `src/index.ts`.** Workflow class ownership has moved to `medina-ventures-pipelines`; the api Worker's remaining `.create()` calls are legacy stubs awaiting the service-binding refactor.
+- **Do not re-add `[[workflows]]` declarations to `wrangler.toml`.** They were removed in Phase 8 and would re-claim workflow ownership from the pipelines Worker, breaking production runs mid-flight.
+- **Do not add new `[triggers]` or `crons` to `wrangler.toml`.** All cron triggers now run on the pipelines Worker (`wrangler.pipelines.toml`).
+- **Migrations are forward-only.** Production has 0001–0091. Write a new migration to undo any schema change; do not edit existing migration files.
+- **D1 production ID `4bb3705c-c471-43f7-b42f-b44ab62f5dab` is live data.** Never run `migrate:remote` or bootstrap scripts against it without a pre-approved plan.
 
 ## Architecture
 
@@ -56,9 +66,33 @@ This README targets a new engineer with a clean machine. If you follow it top-to
 - **Universal work queue substrate** (`src/lib/work-queue.ts`, `work-queue-driver.ts`, `work-queue-handlers/`). A domain-typed durable job queue on top of D1 (`work_queue` table, migration `0083`). Used for `firefly-window`, `embed-retry`, `calendar-refresh`, `intelligent-import`, `deal-replay-evidence`, `marty-lab-experiment`. Three-tier retry with attempt-based escalation, claim leases, `deferWork` for cooperative resumption inside Workflow steps, dead-letter on terminal failure.
 - **Ingestion workflows** (`src/workflows/ingestion.ts`, `ingestion-chunk.ts`, `ingestion-finalizer.ts`). Per-user, per-source backfill orchestrators (Outlook mail/calendar, Firefly transcripts, Slack history). Chunked progressive backfill with checkpointing in `sync_jobs`; finalizer reconciles after the last chunk completes.
 - **Agent / MARTy** (`src/handlers/agent.ts`, `src/lib/agent.ts`, `src/lib/agent-tools.ts`, `src/prompts/`, `src/lib/retrieval.ts`, `src/lib/citations.ts`, `src/lib/citation-verifier.ts`). Claude-powered RAG agent with tool calling, SSE streaming, ACL-aware retrieval, mandatory citation verification. "God Mode" toggle (`src/prompts/god-mode.ts`) gives MARTy write tools (`agent_writes` table, migration `0077`).
-- **Embed pipeline** (`src/lib/embedding.ts`, `src/lib/process-transcript-items.ts`, `src/lib/daily-cron.ts`). Workers AI 768-d embeddings into `medina-ventures-main` Vectorize index. Metadata-indexed fields: `org_id`, `entity_type`, `primary_entity_id`, `doc_type`, `participant_user_ids`, `is_org_wide`. Backfill via `backfillUnembedded` admin endpoint; retry via `embed-retry` work queue domain.
+- **Embed pipeline** (`src/lib/embedding.ts`, `src/lib/process-transcript-items.ts`, `src/lib/daily-cron.ts`). Workers AI 768-d embeddings into `medina-ventures-main` Vectorize index. Active Vectorize metadata indexes: `org_id`, `document_type`, `primary_entity_id`. Backfill via `backfillUnembedded` admin endpoint; retry via `embed-retry` work queue domain.
 - **Integrations** (`src/integrations/{outlook,slack,firefly,reversecontact,news-search,oauth,outlook-send}.ts`). Outlook (Microsoft Graph), Slack (Bolt-style webhooks + Web API), Firefly (transcripts via HMAC-signed webhook + API backfill), ReverseContact (contact enrichment), News (Brave Search fallback), Outlook Send (campaigns).
 - **Daily cron** (`src/lib/daily-cron.ts`, dispatched from `src/index.ts:scheduled()` and from the pipelines Worker). Runs enrichment ticks, embed-queue draining, calendar token health checks, system-status snapshot, work-queue dispatch.
+
+## What to give a new engineer
+
+Before they start, make sure a new engineer has all of the following. Missing any one of these will block a step in Local Setup.
+
+1. **Repo access** — GitHub repository invite (read + write).
+2. **`.dev.vars`** — a pre-filled copy with real secrets (all keys from `.env.example`). Do NOT send as plaintext over Slack/email; use 1Password or a secure secrets-share link.
+3. **`frontend/.env.local`** — one line: `NEXT_PUBLIC_API_URL=http://127.0.0.1:8787`.
+4. **Cloudflare account invite** — Workers admin role on the team account. They'll create their own dev resources via `npm run bootstrap` after logging in.
+5. **Vercel team access** — for frontend deploys (Settings → Members in the Vercel dashboard).
+6. **Third-party dashboard logins** (7 items):
+   - Anthropic console (for their own API key or team key)
+   - Google AI Studio / Google Cloud console (Gemini)
+   - Microsoft Entra portal (Azure AD app registration access)
+   - Slack workspace admin (to install the dev app)
+   - Firefly.ai account (per-user API key)
+   - ReverseContact dashboard (API key)
+   - Cloudflare AI Gateway dashboard (for `CLOUDFLARE_AI_GATEWAY_TOKEN`)
+7. **Four feedback files** — these encode hard-won architectural lessons that are not in the repo. They live in the Claude project memory; share them manually until they are committed under `docs/feedback/`:
+   - <!-- TODO: docs/feedback/feedback_hypothetical_trace_verification.md (content pending) -->
+   - <!-- TODO: docs/feedback/feedback_cf_subrequest_cap.md (content pending) -->
+   - <!-- TODO: docs/feedback/feedback_workflow_vs_waitUntil_lifetime.md (content pending) -->
+   - <!-- TODO: docs/feedback/feedback_acl_layered_redaction.md (content pending) -->
+   - `docs/feedback/feedback_vectorize_metadata_index.md` — already in repo ✓
 
 ## Prerequisites
 
@@ -78,7 +112,27 @@ You do NOT need a separate Cloudflare AI Gateway account; the slug `medina-ventu
 
 ## Local setup
 
-> Commands assume the repo root unless otherwise noted. Replace `<...>` placeholders with your values. The production database ID in `wrangler.toml` is the live database — do not run `migrate:remote` until you have your own database ID or you intend to write to production.
+> Commands assume the repo root unless otherwise noted. The production database ID in `wrangler.toml` is the live database — do not run `migrate:remote` until you have your own database ID.
+
+### Golden path (under 15 minutes)
+
+```bash
+git clone <repo-url> medina-ventures
+cd medina-ventures
+npm install
+cd frontend && npm install && cd ..
+npx wrangler login                    # authenticate with Cloudflare
+npm run bootstrap                     # create D1, R2, KV, Vectorize, Queues
+cp .env.example .dev.vars             # then fill in secrets (see step 5 below)
+echo "NEXT_PUBLIC_API_URL=http://127.0.0.1:8787" > frontend/.env.local
+npm run migrate:local                 # apply all migrations to local D1
+npm run preflight                     # verify environment before first run
+npm run dev                           # start api (port 8787) + frontend (port 3000)
+```
+
+After `npm run bootstrap`, paste the printed resource IDs into `wrangler.toml` and `wrangler.pipelines.toml` before continuing.
+
+The detailed steps below explain what each phase does and what to watch for.
 
 ### 1. Clone and install
 
@@ -98,38 +152,24 @@ npx wrangler whoami        # verify account
 
 If `whoami` shows a different account than the one you want to deploy into, run `npx wrangler logout` and re-`login`.
 
-### 3. Create Cloudflare resources (for your own dev environment)
+### 3. Create Cloudflare resources
 
-If you are working against the existing production resources (read-only or a hot fix), skip to step 5. To stand up a fresh stack:
+Run the bootstrap script — it detects existing resources by name and skips them (idempotent):
 
 ```bash
-# D1
-npx wrangler d1 create medina-ventures-db
-# → copy the database_id into wrangler.toml ([[d1_databases]] database_id)
-
-# R2
-npx wrangler r2 bucket create medina-ventures-storage
-
-# KV
-npx wrangler kv namespace create KV
-# → copy the id into wrangler.toml ([[kv_namespaces]] id)
-
-# Vectorize (768-dim, cosine — matches Workers AI bge-base-en-v1.5)
-npx wrangler vectorize create medina-ventures-main --dimensions=768 --metric=cosine
-# Required metadata indexes (filtered queries silently return 0 without these):
-npx wrangler vectorize create-metadata-index medina-ventures-main --property-name=org_id            --type=string
-npx wrangler vectorize create-metadata-index medina-ventures-main --property-name=entity_type       --type=string
-npx wrangler vectorize create-metadata-index medina-ventures-main --property-name=primary_entity_id --type=string
-npx wrangler vectorize create-metadata-index medina-ventures-main --property-name=doc_type          --type=string
-npx wrangler vectorize create-metadata-index medina-ventures-main --property-name=is_org_wide       --type=string
-npx wrangler vectorize create-metadata-index medina-ventures-main --property-name=participant_user_ids --type=string
-
-# Queues
-npx wrangler queues create audit-log-queue
-npx wrangler queues create audit-log-dlq
-npx wrangler queues create webhook-intake-queue
-npx wrangler queues create webhook-dlq
+npm run bootstrap
+# or: bash scripts/bootstrap-cloudflare.sh
+# dry run first: bash scripts/bootstrap-cloudflare.sh --dry-run
+# per-engineer namespace: bash scripts/bootstrap-cloudflare.sh --name-prefix yourname-
 ```
+
+The script creates: D1, R2, KV, Vectorize index (768-dim cosine), and all four Queues. After creation it prints the exact lines to paste into `wrangler.toml` and `wrangler.pipelines.toml`.
+
+> **Vectorize metadata indexes:** The bootstrap script creates three indexes (`org_id`, `document_type`, `primary_entity_id`) — these are the only fields the retrieval code currently passes to Vectorize as query filters. Three additional fields (`entity_type`, `is_org_wide`, `participant_user_ids`) appear in older planning docs but are not used as Vectorize filters today. See `docs/feedback/feedback_vectorize_metadata_index.md` for the architectural reason.
+>
+> **Important:** Cloudflare does not retroactively index vectors written before an index was created. If you add an index later, you must re-embed existing data via `POST /api/admin/backfill-unembedded`.
+
+If you are working against the existing production resources (read-only or a hotfix), skip to step 5. The bootstrap script refuses to run against the production account ID (`ad54df3fe...`) without `--allow-production`.
 
 ### 4. Update `wrangler.toml` bindings
 
@@ -145,10 +185,16 @@ The Vectorize, R2, AI, and Queue bindings reference by name only, so no edits ne
 
 Run these against the **api** Worker (which serves requests). The pipelines Worker reads the same set; repeat each `secret put` with `--config wrangler.pipelines.toml` for the pipelines Worker.
 
+> **`TOKEN_ENCRYPTION_KEY` must be exactly 32 raw bytes, base64-encoded** (AES-GCM key for OAuth token storage). Generate with:
+> ```bash
+> openssl rand -base64 32
+> ```
+> Using a key shorter than 32 bytes will cause token decryption failures at runtime — the error will appear only when a user first connects an Outlook account.
+
 ```bash
 # Auth
-npx wrangler secret put JWT_SECRET                  # 32+ random bytes, base64
-npx wrangler secret put TOKEN_ENCRYPTION_KEY        # exactly 32 raw bytes, base64-encoded
+npx wrangler secret put JWT_SECRET                  # 32+ random bytes: openssl rand -base64 48
+npx wrangler secret put TOKEN_ENCRYPTION_KEY        # exactly 32 raw bytes, base64-encoded: openssl rand -base64 32
 
 # LLM providers
 npx wrangler secret put ANTHROPIC_API_KEY
@@ -175,23 +221,25 @@ npx wrangler secret put FIREFLY_WEBHOOK_SECRET      # HMAC-SHA256 secret you set
 # Enrichment
 npx wrangler secret put REVERSECONTACT_API_KEY
 
+# Cloudflare (required by pipelines Worker)
+npx wrangler secret put CLOUDFLARE_AI_GATEWAY_TOKEN  # dash → AI → AI Gateway → your gateway → API tokens
+npx wrangler secret put CLOUDFLARE_API_TOKEN         # dash → My Profile → API Tokens → Workers:Edit
+
 # Optional
-npx wrangler secret put DEFAULT_SIGNUP_ORG_ID       # org UUID assigned to self-signup users
+npx wrangler secret put DEFAULT_SIGNUP_ORG_ID       # org UUID — run scripts/seed-default-org.sh first
 npx wrangler secret put ALLOWED_SIGNUP_DOMAINS      # comma-separated email domains
 ```
 
 Verify with `scripts/verify-secrets.sh`.
 
-For local `wrangler dev`, secrets come from `.dev.vars` (gitignored). Create one:
+For local `wrangler dev`, secrets come from `.dev.vars` (gitignored). Create it from the template:
 
 ```bash
-cat > .dev.vars <<'EOF'
-JWT_SECRET=...
-TOKEN_ENCRYPTION_KEY=...
-ANTHROPIC_API_KEY=...
-# (and the rest, same keys as above)
-EOF
+cp .env.example .dev.vars
+$EDITOR .dev.vars   # fill in values
 ```
+
+> **Warning:** Wrangler reads `.dev.vars`, not `.env.local`. If you have a `.env.local` at the repo root containing Worker secrets (not the frontend one at `frontend/.env.local`), rename it: `mv .env.local .dev.vars`. Running `npm run preflight` will detect this and warn you.
 
 ### 6. Frontend environment
 
@@ -217,14 +265,14 @@ The `migrations/` directory is FK-ordered; `wrangler d1 migrations apply` runs t
 
 ### 8. Run dev servers
 
+> **`wrangler dev` runs in remote mode by default for this repo.** The `dev:api` script passes `--remote`, which means it talks to real Cloudflare D1/R2/KV/Vectorize backends using your dev credentials. `--local` mode does not work for Vectorize or AI Gateway. Every request against the API in dev hits live Cloudflare infrastructure — use your own dev resources (from `npm run bootstrap`), not the production ones.
+
 ```bash
 npm run dev              # both API + frontend (concurrently)
 # or run separately:
-npm run dev:api          # wrangler dev (remote mode — talks to real D1/R2/KV)
-npm run dev:web          # next dev on :3000
+npm run dev:api          # wrangler dev --remote (port 8787)
+npm run dev:web          # next dev (port 3000)
 ```
-
-`wrangler dev` runs in **remote** mode by default for this repo because the bindings (D1, Vectorize, AI Gateway) need real backends. `--local` will not work for Vectorize or AI.
 
 ### 9. Verify
 
@@ -265,11 +313,13 @@ Then open http://localhost:3000, sign up (uses `DEFAULT_SIGNUP_ORG_ID` if set, o
 | `SLACK_BOT_TOKEN` | secret | yes for Slack | `xoxb-...` bot token | Slack app → OAuth & Permissions |
 | `FIREFLY_WEBHOOK_SECRET` | secret | yes for Firefly | webhook HMAC | you choose; set same in Firefly |
 | `REVERSECONTACT_API_KEY` | secret | yes for enrichment | ReverseContact API | reversecontact.com → dashboard |
+| `CLOUDFLARE_AI_GATEWAY_TOKEN` | secret | yes (pipelines Worker) | AI Gateway token for Gemini + Claude routing | dash → AI → AI Gateway → your gateway → API tokens |
+| `CLOUDFLARE_API_TOKEN` | secret | yes (pipelines Worker) | Cloudflare API token for workflow state reconciler | dash → My Profile → API Tokens → Workers:Edit |
 | `NEXT_PUBLIC_API_URL` | `frontend/.env.local` | yes | Worker base URL | local: `http://127.0.0.1:8787` |
 
 Bindings (no secret, declared in `wrangler.toml`): `AI`, `D1`, `R2`, `KV`, `VECTORIZE`, `AUDIT_QUEUE`, `AUDIT_DLQ`, `WEBHOOK_QUEUE`, `WEBHOOK_DLQ`. After the planned Phase 8 strip-redeploy, the api Worker will also declare a `[[services]] PIPELINES` binding to invoke workflows on the pipelines Worker.
 
-No `.env.example` exists; this table is the source of truth.
+`.env.example` at the repo root lists all secrets. Use it as a template: `cp .env.example .dev.vars && $EDITOR .dev.vars`.
 
 ## Integration setup
 
@@ -332,8 +382,8 @@ No `.env.example` exists; this table is the source of truth.
   ```
   Per project discipline: "deploy" is not done until both `wrangler deploy` and `git push origin main` have completed.
 - **Migrations**: numbered `NNNN_description.sql`. Never edit a shipped migration; add a new one. Production already has 0001-0091. New migrations go through `npm run migrate:local` first, then `npm run migrate:remote` after schema review. SQLite gotchas: FK targets are not validated at `CREATE TABLE`, so a typo (`REFERENCES orgs` instead of `organizations`) latches in silent until first INSERT under FK enforcement. ON CONFLICT against a partial UNIQUE index must reproduce the partial `WHERE` clause.
-- **Audit-first discipline**: before changing a substrate (work queue, embed pipeline, ACL filter, retrieval), read the current state end-to-end. Verify hypotheses against live D1 with read-only queries before shipping. Memory file `feedback_hypothetical_trace_verification.md` documents the trace-then-ship pattern.
-- **Cloudflare subrequest cap**: a single Worker step can issue at most ~50 subrequests on the paid plan; chunk-parallelism handlers like classify-batch are pinned at ≤10 items/step. See `feedback_cf_subrequest_cap.md`.
+- **Audit-first discipline**: before changing a substrate (work queue, embed pipeline, ACL filter, retrieval), read the current state end-to-end. Verify hypotheses against live D1 with read-only queries before shipping. <!-- TODO: docs/feedback/feedback_hypothetical_trace_verification.md (content pending) -->
+- **Cloudflare subrequest cap**: a single Worker step can issue at most ~50 subrequests on the paid plan; chunk-parallelism handlers like classify-batch are pinned at ≤10 items/step. <!-- TODO: docs/feedback/feedback_cf_subrequest_cap.md (content pending) -->
 
 ## Key subsystems
 
@@ -448,7 +498,7 @@ git checkout main -- src wrangler.toml
 
 - **`Authentication error` from wrangler** — token expired. `npx wrangler logout && npx wrangler login`. Wrangler tokens have been observed to drop silently at UTC midnight; long-running background watches that span 00:00Z go blind. Prefer short pre-midnight watches.
 - **Migration apply fails** — check that `REFERENCES <table>` matches the actual table name (org table is `organizations`, not `orgs`). Check that any `ON CONFLICT(...)` against a partial unique index reproduces the partial `WHERE` clause; otherwise SQLite emits `does not match any UNIQUE constraint`.
-- **MARTy not retrieving recent X** — check `DOC_TYPE_KEYWORDS` in `src/lib/retrieval.ts`; check embed coverage on `/admin` System Status; verify the Vectorize metadata index for the field you are filtering on (filtered queries silently return 0 if the index is missing OR if vectors were inserted before the index was created — see `feedback_vectorize_metadata_index.md`).
+- **MARTy not retrieving recent X** — check `DOC_TYPE_KEYWORDS` in `src/lib/retrieval.ts`; check embed coverage on `/admin` System Status; verify the Vectorize metadata index for the field you are filtering on (filtered queries silently return 0 if the index is missing OR if vectors were inserted before the index was created — see `docs/feedback/feedback_vectorize_metadata_index.md`).
 - **`subrequest limit hit` in Worker logs** — a handler is fanning out too many calls per step. Batch sizes for classify/extract/embed are capped at ≤10 items/step.
 - **D1 transient errors during dual-write** — when writing to two tables in the same step, follow the established ordering (parent before child; vector index after D1 commit). Don't introduce new dual-writes without re-reading `src/lib/persist-document.ts`.
 - **Embed pipeline coverage gap** — `POST /api/admin/backfill-unembedded` (chunked, idempotent). Track progress via `GET /api/admin/embed-queue-health`.
@@ -456,7 +506,7 @@ git checkout main -- src wrangler.toml
 - **OAuth redirect mismatch** — only relevant when delegated fallback is explicitly enabled. `AZURE_REDIRECT_URI` must EXACTLY match the redirect URI registered in Entra.
 - **Slack signature verification fails** — `SLACK_SIGNING_SECRET` is the Basic-Information signing secret, not the OAuth client secret. Easy to mix up.
 - **Firefly webhook returns 401** — `FIREFLY_WEBHOOK_SECRET` in `wrangler secret` must equal the secret you entered in Firefly's webhook configuration; both are HMAC-SHA256.
-- **`waitUntil` task disappears mid-run** — Cloudflare provides no lifetime guarantees for `waitUntil` work; the app-side stale-reset + watchdog is the only cleanup. Don't put critical-path work in `waitUntil`. See `feedback_workflow_vs_waitUntil_lifetime.md`.
+- **`waitUntil` task disappears mid-run** — Cloudflare provides no lifetime guarantees for `waitUntil` work; the app-side stale-reset + watchdog is the only cleanup. Don't put critical-path work in `waitUntil`. <!-- TODO: docs/feedback/feedback_workflow_vs_waitUntil_lifetime.md (content pending) -->
 
 ## Operational endpoints
 
@@ -496,7 +546,7 @@ Full list is in `src/index.ts` under the `/api/admin/` block; all require owner/
 - **Three-tier retry** — work queue retry policy: immediate retry → backed-off retry → dead-letter, with per-tier attempt budgets.
 - **deferWork** — cooperative resume primitive: a Workflow step that exceeds its time budget reschedules itself via the work queue rather than failing the step.
 - **Dead-letter** — a row moved to terminal-failure state after exhausting retries; surfaced via `/api/admin/dlq` (queue DLQs) or `work_queue` rows with `status='dead'`.
-- **ACL** — access control. In this codebase: a chunk/document is `is_org_wide=1` (everyone in org sees it) or has a non-empty `participant_user_ids` list (only those users + owner role see it). Enforced at retrieval filter (Vectorize) AND tool filter (post-filter on returned chunks) — both layers are required; see `feedback_acl_layered_redaction.md`.
+- **ACL** — access control. In this codebase: a chunk/document is `is_org_wide=1` (everyone in org sees it) or has a non-empty `participant_user_ids` list (only those users + owner role see it). Enforced at retrieval filter (Vectorize) AND tool filter (post-filter on returned chunks) — both layers are required. <!-- TODO: docs/feedback/feedback_acl_layered_redaction.md (content pending) -->
 - **Email Privacy v3.0** — the policy that email content is participant-private even though metadata is org-shared. Implemented via `participant_user_ids` ACL.
 - **Phase 6 / 6.1 / 8** — resilience-overhaul phases. Phase 6 introduced the universal work queue. Phase 6.1 hardened circuit breakers. Phase 8 (in progress) splits Workflow class ownership onto a second Worker (`medina-ventures-pipelines`).
 - **Substrate vs handler** — a debugging distinction: structural state (job rows, queue depths, transition counts) can be green while handler-level diagnostics (last_error, heartbeat, response shape) silently regress. Always probe both layers.

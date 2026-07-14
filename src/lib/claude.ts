@@ -143,7 +143,7 @@ function buildGatewayHeaders(env: Env): Record<string, string> {
   if (!apiKey || apiKey.trim().length === 0) {
     throw new Error(
       'CLAUDE_CONFIG_ERROR: ANTHROPIC_API_KEY secret is not set on the Worker. ' +
-        'Run `wrangler secret put ANTHROPIC_API_KEY` and paste the key from .env.local.'
+        'Run `wrangler secret put ANTHROPIC_API_KEY` and paste the key from .dev.vars.'
     );
   }
 
